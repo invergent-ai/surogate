@@ -8,7 +8,7 @@ ensuring efficient and effective LLM operations.
 
 - https://github.com/datajuicer/data-juicer?tab=readme-ov-file
 - https://github.com/modelscope/ms-swift
-- https://github.com/modelscope/evalscope
+- https://github.com/modelscope/evalscope -> bencharmking
 - https://github.com/IST-DASLab/llmq
 - https://github.com/axolotl-ai-cloud/axolotl
 - https://github.com/NVIDIA/Megatron-LM
@@ -16,7 +16,7 @@ ensuring efficient and effective LLM operations.
 - https://github.com/aimhubio/aim
 - https://github.com/sgl-project/sglang
 - https://github.com/vllm-project/vllm
-- https://github.com/confident-ai/deepeval
+- https://github.com/confident-ai/deepeval ->
 - https://github.com/confident-ai/deepteam
 
 # Installation
