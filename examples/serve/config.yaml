@@ -1,1 +1,12 @@
 model: Qwen/Qwen-7B-Chat
+served_name: qwen-7b-chat
+max_memory: 0.9
+tp: 4
+max_context: 2048
+log_interval: 100
+engine: vllm # options: vllm, sglang, pytorch
+adapters:
+  - name: qwen-7b-chat-zh
+    path: ./adapters/qwen-7b-chat-zh
+  - name: qwen-7b-chat-ro
+    path: ./adapters/qwen-7b-chat-ro

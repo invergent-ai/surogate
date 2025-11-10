@@ -2,6 +2,8 @@ import sys
 
 from swift import get_logger
 
+from surogate.serve.serve import SurogateServe
+
 logger = get_logger()
 
 if __name__ == '__main__':
@@ -11,3 +13,4 @@ if __name__ == '__main__':
         sys.exit(1)
 
     config_path = argv[0]
+    SurogateServe(config_path).run()

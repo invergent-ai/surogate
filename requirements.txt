@@ -10,3 +10,7 @@ pybind11
 deepeval
 deepteam
 evalscope
+uvicorn
+fastapi
+aiohttp
+huggingface_hub

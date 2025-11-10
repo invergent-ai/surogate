@@ -8,8 +8,9 @@ from surogate.utils.config import load_config
 
 
 class SurogateEval:
-    def __init__(self, config: str | Path):
-        self.config = load_config(config)
+    def __init__(self, **kwargs):
+        self.args = kwargs
+        self.config = load_config(self.args['config'])
         self.task_config = evalscope.TaskConfig(
             model=self.config['target']['model'],
             api_url=self.config['target']['api_url'],
