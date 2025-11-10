@@ -1,0 +1,12 @@
+datasets:
+  - path: allenai/c4
+    subset: ro
+    split: train
+    text_column: text
+    samples: 2000
+  - path: HuggingFaceFW/fineweb
+    subset: sample-10BT
+    split: train
+    text_column: text
+    samples: 2000
+

@@ -1,0 +1,45 @@
+simulator:
+  model: gpt-3.5-turbo-0125
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  api_url: "http://example:base-url"
+  api_key: "<your-api-key>"
+
+judge:
+  model: gpt-4o
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  api_url: "http://example:base-url"
+  api_key: "<your-api-key>"
+
+target:
+  model: "model_name"
+  temperature: 1
+  top_p: 0.9
+  top_k: 40
+  api_url: "http://example-url"
+  api_key: "<your-api-key>"
+  task: text_generation # image_generation
+  max_tokens: 256
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+
+config:
+  max_concurrent: 5
+  ignore_errors: true
+  output_folder: "eval_results"
+
+datasets:
+  - name: "gsm8k"
+    weight: 1
+    task_type: "math"
+    tags: ["en"]
+  - name: "competition_math"
+    weight: 1
+    task_type: "math"
+    tags: ["en"]
+    subsets:
+      - high_school_mathematics
+      - college_mathematics
