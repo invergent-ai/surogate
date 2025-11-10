@@ -18,3 +18,20 @@ ensuring efficient and effective LLM operations.
 - https://github.com/vllm-project/vllm
 - https://github.com/confident-ai/deepeval
 - https://github.com/confident-ai/deepteam
+
+# Installation
+
+```bash
+uv venv --python 3.12
+uv pip install -r requirements-torch.txt
+uv pip install -r requirements.txt
+bash install-vllm.sh
+bash install-sglang.sh
+bash install-fa.sh
+```
+
+# Run
+
+```
+python -m surogate.cli.main
+```
