@@ -1,0 +1,63 @@
+{
+  "name": "surugate-docs",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "docusaurus": "docusaurus",
+    "start": "docusaurus start",
+    "build": "docusaurus build",
+    "swizzle": "docusaurus swizzle",
+    "deploy": "docusaurus deploy",
+    "clear": "docusaurus clear",
+    "serve": "docusaurus serve",
+    "write-translations": "docusaurus write-translations",
+    "write-heading-ids": "docusaurus write-heading-ids"
+  },
+  "dependencies": {
+    "@docusaurus/core": "^3.5.2",
+    "@docusaurus/plugin-client-redirects": "^3.5.2",
+    "@docusaurus/preset-classic": "^3.5.2",
+    "@docusaurus/plugin-sitemap": "^3.5.2",
+    "@docusaurus/theme-common": "^3.5.2",
+    "@docusaurus/theme-mermaid": "^3.5.2",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mdx-js/react": "3.0.1",
+    "@mui/icons-material": "^6.4.0",
+    "@mui/material": "^6.4.0",
+    "clsx": "^2.1.1",
+    "primeflex": "^3.3.1",
+    "prism-react-renderer": "^2.4.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "rehype-katex": "7",
+    "remark-cli": "^12.0.1",
+    "remark-lint": "^10.0.0",
+    "remark-lint-no-dead-urls": "^1.1.0",
+    "remark-math": "6",
+    "remark-validate-links": "^13.0.1",
+    "remark-validate-links-heading-id": "^0.0.3",
+    "yarn": "^1.22.22"
+  },
+  "devDependencies": {
+    "@docusaurus/module-type-aliases": "^3.5.2"
+  },
+  "browserslist": {
+    "production": [
+      ">0.5%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "remarkConfig": {
+    "plugins": [
+      "remark-validate-links-heading-id",
+      "remark-validate-links"
+    ]
+  }
+}

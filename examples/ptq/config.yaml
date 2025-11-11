@@ -1,0 +1,27 @@
+model: Qwen/Qwen3-0.6B
+
+# Quantization scheme: nvfp4 or awq
+scheme: nvfp4 # options: nvfp4, awq
+
+# KV cache quantization format
+kv_cache_scheme: "fp8"
+
+# Batch size for calibration. Default to 0 as we calculate max batch size on-the-fly
+batch_size: 0
+
+# Maximum sequence length for calibration
+calib_seq: 512
+
+# exported_model
+export_path: outputs/quantized_model
+
+# calibration datasets
+datasets:
+  - name: gigi
+    samples: 512
+  - name: gigi2
+    samples: 256
+
+
+awq_block_size: 0
+

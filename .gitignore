@@ -5,3 +5,7 @@ outputs/
 __pycache__/
 .vscode/
 .DS_Store
+surogate/_version.py
+*.egg-info/
+package-lock.json
+uv.lock

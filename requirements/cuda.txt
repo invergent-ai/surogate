@@ -1,0 +1,4 @@
+flashinfer-python==0.5.2
+flashinfer-cubin==0.5.2
+flash_attn==2.8.2
+nvidia-modelopt==0.37.0

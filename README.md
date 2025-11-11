@@ -18,20 +18,26 @@ ensuring efficient and effective LLM operations.
 - https://github.com/vllm-project/vllm
 - https://github.com/confident-ai/deepeval ->
 - https://github.com/confident-ai/deepteam
-
+- https://www.jackyoustra.com/blog/road-to-petaflop
+- 
 # Installation
 
 ```bash
 uv venv --python 3.12
-uv pip install -r requirements-torch.txt
-uv pip install -r requirements.txt
-bash install-vllm.sh
-bash install-sglang.sh
-bash install-fa.sh
+sh requirements/raw-deps.sh
+uv pip install -r requirements/torch29.txt
+uv pip install -r requirements/build.txt
+uv pip install -r requirements/common.txt
+uv pip install -r requirements/cuda.txt
+
+# install sgl-kernel
+
+uv pip install "numpy==2.2.6"
+rm -rf .venv/lib/python3.12/site-packages/triton_kernels
 ```
 
 # Run
 
 ```
-python -m surogate.cli.main
+uv run surogate
 ```

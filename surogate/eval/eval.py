@@ -3,8 +3,11 @@ from pathlib import Path
 import evalscope
 from evalscope.constants import EvalType
 from evalscope.run import run_single_task, run_task
+from swift import get_logger
 
 from surogate.utils.config import load_config
+
+logger = get_logger()
 
 
 class SurogateEval:

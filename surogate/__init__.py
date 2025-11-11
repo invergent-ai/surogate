@@ -1,4 +1,3 @@
-from typing import TYPE_CHECKING
+from .serve.models import register_additional_model_types
 
-from .version import __version__, __release_datetime__
-
+register_additional_model_types()

@@ -1,6 +1,47 @@
 [project]
 name = "surogate"
-version = "0.1.0"
-description = "Add your description here"
+authors = [{name = "The Invergent Team"}]
+license = "AGPL-3.0"
+license-files = ["LICENSE"]
+readme = "README.md"
+description = "The LLMOps framework for the enterprise"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis"
+]
 requires-python = ">=3.12"
-dependencies = []
+dynamic = [ "version", "dependencies", "optional-dependencies"]
+
+[project.urls]
+Homepage="https://github.com/invergent-ai/surogate"
+Documentation="https://docs.surogate.ai/en/latest/"
+Slack="https://slack.surogate.ai/"
+
+[build-system]
+requires = [
+    "cmake>=3.26.1",
+    "ninja",
+    "packaging>=24.2",
+    "setuptools>=77.0.3,<81.0.0",
+    "setuptools-scm>=8.0",
+    "wheel",
+    "jinja2",
+    "torch==2.9.0",
+    "scikit_build_core"
+]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+surogate = "surogate.cli.main:cli_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["surogate*"]
+
+[tool.uv]
+no-build-isolation-package = ["torch"]
+
