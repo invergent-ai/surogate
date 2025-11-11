@@ -10,3 +10,5 @@ surogate/_version.py
 package-lock.json
 uv.lock
 results
+data
+.deepeval
