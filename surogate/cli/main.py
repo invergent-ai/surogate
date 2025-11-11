@@ -26,6 +26,7 @@ def parse_args():
 
     ptq = subparsers.add_parser('ptq', help="Post-training quantization")
     ptq.add_argument('--config', type=str, required=True, help='Path to config file')
+    ptq.add_argument('--hub_token', type=str, help='Hugging Face/Modelscope token for private model access', default=None)
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:

@@ -1,10 +1,8 @@
 model: Qwen/Qwen3-0.6B
 
-# Quantization scheme: nvfp4 or awq
-scheme: nvfp4 # options: nvfp4, awq
 
-# KV cache quantization format
-kv_cache_scheme: "fp8"
+# Quantization scheme: fp8 (W8A8), awq (INT4 W4A16), gptq_int4 (INT4 W4A16), qptq_int8 (INT8 W8A8), nvfp4 (NVidia FP4)
+scheme: fp8
 
 # Batch size for calibration. Default to 0 as we calculate max batch size on-the-fly
 batch_size: 0
@@ -13,7 +11,11 @@ batch_size: 0
 calib_seq: 512
 
 # exported_model
-export_path: outputs/quantized_model
+save_path: output/Qwen3-0.6B-FP8-Dynamic
+
+# layers to ignore during quantization (lm_head and re:.*lm_head are ignored by default)
+ignore_layers:
+  - lm_head
 
 # calibration datasets
 datasets:
@@ -21,7 +23,4 @@ datasets:
     samples: 512
   - name: gigi2
     samples: 256
-
-
-awq_block_size: 0
 
