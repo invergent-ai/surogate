@@ -1,0 +1,25 @@
+# example_llm_local_vllm.yaml
+target:
+  model: "Qwen/Qwen3-0.6B"
+  api_url: "http://127.0.0.1:8888/v1"
+  api_key: ""  # not needed for local
+  headers: {}
+  generation_config:
+    temperature: 0.7
+    max_tokens: 500
+    top_p: 0.9
+    stop: ["<|endoftext|>"]
+
+benchmarks:
+  - name: "mmlu"
+    subset: ["high_school_physics", "college_math"]
+    limit: 20
+  - name: "gsm8k"
+    limit: 20
+
+parameters:
+  debug: true
+  seed: 42
+
+output:
+  dir: "./results/vllm_qwen3"

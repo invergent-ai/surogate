@@ -1,0 +1,25 @@
+# example_rag_eval.yaml
+target:
+  model: "gpt-4"
+  api_url: "https://api.openai.com/v1"
+
+rag_eval:
+  enabled: true
+  tool: "RAGAS"
+  metrics:
+    - "faithfulness"
+    - "answer_relevancy"
+    - "context_recall"
+    - "context_precision"
+
+  retrieval_config:
+    retriever_type: "dense"
+    top_k: 5
+
+  corpus_path: "./data/corpus.jsonl"
+  questions_path: "./data/questions.jsonl"
+
+  embedding_model: "text-embedding-3-large"
+
+output:
+  dir: "./results/rag"
