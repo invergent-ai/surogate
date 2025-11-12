@@ -9,3 +9,6 @@ surogate/_version.py
 *.egg-info/
 package-lock.json
 uv.lock
+results
+data
+.deepeval

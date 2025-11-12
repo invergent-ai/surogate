@@ -1,0 +1,392 @@
+# config_schema.yaml - Complete field documentation
+
+# Core target configuration
+target:
+  model: null  # Model identifier/name
+
+  # API endpoints (any naming convention)
+  api_url: null
+  api_base: null
+  base_url: null
+  endpoint: null
+
+  # Authentication
+  api_key: null
+  auth_token: null
+  bearer_token: null
+  access_token: null
+
+  # Generic headers
+  headers: null
+
+  # Request parameters
+  request_params: null
+
+  # Model arguments
+  model_args: null
+
+  # Generation configuration
+  generation_config: null
+    # temperature: 0.7
+    # max_tokens: 1024
+    # top_p: 0.9
+    # top_k: 50
+    # frequency_penalty: 0.0
+    # presence_penalty: 0.0
+    # stop: []
+    # n: 1
+    # stream: false
+
+  # Embedding/Reranker specific
+  pooling_mode: null  # "cls", "lasttoken", "max", "mean", "mean_sqrt_len_tokens", "weightedmean"
+  max_seq_length: 512
+  prompt: ""
+  encode_kwargs: null
+  is_cross_encoder: false
+
+  # Environment mappings
+  env_mappings: null
+
+# Multi-model configuration
+models: null
+
+# Evaluation backend
+eval:
+  type: "service"  # "service", "local", "custom"
+  backend: null  # "native", "opencompass", "vlmeval", "rageval", "thirdparty"
+  eval_config: null
+
+# Standard benchmarks
+benchmarks: null
+  # Format 1: Simple list
+  # - "mmlu"
+  # - "gsm8k"
+
+  # Format 2: Detailed
+  # - name: "mmlu"
+  #   subset: []
+  #   limit: null
+  #   split: "test"
+  #   few_shot: null
+  #   few_shot_split: "dev"
+  #   few_shot_random: false
+
+# Custom datasets
+custom_datasets: null
+  # - name: null
+  #   type: null  # "llm", "vlm", "embedding", "reranker"
+  #   data_path: null
+  #   prompt_template: null
+  #   reader_cfg: null
+  #   pred_role: null
+
+# Embedding & Reranker Evaluation (MTEB/CMTEB)
+embedding_reranker_eval:
+  enabled: false
+  tool: null  # "MTEB", "CMTEB"
+  evaluation_mode: "one_stage"  # "one_stage", "two_stage"
+
+  # Model configs for two-stage
+  retrieval_model: null
+  reranker_model: null
+
+  # Evaluation settings
+  tasks: null  # List of task names
+  verbosity: 2
+  output_folder: "outputs"
+  overwrite_results: true
+  topk: 10
+  limits: null
+  hub: "modelscope"  # "modelscope", "huggingface"
+  dataset_revision: null
+  split: "test"
+
+# CLIP Evaluation
+clip_eval:
+  enabled: false
+  tool: "CLIP_Benchmark"
+  benchmark: null
+  tasks: null
+  dataset: null
+  dataset_root: null
+  annotation_file: null
+  batch_size: 64
+  num_workers: 4
+  output_folder: "outputs"
+
+# Mixed data evaluation
+mixed_data:
+  enabled: false
+  schema_path: null
+  datasets: null
+  sampling_strategy: null
+    # strategy: "uniform"  # "uniform", "weighted"
+    # weights: []
+  unified_eval: false
+  metrics: null
+
+# Arena mode
+arena:
+  enabled: false
+  mode: "pairwise"  # "pairwise", "single"
+  models: null
+    # - model: null
+    #   api_url: null
+    #   api_key: null
+  judge_model: null
+  judge_config: null
+  baseline_model: null
+
+# Model inference stress testing
+stress_test:
+  enabled: false
+  dataset: null  # Dataset name or path
+
+  # Load parameters
+  num_prompts: null
+  prompt_length: null
+  output_length: null
+  max_length: null
+
+  # Concurrency settings
+  batch_size: 1
+  concurrent_requests: 1
+  request_rate: null  # Requests per second
+  duration: null  # Test duration in seconds
+
+  # Performance metrics
+  metrics: null  # ["ttft", "tpot", "throughput", "latency"]
+
+  # Logging
+  wandb_logging: false
+  wandb_project: null
+  wandb_run_name: null
+  swanlab_logging: false
+  swanlab_project: null
+
+  # Advanced
+  seed: null
+  tokenizer: null
+  trust_remote_code: false
+
+# AIGC Evaluation
+aigc:
+  enabled: false
+  type: null  # "text_to_image", "image_editing"
+
+  # For image editing
+  benchmark: null  # "gedit_bench"
+
+  # Metrics
+  metrics: null  # ["fid", "clip_score", "lpips", "psnr", "ssim"]
+
+  # Paths
+  reference_images: null
+  generated_images: null
+
+  # Model config
+  model_type: null
+  pretrained_model_path: null
+
+  # Generation parameters
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  height: 512
+  width: 512
+  seed: null
+
+# RAG Evaluation
+rag_eval:
+  enabled: false
+  tool: "RAGAS"  # "RAGAS", "MTEB", "CMTEB"
+
+  # For RAGAS (end-to-end)
+  metrics: null
+    # - "faithfulness"
+    # - "answer_relevancy"
+    # - "context_recall"
+    # - "context_precision"
+    # - "answer_similarity"
+    # - "answer_correctness"
+
+  # RAG pipeline config
+  retrieval_config: null
+    # retriever_type: null
+    # top_k: 5
+    # similarity_threshold: null
+
+  generation_config: null
+    # model: null
+    # temperature: 0.7
+    # max_tokens: 512
+
+  # Data
+  corpus_path: null
+  questions_path: null
+  ground_truths_path: null
+
+  # Multimodal RAG
+  multimodal: false
+  image_text_retrieval: false
+
+  # Embedding model (for retrieval)
+  embedding_model: null
+
+  # Advanced
+  batch_size: null
+  cache_dir: null
+
+# VLM Evaluation (VLMEvalKit backend)
+vlm_eval:
+  enabled: false
+
+  # Model
+  model: null
+  model_type: null
+
+  # Benchmarks
+  benchmark: null
+    # Available: "MMBench", "MME", "SEEDBench", "MMStar", "MMMU",
+    # "MathVista", "ScienceQA", "AI2D", "HallusionBench", etc.
+
+  # Data
+  data_path: null
+  image_path: null
+
+  # Evaluation
+  eval_type: null
+  split: "test"
+
+  # Model parameters
+  temperature: null
+  max_tokens: null
+  nproc: 1  # Number of processes
+
+  # Output
+  work_dir: null
+  rerun: false
+
+# Third-party tools
+third_party:
+  enabled: false
+  tool: null
+    # Available: "toolbench", "t-bench", "tau-bench",
+    # "bfcl-v3", "bfcl-v4", "needle", "longbench-write"
+
+  # Generic config passed to tool
+  config: null
+    # Tool-specific parameters go here
+
+  # Common fields
+  dataset: null
+  split: "test"
+  output_dir: null
+
+# Sandbox environment (for code execution)
+sandbox:
+  enabled: false
+  environment: null  # "ms-enclave"
+
+  # Benchmarks that support sandbox
+  benchmarks: null  # ["humaneval", "livecodebench", "mbpp"]
+
+  # Sandbox config
+  config: null
+    # timeout: 30
+    # max_memory: "1G"
+    # enable_network: false
+
+  # Execution parameters
+  num_workers: 1
+  check_correctness: true
+
+# Output configuration
+output:
+  dir: "./eval_results"
+  format: "json"  # "json", "csv", "both"
+  visualization: false
+  report: false
+  save_details: true
+  save_predictions: false
+  overwrite: false
+
+# Batch mode
+batch:
+  enabled: false
+  tasks: null  # List of complete task configs
+  parallel: false
+  max_workers: 1
+  stop_on_error: false
+
+# General parameters
+parameters:
+  limit: null  # Limit samples per dataset
+  debug: false
+  seed: 42
+  dry_run: false
+  work_dir: "./eval_work"
+  use_cache: true
+  cache_dir: null
+  log_level: "INFO"
+
+  # Model loading
+  device: null  # "cuda", "cpu", "cuda:0"
+  device_map: null
+  torch_dtype: null  # "float16", "bfloat16", "float32"
+  trust_remote_code: false
+  revision: null
+
+  # Inference
+  num_workers: 1
+  batch_size: null
+  max_batch_size: null
+
+# Speed benchmarking
+speed_benchmark:
+  enabled: false
+
+  # Input configuration
+  prompt_length: null  # Or list: [128, 256, 512]
+  output_length: null  # Or list: [128, 256, 512]
+  num_prompts: 100
+  dataset: null  # Use dataset instead of synthetic prompts
+
+  # Load configuration
+  request_rate: null  # Requests per second
+  concurrent_requests: null
+  duration: null  # Test duration
+
+  # Metrics
+  metrics: null
+    # - "throughput"  # Tokens/second
+    # - "ttft"  # Time to first token
+    # - "tpot"  # Time per output token
+    # - "latency"  # End-to-end latency
+    # - "tps"  # Tokens per second
+
+  # Output
+  output_file: null
+  plot: false
+
+# Baseline comparison
+comparison:
+  enabled: false
+  baseline: null  # Baseline model/results to compare against
+  baseline_results_path: null
+
+  # Comparison metrics
+  metrics: null
+    # - "accuracy"
+    # - "throughput"
+    # - "latency"
+
+  # Statistical tests
+  statistical_test: null  # "t-test", "wilcoxon", "bootstrap"
+  confidence_level: 0.95
+
+  # Visualization
+  plot: false
+  plot_type: null  # "bar", "line", "radar"
+
+# Custom sections (extensible)
+custom_config: null

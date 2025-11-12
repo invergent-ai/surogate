@@ -1,0 +1,23 @@
+# example_stress_test.yaml
+target:
+  model: "gpt-3.5-turbo"
+  api_url: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+
+stress_test:
+  enabled: true
+  num_prompts: 1000
+  prompt_length: 256
+  output_length: 128
+  concurrent_requests: 10
+  request_rate: 5
+  metrics:
+    - "throughput"
+    - "ttft"
+    - "tpot"
+    - "latency"
+  wandb_logging: true
+  wandb_project: "llm-performance"
+
+output:
+  dir: "./results/stress"
