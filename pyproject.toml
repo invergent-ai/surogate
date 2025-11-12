@@ -44,7 +44,3 @@ include = ["surogate*"]
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
-
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
-gptqmodel = ["torch"]
