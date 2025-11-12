@@ -1,15 +1,14 @@
 import random
 
-import modelopt.torch.opt as mto
+# import modelopt.torch.opt as mto
 import numpy as np
 import torch
-from datasets import load_dataset
 from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
-from modelopt.torch.utils.memory_monitor import launch_memory_monitor
-from swift import get_logger
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from surogate.utils.config import load_config
+from surogate.datasets.datasets import load_datasets
+from surogate.utils.command import SurogateCommand
+from surogate.utils.logger import get_logger
 
 try:
     from huggingface_hub import snapshot_download
@@ -18,7 +17,7 @@ except ImportError:
 
 logger = get_logger()
 
-mto.enable_huggingface_checkpointing()
+# mto.enable_huggingface_checkpointing()
 
 RAND_SEED = 1234
 DEFAULT_MAX_SEQ_LEN = 2048
@@ -31,10 +30,9 @@ SUPPORTED_SCHEMES = {
     'nvfp4': 'Quantizes the weights and activations to FP4',
 }
 
-class SurogatePtq:
+class SurogatePtq(SurogateCommand):
     def __init__(self, **kwargs):
-        self.args = kwargs
-        self.config = load_config(self.args['config'])
+        super().__init__(**kwargs)
         self.save_dir = self.config.get('save_path', "./output")
         self.additional_ignore_layers = self.config.get('ignore_layers', [])
         self.model_id = self.config['model']
@@ -46,11 +44,7 @@ class SurogatePtq:
         random.seed(RAND_SEED)
         np.random.seed(RAND_SEED)
 
-        # launch a memory monitor to read the currently used GPU memory.
-        monitor = launch_memory_monitor()
-
         if self.config['scheme'] not in SUPPORTED_SCHEMES.keys():
-            monitor.stop()
             raise ValueError(f"Unsupported quantization scheme: {self.config['scheme']}. "
                              f"Supported schemes are: {list(SUPPORTED_SCHEMES.keys())}")
 
@@ -100,35 +94,7 @@ class SurogatePtq:
         ignore_layers.extend(self.additional_ignore_layers)
 
         model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="auto")
-        tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-
-        def preprocess(example):
-            return {
-                "text": tokenizer.apply_chat_template(
-                    example["messages"],
-                    tokenize=False,
-                )
-            }
-
-        def tokenize(sample):
-            return tokenizer(
-                sample["text"],
-                padding=False,
-                max_length=self.config.get('max_seq_length', DEFAULT_MAX_SEQ_LEN),
-                truncation=True,
-                add_special_tokens=False,
-            )
-
-        datasets = []
-        total_samples = 0
-        for ds_config in dataset_config:
-            logger.info(f"Loading dataset: {ds_config.name}")
-            ds = load_dataset(ds_config.name, name=ds_config.subset, split=ds_config.split).shuffle(seed=RAND_SEED).select(
-                range(ds_config.samples))
-            total_samples += ds_config.samples
-            ds = ds.map(preprocess)
-            ds = ds.map(tokenize, remove_columns=ds.column_names)
-            datasets.append(ds)
+        dataset = load_datasets(self.config)
 
         if precision == "int8":
             recipe = [
@@ -148,9 +114,8 @@ class SurogatePtq:
 
         oneshot(
             model=model,
-            dataset=datasets,
+            dataset=dataset,
             recipe=recipe,
-            max_seq_length=self.config.get('max_seq_length', DEFAULT_MAX_SEQ_LEN),
-            num_calibration_samples=total_samples,
+            max_seq_length=self.config.get('sequence_len'),
         )
 

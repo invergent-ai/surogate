@@ -1,8 +1,7 @@
 import argparse
 import sys
-from typing import Dict
 
-from swift.utils import get_logger
+from surogate.utils.logger import get_logger
 
 logger = get_logger()
 

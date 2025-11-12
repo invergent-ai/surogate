@@ -6,7 +6,7 @@ import re
 import evalscope
 from evalscope.constants import EvalType
 from evalscope.run import run_task
-from swift import get_logger
+from surogate.utils.logger import get_logger
 
 from surogate.utils.config import load_config
 

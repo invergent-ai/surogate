@@ -3,7 +3,7 @@ from threading import Thread
 
 import uvicorn
 from fastapi import FastAPI, Response
-from swift import get_logger
+from surogate.utils.logger import get_logger
 from swift.llm import safe_snapshot_download
 from swift.llm.infer.protocol import ModelList, Model
 from swift.plugin import InferStats

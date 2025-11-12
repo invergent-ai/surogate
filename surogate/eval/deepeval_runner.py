@@ -19,7 +19,7 @@ from deepeval.metrics import (
     GEval,
 )
 from deepeval.models.base_model import DeepEvalBaseLLM
-from swift import get_logger
+from surogate.utils.logger import get_logger
 
 from surogate.utils.config import load_config
 

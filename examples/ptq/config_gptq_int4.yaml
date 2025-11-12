@@ -9,13 +9,23 @@ max_seq_len: 2048
 # exported_model
 save_path: output/Qwen3-0.6B-FP8-Dynamic
 
+sequence_len: 2048
+
 # calibration datasets
 datasets:
-  - name: "allenai/c4"
-    split: "train"
-    subset: "yo"
-    samples: 256
-  - name: "HuggingFaceH4/ultrachat_200k"
+#  - path: "allenai/c4"
+#    split: "train"
+#    subset: "yo"
+#    samples: 256
+#    type: "text"
+#    text_column: "text"
+
+  - path: "HuggingFaceH4/ultrachat_200k"
     split: "train_sft"
     samples: 256
+    type: conversation
+    messages_field: messages
+    message_property_mappings:
+      role: role
+      content: content
 
