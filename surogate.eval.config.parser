@@ -1,0 +1,54 @@
+[INFO:swift] Running EvalScope evaluation with config examples/eval/test_config.yaml
+[INFO:swift] [36m[2m[eval.py:35][0m Starting Surogate Eval[0m
+[INFO:swift] [36m[2m[parser.py:45][0m Parsing config file: examples/eval/test_config.yaml[0m
+[INFO:swift] [36m[2m[parser.py:53][0m Config file parsed successfully[0m
+[INFO:swift] [36m[2m[validator.py:31][0m Validating configuration[0m
+[INFO:swift] [36m[2m[validator.py:36][0m Schema validation passed[0m
+[WARNING:swift] [33m[2m[validator.py:50][0m Evaluation enabled but no datasets specified[0m
+[WARNING:swift] [33m[2m[validator.py:50][0m Evaluation enabled but no metrics specified[0m
+[INFO:swift] [36m[2m[validator.py:57][0m Configuration validation passed[0m
+[INFO:swift] [36m[2m[eval.py:80][0m Setting up 9 target(s)[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: llm[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: llm[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: llm[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: embedding[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: embedding[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: embedding[0m
+[INFO:swift] [36m[2m[model.py:359][0m Loading embedding model: sentence-transformers/all-MiniLM-L6-v2[0m
+[INFO:swift] [36m[2m[model.py:361][0m Embedding model loaded successfully[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: reranker[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: reranker[0m
+[INFO:swift] [36m[2m[model.py:507][0m Loading reranker model: cross-encoder/ms-marco-MiniLM-L-12-v2[0m
+[INFO:swift] [36m[2m[model.py:509][0m Reranker model loaded successfully[0m
+[INFO:swift] [36m[2m[factory.py:28][0m Creating target of type: clip[0m
+[INFO:swift] [36m[2m[model.py:725][0m Loading CLIP model: openai/clip-vit-base-patch32[0m
+[INFO:swift] [36m[2m[model.py:728][0m CLIP model loaded successfully[0m
+[INFO:swift] [36m[2m[eval.py:88][0m Successfully initialized 9 target(s)[0m
+[INFO:swift] [36m[2m[eval.py:95][0m Performing health checks on targets...[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'openrouter-gpt4' (llm) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'openrouter-claude' (llm) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'openrouter-llama' (llm) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'openrouter-embedding' (embedding) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'openai-embeddings' (embedding) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'local-embeddings' (embedding) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'cohere-reranker' (reranker) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'local-reranker' (reranker) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:101][0m ✓ Target 'clip-local' (clip) is healthy[0m
+[INFO:swift] [36m[2m[eval.py:111][0m Health check complete: 9/9 targets healthy[0m
+[INFO:swift] [36m[2m[eval.py:128][0m Running functional evaluation[0m
+[INFO:swift] [36m[2m[loader.py:48][0m Loading dataset from examples/eval/datasets/prompts.jsonl (format: .jsonl)[0m
+[INFO:swift] [36m[2m[loader.py:57][0m ✓ Loaded dataset: 5 rows, 2 columns[0m
+[WARNING:swift] [33m[2m[loader.py:123][0m Failed to convert row to test case: Test case input cannot be empty[0m
+[WARNING:swift] [33m[2m[loader.py:123][0m Failed to convert row to test case: Test case input cannot be empty[0m
+[WARNING:swift] [33m[2m[loader.py:123][0m Failed to convert row to test case: Test case input cannot be empty[0m
+[WARNING:swift] [33m[2m[loader.py:123][0m Failed to convert row to test case: Test case input cannot be empty[0m
+[WARNING:swift] [33m[2m[loader.py:123][0m Failed to convert row to test case: Test case input cannot be empty[0m
+[INFO:swift] [36m[2m[loader.py:126][0m ✓ Loaded 0 test cases[0m
+[INFO:swift] [36m[2m[eval.py:170][0m Loaded 0 test cases[0m
+[INFO:swift] [36m[2m[loader.py:48][0m Loading dataset from examples/eval/datasets/prompts.jsonl (format: .jsonl)[0m
+[INFO:swift] [36m[2m[loader.py:57][0m ✓ Loaded dataset: 5 rows, 2 columns[0m
+[ERROR:swift] [31m[2m[eval.py:178][0m Dataset validation failed:[0m
+[ERROR:swift] [31m[2m[eval.py:180][0m   - Missing required column: 'input'[0m
+[INFO:swift] [36m[2m[eval.py:253][0m Cleaning up resources[0m
+[INFO:swift] [36m[2m[eval.py:271][0m Cleanup complete[0m
+[INFO:swift] [36m[2m[eval.py:70][0m Surogate Eval completed[0m

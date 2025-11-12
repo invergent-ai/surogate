@@ -1,0 +1,5 @@
+{"input": "What is the capital of France?", "expected_output": "Paris", "category": "geography", "difficulty": "easy"}
+{"input": "Explain quantum computing in simple terms", "expected_output": "Quantum computing uses quantum bits that can be in multiple states simultaneously", "category": "technology", "difficulty": "medium"}
+{"input": "Write a haiku about autumn", "expected_output": "Leaves fall gently down\nCrisp air whispers of winter\nNature's final dance", "category": "creative", "difficulty": "medium"}
+{"input": "What is 25 * 4?", "expected_output": "100", "category": "math", "difficulty": "easy"}
+{"input": "List 3 benefits of exercise", "expected_output": "Improved cardiovascular health, better mental health, increased strength", "category": "health", "difficulty": "easy"}

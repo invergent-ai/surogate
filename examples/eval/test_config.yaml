@@ -1,0 +1,75 @@
+# examples/eval/test_config.yaml
+project:
+  name: cli-test
+  version: 1.0.0
+  description: Test configuration for Surogate evaluation
+
+targets:
+  # LLM targets via OpenRouter
+  - name: openrouter-gpt4
+    type: llm
+    provider: openai
+    model: openai/gpt-4-turbo-preview
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+
+  - name: openrouter-claude
+    type: llm
+    provider: openai
+    model: anthropic/claude-3.5-sonnet
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+
+  - name: openrouter-llama
+    type: llm
+    provider: openai
+    model: meta-llama/llama-3.1-70b-instruct
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+
+  # Embedding targets
+  - name: openrouter-embedding
+    type: embedding
+    provider: openai
+    model: qwen/qwen3-embedding-0.6b
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+
+  - name: openai-embeddings
+    type: embedding
+    provider: openai
+    model: text-embedding-3-small
+    api_key: ${OPENAI_API_KEY}
+
+  - name: local-embeddings
+    type: embedding
+    provider: local
+    model: sentence-transformers/all-MiniLM-L6-v2
+
+  # Reranker targets
+  - name: cohere-reranker
+    type: reranker
+    provider: cohere
+    model: rerank-multilingual-v3.0
+    api_key: ${COHERE_API_KEY}
+
+  - name: local-reranker
+    type: reranker
+    provider: local
+    model: cross-encoder/ms-marco-MiniLM-L-12-v2
+
+  # CLIP target
+  - name: clip-local
+    type: clip
+    provider: local
+    model: openai/clip-vit-base-patch32
+
+infrastructure:
+  backend: local
+  workers: 4
+
+evaluation:
+  enabled: true
+#  dataset: examples/eval/datasets/single_turn_test.jsonl
+#  dataset: examples/eval/datasets/single_turn_test.csv
+  dataset: examples/eval/datasets/multi_turn_test.jsonl
