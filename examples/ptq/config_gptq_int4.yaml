@@ -1,26 +1,21 @@
 model: Qwen/Qwen3-0.6B
 
-
 # Quantization scheme: fp8 (W8A8), awq (INT4 W4A16), gptq_int4 (INT4 W4A16), qptq_int8 (INT8 W8A8), nvfp4 (NVidia FP4)
-scheme: fp8
-
-# Batch size for calibration. Default to 0 as we calculate max batch size on-the-fly
-batch_size: 0
+scheme: gptq_int4
 
 # Maximum sequence length for calibration
-calib_seq: 512
+max_seq_len: 2048
 
 # exported_model
 save_path: output/Qwen3-0.6B-FP8-Dynamic
 
-# layers to ignore during quantization (lm_head and re:.*lm_head are ignored by default)
-ignore_layers:
-  - lm_head
-
 # calibration datasets
 datasets:
-  - name: gigi
-    samples: 512
-  - name: gigi2
+  - name: "allenai/c4"
+    split: "train"
+    subset: "yo"
+    samples: 256
+  - name: "HuggingFaceH4/ultrachat_200k"
+    split: "train_sft"
     samples: 256
 
