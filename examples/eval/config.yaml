@@ -1,45 +1,270 @@
-simulator:
-  model: gpt-3.5-turbo-0125
-  temperature: 0.7
-  top_p: 0.9
-  top_k: 40
-  api_url: "http://example:base-url"
-  api_key: "<your-api-key>"
+#simulator:
+#  model: gpt-3.5-turbo-0125
+#  temperature: 0.7
+#  top_p: 0.9
+#  top_k: 40
+#  api_url: "http://example:base-url"
+#  api_key: "<your-api-key>"
+#
+#judge:
+#  model: gpt-4o
+#  temperature: 0.7
+#  top_p: 0.9
+#  top_k: 40
+#  api_url: "http://example:base-url"
+#  api_key: "<your-api-key>"
+#
+#target:
+#  model: "model_name"
+#  temperature: 1
+#  top_p: 0.9
+#  top_k: 40
+#  api_url: "http://example-url"
+#  api_key: "<your-api-key>"
+#  task: text_generation # image_generation
+#  max_tokens: 256
+#  frequency_penalty: 0.0
+#  presence_penalty: 0.0
+#
+#config:
+#  max_concurrent: 5
+#  ignore_errors: true
+#  output_folder: "eval_results"
+#
+#datasets:
+#  - name: "gsm8k"
+#    weight: 1
+#    task_type: "math"
+#    tags: ["en"]
+#  - name: "competition_math"
+#    weight: 1
+#    task_type: "math"
+#    tags: ["en"]
+#    subsets:
+#      - high_school_mathematics
+#      - college_mathematics
 
-judge:
-  model: gpt-4o
-  temperature: 0.7
-  top_p: 0.9
-  top_k: 40
-  api_url: "http://example:base-url"
-  api_key: "<your-api-key>"
 
-target:
-  model: "model_name"
-  temperature: 1
-  top_p: 0.9
-  top_k: 40
-  api_url: "http://example-url"
-  api_key: "<your-api-key>"
-  task: text_generation # image_generation
-  max_tokens: 256
-  frequency_penalty: 0.0
-  presence_penalty: 0.0
-
-config:
-  max_concurrent: 5
-  ignore_errors: true
-  output_folder: "eval_results"
-
-datasets:
-  - name: "gsm8k"
-    weight: 1
-    task_type: "math"
-    tags: ["en"]
-  - name: "competition_math"
-    weight: 1
-    task_type: "math"
-    tags: ["en"]
-    subsets:
-      - high_school_mathematics
-      - college_mathematics
+{
+  "project": {
+    // Custom - basic project metadata
+    "name": "",
+    "version": "",
+    "description": ""
+  },
+  "target": {
+    // EvalScope + DeepEval - what to evaluate
+    "type": "",  // EvalScope - "model" or "application"
+    "application_type": "",  // DeepEval - "agent", "chatbot", "rag", "mcp"
+    "model": {
+      // EvalScope - model configuration
+      "provider": "",
+      "name": "",
+      "config": {}
+    },
+    "endpoint": "",  // Custom - HTTP endpoint wrapper
+    "components": {}  // DeepEval - application components (retriever, llm, etc.)
+  },
+  "evaluation": {
+    // EvalScope + DeepEval - functional evaluation
+    "enabled": false,
+    "datasets": [
+      {
+        // EvalScope + DeepEval - dataset management
+        "name": "",
+        "path": "",
+        "format": ""  // DeepEval - "jsonl", "csv"
+      }
+    ],
+    "metrics": {
+      "functional": [
+        {
+          // DeepEval - functional metrics (G-Eval, DAG, RAG, Agentic, etc.)
+          "type": "",  // "g_eval", "dag", "rag_metrics", "agentic", "multi_turn", "mcp", "safety"
+          "criteria": [],
+          "model": "",
+          "include": []
+        }
+      ],
+      "performance": [
+        {
+          // EvalScope - performance benchmarking
+          "type": "",  // "latency", "throughput", "token_speed"
+          "threshold_ms": 0,
+          "requests_per_second": 0
+        }
+      ]
+    },
+    "benchmarks": {
+      // EvalScope + DeepEval - standard benchmarks
+      "standard": [],  // DeepEval - ["mmlu", "hellaswag", "gsm8k", "humaneval", etc.]
+      "third_party": []  // EvalScope - ["tau_bench", "bfcl_v3", "needle_haystack", etc.]
+    }
+  },
+  "red_teaming": {
+    // DeepTeam - security testing
+    "enabled": false,
+    "attack_types": {
+      "adversarial": {
+        "single_turn": {
+          // DeepTeam - single-turn adversarial attacks
+          "enabled": false,
+          "attacks": []  // ["jailbreak", "prompt_injection", "role_play"]
+        },
+        "multi_turn": {
+          // DeepTeam - multi-turn attack chains
+          "enabled": false,
+          "max_turns": 0,
+          "strategies": []  // ["gradual_escalation", "context_manipulation"]
+        }
+      }
+    },
+    "vulnerabilities": {
+      // DeepTeam + DeepEval - vulnerability scanning
+      "scan_for": [],  // ["data_privacy", "pii_leakage", "bias", "toxicity", etc.]
+      "severity_threshold": "",  // "low", "medium", "high", "critical"
+      "custom": []  // DeepTeam - custom vulnerability definitions
+    },
+    "risk_assessment": {
+      // DeepTeam - risk scoring and assessment
+      "enabled": false,
+      "frameworks": []  // ["owasp_top10", "nist_ai_rmf", "mitre_atlas"]
+    }
+  },
+  "guardrails": {
+    // DeepTeam - protection mechanisms
+    "enabled": false,
+    "pre_processing": [
+      {
+        // DeepTeam - input guardrails
+        "type": "",  // "input_validation", "prompt_injection_detector", "pii_detector"
+        "rules": [],  // ["no_pii", "content_filter"]
+        "sensitivity": ""  // "low", "medium", "high"
+      }
+    ],
+    "post_processing": [
+      {
+        // DeepTeam - output guardrails
+        "type": "",  // "output_filter", "hallucination_detector", "toxicity_filter"
+        "rules": [],  // ["no_toxic_content", "no_pii", "factuality_check"]
+        "threshold": 0
+      }
+    ],
+    "runtime": {
+      // DeepTeam - runtime protection
+      "rate_limiting": {
+        "requests_per_minute": 0
+      },
+      "content_moderation": {
+        "provider": "",  // "openai_moderation", etc.
+        "block_categories": []  // ["violence", "hate", "sexual"]
+      }
+    },
+    "custom_guards": [
+      {
+        // DeepTeam - custom guard framework
+        "name": "",
+        "path": "",
+        "config": {}
+      }
+    ]
+  },
+  "testing": {
+    // DeepEval - testing framework
+    "unit_tests": {
+      // DeepEval - unit testing
+      "enabled": false,
+      "path": ""
+    },
+    "integration_tests": {
+      // DeepEval - end-to-end testing
+      "enabled": false,
+      "test_cases": [
+        {
+          "name": "",
+          "input": "",
+          "expected_components": []
+        }
+      ]
+    },
+    "component_tests": [
+      {
+        // DeepEval - component-level testing
+        "component": "",  // "retriever", "llm", etc.
+        "metrics": [],
+        "dataset": ""
+      }
+    ]
+  },
+  "infrastructure": {
+    // EvalScope - execution infrastructure
+    "backend": "",  // "local", "cloud", "kubernetes"
+    "sandbox": {
+      // EvalScope - sandbox environments
+      "enabled": false,
+      "isolation_level": "",  // "process", "container"
+      "timeout_seconds": 0
+    },
+    "parallel_execution": {
+      // EvalScope - parallel processing
+      "enabled": false,
+      "max_workers": 0
+    }
+  },
+  "monitoring": {
+    // DeepEval + Custom - observability
+    "tracing": {
+      // DeepEval - execution tracing
+      "enabled": false,
+      "provider": ""  // "langsmith", "wandb", "custom"
+    },
+    "logging": {
+      // Custom - Python logging library
+      "level": "",  // "debug", "info", "warning", "error"
+      "output": ""  // file path or "stdout"
+    }
+  },
+  "reporting": {
+    // Custom + DeepTeam - report generation
+    "format": [],  // ["json", "html", "markdown"]
+    "output_dir": "",
+    "include": {
+      "executive_summary": false,  // Custom - simple aggregation
+      "detailed_metrics": false,  // Custom - dict to table
+      "vulnerability_report": false,  // DeepTeam
+      "compliance_report": false  // DeepTeam
+    },
+    "compare_with": {
+      // Custom - comparison with previous runs
+      "previous_run": "",
+      "baseline": ""
+    }
+  },
+  "ci_cd": {
+    // DeepEval - CI/CD integration
+    "enabled": false,
+    "blocking": {
+      // DeepEval - quality gates
+      "security_score_min": 0.0,
+      "evaluation_score_min": 0.0,
+      "vulnerability_max": ""  // "low", "medium", "high"
+    }
+  },
+  "compliance": {
+    // DeepTeam - compliance frameworks
+    "frameworks": [
+      {
+        "name": "",  // "owasp_top10_llm", "nist_ai_rmf", "mitre_atlas"
+        "version": "",
+        "required_score": 0.0
+      }
+    ]
+  },
+  "arena": {
+    // EvalScope + DeepEval - comparative evaluation
+    "enabled": false,
+    "models": [],  // list of models to compare
+    "comparison_metrics": [],  // metrics to use for comparison
+    "dataset": ""  // dataset for arena testing
+  }
+}
