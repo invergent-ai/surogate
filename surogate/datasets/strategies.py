@@ -13,6 +13,8 @@ from surogate.utils.schema.enums import InstructionDatasetSystemPromptType
 
 logger = get_logger()
 
+IGNORE_INDEX = -100
+
 class PromptTokenizingStrategy(abc.ABC):
     """
     Abstract class for tokenizing strategies
@@ -20,10 +22,10 @@ class PromptTokenizingStrategy(abc.ABC):
     filter_rows: Optional[Callable] = None
 
     def __init__(
-        self,
-        prompter: Prompter,
-        tokenizer,
-        sequence_len: int | None,
+            self,
+            prompter: Prompter,
+            tokenizer,
+            sequence_len: int | None,
     ):
         self.prompter = prompter
         self.tokenizer: PreTrainedTokenizer = tokenizer
@@ -38,7 +40,7 @@ class PromptTokenizingStrategy(abc.ABC):
         return False
 
     def _tokenize(
-            self, prompt: str
+            self, prompt: str, add_eos_token: bool = True, strip_bos_token: bool = False
     ) -> BatchEncoding:
         empty = BatchEncoding(data={"input_ids": [], "attention_mask": []})
         if not prompt:
@@ -57,7 +59,22 @@ class PromptTokenizingStrategy(abc.ABC):
             logger.warning("Tokenizer result is empty. You may want to audit your dataset")
             return empty
 
+        if (
+                result["input_ids"][-1] != self.tokenizer.eos_token_id
+                and len(result["input_ids"]) < self.sequence_len
+                and add_eos_token
+        ):
+            result["input_ids"].append(self.tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        if result["input_ids"][0] == self.tokenizer.bos_token_id and strip_bos_token:
+            result["input_ids"] = result["input_ids"][1:]
+            result["attention_mask"] = result["attention_mask"][1:]
+
+        result["labels"] = result["input_ids"].copy()
+
         return result
+
 
 class ChatTemplateStrategy(PromptTokenizingStrategy):
     def __init__(
@@ -120,8 +137,8 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         possible_sys_turn = self.transform_message(messages[0])
 
         if (
-            possible_sys_turn["role"] != "system"
-            and self.prompter.system_field in prompt
+                possible_sys_turn["role"] != "system"
+                and self.prompter.system_field in prompt
         ):
             turn = {"role": "system", "content": prompt[self.prompter.system_field]}
             turns.append(turn)
@@ -165,7 +182,6 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
 
         return transformed_message
 
-
     def _get_tools(self, prompt) -> list[dict] | None:
         """Get tools from prompt if available."""
         tools = prompt.get(self.prompter.tools_field, None)
@@ -192,6 +208,7 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
             "Unknown messages format. Please convert it into a list[dict].\n"
             f"Current format: {type(messages)}"
         )
+
 
 class InstructionStrategy(PromptTokenizingStrategy):
     def __init__(
@@ -244,8 +261,21 @@ class InstructionStrategy(PromptTokenizingStrategy):
         else:
             system_prompt = self.prompter.system_prompt
 
-        prompt = self.prompter.build_prompt(instruction, output, input, system_prompt)
-        return self._tokenize(prompt)
+        user_prompt = self.prompter.build_prompt(instruction, None, input, system_prompt)
+        tokenized_prompt = self._tokenize(user_prompt, add_eos_token=False)
+        user_prompt_len = len(tokenized_prompt["input_ids"])
+        tokenized_prompt["labels"] = [IGNORE_INDEX] * user_prompt_len
+
+        tokenized_response_prompt = self._tokenize(
+            output, strip_bos_token=True, add_eos_token=True
+        )
+
+        tokenized_prompt["input_ids"] += tokenized_response_prompt["input_ids"]
+        tokenized_prompt["attention_mask"] += tokenized_response_prompt["attention_mask"]
+        tokenized_prompt["labels"] += tokenized_response_prompt["input_ids"]
+
+        return tokenized_prompt
+
 
 class InstructionStrategyWithChatTemplate(InstructionStrategy):
     def __init__(

@@ -119,7 +119,7 @@ class InstructionPrompter(Prompter):
     def build_prompt(
             self,
             instruction: str,
-            output: str,
+            output: str | None,
             input: str | None = None,
             system_prompt: str | None = None,
     ):
