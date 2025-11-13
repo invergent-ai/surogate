@@ -10,7 +10,7 @@ module.exports = {
     baseUrl: '/',
     onBrokenLinks: 'throw',
     onBrokenMarkdownLinks: 'throw',
-    favicon: 'img/favicon.ico',
+    favicon: 'img/favicon.svg',
     organizationName: 'invergent-ai', // Usually your GitHub org/user name.
     projectName: 'surogate-docs', // Usually your repo name.
     deploymentBranch: 'gh-pages',
