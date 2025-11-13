@@ -45,6 +45,20 @@ class TextDataset(BaseDataset, BaseModel):
     )
 
 class InstructionDataset(BaseDataset, BaseModel):
+    chat_template: ChatTemplateType | None = Field(
+        default='tokenizer_default',
+        json_schema_extra={
+            "description": "The Jinja chat template to use for formatting the prompt: 'tokenizer_default' (Uses the chat template available in the model's tokenizer_config.json file. If the chat template is not available in the tokenizer, it will raise an error) | 'jinja' (Custom Jinja chat template) "
+        }
+    )
+
+    chat_template_jinja: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Custom Jinja chat template path. Required if 'chat_template' is 'jinja'."
+        }
+    )
+
     system_prompt_type: InstructionDatasetSystemPromptType | None = Field(
         default=None,
         json_schema_extra={
@@ -86,6 +100,7 @@ class InstructionDataset(BaseDataset, BaseModel):
             "description": "The name of the column in your dataset that contains the output"
         }
     )
+
 
 
 class ConversationDataset(BaseDataset, BaseModel):

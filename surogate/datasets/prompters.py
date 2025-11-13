@@ -118,18 +118,6 @@ class InstructionPrompter(Prompter):
         self.message_property_mappings = message_property_mappings
 
 
-class UnsupportedPrompter(Prompter):
-    """
-    A dummy class for custom prompters
-    """
-
-    def __init__(self) -> None:
-        pass
-
-    def __repr__(self):
-        return "Pre-tokenized or custom dataset types are unsupported for logging"
-
-
 def get_chat_template_msg_variables(
         chat_template: str, field_messages: str
 ) -> Set[str]:

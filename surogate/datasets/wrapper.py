@@ -95,7 +95,9 @@ def get_chat_template_from_config(
         ds_cfg: ConversationDataset | None = None,
         tokenizer: Optional["PreTrainedTokenizerBase"] = None,
 ) -> str:
-    if ds_cfg.chat_template == ChatTemplateType.tokenizer_default:
+    chat_template = ds_cfg.chat_template or ChatTemplateType.tokenizer_default
+
+    if chat_template == ChatTemplateType.tokenizer_default:
         if not tokenizer:
             raise ValueError(
                 f"`tokenizer` cannot be None when chat_template choice is {ChatTemplateType.tokenizer_default}"
@@ -106,7 +108,7 @@ def get_chat_template_from_config(
                 f"Please add a chat_template in tokenizer config"
             )
         return tokenizer.chat_template
-    elif ds_cfg.chat_template == ChatTemplateType.jinja:
+    elif chat_template == ChatTemplateType.jinja:
         jinja_template = ds_cfg.chat_template_jinja
         if not jinja_template:
             raise ValueError("Jinja template path must be provided for 'jinja' chat template type.")
@@ -118,7 +120,7 @@ def get_chat_template_from_config(
         else:
             raise FileNotFoundError(f"Jinja template file not found: {jinja_template}")
     else:
-        raise ValueError(f"Unsupported chat template type: {ds_cfg.chat_template}")
+        raise ValueError(f"Unsupported chat template type: {chat_template}")
 
 
 def wrap_dataset_for_tokenized_prompt(

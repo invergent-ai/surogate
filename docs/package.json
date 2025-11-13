@@ -26,7 +26,7 @@
     "@mui/icons-material": "^6.4.0",
     "@mui/material": "^6.4.0",
     "clsx": "^2.1.1",
-    "primeflex": "^3.3.1",
+    "primeflex": "^4.0.0",
     "prism-react-renderer": "^2.4.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

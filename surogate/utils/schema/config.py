@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+from surogate.utils.schema.datasets import BaseDataset
+
 
 class SpecialTokensConfig(BaseModel):
     bos_token: str | None = None
@@ -38,5 +40,13 @@ class SurogateBaseConfig(BaseModel):
         default=None,
         json_schema_extra={"description": "Add extra tokens to the tokenizer"},
     )
+
+    datasets: list[BaseDataset] = Field(
+        default=None,
+        json_schema_extra={
+            "description": "List of datasets to use for the task"
+        },
+    )
+
 
 

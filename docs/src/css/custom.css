@@ -1,0 +1,23 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+@import "primeflex/primeflex.css";
+
+:root {
+    --ifm-footer-padding-vertical: 0.75rem;
+    --ifm-menu-color-active: #505050;
+    --ifm-breadcrumb-color-active: #505050;
+    --ifm-font-size-base: 110%;
+    --ifm-line-height-base: 1.5;
+}
+
+[data-theme='dark'] {
+    --ifm-menu-color-active: #fff;
+    --ifm-breadcrumb-color-active: #fff;
+}
+
+.menu__link--active {
+    font-weight: 800;
+}
+
+.breadcrumbs__item--active .breadcrumbs__link {
+    font-weight: 500;
+}

@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 
-from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, concatenate_datasets, disable_caching, \
+from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, interleave_datasets, disable_caching, \
     enable_caching
 from transformers import PreTrainedTokenizer
 
@@ -47,7 +47,7 @@ def _load_and_prepare_datasets(cfg: DictDefault, tokenizer: PreTrainedTokenizer)
                 )
 
         if dataset_config.samples:
-            dataset = dataset.select(range(dataset_config.samples))
+            dataset = dataset.select(range(min(dataset.num_rows, dataset_config.samples)))
 
         dataset_wrapper = get_dataset_wrapper(
             cfg=cfg,
@@ -77,8 +77,8 @@ def merge_datasets(datasets: list[Dataset], cfg: DictDefault) -> Dataset:
         ds = datasets[0]
         return ds.shuffle(seed=cfg.seed)
 
-    logger.info("Merging datasets...")
-    merged_dataset = concatenate_datasets(datasets)
+    logger.info("Interleaving datasets...")
+    merged_dataset = interleave_datasets(datasets)
     merged_dataset = merged_dataset.shuffle(seed=cfg.seed)
     return merged_dataset
 

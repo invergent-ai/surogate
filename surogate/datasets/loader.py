@@ -30,8 +30,7 @@ def load_dataset_with_config(
     load_dataset_kwargs = {
         "split": dataset_config.split if dataset_config.split else None,
         "name": dataset_config.subset,
-        "streaming": streaming,
-        "trust_remote_code": True,
+        "streaming": streaming
     }
 
     logger.info("Loading dataset from path: %s", dataset_config.path)

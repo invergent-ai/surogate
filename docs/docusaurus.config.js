@@ -44,8 +44,8 @@ module.exports = {
             title: "Documentation",
             logo: {
                 alt: 'logo',
-                src: 'img/logo-black.png',
-                srcDark: 'img/logo-white.png',
+                src: 'img/logo-black.svg',
+                srcDark: 'img/logo-white.svg',
             },
             items: [
                 {
@@ -53,11 +53,6 @@ module.exports = {
                     position: 'right',
                 }
             ],
-        },
-        algolia: {
-          appId: '8EXJ6NKCKV',
-          apiKey: '7f951ba32bf4dfde8f61f505b1eae949',
-          indexName: 'statemesh',
         },
         footer: {
             style: 'dark',

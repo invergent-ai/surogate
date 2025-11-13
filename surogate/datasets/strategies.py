@@ -198,3 +198,7 @@ class InstructionStrategy(PromptTokenizingStrategy):
         self.prompter: ChatTemplatePrompter = prompter
 
     def tokenize_prompt(self, prompt: dict[str, Any]):
+        print(prompt)
+        logger.warning("InstructionStrategy is not implemented yet.")
+
+

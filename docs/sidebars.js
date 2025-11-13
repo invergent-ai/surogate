@@ -2,18 +2,6 @@ module.exports = {
     mySidebar: [
         {
             type: 'category',
-            label: 'About',
-            collapsed: false,
-            items: [
-                {
-                    type: 'doc',
-                    id: 'about/welcome',
-                    label: 'Welcome'
-                },
-            ]
-        },
-        {
-            type: 'category',
             label: 'Getting Started',
             collapsed: false,
             items: [
@@ -22,6 +10,39 @@ module.exports = {
                     id: 'getting-started/overview',
                     label: 'Overview'
                 },
+                {
+                    type: 'doc',
+                    id: 'getting-started/configuration',
+                    label: 'Configuration'
+                },
+            ]
+        },
+        {
+            type: 'category',
+            label: 'Datasets',
+            collapsed: false,
+            items: [
+                {
+                    type: 'doc',
+                    id: 'datasets/intro',
+                    label: 'Introduction'
+                },
+                {
+                    type: 'doc',
+                    id: 'datasets/formats',
+                    label: 'Dataset Formats'
+                }
+            ]
+        },
+        {
+            type: 'category',
+            label: 'Quantization',
+            items: [
+                {
+                    type: 'doc',
+                    id: 'ptq/intro',
+                    label: 'Introduction'
+                }
             ]
         },
         {

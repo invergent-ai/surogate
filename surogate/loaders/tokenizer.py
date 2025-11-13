@@ -9,6 +9,9 @@ logger = get_logger()
 def load_tokenizer(cfg: DictDefault) -> PreTrainedTokenizer:
     """Load and configure the tokenizer based on the provided config."""
     tokenizer_path = cfg.get('tokenizer') or cfg.get('model')
+    if tokenizer_path is None:
+        raise ValueError("Either 'tokenizer' or 'model' must be specified in the config.")
+
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path, use_fast=True, trust_remote_code=True
     )
