@@ -12,10 +12,6 @@ class TargetType(Enum):
     EMBEDDING = "embedding"
     RERANKER = "reranker"
     CLIP = "clip"
-    RAG = "rag"
-    AGENT = "agent"
-    CHATBOT = "chatbot"
-    MCP = "mcp"
     CUSTOM = "custom"
 
 

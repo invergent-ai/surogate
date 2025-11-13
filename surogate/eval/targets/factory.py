@@ -1,10 +1,8 @@
-# surogate/eval/targets/factory.py
 from typing import Dict, Any
 from surogate.utils.logger import get_logger
 
 from .base import BaseTarget, TargetType
 from .model import APIModelTarget, LocalModelTarget, EmbeddingTarget, RerankerTarget, CLIPTarget
-from .application import RAGTarget, AgentTarget, ChatbotTarget, MCPTarget
 
 logger = get_logger()
 
@@ -41,24 +39,10 @@ class TargetFactory:
             return RerankerTarget(config)
 
         elif target_type == TargetType.MULTIMODAL:
-            # For now, treat as API model
             return APIModelTarget(config)
 
         elif target_type == TargetType.CLIP:
             return CLIPTarget(config)
-
-        # Application targets
-        elif target_type == TargetType.RAG:
-            return RAGTarget(config)
-
-        elif target_type == TargetType.AGENT:
-            return AgentTarget(config)
-
-        elif target_type == TargetType.CHATBOT:
-            return ChatbotTarget(config)
-
-        elif target_type == TargetType.MCP:
-            return MCPTarget(config)
 
         else:
             raise ValueError(f"Unknown target type: {target_type}")
