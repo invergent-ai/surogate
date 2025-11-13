@@ -12,3 +12,5 @@ uv.lock
 results
 data
 .deepeval
+.loader
+.lock
