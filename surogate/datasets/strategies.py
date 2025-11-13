@@ -86,6 +86,17 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         super().__init__(prompter, tokenizer, sequence_len)
         self.prompter: ChatTemplatePrompter = prompter
 
+        self.roles_to_train = ["assistant"]
+        self.train_on_eos = "turn"
+        self.train_on_eot = self.train_on_eos
+
+        if (
+            hasattr(self.tokenizer, "eos_token")
+            and self.tokenizer.eos_token is not None
+        ):
+            self.eot_tokens = [self.tokenizer.eos_token]
+
+
     @property
     def supports_batched(self) -> bool:
         # Let calling code know we can handle lists of examples
@@ -125,11 +136,166 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
     def _tokenize_single_prompt(self, prompt: dict) -> Dict[str, List[int]]:
         turns = self.get_conversation_thread(prompt)
         tools = self._get_tools(prompt)
-        input_ids = self.prompter.build_prompt(turns, tools=tools)  # type: ignore
+        input_ids = self.prompter.build_prompt(turns, tools=tools)
+        labels = [IGNORE_INDEX] * len(input_ids)
+
+        for index, turn in enumerate(turns):
+            role = turn.get("role")
+            should_train = role in self.roles_to_train
+
+            if not should_train and (
+                self.train_on_eos == "turn"
+            ):
+                if index == len(turns) - 1:
+                    logger.warning(
+                        "Last turn is not trainable, skipping having to find the turn indices. "
+                        "This may cause incorrect last EOS token to be unmasked."
+                        "This is likely a dataset design issue. Please ensure last turn is trainable."
+                    )
+                continue
+
+            turn_start_idx, turn_end_idx = self.find_turn(
+                turns=turns, turn_idx=index, tools=tools
+            )
+            if should_train and turn_start_idx != -1 and turn_end_idx != -1:
+                labels[turn_start_idx:turn_end_idx] = input_ids[
+                    turn_start_idx:turn_end_idx
+                ]
+
+            # Find and handle EOT and EOS tokens
+            token_idx = self.find_first_eot_token(input_ids, start_idx=turn_end_idx)
+            if (
+                    token_idx != -1 and abs(token_idx - turn_end_idx) <= 3
+            ):
+                # Set labels if needed for this turn
+                if self.train_on_eot == "turn" and should_train:
+                    labels[token_idx] = input_ids[token_idx]
+            else:
+                problem_span = self.tokenizer.decode(input_ids[turn_end_idx:token_idx + 1])
+                logger.warning(
+                    f"EOT token missing after turn {turn}. eot_idx: {token_idx}, turn_end_idx: {turn_end_idx}. Problematic span: {problem_span!r}"
+                )
+
+            token_idx = self.find_first_eos_token(input_ids, start_idx=turn_end_idx)
+            if (
+                    token_idx != -1 and abs(token_idx - turn_end_idx) <= 3
+            ):
+                # Set labels if needed for this turn
+                if self.train_on_eos == "turn" and should_train:
+                    labels[token_idx] = input_ids[token_idx]
+            else:
+                problem_span = self.tokenizer.decode(input_ids[turn_end_idx:token_idx + 1])
+                logger.warning(
+                    f"EOS token missing after turn {turn}. eos_idx: {token_idx}, turn_end_idx: {turn_end_idx}. Problematic span: {problem_span!r}"
+                )
+
         return {
             "input_ids": input_ids,
+            "labels": labels,
             "attention_mask": [1] * len(input_ids),
         }
+
+    def find_first_eos_token(self, input_ids, start_idx):
+        eos_token_id = self.tokenizer.eos_token_id
+        for i in range(start_idx, len(input_ids)):
+            if input_ids[i] == eos_token_id:
+                return i
+        return -1
+
+    def find_first_eot_token(self, input_ids, start_idx):
+        """Find the first EOT token in the input_ids starting from start_idx."""
+        # Get token IDs for all EOT tokens
+        eot_token_ids = []
+        for token in self.eot_tokens:
+            token_ids = self.tokenizer.encode(token, add_special_tokens=False)
+            if len(token_ids) != 1:
+                raise ValueError(
+                    f"EOT token '{token}' is encoded as multiple tokens: {token_ids}. Please add it under `tokens: ` in the config."
+                )
+
+            eot_token_ids.append(token_ids[0])  # Use the last token ID if multiple
+
+        # Search for any of the EOT token IDs
+        for i in range(start_idx, len(input_ids)):
+            if input_ids[i] in eot_token_ids:
+                return i
+        return -1
+
+    def find_turn(
+        self, turns: list[dict], turn_idx: int, tools: list[dict] | None = None
+    ):
+        """
+        Locate the starting and ending indices of the specified turn in a conversation.
+        """
+
+        if turn_idx >= len(turns):
+            raise ValueError(f"Turn index {turn_idx} out of range")
+
+        # mistral/gemma3 does not output message if it contains only system message
+        if (
+            turn_idx == 0
+            and turns[0].get("role") == "system"
+            and ("mistral" in self.tokenizer.name_or_path.lower())
+        ):
+            return -1, -1
+
+        empty_turn = {
+            "role": turns[turn_idx].get("role"),
+            "content": "[[dummy_message]]",
+        }
+
+        # Create conversation versions
+        turns_with_empty = turns[:turn_idx] + [empty_turn]
+        turns_with_content = turns[: turn_idx + 1]
+
+        # Generate the conversation up to the turn, with final turn replaced with dummy content
+        dummy_ids = self.prompter.build_prompt(turns_with_empty, tools=tools)  # type: ignore
+
+        # Generate the conversation up to the turn, with final turn included
+        full_ids = self.prompter.build_prompt(turns_with_content, tools=tools)  # type: ignore
+
+        if not full_ids or not dummy_ids:
+            logger.warning(f"Empty template generated for turn {turn_idx}")
+            return -1, -1
+
+        # Find first difference (start of content)
+        start_idx = None
+        min_len = min(len(dummy_ids), len(full_ids))
+        for i in range(min_len):
+            if dummy_ids[i] != full_ids[i]:
+                start_idx = i
+                break
+
+        if start_idx is None:
+            logger.warning(f"Could not find content start boundary for turn {turn_idx}")
+            return -1, -1
+
+        # Find last difference (end of content)
+        end_idx = None
+        for i in range(min_len):
+            dummy_pos = len(dummy_ids) - 1 - i
+            full_pos = len(full_ids) - 1 - i
+            if dummy_ids[dummy_pos] != full_ids[full_pos]:
+                end_idx = full_pos + 1  # Add one to include the last token when slice
+                break
+
+        if end_idx is None:
+            logger.warning(f"Could not find content end boundary for turn {turn_idx}")
+            return -1, -1
+
+        if end_idx < start_idx:
+            logger.warning(
+                f"Content end boundary is before start boundary for turn {turn_idx}"
+            )
+            return -1, -1
+
+        if end_idx == start_idx:
+            logger.warning(
+                f"Content end boundary is the same as start boundary for turn {turn_idx}. This is likely an empty turn."
+            )
+            return -1, -1
+
+        return start_idx, end_idx
 
     def get_conversation_thread(self, prompt):
         turns = []

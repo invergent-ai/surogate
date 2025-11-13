@@ -17,31 +17,28 @@ def tokenizer_without_chat_template():
     return AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
 
 
-@pytest.fixture(scope="class")
-def conversation_dataset_fixture():
-    yield Dataset.from_list([
-        {
-            "messages": [
-                {"role": "system", "content": "You are a technical support bot."},
-                {"role": "user", "content": "My internet is not working."},
-                {"role": "assistant",
-                 "content": "I can help with that. Is the light on your router blinking or solid?"},
-                {"role": "user", "content": "It is blinking red."},
-                {"role": "assistant",
-                 "content": "A blinking red light usually indicates a connection error. Please try restarting it."}
-            ]
-        },
-        {
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "What's the weather like?"},
-                {"role": "assistant", "content": "It's sunny and warm today."}
-            ]
-        }
-    ])
-
-
 class TestDatasets:
+    @pytest.fixture
+    def conversation_dataset_fixture(self):
+        yield Dataset.from_list([
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a technical support bot."},
+                    {"role": "user", "content": "My internet is not working."},
+                    {"role": "assistant", "content": "I can help with that. Is the light on your router blinking or solid?"},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "What's the weather like?"},
+                    {"role": "assistant", "content": "It's sunny and warm today."},
+                    {"role": "user", "content": "What about tomorrow?"},
+                    {"role": "assistant", "content": "Tomorrow will be also sunny."}
+                ]
+            }
+        ])
+
     def test_load_conversation_dataset(self, tokenizer_with_chat_template: PreTrainedTokenizer,
                                        conversation_dataset_fixture):
         cfg = DictDefault({

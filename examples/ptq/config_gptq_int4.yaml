@@ -13,12 +13,12 @@ sequence_len: 2048
 
 # calibration datasets
 datasets:
-  - path: "invergent/self-cognition"
-    split: "train"
-    samples: 128
-    type: instruction
-    instruction_field: question
-    output_field: answer
+#  - path: "invergent/self-cognition"
+#    split: "train"
+#    samples: 128
+#    type: instruction
+#    instruction_field: question
+#    output_field: answer
 
 #  - path: "HuggingFaceH4/ultrachat_200k"
 #    split: "train_sft"
@@ -28,4 +28,11 @@ datasets:
 #    message_property_mappings:
 #      role: role
 #      content: content
-
+  - path: "invergent/densemax-self-cognition"
+    type: conversation
+    split: train
+    samples: 128
+    messages_field: messages
+    message_property_mappings:
+      role: role
+      content: content
