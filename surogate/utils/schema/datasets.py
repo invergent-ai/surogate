@@ -87,12 +87,6 @@ class InstructionDataset(BaseDataset, BaseModel):
         }
     )
 
-    prompt_format: str | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": "Python string template for formatting the prompt. Available variables: '{instruction}': value of the instruction field, '{input}': value of the input field"
-        }
-    )
 
 class ConversationDataset(BaseDataset, BaseModel):
     chat_template: ChatTemplateType | None = Field(

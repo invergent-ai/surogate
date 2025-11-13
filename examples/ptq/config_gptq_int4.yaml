@@ -13,19 +13,19 @@ sequence_len: 2048
 
 # calibration datasets
 datasets:
-#  - path: "allenai/c4"
-#    split: "train"
-#    subset: "yo"
-#    samples: 256
-#    type: "text"
-#    text_column: "text"
+  - path: "invergent/self-cognition"
+    split: "train"
+    samples: 128
+    type: instruction
+    instruction_field: question
+    output_field: answer
 
-  - path: "HuggingFaceH4/ultrachat_200k"
-    split: "train_sft"
-    samples: 256
-    type: conversation
-    messages_field: messages
-    message_property_mappings:
-      role: role
-      content: content
+#  - path: "HuggingFaceH4/ultrachat_200k"
+#    split: "train_sft"
+#    samples: 128
+#    type: conversation
+#    messages_field: messages
+#    message_property_mappings:
+#      role: role
+#      content: content
 

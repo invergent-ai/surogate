@@ -40,9 +40,10 @@ class ChatTemplatePrompter(Prompter):
                 "tool": "tool",
             }
 
-        self._chat_template_msg_variables = self.get_chat_template_msg_variables(
+        self._chat_template_msg_variables = get_chat_template_msg_variables(
             chat_template, messages_field
         )
+
         self.sequence_len = sequence_len
         self.message_property_mappings = message_property_mappings
         self.messages_field = messages_field
@@ -84,11 +85,37 @@ class ChatTemplatePrompter(Prompter):
             **chat_template_kwargs,
         )
 
-    def get_chat_template_msg_variables(
-            self, chat_template: str, field_messages: str
-    ) -> Set[str]:
-        template_analyzer = JinjaTemplateAnalyzer(chat_template)
-        return template_analyzer.get_message_vars(field_messages)
+
+class InstructionPrompter(Prompter):
+    def __init__(
+            self,
+            tokenizer,
+            sequence_len: int | None,
+            chat_template: str,
+            system_prompt: str,
+            instruction_field: str,
+            input_field: str,
+            output_field: str
+    ):
+        message_property_mappings = {
+            "role": "role",
+            "content": "content",
+        }
+
+        self.roles = {
+            "human": "user",
+            "user": "user",
+            "assistant": "assistant",
+            "gpt": "assistant",
+            "system": "system",
+            "tool": "tool",
+        }
+
+        self.tokenizer = tokenizer
+        self.chat_template = chat_template
+        self._chat_template_msg_variables = get_chat_template_msg_variables(chat_template, "messages")
+        self.sequence_len = sequence_len
+        self.message_property_mappings = message_property_mappings
 
 
 class UnsupportedPrompter(Prompter):
@@ -101,3 +128,10 @@ class UnsupportedPrompter(Prompter):
 
     def __repr__(self):
         return "Pre-tokenized or custom dataset types are unsupported for logging"
+
+
+def get_chat_template_msg_variables(
+        chat_template: str, field_messages: str
+) -> Set[str]:
+    template_analyzer = JinjaTemplateAnalyzer(chat_template)
+    return template_analyzer.get_message_vars(field_messages)

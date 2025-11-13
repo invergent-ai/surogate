@@ -81,7 +81,10 @@ def get_dataset_wrapper(
         dataset_strategy = ChatTemplateStrategy(prompter, tokenizer, sequence_len=cfg.get('sequence_len'))
         return wrap_dataset_for_tokenized_prompt(dataset_strategy, dataset, **dataset_kwargs)
     elif dataset_config.type == SurogateDatasetType.instruction:
-        pass
+        chat_template_string = get_chat_template_from_config(
+            ds_cfg=dataset_config, tokenizer=tokenizer
+        )
+
     elif dataset_config.type == SurogateDatasetType.text:
         pass
     else:

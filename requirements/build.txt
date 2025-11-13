@@ -10,3 +10,4 @@ regex
 build
 torch==2.9.0
 scikit_build_core
+pytest

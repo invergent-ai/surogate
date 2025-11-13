@@ -61,9 +61,9 @@ def load_tokenizer(cfg: DictDefault) -> PreTrainedTokenizer:
         )
 
     if is_main_process():
-        logger.info(f"EOS: {tokenizer.eos_token_id} / {tokenizer.eos_token}")
-        logger.info(f"BOS: {tokenizer.bos_token_id} / {tokenizer.bos_token}")
-        logger.info(f"PAD: {tokenizer.pad_token_id} / {tokenizer.pad_token}")
-        logger.info(f"UNK: {tokenizer.unk_token_id} / {tokenizer.unk_token}")
+        logger.debug(f"EOS: {tokenizer.eos_token_id} / {tokenizer.eos_token}")
+        logger.debug(f"BOS: {tokenizer.bos_token_id} / {tokenizer.bos_token}")
+        logger.debug(f"PAD: {tokenizer.pad_token_id} / {tokenizer.pad_token}")
+        logger.debug(f"UNK: {tokenizer.unk_token_id} / {tokenizer.unk_token}")
 
     return tokenizer

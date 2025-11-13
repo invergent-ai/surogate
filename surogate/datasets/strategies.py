@@ -1,7 +1,7 @@
 import abc
 import json
 from collections import defaultdict
-from typing import Optional, Callable, Any, Dict, List
+from typing import Optional, Callable, Any, Dict, List, Tuple
 
 from transformers import PreTrainedTokenizer, BatchEncoding
 
@@ -186,3 +186,15 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
             f"Current format: {type(messages)}"
         )
 
+
+class InstructionStrategy(PromptTokenizingStrategy):
+    def __init__(
+            self,
+            prompter: "ChatTemplatePrompter",
+            tokenizer,
+            sequence_len: int | None,
+    ):
+        super().__init__(prompter, tokenizer, sequence_len)
+        self.prompter: ChatTemplatePrompter = prompter
+
+    def tokenize_prompt(self, prompt: dict[str, Any]):
