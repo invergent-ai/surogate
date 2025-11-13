@@ -5,9 +5,11 @@ from typing import Optional, Callable, Any, Dict, List, Tuple
 
 from transformers import PreTrainedTokenizer, BatchEncoding
 
+from surogate.datasets.prompters import InstructionPrompterWithChatTemplate, InstructionPrompter
 from surogate.datasets.prompters import Prompter, ChatTemplatePrompter
 from surogate.utils.dict import remove_none_values
 from surogate.utils.logger import get_logger
+from surogate.utils.schema.enums import InstructionDatasetSystemPromptType
 
 logger = get_logger()
 
@@ -36,7 +38,7 @@ class PromptTokenizingStrategy(abc.ABC):
         return False
 
     def _tokenize(
-            self, prompt: str, add_eos_token: bool = True, strip_bos_token: bool = False
+            self, prompt: str
     ) -> BatchEncoding:
         empty = BatchEncoding(data={"input_ids": [], "attention_mask": []})
         if not prompt:
@@ -50,6 +52,10 @@ class PromptTokenizingStrategy(abc.ABC):
             return_tensors=None,
             max_length=self.sequence_len,
         )
+
+        if len(result["input_ids"]) == 0:
+            logger.warning("Tokenizer result is empty. You may want to audit your dataset")
+            return empty
 
         return result
 
@@ -105,6 +111,7 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         input_ids = self.prompter.build_prompt(turns, tools=tools)  # type: ignore
         return {
             "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
         }
 
     def get_conversation_thread(self, prompt):
@@ -186,19 +193,89 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
             f"Current format: {type(messages)}"
         )
 
-
 class InstructionStrategy(PromptTokenizingStrategy):
     def __init__(
             self,
-            prompter: "ChatTemplatePrompter",
+            prompter: "InstructionPrompter",
             tokenizer,
             sequence_len: int | None,
     ):
         super().__init__(prompter, tokenizer, sequence_len)
-        self.prompter: ChatTemplatePrompter = prompter
+        self.prompter: InstructionPrompter = prompter
+
+    def supports_batched(self):
+        return True
+
+    def is_prompt_batched(self, prompt: dict[str, Any]) -> bool:
+        return all(isinstance(v, list) for v in prompt.values())
 
     def tokenize_prompt(self, prompt: dict[str, Any]):
-        print(prompt)
-        logger.warning("InstructionStrategy is not implemented yet.")
+        prompt = remove_none_values(prompt)
 
+        if not self.is_prompt_batched(prompt):
+            return self._tokenize_single_prompt(prompt)
 
+        res: dict[str, list] = defaultdict(list)
+        feature_names = list(prompt.keys())
+
+        # Batched case: each value must be a list of equal length
+        for row in zip(*prompt.values(), strict=True):
+            example = dict(zip(feature_names, row, strict=False))
+            tokenized = self._tokenize_single_prompt(example)
+            for k, v in tokenized.items():
+                res[k].append(v)
+
+        return dict(res)
+
+    def _tokenize_single_prompt(self, prompt: dict) -> BatchEncoding:
+        instruction = prompt.get(self.prompter.instruction_field)
+        if instruction is None:
+            raise ValueError(
+                f"Instruction field '{self.prompter.instruction_field}' is missing from the dataset."
+            )
+        input = prompt.get(self.prompter.input_field)
+        output = prompt.get(self.prompter.output_field)
+        if output is None:
+            raise ValueError(
+                f"Output field '{self.prompter.output_field}' is missing from the dataset."
+            )
+        if self.prompter.system_prompt_type == InstructionDatasetSystemPromptType.field:
+            system_prompt = prompt.get(self.prompter.system_prompt_field)
+        else:
+            system_prompt = self.prompter.system_prompt
+
+        prompt = self.prompter.build_prompt(instruction, output, input, system_prompt)
+        return self._tokenize(prompt)
+
+class InstructionStrategyWithChatTemplate(InstructionStrategy):
+    def __init__(
+            self,
+            prompter: "InstructionPrompterWithChatTemplate",
+            tokenizer,
+            sequence_len: int | None,
+    ):
+        super().__init__(prompter, tokenizer, sequence_len)
+        self.prompter: InstructionPrompterWithChatTemplate = prompter
+
+    def _tokenize_single_prompt(self, prompt: dict) -> Dict[str, List[int]]:
+        instruction = prompt.get(self.prompter.instruction_field)
+        if instruction is None:
+            raise ValueError(
+                f"Instruction field '{self.prompter.instruction_field}' is missing from the dataset."
+            )
+        input = prompt.get(self.prompter.input_field)
+        output = prompt.get(self.prompter.output_field)
+        if output is None:
+            raise ValueError(
+                f"Output field '{self.prompter.output_field}' is missing from the dataset."
+            )
+        if self.prompter.system_prompt_type == InstructionDatasetSystemPromptType.field:
+            system_prompt = prompt.get(self.prompter.system_prompt_field)
+        else:
+            system_prompt = self.prompter.system_prompt
+
+        input_ids = self.prompter.build_prompt(instruction, output, input, system_prompt)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+        }

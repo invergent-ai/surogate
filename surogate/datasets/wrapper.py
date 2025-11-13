@@ -4,20 +4,24 @@ from typing import Dict, Any, Optional
 from datasets import Dataset, IterableDataset
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerBase
 
-from surogate.datasets.prompters import Prompter, ChatTemplatePrompter
-from surogate.datasets.strategies import ChatTemplateStrategy, PromptTokenizingStrategy
+from surogate.datasets.prompters import Prompter, ChatTemplatePrompter, InstructionPrompter, \
+    InstructionPrompterWithChatTemplate
+from surogate.datasets.strategies import ChatTemplateStrategy, PromptTokenizingStrategy, InstructionStrategy, \
+    InstructionStrategyWithChatTemplate
 from surogate.utils.dict import DictDefault
-from surogate.utils.schema.datasets import ConversationDataset, InstructionDataset, TextDataset, BaseDataset
+from surogate.utils.schema.datasets import ConversationDataset, InstructionDataset, TextDataset, BaseDataset, \
+    SurogateDataset
 from surogate.utils.schema.enums import SurogateDatasetType, ChatTemplateType
+
 
 class TokenizedPromptDataset(Dataset):
     def __init__(
-        self,
-        prompt_tokenizer: PromptTokenizingStrategy,
-        dataset: Dataset,
-        process_count: int | None = None,
-        keep_in_memory: bool | None = False,
-        **kwargs,
+            self,
+            prompt_tokenizer: PromptTokenizingStrategy,
+            dataset: Dataset,
+            process_count: int | None = None,
+            keep_in_memory: bool | None = False,
+            **kwargs,
     ):
         self.prompt_tokenizer = prompt_tokenizer
         self.process_count = process_count
@@ -35,8 +39,8 @@ class TokenizedPromptDataset(Dataset):
             map_kwargs["batch_size"] = 1_000
 
         if (
-            hasattr(self.prompt_tokenizer, "filter_rows")
-            and self.prompt_tokenizer.filter_rows
+                hasattr(self.prompt_tokenizer, "filter_rows")
+                and self.prompt_tokenizer.filter_rows
         ):
             dataset = dataset.filter(
                 self.prompt_tokenizer.filter_rows,
@@ -56,7 +60,7 @@ class TokenizedPromptDataset(Dataset):
 
 def get_dataset_wrapper(
         cfg: DictDefault,
-        dataset_config: ConversationDataset | InstructionDataset | TextDataset,
+        dataset_config: SurogateDataset,
         tokenizer: PreTrainedTokenizer,
         dataset: Dataset | IterableDataset,
 ) -> Dataset | IterableDataset:
@@ -82,9 +86,46 @@ def get_dataset_wrapper(
         return wrap_dataset_for_tokenized_prompt(dataset_strategy, dataset, **dataset_kwargs)
     elif dataset_config.type == SurogateDatasetType.instruction:
         chat_template_string = get_chat_template_from_config(
-            ds_cfg=dataset_config, tokenizer=tokenizer
+            ds_cfg=dataset_config, tokenizer=tokenizer, fail=False
         )
 
+        if chat_template_string:
+            prompter = InstructionPrompterWithChatTemplate(
+                tokenizer=tokenizer,
+                sequence_len=cfg.get('sequence_len'),
+                chat_template=chat_template_string,
+                system_prompt_type=dataset_config.system_prompt_type,
+                system_prompt_field=dataset_config.system_prompt_field,
+                system_prompt=dataset_config.system_prompt,
+                instruction_field=dataset_config.instruction_field,
+                input_field=dataset_config.input_field,
+                output_field=dataset_config.output_field,
+            )
+            dataset_strategy = InstructionStrategyWithChatTemplate(
+                prompter,
+                tokenizer=tokenizer,
+                sequence_len=cfg.get('sequence_len')
+            )
+        else:
+            prompter = InstructionPrompter(
+                tokenizer=tokenizer,
+                system_prompt_type=dataset_config.system_prompt_type,
+                system_prompt_field=dataset_config.system_prompt_field,
+                system_prompt=dataset_config.system_prompt,
+                instruction_field=dataset_config.instruction_field,
+                input_field=dataset_config.input_field,
+                output_field=dataset_config.output_field,
+                sequence_len=cfg.get('sequence_len'),
+                prompt_format=dataset_config.prompt_format,
+                prompt_format_no_input=dataset_config.prompt_format_no_input,
+            )
+            dataset_strategy = InstructionStrategy(
+                prompter,
+                tokenizer=tokenizer,
+                sequence_len=cfg.get('sequence_len')
+            )
+
+        return wrap_dataset_for_tokenized_prompt(dataset_strategy, dataset, **dataset_kwargs)
     elif dataset_config.type == SurogateDatasetType.text:
         pass
     else:
@@ -94,7 +135,8 @@ def get_dataset_wrapper(
 def get_chat_template_from_config(
         ds_cfg: ConversationDataset | None = None,
         tokenizer: Optional["PreTrainedTokenizerBase"] = None,
-) -> str:
+        fail = True,
+) -> str | None:
     chat_template = ds_cfg.chat_template or ChatTemplateType.tokenizer_default
 
     if chat_template == ChatTemplateType.tokenizer_default:
@@ -103,10 +145,13 @@ def get_chat_template_from_config(
                 f"`tokenizer` cannot be None when chat_template choice is {ChatTemplateType.tokenizer_default}"
             )
         if not tokenizer.chat_template:
-            raise ValueError(
-                f"`chat_template choice is {ChatTemplateType.tokenizer_default} but tokenizer's chat_template is null. "
-                f"Please add a chat_template in tokenizer config"
-            )
+            if fail:
+                raise ValueError(
+                    f"`chat_template choice is {ChatTemplateType.tokenizer_default} but tokenizer's chat_template is null. "
+                    f"Please add a chat_template in tokenizer config"
+                )
+            else:
+                return None
         return tokenizer.chat_template
     elif chat_template == ChatTemplateType.jinja:
         jinja_template = ds_cfg.chat_template_jinja
@@ -139,7 +184,6 @@ def wrap_dataset_for_tokenized_prompt(
             **map_kwargs,
         )
     return TokenizedPromptDataset(prompt_tokenizer, dataset, **kwargs)
-
 
 
 def get_default_process_count():

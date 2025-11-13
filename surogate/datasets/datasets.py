@@ -10,6 +10,7 @@ from surogate.datasets.wrapper import get_dataset_wrapper
 from surogate.loaders.tokenizer import load_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
+from surogate.utils.schema.datasets import BaseDataset, SurogateDataset
 
 logger = get_logger()
 
@@ -33,34 +34,42 @@ def _load_and_prepare_datasets(cfg: DictDefault, tokenizer: PreTrainedTokenizer)
     datasets_configs = cfg.get('datasets')
     datasets = []
     for dataset_config in datasets_configs:
-        dataset = load_dataset_with_config(
-            dataset_config, False
+        dataset_wrapper = _load_and_prepare_single_dataset(
+            cfg, dataset_config, tokenizer
         )
-
-        if isinstance(dataset, (DatasetDict, IterableDatasetDict)):
-            if dataset_config.split and dataset_config.split in dataset:
-                dataset = dataset[dataset_config.split]
-            else:
-                raise ValueError(
-                    f"no {dataset_config.split} split found for dataset {dataset_config.path}, you may "
-                    "specify a split with 'split: ...'"
-                )
-
-        if dataset_config.samples:
-            dataset = dataset.select(range(min(dataset.num_rows, dataset_config.samples)))
-
-        dataset_wrapper = get_dataset_wrapper(
-            cfg=cfg,
-            dataset_config=dataset_config,
-            tokenizer=tokenizer,
-            dataset=dataset,
-        )
-
         datasets.append(dataset_wrapper)
 
     dataset = merge_datasets(datasets, cfg)
 
     return dataset
+
+
+def _load_and_prepare_single_dataset(
+        cfg: DictDefault, dataset_config: SurogateDataset,
+        tokenizer: PreTrainedTokenizer
+) -> Dataset | IterableDataset:
+    dataset = load_dataset_with_config(
+        dataset_config, False
+    )
+
+    if isinstance(dataset, (DatasetDict, IterableDatasetDict)):
+        if dataset_config.split and dataset_config.split in dataset:
+            dataset = dataset[dataset_config.split]
+        else:
+            raise ValueError(
+                f"no {dataset_config.split} split found for dataset {dataset_config.path}, you may "
+                "specify a split with 'split: ...'"
+            )
+
+    if dataset_config.samples:
+        dataset = dataset.select(range(min(dataset.num_rows, dataset_config.samples)))
+
+    return get_dataset_wrapper(
+        cfg=cfg,
+        dataset_config=dataset_config,
+        tokenizer=tokenizer,
+        dataset=dataset,
+    )
 
 
 def merge_datasets(datasets: list[Dataset], cfg: DictDefault) -> Dataset:

@@ -66,7 +66,7 @@ class InstructionDataset(BaseDataset, BaseModel):
         }
     )
 
-    system_field: str | None = Field(
+    system_prompt_field: str | None = Field(
         default=None,
         json_schema_extra={
             "description": "The name of the column in your dataset that contains the System Prompt"
@@ -101,6 +101,19 @@ class InstructionDataset(BaseDataset, BaseModel):
         }
     )
 
+    prompt_format: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Format of the prompt as a Python string template. Use {system}, {instruction}, {input}, and {output} as placeholders."
+        }
+    )
+
+    prompt_format_no_input: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Format of the prompt as a Python string template when there is no 'input'. Use {system}, {instruction} and {output} as placeholders."
+        }
+    )
 
 
 class ConversationDataset(BaseDataset, BaseModel):
@@ -146,3 +159,5 @@ class ConversationDataset(BaseDataset, BaseModel):
         },
     )
 
+
+SurogateDataset = InstructionDataset | ConversationDataset | TextDataset
