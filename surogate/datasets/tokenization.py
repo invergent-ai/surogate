@@ -93,7 +93,11 @@ class TokenizedPromptDataset(Dataset):
             map_kwargs["batched"] = True
             map_kwargs["batch_size"] = 1_000
 
-        return dataset.map(
+        return dataset.filter(
+            drop_empty_rows,
+            num_proc=self.process_count,
+            keep_in_memory=self.keep_in_memory,
+        ).map(
             self.prompt_tokenizer.tokenize_prompt,
             num_proc=self.process_count,
             remove_columns=features,
@@ -113,10 +117,40 @@ def tokenize_dataset(
         if prompt_tokenizer.supports_batched:
             map_kwargs["batched"] = True
         features = list(dataset.features.keys())
-        return dataset.map(
+        return dataset.filter(
+            drop_empty_rows,
+            **map_kwargs
+        ).map(
             prompt_tokenizer.tokenize_prompt,
             remove_columns=features,
             **map_kwargs,
         )
 
     return TokenizedPromptDataset(prompt_tokenizer, dataset, **kwargs)
+
+def drop_empty_rows(row: dict[str, Any]) -> bool:
+    messages = row.get("messages")
+    if not isinstance(messages, list) or not messages:
+        # invalid or empty messages
+        return False
+
+    seen_user = False
+    for turn in messages:
+        if turn.get("role") == "user":
+            seen_user = True
+            content = turn.get("content")
+
+            # Handle only simple string content here; extend if needed for multimodal
+            if content is None:
+                return False
+
+            if not isinstance(content, str):
+                # if the row can have non-string content, decide what to do here
+                return False
+
+            if not content.strip():
+                # empty user turn → drop conversation
+                return False
+
+    # Require at least one user turn
+    return seen_user

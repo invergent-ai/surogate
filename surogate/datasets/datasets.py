@@ -10,6 +10,7 @@ from surogate.datasets.instruction import InstructionPreprocessor
 from surogate.datasets.loader import load_dataset_with_config
 from surogate.datasets.lock import FileLockLoader
 from surogate.datasets.text import TextPreprocessor
+from surogate.datasets.tokenization import drop_empty_rows
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 from surogate.utils.schema.datasets import SurogateDataset, InstructionDataset, ConversationDataset, TextDataset

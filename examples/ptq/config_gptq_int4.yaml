@@ -14,7 +14,7 @@ datasets:
   - path: "wikimedia/wikipedia"
     subset: '20231101.ab'
     split: "train"
-    samples: 512
+    samples: 256
     type: text
     text_field: text
 
