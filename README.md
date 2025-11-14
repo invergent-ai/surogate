@@ -2,8 +2,6 @@
 <a href="https://surogate.ai/">
 <img width="50" alt="surogate llmops framework" src="./docs/static/img/logo-white.svg" />
 </a>
-<br/>
-<br/>
 
 <div align="center">
 <h1>Surogate LLMOps Framework</h1>
