@@ -16,10 +16,12 @@
 <br/>
 
 <div align="center">
+    
 [![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
 [![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
 [![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
 [![Twitter Follow](https://img.shields.io/twitter/follow/invergent-ai?style=social)](https://twitter.com/invergent-ai)
+
 </div>
 
 <div align="center">
