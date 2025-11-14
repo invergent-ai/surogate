@@ -22,10 +22,11 @@ class SurogateBaseConfig(BaseModel):
             "description": "HuggingFace model name or local path"
         }
     )
-    tokenizer: str | None = Field(
+
+    model_type: str = Field(
         default=None,
         json_schema_extra={
-            "description": "Path to a tokenizer config file if you want to use a custom tokenizer"
+            "description": "Type of the model architecture if it cannot be inferred automatically, e.g., 'qwen3', 'qwen3_thinking', 'qwen3_nothinking', etc."
         },
     )
 

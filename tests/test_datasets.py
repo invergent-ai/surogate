@@ -1,20 +1,24 @@
 import pytest
 from datasets import Dataset
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
-from surogate.datasets.wrapper import get_dataset_wrapper
+from surogate.datasets.datasets import wrap_dataset
+from surogate.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
 from surogate.utils.dict import DictDefault
+from surogate.loaders.loader import get_model_and_tokenizer
 from surogate.utils.schema.datasets import ConversationDataset, InstructionDataset
 
 
 @pytest.fixture(scope="class")
 def tokenizer_with_chat_template():
-    return AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    _, tokenizer = get_model_and_tokenizer("Qwen/Qwen3-0.6B", load_model=False)
+    return tokenizer
 
 
 @pytest.fixture(scope="class")
 def tokenizer_without_chat_template():
-    return AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
+    _, tokenizer = get_model_and_tokenizer("unsloth/Llama-3.2-1B", load_model=False)
+    return tokenizer
 
 
 class TestDatasets:
@@ -25,7 +29,8 @@ class TestDatasets:
                 "messages": [
                     {"role": "system", "content": "You are a technical support bot."},
                     {"role": "user", "content": "My internet is not working."},
-                    {"role": "assistant", "content": "I can help with that. Is the light on your router blinking or solid?"},
+                    {"role": "assistant",
+                     "content": "I can help with that. Is the light on your router blinking or solid?"},
                 ]
             },
             {
@@ -39,8 +44,12 @@ class TestDatasets:
             }
         ])
 
-    def test_load_conversation_dataset(self, tokenizer_with_chat_template: PreTrainedTokenizer,
-                                       conversation_dataset_fixture):
+    def test_load_conversation_dataset(
+            self,
+            conversation_dataset_fixture,
+            tokenizer_with_chat_template,
+            tokenizer_without_chat_template
+    ):
         cfg = DictDefault({
             "sequence_len": 2048,
             "datasets": [
@@ -55,14 +64,34 @@ class TestDatasets:
                 }
             ]
         })
-        dataset = get_dataset_wrapper(
+        wrapped_dataset = wrap_dataset(
             cfg,
             ConversationDataset(**cfg.get('datasets')[0]),
-            tokenizer_with_chat_template,
             conversation_dataset_fixture
         )
+        assert len(wrapped_dataset) == 2
+
+        dataset = tokenize_dataset(
+            PromptTokenizingStrategy(
+                tokenizer=tokenizer_with_chat_template,
+                mode='pt',
+            ),
+            wrapped_dataset,
+        )
+
         assert len(dataset) == 2
-        assert "input_ids" in dataset.features
+        assert 'input_ids' in dataset.column_names
+
+        dataset = tokenize_dataset(
+            PromptTokenizingStrategy(
+                tokenizer=tokenizer_without_chat_template,
+                mode='pt',
+            ),
+            wrapped_dataset,
+        )
+
+        assert len(dataset) == 2
+        assert 'input_ids' in dataset.column_names
 
     @pytest.fixture
     def instruction_dataset_fixture(self):
@@ -78,8 +107,12 @@ class TestDatasets:
             }
         ])
 
-    def test_load_instruction_dataset_with_chat_template(self, tokenizer_with_chat_template: PreTrainedTokenizer,
-                                                         instruction_dataset_fixture):
+    def test_load_instruction_dataset(
+            self,
+            tokenizer_with_chat_template: PreTrainedTokenizer,
+            tokenizer_without_chat_template: PreTrainedTokenizer,
+            instruction_dataset_fixture
+    ):
         cfg = DictDefault({
             "sequence_len": 2048,
             "datasets": [
@@ -93,35 +126,32 @@ class TestDatasets:
             ]
         })
 
-        dataset = get_dataset_wrapper(
+        wrapped_dataset = wrap_dataset(
             cfg,
             InstructionDataset(**cfg.get('datasets')[0]),
-            tokenizer_with_chat_template,
             instruction_dataset_fixture
         )
-        assert len(dataset) == 2
-        assert "input_ids" in dataset.features
 
-    def test_load_instruction_dataset_no_chat_template(self, tokenizer_without_chat_template: PreTrainedTokenizer,
-                                                       instruction_dataset_fixture):
-        cfg = DictDefault({
-            "sequence_len": 2048,
-            "datasets": [
-                {
-                    "samples": 128,
-                    "type": "instruction",
-                    "instruction_field": "question",
-                    "output_field": "answer",
-                    "input_field": "input"
-                }
-            ]
-        })
+        assert len(wrapped_dataset) == 2
 
-        dataset = get_dataset_wrapper(
-            cfg,
-            InstructionDataset(**cfg.get('datasets')[0]),
-            tokenizer_without_chat_template,
-            instruction_dataset_fixture
+        dataset = tokenize_dataset(
+            PromptTokenizingStrategy(
+                tokenizer=tokenizer_with_chat_template,
+                mode='pt',
+            ),
+            wrapped_dataset,
         )
+
         assert len(dataset) == 2
-        assert "input_ids" in dataset.features
+        assert 'input_ids' in dataset.column_names
+
+        dataset = tokenize_dataset(
+            PromptTokenizingStrategy(
+                tokenizer=tokenizer_without_chat_template,
+                mode='pt',
+            ),
+            wrapped_dataset,
+        )
+
+        assert len(dataset) == 2
+        assert 'input_ids' in dataset.column_names

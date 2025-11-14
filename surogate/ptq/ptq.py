@@ -3,10 +3,11 @@ import random
 # import modelopt.torch.opt as mto
 import numpy as np
 import torch
-from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from surogate.datasets.datasets import load_datasets
+from surogate.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
+from surogate.loaders.loader import load_model_and_tokenizer
 from surogate.utils.command import SurogateCommand
 from surogate.utils.logger import get_logger
 
@@ -29,6 +30,7 @@ SUPPORTED_SCHEMES = {
     'gptq_int8': 'Quantize weights and activations to INT8 (INT8 W8A8) with GPTQ',
     'nvfp4': 'Quantizes the weights and activations to FP4',
 }
+
 
 class SurogatePtq(SurogateCommand):
     def __init__(self, **kwargs):
@@ -93,12 +95,18 @@ class SurogatePtq(SurogateCommand):
         ignore_layers = ["lm_head", "re:.*lm_head"]
         ignore_layers.extend(self.additional_ignore_layers)
 
-        model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="auto")
-        dataset = load_datasets(self.config)
+        model, tokenizer = load_model_and_tokenizer(self.config)
+        calibration_dataset = load_datasets(self.config)
+        calibration_dataset = tokenize_dataset(
+            PromptTokenizingStrategy(
+                tokenizer=tokenizer,
+                mode='pt',
+            ),
+            calibration_dataset,
+        )
 
         if precision == "int8":
             recipe = [
-                SmoothQuantModifier(smoothing_strength=0.8),
                 GPTQModifier(
                     targets="Linear",
                     scheme="W8A8",
@@ -107,15 +115,14 @@ class SurogatePtq(SurogateCommand):
             ]
         elif precision == "int4":
             recipe = GPTQModifier(
-                    targets="Linear",
-                    scheme="W4A16",
-                    ignore=ignore_layers
-                )
+                targets="Linear",
+                scheme="W4A16",
+                ignore=ignore_layers
+            )
 
         oneshot(
             model=model,
-            dataset=dataset,
+            dataset=calibration_dataset,
             recipe=recipe,
-            max_seq_length=self.config.get('sequence_len'),
+            max_seq_length=self.config.get('sequence_len', DEFAULT_MAX_SEQ_LEN),
         )
-

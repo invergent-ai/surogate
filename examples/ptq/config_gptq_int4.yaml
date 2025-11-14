@@ -1,4 +1,5 @@
 model: Qwen/Qwen3-0.6B
+#model: invergent/Qwen3-0.6B-NVFP4
 
 # Quantization scheme: fp8 (W8A8), awq (INT4 W4A16), gptq_int4 (INT4 W4A16), qptq_int8 (INT8 W8A8), nvfp4 (NVidia FP4)
 scheme: gptq_int4
@@ -13,6 +14,20 @@ sequence_len: 2048
 
 # calibration datasets
 datasets:
+#  - path: "allenai/c4"
+#    subset: 'yo'
+#    split: "train"
+#    samples: 256
+#    type: text
+#    text_field: question
+
+  - path: "wikimedia/wikipedia"
+    subset: '20231101.ab'
+    split: "train"
+    samples: 256
+    type: text
+    text_field: text
+
 #  - path: "invergent/self-cognition"
 #    split: "train"
 #    samples: 128
@@ -28,11 +43,12 @@ datasets:
 #    message_property_mappings:
 #      role: role
 #      content: content
-  - path: "invergent/densemax-self-cognition"
-    type: conversation
-    split: train
-    samples: 128
-    messages_field: messages
-    message_property_mappings:
-      role: role
-      content: content
+
+#  - path: "invergent/densemax-self-cognition"
+#    type: conversation
+#    split: train
+#    samples: 128
+#    messages_field: messages
+#    message_property_mappings:
+#      role: role
+#      content: content

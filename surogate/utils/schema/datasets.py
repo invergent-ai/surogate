@@ -1,3 +1,5 @@
+from typing import Union, Any
+
 from pydantic import BaseModel, Field
 
 from .enums import SurogateDatasetType, InstructionDatasetSystemPromptType, ChatTemplateType
@@ -37,28 +39,24 @@ class BaseDataset(BaseModel):
 
 
 class TextDataset(BaseDataset, BaseModel):
-    text_column: str | None = Field(
+    text_field: str | None = Field(
         default=None,
         json_schema_extra={
             "description": "The name of the column in your dataset that contains the raw text."
         }
     )
 
+    @staticmethod
+    def validate_fields(ds_cfg: 'InstructionDataset', columns: list[str]):
+        if ds_cfg.text_field is None:
+            raise ValueError("'text_field' must be specified for TextDataset.")
+        if ds_cfg.text_field not in columns:
+            raise ValueError(
+                f"Text field '{ds_cfg.text_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
+
+
 class InstructionDataset(BaseDataset, BaseModel):
-    chat_template: ChatTemplateType | None = Field(
-        default='tokenizer_default',
-        json_schema_extra={
-            "description": "The Jinja chat template to use for formatting the prompt: 'tokenizer_default' (Uses the chat template available in the model's tokenizer_config.json file. If the chat template is not available in the tokenizer, it will raise an error) | 'jinja' (Custom Jinja chat template) "
-        }
-    )
-
-    chat_template_jinja: str | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": "Custom Jinja chat template path. Required if 'chat_template' is 'jinja'."
-        }
-    )
-
     system_prompt_type: InstructionDatasetSystemPromptType | None = Field(
         default=None,
         json_schema_extra={
@@ -115,22 +113,36 @@ class InstructionDataset(BaseDataset, BaseModel):
         }
     )
 
+    @staticmethod
+    def validate_fields(ds_cfg: 'InstructionDataset', columns: list[str]):
+        if ds_cfg.instruction_field is None:
+            raise ValueError("'instruction_field' must be specified for InstructionDataset.")
+        if ds_cfg.output_field is None:
+            raise ValueError("'output_field' must be specified for InstructionDataset.")
+
+        if ds_cfg.instruction_field not in columns:
+            raise ValueError(
+                f"Instruction field '{ds_cfg.instruction_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
+        if ds_cfg.output_field not in columns:
+            raise ValueError(
+                f"Output field '{ds_cfg.output_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
+        if ds_cfg.system_prompt_type == InstructionDatasetSystemPromptType.fixed and len(ds_cfg.system_prompt or "") == 0:
+            raise ValueError(
+                "'system_prompt' must be a non-empty string when 'system_prompt_type' is 'fixed'."
+            )
+        if ds_cfg.system_prompt_type == InstructionDatasetSystemPromptType.field and ds_cfg.system_prompt_field is None:
+            raise ValueError(
+                "'system_prompt_field' must be specified when 'system_prompt_type' is 'field'."
+            )
+        if ds_cfg.system_prompt_type == InstructionDatasetSystemPromptType.field and ds_cfg.system_prompt_field not in columns:
+            raise ValueError(
+                f"System prompt field '{ds_cfg.system_prompt_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
+
 
 class ConversationDataset(BaseDataset, BaseModel):
-    chat_template: ChatTemplateType | None = Field(
-        default='tokenizer_default',
-        json_schema_extra={
-            "description": "The Jinja chat template to use for formatting the prompt: 'tokenizer_default' (Uses the chat template available in the model's tokenizer_config.json file. If the chat template is not available in the tokenizer, it will raise an error) | 'jinja' (Custom Jinja chat template) "
-        }
-    )
-
-    chat_template_jinja: str | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": "Custom Jinja chat template path. Required if 'chat_template' is 'jinja'."
-        }
-    )
-
     system_field: str | None = Field(
         default=None,
         json_schema_extra={
@@ -158,6 +170,25 @@ class ConversationDataset(BaseDataset, BaseModel):
             "description": "Mapping of properties from the input dataset to the chat template. (default: message_property_mappings={'role':'role', 'content':'content'}). If a property exists in the template but not in this mapping, the system will attempt to load it directly from the message using the property name as the key. Example: In the mapping below, 'from' is loaded from input dataset and used as 'role', while 'value' is loaded and used as 'content' in the chat template."
         },
     )
+
+    @staticmethod
+    def validate_fields(ds_cfg: 'ConversationDataset', columns: list[str]):
+        if ds_cfg.messages_field is None:
+            raise ValueError("'messages_field' must be specified for ConversationDataset.")
+        if ds_cfg.messages_field not in columns:
+            raise ValueError(
+                f"Messages field '{ds_cfg.messages_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
+
+        if ds_cfg.tools_field is not None and ds_cfg.tools_field not in columns:
+            raise ValueError(
+                f"Tools field '{ds_cfg.tools_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
+
+        if ds_cfg.system_field is not None and ds_cfg.system_field not in columns:
+            raise ValueError(
+                f"System field '{ds_cfg.system_field}' is missing from the dataset. Dataset columns: {columns}."
+            )
 
 
 SurogateDataset = InstructionDataset | ConversationDataset | TextDataset

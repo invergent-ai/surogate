@@ -1,3 +1,0 @@
-from .serve.models import register_additional_model_types
-
-register_additional_model_types()

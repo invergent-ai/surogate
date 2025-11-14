@@ -1,0 +1,100 @@
+import json
+from typing import Dict, Any, Optional
+
+from swift.llm.dataset import RowPreprocessor
+
+from surogate.utils.dict import DictDefault
+from surogate.utils.logger import get_logger
+from surogate.utils.schema.datasets import ConversationDataset
+
+logger = get_logger()
+
+class ConversationPreprocessor(RowPreprocessor):
+    def __init__(self, cfg: DictDefault, dataset_config: ConversationDataset):
+        super().__init__()
+        self.cfg = cfg
+        self.ds_cfg = dataset_config
+        self.message_property_mappings = dataset_config.message_property_mappings or {}
+        self.messages_field = dataset_config.messages_field or "messages"
+        self.system_field = dataset_config.system_field or "system"
+        self.tools_field = dataset_config.system_field or "tools"
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        row["messages"] = self.get_conversation_thread(row)
+        tools = self._get_tools(row)
+        if tools:
+            row["tools"] = tools
+        return row
+
+    def get_conversation_thread(self, row):
+        turns = []
+        messages = self._get_messages(row)
+        possible_sys_turn = self.transform_message(messages[0])
+
+        if (
+                possible_sys_turn["role"] != "system"
+                and self.system_field in row
+        ):
+            turn = {"role": "system", "content": row.pop(self.system_field)}
+            turns.append(turn)
+
+        for message in messages:
+            turns.append(self.transform_message(message))
+
+        return turns
+
+    def transform_message(self, message: dict) -> dict:
+        transformed_message = {}
+        for key, value in self.message_property_mappings.items():
+            if message.get(value) is not None:
+                transformed_message[key] = message[value]
+            else:
+                logger.debug(
+                    f"Could not find value for property {value} in message: {message}"
+                )
+
+        # Map the role if necessary
+        if "tool_calls" in transformed_message and transformed_message["tool_calls"]:
+            for tool_call in transformed_message["tool_calls"]:
+                if "function" in tool_call and "arguments" in tool_call["function"]:
+                    args = tool_call["function"]["arguments"]
+                    if isinstance(args, str):
+                        try:
+                            tool_call["function"]["arguments"] = json.loads(args)
+                        except json.JSONDecodeError as e:
+                            logger.error(
+                                f"Error parsing tool_calls arguments as JSON. "
+                                f"Function: {tool_call.get('function', {}).get('name', 'unknown')}, "
+                                f"Arguments string: {args!r}, "
+                                f"Error: {e}"
+                            )
+                            raise
+
+        return transformed_message
+
+    def _get_messages(self, row):
+        messages = row.pop(self.messages_field, None)
+        if messages is None:
+            raise ValueError("Messages is null. Please check `messages_field`.")
+
+        if isinstance(messages, list):
+            return messages
+
+        raise ValueError(
+            "Unknown messages format. Please convert it into a list[dict].\n"
+            f"Current format: {type(messages)}"
+        )
+
+    def _get_tools(self, row) -> list[dict] | None:
+        """Get tools from prompt if available."""
+        tools = row.pop(self.tools_field, None)
+        if tools is None:
+            return None
+
+        if isinstance(tools, list):
+            return tools
+
+        raise ValueError(
+            "Unknown tools format. Please convert it into a list[dict].\n"
+            f"Current format: {type(tools)}"
+        )
