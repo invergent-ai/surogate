@@ -1,7 +1,37 @@
-# LLMOps Framework
+<div align="center">
+<a href="https://surogate.ai/">
+<img width="50" alt="surogate llmops framework" src="./docs/static/img/logo-white.svg" />
+</a>
+<br/>
+<br/>
 
-LLMOps is a comprehensive framework designed to streamline the development, deployment, and management of Large Language
-Models (LLMs). It provides tools and best practices for data preprocessing, model training, evaluation, and monitoring,
+<div align="center">
+<h1>Surogate LLMOps Framework</h1>
+</div>
+
+<div align="center">
+    <a href="https://surogate.ai">Home Page</a> |
+    <a href="https://docs.surogate.ai">Documentation</a> |
+    <a href="https://github.com/invergent-ai/surogate/tree/main/examples">Examples</a> 
+</div>
+
+<br/>
+
+<div align="center">
+[![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
+[![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
+[![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
+[![Twitter Follow](https://img.shields.io/twitter/follow/invergent-ai?style=social)](https://twitter.com/invergent-ai)
+</div>
+
+<div align="center">
+⭐ Like what we're doing? Give us a star ⬆️
+</div>
+
+</div>
+
+Surogate is a comprehensive LLMOps framework designed to streamline the development, deployment, and management of Large Language
+Models (LLMs). It provides all the necessary tools and best practices for data preprocessing, model training, evaluation, quantization, deployment and monitoring,
 ensuring efficient and effective LLM operations.
 
 # Integrations
