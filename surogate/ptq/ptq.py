@@ -1,4 +1,5 @@
 import random
+import sys
 
 # import modelopt.torch.opt as mto
 import numpy as np
@@ -9,7 +10,7 @@ from surogate.datasets.datasets import load_datasets
 from surogate.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
 from surogate.loaders.loader import load_model_and_tokenizer
 from surogate.utils.command import SurogateCommand
-from surogate.utils.logger import get_logger
+from surogate.utils.logger import get_logger, log_level
 
 try:
     from huggingface_hub import snapshot_download
@@ -65,8 +66,8 @@ class SurogatePtq(SurogateCommand):
     def do_fp8(self):
         from llmcompressor.modifiers.quantization import QuantizationModifier
         from llmcompressor import oneshot
-        from llmcompressor.metrics import PythonLogger
-        PythonLogger._global_file_sink_id = "null"
+
+        patch_llmcompressor_logger()
 
         ignore_layers = ["lm_head", "re:.*lm_head"]
         ignore_layers.extend(self.additional_ignore_layers)
@@ -86,8 +87,8 @@ class SurogatePtq(SurogateCommand):
     def do_gptq(self, precision: str):
         from llmcompressor.modifiers.quantization import GPTQModifier
         from llmcompressor import oneshot
-        from llmcompressor.metrics import PythonLogger
-        PythonLogger._global_file_sink_id = "null"
+
+        patch_llmcompressor_logger()
 
         dataset_config = self.config.get('datasets', [])
         if len(dataset_config) == 0:
@@ -107,23 +108,36 @@ class SurogatePtq(SurogateCommand):
         )
 
         if precision == "int8":
-            recipe = [
-                GPTQModifier(
-                    targets="Linear",
-                    scheme="W8A8",
-                    ignore=ignore_layers
-                ),
-            ]
+            recipe = GPTQModifier(
+                targets="Linear",
+                scheme="W8A8",
+                ignore=ignore_layers
+            )
         elif precision == "int4":
             recipe = GPTQModifier(
                 targets="Linear",
                 scheme="W4A16",
                 ignore=ignore_layers
             )
+        else:
+            raise ValueError(f"Unsupported GPTQ quantization precision: {precision}.")
 
-        oneshot(
+        model = oneshot(
             model=model,
             dataset=calibration_dataset,
             recipe=recipe,
+            log_dir=None,
             max_seq_length=self.config.get('sequence_len', DEFAULT_MAX_SEQ_LEN),
         )
+
+        model.save_pretrained(self.save_dir, save_compressed=True)
+        tokenizer.save_pretrained(self.save_dir)
+
+def patch_llmcompressor_logger():
+    from llmcompressor.metrics import PythonLogger
+    from loguru import logger as loguru_logger
+
+    loguru_logger.remove()
+    loguru_logger.add(sys.stderr, level="ERROR")
+
+    PythonLogger._global_file_sink_id = "null"

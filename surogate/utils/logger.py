@@ -1,10 +1,12 @@
 import os
+import sys
 from contextlib import contextmanager
 from types import MethodType
 import importlib
 import logging
 import inspect
 from typing import Optional
+
 
 init_loggers = {}
 logger_format = logging.Formatter('[%(levelname)s:%(name)s] %(message)s')
@@ -115,6 +117,7 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
         file_mode: Specifies the mode to open the file, if filename is
             specified (if filemode is unspecified, it defaults to 'w').
     """
+
     if log_level is None:
         log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
         log_level = getattr(logging, log_level, logging.INFO)
@@ -222,6 +225,7 @@ def _is_local_master():
     local_rank = int(os.getenv('LOCAL_RANK', -1))
     return local_rank in {-1, 0}
 
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+
 logger = get_logger()
 logger._logger.handlers[0].setFormatter(logger_format)
-log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
