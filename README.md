@@ -10,7 +10,7 @@
 <div align="center">
     <a href="https://surogate.ai">Home Page</a> |
     <a href="https://docs.surogate.ai">Documentation</a> |
-    <a href="https://github.com/invergent-ai/surogate/tree/main/examples">Examples</a> 
+    <a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> 
 </div>
 
 <br/>
