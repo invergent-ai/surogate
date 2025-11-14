@@ -1,10 +1,10 @@
 model: Qwen/Qwen3-0.6B
 
 # Quantization scheme: fp8 (W8A8), awq (INT4 W4A16), gptq_int4 (INT4 W4A16), qptq_int8 (INT8 W8A8), nvfp4 (NVidia FP4)
-scheme: gptq_int4
+scheme: awq
 
 # exported_model
-save_path: output/Qwen3-0.6B-GPTQ-INT4
+save_path: output/Qwen3-0.6B-AWQ
 
 # maximum sequence length for calibration
 sequence_len: 2048
@@ -17,4 +17,3 @@ datasets:
     samples: 512
     type: text
     text_field: text
-

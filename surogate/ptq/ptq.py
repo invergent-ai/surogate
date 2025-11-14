@@ -43,8 +43,9 @@ class SurogatePtq(SurogateCommand):
         if not torch.cuda.is_available():
             raise OSError("GPU is required for PTQ.")
 
-        random.seed(RAND_SEED)
-        np.random.seed(RAND_SEED)
+        seed = self.config.get('seed', RAND_SEED)
+        random.seed(seed)
+        np.random.seed(seed)
 
         if self.config['scheme'] not in SUPPORTED_SCHEMES.keys():
             raise ValueError(f"Unsupported quantization scheme: {self.config['scheme']}. "
