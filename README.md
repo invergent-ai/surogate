@@ -34,22 +34,6 @@ Surogate is a comprehensive LLMOps framework designed to streamline the developm
 Models (LLMs). It provides all the necessary tools and best practices for data preprocessing, model training, evaluation, quantization, deployment and monitoring,
 ensuring efficient and effective LLM operations.
 
-# Integrations
-
-- https://github.com/datajuicer/data-juicer?tab=readme-ov-file
-- https://github.com/modelscope/ms-swift
-- https://github.com/modelscope/evalscope -> bencharmking
-- https://github.com/IST-DASLab/llmq
-- https://github.com/axolotl-ai-cloud/axolotl
-- https://github.com/NVIDIA/Megatron-LM
-- https://github.com/skypilot-org/skypilot/
-- https://github.com/aimhubio/aim
-- https://github.com/sgl-project/sglang
-- https://github.com/vllm-project/vllm
-- https://github.com/confident-ai/deepeval ->
-- https://github.com/confident-ai/deepteam
-- https://www.jackyoustra.com/blog/road-to-petaflop
-- 
 # Installation
 
 ```bash
