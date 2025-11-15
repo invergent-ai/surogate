@@ -68,8 +68,13 @@ class DatasetValidator:
         if null_inputs > 0:
             errors.append(f"Found {null_inputs} rows with null input")
 
-        # FIX: Use str.len_chars() instead of str.lengths()
-        empty_inputs = df.filter(pl.col('input').str.len_chars() == 0).height
+        # FIX: Use str.len_chars() for Polars 0.19+
+        try:
+            empty_inputs = df.filter(pl.col('input').str.len_chars() == 0).height
+        except AttributeError:
+            # Fallback for older Polars versions
+            empty_inputs = df.filter(pl.col('input').str.lengths() == 0).height
+
         if empty_inputs > 0:
             errors.append(f"Found {empty_inputs} rows with empty input")
 
@@ -88,7 +93,6 @@ class DatasetValidator:
             logger.warning(f"✗ Single-turn dataset validation failed with {len(errors)} errors")
 
         return is_valid, errors
-
 
     def _validate_multi_turn(self, df: pl.DataFrame) -> Tuple[bool, List[str]]:
         """Validate multi-turn dataset."""

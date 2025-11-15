@@ -1,6 +1,8 @@
 import os
 import sys
 from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
 from types import MethodType
 import importlib
 import logging
@@ -9,9 +11,9 @@ from typing import Optional
 
 
 init_loggers = {}
-logger_format = logging.Formatter('[%(levelname)s:%(name)s] %(message)s')
 info_set = set()
 warning_set = set()
+DEFAULT_LOG_DIR = Path("logs")
 
 # ANSI color codes
 class Colors:
@@ -19,6 +21,8 @@ class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
     DIM = '\033[2m'
+    ITALIC = '\033[3m'
+    UNDERLINE = '\033[4m'
 
     # Foreground colors
     BLACK = '\033[30m'
@@ -41,81 +45,166 @@ class Colors:
     BRIGHT_WHITE = '\033[97m'
 
     # Background colors
+    BG_BLACK = '\033[40m'
     BG_RED = '\033[41m'
     BG_GREEN = '\033[42m'
     BG_YELLOW = '\033[43m'
     BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+    BG_WHITE = '\033[47m'
+
+    # Bright background colors
+    BG_BRIGHT_BLACK = '\033[100m'
+    BG_BRIGHT_RED = '\033[101m'
+    BG_BRIGHT_GREEN = '\033[102m'
+    BG_BRIGHT_YELLOW = '\033[103m'
+    BG_BRIGHT_BLUE = '\033[104m'
+    BG_BRIGHT_MAGENTA = '\033[105m'
+    BG_BRIGHT_CYAN = '\033[106m'
+    BG_BRIGHT_WHITE = '\033[107m'
+
+
+class ColoredFormatter(logging.Formatter):
+    """Formatter that preserves ANSI color codes and adds timestamps."""
+
+    def __init__(self, fmt='%(message)s', datefmt='%H:%M:%S'):
+        super().__init__(fmt, datefmt)
+
+    def formatMessage(self, record):
+        return record.getMessage()
+
+    def format(self, record):
+        message = self.formatMessage(record)
+
+        # Add timestamp if configured
+        if hasattr(self, '_show_timestamp') and self._show_timestamp:
+            timestamp = self.formatTime(record, self.datefmt)
+            colored_timestamp = f"{Colors.DIM}{timestamp}{Colors.RESET}"
+
+            # Handle multi-line messages
+            if '\n' in message:
+                lines = message.split('\n')
+                # Only add timestamp to first line
+                return f"{colored_timestamp} {lines[0]}\n" + '\n'.join(lines[1:])
+            else:
+                return f"{colored_timestamp} {message}"
+
+        return message
 
 
 class LoggerWrapper:
-    """Wrapper around logger with colors and file/line info."""
+    """Wrapper around logger with vibrant colors and file/line info."""
 
     def __init__(self, logger, show_location: bool = True):
         self._logger = logger
         self.show_location = show_location
 
-    def _add_location(self, msg: str) -> str:
-        """Add file and line number to message."""
+    def _add_location(self, msg: str, color: str) -> str:
+        """Add file and line number to message with color."""
         if not self.show_location:
             return msg
 
         frame = inspect.currentframe().f_back.f_back
-        filename = frame.f_code.co_filename.split('/')[-1]
+        filename = os.path.basename(frame.f_code.co_filename)
         lineno = frame.f_lineno
-        location = f"{Colors.DIM}[{filename}:{lineno}]{Colors.RESET}"
+        location = f"{color}{Colors.ITALIC}[{filename}:{lineno}]{Colors.RESET}"
         return f"{location} {msg}"
 
     def info(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log info message in cyan."""
-        colored_msg = f"{Colors.CYAN}{self._add_location(msg)}{Colors.RESET}"
+        """Log info message in bright cyan."""
+        prefix = f"{Colors.BRIGHT_CYAN}[INFO]{Colors.RESET}"
+        colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_CYAN)}"
         self._logger.info(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def debug(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log debug message in bright black (gray)."""
-        colored_msg = f"{Colors.BRIGHT_BLACK}{self._add_location(msg)}{Colors.RESET}"
+        """Log debug message in magenta."""
+        prefix = f"{Colors.MAGENTA}[DEBUG]{Colors.RESET}"
+        colored_msg = f"{prefix} {self._add_location(msg, Colors.MAGENTA)}"
         self._logger.debug(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def warning(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log warning message in yellow."""
-        colored_msg = f"{Colors.YELLOW}{self._add_location(msg)}{Colors.RESET}"
+        """Log warning message in bright yellow."""
+        prefix = f"{Colors.BRIGHT_YELLOW}[WARNING]{Colors.RESET}"
+        colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_YELLOW)}"
         self._logger.warning(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def error(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log error message in red."""
-        colored_msg = f"{Colors.RED}{self._add_location(msg)}{Colors.RESET}"
+        """Log error message in bright red."""
+        prefix = f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET}"
+        colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_RED)}"
         self._logger.error(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def critical(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log critical message in bright red with bold."""
-        colored_msg = f"{Colors.BOLD}{Colors.BRIGHT_RED}{self._add_location(msg)}{Colors.RESET}"
+        """Log critical message in bold bright red."""
+        prefix = f"{Colors.BOLD}{Colors.BRIGHT_RED}[CRITICAL]{Colors.RESET}"
+        colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_RED)}"
         self._logger.critical(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def success(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log success message in green."""
-        colored_msg = f"{Colors.GREEN}✓ {self._add_location(msg)}{Colors.RESET}"
+        """Log success message in bright green with checkmark."""
+        prefix = f"{Colors.BRIGHT_GREEN}[SUCCESS]{Colors.RESET}"
+        colored_msg = f"{prefix} {Colors.BRIGHT_GREEN}✓{Colors.RESET} {self._add_location(msg, Colors.BRIGHT_GREEN)}"
         self._logger.info(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def header(self, msg: str, *args, exc_info=None, **kwargs):
-        """Log header message in bright blue with bold."""
-        colored_msg = f"{Colors.BOLD}{Colors.BRIGHT_BLUE}{msg}{Colors.RESET}"
+        """Log header message in bold bright blue."""
+        colored_msg = f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}{'─' * 3} {msg} {'─' * 3}{Colors.RESET}"
         self._logger.info(colored_msg, *args, exc_info=exc_info, **kwargs)
 
-    def separator(self, char: str = "=", length: int = 60):
+    def separator(self, char: str = "─", length: int = 80, color: str = None):
         """Log a separator line."""
         line = char * length
-        colored_line = f"{Colors.BRIGHT_BLACK}{line}{Colors.RESET}"
+        color_code = color or Colors.BRIGHT_BLACK
+        colored_line = f"{color_code}{line}{Colors.RESET}"
         self._logger.info(colored_line)
 
+    def highlight(self, msg: str, *args, exc_info=None, **kwargs):
+        """Log highlighted message in bright magenta with background."""
+        colored_msg = f"{Colors.BG_BRIGHT_MAGENTA}{Colors.BRIGHT_WHITE}{Colors.BOLD} {msg} {Colors.RESET}"
+        self._logger.info(colored_msg, *args, exc_info=exc_info, **kwargs)
 
-def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, file_mode: str = 'w'):
-    """ Get logging logger
+    def metric(self, name: str, value: any, unit: str = "", *args, **kwargs):
+        """Log a metric with special formatting."""
+        metric_msg = f"{Colors.BRIGHT_CYAN}📊 {name}:{Colors.RESET} {Colors.BRIGHT_GREEN}{Colors.BOLD}{value}{Colors.RESET}"
+        if unit:
+            metric_msg += f" {Colors.DIM}{unit}{Colors.RESET}"
+        self._logger.info(metric_msg, *args, **kwargs)
+
+    def step(self, step_num: int, total: int, msg: str, *args, **kwargs):
+        """Log a step in a process."""
+        progress = f"{Colors.BRIGHT_BLUE}{Colors.BOLD}[{step_num}/{total}]{Colors.RESET}"
+        colored_msg = f"{progress} {Colors.CYAN}▸{Colors.RESET} {msg}"
+        self._logger.info(colored_msg, *args, **kwargs)
+
+    def banner(self, msg: str, char: str = "═", *args, **kwargs):
+        """Log a banner message."""
+        length = max(len(msg) + 4, 60)
+        top_border = f"{Colors.BRIGHT_BLUE}{Colors.BOLD}{char * length}{Colors.RESET}"
+        middle = f"{Colors.BRIGHT_BLUE}{Colors.BOLD}║{Colors.RESET} {Colors.BRIGHT_WHITE}{Colors.BOLD}{msg.center(length - 4)}{Colors.RESET} {Colors.BRIGHT_BLUE}{Colors.BOLD}║{Colors.RESET}"
+        bottom_border = f"{Colors.BRIGHT_BLUE}{Colors.BOLD}{char * length}{Colors.RESET}"
+
+        # Log as single multi-line message
+        full_banner = f"\n{top_border}\n{middle}\n{bottom_border}\n"
+        self._logger.info(full_banner)
+
+
+def get_logger(
+        log_file: Optional[str] = None,
+        log_level: Optional[int] = None,
+        file_mode: str = 'w',
+        enable_file_logging: bool = False,
+        show_timestamp: bool = True  # NEW: control timestamps
+):
+    """Get logging logger with vibrant color support
 
     Args:
-        log_file: Log filename, if specified, file handler will be added to
-            logger
+        log_file: Log filename. If None and enable_file_logging=True,
+                  auto-generates filename in logs/ directory
         log_level: Logging level.
-        file_mode: Specifies the mode to open the file, if filename is
-            specified (if filemode is unspecified, it defaults to 'w').
+        file_mode: File open mode (default: 'w').
+        enable_file_logging: Whether to enable file logging (default: False)
+        show_timestamp: Whether to show timestamps (default: True)
     """
 
     if log_level is None:
@@ -125,17 +214,12 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
     logger_name = __name__.split('.')[0]
     logger = logging.getLogger(logger_name)
     logger.propagate = False
+
     if logger_name in init_loggers:
         add_file_handler_if_needed(logger, log_file, file_mode, log_level)
-        return logger
+        return LoggerWrapper(logger)
 
-    # handle duplicate logs to the console
-    # Starting in 1.8.0, PyTorch DDP attaches a StreamHandler <stderr> (NOTSET)
-    # to the root logger. As logger.propagate is True by default, this root
-    # level handler causes logging messages from rank>0 processes to
-    # unexpectedly show up on the console, creating much unwanted clutter.
-    # To fix this issue, we set the root logger's StreamHandler, if any, to log
-    # at the ERROR level.
+    # Handle duplicate logs to the console
     for handler in logger.root.handlers:
         if type(handler) is logging.StreamHandler:
             handler.setLevel(logging.ERROR)
@@ -145,12 +229,32 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
 
     is_worker0 = _is_local_master()
 
-    if is_worker0 and log_file is not None:
+    # File logging setup
+    if is_worker0 and enable_file_logging:
+        if log_file is None:
+            # Auto-generate log filename
+            DEFAULT_LOG_DIR.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = str(DEFAULT_LOG_DIR / f"surogate_{timestamp}.log")
+        else:
+            # Ensure parent directory exists
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = str(log_path)
+
         file_handler = logging.FileHandler(log_file, file_mode)
         handlers.append(file_handler)
 
+    # Use ColoredFormatter with or without timestamp
+    if show_timestamp:
+        colored_formatter = ColoredFormatter(datefmt='%Y-%m-%d %H:%M:%S')  # ← CHANGED HERE
+        colored_formatter._show_timestamp = True
+    else:
+        colored_formatter = ColoredFormatter()
+        colored_formatter._show_timestamp = False
+
     for handler in handlers:
-        handler.setFormatter(logger_format)
+        handler.setFormatter(colored_formatter)
         handler.setLevel(log_level)
         logger.addHandler(handler)
 
@@ -167,6 +271,7 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
     logger.warning_if = MethodType(warning_if, logger)
 
     return LoggerWrapper(logger)
+
 
 def info_if(self, msg, cond, *args, **kwargs):
     if cond:
@@ -205,6 +310,7 @@ def logger_context(logger, log_leval):
     finally:
         logger.setLevel(origin_log_level)
 
+
 def add_file_handler_if_needed(logger, log_file, file_mode, log_level):
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler):
@@ -217,15 +323,49 @@ def add_file_handler_if_needed(logger, log_file, file_mode, log_level):
 
     if is_worker0 and log_file is not None:
         file_handler = logging.FileHandler(log_file, file_mode)
-        file_handler.setFormatter(logger_format)
+        file_handler.setFormatter(ColoredFormatter('%(message)s'))
         file_handler.setLevel(log_level)
         logger.addHandler(file_handler)
+
 
 def _is_local_master():
     local_rank = int(os.getenv('LOCAL_RANK', -1))
     return local_rank in {-1, 0}
 
-log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-
+# Create module-level logger
 logger = get_logger()
-logger._logger.handlers[0].setFormatter(logger_format)
+
+# Test the logger if run directly
+if __name__ == "__main__":
+    test_logger = get_logger()
+
+    test_logger.banner("SUROGATE LOGGER TEST")
+
+    test_logger.info("This is an info message with location")
+    test_logger.debug("This is a debug message for troubleshooting")
+    test_logger.success("Operation completed successfully!")
+    test_logger.warning("This is a warning - pay attention!")
+    test_logger.error("Something went wrong here")
+    test_logger.critical("CRITICAL ERROR - immediate attention required!")
+
+    test_logger.separator()
+
+    test_logger.header("Metrics Section")
+    test_logger.metric("Accuracy", "95.3%")
+    test_logger.metric("Latency", "45", "ms")
+    test_logger.metric("Throughput", "1000", "req/s")
+
+    test_logger.separator()
+
+    test_logger.header("Step-by-Step Process")
+    test_logger.step(1, 5, "Loading dataset...")
+    test_logger.step(2, 5, "Preprocessing data...")
+    test_logger.step(3, 5, "Training model...")
+    test_logger.step(4, 5, "Evaluating results...")
+    test_logger.step(5, 5, "Saving outputs...")
+
+    test_logger.separator(char="═", color=Colors.BRIGHT_GREEN)
+
+    test_logger.highlight("HIGHLIGHTED MESSAGE")
+
+    test_logger.separator()

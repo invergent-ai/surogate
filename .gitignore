@@ -14,3 +14,4 @@ data
 .deepeval
 *.loader
 *.lock
+eval_results/

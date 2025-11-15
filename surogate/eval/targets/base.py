@@ -1,7 +1,7 @@
 # surogate/eval/targets/base.py
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Union
-from dataclasses import dataclass
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -13,7 +13,6 @@ class TargetType(Enum):
     RERANKER = "reranker"
     CLIP = "clip"
     CUSTOM = "custom"
-
 
 
 class ModelProvider(Enum):
@@ -30,24 +29,11 @@ class ModelProvider(Enum):
 
 
 @dataclass
-class TargetResponse:
-    """Standardized response format from any target."""
-    content: str
-    raw_response: Dict[str, Any]
-    metadata: Dict[str, Any]
-    error: Optional[str] = None
-
-    @property
-    def success(self) -> bool:
-        return self.error is None
-
-
-@dataclass
 class TargetRequest:
     """Standardized request format to any target."""
     prompt: Optional[str] = None
     messages: Optional[List[Dict[str, str]]] = None
-    inputs: Optional[Dict[str, Any]] = None
+    inputs: Dict[str, Any] = field(default_factory=dict)
     parameters: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -63,52 +49,65 @@ class TargetRequest:
         return result
 
 
+@dataclass
+class TargetResponse:
+    """Response from a target."""
+    content: str
+    raw_response: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timing: Dict[str, float] = field(default_factory=dict)
+    error: Optional[str] = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None
+
+
 class BaseTarget(ABC):
-    """Abstract base class for all evaluation targets."""
+    """Abstract base class for all targets."""
 
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize target.
 
         Args:
-            config: Target configuration dict
+            config: Target configuration
         """
         self.config = config
-        self.target_type = TargetType(config.get('type'))
         self.name = config.get('name', 'unnamed')
+        self.target_type = TargetType(config.get('type'))
         self._validate_config()
 
-    @abstractmethod
     def _validate_config(self):
-        """Validate target-specific configuration."""
+        """Validate target configuration. Override in subclasses."""
         pass
 
     @abstractmethod
     def send_request(self, request: TargetRequest) -> TargetResponse:
         """
-        Send request to target and get response.
+        Send request to target.
 
         Args:
-            request: Standardized request
+            request: Request to send
 
         Returns:
-            Standardized response
+            Response from target
         """
-        pass
+        raise NotImplementedError("Subclasses must implement send_request")
 
     @abstractmethod
     def health_check(self) -> bool:
-        """Check if target is healthy/accessible."""
-        pass
+        """
+        Check if target is healthy and accessible.
 
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.cleanup()
+        Returns:
+            True if healthy, False otherwise
+        """
+        raise NotImplementedError("Subclasses must implement health_check")
 
     def cleanup(self):
-        """Cleanup resources. Override if needed."""
+        """Cleanup any resources used by target."""
         pass
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}(name={self.name}, type={self.target_type.value})"

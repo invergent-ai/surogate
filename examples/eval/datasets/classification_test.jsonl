@@ -1,0 +1,5 @@
+{"input": "Classify the sentiment as positive, negative, or neutral. Respond with only one word.\n\nText: This movie is amazing!", "expected_output": "positive"}
+{"input": "Classify the sentiment as positive, negative, or neutral. Respond with only one word.\n\nText: Terrible service, never coming back", "expected_output": "negative"}
+{"input": "Classify the sentiment as positive, negative, or neutral. Respond with only one word.\n\nText: It was okay, nothing special", "expected_output": "neutral"}
+{"input": "Classify the sentiment as positive, negative, or neutral. Respond with only one word.\n\nText: Best restaurant ever!", "expected_output": "positive"}
+{"input": "Classify the sentiment as positive, negative, or neutral. Respond with only one word.\n\nText: Worst experience of my life", "expected_output": "negative"}

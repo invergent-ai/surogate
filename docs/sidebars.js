@@ -19,19 +19,54 @@ module.exports = {
         },
         {
             type: 'category',
-            label: 'Datasets',
+            label: 'VLM/LLM Evaluation',
             collapsed: false,
             items: [
                 {
                     type: 'doc',
-                    id: 'datasets/intro',
-                    label: 'Introduction'
+                    id: 'eval/overview',
+                    label: 'Overview'
                 },
                 {
                     type: 'doc',
-                    id: 'datasets/formats',
-                    label: 'Dataset Formats'
-                }
+                    id: 'eval/model-support',
+                    label: 'Model Support'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/datasets',
+                    label: 'Datasets'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/functional-metrics',
+                    label: 'Functional Metrics'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/performance-testing',
+                    label: 'Performance Testing'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/standard-benchmarks',
+                    label: 'Standard Benchmarks'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/third-party-benchmarks',
+                    label: 'Third-Party Benchmarks'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/crafting-configs',
+                    label: 'Crafting Configs'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/results',
+                    label: 'Results & Reporting'
+                },
             ]
         },
         {

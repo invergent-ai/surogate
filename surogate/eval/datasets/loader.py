@@ -57,6 +57,35 @@ class DatasetLoader:
         logger.info(f"✓ Loaded dataset: {len(df)} rows, {len(df.columns)} columns")
         return df
 
+    def detect_dataset_type(self, path: str) -> str:
+        """
+        Detect if dataset is single-turn or multi-turn.
+
+        Args:
+            path: Path to dataset file
+
+        Returns:
+            'single_turn' or 'multi_turn'
+        """
+        df = self.load(path)
+
+        # Check if 'turns' column exists (multi-turn indicator)
+        if 'turns' in df.columns:
+            return 'multi_turn'
+
+        # Check if we have conversation-related columns
+        if 'messages' in df.columns or 'conversation' in df.columns:
+            return 'multi_turn'
+
+        # Check if we have single-turn columns
+        # FIX: Only 'input' is required for single-turn (expected_output is optional)
+        if 'input' in df.columns:
+            return 'single_turn'
+
+        # Default to single-turn (most common case)
+        logger.warning("Could not definitively detect dataset type, defaulting to single_turn")
+        return 'single_turn'
+
     def _load_jsonl(self, path: Path) -> pl.DataFrame:
         """Load JSONL file."""
         try:
@@ -131,9 +160,21 @@ class DatasetLoader:
         input_text = row.get('input')
         expected_output = row.get('expected_output')
 
-        # Extract metadata (all fields except input/expected_output)
-        metadata = {k: v for k, v in row.items()
-                    if k not in ['input', 'expected_output']}
+        # Handle metadata - prioritize explicit 'metadata' field
+        if 'metadata' in row and row['metadata']:
+            # If there's an explicit metadata field, use it
+            metadata = row['metadata']
+            if isinstance(metadata, str):
+                # If metadata is stored as JSON string, parse it
+                try:
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse metadata as JSON: {metadata}")
+                    metadata = {}
+        else:
+            # Otherwise, extract metadata from all other fields
+            metadata = {k: v for k, v in row.items()
+                        if k not in ['input', 'expected_output']}
 
         return TestCase(
             input=input_text,

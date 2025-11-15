@@ -1,6 +1,8 @@
 # surogate/eval/config/parser.py
 import json
 import yaml
+import os
+import re
 from pathlib import Path
 from typing import Dict, Any, Union
 from surogate.utils.logger import get_logger
@@ -50,6 +52,9 @@ class ConfigParser:
             elif self.config_path.suffix in {'.yaml', '.yml'}:
                 self.config = self._parse_yaml()
 
+            # Expand environment variables
+            self.config = self._expand_env_vars(self.config)
+
             logger.info("Config file parsed successfully")
             return self.config
 
@@ -66,6 +71,39 @@ class ConfigParser:
         """Parse YAML configuration file."""
         with open(self.config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
+
+    def _expand_env_vars(self, obj: Any) -> Any:
+        """
+        Recursively expand environment variables in config.
+
+        Supports ${VAR_NAME} syntax.
+
+        Args:
+            obj: Object to process (dict, list, str, or other)
+
+        Returns:
+            Object with environment variables expanded
+        """
+        if isinstance(obj, dict):
+            return {k: self._expand_env_vars(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._expand_env_vars(item) for item in obj]
+        elif isinstance(obj, str):
+            # Match ${VAR_NAME} pattern
+            pattern = r'\$\{([^}]+)\}'
+
+            def replace_env_var(match):
+                var_name = match.group(1)
+                value = os.environ.get(var_name)
+                if value is None:
+                    logger.warning(f"Environment variable not found: {var_name}")
+                    return match.group(0)  # Return original if not found
+                logger.debug(f"Expanded ${{{var_name}}}")
+                return value
+
+            return re.sub(pattern, replace_env_var, obj)
+        else:
+            return obj
 
     def get(self, key: str, default: Any = None) -> Any:
         """

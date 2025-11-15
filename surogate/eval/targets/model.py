@@ -1,4 +1,6 @@
 # surogate/eval/targets/model.py
+import time
+
 import httpx
 from typing import Dict, Any, Optional, List
 from surogate.utils.logger import get_logger
@@ -60,6 +62,10 @@ class APIModelTarget(BaseTarget):
 
     def send_request(self, request: TargetRequest) -> TargetResponse:
         """Send request to API model."""
+        import time
+
+        start_time = time.time()
+
         try:
             # Build request payload
             payload = self._build_payload(request)
@@ -70,14 +76,29 @@ class APIModelTarget(BaseTarget):
 
             # Parse response
             data = response.json()
-            return self._parse_response(data)
+
+            end_time = time.time()
+            total_time = end_time - start_time
+
+            result = self._parse_response(data)
+
+            # Add timing information
+            result.timing = {
+                'total_time': total_time,
+                'start_time': start_time,
+                'end_time': end_time
+            }
+
+            return result
 
         except Exception as e:
             logger.error(f"Error calling model API: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
@@ -219,6 +240,7 @@ class LocalModelTarget(BaseTarget):
     def _generate_transformers(self, request: TargetRequest) -> TargetResponse:
         """Generate using transformers."""
         try:
+            start_time = time.time()
             # Get prompt
             if request.messages:
                 prompt = self.tokenizer.apply_chat_template(
@@ -248,18 +270,27 @@ class LocalModelTarget(BaseTarget):
                 skip_special_tokens=True
             )
 
+            end_time = time.time()
+
             return TargetResponse(
                 content=generated_text,
                 raw_response={'output': generated_text},
-                metadata={'backend': 'transformers'}
+                metadata={'backend': 'transformers'},
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
+                }
             )
 
         except Exception as e:
             logger.error(f"Generation error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
@@ -267,7 +298,7 @@ class LocalModelTarget(BaseTarget):
         """Generate using vLLM."""
         try:
             from vllm import SamplingParams
-
+            start_time = time.time()
             # Get prompt
             if request.messages:
                 # vLLM expects string prompts
@@ -289,20 +320,30 @@ class LocalModelTarget(BaseTarget):
             outputs = self.model.generate([prompt], sampling_params)
             generated_text = outputs[0].outputs[0].text
 
+            end_time = time.time()
+
             return TargetResponse(
                 content=generated_text,
                 raw_response={'output': generated_text},
-                metadata={'backend': 'vllm'}
+                metadata={'backend': 'vllm'},
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
+                }
             )
 
         except Exception as e:
             logger.error(f"Generation error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
+
 
     def health_check(self) -> bool:
         """Check if model is loaded."""
@@ -369,9 +410,12 @@ class EmbeddingTarget(BaseTarget):
         elif self.provider == 'local':
             return self._embed_local(request)
 
+    # surogate/eval/targets/model.py - Update _embed_openai method
+
     def _embed_openai(self, request: TargetRequest) -> TargetResponse:
         """Get embeddings from OpenAI."""
         try:
+            start_time = time.time()
             text = request.prompt or request.inputs.get('text')
 
             response = self.client.post(
@@ -384,39 +428,65 @@ class EmbeddingTarget(BaseTarget):
             response.raise_for_status()
             data = response.json()
 
+            end_time = time.time()
+
             embedding = data['data'][0]['embedding']
 
             return TargetResponse(
                 content=str(embedding),
                 raw_response=data,
-                metadata={'dimension': len(embedding)}
+                metadata={
+                    'embedding': embedding,  # ← ADD THIS!
+                    'dimension': len(embedding),
+                    'usage': data.get('usage', {})
+                },
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
+                }
             )
         except Exception as e:
             logger.error(f"OpenAI embedding error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
     def _embed_local(self, request: TargetRequest) -> TargetResponse:
         """Get embeddings from local model."""
         try:
+            start_time = time.time()
             text = request.prompt or request.inputs.get('text')
             embedding = self.model_obj.encode(text)
+
+            end_time = time.time()
 
             return TargetResponse(
                 content=str(embedding.tolist()),
                 raw_response={'embedding': embedding.tolist()},
-                metadata={'dimension': len(embedding)}
+                metadata={
+                    'embedding': embedding.tolist(),  # ← ADD THIS!
+                    'dimension': len(embedding)
+                },
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
+                }
             )
         except Exception as e:
             logger.error(f"Local embedding error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
@@ -521,6 +591,9 @@ class RerankerTarget(BaseTarget):
 
     def _rerank_cohere(self, request: TargetRequest) -> TargetResponse:
         """Rerank using Cohere API."""
+        import time
+        start_time = time.time()
+
         try:
             query = request.inputs.get('query')
             documents = request.inputs.get('documents')
@@ -537,6 +610,8 @@ class RerankerTarget(BaseTarget):
             )
             response.raise_for_status()
             data = response.json()
+
+            end_time = time.time()
 
             # Extract reranked results
             results = data.get('results', [])
@@ -556,19 +631,29 @@ class RerankerTarget(BaseTarget):
                     'num_results': len(results),
                     'top_n': top_n,
                     'provider': 'cohere'
+                },
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
                 }
             )
         except Exception as e:
             logger.error(f"Cohere reranking error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
     def _rerank_openai_compatible(self, request: TargetRequest) -> TargetResponse:
         """Rerank using OpenAI-compatible API (Gemini, Qwen, etc.)."""
+        import time
+        start_time = time.time()
+
         try:
             query = request.inputs.get('query')
             documents = request.inputs.get('documents')
@@ -586,6 +671,8 @@ class RerankerTarget(BaseTarget):
             )
             response.raise_for_status()
             data = response.json()
+
+            end_time = time.time()
 
             # Parse response (try both Cohere and custom formats)
             results = data.get('results', data.get('data', []))
@@ -614,19 +701,29 @@ class RerankerTarget(BaseTarget):
                     'num_results': len(reranked_docs),
                     'top_n': top_n,
                     'provider': self.provider
+                },
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
                 }
             )
         except Exception as e:
             logger.error(f"OpenAI-compatible reranking error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
     def _rerank_local(self, request: TargetRequest) -> TargetResponse:
         """Rerank using local model."""
+        import time
+        start_time = time.time()
+
         try:
             query = request.inputs.get('query')
             documents = request.inputs.get('documents')
@@ -651,6 +748,8 @@ class RerankerTarget(BaseTarget):
                 for idx in ranked_indices[:top_n]
             ]
 
+            end_time = time.time()
+
             return TargetResponse(
                 content=str(reranked_docs),
                 raw_response={'results': reranked_docs},
@@ -658,14 +757,21 @@ class RerankerTarget(BaseTarget):
                     'num_results': len(reranked_docs),
                     'top_n': top_n,
                     'provider': 'local'
+                },
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
                 }
             )
         except Exception as e:
             logger.error(f"Local reranking error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
@@ -738,6 +844,9 @@ class CLIPTarget(BaseTarget):
 
     def _process_openai(self, request: TargetRequest) -> TargetResponse:
         """Process using OpenAI CLIP API."""
+        import time
+        start_time = time.time()
+
         try:
             # OpenAI doesn't have a direct CLIP API, use embeddings endpoint
             text = request.inputs.get('text')
@@ -752,24 +861,36 @@ class CLIPTarget(BaseTarget):
             response.raise_for_status()
             data = response.json()
 
+            end_time = time.time()
+
             embedding = data['data'][0]['embedding']
 
             return TargetResponse(
                 content=str(embedding),
                 raw_response=data,
-                metadata={'dimension': len(embedding)}
+                metadata={'dimension': len(embedding)},
+                timing={
+                    'total_time': end_time - start_time,
+                    'start_time': start_time,
+                    'end_time': end_time
+                }
             )
         except Exception as e:
             logger.error(f"OpenAI CLIP error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
     def _process_local(self, request: TargetRequest) -> TargetResponse:
         """Process using local CLIP model."""
+        import time
+        start_time = time.time()
+
         try:
             from PIL import Image
             import torch
@@ -795,10 +916,17 @@ class CLIPTarget(BaseTarget):
                 logits_per_image = outputs.logits_per_image
                 probs = logits_per_image.softmax(dim=1)
 
+                end_time = time.time()
+
                 return TargetResponse(
                     content=str(probs.tolist()),
                     raw_response={'probabilities': probs.tolist()},
-                    metadata={'task': 'similarity'}
+                    metadata={'task': 'similarity'},
+                    timing={
+                        'total_time': end_time - start_time,
+                        'start_time': start_time,
+                        'end_time': end_time
+                    }
                 )
 
             elif task == 'embed_text':
@@ -807,10 +935,17 @@ class CLIPTarget(BaseTarget):
                 inputs = self.processor(text=[text], return_tensors="pt", padding=True)
                 text_features = self.model_obj.get_text_features(**inputs)
 
+                end_time = time.time()
+
                 return TargetResponse(
                     content=str(text_features.tolist()),
                     raw_response={'embedding': text_features.tolist()},
-                    metadata={'task': 'embed_text', 'dimension': text_features.shape[-1]}
+                    metadata={'task': 'embed_text', 'dimension': text_features.shape[-1]},
+                    timing={
+                        'total_time': end_time - start_time,
+                        'start_time': start_time,
+                        'end_time': end_time
+                    }
                 )
 
             elif task == 'embed_image':
@@ -822,10 +957,17 @@ class CLIPTarget(BaseTarget):
                 inputs = self.processor(images=image, return_tensors="pt")
                 image_features = self.model_obj.get_image_features(**inputs)
 
+                end_time = time.time()
+
                 return TargetResponse(
                     content=str(image_features.tolist()),
                     raw_response={'embedding': image_features.tolist()},
-                    metadata={'task': 'embed_image', 'dimension': image_features.shape[-1]}
+                    metadata={'task': 'embed_image', 'dimension': image_features.shape[-1]},
+                    timing={
+                        'total_time': end_time - start_time,
+                        'start_time': start_time,
+                        'end_time': end_time
+                    }
                 )
 
             else:
@@ -833,10 +975,12 @@ class CLIPTarget(BaseTarget):
 
         except Exception as e:
             logger.error(f"Local CLIP error: {e}")
+            end_time = time.time()
             return TargetResponse(
                 content="",
                 raw_response={},
                 metadata={},
+                timing={'total_time': end_time - start_time},
                 error=str(e)
             )
 
