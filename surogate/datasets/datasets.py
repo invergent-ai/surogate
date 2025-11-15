@@ -19,12 +19,12 @@ from surogate.utils.schema.enums import SurogateDatasetType
 logger = get_logger()
 
 
-def load_datasets(cfg: DictDefault) -> Dataset | IterableDataset:
+def load_datasets(cfg: DictDefault, args: DictDefault) -> Dataset | IterableDataset:
     # Prepare datasets (with file locking logic for multiple ranks)
     loader = FileLockLoader(cfg)
     try:
         disable_caching()
-        dataset = loader.load(lambda: _load_and_prepare_datasets(cfg))
+        dataset = loader.load(lambda: _load_and_prepare_datasets(cfg, args))
     finally:
         loader.cleanup()
         enable_caching()
@@ -32,12 +32,12 @@ def load_datasets(cfg: DictDefault) -> Dataset | IterableDataset:
     return dataset
 
 
-def _load_and_prepare_datasets(cfg: DictDefault) -> Dataset | IterableDataset:
+def _load_and_prepare_datasets(cfg: DictDefault, args: DictDefault) -> Dataset | IterableDataset:
     datasets_configs = cfg.get('datasets')
     datasets = []
     for dataset_config in datasets_configs:
         dataset_wrapper = _load_and_prepare_single_dataset(
-            cfg, dataset_config
+            cfg, args, dataset_config
         )
         datasets.append(dataset_wrapper)
 
@@ -46,9 +46,9 @@ def _load_and_prepare_datasets(cfg: DictDefault) -> Dataset | IterableDataset:
     return dataset
 
 
-def _load_and_prepare_single_dataset(cfg: DictDefault, ds_cfg: SurogateDataset) -> Dataset | IterableDataset:
+def _load_and_prepare_single_dataset(cfg: DictDefault, args: DictDefault, ds_cfg: SurogateDataset) -> Dataset | IterableDataset:
     dataset = load_dataset_with_config(
-        ds_cfg, False
+        ds_cfg, args
     )
 
     if isinstance(dataset, (DatasetDict, IterableDatasetDict)):

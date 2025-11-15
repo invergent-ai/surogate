@@ -4,6 +4,7 @@ from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict,
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, HFValidationError
 
+from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 from surogate.utils.schema.datasets import BaseDataset
 
@@ -24,7 +25,7 @@ EXTENSIONS_TO_DATASET_TYPES = {
 
 def load_dataset_with_config(
         dataset_config: BaseDataset,
-        use_auth_token: bool,
+        args: DictDefault,
         streaming=False
 ) -> Dataset | IterableDataset:
     load_dataset_kwargs = {
@@ -38,9 +39,9 @@ def load_dataset_with_config(
     if Path(dataset_config.path).exists():
         return _load_from_local_path(dataset_config, load_dataset_kwargs)
 
-    is_hub_dataset = _check_if_hub_dataset(dataset_config, use_auth_token)
+    is_hub_dataset = _check_if_hub_dataset(dataset_config, args)
     if is_hub_dataset:
-        return _load_from_hub(dataset_config, use_auth_token, load_dataset_kwargs)
+        return _load_from_hub(dataset_config, args, load_dataset_kwargs)
 
     remote_fs, storage_options = _get_remote_filesystem(dataset_config.path)
     is_cloud_dataset = False
@@ -63,13 +64,13 @@ def load_dataset_with_config(
         f"This is not caused by the dataset type."
     )
 
-def _check_if_hub_dataset(dataset_config: BaseDataset, use_auth_token: bool) -> bool:
+def _check_if_hub_dataset(dataset_config: BaseDataset, args: DictDefault) -> bool:
     """Check if a dataset exists on the HuggingFace Hub."""
     try:
         snapshot_download(
             repo_id=dataset_config.path,
             repo_type="dataset",
-            token=use_auth_token,
+            token=args['hub_token'],
             ignore_patterns=["*"],
         )
         return True
@@ -107,12 +108,12 @@ def _load_from_local_path(
         )
 
 def _load_from_hub(
-        dataset_config: BaseDataset, use_auth_token: bool, load_dataset_kwargs: dict
+        dataset_config: BaseDataset, args: DictDefault, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from the HuggingFace Hub."""
     return load_dataset(
         dataset_config.path,
-        token=use_auth_token,
+        token=args['hub_token'],
         **load_dataset_kwargs,
     )
 

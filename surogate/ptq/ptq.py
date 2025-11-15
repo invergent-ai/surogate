@@ -73,11 +73,11 @@ class SurogatePtq(SurogateCommand):
         random.seed(self.seed)
         np.random.seed(self.seed)
 
-        self.model, self.tokenizer = load_model_and_tokenizer(self.config)
+        self.model, self.tokenizer = load_model_and_tokenizer(self.config, self.args)
 
         calibration_dataset = None
         if self.scheme in ['gptq_int4', 'gptq_int8', 'awq', 'nvfp4']:
-            calibration_dataset = load_datasets(self.config)
+            calibration_dataset = load_datasets(self.config, self.args)
             calibration_dataset = tokenize_dataset(
                 PromptTokenizingStrategy(
                     tokenizer=self.tokenizer,

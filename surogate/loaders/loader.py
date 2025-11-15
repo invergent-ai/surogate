@@ -23,7 +23,7 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 
-def load_model_and_tokenizer(cfg: DictDefault) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
+def load_model_and_tokenizer(cfg: DictDefault, args: DictDefault) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
     model_id = cfg.get('model')
     if model_id is None:
         raise ValueError("'model' must be specified in config.")
@@ -38,7 +38,7 @@ def load_model_and_tokenizer(cfg: DictDefault) -> Tuple[Optional[PreTrainedModel
     model, tokenizer = get_model_and_tokenizer(
         model_id,
         use_hf=True,
-        hub_token=None,
+        hub_token=args.get('hub_token'),
         load_model=model_id is not None,
         new_special_tokens=additional_special_tokens,
         model_type=cfg.get('model_type'),
