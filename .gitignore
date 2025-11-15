@@ -15,3 +15,4 @@ data
 *.loader
 *.lock
 eval_results/
+.deepteam

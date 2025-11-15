@@ -219,62 +219,62 @@ Key Design Principles:
 - ✅ Tool-use benchmarking - EvalScope - surogate/eval/benchmarks/generic.py
 ---
 
-### TODO 8. Red-Teaming & Security
+### ✅ 8. Red-Teaming & Security
 
-#### TODO 8.1 Adversarial Attacks
-- TODO Single-turn attacks - DeepTeam
-- TODO Multi-turn attacks - DeepTeam
-- TODO Jailbreak attempts - DeepTeam, DeepEval
-- TODO Prompt injection - DeepTeam, DeepEval
-- TODO Role-play attacks - DeepTeam
-- TODO Gradual escalation - DeepTeam
-- TODO Context manipulation - DeepTeam
+#### ✅ 8.1 Adversarial Attacks
+- ✅ Single-turn attacks - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
+- ✅ Multi-turn attacks - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
+- ✅ Jailbreak attempts - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
+- ✅ Prompt injection - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
+- ✅ Role-play attacks - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
+- ✅ Gradual escalation - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
+- ✅ Context manipulation - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/base.py
 
-#### TODO 8.2 Vulnerability Scanning
-- TODO Data Privacy vulnerabilities - DeepTeam, DeepEval
-- TODO PII leakage detection - DeepTeam, DeepEval
-- TODO Prompt leakage - DeepTeam, DeepEval
-- TODO Bias detection - DeepTeam, DeepEval
-- TODO Toxicity detection - DeepTeam, DeepEval
-- TODO Misinformation susceptibility - DeepTeam, DeepEval
-- TODO Illegal activity prompting - DeepTeam, DeepEval
-- TODO Personal safety threats - DeepTeam, DeepEval
-- TODO Unauthorized access - DeepTeam, DeepEval
-- TODO Intellectual property leakage - DeepTeam, DeepEval
-- TODO Graphic content generation - DeepTeam, DeepEval
-- TODO Competitive information leakage - DeepTeam, DeepEval
-- TODO Robustness testing - DeepTeam
-- TODO Custom vulnerability definition - DeepTeam
+#### ✅ 8.2 Vulnerability Scanning
+- ✅ Data Privacy vulnerabilities - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ PII leakage detection - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Prompt leakage - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Bias detection - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Toxicity detection - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Misinformation susceptibility - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Illegal activity prompting - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Personal safety threats - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Unauthorized access - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Intellectual property leakage - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Graphic content generation - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Competitive information leakage - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Robustness testing - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
+- ✅ Custom vulnerability definition - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/red_team.py
 
-#### TODO 8.3 Risk Assessment
-- TODO Risk scoring - DeepTeam
-- TODO Severity classification - DeepTeam
-- TODO Attack success rate tracking - DeepTeam
-- TODO Vulnerability reporting - DeepTeam
+#### ✅ 8.3 Risk Assessment
+- ✅ Risk scoring - DeepTeam - surogate/eval/security/risk_assessment.py, surogate/eval/security/red_team.py
+- ✅ Severity classification - DeepTeam - surogate/eval/security/risk_assessment.py, surogate/eval/security/base.py
+- ✅ Attack success rate tracking - DeepTeam - surogate/eval/security/risk_assessment.py, surogate/eval/security/red_team.py
+- ✅ Vulnerability reporting - DeepTeam - surogate/eval/security/risk_assessment.py, surogate/eval/eval.py
 
 ---
 
-### TODO 9. Guardrails
+### ✅ 9. Guardrails
 
-#### TODO 9.1 Input Guardrails
-- TODO Input validation - DeepTeam
-- TODO Content filtering - DeepTeam
-- TODO PII detection and redaction - DeepTeam
-- TODO Prompt injection detection - DeepTeam
+#### ✅ 9.1 Input Guardrails
+- ✅ Input validation - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/guardrails.py
+- ✅ Content filtering - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
+- ✅ PII detection and redaction - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
+- ✅ Prompt injection detection - DeepTeam - surogate/eval/security/red_team.py, surogate/eval/security/guardrails.py
 
-#### TODO 9.2 Output Guardrails
-- TODO Output filtering - DeepTeam
-- TODO Toxicity filtering - DeepTeam
-- TODO PII filtering - DeepTeam
-- TODO Hallucination detection - DeepTeam
-- TODO Factuality checking - DeepTeam
+#### ✅ 9.2 Output Guardrails
+- ✅ Output filtering - DeepTeam - surogate/eval/security/guardrails.py
+- ✅ Toxicity filtering - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
+- ✅ PII filtering - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
+- ✅ Hallucination detection - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
+- ✅ Factuality checking - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
 
-#### TODO 9.3 Runtime Guardrails
-- TODO Rate limiting - DeepTeam
-- TODO Content moderation - DeepTeam
+#### ✅ 9.3 Runtime Guardrails
+- ✅ Rate limiting - Built-in - surogate/eval/metrics/stress.py
+- ✅ Content moderation - DeepTeam - surogate/eval/security/guardrails.py, surogate/eval/security/vulnerabilities.py
 
-#### TODO 9.4 Custom Guards
-- TODO Custom guard framework - DeepTeam
+#### ✅ 9.4 Custom Guards
+- ✅ Custom guard framework - DeepTeam - surogate/eval/security/vulnerabilities.py, surogate/eval/security/guardrails.py
 
 ---
 

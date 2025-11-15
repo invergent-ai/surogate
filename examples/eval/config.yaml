@@ -10,6 +10,8 @@
 # - Stress testing for local deployments
 # - Standard academic benchmarks
 # - Vision-language model evaluation
+# - Red teaming (security testing)
+# - Guardrails (refusal behavior testing)
 # ==============================================================================
 
 project:
@@ -208,26 +210,55 @@ targets:
             type: token_generation_speed
             min_tokens_per_sec: 18  # Higher speed for short responses
 
-    # RED TEAMING (not yet implemented)
+    # RED TEAMING
     # Purpose: Test model robustness against adversarial attacks
+    # Tests: Can attacks break the model and extract harmful content?
     red_teaming:
       enabled: false
+      vulnerabilities:
+        - toxicity             # Generate toxic content
+        - prompt_leakage       # Reveal system prompt
+      vulnerability_types:
+        toxicity: [profanity, insults]
+        prompt_leakage: [instructions]
       attacks:
-        - type: jailbreak       # Attempts to bypass safety measures
-          num_attempts: 10
-        - type: prompt_injection  # Attempts to inject malicious instructions
-          num_attempts: 10
+        - prompt_injection     # Override instructions
+        - roleplay             # Scenario-based attacks
+      attacks_per_vulnerability: 2
+      max_concurrent: 3
+      simulator_model: gpt-3.5-turbo
+      evaluation_model: gpt-4o-mini
+      purpose: "GPT-4 production assistant"
 
-    # GUARDRAILS (not yet implemented)
-    # Purpose: Filter inputs/outputs for safety and compliance
+    # GUARDRAILS
+    # Purpose: Test model refusal behavior
+    # Tests: Does model refuse harmful requests properly?
     guardrails:
       enabled: false
-      input_guards:            # Pre-process user inputs
-        - type: pii_detection  # Detect personally identifiable information
-        - type: prompt_injection_detection
-      output_guards:           # Post-process model outputs
-        - type: toxicity_filter  # Block toxic responses
-        - type: pii_filter     # Redact PII from outputs
+      # Reuse vulnerabilities from red teaming
+      vulnerabilities:
+        - toxicity
+        - prompt_leakage
+      vulnerability_types:
+        toxicity: [profanity, insults]
+        prompt_leakage: [instructions]
+      attacks:
+        - prompt_injection
+        - roleplay
+      attacks_per_vulnerability: 2
+
+      # Safe prompts for false positive testing
+      safe_prompts_dataset: examples/eval/datasets/safe_prompts.jsonl
+
+      # Use judge for refusal detection
+      refusal_judge_model:
+        target: judge-gpt4
+
+      # Execution config
+      max_concurrent: 3
+      simulator_model: gpt-3.5-turbo
+      evaluation_model: gpt-4o-mini
+      purpose: "GPT-4 production assistant"
 
   # ============================================================================
   # TARGET 2: Claude 3.5 Sonnet via OpenRouter
@@ -590,11 +621,44 @@ targets:
     # No regular evaluations - stress testing only
     evaluations: []
 
+    # RED TEAMING - Test security under stress
     red_teaming:
       enabled: false
+      vulnerabilities:
+        - toxicity
+        - prompt_leakage
+      vulnerability_types:
+        toxicity: [profanity, insults]
+        prompt_leakage: [instructions]
+      attacks:
+        - prompt_injection
+        - roleplay
+      attacks_per_vulnerability: 2
+      max_concurrent: 3
+      simulator_model: gpt-3.5-turbo
+      evaluation_model: gpt-4o-mini
+      purpose: "Qwen-3 0.6B local assistant"
 
+    # GUARDRAILS - Test refusal behavior
     guardrails:
       enabled: false
+      vulnerabilities:
+        - toxicity
+        - prompt_leakage
+      vulnerability_types:
+        toxicity: [profanity, insults]
+        prompt_leakage: [instructions]
+      attacks:
+        - prompt_injection
+        - roleplay
+      attacks_per_vulnerability: 2
+      safe_prompts_dataset: examples/eval/datasets/safe_prompts.jsonl
+      refusal_judge_model:
+        target: judge-gpt4
+      max_concurrent: 3
+      simulator_model: gpt-3.5-turbo
+      evaluation_model: gpt-4o-mini
+      purpose: "Qwen-3 0.6B local assistant"
 
   # ============================================================================
   # TARGET 7: Local vLLM - Progressive Stress Test
@@ -652,7 +716,7 @@ targets:
   # TARGET 8: Local vLLM - Duration-Based Stress Test
   # Purpose: Sustained load testing for stability validation
   # Use case: Long-running stability test, memory leak detection
-  # Expected: Stable performance over 1 minute, <2% failure rate
+  # Expected: Stable performance over 1 minute, under 2% failure rate
   # ============================================================================
   - name: vllm-qwen3-sustained
     type: llm
@@ -1217,6 +1281,17 @@ targets:
           #   # F1: Harmonic mean of precision and recall
           #   # Best for: Imbalanced datasets
 
+  # ============================================================================
+  # JUDGE MODEL: GPT-4 for Guardrails Evaluation
+  # Purpose: Unbiased judge for refusal detection
+  # Use case: Evaluate whether models properly refuse harmful requests
+  # ============================================================================
+  - name: judge-gpt4
+    type: llm
+    provider: openai
+    model: gpt-4o-mini
+    api_key: ${OPENAI_API_KEY}
+
 # ==============================================================================
 # USAGE GUIDE
 # ==============================================================================
@@ -1226,6 +1301,10 @@ targets:
 #
 # RUN SPECIFIC TARGET:
 #   surogate eval --config examples/eval/test_config.yaml --target openrouter-gpt4
+#
+# RUN SECURITY TESTING:
+#   # Enable red_teaming and/or guardrails in target, then:
+#   surogate eval --config examples/eval/test_config.yaml --target vllm-qwen3-local
 #
 # VIEW RESULTS:
 #   surogate eval --list                    # List all results
@@ -1258,6 +1337,7 @@ targets:
 #   - Single target, single eval: ~2-3 minutes
 #   - Multiple targets: ~10-20 minutes
 #   - Full benchmark suite: ~30-60 minutes
+#   - Red teaming + guardrails: ~5-10 minutes
 #   - Without limits: 2-8 hours
 #
 # RESULTS LOCATION:

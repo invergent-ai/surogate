@@ -120,11 +120,31 @@ RED_TEAMING_SCHEMA = {
     "type": "object",
     "properties": {
         "enabled": {"type": "boolean"},
-        "attacks": {"type": "array"},
-        "attack_types": {"type": "object"},
-        "vulnerabilities": {"type": "object"},
-        "risk_assessment": {"type": "object"}
-    }
+        "vulnerabilities": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "vulnerability_types": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "array",
+                "items": {"type": "string"}
+            }
+        },
+        "attacks": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "attacks_per_vulnerability": {"type": "integer", "minimum": 1},
+        "max_concurrent": {"type": "integer", "minimum": 1},
+        "run_async": {"type": "boolean"},
+        "simulator_model": {"type": "string"},
+        "evaluation_model": {"type": "string"},
+        # REMOVED: output_folder and save_results (not needed anymore)
+        "purpose": {"type": "string"},
+        "ignore_errors": {"type": "boolean"}
+    },
+    "required": []
 }
 
 
@@ -135,13 +155,45 @@ GUARDRAILS_SCHEMA = {
     "type": "object",
     "properties": {
         "enabled": {"type": "boolean"},
-        "input_guards": {"type": "array"},
-        "output_guards": {"type": "array"},
-        "pre_processing": {"type": "array"},
-        "post_processing": {"type": "array"},
-        "runtime": {"type": "object"},
-        "custom_guards": {"type": "array"}
-    }
+
+        # Test harmful prompts (reuse red-teaming)
+        "vulnerabilities": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "vulnerability_types": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "array",
+                "items": {"type": "string"}
+            }
+        },
+        "attacks": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "attacks_per_vulnerability": {"type": "integer", "minimum": 1},
+
+        # Test safe prompts
+        "safe_prompts_dataset": {"type": "string"},
+
+        # Refusal detection
+        "refusal_judge_model": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string"}
+            },
+            "required": ["target"]
+        },
+
+        # Execution
+        "max_concurrent": {"type": "integer", "minimum": 1},
+        "simulator_model": {"type": "string"},
+        "evaluation_model": {"type": "string"},
+        "purpose": {"type": "string"},
+        "ignore_errors": {"type": "boolean"}
+    },
+    "required": []
 }
 
 # Stress testing schema (NEW)

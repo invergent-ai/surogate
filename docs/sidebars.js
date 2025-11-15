@@ -59,6 +59,16 @@ module.exports = {
                 },
                 {
                     type: 'doc',
+                    id: 'eval/red-teaming',
+                    label: 'Red Teaming & Security'
+                },
+                {
+                    type: 'doc',
+                    id: 'eval/guardrails',
+                    label: 'Guardrails'
+                },
+                {
+                    type: 'doc',
                     id: 'eval/crafting-configs',
                     label: 'Crafting Configs'
                 },
