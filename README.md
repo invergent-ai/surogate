@@ -115,7 +115,7 @@ sh requirements/raw-deps.sh
 uv pip install -r requirements/torch29.txt
 uv pip install -r requirements/build.txt
 uv pip install -r requirements/common.txt
-uv pip install -r requirements/cuda.txt
+MAX_JOBS=8 uv pip install -r requirements/cuda.txt
 
 # install sgl-kernel
 
