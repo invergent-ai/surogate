@@ -36,6 +36,7 @@ lm-eval==0.4.9.1
 immutabledict==4.2.2
 binpacking
 tensorboard
+matplotlib
 
 # sglang
 pybase64
