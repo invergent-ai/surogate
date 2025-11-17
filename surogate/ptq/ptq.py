@@ -22,11 +22,6 @@ loguru_logger.add(sys.stderr, level="ERROR")
 
 PythonLogger._global_file_sink_id = "null"
 
-try:
-    from huggingface_hub import snapshot_download
-except ImportError:
-    snapshot_download = None
-
 logger = get_logger()
 
 RAND_SEED = 1234

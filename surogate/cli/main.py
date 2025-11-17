@@ -21,6 +21,11 @@ def parse_args():
     serve.add_argument('--hub_token', type=str, help='Hugging Face/Modelscope token for private model access',
                        default=None)
 
+    sft = subparsers.add_parser('serve', help="Supervised Fine-Tuning (SFT)")
+    serve.add_argument('--config', type=str, required=True, help='Path to config file')
+    serve.add_argument('--hub_token', type=str, help='Hugging Face/Modelscope token for private model access',
+                       default=None)
+
     # Eval command with multiple operation modes
     eval_parser = subparsers.add_parser('eval', help="Evaluate a model using surogate eval module")
     eval_parser.add_argument('--config', type=str, help='Path to config file (required for run mode)')
@@ -33,12 +38,17 @@ def parse_args():
     # PTQ command
     ptq = subparsers.add_parser('ptq', help="Post-training quantization")
     ptq.add_argument('--config', type=str, required=True, help='Path to config file')
-    ptq.add_argument('--hub_token', type=str, help='Hugging Face/Modelscope token for private model access',
+    ptq.add_argument('--hub_token', type=str, help='Hugging Face token for private model access',
                      default=None)
 
     args = parser.parse_args(sys.argv[1:])
 
     if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    commands_with_config = ['serve', 'pretrain', 'ptq', 'sft']
+    if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
         sys.exit(1)
 
@@ -115,6 +125,11 @@ def cli_main():
         from surogate.ptq.ptq import SurogatePtq
         logger.info(f"Running PTQ with config {args.config}")
         SurogatePtq(**args.__dict__).run()
+
+    elif args.command == 'sft':
+        from surogate.sft.sft import SurogateSFT
+        logger.info(f"Starting SFT with config {args.config}")
+        SurogateSFT(**args.__dict__).run()
 
 
 if __name__ == '__main__':
