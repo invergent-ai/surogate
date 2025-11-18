@@ -21,11 +21,6 @@ def parse_args():
     serve.add_argument('--hub_token', type=str, help='Hugging Face/Modelscope token for private model access',
                        default=None)
 
-    sft = subparsers.add_parser('serve', help="Supervised Fine-Tuning (SFT)")
-    serve.add_argument('--config', type=str, required=True, help='Path to config file')
-    serve.add_argument('--hub_token', type=str, help='Hugging Face/Modelscope token for private model access',
-                       default=None)
-
     # Eval command with multiple operation modes
     eval_parser = subparsers.add_parser('eval', help="Evaluate a model using surogate eval module")
     eval_parser.add_argument('--config', type=str, help='Path to config file (required for run mode)')

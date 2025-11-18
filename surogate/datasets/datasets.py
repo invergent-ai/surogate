@@ -1,30 +1,30 @@
 import os
 from contextlib import contextmanager
+from typing import List
 
 from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, interleave_datasets, disable_caching, \
     enable_caching
-from transformers import PreTrainedTokenizerBase
 
+from surogate.config.dataset_config import DatasetConfig, ConversationDatasetConfig, InstructionDatasetConfig, \
+    TextDatasetConfig
+from surogate.config.enums import SurogateDatasetType
 from surogate.datasets.conversation import ConversationPreprocessor
 from surogate.datasets.instruction import InstructionPreprocessor
 from surogate.datasets.loader import load_dataset_with_config
 from surogate.datasets.lock import FileLockLoader
 from surogate.datasets.text import TextPreprocessor
-from surogate.datasets.tokenization import drop_empty_rows
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
-from surogate.utils.schema.datasets import SurogateDataset, InstructionDataset, ConversationDataset, TextDataset
-from surogate.utils.schema.enums import SurogateDatasetType
 
 logger = get_logger()
 
 
-def load_datasets(cfg: DictDefault, args: DictDefault) -> Dataset | IterableDataset:
+def load_datasets(cfg: List[DatasetConfig], args: DictDefault, temp_path: str, seed: int) -> Dataset | IterableDataset:
     # Prepare datasets (with file locking logic for multiple ranks)
-    loader = FileLockLoader(cfg)
+    loader = FileLockLoader(temp_path)
     try:
         disable_caching()
-        dataset = loader.load(lambda: _load_and_prepare_datasets(cfg, args))
+        dataset = loader.load(lambda: _load_and_prepare_datasets(cfg, args, seed))
     finally:
         loader.cleanup()
         enable_caching()
@@ -32,24 +32,19 @@ def load_datasets(cfg: DictDefault, args: DictDefault) -> Dataset | IterableData
     return dataset
 
 
-def _load_and_prepare_datasets(cfg: DictDefault, args: DictDefault) -> Dataset | IterableDataset:
-    datasets_configs = cfg.get('datasets')
+def _load_and_prepare_datasets(cfg: List[DatasetConfig], args: DictDefault, seed: int) -> Dataset | IterableDataset:
     datasets = []
-    for dataset_config in datasets_configs:
-        dataset_wrapper = _load_and_prepare_single_dataset(
-            cfg, args, dataset_config
-        )
+    for dataset_config in cfg:
+        dataset_wrapper = _load_and_prepare_single_dataset(args, dataset_config)
         datasets.append(dataset_wrapper)
 
-    dataset = merge_datasets(datasets, cfg)
+    dataset = merge_datasets(datasets, seed)
 
     return dataset
 
 
-def _load_and_prepare_single_dataset(cfg: DictDefault, args: DictDefault, ds_cfg: SurogateDataset) -> Dataset | IterableDataset:
-    dataset = load_dataset_with_config(
-        ds_cfg, args
-    )
+def _load_and_prepare_single_dataset(args: DictDefault, ds_cfg: DatasetConfig) -> Dataset | IterableDataset:
+    dataset = load_dataset_with_config(ds_cfg, args)
 
     if isinstance(dataset, (DatasetDict, IterableDatasetDict)):
         if ds_cfg.split and ds_cfg.split in dataset:
@@ -63,51 +58,48 @@ def _load_and_prepare_single_dataset(cfg: DictDefault, args: DictDefault, ds_cfg
     if ds_cfg.samples:
         dataset = dataset.select(range(min(dataset.num_rows, ds_cfg.samples)))
 
-    return wrap_dataset(
-        cfg=cfg,
-        ds_cfg=ds_cfg,
-        dataset=dataset,
-    )
+    return wrap_dataset(ds_cfg=ds_cfg, dataset=dataset)
 
 
-def wrap_dataset(
-        cfg: DictDefault,
-        ds_cfg: SurogateDataset,
-        dataset: Dataset | IterableDataset
-) -> Dataset | IterableDataset:
+def wrap_dataset(ds_cfg: DatasetConfig, dataset: Dataset | IterableDataset) -> Dataset | IterableDataset:
     ds_columns = dataset.column_names
+    ds_cfg.validate_columns(ds_columns)
+
     if ds_cfg.type == SurogateDatasetType.conversation:
-        ConversationDataset.validate_fields(ds_cfg, ds_columns)
-        processor = ConversationPreprocessor(cfg, ds_cfg)
+        ds_cfg = ds_cfg if isinstance(ds_cfg, ConversationDatasetConfig) else ConversationDatasetConfig(
+            **ds_cfg.__dict__)
+        processor = ConversationPreprocessor(ds_cfg)
     elif ds_cfg.type == SurogateDatasetType.instruction:
-        InstructionDataset.validate_fields(ds_cfg, ds_columns)
-        processor = InstructionPreprocessor(cfg, ds_cfg)
+        ds_cfg = ds_cfg if isinstance(ds_cfg, InstructionDatasetConfig) else InstructionDatasetConfig(
+            **ds_cfg.__dict__)
+        processor = InstructionPreprocessor(ds_cfg)
     elif ds_cfg.type == SurogateDatasetType.text:
-        TextDataset.validate_fields(ds_cfg, ds_columns)
-        processor = TextPreprocessor(cfg, ds_cfg)
+        ds_cfg = ds_cfg if isinstance(ds_cfg, TextDatasetConfig) else TextDatasetConfig(
+            **ds_cfg.__dict__)
+        processor = TextPreprocessor(ds_cfg)
     else:
         raise ValueError(f"Unsupported dataset type: {ds_cfg.type}")
 
     return processor(dataset, num_proc=get_default_process_count(), load_from_cache_file=False, strict=False)
 
 
-def merge_datasets(datasets: list[Dataset], cfg: DictDefault) -> Dataset:
+def merge_datasets(datasets: list[Dataset], seed: int) -> Dataset:
     """Merge multiple datasets into one with optional shuffling.
 
     Args:
         datasets: List of datasets to merge.
-        cfg: Configuration object containing shuffle settings.
+        seed: Random seed for shuffling.
 
     Returns:
         Merged dataset.
     """
     if len(datasets) == 1:
         ds = datasets[0]
-        return ds.shuffle(seed=cfg.seed)
+        return ds.shuffle(seed=seed)
 
     logger.info("Interleaving datasets...")
     merged_dataset = interleave_datasets(datasets)
-    merged_dataset = merged_dataset.shuffle(seed=cfg.seed)
+    merged_dataset = merged_dataset.shuffle(seed=seed)
     return merged_dataset
 
 

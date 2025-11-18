@@ -1,0 +1,15 @@
+model: invergent/Qwen3-0.6B-NVFP4
+model_type: qwen3_thinking
+
+served_name: qwen3-0.6b
+max_memory: 0.9
+tp: 1
+max_context: 2048
+max_batch_size: 8
+
+engine: pytorch # options: vllm, sglang, pytorch
+deterministic: False
+
+
+log_interval: 100
+

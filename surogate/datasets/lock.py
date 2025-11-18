@@ -18,12 +18,10 @@ class FileLockLoader:
     the preprocessed dataset once the first process is done.
     """
 
-    def __init__(self, cfg: DictDefault):
-        self.cfg = cfg
-        self.dataset_prepared_path = "last_run_prepared"
-        self.lock_file_path = Path(self.dataset_prepared_path) / LOCK_FILE_NAME
-        self.ready_flag_path = Path(self.dataset_prepared_path) / READY_FILE_NAME
-        self.counter_path = Path(self.dataset_prepared_path) / PROCESS_COUNTER_FILE_NAME
+    def __init__(self, save_path: str):
+        self.lock_file_path = Path(save_path) / LOCK_FILE_NAME
+        self.ready_flag_path = Path(save_path) / READY_FILE_NAME
+        self.counter_path = Path(save_path) / PROCESS_COUNTER_FILE_NAME
 
     def load(self, load_fn: Callable[[], Any]) -> Any:
         with FileLock(str(self.lock_file_path)):

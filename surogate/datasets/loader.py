@@ -4,9 +4,9 @@ from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict,
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, HFValidationError
 
+from surogate.config.dataset_config import DatasetConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
-from surogate.utils.schema.datasets import BaseDataset
 
 from adlfs import AzureBlobFileSystem
 from gcsfs import GCSFileSystem
@@ -24,7 +24,7 @@ EXTENSIONS_TO_DATASET_TYPES = {
 }
 
 def load_dataset_with_config(
-        dataset_config: BaseDataset,
+        dataset_config: DatasetConfig,
         args: DictDefault,
         streaming=False
 ) -> Dataset | IterableDataset:
@@ -64,7 +64,7 @@ def load_dataset_with_config(
         f"This is not caused by the dataset type."
     )
 
-def _check_if_hub_dataset(dataset_config: BaseDataset, args: DictDefault) -> bool:
+def _check_if_hub_dataset(dataset_config: DatasetConfig, args: DictDefault) -> bool:
     """Check if a dataset exists on the HuggingFace Hub."""
     try:
         snapshot_download(
@@ -85,7 +85,7 @@ def _check_if_hub_dataset(dataset_config: BaseDataset, args: DictDefault) -> boo
         return False
 
 def _load_from_local_path(
-        dataset_config: BaseDataset, load_dataset_kwargs: dict
+        dataset_config: DatasetConfig, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from a local path."""
     local_path = Path(dataset_config.path)
@@ -108,7 +108,7 @@ def _load_from_local_path(
         )
 
 def _load_from_hub(
-        dataset_config: BaseDataset, args: DictDefault, load_dataset_kwargs: dict
+        dataset_config: DatasetConfig, args: DictDefault, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from the HuggingFace Hub."""
     return load_dataset(
@@ -118,7 +118,7 @@ def _load_from_hub(
     )
 
 def _load_from_cloud(
-        dataset_config: BaseDataset,
+        dataset_config: DatasetConfig,
         remote_fs: S3FileSystem | GCSFileSystem | AzureBlobFileSystem | OCIFileSystem,
         storage_options: dict,
         load_dataset_kwargs: dict,
@@ -144,7 +144,7 @@ def _load_from_cloud(
     )
 
 def _load_from_url(
-        dataset_config: BaseDataset, load_dataset_kwargs: dict
+        dataset_config: DatasetConfig, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from a URL."""
     dataset_type = get_dataset_type(dataset_config)
@@ -203,11 +203,8 @@ def _get_remote_filesystem(
     return None, {}
 
 
-def get_dataset_type(dataset_config: BaseDataset) -> str:
+def get_dataset_type(dataset_config: DatasetConfig) -> str:
     """Get the dataset type from the path if it's not specified."""
-    if dataset_config.ds_type:
-        return dataset_config.ds_type
-
     for extension, dataset_type in EXTENSIONS_TO_DATASET_TYPES.items():
         if extension in dataset_config.path:
             return dataset_type

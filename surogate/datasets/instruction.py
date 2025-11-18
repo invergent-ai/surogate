@@ -2,10 +2,11 @@ from typing import Dict, Any, Optional
 
 from swift.llm.dataset import RowPreprocessor
 from swift.llm import history_to_messages
+
+from surogate.config.dataset_config import InstructionDatasetConfig
+from surogate.config.enums import InstructionDatasetSystemPromptType
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
-from surogate.utils.schema.datasets import InstructionDataset
-from surogate.utils.schema.enums import InstructionDatasetSystemPromptType
 
 logger = get_logger()
 
@@ -17,9 +18,8 @@ class InstructionPreprocessor(RowPreprocessor):
     default_prompt_format = "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
     default_prompt_no_input_format = "### Instruction:\n{instruction}\n\n### Response:\n"
 
-    def __init__(self, cfg: DictDefault, dataset_config: InstructionDataset):
+    def __init__(self, dataset_config: InstructionDatasetConfig):
         super().__init__()
-        self.cfg = cfg
         self.ds_cfg = dataset_config
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:

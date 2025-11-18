@@ -3,16 +3,14 @@ from typing import Dict, Any, Optional
 
 from swift.llm.dataset import RowPreprocessor
 
-from surogate.utils.dict import DictDefault
+from surogate.config.dataset_config import ConversationDatasetConfig
 from surogate.utils.logger import get_logger
-from surogate.utils.schema.datasets import ConversationDataset
 
 logger = get_logger()
 
 class ConversationPreprocessor(RowPreprocessor):
-    def __init__(self, cfg: DictDefault, dataset_config: ConversationDataset):
+    def __init__(self, dataset_config: ConversationDatasetConfig):
         super().__init__()
-        self.cfg = cfg
         self.ds_cfg = dataset_config
         self.message_property_mappings = dataset_config.message_property_mappings or {}
         self.messages_field = dataset_config.messages_field or "messages"

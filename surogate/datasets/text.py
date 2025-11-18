@@ -2,16 +2,14 @@ from typing import Dict, Any, Optional
 
 from swift.llm.dataset import RowPreprocessor
 
-from surogate.utils.dict import DictDefault
+from surogate.config.dataset_config import TextDatasetConfig
 from surogate.utils.logger import get_logger
-from surogate.utils.schema.datasets import TextDataset
 
 logger = get_logger()
 
 class TextPreprocessor(RowPreprocessor):
-    def __init__(self, cfg: DictDefault, dataset_config: TextDataset):
+    def __init__(self, dataset_config: TextDatasetConfig):
         super().__init__()
-        self.cfg = cfg
         self.ds_cfg = dataset_config
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:

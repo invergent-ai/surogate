@@ -1,8 +1,0 @@
-model: invergent/Qwen3-0.6B-NVFP4
-served_name: qwen3-0.6b
-max_memory: 0.9
-tp: 1
-max_context: 2048
-log_interval: 100
-engine: sglang # options: vllm, sglang, pytorch
-

@@ -14,7 +14,7 @@ from swift.llm.model.register import MODEL_MAPPING, get_default_torch_dtype, \
     deepspeed_set_z3_leaf_modules, get_matched_model_types
 from swift.llm.model.utils import HfConfigFactory, ModelInfo, safe_snapshot_download, InitModelStrategy
 from swift.utils import patch_getattr
-from transformers import PreTrainedTokenizerBase, AddedToken, PreTrainedModel, GenerationConfig, AutoConfig, \
+from transformers import PreTrainedTokenizerBase, PreTrainedModel, GenerationConfig, AutoConfig, \
     AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM, PretrainedConfig
 
 from surogate.utils.dict import DictDefault
@@ -23,34 +23,17 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 
-def load_model_and_tokenizer(cfg: DictDefault, args: DictDefault) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
-    model_id = cfg.get('model')
+def load_model_and_tokenizer(model_id: str, model_type: str, args: DictDefault, load_model = True) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
     if model_id is None:
         raise ValueError("'model' must be specified in config.")
-
-    additional_special_tokens = None
-    if cfg.special_tokens:
-        special_tokens = cfg.get('special_tokens').to_dict()
-        additional_special_tokens = special_tokens.pop(
-            "additional_special_tokens", None
-        )
 
     model, tokenizer = get_model_and_tokenizer(
         model_id,
         use_hf=True,
         hub_token=args.get('hub_token'),
-        load_model=model_id is not None,
-        new_special_tokens=additional_special_tokens,
-        model_type=cfg.get('model_type'),
+        load_model=load_model,
+        model_type=model_type,
     )
-
-    if cfg.tokens:
-        tokenizer.add_tokens(
-            [
-                AddedToken(token, rstrip=False, lstrip=False, normalized=False)
-                for token in cfg.tokens
-            ]
-        )
 
     return model, tokenizer
 

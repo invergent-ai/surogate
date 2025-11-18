@@ -1,14 +1,14 @@
 import os
-import sys
 from contextlib import contextmanager
 from datetime import datetime
+from importlib.util import find_spec
+from logging import getLevelName
 from pathlib import Path
 from types import MethodType
-import importlib
 import logging
 import inspect
 from typing import Optional
-
+import swift.utils.logger
 
 init_loggers = {}
 info_set = set()
@@ -188,6 +188,10 @@ class LoggerWrapper:
         full_banner = f"\n{top_border}\n{middle}\n{bottom_border}\n"
         self._logger.info(full_banner)
 
+    def level(self):
+        """Get current logging level."""
+        return getLevelName(self._logger.level)
+
 
 def get_logger(
         log_file: Optional[str] = None,
@@ -270,22 +274,23 @@ def get_logger(
     logger.info_if = MethodType(info_if, logger)
     logger.warning_if = MethodType(warning_if, logger)
 
-    return LoggerWrapper(logger)
+    wrapper = LoggerWrapper(logger)
+    return wrapper
 
 
-def info_if(self, msg, cond, *args, **kwargs):
+def info_if(self, msg, cond):
     if cond:
         with logger_context(self, logging.INFO):
             self.info(msg)
 
 
-def warning_if(self, msg, cond, *args, **kwargs):
+def warning_if(self, msg, cond):
     if cond:
         with logger_context(self, logging.INFO):
             self.warning(msg)
 
 
-def info_once(self, msg, *args, **kwargs):
+def info_once(self, msg, **kwargs):
     hash_id = kwargs.get('hash_id') or msg
     if hash_id in info_set:
         return
@@ -293,7 +298,7 @@ def info_once(self, msg, *args, **kwargs):
     self.info(msg)
 
 
-def warning_once(self, msg, *args, **kwargs):
+def warning_once(self, msg, **kwargs):
     hash_id = kwargs.get('hash_id') or msg
     if hash_id in warning_set:
         return
@@ -302,9 +307,9 @@ def warning_once(self, msg, *args, **kwargs):
 
 
 @contextmanager
-def logger_context(logger, log_leval):
+def logger_context(logger, log_level):
     origin_log_level = logger.level
-    logger.setLevel(log_leval)
+    logger.setLevel(log_level)
     try:
         yield
     finally:
@@ -316,7 +321,7 @@ def add_file_handler_if_needed(logger, log_file, file_mode, log_level):
         if isinstance(handler, logging.FileHandler):
             return
 
-    if importlib.util.find_spec('torch') is not None:
+    if find_spec('torch') is not None:
         is_worker0 = int(os.getenv('LOCAL_RANK', -1)) in {-1, 0}
     else:
         is_worker0 = True
@@ -334,6 +339,9 @@ def _is_local_master():
 
 # Create module-level logger
 logger = get_logger()
+swift.utils.get_logger = get_logger
+swift.utils.logger.get_logger = get_logger
+swift.utils.logger.logger = logger
 
 # Test the logger if run directly
 if __name__ == "__main__":
