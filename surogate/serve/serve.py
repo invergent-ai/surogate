@@ -78,7 +78,7 @@ class SurogateServe(SurogateCommand):
         return JSONResponse(content=global_stats)
 
     async def get_available_models(self):
-        model_list = [self.config.served_model_name or get_model_name(self.config.model)]
+        model_list = [self.config.served_name or get_model_name(self.config.model)]
         if self.config.adapters:
             model_list += [adapter.name for adapter in self.config.adapters]
 

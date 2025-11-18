@@ -16,3 +16,4 @@ data
 *.lock
 eval_results/
 .deepteam
+output/

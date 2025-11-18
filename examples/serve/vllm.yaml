@@ -1,5 +1,5 @@
 model: invergent/Qwen3-0.6B-NVFP4
-model_type: qwen3
+model_type: qwen3_thinking
 served_name: qwen3-0.6b
 infer_backend: vllm
 

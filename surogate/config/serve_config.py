@@ -33,7 +33,7 @@ class ServeConfig(ModelConfig, AdapterConfig):
         host (str): The host address to bind the server to. Default is '0.0.0.0'.
         port (int): The port number to bind the server to. Default is 8000.
         api_key (Optional[str]): The API key for authentication. Default is None.
-        served_model_name (Optional[str]): The name of the model being served. Default is None.
+        served_name (Optional[str]): The name of the model being served. Default is None.
         max_logprobs(int): Max number of logprobs to return. Default is 20.
         seed (int): Random seed for reproducibility. Default is 1234.
         adapters (Optional[List[AdapterConfig]]): List of adapter configurations. Default is None.
@@ -49,7 +49,7 @@ class ServeConfig(ModelConfig, AdapterConfig):
     port: Optional[int] = None
     max_logprobs: Optional[int] = None
     api_key: Optional[str] = None
-    served_model_name: Optional[str] = None
+    served_name: Optional[str] = None
     seed: Optional[int] = None
     adapters: Optional[List[AdapterConfig]] = None
     deterministic: Optional[bool] = None
@@ -66,7 +66,7 @@ class ServeConfig(ModelConfig, AdapterConfig):
         self.port = cfg['port'] or 8000
         self.max_logprobs = cfg['max_logprobs'] or 20
         self.api_key = cfg['api_key']
-        self.served_model_name = cfg['served_model_name']
+        self.served_name = cfg['served_name']
         self.seed = cfg['seed']
         self.adapters = [AdapterConfig(cfg) for cfg in cfg['adapters']] if cfg['adapters'] else []
         self.deterministic = cfg['deterministic'] or False

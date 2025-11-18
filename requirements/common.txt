@@ -38,6 +38,7 @@ binpacking
 tensorboard
 matplotlib
 scikit_build_core
+autoawq
 
 # sglang
 pybase64
@@ -50,7 +51,6 @@ torchao == 0.14.1
 xgrammar == 0.1.25
 openai_harmony
 addict
-
 
 # vllm
 blake3
