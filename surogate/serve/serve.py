@@ -1,28 +1,27 @@
-import asyncio
 import json
 from dataclasses import asdict
 from http import HTTPStatus
-from threading import Thread
-from typing import Optional, Union, DefaultDict
+from typing import Optional, Union
 
 import uvicorn
-from fastapi import FastAPI, Response, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from swift.llm import get_template
+from swift.llm import safe_snapshot_download, AdapterRequest
+from swift.llm.infer.infer_engine import PtEngine, InferEngine
+from swift.llm.infer.protocol import ModelList, Model, ChatCompletionRequest, MultiModalRequestMixin
+from swift.llm.infer.utils import update_generation_config_eos_token
+from swift.llm.model.register import get_model_name
+from swift.llm.template import Template
+from swift.plugin import InferStats
+from swift.tuners import Swift
+from swift.utils import seed_everything
 
 from surogate.config.serve_config import ServeConfig
 from surogate.loaders.loader import load_model_and_tokenizer
 from surogate.utils.command import SurogateCommand
 from surogate.utils.logger import get_logger
-from swift.llm import safe_snapshot_download, AdapterRequest
-from swift.llm.infer.infer_engine import PtEngine, InferEngine
-from swift.llm.infer.protocol import ModelList, Model, ChatCompletionRequest, EmbeddingRequest, MultiModalRequestMixin
-from swift.plugin import InferStats
-from swift.llm.infer.utils import prepare_adapter, update_generation_config_eos_token
-from swift.utils import seed_everything
-from swift.llm import ModelMeta, get_template
-from swift.llm.template import Template
-from swift.tuners import Swift
-from swift.llm.model.register import get_model_name
+
 logger = get_logger()
 
 
@@ -52,13 +51,9 @@ class SurogateServe(SurogateCommand):
 
     def _register_app(self):
         self.app.get('/health')(self.health)
-        self.app.get('/ping')(self.ping)
-        self.app.post('/ping')(self.ping)
         self.app.get('/stats')(self.stats)
         self.app.get('/v1/models')(self.get_available_models)
         self.app.post('/v1/chat/completions')(self.create_chat_completion)
-        # self.app.post('/v1/completions')(self.create_completion)
-        # self.app.post('/v1/embeddings')(self.create_embedding)
 
     async def health(self) -> Response:
         """Health check endpoint."""
@@ -66,10 +61,6 @@ class SurogateServe(SurogateCommand):
             return Response(status_code=200)
         else:
             return Response(status_code=503)
-
-    async def ping(self) -> Response:
-        """Ping check endpoint. Required for SageMaker compatibility."""
-        return await self.health()
 
     async def stats(self) -> JSONResponse:
         global_stats = self.infer_stats.compute()
