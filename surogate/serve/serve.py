@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import asdict
 from http import HTTPStatus
 from typing import Optional, Union
@@ -23,7 +24,6 @@ from surogate.utils.command import SurogateCommand
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
-
 
 class SurogateServe(SurogateCommand):
     config: ServeConfig
@@ -177,6 +177,7 @@ class SurogateServe(SurogateCommand):
             return PtEngine.from_model_template(model, self.template)
         elif self.config.infer_backend == 'vllm':
             from swift.llm.infer import VllmEngine
+            from vllm.config import KVTransferConfig
 
             if self.config.adapters:
                 self.infer_kwargs['adapter_request'] = AdapterRequest('_lora', self.config.adapters[0].path)
@@ -186,6 +187,23 @@ class SurogateServe(SurogateCommand):
                 processor=None,
                 use_chat_template=self.config.use_chat_template
             )
+
+            os.environ["VLLM_HAS_FLASHINFER_CUBIN"] = "1"
+
+            if self.cache_enabled():
+                os.environ["LMCACHE_TRACK_USAGE"] = "false"
+                os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
+                os.environ["LMCACHE_USAGE_TRACK_URL"] = "/dev/null"
+                os.environ["PYTHONHASHSEED"] = "0"
+                os.environ["LMCACHE_CHUNK_SIZE"] = str(self.config.cache.chunk_size)
+                os.environ["LMCACHE_REMOTE_SERDE"] = "cachegen"
+                if self.config.cache.max_memory_cache_gb > 0:
+                    os.environ["LMCACHE_LOCAL_CPU"] = "True"
+                    os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = str(self.config.cache.max_memory_cache_gb)
+                if self.config.cache.max_disk_cache_gb > 0:
+                    os.environ["LMCACHE_LOCAL_CPU"] = "False"
+                    os.environ["LMCACHE_LOCAL_DISK"] = self.config.cache.disk_cache_path
+                    os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = str(self.config.cache.max_disk_cache_gb)
 
             return VllmEngine(
                 use_async_engine=True,
@@ -197,6 +215,12 @@ class SurogateServe(SurogateCommand):
                 hub_token=self.args['hub_token'],
                 model_type=self.config.model_type,
                 template=self.template,
+                engine_kwargs={
+                    'kv_transfer_config': KVTransferConfig(
+                        kv_connector="LMCacheConnectorV1",
+                        kv_role="kv_both",
+                    )
+                } if self.cache_enabled() else None
             )
         elif self.config.infer_backend == 'sglang':
             from swift.llm.infer import SglangEngine
@@ -216,6 +240,10 @@ class SurogateServe(SurogateCommand):
                 hub_token=self.args['hub_token'],
                 model_type=self.config.model_type,
                 template=self.template,
+                engine_kwargs={
+                    'enable_hierarchical_cache': self.cache_enabled(),
+                    'hicache_ratio': 1
+                }
             )
         else:
             raise ValueError(f"Unsupported inference engine: {self.config['engine']}")
@@ -225,3 +253,7 @@ class SurogateServe(SurogateCommand):
         if self.config.adapters:
             for adapter in self.config.adapters:
                 safe_snapshot_download(adapter.path, use_hf=True, hub_token=self.args['hf_token'])
+
+    def cache_enabled(self):
+        return self.config.cache and self.config.cache.enabled
+

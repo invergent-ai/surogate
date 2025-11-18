@@ -1,3 +1,4 @@
+import pathlib
 from dataclasses import dataclass
 from typing import Optional, Literal, List
 
@@ -21,6 +22,23 @@ class AdapterConfig:
     def __init__(self, cfg: DictDefault):
         self.name = cfg['name']
         self.path = cfg['path']
+
+
+
+@dataclass
+class ServeCacheConfig:
+    enabled: Optional[bool] = None
+    chunk_size: Optional[int] = None
+    max_memory_cache_gb: Optional[float] = None
+    max_disk_cache_gb: Optional[float] = None
+    disk_cache_path: Optional[str] = None
+
+    def __init__(self, cfg: DictDefault):
+        self.enabled = cfg['enabled'] or False
+        self.chunk_size = cfg['chunk_size'] or 256
+        self.max_memory_cache_gb = cfg['max_memory_cache_gb'] or 0
+        self.max_disk_cache_gb = cfg['max_disk_cache_gb'] or 0
+        self.disk_cache_path = cfg['disk_cache_path'] or '/tmp'
 
 
 @dataclass
@@ -57,6 +75,7 @@ class ServeConfig(ModelConfig, AdapterConfig):
     tensor_parallel: Optional[int] = None
     max_memory: Optional[float] = None
     use_chat_template: Optional[bool] = None
+    cache: Optional[ServeCacheConfig] = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
@@ -74,6 +93,7 @@ class ServeConfig(ModelConfig, AdapterConfig):
         self.tensor_parallel = cfg['tensor_parallel'] or 1
         self.max_memory = cfg['max_memory'] or 0.9
         self.use_chat_template = cfg['use_chat_template'] or True
+        self.cache = ServeCacheConfig(cfg['cache']) if cfg['cache'] else None
         self.__post_init__()
 
     def __post_init__(self):
@@ -84,3 +104,4 @@ class ServeConfig(ModelConfig, AdapterConfig):
                              f'["vllm", "pytorch", "sglang"]')
 
         self.port = find_free_port(self.port)
+
