@@ -40,6 +40,10 @@ matplotlib
 scikit_build_core
 autoawq
 
+# lmcache
+aiofile
+redis
+
 # sglang
 pybase64
 partial_json_parser

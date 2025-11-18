@@ -7,6 +7,12 @@ max_context: 2048
 tensor_parallel: 1
 max_memory: 0.9
 
+cache:
+  enabled: 1
+  max_memory_cache_gb: 1
+  max_disk_cache_gb: 1
+  disk_cache_path: /tmp
+
 #adapters:
 #  - name: qwen3-0.6b-nvfp4
 #    path: invergent/Qwen3-0.6B-NVFP4-adapter
