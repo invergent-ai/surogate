@@ -38,6 +38,7 @@ class PTQConfig(ModelConfig):
 
 
     def __post_init__(self):
+        super().__post_init__()
         if self.scheme in ['gptq_int4', 'gptq_int8', 'awq', 'nvfp4']:
             if not self.datasets:
                 raise ValueError(f'Calibration datasets are required for quantization scheme: {self.scheme}')

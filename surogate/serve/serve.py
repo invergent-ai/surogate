@@ -176,7 +176,7 @@ class SurogateServe(SurogateCommand):
     def _get_infer_engine(self) -> InferEngine:
         if self.config.infer_backend == 'pytorch':
             model, tokenizer = load_model_and_tokenizer(self.config.model, self.config.model_type, self.args, True)
-            self.template = get_template(model.model_meta.template, tokenizer)
+            self.template = get_template(model.model_meta.template, tokenizer, use_chat_template=self.config.use_chat_template)
             if self.template.use_model:
                 self.template.model = model
             for adapter in self.config.adapters:
@@ -190,24 +190,41 @@ class SurogateServe(SurogateCommand):
             if self.config.adapters:
                 self.infer_kwargs['adapter_request'] = AdapterRequest('_lora', self.config.adapters[0].path)
 
+            self.template = get_template(
+                self.config.model_meta.template,
+                processor=None,
+                use_chat_template=self.config.use_chat_template
+            )
+
             return VllmEngine(
-                model_id_or_path=self.config['model'],
-                gpu_memory_utilization=self.config['max_memory'] or 0.9,
-                tensor_parallel_size=self.config['tp'] or 1,
-                max_model_len=self.config['max_context'] if self.config['max_context'] else None,
+                use_async_engine=True,
+                model_id_or_path=self.config.model,
+                gpu_memory_utilization=self.config.max_memory,
+                tensor_parallel_size=self.config.tensor_parallel,
+                max_model_len=self.config.max_context,
                 use_hf=True,
-                hub_token=self.args['hub_token'] if self.args['hub_token'] else None,
-                model_type=self.config['model_type']
+                hub_token=self.args['hub_token'],
+                model_type=self.config.model_type,
+                template=self.template,
             )
         elif self.config.infer_backend == 'sglang':
             from swift.llm.infer import SglangEngine
+
+            self.template = get_template(
+                self.config.model_meta.template,
+                processor=None,
+                use_chat_template=self.config.use_chat_template
+            )
+
             return SglangEngine(
-                model_id_or_path=self.config['model'],
-                tp_size=self.config['tp'] or 1,
-                context_length=self.config['max_context'] if self.config['max_context'] else None,
+                model_id_or_path=self.config.model,
+                mem_fraction_static=0.9,
+                tp_size=self.config.tensor_parallel,
+                context_length=self.config.max_context,
                 use_hf=True,
-                hub_token=self.args['hub_token'] if self.args['hub_token'] else None,
-                model_type=self.config['model_type']
+                hub_token=self.args['hub_token'],
+                model_type=self.config.model_type,
+                template=self.template,
             )
         else:
             raise ValueError(f"Unsupported inference engine: {self.config['engine']}")

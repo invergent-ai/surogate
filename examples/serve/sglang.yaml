@@ -1,7 +1,11 @@
 model: invergent/Qwen3-0.6B-NVFP4
 model_type: qwen3
 served_name: qwen3-0.6b
-infer_backend: pytorch
+infer_backend: sglang
+
+max_context: 2048
+tensor_parallel: 1
+max_memory: 0.9
 
 #adapters:
 #  - name: qwen3-0.6b-nvfp4

@@ -37,6 +37,7 @@ immutabledict==4.2.2
 binpacking
 tensorboard
 matplotlib
+scikit_build_core
 
 # sglang
 pybase64

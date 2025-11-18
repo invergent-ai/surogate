@@ -39,6 +39,9 @@ class ModelConfig(ABC):
     def _init_model_info_and_torch_dtype(self):
         self.model_info, self.model_meta = get_model_info_and_meta(
             model_id_or_path=self.model,
-            model_type=self.model_type
+            model_type=self.model_type,
+            use_hf=True
         )
         self.torch_dtype = self.model_info.torch_dtype
+
+

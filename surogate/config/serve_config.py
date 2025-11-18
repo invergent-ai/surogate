@@ -5,6 +5,7 @@ from surogate.config.model_config import ModelConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.net import find_free_port
 
+
 @dataclass
 class AdapterConfig:
     """
@@ -21,6 +22,7 @@ class AdapterConfig:
         self.name = cfg['name']
         self.path = cfg['path']
 
+
 @dataclass
 class ServeConfig(ModelConfig, AdapterConfig):
     """
@@ -36,6 +38,10 @@ class ServeConfig(ModelConfig, AdapterConfig):
         seed (int): Random seed for reproducibility. Default is 1234.
         adapters (Optional[List[AdapterConfig]]): List of adapter configurations. Default is None.
         deterministic (bool): Whether to use deterministic inference. Default is False.
+        max_context (Optional[int]): Maximum context length for the model. Default is None.
+        tensor_parallel (int): Tensor parallelism size. Default is 1.
+        max_memory (float): Maximum GPU memory utilization. Default is 0.9 (90%).
+        use_chat_template (bool): Whether to use model's chat template. Default is True.
     """
     infer_backend: Optional[Literal['vllm', 'pytorch', 'sglang']] = None
 
@@ -47,6 +53,10 @@ class ServeConfig(ModelConfig, AdapterConfig):
     seed: Optional[int] = None
     adapters: Optional[List[AdapterConfig]] = None
     deterministic: Optional[bool] = None
+    max_context: Optional[int] = None
+    tensor_parallel: Optional[int] = None
+    max_memory: Optional[float] = None
+    use_chat_template: Optional[bool] = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
@@ -60,10 +70,16 @@ class ServeConfig(ModelConfig, AdapterConfig):
         self.seed = cfg['seed']
         self.adapters = [AdapterConfig(cfg) for cfg in cfg['adapters']] if cfg['adapters'] else []
         self.deterministic = cfg['deterministic'] or False
+        self.max_context = cfg['max_context']
+        self.tensor_parallel = cfg['tensor_parallel'] or 1
+        self.max_memory = cfg['max_memory'] or 0.9
+        self.use_chat_template = cfg['use_chat_template'] or True
         self.__post_init__()
 
     def __post_init__(self):
-        if not self.infer_backend in ['vllm', 'pytorch', 'sglang']:
+        super().__post_init__()
+
+        if self.infer_backend not in ['vllm', 'pytorch', 'sglang']:
             raise ValueError(f'Unsupported infer_backend: {self.infer_backend}. Supported backends: '
                              f'["vllm", "pytorch", "sglang"]')
 
