@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field
+from abc import ABC
+from dataclasses import dataclass
 from typing import Optional
 
 from swift.llm import MODEL_MAPPING
@@ -11,7 +12,7 @@ logger = get_logger()
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(ABC):
     """
     PTQConfig class is a dataclass that holds configuration parameters for quantizing a model using SurogatePtq.
 
@@ -25,7 +26,6 @@ class ModelConfig:
     def __init__(self, cfg: DictDefault):
         self.model = cfg['model']
         self.model_type = cfg['model_type']
-        self.__post_init__()
 
     def __post_init__(self):
         if self.model is None:

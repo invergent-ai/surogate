@@ -1,0 +1,11 @@
+model: invergent/Qwen3-0.6B-NVFP4
+model_type: qwen3
+served_name: qwen3-0.6b
+engine: pytorch
+
+#adapters:
+#  - name: qwen3-0.6b-nvfp4
+#    path: invergent/Qwen3-0.6B-NVFP4-adapter
+#  - name: qwen3-0.6b-instruct
+#    path: invergent/Qwen3-0.6B-Instruct-adapter
+
