@@ -117,7 +117,8 @@ uv pip install -r requirements/build.txt
 uv pip install -r requirements/common.txt
 MAX_JOBS=8 uv pip install -r requirements/cuda.txt
 
-# install sgl-kernel
+# build sgl-kernel
+# build lmcache
 
 uv pip install "numpy==2.2.6"
 rm -rf .venv/lib/python3.12/site-packages/triton_kernels
