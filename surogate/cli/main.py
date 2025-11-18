@@ -36,6 +36,12 @@ def parse_args():
     ptq.add_argument('--hub_token', type=str, help='Hugging Face token for private model access',
                      default=None)
 
+    # SFT command
+    sft = subparsers.add_parser('sft', help="Supervised fine-tuning")
+    sft.add_argument('--config', type=str, required=True, help='Path to config file')
+    sft.add_argument('--hub_token', type=str, help='Hugging Face token for private model access',
+                     default=None)
+
     args = parser.parse_args(sys.argv[1:])
 
     if args.command is None:

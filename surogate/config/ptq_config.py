@@ -16,8 +16,8 @@ class PTQConfig(ModelConfig):
         sequence_len (int): The sequence length to use for calibration. Default is 2048.
         datasets (Optional[List[DatasetConfig]]): List of dataset configurations for calibration. Default is None.
         ignore_layers (Optional[List[str]]): List of layer names to ignore during quantization.
-        seed (int): Random seed for reproducibility. Default is 1234.
-        save_path (str): Path to save the quantized model. Default is "./output".
+        seed (Optional[int]): Random seed for reproducibility. Default is 1234.
+        save_path (Optional[str]): Path to save the quantized model. Default is "./output".
     """
     scheme: Optional[Literal['fp8', 'gptq_int4', 'gptq_int8', 'awq', 'nvfp4']] = None
     sequence_len: Optional[int] = None

@@ -1,0 +1,7 @@
+model: Qwen/Qwen3-0.6B
+model_type: qwen3_thinking
+
+datasets:
+  - path: "invergent/densemax-self-cognition"
+    split: "train"
+    type: conversation

@@ -135,8 +135,6 @@ class SurogateServe(SurogateCommand):
             return res_or_gen
 
     def _post_process(self, request_info, response, return_cmpl_response: bool = False):
-        args = self.args
-
         for i in range(len(response.choices)):
             if not hasattr(response.choices[i], 'message') or not isinstance(response.choices[i].message.content,
                                                                              (tuple, list)):
