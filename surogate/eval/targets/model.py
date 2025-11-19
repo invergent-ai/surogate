@@ -149,9 +149,60 @@ class APIModelTarget(BaseTarget):
     def health_check(self) -> bool:
         """Check if API is accessible."""
         try:
-            response = self.client.get("/models")
-            return response.status_code == 200
-        except:
+            # For localhost/local endpoints - try various health endpoints
+            # Check this FIRST before provider-specific logic
+            if any(x in self.base_url for x in ['localhost', '127.0.0.1', '0.0.0.0']):
+                # Try /v1/models first (most common for vLLM/OpenAI-compatible)
+                try:
+                    response = self.client.get("/v1/models", timeout=5)
+                    if response.status_code == 200:
+                        logger.debug(f"{self.name}: /v1/models endpoint healthy")
+                        return True
+                except:
+                    pass
+
+                # Try /models
+                try:
+                    response = self.client.get("/models", timeout=5)
+                    if response.status_code == 200:
+                        logger.debug(f"{self.name}: /models endpoint healthy")
+                        return True
+                except:
+                    pass
+
+                # Try /health
+                try:
+                    response = self.client.get("/health", timeout=5)
+                    if response.status_code == 200:
+                        logger.debug(f"{self.name}: /health endpoint healthy")
+                        return True
+                except:
+                    pass
+
+                logger.warning(f"Health check failed for {self.name}. Ensure server is running at {self.base_url}")
+                return False
+
+            # Special handling for OpenAI and Anthropic APIs (non-localhost)
+            # Only check API key if it's actually needed (remote API)
+            if self.provider in [ModelProvider.OPENAI, ModelProvider.ANTHROPIC]:
+                has_key = bool(self.api_key)
+                if not has_key:
+                    logger.error(f"No API key provided for {self.name}")
+                else:
+                    logger.debug(f"{self.name}: API key present, assuming healthy")
+                return has_key
+
+            # For other remote APIs (OpenRouter, Cohere, etc.)
+            try:
+                response = self.client.get("/models", timeout=10)
+                return response.status_code == 200
+            except:
+                logger.warning(f"Could not verify health for {self.name}")
+                # Be optimistic if we have credentials
+                return bool(self.api_key)
+
+        except Exception as e:
+            logger.error(f"Health check error for {self.name}: {e}")
             return False
 
     def cleanup(self):

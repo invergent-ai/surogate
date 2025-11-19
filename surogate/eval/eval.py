@@ -3,32 +3,24 @@ import asyncio
 from pathlib import Path
 from typing import Dict, Any, List
 
+from surogate.config.eval_config import EvalConfig, TargetConfig
 from surogate.eval.backend import LocalBackend
 from surogate.eval.benchmarks import BenchmarkRegistry, BenchmarkConfig
-from surogate.eval.config import ConfigParser, ConfigValidator
 from surogate.eval.datasets import DatasetLoader, DatasetValidator
 from surogate.eval.targets import BaseTarget, TargetFactory
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
+from surogate.utils.command import SurogateCommand
 
 
-class SurogateEval:
+class SurogateEval(SurogateCommand):
     """Main evaluation orchestrator."""
+    config: EvalConfig
 
-    def __init__(self, config: str, **kwargs):
-        """
-        Initialize Surogate Eval.
-
-        Args:
-            config: Path to configuration file
-            **kwargs: Additional arguments
-        """
-        self.config_path = config
-        self.kwargs = kwargs
-        self.config = None
-        self.targets: List[BaseTarget] = []
+    def __init__(self, **kwargs):
+        super().__init__(EvalConfig, **kwargs)
 
         # Consolidated results structure
         self.consolidated_results = {
@@ -41,7 +33,7 @@ class SurogateEval:
             },
             "targets": []
         }
-
+        self.targets: List[BaseTarget] = []
 
     def run(self):
         """Run the evaluation pipeline."""
@@ -49,41 +41,28 @@ class SurogateEval:
 
         logger.banner("SUROGATE EVAL")
 
-        # Set timestamp at start
         self.consolidated_results["timestamp"] = datetime.now().isoformat()
 
-        # 1. Parse configuration
-        parser = ConfigParser(self.config_path)
-        self.config = parser.parse()
+        # Store project info directly from config
+        self.consolidated_results["project"] = {
+            "name": self.config.project.name,
+            "version": self.config.project.version,
+            "description": self.config.project.description
+        }
 
-        # Store project info
-        self.consolidated_results["project"] = self.config.get('project', {})
-
-        # 2. Validate configuration
-        validator = ConfigValidator(self.config)
-        is_valid, errors = validator.validate()
-
-        if not is_valid:
-            logger.error("Configuration validation failed")
-            for error in errors:
-                logger.error(f"  - {error}")
-            raise ValueError("Invalid configuration")
-
-        # 3. Process each target
+        # Process targets
         try:
             self._process_targets()
         finally:
-            # 4. Cleanup
             self._cleanup()
 
-        # 5. Save consolidated results
+        # Save results
         self._save_consolidated_results()
-
         logger.success("Surogate Eval completed")
 
     def _process_targets(self):
         """Process all targets from config."""
-        target_configs = self.config.get('targets', [])
+        target_configs = self.config.targets  # Direct attribute access
 
         if not target_configs:
             logger.warning("No targets specified in configuration")
@@ -96,10 +75,13 @@ class SurogateEval:
         # PHASE 1: Create ALL targets first (so judge targets exist for evaluations)
         logger.info("Creating all targets...")
         for target_config in target_configs:
-            target_name = target_config.get('name', 'unnamed')
+            target_name = target_config.name or 'unnamed'
             try:
                 logger.info(f"Creating target: {target_name}")
-                target = TargetFactory.create_target(target_config)
+
+                # Convert TargetConfig to dict for TargetFactory
+                target_dict = target_config.to_dict()
+                target = TargetFactory.create_target(target_dict)
 
                 # Health check
                 if not target.health_check():
@@ -126,7 +108,7 @@ class SurogateEval:
         # PHASE 2: Now run evaluations on each target
         logger.info("Running evaluations on all targets...")
         for target_config in target_configs:
-            target_name = target_config.get('name', 'unnamed')
+            target_name = target_config.name or 'unnamed'
 
             # Find the created target
             target = self._find_target_by_name(target_name)
@@ -160,13 +142,13 @@ class SurogateEval:
                 import traceback
                 traceback.print_exc()
 
-    def _run_target_evaluations(self, target: BaseTarget, target_config: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_target_evaluations(self, target: BaseTarget, target_config: TargetConfig) -> Dict[str, Any]:
         """
         Run all evaluations for a single target.
 
         Args:
             target: Already-created target instance
-            target_config: Target configuration dictionary
+            target_config: Target configuration (TargetConfig dataclass)
 
         Returns:
             Target results dictionary
@@ -187,7 +169,7 @@ class SurogateEval:
         backend = self._setup_target_backend(target_config)
 
         # Run evaluations
-        evaluations = target_config.get('evaluations', [])
+        evaluations = target_config.evaluations or []
         if evaluations:
             logger.info(f"Running {len(evaluations)} evaluation(s) for target '{target_name}'")
             self.consolidated_results["summary"]["total_evaluations"] += len(evaluations)
@@ -210,7 +192,7 @@ class SurogateEval:
                     target_result['benchmarks'] = benchmark_results
 
         # Run stress testing
-        stress_testing = target_config.get('stress_testing', {})
+        stress_testing = target_config.stress_testing or {}
         if stress_testing.get('enabled'):
             logger.info(f"Running stress testing for target '{target_name}'")
             stress_result = self._run_stress_testing(target, stress_testing)
@@ -223,7 +205,7 @@ class SurogateEval:
             results = {}
 
             # Run red teaming - ONLY if enabled
-            red_teaming = target_config.get('red_teaming', {})
+            red_teaming = target_config.red_teaming or {}
             if red_teaming.get('enabled'):
                 logger.info(f"Running red teaming for target '{target_name}'")
                 red_team_result = await self._run_red_teaming_async(target, red_teaming)
@@ -231,7 +213,7 @@ class SurogateEval:
                     results['red_teaming'] = red_team_result
 
             # Run guardrails - ONLY if enabled
-            guardrails = target_config.get('guardrails', {})
+            guardrails = target_config.guardrails or {}
             if guardrails.get('enabled'):
                 logger.info(f"Testing guardrails for target '{target_name}'")
                 guardrails_result = await self._run_guardrails_testing_async(target, guardrails)
@@ -241,8 +223,8 @@ class SurogateEval:
             return results
 
         # Run all async security tests in one event loop (if any are enabled)
-        red_teaming = target_config.get('red_teaming', {})
-        guardrails = target_config.get('guardrails', {})
+        red_teaming = target_config.red_teaming or {}
+        guardrails = target_config.guardrails or {}
 
         if red_teaming.get('enabled') or guardrails.get('enabled'):
             security_results = asyncio.run(run_security_tests())
@@ -258,17 +240,17 @@ class SurogateEval:
 
         return target_result
 
-    def _setup_target_backend(self, target_config: Dict[str, Any]) -> Any:
+    def _setup_target_backend(self, target_config: TargetConfig) -> Any:
         """
         Setup execution backend for a target.
 
         Args:
-            target_config: Target configuration
+            target_config: Target configuration (TargetConfig dataclass)
 
         Returns:
             Backend instance or None
         """
-        infra_config = target_config.get('infrastructure', {})
+        infra_config = target_config.infrastructure or {}
 
         if not infra_config:
             logger.debug("No infrastructure config - using default")
@@ -294,7 +276,7 @@ class SurogateEval:
 
         Args:
             target: Target to evaluate
-            eval_config: Evaluation configuration
+            eval_config: Evaluation configuration (dict from evaluations list)
             backend: Execution backend (optional)
 
         Returns:
@@ -486,8 +468,6 @@ class SurogateEval:
                 "error": str(e)
             }
 
-    # In eval.py - simplify _run_benchmarks
-
     def _run_benchmarks(
             self,
             target: BaseTarget,
@@ -518,8 +498,6 @@ class SurogateEval:
                 benchmark_results.append(bench_result)
 
         return benchmark_results
-
-    # surogate/eval/eval.py - Update _run_single_benchmark method
 
     def _run_single_benchmark(
             self,
@@ -603,7 +581,7 @@ class SurogateEval:
 
         Args:
             target: Target to stress test
-            stress_config: Stress testing configuration
+            stress_config: Stress testing configuration (dict)
 
         Returns:
             Stress test results
@@ -675,7 +653,7 @@ class SurogateEval:
         single_turn_metrics = {
             'g_eval',
             'dag',
-            'multimodal_g_eval',  # ADD THIS LINE
+            'multimodal_g_eval',
             'toxicity',
             'bias',
             'harm',
@@ -692,7 +670,7 @@ class SurogateEval:
             'context_retention',
             'turn_analysis',
             'conversational_dag',
-            'multimodal_g_eval',  # ADD THIS LINE TOO (works for both)
+            'multimodal_g_eval',
             'toxicity',
             'bias',
             'harm',
@@ -733,7 +711,7 @@ class SurogateEval:
 
         Args:
             target: Target to test
-            red_team_config: Red teaming configuration
+            red_team_config: Red teaming configuration (dict)
 
         Returns:
             Red teaming results
@@ -759,7 +737,7 @@ class SurogateEval:
 
             # Run red-teaming
             runner = RedTeamRunner(target, config)
-            risk_assessment = await runner.run()  # await instead of asyncio.run()
+            risk_assessment = await runner.run()
 
             return risk_assessment.to_dict()
 
@@ -773,13 +751,14 @@ class SurogateEval:
                 "error": str(e)
             }
 
-    async def _run_guardrails_testing_async(self, target: BaseTarget, guardrails_config: Dict[str, Any]) -> Dict[str, Any]:
+    async def _run_guardrails_testing_async(self, target: BaseTarget, guardrails_config: Dict[str, Any]) -> Dict[
+        str, Any]:
         """
         Test guardrails on target (async version).
 
         Args:
             target: Target to test
-            guardrails_config: Guardrails configuration
+            guardrails_config: Guardrails configuration (dict)
 
         Returns:
             Guardrails test results
@@ -813,7 +792,7 @@ class SurogateEval:
 
             # Run guardrails evaluation
             evaluator = GuardrailsEvaluator(target, config, judge_target)
-            result = await evaluator.evaluate()  # await instead of asyncio.run()
+            result = await evaluator.evaluate()
 
             return result.to_dict()
 
