@@ -13,7 +13,7 @@ class DatasetConfig:
     Args:
         path (Optional[str]): HuggingFace dataset repo | s3:// | gs:// | path to local file or directory.
         subset (Optional[str]): HuggingFace subset of dataset to load
-        split (Optional[str]): Name of dataset split to load from.
+        split (Optional[str]): Name of dataset split to load from. Defaults to 'train'.
         type (Optional[Literal['text', 'instruction', 'conversation']]): The type of dataset.
         samples (Optional[int]): Number of samples to use.
     """
@@ -145,9 +145,13 @@ class ConversationDatasetConfig(DatasetConfig):
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
         self.system_field = cfg['system_field']
-        self.messages_field = cfg['messages_field'] or 'messages'
+        self.messages_field = cfg['messages_field'] or "messages"
         self.tools_field = cfg['tools_field']
-        self.message_property_mappings = cfg['message_property_mappings']
+        self.message_property_mappings = cfg['message_property_mappings'] or {
+            "role": "role",
+            "content": "content",
+            "tool_calls": "tool_calls",
+        }
         self.__post_init__()
 
     def __post_init__(self):

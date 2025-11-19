@@ -113,8 +113,8 @@ def disable_datasets_caching():
 
 
 def get_default_process_count():
-    if axolotl_dataset_processes := os.environ.get("SUROGATE_DATASET_PROCESSES"):
-        return int(axolotl_dataset_processes)
+    if dataset_processes := os.environ.get("SUROGATE_DATASET_PROCESSES"):
+        return int(dataset_processes)
     if runpod_cpu_count := os.environ.get("RUNPOD_CPU_COUNT"):
         return int(runpod_cpu_count)
     return os.cpu_count()

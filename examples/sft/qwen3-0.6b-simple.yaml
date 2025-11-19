@@ -1,7 +1,18 @@
 model: Qwen/Qwen3-0.6B
 model_type: qwen3_thinking
+save_path: ./output
+
+num_train_epochs: 1
+sequence_len: 2048
+report_to:
+  - aim
+
+deepspeed: zero3_offload
 
 datasets:
-  - path: "invergent/densemax-self-cognition"
-    split: "train"
-    type: conversation
+  - path: "invergent/alpaca-gpt4-data-en"
+    samples: 500
+    type: instruction
+    instruction_field: instruction
+    input_field: input
+    output_field: output

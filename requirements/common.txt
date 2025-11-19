@@ -39,6 +39,9 @@ tensorboard
 matplotlib
 scikit_build_core
 autoawq
+aim
+liger_kernel
+mpi4py
 
 # lmcache
 aiofile

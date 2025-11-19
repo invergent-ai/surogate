@@ -12,10 +12,10 @@ class ConversationPreprocessor(RowPreprocessor):
     def __init__(self, dataset_config: ConversationDatasetConfig):
         super().__init__()
         self.ds_cfg = dataset_config
-        self.message_property_mappings = dataset_config.message_property_mappings or {}
-        self.messages_field = dataset_config.messages_field or "messages"
+        self.message_property_mappings = dataset_config.message_property_mappings
+        self.messages_field = dataset_config.messages_field
         self.system_field = dataset_config.system_field or "system"
-        self.tools_field = dataset_config.system_field or "tools"
+        self.tools_field = dataset_config.tools_field or "tools"
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         row["messages"] = self.get_conversation_thread(row)
@@ -29,10 +29,7 @@ class ConversationPreprocessor(RowPreprocessor):
         messages = self._get_messages(row)
         possible_sys_turn = self.transform_message(messages[0])
 
-        if (
-                possible_sys_turn["role"] != "system"
-                and self.system_field in row
-        ):
+        if possible_sys_turn.get("role", None) != "system" and self.system_field in row:
             turn = {"role": "system", "content": row.pop(self.system_field)}
             turns.append(turn)
 
