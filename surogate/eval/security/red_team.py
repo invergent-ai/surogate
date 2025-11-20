@@ -1,19 +1,18 @@
-# surogate/eval/security/red_team.py - CORRECTED version
+# surogate/eval/security/red_team.py
 
 """Red-teaming runner using DeepTeam."""
 
+import os
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Callable
-from pathlib import Path
-import asyncio
+from typing import List, Dict, Any, Optional
 
 from surogate.eval.targets.base import BaseTarget, TargetRequest
 from surogate.utils.logger import get_logger
-from .base import AttackType, VulnerabilityType, SeverityLevel
+from .base import SeverityLevel
 from .risk_assessment import RiskAssessment
 
 logger = get_logger()
-
+os.environ["DEEPTEAM_TELEMETRY_OPT_OUT"] = "YES"
 
 @dataclass
 class RedTeamConfig:

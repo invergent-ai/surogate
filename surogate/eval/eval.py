@@ -1,5 +1,6 @@
 # surogate/eval/eval.py
 import asyncio
+import os
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -14,6 +15,10 @@ logger = get_logger()
 
 from surogate.utils.command import SurogateCommand
 
+os.environ["DEEPEVAL_TELEMETRY_OPT_OUT"] = "1"
+os.environ["DEEPEVAL_FILE_SYSTEM"] = "READ_ONLY"
+os.environ['EVALSCOPE_CACHE'] = os.path.join(os.path.expanduser('~'), '.cache', 'evalscope')
+os.environ['MODELSCOPE_TRUST_REMOTE_CODE'] = '1'
 
 class SurogateEval(SurogateCommand):
     """Main evaluation orchestrator."""

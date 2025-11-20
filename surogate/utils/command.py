@@ -20,7 +20,7 @@ class SurogateCommand(ABC):
         self.args = DictDefault(kwargs)
         self.config = self.load_config(config_cls)
 
-        if self.config.seed:
+        if hasattr(self.config, 'seed') and self.config.seed:
             seed_everything(self.config.seed)
 
     def _expand_env_vars(self, obj: Any) -> Any:

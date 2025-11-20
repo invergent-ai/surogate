@@ -84,7 +84,8 @@ COMMAND_MAPPING: Dict[str, str] = {
     'ptq': 'surogate.cli.ptq',
 }
 
-if __name__ == '__main__':
+def cli_main():
+    """Main CLI entry point for installed command."""
     args = parse_args()
     file_path = importlib.util.find_spec(COMMAND_MAPPING[args.command]).origin
     torchrun_args = get_torchrun_args()
@@ -100,3 +101,7 @@ if __name__ == '__main__':
 
     if result.returncode != 0:
         sys.exit(result.returncode)
+
+
+if __name__ == '__main__':
+    cli_main()

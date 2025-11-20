@@ -1,6 +1,7 @@
 # surogate/eval/benchmarks/backends/evalscope_backend.py
 """EvalScope backend for benchmark evaluation."""
 import os
+import tempfile
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
@@ -93,10 +94,6 @@ class EvalScopeBackend:
                 "EvalScope is not installed. "
                 "Install it with: pip install evalscope"
             )
-
-        # Trust remote code for ModelScope datasets
-        os.environ['MODELSCOPE_TRUST_REMOTE_CODE'] = '1'
-
         logger.debug("Initialized EvalScope benchmark backend")
 
     def evaluate(
@@ -160,6 +157,7 @@ class EvalScopeBackend:
         # Base config
         task_cfg_dict = {
             'datasets': [dataset_name],
+            'work_dir': tempfile.gettempdir(),
         }
 
         # Add model configuration based on eval type

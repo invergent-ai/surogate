@@ -791,10 +791,17 @@ targets:
               target: vllm-qwen3-benchmarks  # Self-scoring
             # Expected: 0.25-0.35 for 0.6B model (vs 0.75+ for GPT-4)
 
-          - name: bbh           # BIG-Bench Hard
+          - name: bbh
             num_fewshot: 3
-            tasks: ["Logical Reasoning", "Mathematical Reasoning"]
-            limit: 3            # TEST MODE
+            limit: 3
+            subset:
+              # Logical Reasoning subsets
+              - "logical_deduction_three_objects"
+              - "logical_deduction_five_objects"
+              - "logical_deduction_seven_objects"
+              - "formal_fallacies"
+              # Mathematical Reasoning subsets
+              - "multistep_arithmetic_two"
             # Full test: 6,511 questions
             judge_model:
               target: vllm-qwen3-benchmarks
