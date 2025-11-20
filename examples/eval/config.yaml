@@ -779,14 +779,31 @@ targets:
           # ACADEMIC BENCHMARKS (Multiple Choice)
           # These require a judge model for scoring
 
-          - name: mmlu          # Massive Multitask Language Understanding
-            num_fewshot: 3      # 3 examples shown before each question
-            tasks: ["STEM"]     # Only STEM subjects (faster)
-            limit: 3            # TEST MODE: Only 3 questions
-            # Full test: Remove limit (5,900 questions, ~2 hours)
+          - name: mmlu
+            num_fewshot: 3
+            limit: 3
+            subset:
+              - "abstract_algebra"
+              - "astronomy"
+              - "college_biology"
+              - "college_chemistry"
+              - "college_computer_science"
+              - "college_mathematics"
+              - "college_physics"
+              - "computer_security"
+              - "conceptual_physics"
+              - "electrical_engineering"
+              - "elementary_mathematics"
+              - "high_school_biology"
+              - "high_school_chemistry"
+              - "high_school_computer_science"
+              - "high_school_mathematics"
+              - "high_school_physics"
+              - "high_school_statistics"
+              - "machine_learning"
             backend_params:
-              max_tokens: 256   # Sufficient for multiple choice
-              temperature: 0.0  # Deterministic for benchmarks
+              max_tokens: 256
+              temperature: 0.0
             judge_model:
               target: vllm-qwen3-benchmarks  # Self-scoring
             # Expected: 0.25-0.35 for 0.6B model (vs 0.75+ for GPT-4)
