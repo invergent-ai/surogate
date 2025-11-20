@@ -133,6 +133,21 @@ class EvalScopeBackend:
             # Run the task
             results = run_task(task_cfg=task_config)
 
+            # EvalScope saves results to work_dir/reports/{model_id}/{dataset}.json
+            # Read the results from that file
+            import json
+            work_dir = task_config.work_dir
+            model_id = task_config.model_id
+            results_file = Path(work_dir) / 'reports' / model_id / f'{evalscope_dataset}.json'
+
+            if results_file.exists():
+                with open(results_file, 'r') as f:
+                    results = json.load(f)
+                logger.debug(f"Loaded results from: {results_file}")
+            else:
+                logger.warning(f"Results file not found: {results_file}")
+                results = {}
+
             # Parse results
             parsed_results = self._parse_results(results, benchmark_name)
 
@@ -267,53 +282,55 @@ class EvalScopeBackend:
         Parse EvalScope results into standardized format.
 
         Args:
-            results: Raw EvalScope results
+            results: Raw EvalScope results from JSON file
             benchmark_name: Benchmark name
 
         Returns:
             Parsed results dictionary
         """
+        # EvalScope JSON format:
+        # {
+        #   "score": 0.2222,
+        #   "metrics": [{"name": "mean_acc", "score": 0.2222, "num": 9, "categories": [...]}]
+        # }
+
         task_results = {}
-        overall_scores = []
-        num_samples = 0
+        overall_score = results.get('score', 0.0)
 
-        # Extract results for each dataset
-        for dataset_key, dataset_results in results.items():
-            if isinstance(dataset_results, dict):
-                # Get main score
-                score = dataset_results.get('score', 0.0)
-                overall_scores.append(score)
+        # Extract subset scores from metrics
+        metrics = results.get('metrics', [])
+        total_samples = 0
 
-                # Get sample count
-                n_samples = dataset_results.get('num_samples', dataset_results.get('n', 0))
-                num_samples += n_samples
+        for metric in metrics:
+            metric_name = metric.get('name', 'unknown')
+            categories = metric.get('categories', [])
 
-                # Store task result
-                task_results[dataset_key] = {
-                    'score': score,
-                    'accuracy': score,  # Alias
-                    'n_samples': n_samples,
-                }
+            for category in categories:
+                subsets = category.get('subsets', [])
 
-                # Add category scores if available
-                category_scores = dataset_results.get('category_scores', {})
-                if category_scores:
-                    for category, cat_score in category_scores.items():
-                        task_results[f"{dataset_key}_{category}"] = {
-                            'score': cat_score,
-                            'accuracy': cat_score,
+                for subset in subsets:
+                    subset_name = subset.get('name')
+                    subset_score = subset.get('score', 0.0)
+                    subset_num = subset.get('num', 0)
+
+                    if subset_name:
+                        task_results[subset_name] = {
+                            'score': subset_score,
+                            'accuracy': subset_score,
+                            'n_samples': subset_num,
                         }
-
-        # Calculate overall score
-        overall_score = sum(overall_scores) / len(overall_scores) if overall_scores else 0.0
+                        total_samples += subset_num
 
         return {
             'overall_score': overall_score,
+            'num_samples': total_samples,
             'task_results': task_results,
             'metadata': {
                 'backend': 'evalscope',
                 'benchmark': benchmark_name,
-                'num_datasets': len(overall_scores),
+                'num_datasets': len(task_results),
+                'dataset_name': results.get('dataset_name', benchmark_name),
+                'model_name': results.get('model_name', 'unknown'),
             }
         }
 
