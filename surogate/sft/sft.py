@@ -17,7 +17,7 @@ from surogate.utils.logger import get_logger
 from swift.llm.train.tuner import get_multimodal_target_regex
 from swift.llm.dataset.loader import DatasetLoader
 from swift.llm.dataset.utils import EncodePreprocessor, LazyLLMDataset, IterablePackingDataset, PackingDataset
-from swift.utils import seed_everything, check_json_format, find_all_linears, find_embedding, get_model_parameter_info
+from swift.utils import check_json_format, find_all_linears, find_embedding, get_model_parameter_info
 from swift.tuners import LoraConfig, get_peft_model
 from swift.utils.env import is_master
 from swift.utils.io_utils import append_to_jsonl
@@ -30,9 +30,6 @@ class SurogateSFT(SurogateCommand):
 
     def __init__(self, **kwargs):
         super().__init__(SFTConfig, **kwargs)
-
-        if self.config.seed:
-            seed_everything(self.config.seed)
 
         self.model, self.tokenizer = get_model_and_tokenizer(self.config.model)
 

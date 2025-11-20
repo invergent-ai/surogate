@@ -6,7 +6,6 @@ from llmcompressor.metrics import PythonLogger
 from llmcompressor.modifiers.awq import AWQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier, GPTQModifier
 from loguru import logger as loguru_logger
-from swift.utils import seed_everything
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from surogate.config.ptq_config import PTQConfig
@@ -32,7 +31,7 @@ SUPPORTED_SCHEMES = {
     'nvfp4': 'Quantizes the weights and activations to FP4',
 }
 
-class SurogatePtq(SurogateCommand):
+class SurogatePTQ(SurogateCommand):
     config: PTQConfig
     model: PreTrainedModel
     tokenizer: PreTrainedTokenizerBase
@@ -46,8 +45,6 @@ class SurogatePtq(SurogateCommand):
     def run(self):
         if not torch.cuda.is_available():
             raise OSError("GPU is required for PTQ.")
-
-        seed_everything(self.config.seed)
 
         self.model, self.tokenizer = load_model_and_tokenizer(self.config.model, self.config.model_type, self.args, True)
 

@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from surogate.utils.logger import get_logger
+from swift.utils import seed_everything
 
 logger = get_logger()
 
@@ -18,6 +19,9 @@ class SurogateCommand(ABC):
     def __init__(self, config_cls: Any, **kwargs):
         self.args = DictDefault(kwargs)
         self.config = self.load_config(config_cls)
+
+        if self.config.seed:
+            seed_everything(self.config.seed)
 
     def _expand_env_vars(self, obj: Any) -> Any:
         """

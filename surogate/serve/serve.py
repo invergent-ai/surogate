@@ -16,7 +16,6 @@ from swift.llm.model.register import get_model_name
 from swift.llm.template import Template
 from swift.plugin import InferStats
 from swift.tuners import Swift
-from swift.utils import seed_everything
 
 from surogate.config.serve_config import ServeConfig
 from surogate.loaders.loader import load_model_and_tokenizer
@@ -31,9 +30,6 @@ class SurogateServe(SurogateCommand):
 
     def __init__(self, **kwargs):
         super().__init__(ServeConfig, **kwargs)
-
-        if self.config.seed:
-            seed_everything(self.config.seed, full_determinism=self.config.deterministic)
 
         self._init_adapters()
         self.infer_engine = self._get_infer_engine()
