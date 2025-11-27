@@ -1,1 +1,3 @@
-MAX_JOBS=6 uv pip install "flash_attn==2.8.2" --no-build-isolation
+git clone -b v2.8.3 --depth 1 https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention
+MAX_JOBS=20 uv run python setup.py install
