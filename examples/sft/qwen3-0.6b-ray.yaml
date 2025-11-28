@@ -7,10 +7,10 @@ sequence_len: 2048
 report_to:
   - aim
 
-max_steps: 100
+max_steps: 10
 
 use_ray: true
-deepspeed: zero3_offload
+deepspeed: zero2
 
 device_groups:
   nproc_per_node: 4

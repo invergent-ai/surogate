@@ -6,6 +6,7 @@ from typing import List
 from swift.llm import BaseArguments, TrainArguments, DATASET_MAPPING, DatasetMeta, AutoPreprocessor
 from swift.llm.dataset.loader import load_dataset
 from swift.llm.train import SwiftSft
+from swift.plugin import extra_callbacks
 from swift.ray import RayHelper
 from transformers import SchedulerType
 
@@ -17,6 +18,7 @@ from surogate.datasets.datasets import get_default_process_count
 from surogate.datasets.instruction import InstructionPreprocessor
 from surogate.datasets.loader import _check_if_hub_dataset, swift_load_dataset
 from surogate.datasets.text import TextPreprocessor
+from surogate.sft.callback import SurogateSftCallback
 from surogate.sft.deepspeed import DEEPSPEED_CONFIGS
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
@@ -27,7 +29,6 @@ logger = get_logger()
 @RayHelper.worker(group=['default'])
 class SurogateSFT(SurogateCommand, SwiftSft):
     def __init__(self, config: SFTConfig, args: DictDefault):
-
         super().__init__(config=config, args=args, swift=True)
         config.__post_init__()
         self._pre_prepare_datasets()
@@ -94,6 +95,11 @@ class SurogateSFT(SurogateCommand, SwiftSft):
 
         return train_dataset, val_dataset
 
+    @RayHelper.function(group='default')
+    def _prepare_callbacks(self):
+        super()._prepare_callbacks()
+        self.callbacks.append(SurogateSftCallback(self.sg_config))
+
 
     def to_swift_args(self) -> BaseArguments:
         dataset_paths = [dataset.path for dataset in self.sg_config.datasets]
@@ -103,6 +109,8 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             model_type=self.sg_config.model_type,
             num_train_epochs=self.sg_config.num_train_epochs,
             output_dir=self.sg_config.save_path,
+            add_version=False,
+            create_checkpoint_symlink=True,
             resume_from_checkpoint=self.sg_config.resume_from_checkpoint,
             seed=self.sg_config.seed,
             dataset=dataset_paths,
