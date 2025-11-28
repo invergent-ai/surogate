@@ -17,3 +17,5 @@ data
 eval_results/
 .deepteam
 output/
+.aim/
+.deepeval/
