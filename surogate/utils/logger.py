@@ -4,7 +4,6 @@ from datetime import datetime
 from importlib.util import find_spec
 from logging import getLevelName
 from pathlib import Path
-from types import MethodType
 import logging
 import inspect
 from typing import Optional
@@ -117,6 +116,19 @@ class LoggerWrapper:
         colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_CYAN)}"
         self._logger.info(colored_msg, *args, exc_info=exc_info, **kwargs)
 
+    def info_once(self, msg: str, **kwargs):
+        """Log info message only once."""
+        hash_id = kwargs.get('hash_id') or msg
+        if hash_id in info_set:
+            return
+        info_set.add(hash_id)
+        self.info(msg, **kwargs)
+
+    def info_if(self, msg: str, cond: bool):
+        """Log info message if condition is true."""
+        if cond:
+            self.info(msg)
+
     def debug(self, msg: str, *args, exc_info=None, **kwargs):
         """Log debug message in magenta."""
         prefix = f"{Colors.MAGENTA}[DEBUG]{Colors.RESET}"
@@ -128,6 +140,19 @@ class LoggerWrapper:
         prefix = f"{Colors.BRIGHT_YELLOW}[WARNING]{Colors.RESET}"
         colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_YELLOW)}"
         self._logger.warning(colored_msg, *args, exc_info=exc_info, **kwargs)
+
+    def warning_once(self, msg: str, **kwargs):
+        """Log warning message only once."""
+        hash_id = kwargs.get('hash_id') or msg
+        if hash_id in warning_set:
+            return
+        warning_set.add(hash_id)
+        self.warning(msg, **kwargs)
+
+    def warning_if(self, msg: str, cond: bool):
+        """Log warning message if condition is true."""
+        if cond:
+            self.warning(msg)
 
     def error(self, msg: str, *args, exc_info=None, **kwargs):
         """Log error message in bright red."""
@@ -269,42 +294,8 @@ def get_logger(
 
     init_loggers[logger_name] = True
 
-    logger.info_once = MethodType(info_once, logger)
-    logger.warning_once = MethodType(warning_once, logger)
-    logger.info_if = MethodType(info_if, logger)
-    logger.warning_if = MethodType(warning_if, logger)
-
     wrapper = LoggerWrapper(logger)
     return wrapper
-
-
-def info_if(self, msg, cond):
-    if cond:
-        with logger_context(self, logging.INFO):
-            self.info(msg)
-
-
-def warning_if(self, msg, cond):
-    if cond:
-        with logger_context(self, logging.INFO):
-            self.warning(msg)
-
-
-def info_once(self, msg, **kwargs):
-    hash_id = kwargs.get('hash_id') or msg
-    if hash_id in info_set:
-        return
-    info_set.add(hash_id)
-    self.info(msg)
-
-
-def warning_once(self, msg, **kwargs):
-    hash_id = kwargs.get('hash_id') or msg
-    if hash_id in warning_set:
-        return
-    warning_set.add(hash_id)
-    self.warning(msg)
-
 
 @contextmanager
 def logger_context(logger, log_level):

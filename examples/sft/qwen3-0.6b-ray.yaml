@@ -7,6 +7,19 @@ sequence_len: 2048
 report_to:
   - aim
 
+max_steps: 100
+
+use_ray: true
+deepspeed: zero3_offload
+
+device_groups:
+  nproc_per_node: 4
+  default:
+    device: GPU
+    ranks: list(range(0, 4))
+    workers:
+      - default
+
 datasets:
   - path: "invergent/alpaca-gpt4-data-en"
     samples: 100

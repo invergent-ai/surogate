@@ -1,25 +1,22 @@
-import math
-import os
 from dataclasses import dataclass
 from typing import Optional, List, Literal
 
-from surogate.config.dataset_config import SurogateDatasetConfig, create_dataset_config
-from surogate.config.model_config import ModelConfig
-from surogate.datasets.datasets import get_default_process_count
-from surogate.sft.deepspeed import DEEPSPEED_CONFIGS
-from surogate.utils.aim import AimCallback
-from surogate.utils.dict import DictDefault
-from surogate.utils.fs import to_abspath
-from surogate.utils.logger import get_logger
-from surogate.utils.seed import RAND_SEED
-from swift.utils.env import get_dist_setting, is_master, is_mp
-from swift.utils import add_version_to_work_dir, get_device_count
+from swift.llm import get_model_info_meta
 from swift.llm.model.constant import MLLMModelType, LLMModelType
+from swift.utils import is_mp
 from transformers import Seq2SeqTrainingArguments, IntervalStrategy, SchedulerType
 from transformers.training_args import OptimizerNames
 
-logger = get_logger()
+from surogate.config.dataset_config import SurogateDatasetConfig, create_dataset_config
+from surogate.config.model_config import ModelConfig
+from surogate.config.ray_config import RayConfig
+from surogate.datasets.datasets import get_default_process_count
+from surogate.utils.aim import AimCallback
+from surogate.utils.dict import DictDefault
+from surogate.utils.logger import get_logger
+from surogate.utils.seed import RAND_SEED
 
+logger = get_logger()
 
 def is_flash_attn_available():
     try:
@@ -30,7 +27,7 @@ def is_flash_attn_available():
 
 
 @dataclass
-class SFTConfig(ModelConfig):
+class SFTConfig(ModelConfig, RayConfig):
     """
     SFTConfig class is a dataclass that holds configuration parameters for Supervised Fine-Tuning (SFT)
 
@@ -78,7 +75,7 @@ class SFTConfig(ModelConfig):
     learning_rate: Optional[float] = None
     checkpoint_steps: Optional[int] = None
     max_checkpoints_to_keep: Optional[int] = None
-    report_to: Optional[Literal['wandb']] = None
+    report_to: Optional[List[Literal['wandb', 'aim']]] = None
     max_steps: Optional[int] = None
     warmup_ratio: Optional[float] = None
     weight_decay: Optional[float] = None
@@ -93,7 +90,6 @@ class SFTConfig(ModelConfig):
     lora_dropout: Optional[float] = None
     lora_target_modules: Optional[List[str]] = None
 
-    use_ray: Optional[bool] = False
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
@@ -123,76 +119,14 @@ class SFTConfig(ModelConfig):
         self.lora_alpha = cfg['lora_alpha'] or 32
         self.lora_dropout = cfg['lora_dropout'] or 0.05
         self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
-        self.use_ray = cfg.get('use_ray', False)
         self.__post_init__()
 
     def __post_init__(self):
-        super().__post_init__()
-
-        if self.resume_from_checkpoint:
-            self.resume_from_checkpoint = to_abspath(self.resume_from_checkpoint, True)
-
-        if not self.datasets:
-            raise ValueError(f'At least one dataset must be provided for SFT.')
-
-        if (self.validation_datasets or self.stream_datasets) and self.validation_split_ratio > 0.0:
-            self.validation_split_ratio = 0.0
-            logger.info("Setting validation_split_ratio to 0.0 because either validation_datasets are provided "
-                        "or stream_datasets is True.")
-
-        if self.validation_datasets is None and self.validation_split_ratio == 0.0:
-            logger.info(f'No validation datasets / split ration provided. '
-                        f'Setting validation data as 10% of training data by default.')
-            self.validation_split_ratio = 0.1
-
-        self.rank, self.local_rank, self.global_world_size, self.local_world_size = get_dist_setting()
-        logger.info(f'rank: {self.rank}, local_rank: {self.local_rank}, '
-                    f'world_size: {self.global_world_size}, local_world_size: {self.local_world_size}')
-
-        if self.gradient_accumulation_steps is None:
-            world_size = get_dist_setting()[2]
-            self.gradient_accumulation_steps = max(1, math.ceil(16 / self.per_device_train_batch_size / world_size))
-            logger.info(f'Setting gradient_accumulation_steps: {self.gradient_accumulation_steps}')
-
-        self.save_path = add_version_to_work_dir(self.save_path)
-        self.save_path = to_abspath(self.save_path)
-
-        if is_master():
-            os.makedirs(self.save_path, exist_ok=True)
-
-        self.run_name = self.save_path
-        self.logging_dir = to_abspath(f'{self.save_path}/runs')
-
-        self.padding_free = False
-
-        if self.sample_packing:
-            if not is_flash_attn_available():
-                logger.warning("Flash Attention is not available. Disabling sample packing.")
-                self.sample_packing = False
-            else:
-                self.padding_free = True
-
-        if self.deepspeed:
-            self._init_deepspeed()
-
         if 'aim' in self.report_to:
             from transformers.integrations import INTEGRATION_TO_CALLBACK
             INTEGRATION_TO_CALLBACK['aim'] = AimCallback(
                 experiment=self.save_path
             )
-
-    def _init_deepspeed(self):
-        if is_mp() and not self.use_ray:
-            raise ValueError('DeepSpeed is not compatible with `device_map`. '
-                             f'n_gpu: {get_device_count()}, '
-                             f'local_world_size: {self.local_world_size}.')
-
-        logger.info(f'Using deepspeed: {self.deepspeed}')
-        if self.deepspeed not in DEEPSPEED_CONFIGS.keys():
-            raise ValueError(f'Deepspeed config `{self.deepspeed}` is not supported. '
-                             f'Supported configs: {list(DEEPSPEED_CONFIGS.keys())}')
-
-        self.deepspeed = DEEPSPEED_CONFIGS[self.deepspeed]
 
     def to_hf_training_args(self) -> Seq2SeqTrainingArguments:
         eval_strategy = IntervalStrategy.STEPS if self.validation_datasets or self.validation_split_ratio > 0.0 else IntervalStrategy.NO
@@ -240,7 +174,12 @@ class SFTConfig(ModelConfig):
         return training_args
 
     def should_apply_liger_kernel(self) -> bool:
-        return self.model_info.model_type in [
+        if is_mp():
+            # liger_kernel does not support device_map. Use DDP/DeepSpeed for multi-GPU training.
+            return False
+
+        model_info, model_meta = get_model_info_meta(self.model, use_hf=True)
+        return model_info.model_type in [
             MLLMModelType.llama4, LLMModelType.llama3, LLMModelType.llama3_1, LLMModelType.llama3_2,
             MLLMModelType.llama3_2_vision,
 

@@ -17,10 +17,10 @@ class DatasetConfig:
         type (Optional[Literal['text', 'instruction', 'conversation']]): The type of dataset.
         samples (Optional[int]): Number of samples to use.
     """
-    path: str = None
+    path: str | None = None
     subset: Optional[str] = None
-    split: str = None
-    type: Literal[SurogateDatasetType.text, SurogateDatasetType.instruction, SurogateDatasetType.conversation] = None
+    split: str | None = None
+    type: Literal[SurogateDatasetType.text, SurogateDatasetType.instruction, SurogateDatasetType.conversation] | None = None
     samples: Optional[int] = None
 
     def __init__(self, cfg: DictDefault):
@@ -83,9 +83,9 @@ class InstructionDatasetConfig(DatasetConfig):
     system_prompt_field: Optional[str] = None
     system_prompt: Optional[str] = None
 
-    instruction_field: str = None
+    instruction_field: str | None = None
     input_field: Optional[str] = None
-    output_field: str = None
+    output_field: str | None = None
 
     prompt_format: Optional[str] = None
     prompt_format_no_input: Optional[str] = None
@@ -140,7 +140,7 @@ class ConversationDatasetConfig(DatasetConfig):
     system_field: Optional[str] = None
     messages_field: Optional[str] = None
     tools_field: Optional[str] = None
-    message_property_mappings: Optional[str] = None
+    message_property_mappings: Optional[dict[str, str]] = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)

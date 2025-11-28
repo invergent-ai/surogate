@@ -1,78 +1,30 @@
-import json
-import os
-import re
-from abc import ABC, abstractmethod
-from pathlib import Path
+import abc
 from typing import Any
 
-import yaml
-
-from surogate.utils.logger import get_logger
+from swift.llm import BaseArguments, TrainArguments
 from swift.utils import seed_everything
+
+from surogate.config.loader import SurogateConfig
+from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
 from surogate.utils.dict import DictDefault
 
 
-class SurogateCommand(ABC):
-    def __init__(self, config_cls: Any, **kwargs):
-        self.args = DictDefault(kwargs)
-        self.config = self.load_config(config_cls)
+class SurogateCommand(abc.ABC):
+    config: SurogateConfig
+    model: Any
+    
+    def __init__(self, *, config: SurogateConfig, args: DictDefault, swift=False):
+        self.sg_args = DictDefault(args)
+        self.sg_config = config
 
-        if hasattr(self.config, 'seed') and self.config.seed:
-            seed_everything(self.config.seed)
-
-    def _expand_env_vars(self, obj: Any) -> Any:
-        """
-        Recursively expand environment variables in config.
-        Supports ${VAR_NAME} syntax.
-        """
-        if isinstance(obj, dict):
-            return {k: self._expand_env_vars(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._expand_env_vars(item) for item in obj]
-        elif isinstance(obj, str):
-            # Match ${VAR_NAME} pattern
-            pattern = r'\$\{([^}]+)\}'
-
-            def replace_env_var(match):
-                var_name = match.group(1)
-                value = os.environ.get(var_name)
-                if value is None:
-                    logger.warning(f"Environment variable not found: {var_name}")
-                    return match.group(0)  # Return original if not found
-                logger.debug(f"Expanded ${{{var_name}}} (length: {len(value)})")
-                return value
-
-            return re.sub(pattern, replace_env_var, obj)
+        if swift:
+            super().__init__(self.to_swift_args())
         else:
-            return obj
+            if hasattr(self.sg_config, 'seed') and self.sg_config.seed:
+                seed_everything(self.sg_config.seed)
 
-    def load_config(self, config_cls):
-        if isinstance(self.args['config'], (str, Path)):
-            with open(self.args['config'], encoding="utf-8") as file:
-                cfg_dict = yaml.safe_load(file)
-
-                # Expand environment variables
-                cfg_dict = self._expand_env_vars(cfg_dict)
-
-                cfg: DictDefault = DictDefault(cfg_dict)
-            cfg.config_path = self.args['config']
-
-        config = config_cls(cfg)
-
-        cfg_to_log = {
-            k: v for k, v in cfg.items() if v is not None
-        }
-
-        logger.debug(
-            "config:\n%s",
-            json.dumps(cfg_to_log, indent=2, default=str, sort_keys=True),
-        )
-
-        return config
-
-    @abstractmethod
-    def run(self):
+    def to_swift_args(self) -> BaseArguments:
         pass

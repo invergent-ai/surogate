@@ -5,18 +5,14 @@ from swift.llm import history_to_messages
 
 from surogate.config.dataset_config import InstructionDatasetConfig
 from surogate.config.enums import InstructionDatasetSystemPromptType
-from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
 
 class InstructionPreprocessor(RowPreprocessor):
-    default_system_prompt = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request."
-    default_system_prompt_no_input = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
-
-    default_prompt_format = "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
-    default_prompt_no_input_format = "### Instruction:\n{instruction}\n\n### Response:\n"
+    default_prompt_format = "{instruction}\n{input}"
+    default_prompt_no_input_format = "{instruction}"
 
     def __init__(self, dataset_config: InstructionDatasetConfig):
         super().__init__()
@@ -46,13 +42,9 @@ class InstructionPreprocessor(RowPreprocessor):
             else self.default_prompt_no_input_format
 
         if input:
-            query = (
-                        system_prompt if system_prompt else self.default_system_prompt
-                    ) + turn_format.format(instruction=instruction, input=input)
+            query = turn_format.format(instruction=instruction, input=input)
         else:
-            query = (
-                        system_prompt if system_prompt else self.default_system_prompt_no_input
-                    ) + turn_no_input_format.format(instruction=instruction)
+            query = turn_no_input_format.format(instruction=instruction)
 
         history = [query, output]
         row.update({'messages': history_to_messages([history], system_prompt)})

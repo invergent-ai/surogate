@@ -1,9 +1,12 @@
 from pathlib import Path
+from typing import Optional, Literal, Dict
 
 from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict, load_from_disk, load_dataset
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, HFValidationError
-
+from swift.llm import DatasetMeta, RowPreprocessor
+from swift.llm.dataset.loader import DatasetSyntax
+from datasets import Dataset as HfDataset
 from surogate.config.dataset_config import DatasetConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -15,7 +18,6 @@ from s3fs import S3FileSystem
 
 logger = get_logger()
 
-
 EXTENSIONS_TO_DATASET_TYPES = {
     ".parquet": "parquet",
     ".arrow": "arrow",
@@ -23,9 +25,34 @@ EXTENSIONS_TO_DATASET_TYPES = {
     ".txt": "text",
 }
 
+
+def swift_load_dataset(
+        dataset_syntax: Optional[DatasetSyntax] = None,
+        dataset_meta: Optional[DatasetMeta] = None,
+        *,
+        num_proc: int = 1,
+        load_from_cache_file: bool = True,
+        streaming: bool = False,
+        use_hf: Optional[bool] = None,
+        hub_token: Optional[str] = None,
+        strict: bool = False,
+        download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
+        columns: Optional[Dict[str, str]] = None,
+        remove_unused_columns: bool = True,
+        dataset_config: DatasetConfig,
+        sg_args: DictDefault,
+) -> HfDataset:
+    dataset = load_dataset_with_config(dataset_config, hub_token, streaming)
+    dataset = dataset_meta.preprocess_func(
+        dataset, num_proc=num_proc, load_from_cache_file=load_from_cache_file, strict=strict)
+    if remove_unused_columns:
+        dataset = RowPreprocessor.remove_useless_columns(dataset)
+    return dataset
+
+
 def load_dataset_with_config(
         dataset_config: DatasetConfig,
-        args: DictDefault,
+        hub_token: Optional[str] = None,
         streaming=False
 ) -> Dataset | IterableDataset:
     load_dataset_kwargs = {
@@ -39,9 +66,9 @@ def load_dataset_with_config(
     if Path(dataset_config.path).exists():
         return _load_from_local_path(dataset_config, load_dataset_kwargs)
 
-    is_hub_dataset = _check_if_hub_dataset(dataset_config, args)
+    is_hub_dataset = _check_if_hub_dataset(dataset_config.path, hub_token)
     if is_hub_dataset:
-        return _load_from_hub(dataset_config, args, load_dataset_kwargs)
+        return _load_from_hub(dataset_config, hub_token, load_dataset_kwargs)
 
     remote_fs, storage_options = _get_remote_filesystem(dataset_config.path)
     is_cloud_dataset = False
@@ -64,13 +91,14 @@ def load_dataset_with_config(
         f"This is not caused by the dataset type."
     )
 
-def _check_if_hub_dataset(dataset_config: DatasetConfig, args: DictDefault) -> bool:
+
+def _check_if_hub_dataset(path: str, hub_token: Optional[str]) -> bool:
     """Check if a dataset exists on the HuggingFace Hub."""
     try:
         snapshot_download(
-            repo_id=dataset_config.path,
+            repo_id=path,
             repo_type="dataset",
-            token=args['hub_token'],
+            token=hub_token,
             ignore_patterns=["*"],
         )
         return True
@@ -83,6 +111,7 @@ def _check_if_hub_dataset(dataset_config: DatasetConfig, args: DictDefault) -> b
             ValueError,
     ):
         return False
+
 
 def _load_from_local_path(
         dataset_config: DatasetConfig, load_dataset_kwargs: dict
@@ -107,15 +136,17 @@ def _load_from_local_path(
             "Unhandled dataset load: local path exists, but is neither a directory or a file"
         )
 
+
 def _load_from_hub(
-        dataset_config: DatasetConfig, args: DictDefault, load_dataset_kwargs: dict
+        dataset_config: DatasetConfig, hub_token: Optional[str], load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from the HuggingFace Hub."""
     return load_dataset(
         dataset_config.path,
-        token=args['hub_token'],
+        token=hub_token,
         **load_dataset_kwargs,
     )
+
 
 def _load_from_cloud(
         dataset_config: DatasetConfig,
@@ -143,6 +174,7 @@ def _load_from_cloud(
         f"Cloud path {dataset_config.path} is neither a directory nor a file"
     )
 
+
 def _load_from_url(
         dataset_config: DatasetConfig, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
@@ -153,6 +185,7 @@ def _load_from_url(
         data_files=dataset_config.path,
         **load_dataset_kwargs,
     )
+
 
 def _get_remote_filesystem(
         path: str,
@@ -210,4 +243,3 @@ def get_dataset_type(dataset_config: DatasetConfig) -> str:
             return dataset_type
 
     return "json"
-

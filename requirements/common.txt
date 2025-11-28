@@ -38,12 +38,12 @@ binpacking
 tensorboard
 matplotlib
 scikit_build_core
-autoawq
 aim
 liger_kernel
 mpi4py
 dacite
 math_verify==0.5.2
+ray
 
 # lmcache
 aiofile

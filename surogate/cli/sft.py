@@ -1,8 +1,13 @@
 import sys
 import argparse
-from swift.ray import try_init_ray
 
-from surogate.sft.sft import SurogateSFT
+from swift.ray import RayHelper
+
+from surogate.config.loader import load_config
+from surogate.config.sft_config import SFTConfig
+
+from surogate.utils.dict import DictDefault
+
 
 def prepare_command_parser(parser=None):
     if parser is None:
@@ -10,12 +15,28 @@ def prepare_command_parser(parser=None):
 
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--hub_token', type=str, help='Hugging Face token for private model access',
-                     default=None)
+                        default=None)
     return parser
+
 
 if __name__ == '__main__':
     args = prepare_command_parser().parse_args(sys.argv[1:])
+    config = load_config(SFTConfig, args.config)
 
-    try_init_ray()
+    from swift.cli.utils import try_use_single_device_mode
+    try_use_single_device_mode()
 
-    SurogateSFT(**args.__dict__).run()
+    if config.use_ray:
+        RayHelper.initialize({
+            'nproc_per_node': config.ray_nproc_per_node,
+            **{
+                name: {
+                    'device': group.device,
+                    'ranks': group.ranks,
+                    'workers': group.workers
+                } for name, group in config.ray_groups.items()
+            }
+        })
+
+    from surogate.sft.sft import sft_main
+    sft_main(config, DictDefault(**args.__dict__))
