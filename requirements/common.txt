@@ -1,4 +1,4 @@
-transformers==4.57.1
+transformers==4.57.2
 modelscope>=1.23
 peft==0.17.1
 wheel
@@ -10,7 +10,7 @@ deepteam==0.2.9
 uvicorn
 fastapi
 aiohttp
-huggingface_hub
+huggingface_hub<1
 skypilot==0.10.5
 IPython
 accelerate
