@@ -124,6 +124,7 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             learning_rate=self.sg_config.learning_rate,
             lr_scheduler_type=SchedulerType.COSINE,
             save_steps=self.sg_config.checkpoint_steps,
+            eval_steps=self.sg_config.eval_steps,
             save_total_limit=self.sg_config.max_checkpoints_to_keep,
             report_to=self.sg_config.report_to,
             max_steps=self.sg_config.max_steps,
@@ -134,6 +135,7 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             deepspeed=DEEPSPEED_CONFIGS[self.sg_config.deepspeed] if self.sg_config.deepspeed else None,
             packing=self.sg_config.sample_packing,
             use_liger_kernel=self.sg_config.should_apply_liger_kernel(),
+            gradient_accumulation_steps=self.sg_config.gradient_accumulation_steps,
 
             lora_rank=self.sg_config.lora_rank,
             lora_alpha=self.sg_config.lora_alpha,

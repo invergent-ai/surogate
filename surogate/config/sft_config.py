@@ -75,6 +75,7 @@ class SFTConfig(ModelConfig, RayConfig):
     learning_rate: Optional[float] = None
     checkpoint_steps: Optional[int] = None
     max_checkpoints_to_keep: Optional[int] = None
+    eval_steps: Optional[int] = None
     report_to: Optional[List[Literal['wandb', 'aim']]] = None
     max_steps: Optional[int] = None
     warmup_ratio: Optional[float] = None
@@ -103,9 +104,10 @@ class SFTConfig(ModelConfig, RayConfig):
         self.stream_datasets = cfg.get('stream_datasets', False)
         self.sequence_len = cfg['sequence_len']
         self.gradient_checkpointing = cfg.get('gradient_checkpointing', True)
-        self.learning_rate = cfg.get('learning_rate', 1e-4)
+        self.learning_rate = float(cfg.get('learning_rate', 1e-4))
         self.checkpoint_steps = cfg.get('checkpoint_steps', 50)
         self.max_checkpoints_to_keep = cfg.get('max_checkpoints_to_keep', 5)
+        self.eval_steps = cfg.get('eval_steps', 100)
         self.report_to = cfg['report_to'] or []
         self.max_steps = cfg['max_steps'] or -1
         self.warmup_ratio = cfg['warmup_ratio'] or 0.05
@@ -127,51 +129,6 @@ class SFTConfig(ModelConfig, RayConfig):
             INTEGRATION_TO_CALLBACK['aim'] = AimCallback(
                 experiment=self.save_path
             )
-
-    def to_hf_training_args(self) -> Seq2SeqTrainingArguments:
-        eval_strategy = IntervalStrategy.STEPS if self.validation_datasets or self.validation_split_ratio > 0.0 else IntervalStrategy.NO
-        training_args = Seq2SeqTrainingArguments(
-            output_dir=self.save_path,
-            per_device_train_batch_size=self.per_device_train_batch_size,
-            per_device_eval_batch_size=1,
-            gradient_accumulation_steps=self.gradient_accumulation_steps,
-            gradient_checkpointing=self.gradient_checkpointing,
-            use_liger_kernel=self.should_apply_liger_kernel(),
-            learning_rate=self.learning_rate,
-            weight_decay=self.weight_decay,
-            max_grad_norm=self.gradient_clip_norm,
-            num_train_epochs=self.num_train_epochs,
-            max_steps=self.max_steps,
-            lr_scheduler_type=SchedulerType.COSINE,
-            warmup_ratio=self.warmup_ratio,
-            warmup_steps=0,
-            logging_steps=1,
-            save_strategy=IntervalStrategy.STEPS,
-            remove_unused_columns=False,
-            save_steps=self.checkpoint_steps,
-            save_total_limit=self.max_checkpoints_to_keep,
-            seed=self.seed,
-            bf16=True,
-            fp16=False,
-            metric_for_best_model='loss',
-            greater_is_better=False,
-            eval_strategy=eval_strategy,
-            eval_steps=self.checkpoint_steps,
-            accelerator_config={'dispatch_batches': False},
-            dataloader_num_workers=get_default_process_count(),
-            optim=OptimizerNames.ADAMW_TORCH_FUSED,
-            report_to=self.report_to,
-            push_to_hub=False,
-            run_name=self.save_path,
-            logging_dir=self.logging_dir,
-            data_seed=self.seed,
-            ddp_timeout=18000000,
-            deepspeed=self.deepspeed,
-        )
-        
-        training_args.packing = self.sample_packing
-
-        return training_args
 
     def should_apply_liger_kernel(self) -> bool:
         if is_mp():

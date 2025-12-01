@@ -3,6 +3,8 @@ model_type: qwen3_thinking
 save_path: ./output
 
 num_train_epochs: 1
+learning_rate: 2e-5
+
 sequence_len: 2048
 report_to:
   - aim
