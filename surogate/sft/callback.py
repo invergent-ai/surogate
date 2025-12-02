@@ -1,3 +1,5 @@
+import time
+
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
 
 from surogate.config.sft_config import SFTConfig
@@ -9,5 +11,26 @@ class SurogateSftCallback(TrainerCallback):
     def __init__(self,  config: SFTConfig):
         self.config = config
 
+    def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        self.start_time = time.time()
+
+    def on_step_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logger.info(f"### Starting training step {state.global_step + 1}")
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logger.info(f"### Completed training step {state.global_step}")
+
+    def on_epoch_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logger.info(f"### Starting epoch {state.epoch + 1}")
+
+    def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logger.info(f"### Completed epoch {state.epoch}")
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logger.info(f"### Evaluation at step {state.global_step}")
+
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logger.info(f"### Logging at step {state.global_step}")
+
     def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        logger.info(f"Model checkpoint saved at step {state.global_step} to {args.output_dir}")
+        logger.info(f"### Model checkpoint saved at step {state.global_step} to {args.output_dir}")

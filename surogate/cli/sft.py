@@ -8,7 +8,6 @@ from surogate.config.sft_config import SFTConfig
 
 from surogate.utils.dict import DictDefault
 
-
 def prepare_command_parser(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
@@ -22,9 +21,6 @@ def prepare_command_parser(parser=None):
 if __name__ == '__main__':
     args = prepare_command_parser().parse_args(sys.argv[1:])
     config = load_config(SFTConfig, args.config)
-
-    from swift.cli.utils import try_use_single_device_mode
-    try_use_single_device_mode()
 
     if config.use_ray:
         RayHelper.initialize({

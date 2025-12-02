@@ -7,7 +7,6 @@ from pathlib import Path
 import logging
 import inspect
 from typing import Optional
-import swift.utils.logger
 
 init_loggers = {}
 info_set = set()
@@ -111,6 +110,9 @@ class LoggerWrapper:
         return f"{location} {msg}"
 
     def info(self, msg: str, *args, exc_info=None, **kwargs):
+        if _is_from_swift():
+            self.debug(msg, exc_info=exc_info, *args, **kwargs)
+            return
         """Log info message in bright cyan."""
         prefix = f"{Colors.BRIGHT_CYAN}[INFO]{Colors.RESET}"
         colored_msg = f"{prefix} {self._add_location(msg, Colors.BRIGHT_CYAN)}"
@@ -241,6 +243,9 @@ def get_logger(
         log_level = getattr(logging, log_level, logging.INFO)
 
     logger_name = __name__.split('.')[0]
+    if logger_name.startswith('swift'):
+        log_level = logging.DEBUG
+
     logger = logging.getLogger(logger_name)
     logger.propagate = False
 
@@ -328,11 +333,28 @@ def _is_local_master():
     local_rank = int(os.getenv('LOCAL_RANK', -1))
     return local_rank in {-1, 0}
 
+def _is_from_swift():
+    frame = inspect.currentframe()
+    try:
+        # Go up the stack to find the actual caller (skip wrapper frames)
+        caller_frame = frame.f_back
+        while caller_frame:
+            caller_module = caller_frame.f_globals.get('__name__', '')
+            # Check if we're still in the logger wrapper
+            if not caller_module.startswith(__name__):
+                break
+            caller_frame = caller_frame.f_back
+
+        # Check if caller is from a 'swift' package
+        if caller_module.startswith('swift'):
+            return True
+    finally:
+        del frame  # Avoid reference cycles
+
+    return False
+
 # Create module-level logger
 logger = get_logger()
-swift.utils.get_logger = get_logger
-swift.utils.logger.get_logger = get_logger
-swift.utils.logger.logger = logger
 
 # Test the logger if run directly
 if __name__ == "__main__":

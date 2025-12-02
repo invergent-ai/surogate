@@ -40,7 +40,7 @@ surogate = "surogate.cli.main:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["surogate*"]
+include = ["surogate*", "swift*"]
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
