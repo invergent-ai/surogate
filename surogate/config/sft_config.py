@@ -4,13 +4,10 @@ from typing import Optional, List, Literal
 from swift.llm import get_model_info_meta
 from swift.llm.model.constant import MLLMModelType, LLMModelType
 from swift.utils import is_mp
-from transformers import Seq2SeqTrainingArguments, IntervalStrategy, SchedulerType
-from transformers.training_args import OptimizerNames
 
 from surogate.config.dataset_config import SurogateDatasetConfig, create_dataset_config
 from surogate.config.model_config import ModelConfig
 from surogate.config.ray_config import RayConfig
-from surogate.datasets.datasets import get_default_process_count
 from surogate.utils.aim import AimCallback
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger

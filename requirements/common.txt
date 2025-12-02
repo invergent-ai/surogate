@@ -1,4 +1,4 @@
-transformers==4.57.2
+transformers==4.57.1
 modelscope>=1.23
 peft==0.17.1
 wheel
