@@ -45,6 +45,7 @@ dacite
 math_verify==0.5.2
 ray
 unique-namer
+bitsandbytes
 
 # lmcache
 aiofile

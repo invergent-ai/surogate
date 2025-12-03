@@ -1,12 +1,15 @@
 model: Qwen/Qwen3-4B-Instruct-2507
 save_path: ./output
 
+apply_recommended_values: true
+
 sample_packing: false
-num_train_epochs: 3
+num_train_epochs: 15
 sequence_len: 4096
 
 learning_rate: 2e-4
 
+qlora: true
 lora_rank: 32
 lora_alpha: 64
 lora_target_modules:

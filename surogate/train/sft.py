@@ -252,7 +252,7 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         optimal_config = recommend_training_params(
             model_size_b=params / 1e9,
             dataset_size=dataset_size,
-            quantization="bf16",
+            quantization="4bit" if self.sg_config.qlora else "bf16",
             num_gpus=world_size,
             vram_per_gpu_gb=int(self.system_info['gpu_memory_gb']),
             seq_len=self.sg_config.sequence_len,
@@ -289,6 +289,9 @@ class SurogateSFT(SurogateCommand, SwiftSft):
     def to_swift_args(self) -> BaseArguments:
         dataset_paths = [dataset.path for dataset in self.sg_config.datasets]
         val_dataset_paths = [dataset.path for dataset in self.sg_config.validation_datasets]
+        if self.sg_config.qlora:
+            logger.info("QLoRA training enabled: using 4-bit quantization with bitsandbytes.")
+
         swift_args = TrainArguments(
             model=self.sg_config.model,
             model_type=self.sg_config.model_type,
@@ -326,6 +329,12 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             lora_alpha=self.sg_config.lora_alpha,
             lora_dropout=self.sg_config.lora_dropout,
             target_modules=self.sg_config.lora_target_modules,
+
+            bnb_4bit_compute_dtype='bfloat16' if self.sg_config.qlora else None,
+            bnb_4bit_quant_type='nf4',
+            bnb_4bit_use_double_quant=True,
+            quant_method='bnb' if self.sg_config.qlora else None,
+            quant_bits=4 if self.sg_config.qlora else None,
 
             attn_impl='flash_attention_2',
 
