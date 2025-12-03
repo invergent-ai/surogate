@@ -32,7 +32,6 @@ class SFTConfig(ModelConfig, RayConfig):
 
     Args:
         run_name (Optional[str]): Name of the training run. Defaults to None.
-        qlora: Optional[bool]: Whether to use QLoRA for training. Default is False.
         apply_recommended_values (Optional[bool]): Whether to apply recommended configuration values. Default is True.
         num_train_epochs (Optional[int]): Number of training epochs. Defaults to 3.
         save_path (Optional[str]): Directory to save the output. Defaults to './output'.
@@ -61,6 +60,8 @@ class SFTConfig(ModelConfig, RayConfig):
         lora_alpha (Optional[int]): Alpha value for LoRA adapters. Default is 32.
         lora_dropout (Optional[float]): Dropout rate for LoRA adapters. Default is 0.05.
         lora_target_modules (Optional[List[str]]): List of module names to apply LoRA adapters to. Default is  all linear modules.
+        qlora: Optional[bool]: Whether to use QLoRA for training. Default is False.
+        merge_adapter: Optional[bool]: Whether to merge LoRA adapters into the base model after training. Default is False.
 
         usr_ray: Optional[bool]: Whether to use Ray for distributed training. Default is False.
     """
@@ -91,6 +92,7 @@ class SFTConfig(ModelConfig, RayConfig):
     sample_packing: Optional[bool] = None
 
     qlora: Optional[bool] = False
+    merge_adapter: Optional[bool] = False
     lora_rank: Optional[int] = None
     lora_alpha: Optional[int] = None
     lora_dropout: Optional[float] = None
@@ -124,6 +126,7 @@ class SFTConfig(ModelConfig, RayConfig):
         self.deepspeed = cfg['deepspeed']
         self.sample_packing = cfg.get('sample_packing', True)
         self.qlora = cfg.get('qlora', False)
+        self.merge_adapter = cfg.get('merge_adapter', False)
         self.lora_rank = cfg['lora_rank'] or 8
         self.lora_alpha = cfg['lora_alpha'] or 32
         self.lora_dropout = cfg['lora_dropout'] or 0.05

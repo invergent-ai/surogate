@@ -3,6 +3,7 @@ from functools import partial
 from pathlib import Path
 from typing import List
 
+import datasets
 import torch
 from transformers import SchedulerType, trainer
 
@@ -20,14 +21,15 @@ from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters, recommend_training_params
-from swift.llm import BaseArguments, TrainArguments, DATASET_MAPPING, DatasetMeta, AutoPreprocessor, DATASET_TYPE
+from swift import Swift
+from swift.llm import BaseArguments, TrainArguments, DATASET_MAPPING, DatasetMeta, AutoPreprocessor, DATASET_TYPE, save_checkpoint
 from swift.llm.dataset.loader import load_dataset
+from swift.llm.export.merge_lora import check_tie_word_embeddings
 from swift.llm.train import SwiftSft
 from swift.ray import RayHelper
 from swift.trainers import TrainerFactory
 from swift.utils import get_model_parameter_info, get_dist_setting, is_master
 
-import datasets
 datasets.logging.set_verbosity_warning()
 
 logger = get_logger()
@@ -355,6 +357,25 @@ class SurogateSFT(SurogateCommand, SwiftSft):
 
         return swift_args
 
+
+    def _save_trainer_state(self, trainer):
+        state = trainer.state
+
+        if not self.sg_config.merge_adapter:
+            return super()._save_trainer_state(trainer)
+        elif hasattr(state, 'last_model_checkpoint'):
+            check_tie_word_embeddings(self.model)
+            Swift.merge_and_unload(self.model)
+            model = self.model.model
+            logger.info('Saving merged weights...')
+            save_checkpoint(
+                model,
+                self.template.processor,
+                f"{self.sg_config.save_path}/merged",
+                safe_serialization=True,
+                model_dirs=[state.last_model_checkpoint],
+                max_shard_size='5GB',
+                additional_saved_files=model.model_meta.additional_saved_files)
 
 def sft_main(config: SFTConfig, args: DictDefault):
     SurogateSFT(config, args).main()
