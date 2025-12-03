@@ -13,4 +13,3 @@ from .utils import EncodePreprocessor, IterablePackingDataset, LazyLLMDataset, P
 
 datasets.fingerprint.get_temporary_cache_files_directory = get_temporary_cache_files_directory
 datasets.arrow_dataset.get_temporary_cache_files_directory = get_temporary_cache_files_directory
-register_dataset_info()

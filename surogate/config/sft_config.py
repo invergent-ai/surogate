@@ -32,6 +32,7 @@ class SFTConfig(ModelConfig, RayConfig):
 
     Args:
         run_name (Optional[str]): Name of the training run. Defaults to None.
+        qlora: Optional[bool]: Whether to use QLoRA for training. Default is False.
         num_train_epochs (Optional[int]): Number of training epochs. Defaults to 3.
         save_path (Optional[str]): Directory to save the output. Defaults to './output'.
         resume_from_checkpoint (Optional[str]): Path to a checkpoint to resume training from. Loads model weights, optimizer state, random seed, and resumes training from the last step. Defaults to None.
@@ -87,6 +88,7 @@ class SFTConfig(ModelConfig, RayConfig):
     deepspeed: Optional[str] = None
     sample_packing: Optional[bool] = None
 
+    qlora: Optional[bool] = False
     lora_rank: Optional[int] = None
     lora_alpha: Optional[int] = None
     lora_dropout: Optional[float] = None
@@ -118,6 +120,7 @@ class SFTConfig(ModelConfig, RayConfig):
         self.gradient_accumulation_steps = cfg['gradient_accumulation_steps']
         self.deepspeed = cfg['deepspeed']
         self.sample_packing = cfg.get('sample_packing', True)
+        self.qlora = cfg.get('qlora', False)
         self.lora_rank = cfg['lora_rank'] or 8
         self.lora_alpha = cfg['lora_alpha'] or 32
         self.lora_dropout = cfg['lora_dropout'] or 0.05
