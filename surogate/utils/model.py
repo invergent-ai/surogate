@@ -211,8 +211,8 @@ def recommend_training_params(
         use_offload = True
         offload_device = "nvme" if offload_to_nvme else "cpu"
         warnings.append(
-            f"Enabling {offload_device.upper()} offload: only {available_for_batch:.1f}GB "
-            f"available after model memory ({per_gpu_mem:.1f}GB)"
+            f"Enabling {offload_device.upper()} offload. "
+            f"Model+buffers exceed available GPU memory by {math.fabs(available_for_batch):.1f} GB"
         )
         # After offloading optimizer states, recalculate available memory
         if ds_stage == 3:

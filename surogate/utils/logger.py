@@ -256,7 +256,7 @@ class LoggerWrapper:
         bottom_border = f"{Colors.BRIGHT_BLUE}{Colors.BOLD}{char * length}{Colors.RESET}"
 
         # Log as single multi-line message
-        full_banner = f"\n{top_border}\n{middle}\n{bottom_border}\n"
+        full_banner = f"\n{top_border}\n{middle}\n{bottom_border}"
         self._logger.info(full_banner)
 
 def get_logger(

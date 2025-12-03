@@ -14,6 +14,7 @@ lora_target_modules:
 
 datasets:
   - path: "invergent/alpaca-gpt4-data-en"
+    samples: 100
     type: instruction
     instruction_field: instruction
     input_field: input

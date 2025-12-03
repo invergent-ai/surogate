@@ -171,26 +171,25 @@ class SurogateSFT(SurogateCommand, SwiftSft):
                 logger.warning("Weight tying detected - this can cause ZeRO-3 imbalance")
 
         mem = optimal_config['memory_breakdown']
-        logger.info("Memory Breakdown per GPU:")
-        logger.info(f" Weights:                 {mem['weight_mem_gb']:6.2f} GB")
-        logger.info(f" Gradients:               {mem['grad_mem_gb']:6.2f} GB")
-        logger.info(f" Optimizer States:        {mem['optimizer_mem_gb']:6.2f} GB")
-        logger.info(f" Total (before ZeRO):     {mem['optimizer_mem_gb']:6.2f} GB")
-        logger.info(f" Per GPU (after ZeRO):    {mem['per_gpu_mem_gb']:6.2f} GB")
+        logger.header("Memory Breakdown per GPU:")
+        logger.metric("Weights", f"{mem['weight_mem_gb']:6.2f}", "GB")
+        logger.metric("Gradients", f"{mem['grad_mem_gb']:6.2f}", "GB")
+        logger.metric("Optimizer States", f"{mem['optimizer_mem_gb']:6.2f}", "GB")
+        logger.metric("Total (before ZeRO)", f"{mem['optimizer_mem_gb']:6.2f}", "GB")
+        logger.metric("Per GPU (after ZeRO)", f"{mem['per_gpu_mem_gb']:6.2f}", "GB")
         if mem.get('zero3_allgather_peak_gb', 0) > 0:
-            logger.info(f" ZeRO-3 Allgather Peak:   {mem['zero3_allgather_peak_gb']:6.2f} GB")
-        logger.info(f" Activation/sample:       {mem['activation_per_sample_gb']:6.2f} GB")
-        logger.info(f" Available for batch:     {mem['available_for_batch_gb']:6.2f} GB")
+            logger.metric("ZeRO-3 all-gather Peak", f"{mem['zero3_allgather_peak_gb']:6.2f}", "GB")
+        logger.metric("Activation/sample", f"{mem['activation_per_sample_gb']:6.2f}", "GB")
+        logger.metric("Available for batch", f"{mem['available_for_batch_gb']:6.2f}", "GB")
 
         if optimal_config['warnings']:
-            logger.banner(f"{'⚠️  WARNINGS ⚠️':-^60}")
             for w in optimal_config['warnings']:
                 logger.warning(f"{w}")
 
         if is_master():
-            logger.info("Recommended training configuration based on model and dataset size:")
+            logger.header("Recommended Training Configuration")
             for key in ['per_device_train_batch_size', 'gradient_accumulation_steps', 'deepspeed_stage', 'use_offload', 'offload_device']:
-                logger.info(f" - {key}: {optimal_config[key]}")
+                logger.metric(key, optimal_config[key])
 
         return optimal_config
 

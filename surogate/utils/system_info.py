@@ -77,7 +77,7 @@ def get_system_info() -> Dict[str, Any]:
     return info
 
 def print_system_diagnostics(system_info):
-    logger.header("System Information:")
+    logger.header("System Information")
     logger.metrics(names=['Python', 'PyTorch'], values=[system_info.get('python_version', 'Unknown')[:70], system_info.get('pytorch_version', 'Unknown')])
     if torch.cuda.is_available():
         logger.metrics(names=['CUDA', 'GPU Count'], values=[system_info.get('cuda_version', 'Unknown'), system_info.get('gpu_count', 0)])
