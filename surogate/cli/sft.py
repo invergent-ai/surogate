@@ -1,6 +1,9 @@
 import sys
 import argparse
 
+from surogate.utils.logger import get_logger
+logger = get_logger()
+
 from swift.ray import RayHelper
 
 from surogate.config.loader import load_config
@@ -8,13 +11,14 @@ from surogate.config.sft_config import SFTConfig
 
 from surogate.utils.dict import DictDefault
 
+
 def prepare_command_parser(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
 
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--hub_token', type=str, help='Hugging Face token for private model access',
-                        default=None)
+    parser.add_argument('--hub_token', type=str, help='Hugging Face token for private model access', default=None)
+
     return parser
 
 
@@ -34,5 +38,6 @@ if __name__ == '__main__':
             }
         })
 
-    from surogate.sft.sft import sft_main
+    from surogate.train.sft import sft_main
+
     sft_main(config, DictDefault(**args.__dict__))

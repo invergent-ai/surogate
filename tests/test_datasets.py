@@ -6,7 +6,6 @@ from surogate.datasets.datasets import wrap_dataset
 from surogate.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
 from surogate.utils.dict import DictDefault
 from surogate.loaders.loader import get_model_and_tokenizer
-from surogate.utils.schema.datasets import ConversationDataset, InstructionDataset
 
 
 @pytest.fixture(scope="class")

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional, List, Literal
 
+from surogate.datasets.progress import create_hfhub_tqdm
 from swift.llm import get_model_info_meta
 from swift.llm.model.constant import MLLMModelType, LLMModelType
 from swift.utils import is_mp
@@ -132,7 +133,7 @@ class SFTConfig(ModelConfig, RayConfig):
             # liger_kernel does not support device_map. Use DDP/DeepSpeed for multi-GPU training.
             return False
 
-        model_info, model_meta = get_model_info_meta(self.model, use_hf=True)
+        model_info, model_meta = get_model_info_meta(self.model, use_hf=True, tqdm_class=create_hfhub_tqdm('Downloading model - '))
         return model_info.model_type in [
             MLLMModelType.llama4, LLMModelType.llama3, LLMModelType.llama3_1, LLMModelType.llama3_2,
             MLLMModelType.llama3_2_vision,

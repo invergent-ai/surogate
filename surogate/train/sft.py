@@ -3,11 +3,6 @@ from functools import partial
 from pathlib import Path
 from typing import List
 
-from swift.llm import BaseArguments, TrainArguments, DATASET_MAPPING, DatasetMeta, AutoPreprocessor
-from swift.llm.dataset.loader import load_dataset
-from swift.llm.train import SwiftSft
-from swift.plugin import extra_callbacks
-from swift.ray import RayHelper
 from transformers import SchedulerType
 
 from surogate.config.dataset_config import DatasetConfig
@@ -18,19 +13,33 @@ from surogate.datasets.datasets import get_default_process_count
 from surogate.datasets.instruction import InstructionPreprocessor
 from surogate.datasets.loader import _check_if_hub_dataset, swift_load_dataset
 from surogate.datasets.text import TextPreprocessor
-from surogate.sft.callback import SurogateSftCallback
-from surogate.sft.deepspeed import DEEPSPEED_CONFIGS
+from surogate.train.callback import SurogateTrainCallback
+from surogate.train.deepspeed import DEEPSPEED_CONFIGS
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
+from surogate.utils.model import estimate_model_parameters, recommend_training_params
+from swift.llm import BaseArguments, TrainArguments, DATASET_MAPPING, DatasetMeta, AutoPreprocessor, DATASET_TYPE
+from swift.llm.dataset.loader import load_dataset
+from swift.llm.train import SwiftSft
+from swift.ray import RayHelper
+from swift.trainers import TrainerFactory
+from swift.utils import get_model_parameter_info, get_dist_setting, is_master
+
+import datasets
+datasets.logging.set_verbosity_warning()
 
 logger = get_logger()
+
 
 @RayHelper.worker(group=['default'])
 class SurogateSFT(SurogateCommand, SwiftSft):
     def __init__(self, config: SFTConfig, args: DictDefault):
         super().__init__(config=config, args=args, swift=True)
         config.__post_init__()
+        if self.sg_config.sequence_len is None and self.model.model_info is not None:
+            self.sg_config.sequence_len = self.model.model_info.max_model_len
+
         self._pre_prepare_datasets()
 
     def _pre_prepare_datasets(self):
@@ -76,8 +85,8 @@ class SurogateSFT(SurogateCommand, SwiftSft):
                 return dataset_id
 
         self.args.dataset = list(map(partial(to_swift_dataset_id, self.sg_config.datasets), train_dataset_ids))
-        self.args.val_dataset = list(map(partial(to_swift_dataset_id, self.sg_config.validation_datasets), val_dataset_ids))
-
+        self.args.val_dataset = list(
+            map(partial(to_swift_dataset_id, self.sg_config.validation_datasets), val_dataset_ids))
 
     def _get_dataset(self):
         # The random shuffling of the training set occurs in the dataloader of the trainer.
@@ -98,8 +107,92 @@ class SurogateSFT(SurogateCommand, SwiftSft):
     @RayHelper.function(group='default')
     def _prepare_callbacks(self):
         super()._prepare_callbacks()
-        self.callbacks.append(SurogateSftCallback(self.sg_config))
+        self.callbacks.append(SurogateTrainCallback(self.sg_config))
 
+    @RayHelper.function(group='default')
+    def run(self):
+        args = self.args
+        train_dataset, val_dataset = self._prepare_dataset()
+
+        if args.task_type == 'seq_cls':
+            args.problem_type = args.problem_type or getattr(self.model.config, 'problem_type', None)
+            logger.info(f'args.problem_type: {args.problem_type}')
+        args.save_args()
+
+        data_collator = self._get_data_collator()
+        # Some tuners require train_dataset and data_collator for preparation: LoRA-GA
+        self.model = self.prepare_model(self.args, self.model, template=self.template, train_dataset=train_dataset)
+        model_parameter_info = get_model_parameter_info(self.model)
+        self.train_msg['model_parameter_info'] = model_parameter_info
+
+        optim_config = self._determine_optimal_config(train_dataset)
+
+        if self.sg_config.per_device_train_batch_size != optim_config['per_device_train_batch_size']:
+            logger.warning(f'The configured per_device_train_batch_size '
+                           f'({self.sg_config.per_device_train_batch_size}) differs from '
+                           f'the recommended per_device_train_batch_size is {optim_config["per_device_train_batch_size"]}')
+            self.args.training_args.per_device_train_batch_size = optim_config['per_device_train_batch_size']
+
+        if self.sg_config.gradient_accumulation_steps is None:
+            self.args.training_args.gradient_accumulation_steps = optim_config['gradient_accumulation_steps']
+
+        if self.sg_config.deepspeed is None:
+            self.args.training_args.deepspeed = optim_config['deepspeed']
+
+        trainer_cls = TrainerFactory.get_trainer_cls(args)
+        trainer = trainer_cls(
+            model=self.model,
+            args=self.args.training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            callbacks=self.callbacks,
+            template=self.template,
+            **self._get_trainer_kwargs(),
+        )
+        return self.train(trainer)
+
+    def _determine_optimal_config(self, train_dataset: DATASET_TYPE):
+        params = estimate_model_parameters(self.model.config)
+        dataset_size = len(train_dataset)
+        rank, local_rank, world_size, local_world_size = get_dist_setting()
+        optimal_config = recommend_training_params(
+            model_size_b=params / 1e9,
+            dataset_size=dataset_size,
+            quantization="bf16",
+            num_gpus=world_size,
+            vram_per_gpu_gb=int(self.system_info['gpu_memory_gb']),
+            seq_len=self.sg_config.sequence_len,
+        )
+
+        if hasattr(self.model, 'tie_weights') and optimal_config['deepspeed_stage'] == 3:
+            # Check if weights are tied
+            if self.model.config.tie_word_embeddings and is_master():
+                logger.warning("Weight tying detected - this can cause ZeRO-3 imbalance")
+
+        mem = optimal_config['memory_breakdown']
+        logger.info("Memory Breakdown per GPU:")
+        logger.info(f" Weights:                 {mem['weight_mem_gb']:6.2f} GB")
+        logger.info(f" Gradients:               {mem['grad_mem_gb']:6.2f} GB")
+        logger.info(f" Optimizer States:        {mem['optimizer_mem_gb']:6.2f} GB")
+        logger.info(f" Total (before ZeRO):     {mem['optimizer_mem_gb']:6.2f} GB")
+        logger.info(f" Per GPU (after ZeRO):    {mem['per_gpu_mem_gb']:6.2f} GB")
+        if mem.get('zero3_allgather_peak_gb', 0) > 0:
+            logger.info(f" ZeRO-3 Allgather Peak:   {mem['zero3_allgather_peak_gb']:6.2f} GB")
+        logger.info(f" Activation/sample:       {mem['activation_per_sample_gb']:6.2f} GB")
+        logger.info(f" Available for batch:     {mem['available_for_batch_gb']:6.2f} GB")
+
+        if optimal_config['warnings']:
+            logger.banner(f"{'⚠️  WARNINGS ⚠️':-^60}")
+            for w in optimal_config['warnings']:
+                logger.warning(f"{w}")
+
+        if is_master():
+            logger.info("Recommended training configuration based on model and dataset size:")
+            for key in ['per_device_train_batch_size', 'gradient_accumulation_steps', 'deepspeed_stage', 'use_offload', 'offload_device']:
+                logger.info(f" - {key}: {optimal_config[key]}")
+
+        return optimal_config
 
     def to_swift_args(self) -> BaseArguments:
         dataset_paths = [dataset.path for dataset in self.sg_config.datasets]

@@ -4,6 +4,8 @@ from typing import Optional, Literal, Dict
 from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict, load_from_disk, load_dataset
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, HFValidationError
+
+from surogate.datasets.progress import create_hfhub_tqdm
 from swift.llm import DatasetMeta, RowPreprocessor
 from swift.llm.dataset.loader import DatasetSyntax
 from datasets import Dataset as HfDataset
@@ -61,8 +63,6 @@ def load_dataset_with_config(
         "streaming": streaming
     }
 
-    logger.info("Loading dataset from path: %s", dataset_config.path)
-
     if Path(dataset_config.path).exists():
         return _load_from_local_path(dataset_config, load_dataset_kwargs)
 
@@ -95,11 +95,13 @@ def load_dataset_with_config(
 def _check_if_hub_dataset(path: str, hub_token: Optional[str]) -> bool:
     """Check if a dataset exists on the HuggingFace Hub."""
     try:
+        logger.info_once("Fetching dataset...")
         snapshot_download(
             repo_id=path,
             repo_type="dataset",
             token=hub_token,
             ignore_patterns=["*"],
+            tqdm_class=create_hfhub_tqdm('Downloading dataset - ')
         )
         return True
     except (
@@ -121,11 +123,13 @@ def _load_from_local_path(
 
     if local_path.is_dir():
         try:
+            logger.info(f"Loading dataset from {local_path}...")
             return load_from_disk(dataset_config.path)
         except FileNotFoundError:
             return load_dataset(dataset_config.path, **load_dataset_kwargs)
     elif local_path.is_file():
         dataset_type = get_dataset_type(dataset_config)
+        logger.info(f"Loading dataset from {local_path}...")
         return load_dataset(
             dataset_type,
             data_files=dataset_config.path,

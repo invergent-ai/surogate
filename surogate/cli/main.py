@@ -1,12 +1,17 @@
 # surogate/cli/main.py
 
 import argparse
+import gc
 import importlib.util
 import os
 import subprocess
 import sys
 from typing import Optional, List, Dict
+import signal
+import torch
+
 from surogate.utils.logger import get_logger
+from surogate.utils.system_info import print_system_diagnostics, get_system_info
 
 logger = get_logger()
 
@@ -30,6 +35,8 @@ def get_torchrun_args() -> Optional[List[str]]:
 
 
 def parse_args():
+    logger.banner("Surogate LLMOps Toolkit CLI")
+
     parser = argparse.ArgumentParser(description="Surogate LLMOps Framework")
     parser.set_defaults(func=lambda _args, p=parser: p.print_help())
     subparsers = parser.add_subparsers(dest='command', metavar='<command>')
@@ -92,16 +99,52 @@ def cli_main():
     python_cmd = sys.executable
     command_args = sys.argv[2:]
 
+    system_info = get_system_info()
+    print_system_diagnostics(system_info)
+
+    torch.cuda.empty_cache()
+
     if torchrun_args is None:
-        args = [python_cmd, file_path, *command_args]
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // torch.cuda.device_count())
+            logger.info(f"Multiple GPUs detected, running on {torch.cuda.device_count()} GPUs")
+            cmd_args = [python_cmd, '-m', 'torch.distributed.run', f"--nproc-per-node={torch.cuda.device_count()}", "--standalone", "--nnodes=1", "--node-rank=0", file_path, *command_args]
+        else:
+            cmd_args = [python_cmd, file_path, *command_args]
     else:
-        args = [python_cmd, '-m', 'torch.distributed.run', *torchrun_args, file_path, *command_args]
+        os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // torch.cuda.device_count())
+        cmd_args = [python_cmd, '-m', 'torch.distributed.run', *torchrun_args, file_path, *command_args]
 
-    result = subprocess.run(args)
+    process = None
+    try:
+        process = subprocess.Popen(cmd_args, preexec_fn=os.setsid)
+        return process.wait()
+    except KeyboardInterrupt:
+        logger.warning("Process interrupted by user")
+        return 0
+    except Exception as e:
+        logger.error("An error occurred:")
+        logger.error(f"Error Type: {{type(e).__name__}}")
+        logger.error(f"Error Message: {{e}}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        logger.info("Cleaning up...")
+        if process:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if it doesn't respond
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
+        gc.collect()
 
 if __name__ == '__main__':
-    cli_main()
+    exit(cli_main())

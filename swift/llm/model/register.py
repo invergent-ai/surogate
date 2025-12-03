@@ -21,6 +21,7 @@ from transformers.utils import (is_torch_bf16_gpu_available, is_torch_cuda_avail
                                 is_torch_npu_available, strtobool)
 from transformers.utils.versions import require_version
 
+from surogate.datasets.progress import create_hfhub_tqdm
 from swift.utils import get_dist_setting, get_logger, is_mp, is_unsloth_available, patch_getattr
 from .constant import ModelType
 from .patcher import (get_lm_head_model, patch_attach_align_device_hook_on_blocks, patch_automodel,
@@ -635,7 +636,9 @@ def get_model_info_meta(
         download_model=download_model,
         use_hf=use_hf,
         ignore_patterns=getattr(model_meta, 'ignore_patterns', None),
-        hub_token=hub_token)
+        hub_token=hub_token,
+        tqdm_class=create_hfhub_tqdm("Downloading model - ")
+    )
 
     model_type = model_type or getattr(model_meta, 'model_type', None)
     model_info = _get_model_info(model_dir, model_type, quantization_config=quantization_config)

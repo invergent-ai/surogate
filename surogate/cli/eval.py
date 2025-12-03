@@ -2,7 +2,6 @@ import argparse
 import sys
 
 from surogate.utils.logger import get_logger
-
 logger = get_logger()
 
 def prepare_command_parser(parser=None):
