@@ -1,11 +1,12 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, List, Literal
 
 from surogate.datasets.progress import create_hfhub_tqdm
 from swift.llm import get_model_info_meta
 from swift.llm.model.constant import MLLMModelType, LLMModelType
 from swift.utils import is_mp
-
+from namer import generate as generate_unique_name
 from surogate.config.dataset_config import SurogateDatasetConfig, create_dataset_config
 from surogate.config.model_config import ModelConfig
 from surogate.config.ray_config import RayConfig
@@ -30,6 +31,7 @@ class SFTConfig(ModelConfig, RayConfig):
     SFTConfig class is a dataclass that holds configuration parameters for Supervised Fine-Tuning (SFT)
 
     Args:
+        run_name (Optional[str]): Name of the training run. Defaults to None.
         num_train_epochs (Optional[int]): Number of training epochs. Defaults to 3.
         save_path (Optional[str]): Directory to save the output. Defaults to './output'.
         resume_from_checkpoint (Optional[str]): Path to a checkpoint to resume training from. Loads model weights, optimizer state, random seed, and resumes training from the last step. Defaults to None.
@@ -60,6 +62,7 @@ class SFTConfig(ModelConfig, RayConfig):
 
         usr_ray: Optional[bool]: Whether to use Ray for distributed training. Default is False.
     """
+    run_name: Optional[str] = None
     num_train_epochs: Optional[int] = None
     save_path: Optional[str] = None
     resume_from_checkpoint: Optional[str] = None
@@ -119,9 +122,19 @@ class SFTConfig(ModelConfig, RayConfig):
         self.lora_alpha = cfg['lora_alpha'] or 32
         self.lora_dropout = cfg['lora_dropout'] or 0.05
         self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
+        self.run_name = cfg['run_name'] or self.generate_run_name()
         self.__post_init__()
 
     def __post_init__(self):
+        _save_path = Path(self.save_path)
+        if _save_path.exists():
+            if not _save_path.is_dir():
+                raise ValueError(f"Save path {_save_path} already exists and is not a directory. Aborting.")
+            if any(_save_path.iterdir()):
+                raise ValueError(f"Save path {_save_path} is not empty. Aborting.")
+        else:
+            _save_path.mkdir(parents=True, exist_ok=True)
+
         if 'aim' in self.report_to:
             from transformers.integrations import INTEGRATION_TO_CALLBACK
             INTEGRATION_TO_CALLBACK['aim'] = AimCallback(
@@ -129,10 +142,6 @@ class SFTConfig(ModelConfig, RayConfig):
             )
 
     def should_apply_liger_kernel(self) -> bool:
-        if is_mp():
-            # liger_kernel does not support device_map. Use DDP/DeepSpeed for multi-GPU training.
-            return False
-
         model_info, model_meta = get_model_info_meta(self.model, use_hf=True, tqdm_class=create_hfhub_tqdm('Downloading model - '))
         return model_info.model_type in [
             MLLMModelType.llama4, LLMModelType.llama3, LLMModelType.llama3_1, LLMModelType.llama3_2,
@@ -154,3 +163,7 @@ class SFTConfig(ModelConfig, RayConfig):
 
             MLLMModelType.internvl3
         ]
+
+    def generate_run_name(self):
+        return generate_unique_name(category='science')
+

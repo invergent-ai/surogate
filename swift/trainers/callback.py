@@ -110,6 +110,4 @@ class PrinterCallbackNew(PrinterCallback):
 
 
 # monkey patching
-trainer.DEFAULT_PROGRESS_CALLBACK = ProgressCallbackNew
 trainer.DEFAULT_CALLBACKS = [DefaultFlowCallbackNew]
-trainer.PrinterCallback = PrinterCallbackNew

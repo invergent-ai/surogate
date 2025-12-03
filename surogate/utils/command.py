@@ -43,4 +43,5 @@ class SurogateCommand(abc.ABC):
         rank, local_rank, world_size, local_world_size = get_dist_setting()
         is_distributed = world_size > 1
         logger.info(f"Distributed Environment: {'Yes' if is_distributed else 'No'}")
-        logger.info(f"World Size: {world_size}, Local Rank: {local_rank}")
+        if is_distributed:
+            logger.info(f"World Size: {world_size}, Local Rank: {local_rank}")

@@ -13,7 +13,6 @@ from surogate.datasets.datasets import get_default_process_count
 from surogate.datasets.instruction import InstructionPreprocessor
 from surogate.datasets.loader import _check_if_hub_dataset, swift_load_dataset
 from surogate.datasets.text import TextPreprocessor
-from surogate.train.callback import SurogateTrainCallback
 from surogate.train.deepspeed import DEEPSPEED_CONFIGS
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
@@ -105,11 +104,6 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         return train_dataset, val_dataset
 
     @RayHelper.function(group='default')
-    def _prepare_callbacks(self):
-        super()._prepare_callbacks()
-        self.callbacks.append(SurogateTrainCallback(self.sg_config))
-
-    @RayHelper.function(group='default')
     def run(self):
         args = self.args
         train_dataset, val_dataset = self._prepare_dataset()
@@ -130,7 +124,8 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         if self.sg_config.per_device_train_batch_size != optim_config['per_device_train_batch_size']:
             logger.warning(f'The configured per_device_train_batch_size '
                            f'({self.sg_config.per_device_train_batch_size}) differs from '
-                           f'the recommended per_device_train_batch_size is {optim_config["per_device_train_batch_size"]}')
+                           f'the recommended per_device_train_batch_size is {optim_config["per_device_train_batch_size"]}. '
+                           f'Using the recommended value.')
             self.args.training_args.per_device_train_batch_size = optim_config['per_device_train_batch_size']
 
         if self.sg_config.gradient_accumulation_steps is None:
@@ -150,6 +145,7 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             template=self.template,
             **self._get_trainer_kwargs(),
         )
+        logger.info(f"Starting training run {self.sg_config.run_name}...")
         return self.train(trainer)
 
     def _determine_optimal_config(self, train_dataset: DATASET_TYPE):
@@ -168,7 +164,7 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         if hasattr(self.model, 'tie_weights') and optimal_config['deepspeed_stage'] == 3:
             # Check if weights are tied
             if self.model.config.tie_word_embeddings and is_master():
-                logger.warning("Weight tying detected - this can cause ZeRO-3 imbalance")
+                logger.warning("The model has weight tying enabled - this can cause ZeRO-3 memory imbalance across GPUs.")
 
         mem = optimal_config['memory_breakdown']
         logger.header("Memory Breakdown per GPU:")
