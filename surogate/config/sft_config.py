@@ -33,6 +33,7 @@ class SFTConfig(ModelConfig, RayConfig):
     Args:
         run_name (Optional[str]): Name of the training run. Defaults to None.
         qlora: Optional[bool]: Whether to use QLoRA for training. Default is False.
+        apply_recommended_values (Optional[bool]): Whether to apply recommended configuration values. Default is True.
         num_train_epochs (Optional[int]): Number of training epochs. Defaults to 3.
         save_path (Optional[str]): Directory to save the output. Defaults to './output'.
         resume_from_checkpoint (Optional[str]): Path to a checkpoint to resume training from. Loads model weights, optimizer state, random seed, and resumes training from the last step. Defaults to None.
@@ -64,6 +65,7 @@ class SFTConfig(ModelConfig, RayConfig):
         usr_ray: Optional[bool]: Whether to use Ray for distributed training. Default is False.
     """
     run_name: Optional[str] = None
+    apply_recommended_values: Optional[bool] = True
     num_train_epochs: Optional[int] = None
     save_path: Optional[str] = None
     resume_from_checkpoint: Optional[str] = None
@@ -97,6 +99,7 @@ class SFTConfig(ModelConfig, RayConfig):
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
+        self.apply_recommended_values = cfg.get('apply_recommended_values', True)
         self.num_train_epochs = cfg['num_train_epochs'] or 3
         self.save_path = cfg['save_path'] or './output'
         self.resume_from_checkpoint = cfg['resume_from_checkpoint']

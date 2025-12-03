@@ -3,7 +3,8 @@ from functools import partial
 from pathlib import Path
 from typing import List
 
-from transformers import SchedulerType
+import torch
+from transformers import SchedulerType, trainer
 
 from surogate.config.dataset_config import DatasetConfig
 from surogate.config.enums import SurogateDatasetType
@@ -14,6 +15,7 @@ from surogate.datasets.instruction import InstructionPreprocessor
 from surogate.datasets.loader import _check_if_hub_dataset, swift_load_dataset
 from surogate.datasets.text import TextPreprocessor
 from surogate.train.deepspeed import DEEPSPEED_CONFIGS
+from surogate.train.noop_callbacks import NoopTrainerCallback, NoopPrinterCallback
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -30,6 +32,13 @@ datasets.logging.set_verbosity_warning()
 
 logger = get_logger()
 
+trainer.DEFAULT_PROGRESS_CALLBACK = NoopTrainerCallback
+trainer.PrinterCallback = NoopPrinterCallback
+
+class SFTTrainerCallback(trainer.TrainerCallback):
+    def on_log(self, args, state, control, metrics=None, **kwargs):
+        if is_master():
+            logger.info(json.dumps(state.log_history[-1]))
 
 @RayHelper.worker(group=['default'])
 class SurogateSFT(SurogateCommand, SwiftSft):
@@ -104,14 +113,14 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         return train_dataset, val_dataset
 
     @RayHelper.function(group='default')
-    def run(self):
-        args = self.args
-        train_dataset, val_dataset = self._prepare_dataset()
+    def _prepare_callbacks(self):
+        super()._prepare_callbacks()
+        self.callbacks.append(SFTTrainerCallback())
 
-        if args.task_type == 'seq_cls':
-            args.problem_type = args.problem_type or getattr(self.model.config, 'problem_type', None)
-            logger.info(f'args.problem_type: {args.problem_type}')
-        args.save_args()
+    @RayHelper.function(group='default')
+    def run(self):
+        train_dataset, val_dataset = self._prepare_dataset()
+        self.args.save_args()
 
         data_collator = self._get_data_collator()
         # Some tuners require train_dataset and data_collator for preparation: LoRA-GA
@@ -119,22 +128,36 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         model_parameter_info = get_model_parameter_info(self.model)
         self.train_msg['model_parameter_info'] = model_parameter_info
 
-        optim_config = self._determine_optimal_config(train_dataset)
+        if self.sg_config.apply_recommended_values:
+            optim_config = self._determine_recommended_config(train_dataset)
 
-        if self.sg_config.per_device_train_batch_size != optim_config['per_device_train_batch_size']:
-            logger.warning(f'The configured per_device_train_batch_size '
-                           f'({self.sg_config.per_device_train_batch_size}) differs from '
-                           f'the recommended per_device_train_batch_size is {optim_config["per_device_train_batch_size"]}. '
-                           f'Using the recommended value.')
-            self.args.training_args.per_device_train_batch_size = optim_config['per_device_train_batch_size']
+            if self.sg_config.per_device_train_batch_size != optim_config['per_device_train_batch_size']:
+                logger.warning(f'The configured per_device_train_batch_size '
+                               f'({self.sg_config.per_device_train_batch_size}) differs from '
+                               f'the recommended per_device_train_batch_size is {optim_config["per_device_train_batch_size"]}. '
+                               f'Using the recommended value.')
+                self.args.training_args.per_device_train_batch_size = optim_config['per_device_train_batch_size']
 
-        if self.sg_config.gradient_accumulation_steps is None:
-            self.args.training_args.gradient_accumulation_steps = optim_config['gradient_accumulation_steps']
+            if self.sg_config.gradient_accumulation_steps is None:
+                self.args.training_args.gradient_accumulation_steps = optim_config['gradient_accumulation_steps']
 
-        if self.sg_config.deepspeed is None:
-            self.args.training_args.deepspeed = optim_config['deepspeed']
+            if self.sg_config.deepspeed is None:
+                self.args.training_args.deepspeed = optim_config['deepspeed']
 
-        trainer_cls = TrainerFactory.get_trainer_cls(args)
+
+        logger.info(f"Starting training run '{self.sg_config.run_name}'...")
+        return self.train_with_oom_recovery(data_collator, train_dataset, val_dataset)
+
+
+    def train_with_oom_recovery(self, data_collator, train_dataset, val_dataset):
+        trainer_cls = TrainerFactory.get_trainer_cls(self.args)
+        original_batch_size = self.args.training_args.per_device_train_batch_size
+        original_grad_accum = self.args.training_args.gradient_accumulation_steps
+        min_batch_size = 1
+        attempt = 0
+        max_attempts = 10
+        res = None
+
         trainer = trainer_cls(
             model=self.model,
             args=self.args.training_args,
@@ -145,10 +168,84 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             template=self.template,
             **self._get_trainer_kwargs(),
         )
-        logger.info(f"Starting training run {self.sg_config.run_name}...")
-        return self.train(trainer)
 
-    def _determine_optimal_config(self, train_dataset: DATASET_TYPE):
+        while self.args.per_device_train_batch_size >= min_batch_size and attempt < max_attempts:
+            attempt += 1
+
+            try:
+                res = trainer.train(trainer.args.resume_from_checkpoint)
+                logger.info("Training completed successfully.")
+                break
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                is_oom = any(x in error_msg for x in ["out of memory", "oom", "cuda out of memory", "mps out of memory"])
+                if is_oom:
+                    logger.warning(f"Out of memory error encountered during training attempt {attempt}.")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+
+                    import gc
+                    gc.collect()
+
+                    current_batch = self.args.training_args.per_device_train_batch_size
+                    current_grad_accum = self.args.training_args.gradient_accumulation_steps
+
+                    if current_grad_accum < 16 and current_batch > 1:
+                        # If gradient accumulation is reasonable, increase it and reduce batch size
+                        new_batch_size = max(1, current_batch // 2)
+                        new_grad_accum = min(32, current_grad_accum * 2)
+                    elif current_batch > 1:
+                        # Just reduce batch size
+                        new_batch_size = max(1, current_batch // 2)
+                        new_grad_accum = current_grad_accum
+                    else:
+                        # Can't reduce further
+                        logger.error("Cannot reduce batch size further to recover from OOM.")
+                        raise
+
+                    self.args.training_args.per_device_train_batch_size = new_batch_size
+                    self.args.training_args.gradient_accumulation_steps = new_grad_accum
+
+                    logger.info(f"Adjusting training configuration to recover from OOM:")
+                    logger.metric("New batch size", f"{current_batch} → {new_batch_size}")
+                    logger.metric("New gradient accumulation", f"{current_grad_accum} → {new_grad_accum}")
+                    logger.metric("New effective batch size", f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}")
+
+                    trainer = trainer_cls(
+                        model=self.model,
+                        args=self.args.training_args,
+                        data_collator=data_collator,
+                        train_dataset=train_dataset,
+                        eval_dataset=val_dataset,
+                        callbacks=self.callbacks,
+                        template=self.template,
+                        **self._get_trainer_kwargs(),
+                    )
+                else:
+                    raise
+
+            finally:
+                res = self._save_trainer_state(trainer)
+
+        if attempt >= max_attempts:
+            logger.error(f"Training failed after {max_attempts} attempts")
+            raise RuntimeError(f"Could not complete training after {max_attempts} OOM recovery attempts")
+
+        final_batch = self.args.training_args.per_device_train_batch_size
+        final_grad_accum = self.args.training_args.gradient_accumulation_steps
+
+        if final_batch != original_batch_size or final_grad_accum != original_grad_accum:
+            logger.info("Training completed with adjusted batch size and/or gradient accumulation steps:")
+            logger.metric("Batch size", f"{original_batch_size} → {final_batch}")
+            logger.metric("Gradient accumulation", f"{original_grad_accum} → {final_grad_accum}")
+            logger.metric("Effective batch size", f"{original_batch_size * original_grad_accum} → {final_batch * final_grad_accum}")
+
+        return res
+
+
+    def _determine_recommended_config(self, train_dataset: DATASET_TYPE):
         params = estimate_model_parameters(self.model.config)
         dataset_size = len(train_dataset)
         rank, local_rank, world_size, local_world_size = get_dist_setting()

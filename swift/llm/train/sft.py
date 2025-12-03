@@ -217,6 +217,10 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 last_checkpoint = os.path.join(self.args.output_dir, 'last')
                 best_checkpoint = os.path.join(self.args.output_dir, 'best')
                 if is_master():
+                    if os.path.islink(last_checkpoint):
+                        os.unlink(last_checkpoint)
+                    if os.path.islink(best_checkpoint):
+                        os.unlink(best_checkpoint)
                     os.symlink(state.last_model_checkpoint, last_checkpoint)
                     os.symlink(state.best_model_checkpoint, best_checkpoint)
                 state.last_model_checkpoint = last_checkpoint

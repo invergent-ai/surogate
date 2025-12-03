@@ -8,6 +8,7 @@ from datasets import Dataset as HfDataset
 from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
+from surogate.datasets.progress import create_hfhub_tqdm
 from swift.utils import get_logger, is_dist, is_master
 from ..template import MaxLengthError
 from .preprocessor import RowPreprocessor
@@ -161,7 +162,8 @@ class PackingDataset(Dataset):
         i = 0
         PACKING_BATCH_SIZE = 1000
         input_data, packed_idx, packed_length = [], [], []
-        with tqdm(total=len(data), dynamic_ncols=True, desc='Packing: ') as prog_bar:
+        sg_tqdm = create_hfhub_tqdm("Packing dataset")
+        with sg_tqdm(total=len(data), dynamic_ncols=True) as prog_bar:
             while True:
                 new_data = data[i:i + PACKING_BATCH_SIZE]
                 input_data += new_data
