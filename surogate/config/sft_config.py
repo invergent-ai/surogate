@@ -5,7 +5,6 @@ from typing import Optional, List, Literal
 from surogate.datasets.progress import create_hfhub_tqdm
 from swift.llm import get_model_info_meta
 from swift.llm.model.constant import MLLMModelType, LLMModelType
-from swift.utils import is_mp
 from namer import generate as generate_unique_name
 from surogate.config.dataset_config import SurogateDatasetConfig, create_dataset_config
 from surogate.config.model_config import ModelConfig

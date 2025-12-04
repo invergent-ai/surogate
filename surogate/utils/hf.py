@@ -2,10 +2,12 @@ import fnmatch
 import json
 import os
 import shutil
+from typing import Literal
 
 import huggingface_hub
-from huggingface_hub import scan_cache_dir
-from huggingface_hub.hf_api import RepoFile
+from huggingface_hub import scan_cache_dir, HfFileSystem
+from huggingface_hub.errors import GatedRepoError
+from huggingface_hub.hf_api import RepoFile, list_repo_files
 from transformers import AutoModel
 
 
@@ -388,3 +390,149 @@ def get_model_architecture(repo_id):
         "architecture": architecture,
         "total_parameters": sum(p.numel() for p in model.parameters())
     }
+
+
+def get_cache_dir_for_repo(repo_id: str, repo_type: Literal["model", "dataset"]):
+    """Get the HuggingFace cache directory for a specific repo"""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    # Convert repo_id to cache-safe name (same logic as huggingface_hub)
+    # repo_name = re.sub(r'[^\w\-_.]', '-', repo_id)
+    # Replace / with --
+    repo_name = repo_id.replace("/", "--")
+    prefix = "datasets" if repo_type == "dataset" else "models"
+    return os.path.join(HF_HUB_CACHE, f"{prefix}--{repo_name}")
+
+
+def get_local_snapshot_path(repo_id, repo_type: Literal["model", "dataset"]):
+    cache_dir = get_cache_dir_for_repo(repo_id, repo_type)
+    if not os.path.exists(cache_dir):
+        return None
+
+    snapshots_dir = os.path.join(cache_dir, "snapshots")
+    if not os.path.exists(snapshots_dir):
+        return None
+
+    # Get the most recent snapshot (highest timestamp or lexicographically last)
+    try:
+        commits = os.listdir(snapshots_dir)
+        if not commits:
+            return 0
+
+        # Use the lexicographically last commit (usually the latest)
+        latest_commit = sorted(commits)[-1]
+        return os.path.join(snapshots_dir, latest_commit)
+    except Exception:
+        return None
+
+
+def get_downloaded_size_from_cache(repo_id, file_metadata, repo_type: Literal["model", "dataset"]):
+    """
+    Check HuggingFace cache directory to see which files exist and their sizes.
+    Returns total downloaded bytes.
+    """
+    try:
+        snapshot_path = get_local_snapshot_path(repo_id, repo_type)
+        if not snapshot_path:
+            return 0
+
+        downloaded_size = 0
+
+        # Check each expected file
+        for filename, expected_size in file_metadata.items():
+            file_path = os.path.join(snapshot_path, filename)
+
+            if os.path.exists(file_path):
+                try:
+                    actual_size = os.path.getsize(file_path)
+                    # Use the smaller of expected and actual size to be conservative
+                    downloaded_size += min(actual_size, expected_size)
+                except Exception:
+                    pass
+
+        return downloaded_size
+
+    except Exception as e:
+        print(f"Error checking cache: {e}")
+        return 0
+
+
+def check_model_gated(repo_id):
+    """
+    Check if a model is gated by trying to read config.json or model_index.json
+    using HuggingFace Hub filesystem.
+
+    Args:
+        repo_id (str): The repository ID to check
+
+    Raises:
+        GatedRepoError: If the model is gated and requires authentication/license acceptance
+    """
+    fs = HfFileSystem()
+
+    # List of config files to check
+    config_files = ["config.json", "model_index.json"]
+
+    # Try to read each config file
+    for config_file in config_files:
+        file_path = f"{repo_id}/{config_file}"
+        try:
+            # Try to open and read the file
+            with fs.open(file_path, "r") as f:
+                f.read(1)  # Just read a byte to check accessibility
+            # If we can read any config file, the model is not gated
+            return
+        except GatedRepoError:
+            # If we get a GatedRepoError, the model is definitely gated
+            raise GatedRepoError(f"Model {repo_id} is gated and requires authentication or license acceptance")
+        except Exception:
+            # If we get other errors (like file not found), continue to next file
+            continue
+
+    # If we couldn't read any config file due to non-gated errors,
+    # we'll let the main download process handle it
+    return
+
+
+def get_repo_file_metadata(repo_id, repo_type: Literal["model", "dataset"], allow_patterns=None):
+    """
+    Get metadata for all files in a HuggingFace repo.
+    Returns dict with filename -> size mapping.
+    """
+    try:
+        # Get list of files in the repo
+        files = list_repo_files(repo_id, repo_type=repo_type)
+
+        # Filter out git files
+        files = [f for f in files if not f.startswith('.git')]
+
+        # Filter by allow_patterns if provided
+        if allow_patterns:
+            import fnmatch
+            filtered_files = []
+            for file in files:
+                if any(fnmatch.fnmatch(file, pattern) for pattern in allow_patterns):
+                    filtered_files.append(file)
+            files = filtered_files
+
+        # Get file sizes using HfFileSystem
+        fs = HfFileSystem()
+        file_metadata = {}
+        total_size = 0
+
+        for file in files:
+            try:
+                # Get file info including size
+                file_info = fs.info(f"{repo_id}/{file}")
+                file_size = file_info.get('size', 0)
+                file_metadata[file] = file_size
+                total_size += file_size
+            except Exception as e:
+                print(f"  Warning: Could not get size for {file}: {e}")
+                file_metadata[file] = 0
+
+        return file_metadata, total_size
+
+    except Exception as e:
+        print(f"Error getting repo metadata: {e}")
+        return {}, 0

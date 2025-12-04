@@ -25,3 +25,17 @@ def to_abspath(path: Union[str, List[str], None], check_path_exist: bool = False
     for v in path:
         res.append(to_abspath(v, check_path_exist))
     return res
+
+
+def raise_nofile_limit():
+    try:
+        import resource  # POSIX only
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 8192 if soft < 8192 else soft
+        if hard < target:
+            target = hard  # cannot exceed hard limit
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        # Silently ignore on unsupported platforms
+        pass

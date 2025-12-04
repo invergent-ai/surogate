@@ -1,4 +1,3 @@
-import asyncio
 import gc
 import json
 import os
@@ -9,12 +8,15 @@ from threading import Thread, Event
 import lakefs_sdk
 import urllib3
 from datasets import load_dataset
-from huggingface_hub import list_repo_files, get_paths_info
 from huggingface_hub.errors import GatedRepoError
+from namer import generate as generate_unique_name
 
-from surogate.utils.hf import delete_dataset_from_hf_cache
+from surogate.jobs.progress_reporter import PrinterJobProgressReporter
+from surogate.utils.fs import raise_nofile_limit
+from surogate.utils.hf import delete_dataset_from_hf_cache, get_downloaded_size_from_cache, get_repo_file_metadata
 from surogate.utils.lakefs import ensure_repository, delete_repository
 
+ENV_JOB_NAME = "JOB_NAME"
 ENV_HF_DATASET_ID = "HF_DATASET_ID"
 ENV_HF_DATASET_SUBSET = "HF_DATASET_SUBSET"
 ENV_HF_TOKEN = "HF_TOKEN"
@@ -36,6 +38,7 @@ error_msg = False
 # Global variables for cache-based progress tracking
 _cache_stop_monitoring = False
 
+job_name = os.getenv(ENV_JOB_NAME, generate_unique_name(category='science'))
 hf_dataset_id = os.getenv(ENV_HF_DATASET_ID, "")
 hf_dataset_subset = os.getenv(ENV_HF_DATASET_SUBSET, "")
 hf_token = os.getenv(ENV_HF_TOKEN, "")
@@ -44,6 +47,7 @@ lakefs_branch = os.getenv(ENV_LAKEFS_BRANCH, "")
 lakefs_key = os.getenv(ENV_LAKEFS_KEY, "")
 lakefs_secret = os.getenv(ENV_LAKEFS_SECRET, "")
 lakefs_endpoint = os.getenv(ENV_LAKEFS_ENDPOINT, "")
+progress_reporter = PrinterJobProgressReporter(job_name)
 
 urllib3.disable_warnings()
 
@@ -54,153 +58,26 @@ lakefs_configuration.verify_ssl = False
 
 if not hf_dataset_id or not lakefs_repo_id or not lakefs_branch or not lakefs_key or not lakefs_secret or not lakefs_endpoint:
     print("ERROR: Missing required environment variables.")
-    print(f"Make sure {ENV_HF_DATASET_ID}, {ENV_LAKEFS_REPO_ID}, {ENV_LAKEFS_BRANCH}, {ENV_LAKEFS_KEY}, {ENV_LAKEFS_ENDPOINT} and {ENV_LAKEFS_SECRET} are set.")
+    print(
+        f"Make sure {ENV_HF_DATASET_ID}, {ENV_LAKEFS_REPO_ID}, {ENV_LAKEFS_BRANCH}, {ENV_LAKEFS_KEY}, {ENV_LAKEFS_ENDPOINT} and {ENV_LAKEFS_SECRET} are set.")
     exit(1)
 
 # Try to raise the soft limit of open files to reduce chances of hitting 'too many open files'
-try:
-    import resource  # POSIX only
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = 8192 if soft < 8192 else soft
-    if hard < target:
-        target = hard  # cannot exceed hard limit
-    if soft < target:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-except Exception:
-    # Silently ignore on unsupported platforms
-    pass
-
-
-def get_repo_file_metadata(repo_id, allow_patterns=None):
-    """
-    Get metadata for all files in a HuggingFace repo.
-    Returns dict with filename -> size mapping.
-    """
-    try:
-        # Get list of files in the repo
-        files = list_repo_files(repo_id=repo_id, repo_type="dataset")
-
-        # Filter out git files
-        files = [f for f in files if not f.startswith('.git')]
-
-        # Filter by allow_patterns if provided
-        if allow_patterns:
-            import fnmatch
-            filtered_files = []
-            for file in files:
-                if any(fnmatch.fnmatch(file, pattern) for pattern in allow_patterns):
-                    filtered_files.append(file)
-            files = filtered_files
-
-        # Get file sizes using HfFileSystem
-        file_metadata = {}
-        total_size = 0
-
-        path_infos = get_paths_info(repo_id=repo_id, paths=files, repo_type="dataset")
-
-        for (file, path_info) in zip(files, path_infos):
-            try:
-                # Get file info including size
-                file_size = path_info.size
-                file_metadata[file] = file_size
-                total_size += file_size
-            except Exception as e:
-                print(f"  Warning: Could not get size for {file}: {e}")
-                file_metadata[file] = 0
-
-        return file_metadata, total_size
-
-    except Exception as e:
-        print(f"Error getting repo metadata: {e}")
-        return {}, 0
-
-
-def get_cache_dir_for_repo(repo_id):
-    """Get the HuggingFace cache directory for a specific repo"""
-    from huggingface_hub.constants import HF_HUB_CACHE
-
-    # Convert repo_id to cache-safe name (same logic as huggingface_hub)
-    # repo_name = re.sub(r'[^\w\-_.]', '-', repo_id)
-    # Replace / with --
-    repo_name = repo_id.replace("/", "--")
-
-    return os.path.join(HF_HUB_CACHE, f"datasets--{repo_name}")
-
-
-def get_local_snapshot_path(repo_id):
-    cache_dir = get_cache_dir_for_repo(repo_id)
-    if not os.path.exists(cache_dir):
-        return None
-
-    snapshots_dir = os.path.join(cache_dir, "snapshots")
-    if not os.path.exists(snapshots_dir):
-        return None
-
-    # Get the most recent snapshot (highest timestamp or lexicographically last)
-    try:
-        commits = os.listdir(snapshots_dir)
-        if not commits:
-            return 0
-
-        latest_commit = sorted(commits)[-1]
-        return os.path.join(snapshots_dir, latest_commit)
-    except Exception:
-        return None
-
-
-def get_downloaded_size_from_cache(repo_id, file_metadata):
-    """
-    Check HuggingFace cache directory to see which files exist and their sizes.
-    Returns total downloaded bytes.
-    """
-    try:
-        snapshot_path = get_local_snapshot_path(repo_id)
-        if not snapshot_path:
-            return 0
-
-        downloaded_size = 0
-
-        # Check each expected file
-        for filename, expected_size in file_metadata.items():
-            file_path = os.path.join(snapshot_path, filename)
-
-            if os.path.exists(file_path):
-                try:
-                    actual_size = os.path.getsize(file_path)
-                    # Use the smaller of expected and actual size to be conservative
-                    downloaded_size += min(actual_size, expected_size)
-                except Exception:
-                    pass
-
-        return downloaded_size
-
-    except Exception as e:
-        print(f"Error checking cache: {e}")
-        return 0
-
-
-def report_progress(downloaded_bytes, total_bytes):
-    if total_bytes <= 0:
-        print(f"PROGRESS: {downloaded_bytes}/?/0.0%")
-    else:
-        try:
-            pct = (downloaded_bytes / total_bytes) * 100
-        except ZeroDivisionError:
-            pct = 0.0
-        print(f"PROGRESS: {downloaded_bytes}/{total_bytes}/{pct:.1f}%")
+raise_nofile_limit()
 
 
 def cache_progress_monitor(file_metadata, total_bytes):
     """
-        Monitor cache directory for download progress.
-        Runs in a separate thread.
-        """
+    Monitor cache directory for download progress.
+    Runs in a separate thread.
+    """
     global _cache_stop_monitoring
 
     while not _cache_stop_monitoring:
         try:
-            downloaded_bytes = get_downloaded_size_from_cache(hf_dataset_id, file_metadata)
-            report_progress(downloaded_bytes, total_bytes)
+            downloaded_bytes = get_downloaded_size_from_cache(hf_dataset_id, file_metadata, "dataset")
+            progress_reporter.update((downloaded_bytes / total_bytes) * 100)
+            progress_reporter.report()
 
             # Check if download is complete (tolerate minor discrepancies)
             if total_bytes > 0 and downloaded_bytes >= total_bytes * 0.99:
@@ -213,7 +90,7 @@ def cache_progress_monitor(file_metadata, total_bytes):
             time.sleep(5)  # Wait longer on error
 
 
-def do_download(repo_id, queue, allow_patterns=None):
+def do_download(repo_id, queue):
     try:
         # keep_in_memory reduces number of simultaneously open mmap'd arrow files
         ds = load_dataset(repo_id, hf_dataset_subset or None, token=hf_token or None, keep_in_memory=False)
@@ -249,13 +126,15 @@ def launch_snapshot(repo_id, allow_patterns=None):
         queue.close()
     except Exception:
         pass
+
     return result
+
 
 def download_blocking(is_downloaded):
     global error_msg, returncode, _cache_stop_monitoring
 
     try:
-        file_metadata, actual_total_size = get_repo_file_metadata(hf_dataset_id, allow_patterns)
+        file_metadata, actual_total_size = get_repo_file_metadata(hf_dataset_id, 'dataset', allow_patterns)
         progress_thread = Thread(
             target=cache_progress_monitor,
             args=(file_metadata, actual_total_size),
@@ -266,7 +145,7 @@ def download_blocking(is_downloaded):
         result = launch_snapshot(repo_id=hf_dataset_id, allow_patterns=allow_patterns)
         if isinstance(result, str) and result.startswith("error:"):
             returncode = 1
-            error_msg = result[len("error: ") :]
+            error_msg = result[len("error: "):]
 
         _cache_stop_monitoring = True
         progress_thread.join(timeout=5)
@@ -279,6 +158,7 @@ def download_blocking(is_downloaded):
         error_msg = f"{type(e).__name__}: {e}"
 
     is_downloaded.set()
+
 
 def write_dataset_info(dataset, path="/tmp"):
     splits = dataset.shape  # Shape of each split (number of rows, number of columns)
@@ -294,7 +174,8 @@ def write_dataset_info(dataset, path="/tmp"):
     with open(f"{path}/surogate_info.json", "w") as f:
         json.dump(splits_info, f, indent=2)
 
-async def main():
+
+def main():
     global returncode
 
     with lakefs_sdk.ApiClient(lakefs_configuration) as api_client:
@@ -334,7 +215,7 @@ async def main():
                         repository=lakefs_repo_id,
                         branch=lakefs_branch,
                         commit_creation=lakefs_sdk.CommitCreation(
-                            message= "Add dataset " + hf_dataset_id
+                            message="Add dataset " + hf_dataset_id
                         )
                     )
                 except lakefs_sdk.ApiException as e:
@@ -366,4 +247,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
