@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-1.7B
+model: Qwen/Qwen3-4B
 model_type: qwen3
 save_path: ./output
 
@@ -10,8 +10,7 @@ sequence_len: 4096
 
 learning_rate: 2e-4
 
-qlora: false
-lora_fast: true
+qlora: true
 lora_rank: 8
 lora_alpha: 16
 lora_target_modules:
