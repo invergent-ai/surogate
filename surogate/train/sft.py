@@ -1,34 +1,35 @@
-import json
+import os
 from functools import partial
-from pathlib import Path
 from typing import List
 
 import datasets
+import numpy as np
 import torch
-from transformers import SchedulerType, trainer
+from datasets import Dataset as HfDataset
+from transformers import trainer, TrainingArguments
 
-from surogate.config.dataset_config import DatasetConfig
-from surogate.config.enums import SurogateDatasetType
-from surogate.config.sft_config import SFTConfig
-from surogate.datasets.conversation import ConversationPreprocessor
-from surogate.datasets.datasets import get_default_process_count
-from surogate.datasets.instruction import InstructionPreprocessor
-from surogate.datasets.loader import _check_if_hub_dataset, swift_load_dataset
-from surogate.datasets.text import TextPreprocessor
-from surogate.train.deepspeed import DEEPSPEED_CONFIGS
-from surogate.train.noop_callbacks import NoopTrainerCallback, NoopPrinterCallback
+from surogate.core.config.sft_config import SFTConfig
+from surogate.core.datasets.datasets import get_default_process_count
+from surogate.core.datasets.loader import load_dataset_with_config, \
+    post_process, pre_process
+from surogate.core.datasets.packing import IterablePackingDataset, PackingDataset
+from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
+from surogate.core.datasets.utils import DATASET_TYPE, LazyLLMDataset
+from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
+from surogate.core.model.saver import save_checkpoint
+from surogate.train.callbacks import NoopPrinterCallback, NoopTrainerCallback, SFTTrainerCallback
+from surogate.train.train_utils import TrainUtils
+from surogate.train.trainer import SurogateTrainer
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
+from surogate.utils.dist import is_master, get_dist_setting
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters, recommend_training_params
-from swift import Swift
-from swift.llm import BaseArguments, TrainArguments, DATASET_MAPPING, DatasetMeta, AutoPreprocessor, DATASET_TYPE, save_checkpoint
-from swift.llm.dataset.loader import load_dataset
+from surogate.utils.np_utils import get_seed
+from swift.llm.dataset.loader import DatasetLoader
 from swift.llm.export.merge_lora import check_tie_word_embeddings
-from swift.llm.train import SwiftSft
 from swift.ray import RayHelper
-from swift.trainers import TrainerFactory
-from swift.utils import get_model_parameter_info, get_dist_setting, is_master
+from swift.utils import append_to_jsonl
 
 datasets.logging.set_verbosity_warning()
 
@@ -37,150 +38,211 @@ logger = get_logger()
 trainer.DEFAULT_PROGRESS_CALLBACK = NoopTrainerCallback
 trainer.PrinterCallback = NoopPrinterCallback
 
-class SFTTrainerCallback(trainer.TrainerCallback):
-    def on_log(self, args, state, control, metrics=None, **kwargs):
-        if is_master():
-            logger.info(json.dumps(state.log_history[-1]))
-
 @RayHelper.worker(group=['default'])
-class SurogateSFT(SurogateCommand, SwiftSft):
+class SurogateSFT(SurogateCommand):
+    training_args: TrainingArguments
+    template_processor: ChatTemplateProcessor
+
     def __init__(self, config: SFTConfig, args: DictDefault):
-        super().__init__(config=config, args=args, swift=True)
+        super().__init__(config=config, args=args)
         config.__post_init__()
-        if self.sg_config.sequence_len is None and self.model.model_info is not None:
-            self.sg_config.sequence_len = self.model.model_info.max_model_len
 
-        self._pre_prepare_datasets()
+        self._prepare_model_tokenizer()
+        self._prepare_template()
+        self._prepare_callbacks()
 
-    def _pre_prepare_datasets(self):
-        DATASET_MAPPING.clear()
-        train_dataset_ids = [ds.path for ds in self.sg_config.datasets]
-        val_dataset_ids = [ds.path for ds in self.sg_config.validation_datasets]
+    @RayHelper.function(group='default')
+    def _prepare_model_tokenizer(self):
+        self.model, self.processor = self.config.get_model_processor()
+        if self.config.sequence_parallel_size > 1:
+            from sequence_parallel import sequence_parallel
+            sequence_parallel.prepare(
+                self.config.sequence_parallel_size, model=self.model, tokenizer=self.processor,
+                padding_free=self.config.padding_free)
+        if self.model is None:
+            return
+        if hasattr(self.model, 'hf_device_map'):
+            logger.info(f'model.hf_device_map: {self.model.hf_device_map}')
 
-        def to_swift_dataset_id(datasets: List[DatasetConfig], dataset_id: str) -> str:
-            ds_config: DatasetConfig = next(filter(lambda ds: ds.path == dataset_id, datasets), None)
-            load_function = partial(swift_load_dataset, dataset_config=ds_config, sg_args=self.sg_args)
-            if ds_config.type == SurogateDatasetType.instruction:
-                preprocess_func = InstructionPreprocessor(ds_config)
-            elif ds_config.type == SurogateDatasetType.conversation:
-                preprocess_func = ConversationPreprocessor(ds_config)
-            elif ds_config.type == SurogateDatasetType.text:
-                preprocess_func = TextPreprocessor(ds_config)
-            else:
-                preprocess_func = AutoPreprocessor()
-
-            if Path(dataset_id).exists():
-                DATASET_MAPPING[dataset_id] = DatasetMeta(
-                    dataset_path=dataset_id,
-                    load_function=load_function,
-                    preprocess_func=preprocess_func
-                )
-                return dataset_id
-            elif _check_if_hub_dataset(dataset_id, self.sg_args):
-                DATASET_MAPPING[dataset_id] = DatasetMeta(
-                    hf_dataset_id=dataset_id,
-                    load_function=load_function,
-                    preprocess_func=preprocess_func
-                )
-                dataset_id = f"hf::{dataset_id}"
-                if ds_config.samples:
-                    dataset_id += f"#{ds_config.samples}"
-                return dataset_id
-            else:
-                DATASET_MAPPING[dataset_id] = DatasetMeta(
-                    dataset_path=dataset_id,
-                    load_function=load_function,
-                    preprocess_func=preprocess_func
-                )
-                return dataset_id
-
-        self.args.dataset = list(map(partial(to_swift_dataset_id, self.sg_config.datasets), train_dataset_ids))
-        self.args.val_dataset = list(
-            map(partial(to_swift_dataset_id, self.sg_config.validation_datasets), val_dataset_ids))
-
-    def _get_dataset(self):
-        # The random shuffling of the training set occurs in the dataloader of the trainer.
-        train_dataset, val_dataset = load_dataset(
-            self.args.dataset, num_proc=get_default_process_count(),
-            split_dataset_ratio=self.args.split_dataset_ratio, shuffle=self.args.dataset_shuffle,
-            use_hf=True, hub_token=self.sg_args['hub_token'])
-
-        if len(self.args.val_dataset) > 0:
-            _, val_dataset = load_dataset(
-                self.args.val_dataset, num_proc=get_default_process_count(),
-                split_dataset_ratio=1.0, shuffle=self.args.val_dataset_shuffle,
-                use_hf=True, hub_token=self.sg_args['hub_token'])
-            assert self.args.split_dataset_ratio == 0.
-
-        return train_dataset, val_dataset
+    @RayHelper.function(group='default')
+    def _prepare_template(self) -> None:
+        template_processor = self.config.get_template_processor(self.processor)
+        template_processor.set_mode('train')
+        if template_processor.use_model:
+            template_processor.model = self.model
+        if self.config.model_template.is_multimodal and (
+                self.config.padding_free or self.config.sample_packing) and not template_processor.support_padding_free:
+            raise ValueError(f'Template `{self.config.template}` does not support padding free or packing.')
+        self.template_processor = template_processor
 
     @RayHelper.function(group='default')
     def _prepare_callbacks(self):
-        super()._prepare_callbacks()
-        self.callbacks.append(SFTTrainerCallback())
+        self.callbacks = [SFTTrainerCallback()]
+
+    @RayHelper.function(group='default')
+    def _prepare_datasets(self):
+        train_datasets, val_datasets = [], []
+        seed = np.random.RandomState(self.config.seed)
+
+        for ds_config in self.config.datasets:
+            dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)
+            dataset = pre_process(dataset, ds_config, num_proc=get_default_process_count())
+            train_dataset, val_dataset = post_process(
+                dataset,
+                dataset_sample=ds_config.samples,
+                split_dataset_ratio=self.config.validation_split_ratio,
+                streaming=self.config.stream_datasets,
+                random_state=seed,
+            )
+            train_datasets.append(train_dataset)
+            val_datasets.append(val_dataset)
+
+        for ds_config in self.config.validation_datasets:
+            dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)
+            dataset = pre_process(dataset, ds_config, num_proc=get_default_process_count())
+            _, val_dataset = post_process(
+                dataset,
+                dataset_sample=ds_config.samples,
+                split_dataset_ratio=1.0,
+                streaming=self.config.stream_datasets,
+                random_state=seed,
+            )
+            val_datasets.append(val_dataset)
+
+        train_dataset = DatasetLoader._concat_datasets(train_datasets)
+        train_dataset = DatasetLoader.shuffle_dataset(
+            train_dataset, seed=get_seed(seed), buffer_size=1000)
+
+        val_dataset = DatasetLoader._concat_datasets(val_datasets)
+        val_dataset = DatasetLoader.shuffle_dataset(
+            val_dataset, seed=get_seed(seed), buffer_size=1000)
+
+        train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=True)
+
+        datasets = [train_dataset, val_dataset]
+        datasets = self._post_process_datasets(datasets)
+        return datasets
+
+    def _encode_dataset(self, train_dataset, val_dataset, pre_process=True):
+        template_processor = self.template_processor
+        self._save_val_dataset(val_dataset)
+
+        datasets = [train_dataset, val_dataset]
+        if not pre_process:
+            return datasets
+
+        origin_template_model = template_processor.model
+        template_processor.model = None  # Avoid serializing the model.
+        for i, dataset in enumerate(datasets):
+            if dataset is None:
+                continue
+            preprocessor = EncodePreprocessor(template=template_processor,
+                                              pre_tokenize=self.config.model_template.is_multimodal)
+            batch_size = 100 if self.config.model_template.is_multimodal else 1000
+            dataset = preprocessor(
+                dataset,
+                num_proc=get_default_process_count(),
+                load_from_cache_file=False,
+                strict=False,
+                batch_size=batch_size)
+            datasets[i] = dataset
+        template_processor.model = origin_template_model
+
+        return datasets
+
+    def _save_val_dataset(self, val_dataset):
+        output_dir = self.config.save_path
+        if is_master() and isinstance(val_dataset, HfDataset) and len(self.config.validation_datasets) == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            val_dataset_path = os.path.join(output_dir, 'val_dataset.jsonl')
+            append_to_jsonl(val_dataset_path, val_dataset.to_list())
+            logger.info(f'The split dataset from the training set will be saved at: {val_dataset_path}.')
+
+    def _post_process_datasets(self, datasets: List) -> List:
+        template = self.template_processor
+        for i, dataset in enumerate(datasets):
+            if dataset is None:
+                continue
+            if self.config.model_template.is_multimodal and not self.config.stream_datasets:
+                dataset = LazyLLMDataset(dataset, template.encode, strict=False, random_state=self.config.seed)
+            if self.config.sample_packing:
+                packing_dataset_cls = IterablePackingDataset if self.config.stream_datasets else PackingDataset
+                dataset = packing_dataset_cls(
+                    template,
+                    dataset,
+                    num_proc=get_default_process_count(),
+                    packing_length=self.config.sequence_len,
+                    strict=False,
+                    load_from_cache_file=True)
+            elif self.config.stream_datasets:
+                preprocessor = EncodePreprocessor(template=template)
+                dataset = preprocessor(
+                    dataset,
+                    num_proc=get_default_process_count(),
+                    load_from_cache_file=True,
+                    strict=False)
+            datasets[i] = dataset
+        return datasets
 
     @RayHelper.function(group='default')
     def run(self):
-        train_dataset, val_dataset = self._prepare_dataset()
-        self.args.save_args()
-
+        train_dataset, val_dataset = self._prepare_datasets()
         data_collator = self._get_data_collator()
-        # Some tuners require train_dataset and data_collator for preparation: LoRA-GA
-        self.model = self.prepare_model(self.args, self.model, template=self.template, train_dataset=train_dataset)
-        model_parameter_info = get_model_parameter_info(self.model)
-        self.train_msg['model_parameter_info'] = model_parameter_info
 
-        if self.sg_config.apply_recommended_values:
+        self.model = TrainUtils.prepare_model(self.config, self.model, task_type="causal_lm")
+
+        if self.config.apply_recommended_values:
             optim_config = self._determine_recommended_config(train_dataset)
 
-            if self.sg_config.per_device_train_batch_size != optim_config['per_device_train_batch_size']:
+            if self.config.per_device_train_batch_size != optim_config['per_device_train_batch_size']:
                 logger.warning(f'The configured per_device_train_batch_size '
-                               f'({self.sg_config.per_device_train_batch_size}) differs from '
+                               f'({self.config.per_device_train_batch_size}) differs from '
                                f'the recommended per_device_train_batch_size is {optim_config["per_device_train_batch_size"]}. '
                                f'Using the recommended value.')
-                self.args.training_args.per_device_train_batch_size = optim_config['per_device_train_batch_size']
+                self.config.trainer_args.per_device_train_batch_size = optim_config['per_device_train_batch_size']
 
-            if self.sg_config.gradient_accumulation_steps is None:
-                self.args.training_args.gradient_accumulation_steps = optim_config['gradient_accumulation_steps']
+            if self.config.gradient_accumulation_steps is None:
+                self.config.trainer_args.gradient_accumulation_steps = optim_config['gradient_accumulation_steps']
 
-            if self.sg_config.deepspeed is None:
-                self.args.training_args.deepspeed = optim_config['deepspeed']
+            if self.config.deepspeed is None:
+                self.config.trainer_args.deepspeed = optim_config['deepspeed']
 
-
-        logger.info(f"Starting training run '{self.sg_config.run_name}'...")
+        logger.info(f"Starting training run '{self.config.run_name}'...")
         return self.train_with_oom_recovery(data_collator, train_dataset, val_dataset)
 
+    def _get_data_collator(self):
+        return partial(self.template_processor.data_collator, padding_to=None)
 
     def train_with_oom_recovery(self, data_collator, train_dataset, val_dataset):
-        trainer_cls = TrainerFactory.get_trainer_cls(self.args)
-        original_batch_size = self.args.training_args.per_device_train_batch_size
-        original_grad_accum = self.args.training_args.gradient_accumulation_steps
+        original_batch_size = self.config.trainer_args.per_device_train_batch_size
+        original_grad_accum = self.config.trainer_args.gradient_accumulation_steps
         min_batch_size = 1
         attempt = 0
         max_attempts = 10
         res = None
 
-        trainer = trainer_cls(
+        trainer = SurogateTrainer(
+            config=self.config,
+            args=self.config.trainer_args,
             model=self.model,
-            args=self.args.training_args,
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
+            template_processor=self.template_processor,
             callbacks=self.callbacks,
-            template=self.template,
-            **self._get_trainer_kwargs(),
         )
 
-        while self.args.per_device_train_batch_size >= min_batch_size and attempt < max_attempts:
+        while self.config.trainer_args.per_device_train_batch_size >= min_batch_size and attempt < max_attempts:
             attempt += 1
 
             try:
-                res = trainer.train(trainer.args.resume_from_checkpoint)
+                res = trainer.train(self.config.resume_from_checkpoint)
                 logger.info("Training completed successfully.")
                 break
             except RuntimeError as e:
                 error_msg = str(e).lower()
-                is_oom = any(x in error_msg for x in ["out of memory", "oom", "cuda out of memory", "mps out of memory"])
+                is_oom = any(
+                    x in error_msg for x in ["out of memory", "oom", "cuda out of memory", "mps out of memory"])
                 if is_oom:
                     logger.warning(f"Out of memory error encountered during training attempt {attempt}.")
                     if torch.cuda.is_available():
@@ -191,8 +253,8 @@ class SurogateSFT(SurogateCommand, SwiftSft):
                     import gc
                     gc.collect()
 
-                    current_batch = self.args.training_args.per_device_train_batch_size
-                    current_grad_accum = self.args.training_args.gradient_accumulation_steps
+                    current_batch = self.config.trainer_args.per_device_train_batch_size
+                    current_grad_accum = self.config.trainer_args.gradient_accumulation_steps
 
                     if current_grad_accum < 16 and current_batch > 1:
                         # If gradient accumulation is reasonable, increase it and reduce batch size
@@ -207,23 +269,24 @@ class SurogateSFT(SurogateCommand, SwiftSft):
                         logger.error("Cannot reduce batch size further to recover from OOM.")
                         raise
 
-                    self.args.training_args.per_device_train_batch_size = new_batch_size
-                    self.args.training_args.gradient_accumulation_steps = new_grad_accum
+                    self.config.trainer_args.per_device_train_batch_size = new_batch_size
+                    self.config.trainer_args.gradient_accumulation_steps = new_grad_accum
 
                     logger.info(f"Adjusting training configuration to recover from OOM:")
                     logger.metric("New batch size", f"{current_batch} → {new_batch_size}")
                     logger.metric("New gradient accumulation", f"{current_grad_accum} → {new_grad_accum}")
-                    logger.metric("New effective batch size", f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}")
+                    logger.metric("New effective batch size",
+                                  f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}")
 
-                    trainer = trainer_cls(
+                    trainer = SurogateTrainer(
+                        config=self.config,
                         model=self.model,
-                        args=self.args.training_args,
+                        args=self.config.trainer_args,
                         data_collator=data_collator,
                         train_dataset=train_dataset,
                         eval_dataset=val_dataset,
                         callbacks=self.callbacks,
-                        template=self.template,
-                        **self._get_trainer_kwargs(),
+                        template_processor=self.template_processor,
                     )
                 else:
                     raise
@@ -235,17 +298,17 @@ class SurogateSFT(SurogateCommand, SwiftSft):
             logger.error(f"Training failed after {max_attempts} attempts")
             raise RuntimeError(f"Could not complete training after {max_attempts} OOM recovery attempts")
 
-        final_batch = self.args.training_args.per_device_train_batch_size
-        final_grad_accum = self.args.training_args.gradient_accumulation_steps
+        final_batch = self.config.trainer_args.per_device_train_batch_size
+        final_grad_accum = self.config.trainer_args.gradient_accumulation_steps
 
         if final_batch != original_batch_size or final_grad_accum != original_grad_accum:
             logger.info("Training completed with adjusted batch size and/or gradient accumulation steps:")
             logger.metric("Batch size", f"{original_batch_size} → {final_batch}")
             logger.metric("Gradient accumulation", f"{original_grad_accum} → {final_grad_accum}")
-            logger.metric("Effective batch size", f"{original_batch_size * original_grad_accum} → {final_batch * final_grad_accum}")
+            logger.metric("Effective batch size",
+                          f"{original_batch_size * original_grad_accum} → {final_batch * final_grad_accum}")
 
         return res
-
 
     def _determine_recommended_config(self, train_dataset: DATASET_TYPE):
         params = estimate_model_parameters(self.model.config)
@@ -254,16 +317,17 @@ class SurogateSFT(SurogateCommand, SwiftSft):
         optimal_config = recommend_training_params(
             model_size_b=params / 1e9,
             dataset_size=dataset_size,
-            quantization="4bit" if self.sg_config.qlora else "bf16",
+            quantization="4bit" if self.config.qlora else "bf16",
             num_gpus=world_size,
             vram_per_gpu_gb=int(self.system_info['gpu_memory_gb']),
-            seq_len=self.sg_config.sequence_len,
+            seq_len=self.config.sequence_len,
         )
 
         if hasattr(self.model, 'tie_weights') and optimal_config['deepspeed_stage'] == 3:
             # Check if weights are tied
             if self.model.config.tie_word_embeddings and is_master():
-                logger.warning("The model has weight tying enabled - this can cause ZeRO-3 memory imbalance across GPUs.")
+                logger.warning(
+                    "The model has weight tying enabled - this can cause ZeRO-3 memory imbalance across GPUs.")
 
         mem = optimal_config['memory_breakdown']
         logger.header("Memory Breakdown per GPU:")
@@ -283,99 +347,31 @@ class SurogateSFT(SurogateCommand, SwiftSft):
 
         if is_master():
             logger.header("Recommended Training Configuration")
-            for key in ['per_device_train_batch_size', 'gradient_accumulation_steps', 'deepspeed_stage', 'use_offload', 'offload_device']:
+            for key in ['per_device_train_batch_size', 'gradient_accumulation_steps', 'deepspeed_stage', 'use_offload',
+                        'offload_device']:
                 logger.metric(key, optimal_config[key])
 
         return optimal_config
 
-    def to_swift_args(self) -> BaseArguments:
-        dataset_paths = [dataset.path for dataset in self.sg_config.datasets]
-        val_dataset_paths = [dataset.path for dataset in self.sg_config.validation_datasets]
-        if self.sg_config.qlora:
-            logger.info("QLoRA training enabled: using 4-bit quantization with bitsandbytes.")
-
-        swift_args = TrainArguments(
-            model=self.sg_config.model,
-            model_type=self.sg_config.model_type,
-            num_train_epochs=self.sg_config.num_train_epochs,
-            output_dir=self.sg_config.save_path,
-            add_version=False,
-            create_checkpoint_symlink=True,
-            resume_from_checkpoint=self.sg_config.resume_from_checkpoint,
-            seed=self.sg_config.seed,
-            dataset=dataset_paths,
-            dataset_shuffle=True,
-            val_dataset=val_dataset_paths,
-            val_dataset_shuffle=True,
-            split_dataset_ratio=self.sg_config.validation_split_ratio,
-            streaming=self.sg_config.stream_datasets,
-            max_length=self.sg_config.sequence_len,
-            gradient_checkpointing=self.sg_config.gradient_checkpointing,
-            learning_rate=self.sg_config.learning_rate,
-            lr_scheduler_type=SchedulerType.COSINE,
-            save_steps=self.sg_config.checkpoint_steps,
-            eval_steps=self.sg_config.eval_steps,
-            save_total_limit=self.sg_config.max_checkpoints_to_keep,
-            report_to=self.sg_config.report_to,
-            max_steps=self.sg_config.max_steps,
-            warmup_ratio=self.sg_config.warmup_ratio,
-            weight_decay=self.sg_config.weight_decay,
-            max_grad_norm=self.sg_config.gradient_clip_norm,
-            per_device_train_batch_size=self.sg_config.per_device_train_batch_size,
-            deepspeed=DEEPSPEED_CONFIGS[self.sg_config.deepspeed] if self.sg_config.deepspeed else None,
-            packing=self.sg_config.sample_packing,
-            use_liger_kernel=self.sg_config.should_apply_liger_kernel(),
-            gradient_accumulation_steps=self.sg_config.gradient_accumulation_steps,
-
-            lora_rank=self.sg_config.lora_rank,
-            lora_alpha=self.sg_config.lora_alpha,
-            lora_dropout=self.sg_config.lora_dropout,
-            target_modules=self.sg_config.lora_target_modules,
-
-            bnb_4bit_compute_dtype='bfloat16' if self.sg_config.qlora else None,
-            bnb_4bit_quant_type='nf4',
-            bnb_4bit_use_double_quant=True,
-            quant_method='bnb' if self.sg_config.qlora else None,
-            quant_bits=4 if self.sg_config.qlora else None,
-
-            attn_impl='flash_attention_2',
-
-            use_hf=True,
-
-            use_ray=self.sg_config.use_ray,
-            device_groups=json.dumps({
-                'nproc_per_node': self.sg_config.ray_nproc_per_node,
-                **{
-                    name: {
-                        'device': group.device,
-                        'ranks': group.ranks,
-                        'workers': group.workers
-                    } for name, group in self.sg_config.ray_groups.items()
-                }
-            }) if self.sg_config.use_ray else None,
-        )
-
-        return swift_args
-
-
     def _save_trainer_state(self, trainer):
         state = trainer.state
 
-        if not self.sg_config.merge_adapter:
-            return super()._save_trainer_state(trainer)
-        elif hasattr(state, 'last_model_checkpoint'):
+        if self.config.merge_adapter:
             check_tie_word_embeddings(self.model)
-            Swift.merge_and_unload(self.model)
+            self.model.merge_and_unload()
             model = self.model.model
             logger.info('Saving merged weights...')
             save_checkpoint(
                 model,
-                self.template.processor,
-                f"{self.sg_config.save_path}/merged",
+                self.template_processor.processor,
+                f"{self.config.save_path}/merged",
                 safe_serialization=True,
                 model_dirs=[state.last_model_checkpoint],
                 max_shard_size='5GB',
-                additional_saved_files=model.model_meta.additional_saved_files)
+                additional_saved_files=self.config.model_template.additional_saved_files)
+        elif hasattr(state, 'last_model_checkpoint'):
+            if trainer.args.push_to_hub:
+                trainer.push_to_hub()
 
 def sft_main(config: SFTConfig, args: DictDefault):
-    SurogateSFT(config, args).main()
+    SurogateSFT(config, args).run()

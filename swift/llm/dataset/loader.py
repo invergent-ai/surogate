@@ -518,7 +518,7 @@ def load_dataset(
     }
     use_hf_default = use_hf
     if use_hf_default is None:
-        use_hf_default = True if use_hf_hub() else False
+        use_hf_default = True
     for dataset in datasets:
         dataset_syntax = DatasetSyntax.parse(dataset)
         use_hf = dataset_syntax.use_hf or use_hf_default

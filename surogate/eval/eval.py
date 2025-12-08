@@ -4,9 +4,9 @@ import os
 from pathlib import Path
 from typing import Dict, Any, List
 
-from surogate.config.eval_config import EvalConfig, TargetConfig
+from surogate.core.config.eval_config import EvalConfig, TargetConfig
 from surogate.eval.backend import LocalBackend
-from surogate.eval.benchmarks import BenchmarkRegistry, BenchmarkConfig
+from surogate.eval.benchmarks import BenchmarkRegistry
 from surogate.eval.datasets import DatasetLoader, DatasetValidator
 from surogate.eval.targets import BaseTarget, TargetFactory
 from surogate.utils.logger import get_logger
@@ -287,7 +287,6 @@ class SurogateEval(SurogateCommand):
         Returns:
             Evaluation result dictionary
         """
-        from datetime import datetime
 
         eval_name = eval_config.get('name', 'unnamed')
         dataset_path = eval_config.get('dataset')

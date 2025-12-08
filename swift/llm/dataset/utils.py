@@ -6,9 +6,8 @@ import numpy as np
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from torch.utils.data import Dataset, IterableDataset
-from tqdm import tqdm
 
-from surogate.datasets.progress import create_hfhub_tqdm
+from surogate.core.datasets.progress import create_hfhub_tqdm
 from swift.utils import get_logger, is_dist, is_master
 from ..template import MaxLengthError
 from .preprocessor import RowPreprocessor

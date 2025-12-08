@@ -1,11 +1,8 @@
 import math
+import re
+from typing import Optional
 
 from transformers import PretrainedConfig
-
-from surogate.config.sft_config import SFTConfig
-from surogate.utils.logger import get_logger
-
-logger = get_logger()
 
 def estimate_model_parameters(config: PretrainedConfig) -> int:
     # Dense components
@@ -41,45 +38,6 @@ def estimate_model_parameters(config: PretrainedConfig) -> int:
 
     num_layers = getattr(config, 'num_layers', None) or getattr(config, 'num_hidden_layers', None) or 0
     return embed_params + (params_per_layer * num_layers) + final_norm + lm_head
-
-def estimate_training_memory(model, sg_config: SFTConfig):
-    params = estimate_model_parameters(model.config)
-    dtype = getattr(model.config, 'torch_dtype', None)
-    if dtype is None:
-        # Fall back to checking the first parameter's dtype
-        dtype = next(model.parameters()).dtype
-
-    import torch
-    dtype_to_bytes = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-        torch.float8_e4m3fn: 1,
-        torch.float8_e5m2: 1,
-        torch.int8: 1,
-    }
-    bytes_per_param = dtype_to_bytes.get(dtype, 4)  # Default to 4 if unknown
-    model_memory = params * bytes_per_param / 1e9
-
-    # Optimizer memory depends on training precision, not storage precision
-    # For mixed precision training, optimizer states are typically in fp32
-    optimizer_memory = params * 8 / 1e9  # Adam needs ~8 bytes per parameter
-
-    # Activation memory uses the training dtype
-    activation_memory = (
-            sg_config.per_device_train_batch_size *
-            sg_config.sequence_len *
-            model.config.hidden_size *
-            bytes_per_param / 1e9
-    )
-
-    total_memory_needed = model_memory + optimizer_memory + activation_memory
-
-    logger.info(f"Memory estimates - Model: {model_memory:.2f}GB, "
-                f"Optimizer: {optimizer_memory:.2f}GB, "
-                f"Activations: {activation_memory:.2f}GB, "
-                f"Total: {total_memory_needed:.2f}GB")
-
 
 def recommend_training_params(
     model_size_b: float,          # e.g., 4, 7, 8, 13, 70 (Billion params)
@@ -338,4 +296,17 @@ def recommend_training_params(
         "warnings": warnings,
         "memory_breakdown": memory_breakdown,
     }
+
+def get_model_name(model_id_or_path: str) -> Optional[str]:
+    assert isinstance(model_id_or_path, str), f'model_id_or_path: {model_id_or_path}'
+    # compat hf hub
+    model_id_or_path = model_id_or_path.rstrip('/')
+    match_ = re.search('/models--.+?--(.+?)/snapshots/', model_id_or_path)
+    if match_ is not None:
+        return match_.group(1)
+
+    model_name = model_id_or_path.rsplit('/', 1)[-1]
+    # compat modelscope snapshot_download
+    model_name = model_name.replace('___', '.')
+    return model_name
 

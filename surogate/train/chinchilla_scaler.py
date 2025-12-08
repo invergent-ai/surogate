@@ -7,7 +7,7 @@ import numpy as np
 from datasets import Dataset
 from transformers import PreTrainedModel
 
-from surogate.config.sft_config import SFTConfig
+from surogate.core.config.sft_config import SFTConfig
 from surogate.utils.logger import get_logger
 
 logger = get_logger()

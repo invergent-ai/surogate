@@ -1,4 +1,5 @@
-model: Qwen/Qwen3-4B-Instruct-2507
+model: Qwen/Qwen3-1.7B
+model_type: qwen3
 save_path: ./output
 
 apply_recommended_values: true
@@ -9,15 +10,15 @@ sequence_len: 4096
 
 learning_rate: 2e-4
 
-qlora: true
-lora_rank: 32
-lora_alpha: 64
+qlora: false
+lora_fast: true
+lora_rank: 8
+lora_alpha: 16
 lora_target_modules:
   - all-linear
 
 datasets:
   - path: "invergent/alpaca-gpt4-data-en"
-    samples: 100
     type: instruction
     instruction_field: instruction
     input_field: input

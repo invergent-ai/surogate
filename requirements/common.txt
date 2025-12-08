@@ -1,4 +1,4 @@
-transformers==4.57.1
+transformers==4.57.3
 modelscope>=1.23
 peft==0.17.1
 wheel
@@ -46,6 +46,9 @@ math_verify==0.5.2
 ray
 unique-namer
 bitsandbytes
+qwen-vl-utils==0.0.14
+decord
+librosa
 
 # lmcache
 aiofile

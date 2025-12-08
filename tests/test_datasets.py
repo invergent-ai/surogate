@@ -2,10 +2,10 @@ import pytest
 from datasets import Dataset
 from transformers import PreTrainedTokenizer
 
-from surogate.datasets.datasets import wrap_dataset
-from surogate.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
+from surogate.core.datasets.datasets import wrap_dataset
+from surogate.core.datasets import tokenize_dataset, PromptTokenizingStrategy
 from surogate.utils.dict import DictDefault
-from surogate.loaders.loader import get_model_and_tokenizer
+from surogate.core.loaders import get_model_and_tokenizer
 
 
 @pytest.fixture(scope="class")

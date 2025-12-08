@@ -1,13 +1,13 @@
 import sys
 import argparse
 
+from surogate.core.config.loader import load_config
 from surogate.utils.logger import get_logger
 logger = get_logger()
 
 from swift.ray import RayHelper
 
-from surogate.config.loader import load_config
-from surogate.config.sft_config import SFTConfig
+from surogate.core.config.sft_config import SFTConfig
 
 from surogate.utils.dict import DictDefault
 

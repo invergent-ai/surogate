@@ -21,7 +21,7 @@ from transformers.utils import (is_torch_bf16_gpu_available, is_torch_cuda_avail
                                 is_torch_npu_available, strtobool)
 from transformers.utils.versions import require_version
 
-from surogate.datasets.progress import create_hfhub_tqdm
+from surogate.core.datasets.progress import create_hfhub_tqdm
 from swift.utils import get_dist_setting, get_logger, is_mp, is_unsloth_available, patch_getattr
 from .constant import ModelType
 from .patcher import (get_lm_head_model, patch_attach_align_device_hook_on_blocks, patch_automodel,

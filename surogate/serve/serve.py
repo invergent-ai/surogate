@@ -7,6 +7,8 @@ from typing import Optional, Union
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from surogate.core.loaders.loader import load_model_and_tokenizer
 from swift.llm import get_template
 from swift.llm import safe_snapshot_download, AdapterRequest
 from swift.llm.infer.infer_engine import PtEngine, InferEngine
@@ -17,8 +19,7 @@ from swift.llm.template import Template
 from swift.plugin import InferStats
 from swift.tuners import Swift
 
-from surogate.config.serve_config import ServeConfig
-from surogate.loaders.loader import load_model_and_tokenizer
+from surogate.core.config.serve_config import ServeConfig
 from surogate.utils.command import SurogateCommand
 from surogate.utils.logger import get_logger
 

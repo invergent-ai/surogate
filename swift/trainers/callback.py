@@ -109,5 +109,3 @@ class PrinterCallbackNew(PrinterCallback):
             print(logs, flush=True)
 
 
-# monkey patching
-trainer.DEFAULT_CALLBACKS = [DefaultFlowCallbackNew]

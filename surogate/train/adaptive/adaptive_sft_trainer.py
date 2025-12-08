@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl, trainer
 
-from surogate.config.sft_config import SFTConfig
+from surogate.core.config.sft_config import SFTConfig
 from surogate.train.noop_callbacks import NoopTrainerCallback, NoopPrinterCallback
 from surogate.utils.logger import get_logger
 from swift import Seq2SeqTrainer

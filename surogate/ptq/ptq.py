@@ -8,10 +8,10 @@ from llmcompressor.modifiers.quantization import QuantizationModifier, GPTQModif
 from loguru import logger as loguru_logger
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from surogate.config.ptq_config import PTQConfig
-from surogate.datasets.datasets import load_datasets
-from surogate.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
-from surogate.loaders.loader import load_model_and_tokenizer
+from surogate.core.config.ptq_config import PTQConfig
+from surogate.core.datasets.datasets import load_datasets
+from surogate.core.datasets.tokenization import tokenize_dataset, PromptTokenizingStrategy
+from surogate.core.loaders.loader import load_model_and_tokenizer
 from surogate.utils.command import SurogateCommand
 from surogate.utils.logger import get_logger
 
