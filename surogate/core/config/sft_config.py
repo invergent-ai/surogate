@@ -237,6 +237,8 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         args_dict['fp16'] = self.fp16
         args_dict['bf16'] = self.bf16
         args_dict['optim'] = OptimizerNames.ADAMW_TORCH_8BIT
+        args_dict['use_liger_kernel'] = True
+
         return TrainingArguments(**args_dict)
 
     def _init_mixed_precision(self):
