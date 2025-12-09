@@ -1,12 +1,15 @@
 model: Qwen/Qwen3-4B
 model_type: qwen3
 save_path: ./output
+merge_adapter: false
+apply_recommended_values: false
 
-apply_recommended_values: true
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+sample_packing: true
+sequence_len: 2048
 
-sample_packing: false
-num_train_epochs: 15
-sequence_len: 4096
+num_train_epochs: 1
 
 learning_rate: 2e-4
 
@@ -17,9 +20,10 @@ lora_target_modules:
   - all-linear
 
 datasets:
-  - path: "invergent/alpaca-gpt4-data-en"
-    type: instruction
-    instruction_field: instruction
-    input_field: input
-    output_field: output
+  - path: "mlabonne/FineTome-100k"
+    type: conversation
+    messages_field: conversations
+    message_property_mappings:
+      role: from
+      content: value
 

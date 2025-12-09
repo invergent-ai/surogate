@@ -3,7 +3,8 @@ import glob
 import os
 import shutil
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Dict
+
 
 def get_cache_dir():
     default_cache_dir = Path.home().joinpath('.cache', 'surogate')
@@ -108,3 +109,4 @@ def copy_files_by_pattern(source_dir, dest_dir, patterns, exclude_patterns=None)
                     destination = os.path.join(dest_dir, file_name)
                     if not os.path.exists(destination):
                         shutil.copy2(file_path, destination)
+

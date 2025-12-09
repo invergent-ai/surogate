@@ -8,16 +8,14 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from surogate.core.infer.infer_engine import InferEngine
+from surogate.core.infer.torch_engine import TorchEngine
 from surogate.core.loaders.loader import load_model_and_tokenizer
-from swift.llm import get_template
-from swift.llm import safe_snapshot_download, AdapterRequest
-from swift.llm.infer.infer_engine import PtEngine, InferEngine
-from swift.llm.infer.protocol import ModelList, Model, ChatCompletionRequest, MultiModalRequestMixin
-from swift.llm.infer.utils import update_generation_config_eos_token
-from swift.llm.model.register import get_model_name
-from swift.llm.template import Template
-from swift.plugin import InferStats
-from swift.tuners import Swift
+from surogate.core.model.chat_templates.processor import get_chat_template_processor, ChatTemplateProcessor
+from surogate.core.model.loader import safe_snapshot_download
+from surogate.core.model.utils import update_generation_config_eos_token
+from surogate.train.train_utils import TrainUtils
+from surogate.utils.metric import InferStats
 
 from surogate.core.config.serve_config import ServeConfig
 from surogate.utils.command import SurogateCommand
@@ -27,7 +25,7 @@ logger = get_logger()
 
 class SurogateServe(SurogateCommand):
     config: ServeConfig
-    template: Template
+    template: ChatTemplateProcessor
 
     def __init__(self, **kwargs):
         super().__init__(ServeConfig, **kwargs)
@@ -162,26 +160,28 @@ class SurogateServe(SurogateCommand):
     def _get_infer_engine(self) -> InferEngine:
         if self.config.infer_backend == 'pytorch':
             model, tokenizer = load_model_and_tokenizer(self.config.model, self.config.model_type, self.args, True)
-            self.template = get_template(model.model_meta.template, tokenizer, use_chat_template=self.config.use_chat_template)
+            self.template = get_chat_template_processor(
+                model.model_template.chat_template,
+                tokenizer,
+                use_chat_template=self.config.use_chat_template)
             if self.template.use_model:
                 self.template.model = model
             for adapter in self.config.adapters:
-                model = Swift.from_pretrained(model, adapter.path)
+                model = TrainUtils.from_pretrained(model, adapter.path)
 
             update_generation_config_eos_token(model.generation_config, self.template)
-            return PtEngine.from_model_template(model, self.template)
+            return TorchEngine.from_model_template(model, self.template)
         elif self.config.infer_backend == 'vllm':
-            from swift.llm.infer import VllmEngine
+            from surogate.core.infer import VllmEngine
             from vllm.config import KVTransferConfig
 
             if self.config.adapters:
                 self.infer_kwargs['adapter_request'] = AdapterRequest('_lora', self.config.adapters[0].path)
 
-            self.template = get_template(
-                self.config.model_meta.template,
+            self.template = get_chat_template_processor(
+                self.config.model_template.chat_template,
                 processor=None,
-                use_chat_template=self.config.use_chat_template
-            )
+                use_chat_template=self.config.use_chat_template)
 
             os.environ["VLLM_HAS_FLASHINFER_CUBIN"] = "1"
 
@@ -218,10 +218,10 @@ class SurogateServe(SurogateCommand):
                 } if self.cache_enabled() else None
             )
         elif self.config.infer_backend == 'sglang':
-            from swift.llm.infer import SglangEngine
+            from surogate.core.infer import SglangEngine
 
-            self.template = get_template(
-                self.config.model_meta.template,
+            self.template = get_chat_template_processor(
+                self.config.model_template.chat_template,
                 processor=None,
                 use_chat_template=self.config.use_chat_template
             )

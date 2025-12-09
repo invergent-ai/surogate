@@ -97,7 +97,6 @@ def patch_automodel_for_sequence_classification(
             return res
 
     # Patch 2: missing __init__ methods
-    # https://github.com/modelscope/ms-swift/pull/5820
     patched_classes = []
     if patch_missing_init:
 
@@ -476,3 +475,18 @@ def detab_code(code: str) -> Tuple[str, str]:
     except AttributeError:
         return code, ""
     return code, spaces
+
+
+@contextmanager
+def patch_attach_align_device_hook_on_blocks():
+    from accelerate import big_modeling
+    origin_attach_align_device_hook_on_blocks = big_modeling.attach_align_device_hook_on_blocks
+
+    def attach_align_device_hook_on_blocks(*args, **kwargs):
+        return
+
+    big_modeling.attach_align_device_hook_on_blocks = attach_align_device_hook_on_blocks
+    try:
+        yield
+    finally:
+        big_modeling.attach_align_device_hook_on_blocks = origin_attach_align_device_hook_on_blocks

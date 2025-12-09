@@ -1,30 +1,28 @@
 from pathlib import Path
-from typing import Optional, Literal, Dict, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
-from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict, load_from_disk, load_dataset
+from adlfs import AzureBlobFileSystem
+from datasets import Dataset as HfDataset
+from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict, load_from_disk, load_dataset, \
+    concatenate_datasets
+from gcsfs import GCSFileSystem
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, HFValidationError
+from ocifs import OCIFileSystem
+from s3fs import S3FileSystem
 
+from surogate.core.config.dataset_config import DatasetConfig
 from surogate.core.config.enums import SurogateDatasetType
+from surogate.core.datasets.preprocessor.auto import AutoPreprocessor
 from surogate.core.datasets.preprocessor.conversation import ConversationPreprocessor
 from surogate.core.datasets.preprocessor.instruction import InstructionPreprocessor
 from surogate.core.datasets.preprocessor.text import TextPreprocessor
 from surogate.core.datasets.progress import create_hfhub_tqdm
 from surogate.core.datasets.utils import DATASET_TYPE, sample_dataset
 from surogate.utils.dist import safe_ddp_context
-from surogate.utils.np_utils import get_seed
-from swift.llm import DatasetMeta, RowPreprocessor, AutoPreprocessor
-from swift.llm.dataset.loader import DatasetSyntax
-from datasets import Dataset as HfDataset
-from surogate.core.config.dataset_config import DatasetConfig
-from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
-
-from adlfs import AzureBlobFileSystem
-from gcsfs import GCSFileSystem
-from ocifs import OCIFileSystem
-from s3fs import S3FileSystem
+from surogate.utils.np_utils import get_seed
 
 logger = get_logger()
 
@@ -34,30 +32,6 @@ EXTENSIONS_TO_DATASET_TYPES = {
     ".csv": "csv",
     ".txt": "text",
 }
-
-
-def swift_load_dataset(
-        dataset_syntax: Optional[DatasetSyntax] = None,
-        dataset_meta: Optional[DatasetMeta] = None,
-        *,
-        num_proc: int = 1,
-        load_from_cache_file: bool = True,
-        streaming: bool = False,
-        use_hf: Optional[bool] = None,
-        hub_token: Optional[str] = None,
-        strict: bool = False,
-        download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
-        columns: Optional[Dict[str, str]] = None,
-        remove_unused_columns: bool = True,
-        dataset_config: DatasetConfig,
-        sg_args: DictDefault,
-) -> HfDataset:
-    dataset = load_dataset_with_config(dataset_config, hub_token, streaming)
-    dataset = dataset_meta.preprocess_func(
-        dataset, num_proc=num_proc, load_from_cache_file=load_from_cache_file, strict=strict)
-    if remove_unused_columns:
-        dataset = RowPreprocessor.remove_useless_columns(dataset)
-    return dataset
 
 
 def load_dataset_with_config(
@@ -325,3 +299,18 @@ def post_process(
                     test_size=val_sample, shuffle=shuffle, seed=get_seed(random_state)).values()
             train_dataset = sample_dataset(train_dataset, train_sample, shuffle, random_state)
     return train_dataset, val_dataset
+
+
+def concat_datasets(datasets: List[HfDataset]) -> Optional[HfDataset]:
+    if len(datasets) == 0:
+        return
+    if len(datasets) == 1:
+        return datasets[0]
+    return concatenate_datasets(datasets)
+
+def shuffle_dataset(dataset, seed: int, buffer_size: int = 1000):
+    if isinstance(dataset, HfDataset):
+        with safe_ddp_context(None, True):
+            return dataset.shuffle(seed=seed)
+    else:
+        return dataset.shuffle(seed=seed, buffer_size=buffer_size)

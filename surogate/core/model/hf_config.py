@@ -3,7 +3,7 @@ from typing import Union, Dict, Any, Optional, List, Tuple
 import torch
 from transformers import PretrainedConfig
 
-from swift.utils import deep_getattr
+from surogate.utils.utils import deep_getattr
 
 
 class HfConfigFactory:

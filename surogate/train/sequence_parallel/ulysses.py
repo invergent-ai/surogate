@@ -8,9 +8,11 @@ import torch.distributed as dist
 from torch.distributed import init_device_mesh
 from transformers import PreTrainedTokenizer
 
-from swift.llm import HfConfigFactory, get_llm_model
-from swift.utils import get_cu_seqlens_from_position_ids, get_device, get_dist_setting
 from .utils import GatherLoss
+from ...core.model.hf_config import HfConfigFactory
+from ...core.model.utils import get_llm_module_from_multimodal
+from ...utils.dist import get_dist_setting, get_device
+from ...utils.tensor import get_cu_seqlens_from_position_ids
 
 
 # Code borrowed from deepspeed, here is why:
@@ -400,7 +402,7 @@ class SequenceParallel:
         self.padding_free = padding_free
         self.world_size = sp_size
 
-        llm_model = get_llm_model(model)
+        llm_model = get_llm_module_from_multimodal(model)
 
         if hasattr(llm_model, 'language_model'):
             if hasattr(llm_model.language_model, '_update_causal_mask'):

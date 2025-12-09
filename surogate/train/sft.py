@@ -11,25 +11,25 @@ from transformers import trainer, TrainingArguments
 from surogate.core.config.sft_config import SFTConfig
 from surogate.core.datasets.datasets import get_default_process_count
 from surogate.core.datasets.loader import load_dataset_with_config, \
-    post_process, pre_process
+    post_process, pre_process, concat_datasets, shuffle_dataset
 from surogate.core.datasets.packing import IterablePackingDataset, PackingDataset
 from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
 from surogate.core.datasets.utils import DATASET_TYPE, LazyLLMDataset
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.core.model.saver import save_checkpoint
+from surogate.core.model.utils import check_tie_word_embeddings
 from surogate.train.callbacks import NoopPrinterCallback, NoopTrainerCallback, SFTTrainerCallback
 from surogate.train.train_utils import TrainUtils
 from surogate.train.trainer import SurogateTrainer
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.dist import is_master, get_dist_setting
+from surogate.utils.jsonl import append_to_jsonl
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters, recommend_training_params
 from surogate.utils.np_utils import get_seed
-from swift.llm.dataset.loader import DatasetLoader
-from swift.llm.export.merge_lora import check_tie_word_embeddings
-from swift.ray import RayHelper
-from swift.utils import append_to_jsonl
+
+from surogate.ray import RayHelper
 
 datasets.logging.set_verbosity_warning()
 
@@ -109,12 +109,12 @@ class SurogateSFT(SurogateCommand):
             )
             val_datasets.append(val_dataset)
 
-        train_dataset = DatasetLoader._concat_datasets(train_datasets)
-        train_dataset = DatasetLoader.shuffle_dataset(
+        train_dataset = concat_datasets(train_datasets)
+        train_dataset = shuffle_dataset(
             train_dataset, seed=get_seed(seed), buffer_size=1000)
 
-        val_dataset = DatasetLoader._concat_datasets(val_datasets)
-        val_dataset = DatasetLoader.shuffle_dataset(
+        val_dataset = concat_datasets(val_datasets)
+        val_dataset = shuffle_dataset(
             val_dataset, seed=get_seed(seed), buffer_size=1000)
 
         train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=True)

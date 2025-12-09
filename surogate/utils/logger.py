@@ -283,9 +283,6 @@ def get_logger(
         log_level = getattr(logging, log_level, logging.INFO)
 
     logger_name = (name or __name__).split('.')[0]
-    if logger_name.startswith('swift'):
-        log_level = logging.DEBUG
-
     logger = logging.getLogger(logger_name)
     logger.propagate = False
 
@@ -385,8 +382,7 @@ def _is_from_libraries():
                 break
             caller_frame = caller_frame.f_back
 
-        # Check if caller is from a 'swift' package
-        if caller_module.startswith('swift') or caller_module.startswith('transformers') or caller_module.startswith('datasets') or caller_module.startswith('huggingface_hub'):
+        if caller_module.startswith('transformers') or caller_module.startswith('datasets') or caller_module.startswith('huggingface_hub'):
             return True
     finally:
         del frame  # Avoid reference cycles

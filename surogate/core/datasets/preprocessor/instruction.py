@@ -1,10 +1,9 @@
 from typing import Dict, Any, Optional
 
-from swift.llm.dataset import RowPreprocessor
-from swift.llm import history_to_messages
-
 from surogate.core.config.dataset_config import InstructionDatasetConfig
 from surogate.core.config.enums import InstructionDatasetSystemPromptType
+from surogate.core.datasets.preprocessor.row import RowPreprocessor
+from surogate.core.model.chat_templates.utils import history_to_messages
 from surogate.utils.logger import get_logger
 
 logger = get_logger()

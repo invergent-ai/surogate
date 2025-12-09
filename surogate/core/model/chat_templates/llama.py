@@ -3,7 +3,7 @@ from typing import Optional
 import datetime as dt
 
 from .base import ChatTemplate, Prompt,register_chat_template
-from swift.llm.template.constant import LLMTemplateType
+from ...config.enums import ChatTemplateType
 
 # ref: https://github.com/facebookresearch/llama/blob/main/llama/generation.py
 LLAMA_DEFAULT_SYSTEM = (
@@ -17,7 +17,7 @@ LLAMA_DEFAULT_SYSTEM = (
 
 register_chat_template(
     ChatTemplate(
-        LLMTemplateType.llama, ['<s>[INST] '], ['{{QUERY}} [/INST]'], ['</s><s>[INST] '], ['</s>'],
+        ChatTemplateType.llama, ['<s>[INST] '], ['{{QUERY}} [/INST]'], ['</s><s>[INST] '], ['</s>'],
         default_system=LLAMA_DEFAULT_SYSTEM,
         system_prefix=['<s>[INST] <<SYS>>\n{{SYSTEM}}\n<</SYS>>\n\n']))
 
@@ -34,7 +34,7 @@ class Llama3ChatTemplate(ChatTemplate):
         default_factory=lambda: ['<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{{SYSTEM}}<|eot_id|>'])
     agent_template: str = 'llama3'
 
-register_chat_template(Llama3ChatTemplate(LLMTemplateType.llama3))
+register_chat_template(Llama3ChatTemplate(ChatTemplateType.llama3))
 
 def _get_llama32_prefix() -> Prompt:
     now = dt.datetime.now()

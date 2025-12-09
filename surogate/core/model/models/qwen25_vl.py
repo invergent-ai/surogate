@@ -3,6 +3,7 @@ import os
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLAttention
 
 from surogate.core.config.enums import ChatTemplateType
+from surogate.core.model.chat_templates.vision_utils import load_file
 from surogate.core.model.patcher import patch_get_input_embeddings
 from surogate.core.model.registry import register_model, ModelTemplate, MLLMModelType
 from surogate.core.model.utils import get_model_tokenizer_multimodal
@@ -49,7 +50,6 @@ def patch_qwen_vl_utils(vision_process):
     if _read_video_decord is not None:
 
         def _new_read_video_decord(ele: dict):
-            from swift.llm import load_file
             ele['video'] = load_file(ele['video'])
             return _read_video_decord(ele)
 

@@ -5,8 +5,7 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from surogate.core.config.enums import MLLMModelType
-from swift.llm.model.constant import RMModelType, RerankerModelType
+from surogate.core.config.enums import MLLMModelType, RMModelType, RerankerModelType
 
 MODEL_MAPPING: Dict[str, 'ModelTemplate'] = {}
 

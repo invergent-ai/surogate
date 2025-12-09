@@ -10,9 +10,9 @@ from surogate.core.model.hf_config import HfConfigFactory
 from surogate.core.model.utils import get_model_info_and_template, get_model_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.dist import get_dist_setting
+from surogate.utils.jsonl import json_parse_to_dict
 from surogate.utils.logger import get_logger
 from surogate.utils.model import get_model_name
-from swift.utils import json_parse_to_dict
 
 logger = get_logger()
 

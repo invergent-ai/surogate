@@ -7,7 +7,7 @@ import transformers
 from surogate.core.config.loader import SurogateConfig
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info
-from swift.utils import seed_everything
+from surogate.utils.tensor import seed_everything
 
 logger = get_logger()
 

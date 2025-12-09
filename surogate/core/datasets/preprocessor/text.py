@@ -1,8 +1,7 @@
 from typing import Dict, Any, Optional
 
-from swift.llm.dataset import RowPreprocessor
-
 from surogate.core.config.dataset_config import TextDatasetConfig
+from surogate.core.datasets.preprocessor.row import RowPreprocessor
 from surogate.utils.logger import get_logger
 
 logger = get_logger()

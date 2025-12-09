@@ -6,6 +6,28 @@ History = List[Union[Tuple[str, str], List[str]]]
 Message = Dict[str, Union[str, List[Dict[str, Any]], List[int], None]]
 Messages = List[Message]
 
+def history_to_messages(history: History,
+                        system: Optional[str] = None,
+                        roles: Optional[List[List[str]]] = None) -> 'Messages':
+    """
+    history: [['query1', 'response1'], ['query2', 'response2']]
+        or [['query1', 'response1'], ['query2', None]]
+    """
+    messages = []
+    if not roles:
+        roles = [['user', 'assistant']] * len(history)
+    else:
+        assert len(roles) == len(history), f'len(roles): {len(roles)}, len(history): {len(history)}'
+    if system is not None:
+        messages.append({'role': 'system', 'content': system})
+
+    for role, h in zip(roles, history):
+        assert isinstance(h, (list, tuple))
+        if h[0] is not None:
+            messages.append({'role': role[0], 'content': h[0]})
+        if h[1] is not None:
+            messages.append({'role': role[1], 'content': h[1]})
+    return messages
 
 def messages_to_history(messages: 'Messages') -> Dict[str, Any]:
     system = None

@@ -5,25 +5,25 @@ from functools import partial
 from typing import Tuple, Optional, Union, Dict, Any, List, Literal
 
 import torch
-from swift.llm.model import fix_do_sample_warning, get_default_device_map, \
-    ModelMeta, get_matched_model_meta
-from swift.llm.model.patcher import (get_lm_head_model, patch_attach_align_device_hook_on_blocks,
-                                     patch_get_dynamic_module, patch_mp_ddp,
-                                     patch_tp_plan, patch_automodel_for_sequence_classification, patch_automodel)
-from swift.llm.model.register import MODEL_MAPPING, get_default_torch_dtype, \
-    deepspeed_set_z3_leaf_modules, get_matched_model_types
-from swift.llm.model.utils import HfConfigFactory, ModelInfo, safe_snapshot_download, InitModelStrategy
-from swift.utils import patch_getattr
 from transformers import PreTrainedTokenizerBase, PreTrainedModel, GenerationConfig, AutoConfig, \
     AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM, PretrainedConfig
 
+from surogate.core.model.hf_config import HfConfigFactory
+from surogate.core.model.init_strategy import InitModelStrategy
+from surogate.core.model.model_info import ModelInfo, get_matched_model_types
+from surogate.core.model.patcher import patch_mp_ddp, patch_get_dynamic_module, patch_tp_plan, patch_getattr, \
+    get_lm_head_model, patch_automodel_for_sequence_classification, patch_automodel, deepspeed_set_z3_leaf_modules, \
+    patch_attach_align_device_hook_on_blocks
+from surogate.core.model.registry import MODEL_MAPPING
+from surogate.core.model.utils import get_model_info_and_template, get_default_device_map, fix_do_sample_warning
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
 
-def load_model_and_tokenizer(model_id: str, model_type: str, args: DictDefault, load_model = True) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
+def load_model_and_tokenizer(model_id: str, model_type: str, args: DictDefault, load_model=True) -> Tuple[
+    Optional[PreTrainedModel], PreTrainedTokenizerBase]:
     if model_id is None:
         raise ValueError("'model' must be specified in config.")
 
@@ -82,7 +82,7 @@ def get_model_and_tokenizer(
     if download_model is None:
         download_model = load_model and not return_dummy_model
 
-    model_info, model_meta = get_model_info_and_meta(
+    model_info, model_template = get_model_info_and_template(
         model_id_or_path,
         torch_dtype,
         use_hf=True,
@@ -102,11 +102,11 @@ def get_model_and_tokenizer(
     if max_memory:
         model_kwargs['max_memory'] = max_memory
     model_dir = model_info.model_dir
-    get_function = model_meta.get_function
+    get_function = model_template.get_function
     kwargs['automodel_class'] = automodel_class
     kwargs['attn_impl'] = attn_impl
     kwargs['rope_scaling'] = rope_scaling
-    kwargs['model_meta'] = model_meta
+    kwargs['model_meta'] = model_template
     kwargs['max_model_len'] = max_model_len
     kwargs['return_dummy_model'] = return_dummy_model
     patch_offload = kwargs.pop('patch_offload', False)
@@ -125,7 +125,7 @@ def get_model_and_tokenizer(
             logger.info(f'Added {num_new_tokens} new special tokens.')
 
             if model is not None and not return_dummy_model:
-                llm_model = get_lm_head_model(model, model_meta)
+                llm_model = get_lm_head_model(model, model_template)
                 origin_vocab_size = HfConfigFactory.get_config_attr(llm_model.config, 'vocab_size')
                 if origin_vocab_size < len(tokenizer):
                     vocab_size = math.ceil(len(tokenizer) / 128) * 128
@@ -134,11 +134,11 @@ def get_model_and_tokenizer(
                     HfConfigFactory.set_config_attr(llm_model.config, 'vocab_size', vocab_size)
 
     tokenizer.model_info = model_info
-    tokenizer.model_meta = model_meta
+    tokenizer.model_meta = model_template
 
     if model is not None:
         model.model_info = model_info
-        model.model_meta = model_meta
+        model.model_meta = model_template
         model.model_dir = model_dir
 
         # generation_config
@@ -151,7 +151,7 @@ def get_model_and_tokenizer(
 
     if processor is not None:
         processor.model_info = model_info
-        processor.model_meta = model_meta
+        processor.model_meta = model_template
 
     return model, processor
 
@@ -183,7 +183,7 @@ def get_model_and_tokenizer_from_local(
     rope_scaling = kwargs.get('rope_scaling')
     max_model_len = kwargs.get('max_model_len')
     return_dummy_model = kwargs.get('return_dummy_model')
-    model_meta = kwargs.get('model_meta')
+    model_template = kwargs.get('model_template')
     if rope_scaling:
         HfConfigFactory.set_config_attr(model_config, 'rope_scaling', rope_scaling)
     if max_model_len:
@@ -200,7 +200,7 @@ def get_model_and_tokenizer_from_local(
     if model_info.task_type == 'seq_cls':
         problem_type = kwargs.get('problem_type')
         if problem_type is None:
-            if model_info.num_labels == 1 or model_meta.is_reward:
+            if model_info.num_labels == 1 or model_template.is_reward:
                 problem_type = 'regression'
             else:
                 problem_type = 'single_label_classification'
@@ -225,16 +225,16 @@ def get_model_and_tokenizer_from_local(
         automodel_class = automodel_class or AutoModelForCausalLM
         context_kwargs = {
             'model_info': model_info,
-            'model_meta': model_meta,
+            'model_meta': model_template,
             'automodel_class': automodel_class,
             'return_dummy_model': return_dummy_model,
         }
         if model is None:
             if return_dummy_model:
                 context = partial(patch_automodel, **context_kwargs)
-            elif model_info.task_type == 'seq_cls' and not model_meta.is_reward:
+            elif model_info.task_type == 'seq_cls' and not model_template.is_reward:
                 context = partial(patch_automodel_for_sequence_classification, **context_kwargs)
-            elif model_info.task_type == 'seq_cls' and model_meta.is_reward and model_config.num_labels > 1:
+            elif model_info.task_type == 'seq_cls' and model_template.is_reward and model_config.num_labels > 1:
                 logger.warning('You are using a reward model for seq_cls task and num_labels > 1, '
                                'ignore_mismatched_sizes will be set to True')
                 model_kwargs['ignore_mismatched_sizes'] = True
@@ -260,8 +260,8 @@ def get_model_and_tokenizer_from_local(
             model._auto_class = automodel_class.__name__
 
         if model_info.task_type == 'embedding' and automodel_class.__name__ != 'AutoModel':
-            from swift.llm.model.patcher import patch_output_normalizer
-            patch_output_normalizer(model, model_meta=model_meta)
+            from surogate.core.model.patcher import patch_output_normalizer
+            patch_output_normalizer(model, model_template=model_template)
 
         init_strategy = kwargs.get('init_strategy')
         if init_strategy is not None:

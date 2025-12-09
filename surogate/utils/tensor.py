@@ -1,8 +1,10 @@
+import random
 from collections.abc import Mapping
-from typing import Any, Union, List, Dict
+from typing import Any, Union, List, Dict, Optional
 
 import numpy as np
 import torch
+from transformers import enable_full_determinism, set_seed
 
 from surogate.utils.dist import get_device_count, get_dist_setting
 
@@ -64,3 +66,24 @@ def get_dataset_lengths(dataset, from_arrow=False):
             input_ids = dataset["input_ids"]
             lengths = np.array([len(seq) for seq in input_ids])
     return lengths
+
+def seed_everything(seed: Optional[int] = None, full_determinism: bool = False) -> int:
+
+    if seed is None:
+        seed_max = np.iinfo(np.int32).max
+        seed = random.randint(0, seed_max)
+
+    if full_determinism:
+        enable_full_determinism(seed)
+    else:
+        set_seed(seed)
+    return seed
+
+
+def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
+    position_ids = position_ids[0]
+    seq_start_indices = torch.where(position_ids == 0)[0]
+    seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(position_ids)], device=position_ids.device)])
+    seq_lengths = seq_end_indices - seq_start_indices
+    cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=position_ids.device), seq_lengths]), dim=0)
+    return cu_seqlens

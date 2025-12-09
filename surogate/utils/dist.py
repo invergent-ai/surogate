@@ -6,11 +6,10 @@ from typing import Tuple, Optional, Union
 import torch
 from datasets.utils._filelock import FileLock
 from transformers import set_seed
-from transformers.utils import strtobool, is_torch_cuda_available
+from transformers.utils import strtobool, is_torch_cuda_available, is_torch_mps_available
 
 from surogate.utils.fs import get_cache_dir
 from surogate.utils.logger import get_logger
-from swift.utils import get_current_device
 
 logger = get_logger()
 
@@ -30,6 +29,10 @@ def is_dist():
 def is_local_master():
     local_rank = get_dist_setting()[1]
     return local_rank in {-1, 0}
+
+def is_last_rank():
+    rank, _, world_size, _ = get_dist_setting()
+    return rank in {-1, world_size - 1}
 
 def get_dist_setting() -> Tuple[int, int, int, int]:
     """return rank, local_rank, world_size, local_world_size"""
@@ -55,7 +58,7 @@ def is_mp_ddp() -> bool:
         return True
     return False
 
-def print_distributed_config(self):
+def print_distributed_config():
     rank, local_rank, world_size, local_world_size = get_dist_setting()
     is_distributed = world_size > 1
     logger.info(f"Distributed Environment: {'Yes' if is_distributed else 'No'}")
@@ -84,6 +87,28 @@ def get_device_type() -> torch.device:
     device = torch.device("cpu")
     if is_torch_cuda_available():
         device = torch.device("cuda")
+    return device
+
+def get_current_device():
+    if is_torch_cuda_available():
+        current_device = torch.cuda.current_device()
+    elif is_torch_mps_available():
+        current_device = 'mps'
+    else:
+        current_device = 'cpu'
+    return current_device
+
+def get_device(local_rank: Optional[Union[str, int]] = None) -> str:
+    if local_rank is None:
+        local_rank = max(0, get_dist_setting()[1])
+    local_rank = str(local_rank)
+    if is_torch_mps_available():
+        device = 'mps:{}'.format(local_rank)
+    elif is_torch_cuda_available():
+        device = 'cuda:{}'.format(local_rank)
+    else:
+        device = 'cpu'
+
     return device
 
 _DISABLE_USE_BARRIER = False

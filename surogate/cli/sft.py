@@ -5,8 +5,7 @@ from surogate.core.config.loader import load_config
 from surogate.utils.logger import get_logger
 logger = get_logger()
 
-from swift.ray import RayHelper
-
+from surogate.ray import RayHelper
 from surogate.core.config.sft_config import SFTConfig
 
 from surogate.utils.dict import DictDefault

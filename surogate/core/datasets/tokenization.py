@@ -2,9 +2,10 @@ from collections import defaultdict
 from typing import Any, Dict, Literal
 
 from datasets import Dataset, IterableDataset
-from swift.llm import ModelMeta, get_template
 from transformers import PreTrainedTokenizerBase
 
+from surogate.core.model.chat_templates.processor import get_chat_template_processor
+from surogate.core.model.registry import ModelTemplate
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -25,12 +26,12 @@ class PromptTokenizingStrategy:
             - ''train', 'rlhf', 'kto', 'gkd' are training modes
             task: The type of task for which the prompt is being tokenized.
         """
-        model_meta: ModelMeta = getattr(tokenizer, "model_meta")
-        self.template = get_template(model_meta.template, tokenizer)
+        model_template: ModelTemplate = getattr(tokenizer, "model_template")
+        self.template = get_chat_template_processor(model_template.chat_template, tokenizer)
         self.template.set_mode(mode)
         self.template.task_type = task
         if self.template is None:
-            raise ValueError(f"Chat Template not found for the architecture {model_meta.model_arch}.")
+            raise ValueError(f"Chat Template not found for the architecture {model_template.model_arch}.")
 
         self.tokenizer: PreTrainedTokenizerBase = tokenizer
 

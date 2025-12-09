@@ -541,7 +541,7 @@ class ChatTemplateProcessor:
             if context == '<image>' and inputs.is_multimodal and inputs.image_idx < len(inputs.images):
                 c_list = self.replace_tag('image', inputs.image_idx, inputs)
                 inputs.image_idx += 1
-                loss_scale = 0. if self.template_backend == 'swift' else 1.
+                loss_scale = 0. if self.template_backend == 'native' else 1.
             else:
                 c_list = [context]
             res += c_list
@@ -610,7 +610,7 @@ class ChatTemplateProcessor:
             template_backend = 'jinja'
             logger.info_once(f'Setting template_backend: {template_backend}')
         res_context_list, loss_scale_list, answer_len = (
-            self._native_encode(inputs) if template_backend == 'swift' else self._jinja_encode(inputs))
+            self._native_encode(inputs) if template_backend == 'native' else self._jinja_encode(inputs))
         encoded = {}
         if self.is_encoder_decoder or self.mode == 'gkd':
             total_len = len(res_context_list)
@@ -974,7 +974,6 @@ class ChatTemplateProcessor:
         return input_ids, labels, loss_mask
 
     def data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
-        from swift.llm import RowPreprocessor
         if self.packing and isinstance(batch[0], list):
             batch = sum(batch, start=[])
         num_samples = len(batch)
@@ -1554,7 +1553,7 @@ class ChatTemplateProcessor:
 
 def get_chat_template_processor(
         template_type: str,
-        processor: 'Processor',
+        processor: Optional['Processor'],
         default_system: Optional[str] = None,
         max_length: Optional[int] = None,
         *,

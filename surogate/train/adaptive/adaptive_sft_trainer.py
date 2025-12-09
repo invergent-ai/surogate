@@ -16,9 +16,9 @@ import torch
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl, trainer
 
 from surogate.core.config.sft_config import SFTConfig
-from surogate.train.noop_callbacks import NoopTrainerCallback, NoopPrinterCallback
+from surogate.train.callbacks import NoopTrainerCallback, NoopPrinterCallback
+from surogate.train.trainer import SurogateTrainer
 from surogate.utils.logger import get_logger
-from swift import Seq2SeqTrainer
 
 logger = get_logger()
 
@@ -564,7 +564,7 @@ class AdaptiveTrainerCallback(TrainerCallback):
         return memory_stats
 
 
-class AdaptiveSFTTrainer(Seq2SeqTrainer):
+class AdaptiveSFTTrainer(SurogateTrainer):
     def __init__(self, config: SFTConfig, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sg_config = config

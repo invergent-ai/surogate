@@ -23,6 +23,7 @@ from surogate.core.model.patcher import patch_awq_compat, patch_automodel_for_se
 from surogate.core.model.registry import ModelTemplate, MODEL_MAPPING
 from surogate.utils.dist import get_dist_setting, is_mp
 from surogate.utils.logger import get_logger
+from surogate.utils.utils import deep_getattr
 
 logger = get_logger()
 
@@ -434,3 +435,50 @@ def get_causal_lm_model_cls_prefix(model_type: str) -> Tuple[str, str]:
         [part.capitalize() for part in model_type.split("_")]
     )
     return causal_lm_cls_prefix, f"{causal_lm_cls_prefix}ForCausalLM"
+
+
+def check_tie_word_embeddings(model):
+    config = model.config
+    try:
+        from peft.utils import ModulesToSaveWrapper
+        if not HfConfigFactory.get_config_attr(config, 'tie_word_embeddings'):
+            return
+        for module in [model.get_input_embeddings(), model.get_output_embeddings()]:
+            if not isinstance(module, ModulesToSaveWrapper):
+                return
+        HfConfigFactory.set_config_attr(config, 'tie_word_embeddings', False)
+    except Exception:
+        pass
+
+def get_llm_module_from_multimodal(model: torch.nn.Module, model_template=None, inner_backbone=True):
+    """Get LLM model, this function can be used to get the llm module from a multi-modal model.
+
+    Args:
+        model: The model instance
+        model_meta: The model_meta information
+        inner_backbone: Get inner backbone model, like `QwenModel` or `LlamaModel`
+
+    Returns:
+
+    """
+    from peft import PeftModel
+    from accelerate.utils import extract_model_from_parallel
+    model = extract_model_from_parallel(model)
+
+    if isinstance(model, PeftModel):
+        model = model.model
+    if model_template is None:
+        model_template = model.model_template
+
+    llm_prefix = getattr(model_template.model_arch, 'language_model', None)
+    if llm_prefix:
+        llm_model = deep_getattr(model, llm_prefix[0])
+    else:
+        llm_model = model
+
+    if inner_backbone:
+        if hasattr(llm_model, 'thinker'):
+            llm_model = llm_model.thinker.model
+        elif hasattr(llm_model, 'model'):
+            llm_model = llm_model.model
+    return llm_model

@@ -4,17 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from typing import Optional, Any, List, Union, Tuple, Dict
 
-
-@dataclass
-class Function:
-    name: str
-    arguments: Optional[str]
-
-    def __post_init__(self):
-        if not isinstance(self.arguments, str):
-            self.arguments = json.dumps(self.arguments)
-        self.name = self.name.strip()
-        self.arguments = self.arguments.strip()
+from surogate.core.infer.protocol import Function
+from surogate.core.model.chat_templates.utils import split_str_parts_by
 
 @dataclass
 class AgentKeyword:
@@ -35,8 +26,6 @@ class ReactCompatMixin:
 
     @staticmethod
     def _split_action_action_input(response: str, keyword: AgentKeyword) -> List['Function']:
-        from swift.llm.template import split_str_parts_by
-        from swift.llm.infer import Function
         agent_parts = split_str_parts_by(response, list(asdict(keyword).values()))
         functions = []
         action_content = None

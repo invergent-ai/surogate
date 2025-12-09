@@ -275,7 +275,6 @@ class RowPreprocessor:
             return
         messages = row['messages']
         assert len(messages) > 0, f'messages: {messages}'
-        # fix swift/SlimOrca
         for message in messages:
             keys = set(message.keys()) - {'role', 'content', 'loss'}
             for key in keys:

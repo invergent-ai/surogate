@@ -29,7 +29,7 @@ class GatherLoss(torch.autograd.Function):
         # change from label.shape to loss, because label may be None
         ctx.scatter_shape = loss.shape[gather_idx or 0]
         ctx.gather_idx = gather_idx or 0
-        from swift.trainers.sequence_parallel import sequence_parallel
+        from surogate.train.sequence_parallel import sequence_parallel
         if position_ids is not None:
             position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
         ctx.position_ids = position_ids
@@ -42,7 +42,7 @@ class GatherLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_output):
-        from swift.trainers.sequence_parallel import sequence_parallel
+        from surogate.train.sequence_parallel import sequence_parallel
         _grad = grad_output[0] * sequence_parallel.world_size
         if sequence_parallel.rp_world_size > 1:
             _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
