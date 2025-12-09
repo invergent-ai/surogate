@@ -168,7 +168,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
             if not _save_path.is_dir():
                 raise ValueError(f"Save path {_save_path} already exists and is not a directory. Aborting.")
             if any(_save_path.iterdir()):
-                raise ValueError(f"Save path {_save_path} is not empty. Aborting.")
+                logger.warning("Save path {_save_path} is not empty.")
         else:
             if is_master():
                 _save_path.mkdir(parents=True, exist_ok=True)
@@ -237,7 +237,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         args_dict['fp16'] = self.fp16
         args_dict['bf16'] = self.bf16
         args_dict['optim'] = OptimizerNames.ADAMW_8BIT
-        args_dict['use_liger_kernel'] = True
+        args_dict['use_liger_kernel'] = self.sample_packing and False
 
         return TrainingArguments(**args_dict)
 

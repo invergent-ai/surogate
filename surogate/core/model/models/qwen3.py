@@ -3,6 +3,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
 
 from surogate.core.config.enums import LLMModelType, ChatTemplateType
 from surogate.core.model.architecture import ModelArchitecture
+from surogate.core.model.models.fast_qwen3 import FastQwen3Model
 from surogate.core.model.registry import register_model, ModelTemplate
 from surogate.core.model.utils import get_model_tokenizer_with_flash_attn
 
@@ -29,6 +30,7 @@ register_model(
         get_model_tokenizer_with_flash_attn,
         architectures=['Qwen3ForCausalLM'],
         attention_cls=Qwen3Attention,
+        fast_cls=FastQwen3Model,
         model_arch=ModelArchitecture.llama))
 
 

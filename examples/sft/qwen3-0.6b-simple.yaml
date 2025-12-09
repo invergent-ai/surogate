@@ -10,13 +10,13 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 30
+num_train_epochs: 1
 
 learning_rate: 2e-4
 
 qlora: true
-lora_fast: true
-lora_rank: 32
+lora_fast: false
+lora_rank: 16
 lora_alpha: 32
 lora_target_modules:
   - all-linear

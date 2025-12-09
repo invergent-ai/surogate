@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from typing import Optional, Any, List, Union, Tuple, Dict
 
-from surogate.core.infer.protocol import Function
 from surogate.core.model.chat_templates.utils import split_str_parts_by
 
 @dataclass
@@ -35,6 +34,7 @@ class ReactCompatMixin:
             if action_content is None and key == keyword.action.lower():
                 action_content = content
             elif action_content is not None and key == keyword.action_input.lower():
+                from surogate.core.infer.protocol import Function
                 functions.append(Function(name=action_content, arguments=content))
                 action_content = None
 

@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from surogate.core.infer.infer_engine import InferEngine
+from surogate.core.infer.protocol import ChatCompletionRequest, Model, ModelList, AdapterRequest, MultiModalRequestMixin
 from surogate.core.infer.torch_engine import TorchEngine
 from surogate.core.loaders.loader import load_model_and_tokenizer
 from surogate.core.model.chat_templates.processor import get_chat_template_processor, ChatTemplateProcessor
@@ -20,6 +21,7 @@ from surogate.utils.metric import InferStats
 from surogate.core.config.serve_config import ServeConfig
 from surogate.utils.command import SurogateCommand
 from surogate.utils.logger import get_logger
+from surogate.utils.model import get_model_name
 
 logger = get_logger()
 

@@ -117,4 +117,4 @@ def get_default_process_count():
         return int(dataset_processes)
     if runpod_cpu_count := os.environ.get("RUNPOD_CPU_COUNT"):
         return int(runpod_cpu_count)
-    return max(1, os.cpu_count() // 2)
+    return os.cpu_count()

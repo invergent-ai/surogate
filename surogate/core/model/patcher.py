@@ -1,4 +1,5 @@
 import copy
+import inspect
 import os
 import re
 from contextlib import contextmanager
@@ -490,3 +491,73 @@ def patch_attach_align_device_hook_on_blocks():
         yield
     finally:
         big_modeling.attach_align_device_hook_on_blocks = origin_attach_align_device_hook_on_blocks
+
+# Patches models to add RoPE Scaling
+def patch_linear_scaling(
+        model_name = None,
+        rope_module = None,
+        scaled_rope_module = None,
+        attention_module = None,
+):
+    assert rope_module is not None and scaled_rope_module is not None
+    assert attention_module is not None
+
+    model_filepath = f"transformers.models.{model_name}.modeling_{model_name}"
+    exec_code = (
+        f"import torch.nn as nn\n"
+        f"from typing import Union, Optional, List, Any, Callable, Tuple\n"
+        f"from {model_filepath} import logger, "
+        f"{model_name.title()}Attention, {model_name.title()}Config"
+    )
+
+    try:
+        function = inspect.getsource(attention_module.__init__)
+    except:
+        # Most likely already patched!
+        return None, None
+    where = function.find("def")
+    function = function.split("\n")
+    function = "\n".join(x[where:] for x in function)
+    init_name = f"{model_name.title()}Attention__init__"
+    function = function.replace("def __init__", f"def {init_name}")
+    function = function.replace(
+        "super().__init__()",
+        f"super({model_name.title()}Attention, self).__init__()",
+    )
+    fix_rope_function = """
+    if getattr(self.config, "rope_scaling", None) is None:
+        self.rotary_emb = {rope_function}(
+            dim = self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+    else:
+        scaling_type = self.config.rope_scaling["type"]
+        scaling_factor = self.config.rope_scaling["factor"]
+        if scaling_type == "linear":
+            self.rotary_emb = {scaled_rope_function}(
+                dim = self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                scaling_factor=scaling_factor,
+                base=self.rope_theta,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling type {{scaling_type}}")
+    pass
+    """
+    fix_rope_function = fix_rope_function.format(
+        rope_function = rope_module.__name__,
+        scaled_rope_function = scaled_rope_module.__name__,
+    )
+    rotary_emb = re.findall(
+        r"self\.rotary\_emb \= .+?\)",
+        function,
+        flags = re.DOTALL | re.MULTILINE,
+    )
+    if len(rotary_emb) == 0:
+        return None, exec_code + "\n\n" + function
+
+    rotary_emb = rotary_emb[0]
+    function = function.replace(rotary_emb, fix_rope_function, 1)
+    function = exec_code + "\n\n" + function
+    return init_name, function

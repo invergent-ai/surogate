@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Callable, Tuple, List, Type
+from typing import Dict, Optional, Callable, Tuple, List, Type, Any
 
 import torch
 from torch import nn
@@ -26,6 +26,7 @@ class ModelTemplate:
     tags: List[str] = field(default_factory=list)
     task_type: Optional[str] = None
     attention_cls: Type[nn.Module] = None
+    fast_cls: Optional[Any] = None
 
     def __post_init__(self):
         if self.chat_template is None:

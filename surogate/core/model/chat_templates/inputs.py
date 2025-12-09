@@ -1,7 +1,7 @@
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Union, Tuple, Any, Optional
+from typing import Dict, List, Union, Any, Optional
 
 from PIL import Image
 

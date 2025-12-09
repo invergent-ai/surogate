@@ -176,7 +176,7 @@ def get_model_tokenizer_from_local(
                     model = None
 
         automodel_class = automodel_class or AutoModelForCausalLM
-        model_template = kwargs['model_template']
+        model_template: ModelTemplate = kwargs['model_template']
         context_kwargs = {
             'model_info': model_info,
             'model_template': model_template,
@@ -202,8 +202,12 @@ def get_model_tokenizer_from_local(
                 context = partial(patch_automodel, **context_kwargs)
 
             with context():
-                model = automodel_class.from_pretrained(
-                    model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
+                if model_template.fast_cls:
+                    model = model_template.fast_cls.from_pretrained(
+                        model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
+                else:
+                    model = automodel_class.from_pretrained(
+                        model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
 
         # fix not save modeling_xxx.py (transformers 4.45)
         # https://github.com/huggingface/transformers/issues/24737
