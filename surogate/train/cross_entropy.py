@@ -21,9 +21,6 @@ def apply_cross_entropy_patch(config: SFTConfig):
             "Axolotl's fork of cut_cross_entropy is not installed. "
             + _CCE_INSTALL_MESSAGE
         )
-    import pydevd_pycharm
-    pydevd_pycharm.settrace('localhost', port=5678, stdout_to_server=True, stderr_to_server=True)
-
     _patch_llama_like(config.model_info.native_model_type)
 
     from cut_cross_entropy.transformers.patch import cce_patch
