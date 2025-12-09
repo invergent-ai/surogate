@@ -143,7 +143,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         self.report_to = cfg['report_to'] or []
         self.max_steps = cfg['max_steps'] or -1
         self.warmup_ratio = cfg['warmup_ratio'] or 0.05
-        self.weight_decay = cfg['weight_decay'] or 0.1
+        self.weight_decay = cfg['weight_decay'] or 0.01
         self.gradient_clip_norm = cfg['gradient_clip_norm'] or 1.0
         self.per_device_train_batch_size = cfg['per_device_train_batch_size'] or 1
         self.gradient_accumulation_steps = cfg['gradient_accumulation_steps'] or 1
@@ -236,7 +236,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         args_dict['logging_steps'] = 1
         args_dict['fp16'] = self.fp16
         args_dict['bf16'] = self.bf16
-        args_dict['optim'] = OptimizerNames.ADAMW_TORCH_8BIT
+        args_dict['optim'] = OptimizerNames.ADAMW_8BIT
         args_dict['use_liger_kernel'] = True
 
         return TrainingArguments(**args_dict)

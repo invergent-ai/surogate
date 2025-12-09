@@ -1,29 +1,28 @@
 model: Qwen/Qwen3-4B
-model_type: qwen3
+#model_type: qwen3
 save_path: ./output
 merge_adapter: false
 apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
+
 sample_packing: true
 sequence_len: 2048
 
-num_train_epochs: 1
+max_steps: 30
 
 learning_rate: 2e-4
 
 qlora: true
-lora_rank: 8
-lora_alpha: 16
+lora_fast: true
+lora_rank: 32
+lora_alpha: 32
 lora_target_modules:
   - all-linear
 
 datasets:
   - path: "mlabonne/FineTome-100k"
-    type: conversation
-    messages_field: conversations
-    message_property_mappings:
-      role: from
-      content: value
+    type: auto
+
 

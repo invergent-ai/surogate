@@ -15,6 +15,7 @@ class ConversationPreprocessor(RowPreprocessor):
         self.messages_field = dataset_config.messages_field
         self.system_field = dataset_config.system_field or "system"
         self.tools_field = dataset_config.tools_field or "tools"
+        self.columns[self.messages_field] = "messages"
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         row["messages"] = self.get_conversation_thread(row)

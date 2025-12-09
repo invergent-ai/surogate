@@ -15,6 +15,7 @@ logger = get_logger()
 @dataclass
 class ModelInfo:
     model_type: str
+    native_model_type: str
     model_dir: str
     torch_dtype: torch.dtype
     max_model_len: int
@@ -60,12 +61,16 @@ class ModelInfo:
         max_model_len = HfConfigFactory.get_max_model_len(config)
         rope_scaling = HfConfigFactory.get_config_attr(config, 'rope_scaling')
         is_moe_model = HfConfigFactory.is_moe_model(config)
+        native_model_type = HfConfigFactory.get_config_attr(config, 'model_type')
 
         if model_type is None:
             architectures = HfConfigFactory.get_config_attr(config, 'architectures')
             model_types = get_matched_model_types(architectures)
             if len(model_types) > 1:
-                raise ValueError('Failed to automatically match `model_type`. '
+                if "Qwen3ForCausalLM" in architectures:
+                    model_type = "qwen3"
+                else:
+                    raise ValueError('Failed to automatically match `model_type`. '
                                  f'Please explicitly pass the `model_type` for `{model_dir}`. '
                                  f'Recommended `model_types` include: {model_types}.')
             elif len(model_types) == 1:
@@ -75,6 +80,7 @@ class ModelInfo:
 
         return ModelInfo(
             model_type,
+            native_model_type,
             model_dir,
             torch_dtype,
             max_model_len,

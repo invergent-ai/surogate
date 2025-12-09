@@ -10,6 +10,7 @@ from peft.utils import CONFIG_NAME
 from torch import nn
 
 from surogate.core.config.sft_config import SFTConfig
+from surogate.train.cross_entropy import apply_cross_entropy_patch
 from surogate.train.lora_fast.lora_fa import patch_fa_peft_integration
 from surogate.train.lora_fast.lora_fast import apply_lora_fast_post_load, apply_lora_fast_pre_load
 from surogate.train.peft import LoraConfig
@@ -31,6 +32,8 @@ class TrainUtils:
         if config.lora_fast:
             patch_fa_peft_integration()
             apply_lora_fast_pre_load(config)
+
+        apply_cross_entropy_patch(config)
 
         if config.resume_from_checkpoint:
             model = cls.from_pretrained(model, config.resume_from_checkpoint, is_trainable=True)

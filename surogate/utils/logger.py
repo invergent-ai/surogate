@@ -259,6 +259,9 @@ class LoggerWrapper:
         full_banner = f"\n{top_border}\n{middle}\n{bottom_border}"
         self._logger.info(full_banner)
 
+    def addFilter(self, filter):
+        pass
+
 def get_logger(
         name: Optional[str] = None,
         log_file: Optional[str] = None,

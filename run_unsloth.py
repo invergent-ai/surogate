@@ -30,10 +30,11 @@ model = FastLanguageModel.get_peft_model(
 
 dataset = load_dataset("mlabonne/FineTome-100k", split = "train")
 dataset = standardize_sharegpt(dataset)
-dataset = tokenizer.apply_chat_template(
-    list(dataset["conversations"]),
-    tokenize = False,
-)
+def format_prompts(examples):
+    convos = examples["conversations"]
+    texts = [tokenizer.apply_chat_template(convo, tokenize = False) for convo in convos]
+    return { "text" : texts, }
+dataset = dataset.map(format_prompts, batched=True)
 
 trainer = SFTTrainer(
     model = model,

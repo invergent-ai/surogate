@@ -7,7 +7,7 @@ from surogate.utils.dict import DictDefault
 
 
 @dataclass
-class DatasetConfig(ABC):
+class DatasetConfig:
     """
     DatasetConfig class is a dataclass that holds configuration parameters for a dataset.
 
@@ -189,4 +189,4 @@ def create_dataset_config(ds_cfg: DictDefault):
     elif ds_type == 'conversation':
         return ConversationDatasetConfig(ds_cfg)
     else:
-        raise ValueError(f'Unknown dataset type: {ds_type}')
+        return DatasetConfig(ds_cfg)
