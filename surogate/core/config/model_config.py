@@ -7,6 +7,7 @@ from typing import Optional, Literal, Union, Dict, Any
 import torch
 
 from surogate.core.model.hf_config import HfConfigFactory
+from surogate.core.model.quant.falqon_quant_config import FalqonQuantizationConfig
 from surogate.core.model.utils import get_model_info_and_template, get_model_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.dist import get_dist_setting
@@ -43,7 +44,7 @@ class ModelConfig(ABC):
             model weights are allocated across devices according to max_memory,
             e.g., --max_memory '{0: "20GB", 1: "20GB"}'.
             Default is None. Passed through to the from_pretrained interface in Transformers.
-        quant_method: Optional[Literal['bnb_4bit', 'fp8']]: On-the-fly quantization method used when loading the model.
+        quant_method: Optional[Literal['bnb_4bit', 'falqon']]: On-the-fly quantization method used when loading the model.
             Default is None.
     """
     model: Optional[str] = None
@@ -55,7 +56,7 @@ class ModelConfig(ABC):
     attn_impl: Optional[str] = None
     device_map: Optional[Union[dict, str]] = None
     max_memory: Optional[Union[dict, str]] = None
-    quant_method: Optional[Literal['bnb_4bit', 'fp8']] = None
+    quant_method: Optional[Literal['bnb_4bit', 'falqon']] = None
     num_labels: Optional[int] = None
 
     def __init__(self, cfg: DictDefault):
@@ -166,11 +167,10 @@ class ModelConfig(ABC):
     def _init_quantization_config(self):
         if self.quant_method is None:
             return None
-        assert self.quant_method in {'bnb_4bit', 'fp8'}
-
-        from transformers import BitsAndBytesConfig
+        assert self.quant_method in {'bnb_4bit', 'falqon'}
 
         if self.quant_method == 'bnb_4bit':
+            from transformers import BitsAndBytesConfig
             bnb_4bit_compute_dtype = None
             if self.torch_dtype in {torch.float16, torch.float32}:
                 bnb_4bit_compute_dtype = torch.float32
@@ -188,10 +188,8 @@ class ModelConfig(ABC):
                 bnb_4bit_quant_type='nf4',
                 bnb_4bit_quant_storage=torch.bfloat16,
                 llm_int8_skip_modules=self._get_modules_to_skip_quant())
-        elif self.quant_method == 'fp8':
-            from transformers import FineGrainedFP8Config
-            modules_to_not_convert = self._get_modules_to_skip_quant()
-            quantization_config = FineGrainedFP8Config(modules_to_not_convert=modules_to_not_convert)
+        elif self.quant_method == 'falqon':
+            quantization_config = FalqonQuantizationConfig()
         else:
             raise ValueError(f'Unsupported quantization method: {self.quant_method}')
 
@@ -243,4 +241,3 @@ class ModelConfig(ABC):
         res['task_type'] = task_type or self.task_type
         res['num_labels'] = num_labels or self.num_labels
         return get_model_tokenizer(**res)
-

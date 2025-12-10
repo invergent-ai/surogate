@@ -1,1 +1,1 @@
-from . import (models, agent_templates, chat_templates)
+from . import (models, agent_templates, chat_templates, quant)

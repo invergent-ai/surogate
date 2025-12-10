@@ -18,6 +18,7 @@ from surogate.core.datasets.utils import DATASET_TYPE, LazyLLMDataset
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.core.model.saver import save_checkpoint
 from surogate.core.model.utils import check_tie_word_embeddings
+from surogate.ray import RayHelper
 from surogate.train.callbacks import NoopPrinterCallback, NoopTrainerCallback, SFTTrainerCallback
 from surogate.train.train_utils import TrainUtils
 from surogate.train.trainer import SurogateTrainer
@@ -28,8 +29,6 @@ from surogate.utils.jsonl import append_to_jsonl
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters, recommend_training_params
 from surogate.utils.np_utils import get_seed
-
-from surogate.ray import RayHelper
 
 datasets.logging.set_verbosity_warning()
 
@@ -61,8 +60,6 @@ class SurogateSFT(SurogateCommand):
                 padding_free=self.config.padding_free)
         if self.model is None:
             return
-        if hasattr(self.model, 'hf_device_map'):
-            logger.info(f'model.hf_device_map: {self.model.hf_device_map}')
 
     @RayHelper.function(group='default')
     def _prepare_template(self) -> None:

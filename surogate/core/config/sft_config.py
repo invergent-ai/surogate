@@ -109,6 +109,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
     sequence_parallel_size: int = 1
 
     qlora: Optional[bool] = False
+    qlora_fast: Optional[bool] = False
     merge_adapter: Optional[bool] = False
     lora_rank: Optional[int] = None
     lora_alpha: Optional[int] = None
@@ -151,6 +152,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         self.sample_packing = cfg.get('sample_packing', True)
         self.sequence_parallel_size = cfg.get('sequence_parallel_size', 1)
         self.qlora = cfg.get('qlora', False)
+        self.qlora_fast = cfg.get('qlora_fast', False)
         self.merge_adapter = cfg.get('merge_adapter', False)
         self.lora_rank = cfg['lora_rank'] or 8
         self.lora_alpha = cfg['lora_alpha'] or 32
@@ -168,7 +170,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
             if not _save_path.is_dir():
                 raise ValueError(f"Save path {_save_path} already exists and is not a directory. Aborting.")
             if any(_save_path.iterdir()):
-                logger.warning("Save path {_save_path} is not empty.")
+                logger.warning_once("Save path {_save_path} is not empty.")
         else:
             if is_master():
                 _save_path.mkdir(parents=True, exist_ok=True)
@@ -186,6 +188,8 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
 
         if self.qlora:
             self.quant_method = 'bnb_4bit'
+        if self.qlora_fast:
+            self.quant_method = 'falqon'
 
         self.prompt_template = self.model_template.chat_template
         if self.use_chat_template is None:

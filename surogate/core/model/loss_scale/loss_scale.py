@@ -18,7 +18,6 @@ class LossScale:
     is_binary = None
 
     def __init__(self):
-        logger.info('Initializing LossScale')
         if self.loss_scale_config is not None:
             path = os.path.dirname(os.path.abspath(__file__))
             config_path = os.path.join(path, 'loss_scales', self.loss_scale_config)

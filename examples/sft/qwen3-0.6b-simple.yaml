@@ -14,7 +14,7 @@ num_train_epochs: 1
 
 learning_rate: 2e-4
 
-qlora: true
+qlora_fast: true
 lora_fast: false
 lora_rank: 16
 lora_alpha: 32
@@ -23,6 +23,7 @@ lora_target_modules:
 
 datasets:
   - path: "mlabonne/FineTome-100k"
+    samples: 10
     type: auto
 
 
