@@ -218,6 +218,12 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         self._init_device()
         self.accelerator_config = {'dispatch_batches': False}
 
+        if self.learning_rate < 1e-7:
+            logger.warning(f"Your learning rate {self.learning_rate} is set to a very low value. Consider increasing it to avoid vanishing gradients!")
+        elif self.learning_rate > 1:
+            logger.warning(f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!")
+
+
         self.trainer_args = self.to_trainer_args()
         self.trainer_args.remove_unused_columns = False
         self.trainer_args.output_dir = self.save_path
@@ -241,7 +247,12 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         args_dict['fp16'] = self.fp16
         args_dict['bf16'] = self.bf16
         args_dict['optim'] = OptimizerNames.ADAMW_8BIT
-        args_dict['use_liger_kernel'] = self.sample_packing and False
+        args_dict['use_liger_kernel'] = False
+        args_dict['dataloader_pin_memory'] = True
+        args_dict['include_tokens_per_second'] = False
+        args_dict['per_device_eval_batch_size'] = 4
+        args_dict['eval_accumulation_steps'] = 2
+        args_dict['torch_empty_cache_steps'] = 250
 
         return TrainingArguments(**args_dict)
 

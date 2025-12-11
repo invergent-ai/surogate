@@ -46,7 +46,6 @@ class SurogateSFT(SurogateCommand):
     def __init__(self, config: SFTConfig, args: DictDefault):
         super().__init__(config=config, args=args)
         config.__post_init__()
-
         self._prepare_model_tokenizer()
         self._prepare_template()
         self._prepare_callbacks()

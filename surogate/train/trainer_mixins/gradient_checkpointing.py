@@ -32,7 +32,7 @@ class GradientCheckpointingMixin(Trainer):
                 use_reentrant_ = False
             else:
                 use_reentrant_ = True
-        logger.info(f'use_reentrant: {use_reentrant_}')
+
         _old_checkpoint = torch.utils.checkpoint.checkpoint
 
         @wraps(_old_checkpoint)

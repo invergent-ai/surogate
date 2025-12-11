@@ -10,9 +10,8 @@ from peft.utils import CONFIG_NAME
 from torch import nn
 
 from surogate.core.config.sft_config import SFTConfig
+from surogate.core.model.peft_patcher import patch_peft_model
 from surogate.train.cross_entropy import apply_cross_entropy_patch
-from surogate.train.lora_fast.lora_fa import patch_fa_peft_integration
-from surogate.train.lora_fast.lora_fast import apply_lora_fast_post_load, apply_lora_fast_pre_load
 from surogate.train.peft import LoraConfig
 from surogate.utils.logger import get_logger
 from surogate.utils.utils import deep_getattr
@@ -29,23 +28,13 @@ class TrainUtils:
             *,
             task_type=None
     ):
-        if config.lora_fast:
-            patch_fa_peft_integration()
-            apply_lora_fast_pre_load(config)
-
         apply_cross_entropy_patch(config)
 
         if config.resume_from_checkpoint:
             model = cls.from_pretrained(model, config.resume_from_checkpoint, is_trainable=True)
         else:
             model = cls.prepare_adapter(config, model, task_type=task_type)
-
-        if config.lora_fast:
-            if not isinstance(model, PeftModelForCausalLM):
-                logger.warning("lora_fast is enabled, but the model is not a PeftModelForCausalLM.")
-            else:
-                model = apply_lora_fast_post_load(config, model)
-
+            model = patch_peft_model(model)
 
         # fix bug: Attempting to unscale FP16 gradients.
         #   peft: https://github.com/huggingface/peft/issues/1249

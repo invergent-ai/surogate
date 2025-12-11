@@ -66,7 +66,7 @@ def get_model_info_and_template(
 
     if torch_dtype is None:
         torch_dtype = model_template.torch_dtype or get_default_torch_dtype(model_info.torch_dtype)
-        logger.info(f'Setting torch_dtype: {torch_dtype}')
+        logger.debug(f'Setting torch_dtype: {torch_dtype}')
 
     model_info.torch_dtype = torch_dtype
     if task_type is None:
@@ -204,7 +204,7 @@ def get_model_tokenizer_from_local(
             with context():
                 if model_template.fast_cls:
                     model = model_template.fast_cls.from_pretrained(
-                        model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
+                        model_dir, model_config=model_config, **model_kwargs)
                 else:
                     model = automodel_class.from_pretrained(
                         model_dir, config=model_config, trust_remote_code=True, **model_kwargs)

@@ -1,22 +1,30 @@
 from functools import partial
 
+from transformers.loss.loss_utils import LOSS_MAPPING
+
 from surogate.core.config.sft_config import SFTConfig
+from surogate.core.model.kernels.cross_entropy_loss import fast_causal_lm_loss
 from surogate.core.model.utils import get_causal_lm_model_cls_prefix
 from surogate.utils.debug import debug_breakpoint
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
-_CCE_INSTALL_MESSAGE = (
-    "Please install Axolotl's fork of cut_cross_entropy with transformers support using "
-    '`pip install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@8a1a0ec"`'
-)
 
 def apply_cross_entropy_patch(config: SFTConfig):
-    logger.info("Applying Cut Cross-Entropy (CCE) patch")
+    # CCE decreases VRAM usage but it slightly increases training time.
+    _apply_cce(config)
+    _apply_fast_ce()
+
+def _apply_cce(config: SFTConfig):
+    logger.debug("Applying Cut Cross-Entropy (CCE) patch")
 
     from cut_cross_entropy.transformers.patch import AXOLOTL_CCE_FORK
     if not AXOLOTL_CCE_FORK:
+        _CCE_INSTALL_MESSAGE = (
+            "Please install Axolotl's fork of cut_cross_entropy with transformers support using "
+            '`pip install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@8a1a0ec"`'
+        )
         raise ImportError(
             "Axolotl's fork of cut_cross_entropy is not installed. "
             + _CCE_INSTALL_MESSAGE
@@ -25,7 +33,6 @@ def apply_cross_entropy_patch(config: SFTConfig):
 
     from cut_cross_entropy.transformers.patch import cce_patch
     cce_patch(config.model_info.native_model_type)
-
 
 def _patch_llama_like(model_type: str):
     from cut_cross_entropy.transformers.patch import PATCH_FNS
@@ -52,3 +59,9 @@ def _patch_llama_like(model_type: str):
 
     if model_type not in PATCH_FNS:
         PATCH_FNS[model_type] = partial(patch_generic, model_type=model_type)
+
+
+def _apply_fast_ce():
+    logger.debug("Applying Fast Cross-Entropy Loss patch")
+    LOSS_MAPPING["ForCausalLM"] = fast_causal_lm_loss
+

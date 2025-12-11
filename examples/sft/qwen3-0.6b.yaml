@@ -1,0 +1,31 @@
+model: Qwen/Qwen3-4B
+#model_type: qwen3
+save_path: ./output
+merge_adapter: false
+apply_recommended_values: false
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+
+sample_packing: true
+sequence_len: 2048
+
+num_train_epochs: 1
+
+learning_rate: 2e-4
+
+qlora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - all-linear
+
+datasets:
+  - path: "invergent/alpaca-gpt4-data-en"
+    type: instruction
+    split: train
+    instruction_field: instruction
+    input_field: input
+    output_field: output
+
+

@@ -47,3 +47,4 @@ class Llama32ChatTemplate(Llama3ChatTemplate):
     prefix: Prompt = field(default_factory=lambda: _get_llama32_prefix())
     system_prefix: Optional[Prompt] = None
 
+register_chat_template(Llama32ChatTemplate(ChatTemplateType.llama3_2))

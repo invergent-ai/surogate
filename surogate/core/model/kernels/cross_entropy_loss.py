@@ -24,18 +24,26 @@ from .utils import (
 )
 from packaging.version import Version
 
+
+@triton.heuristics(
+    {
+        "DO_SOFTCAPPING": lambda args: bool(args["DO_SOFTCAPPING"]),
+        "DO_LOGIT_SCALING": lambda args: bool(args["DO_LOGIT_SCALING"]),
+    }
+)
+@triton.jit
 def _cross_entropy_forward(
-    logits_ptr,
-    logits_row_stride,
-    loss_ptr,
-    logsumexp_ptr,
-    labels_ptr,
-    VOCAB_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    DO_SOFTCAPPING: tl.constexpr,
-    SOFTCAP: tl.constexpr,
-    DO_LOGIT_SCALING: tl.constexpr,
-    LOGIT_SCALE: tl.constexpr,
+        logits_ptr,
+        logits_row_stride,
+        loss_ptr,
+        logsumexp_ptr,
+        labels_ptr,
+        VOCAB_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        DO_SOFTCAPPING: tl.constexpr,
+        SOFTCAP: tl.constexpr,
+        DO_LOGIT_SCALING: tl.constexpr,
+        LOGIT_SCALE: tl.constexpr,
 ):
     """
     Cross Entropy Loss = 1/n sum [ -yi log(Pi) ]
@@ -67,7 +75,7 @@ def _cross_entropy_forward(
     mask = col_offsets < VOCAB_SIZE
 
     label_idx = tl.load(labels_ptr).to(tl.int32)
-    logits = tl.load(logits_ptr + col_offsets, mask = mask, other = -float("inf")).to(
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(
         tl.float32
     )
 
@@ -96,28 +104,26 @@ def _cross_entropy_forward(
     tl.store(loss_ptr, loss)
 
 
-_cross_entropy_forward = triton.jit(_cross_entropy_forward)
-_cross_entropy_forward = triton.heuristics(
+@triton.heuristics(
     {
         "DO_SOFTCAPPING": lambda args: bool(args["DO_SOFTCAPPING"]),
         "DO_LOGIT_SCALING": lambda args: bool(args["DO_LOGIT_SCALING"]),
     }
-)(_cross_entropy_forward)
-
-
+)
+@triton.jit
 def _chunked_cross_entropy_forward(
-    logits_ptr,
-    logits_row_stride: tl.constexpr,
-    loss_ptr,
-    logsumexp_ptr,
-    labels_ptr,
-    VOCAB_SIZE: tl.constexpr,
-    N_CHUNKS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    DO_SOFTCAPPING: tl.constexpr,
-    SOFTCAP: tl.constexpr,
-    DO_LOGIT_SCALING: tl.constexpr,
-    LOGIT_SCALE: tl.constexpr,
+        logits_ptr,
+        logits_row_stride: tl.constexpr,
+        loss_ptr,
+        logsumexp_ptr,
+        labels_ptr,
+        VOCAB_SIZE: tl.constexpr,
+        N_CHUNKS: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        DO_SOFTCAPPING: tl.constexpr,
+        SOFTCAP: tl.constexpr,
+        DO_LOGIT_SCALING: tl.constexpr,
+        LOGIT_SCALE: tl.constexpr,
 ):
     """
     256K vocab divided in 4 chunks
@@ -154,7 +160,7 @@ def _chunked_cross_entropy_forward(
     mask = col_offsets < VOCAB_SIZE
 
     label_idx = tl.load(labels_ptr).to(tl.int32)
-    logits = tl.load(logits_ptr + col_offsets, mask = mask, other = -float("inf")).to(
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(
         tl.float32
     )
 
@@ -186,28 +192,26 @@ def _chunked_cross_entropy_forward(
     tl.store(logsumexp_ptr, logsumexp)
 
 
-_chunked_cross_entropy_forward = triton.jit(_chunked_cross_entropy_forward)
-_chunked_cross_entropy_forward = triton.heuristics(
+@triton.heuristics(
     {
         "DO_SOFTCAPPING": lambda args: bool(args["DO_SOFTCAPPING"]),
         "DO_LOGIT_SCALING": lambda args: bool(args["DO_LOGIT_SCALING"]),
     }
-)(_chunked_cross_entropy_forward)
-
-
+)
+@triton.jit
 def _cross_entropy_backward(
-    logits_ptr,
-    logits_row_stride: tl.constexpr,
-    dloss_ptr,
-    dloss_row_stride: tl.constexpr,
-    logsumexp_ptr,
-    labels_ptr,
-    VOCAB_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    DO_SOFTCAPPING: tl.constexpr,
-    SOFTCAP: tl.constexpr,
-    DO_LOGIT_SCALING: tl.constexpr,
-    LOGIT_SCALE: tl.constexpr,
+        logits_ptr,
+        logits_row_stride: tl.constexpr,
+        dloss_ptr,
+        dloss_row_stride: tl.constexpr,
+        logsumexp_ptr,
+        labels_ptr,
+        VOCAB_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        DO_SOFTCAPPING: tl.constexpr,
+        SOFTCAP: tl.constexpr,
+        DO_LOGIT_SCALING: tl.constexpr,
+        LOGIT_SCALE: tl.constexpr,
 ):
     """
     CE_i = -y log(P) = y * (log[sum(exp(x))] - x)
@@ -238,7 +242,7 @@ def _cross_entropy_backward(
     else:
         dloss = 0.0
 
-    x = tl.load(logits_ptr + col_offsets, mask = mask, other = -float("inf")).to(tl.float32)
+    x = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
 
     # Do logit scaling for Cohere
     if DO_LOGIT_SCALING:
@@ -269,16 +273,7 @@ def _cross_entropy_backward(
         y = y * (1.0 - partial * partial)
 
     # If y == 0: dC/dx = 0 ==> we already masked it to be = 0, so dloss = 0.
-    tl.store(logits_ptr + col_offsets, dloss * y, mask = mask)
-
-
-_cross_entropy_backward = triton.jit(_cross_entropy_backward)
-_cross_entropy_backward = triton.heuristics(
-    {
-        "DO_SOFTCAPPING": lambda args: bool(args["DO_SOFTCAPPING"]),
-        "DO_LOGIT_SCALING": lambda args: bool(args["DO_LOGIT_SCALING"]),
-    }
-)(_cross_entropy_backward)
+    tl.store(logits_ptr + col_offsets, dloss * y, mask=mask)
 
 
 MAX_FUSED_SIZE = 65536  # 2**16
@@ -287,7 +282,7 @@ MAX_FUSED_SIZE = 65536  # 2**16
 class Fast_CrossEntropyLoss(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, logits, labels, logit_softcapping: float = 0, logit_scaling: float = 0
+            ctx, logits, labels, logit_softcapping: float = 0, logit_scaling: float = 0
     ):
         n_rows: int
         vocab_size: int
@@ -296,7 +291,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
 
         div, mod = divmod(vocab_size, MAX_FUSED_SIZE)
         n_chunks: int = div + (mod != 0)
-        losses = torch.empty(n_rows, dtype = torch.float32, device = device)
+        losses = torch.empty(n_rows, dtype=torch.float32, device=device)
 
         DO_SOFTCAPPING: bool = bool(logit_softcapping != 0)
         DO_LOGIT_SCALING: bool = bool(logit_scaling != 0)
@@ -306,7 +301,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
         if n_chunks == 1:
             # For small vocabs <= 65336 like Llama, Mistral
             BLOCK_SIZE, num_warps = calculate_settings(vocab_size)
-            logsumexp = torch.empty(n_rows, dtype = torch.float32, device = device)
+            logsumexp = torch.empty(n_rows, dtype=torch.float32, device=device)
 
             with torch_gpu_device(device):
                 _cross_entropy_forward[(n_rows,)](
@@ -315,13 +310,13 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                     losses,
                     logsumexp,
                     labels,
-                    VOCAB_SIZE = vocab_size,
-                    BLOCK_SIZE = BLOCK_SIZE,
-                    DO_SOFTCAPPING = DO_SOFTCAPPING,
-                    SOFTCAP = logit_softcapping,
-                    DO_LOGIT_SCALING = DO_LOGIT_SCALING,
-                    LOGIT_SCALE = logit_scaling,
-                    num_warps = num_warps,
+                    VOCAB_SIZE=vocab_size,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    DO_SOFTCAPPING=DO_SOFTCAPPING,
+                    SOFTCAP=logit_softcapping,
+                    DO_LOGIT_SCALING=DO_LOGIT_SCALING,
+                    LOGIT_SCALE=logit_scaling,
+                    num_warps=num_warps,
                 )
         else:
             # For large vocabs > 65336 like Gemma 256K
@@ -330,8 +325,8 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                     n_rows,
                     n_chunks,
                 ),
-                dtype = torch.float32,
-                device = device,
+                dtype=torch.float32,
+                device=device,
             )
 
             with torch_gpu_device(device):
@@ -346,18 +341,18 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                     losses,
                     logsumexp,
                     labels,
-                    VOCAB_SIZE = vocab_size,
-                    N_CHUNKS = n_chunks,
-                    BLOCK_SIZE = MAX_FUSED_SIZE,
-                    DO_SOFTCAPPING = DO_SOFTCAPPING,
-                    SOFTCAP = logit_softcapping,
-                    DO_LOGIT_SCALING = DO_LOGIT_SCALING,
-                    LOGIT_SCALE = logit_scaling,
-                    num_warps = 32,
+                    VOCAB_SIZE=vocab_size,
+                    N_CHUNKS=n_chunks,
+                    BLOCK_SIZE=MAX_FUSED_SIZE,
+                    DO_SOFTCAPPING=DO_SOFTCAPPING,
+                    SOFTCAP=logit_softcapping,
+                    DO_LOGIT_SCALING=DO_LOGIT_SCALING,
+                    LOGIT_SCALE=logit_scaling,
+                    num_warps=32,
                 )
             # logsumexp(chunked_logsumexp) - x
             # Do the -x separately
-            logsumexp = torch.logsumexp(logsumexp, dim = 1)  # Row sum
+            logsumexp = torch.logsumexp(logsumexp, dim=1)  # Row sum
             losses += logsumexp
             losses.masked_fill_(labels == -100, 0)  # Don't forget to mask padding out!
 
@@ -394,13 +389,13 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                 dlosses.stride(0),
                 logsumexp,
                 labels,
-                VOCAB_SIZE = vocab_size,
-                BLOCK_SIZE = BLOCK_SIZE,
-                DO_SOFTCAPPING = ctx.DO_SOFTCAPPING,
-                SOFTCAP = ctx.logit_softcapping,
-                DO_LOGIT_SCALING = ctx.DO_LOGIT_SCALING,
-                LOGIT_SCALE = ctx.logit_scaling,
-                num_warps = 8,
+                VOCAB_SIZE=vocab_size,
+                BLOCK_SIZE=BLOCK_SIZE,
+                DO_SOFTCAPPING=ctx.DO_SOFTCAPPING,
+                SOFTCAP=ctx.logit_softcapping,
+                DO_LOGIT_SCALING=ctx.DO_LOGIT_SCALING,
+                LOGIT_SCALE=ctx.logit_scaling,
+                num_warps=8,
             )
         return (
             logits,
@@ -410,12 +405,12 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
         )
 
 
-def fast_cross_entropy_loss(
-    logits,
-    labels,
-    logit_softcapping = 0,
-    logit_scaling = 0,
-    n_items = None,
+def _fast_cross_entropy_loss(
+        logits,
+        labels,
+        logit_softcapping=0,
+        logit_scaling=0,
+        n_items=None,
 ):
     """
     Arguments:
@@ -438,7 +433,48 @@ def fast_cross_entropy_loss(
     return loss.sum() / n_items
 
 
-if (Version(torch.__version__) < Version("2.4.0")) and not hasattr(
-    fast_cross_entropy_loss, "__wrapped__"
-):
-    fast_cross_entropy_loss = torch._disable_dynamo(fast_cross_entropy_loss)
+def fast_causal_lm_loss(
+        logits: torch.Tensor,
+        labels: torch.Tensor | None,
+        vocab_size: int,
+        num_items_in_batch: int | torch.Tensor | None = None,
+        ignore_index: int = -100,
+        **kwargs,
+) -> torch.Tensor | None:
+    """
+    Compute causal LM loss with shifted labels (next-token prediction).
+
+    Uses fast_cross_entropy_loss when ignore_index=-100, otherwise falls back
+    to standard cross_entropy with configurable reduction.
+    """
+    if labels is None:
+        return None
+
+    # Shift labels left by 1 for next-token prediction (keeps logits unchanged)
+    shifted_labels = torch.empty_like(labels)
+    shifted_labels[..., :-1] = labels[..., 1:]
+    shifted_labels[..., -1] = ignore_index
+
+    # Fast path: use optimized kernel when using default ignore_index
+    if ignore_index == -100:
+        return torch._disable_dynamo(_fast_cross_entropy_loss)(
+            logits=logits,
+            labels=shifted_labels,
+            n_items=num_items_in_batch,
+        )
+
+    # Standard path: use PyTorch cross_entropy
+    use_sum_reduction = num_items_in_batch is not None
+    loss = torch.nn.functional.cross_entropy(
+        logits,
+        shifted_labels,
+        ignore_index=ignore_index,
+        reduction="sum" if use_sum_reduction else "mean",
+    )
+
+    if use_sum_reduction:
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.to(loss.device)
+        loss = loss / num_items_in_batch
+
+    return loss

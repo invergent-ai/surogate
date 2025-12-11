@@ -1,6 +1,6 @@
 transformers==4.57.3
 huggingface-hub>=0.34.0,<1.0
-datasets==3.6.0
+datasets==4.3.0
 modelscope>=1.23
 peft==0.18.0
 wheel
