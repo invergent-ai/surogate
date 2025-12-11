@@ -8,10 +8,11 @@ import torch
 from datasets import Dataset as HfDataset
 from transformers import trainer, TrainingArguments
 
+from surogate.core.config.dataset_config import DatasetConfig
 from surogate.core.config.sft_config import SFTConfig
 from surogate.core.datasets.datasets import get_default_process_count
 from surogate.core.datasets.loader import load_dataset_with_config, \
-    post_process, pre_process, concat_datasets, shuffle_dataset
+    post_process, pre_process, concat_datasets, shuffle_dataset, _load_from_local_path
 from surogate.core.datasets.packing import IterablePackingDataset, PackingDataset
 from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
 from surogate.core.datasets.utils import DATASET_TYPE, LazyLLMDataset
@@ -79,50 +80,68 @@ class SurogateSFT(SurogateCommand):
     @RayHelper.function(group='default')
     def _prepare_datasets(self):
         train_datasets, val_datasets = [], []
-        seed = np.random.RandomState(self.config.seed)
+        train_dataset, val_dataset = None, None
+        if not self.config.stream_datasets:
+            for cached_ds in ['train_dataset', 'val_dataset']:
+                if os.path.exists(os.path.join(self.config.save_path, cached_ds)):
+                    logger.info(f"Loading cached {cached_ds}...")
+                    load_dataset_kwargs = {
+                        'streaming': False,
+                    }
+                    ds = _load_from_local_path(
+                        DatasetConfig(DictDefault({'path': os.path.join(self.config.save_path, cached_ds)})), load_dataset_kwargs)
+                    if cached_ds == 'train_dataset':
+                        train_dataset = ds
+                    else:
+                        val_dataset = ds
+        else:
+            seed = np.random.RandomState(self.config.seed)
+            for ds_config in self.config.datasets:
+                dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)
+                dataset = pre_process(dataset, ds_config, num_proc=get_default_process_count())
+                train_dataset, val_dataset = post_process(
+                    dataset,
+                    dataset_sample=ds_config.samples,
+                    split_dataset_ratio=self.config.validation_split_ratio,
+                    streaming=self.config.stream_datasets,
+                    random_state=seed,
+                )
+                train_datasets.append(train_dataset)
+                val_datasets.append(val_dataset)
 
-        for ds_config in self.config.datasets:
-            dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)
-            dataset = pre_process(dataset, ds_config, num_proc=get_default_process_count())
-            train_dataset, val_dataset = post_process(
-                dataset,
-                dataset_sample=ds_config.samples,
-                split_dataset_ratio=self.config.validation_split_ratio,
-                streaming=self.config.stream_datasets,
-                random_state=seed,
-            )
-            train_datasets.append(train_dataset)
-            val_datasets.append(val_dataset)
+            for ds_config in self.config.validation_datasets:
+                dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)
+                dataset = pre_process(dataset, ds_config, num_proc=get_default_process_count())
+                _, val_dataset = post_process(
+                    dataset,
+                    dataset_sample=ds_config.samples,
+                    split_dataset_ratio=1.0,
+                    streaming=self.config.stream_datasets,
+                    random_state=seed,
+                )
+                val_datasets.append(val_dataset)
 
-        for ds_config in self.config.validation_datasets:
-            dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)
-            dataset = pre_process(dataset, ds_config, num_proc=get_default_process_count())
-            _, val_dataset = post_process(
-                dataset,
-                dataset_sample=ds_config.samples,
-                split_dataset_ratio=1.0,
-                streaming=self.config.stream_datasets,
-                random_state=seed,
-            )
-            val_datasets.append(val_dataset)
+            train_dataset = concat_datasets(train_datasets)
+            train_dataset = shuffle_dataset(
+                train_dataset, seed=get_seed(seed), buffer_size=1000)
 
-        train_dataset = concat_datasets(train_datasets)
-        train_dataset = shuffle_dataset(
-            train_dataset, seed=get_seed(seed), buffer_size=1000)
+            val_dataset = concat_datasets(val_datasets)
+            val_dataset = shuffle_dataset(
+                val_dataset, seed=get_seed(seed), buffer_size=1000)
 
-        val_dataset = concat_datasets(val_datasets)
-        val_dataset = shuffle_dataset(
-            val_dataset, seed=get_seed(seed), buffer_size=1000)
+            train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=True)
 
-        train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=True)
+            if not self.config.stream_datasets:
+                train_dataset.save_to_disk(os.path.join(self.config.save_path, 'train_dataset'))
+                if val_dataset is not None:
+                    val_dataset.save_to_disk(os.path.join(self.config.save_path, 'val_dataset'))
 
-        datasets = [train_dataset, val_dataset]
-        datasets = self._post_process_datasets(datasets)
-        return datasets
+        _datasets = [train_dataset, val_dataset]
+        _datasets = self._post_process_datasets(_datasets)
+        return _datasets
 
     def _encode_dataset(self, train_dataset, val_dataset, pre_process=True):
         template_processor = self.template_processor
-        self._save_val_dataset(val_dataset)
 
         datasets = [train_dataset, val_dataset]
         if not pre_process:
@@ -146,14 +165,6 @@ class SurogateSFT(SurogateCommand):
         template_processor.model = origin_template_model
 
         return datasets
-
-    def _save_val_dataset(self, val_dataset):
-        output_dir = self.config.save_path
-        if is_master() and isinstance(val_dataset, HfDataset) and len(self.config.validation_datasets) == 0:
-            os.makedirs(output_dir, exist_ok=True)
-            val_dataset_path = os.path.join(output_dir, 'val_dataset.jsonl')
-            append_to_jsonl(val_dataset_path, val_dataset.to_list())
-            logger.info(f'The split dataset from the training set will be saved at: {val_dataset_path}.')
 
     def _post_process_datasets(self, datasets: List) -> List:
         template = self.template_processor

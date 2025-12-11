@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict, Optional
 
 from surogate.core.datasets.preprocessor.row import RowPreprocessor
+from surogate.core.model.chat_templates.utils import history_to_messages
 
 
 class ResponsePreprocessor(RowPreprocessor):

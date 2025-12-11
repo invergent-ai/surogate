@@ -14,16 +14,19 @@ num_train_epochs: 1
 
 learning_rate: 2e-4
 
-qlora_fast: true
-lora_fast: false
+qlora: true
 lora_rank: 16
 lora_alpha: 32
 lora_target_modules:
   - all-linear
 
 datasets:
-  - path: "mlabonne/FineTome-100k"
+  - path: "invergent/alpaca-gpt4-data-en"
     samples: 10
-    type: auto
+    type: instruction
+    split: train
+    instruction_field: instruction
+    input_field: input
+    output_field: output
 
 

@@ -162,7 +162,6 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         self.lora_fast = cfg.get('lora_fast', False)
         self.run_name = cfg['run_name'] or self.generate_run_name()
         self.modules_to_save = cfg.get('modules_to_save', [])
-        self.__post_init__()
 
     def __post_init__(self):
         _save_path = Path(self.save_path)

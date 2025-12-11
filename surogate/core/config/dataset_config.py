@@ -21,7 +21,7 @@ class DatasetConfig:
     path: str | None = None
     subset: Optional[str] = None
     split: str | None = None
-    type: Literal[SurogateDatasetType.text, SurogateDatasetType.instruction, SurogateDatasetType.conversation] | None = None
+    type: Literal[SurogateDatasetType.text, SurogateDatasetType.instruction, SurogateDatasetType.conversation, SurogateDatasetType.auto] | None = None
     samples: Optional[int] = None
 
     def __init__(self, cfg: DictDefault):

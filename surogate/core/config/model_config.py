@@ -7,7 +7,6 @@ from typing import Optional, Literal, Union, Dict, Any
 import torch
 
 from surogate.core.model.hf_config import HfConfigFactory
-from surogate.core.model.quant.falqon_quant_config import FalqonQuantizationConfig
 from surogate.core.model.utils import get_model_info_and_template, get_model_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.dist import get_dist_setting
@@ -188,8 +187,6 @@ class ModelConfig(ABC):
                 bnb_4bit_quant_type='nf4',
                 bnb_4bit_quant_storage=torch.bfloat16,
                 llm_int8_skip_modules=self._get_modules_to_skip_quant())
-        elif self.quant_method == 'falqon':
-            quantization_config = FalqonQuantizationConfig()
         else:
             raise ValueError(f'Unsupported quantization method: {self.quant_method}')
 

@@ -4,6 +4,7 @@ class SurogateDatasetType(str, Enum):
     text = "text"
     instruction = "instruction"
     conversation = "conversation"
+    auto = "auto"
 
 class InstructionDatasetSystemPromptType(str, Enum):
     fixed = "fixed"

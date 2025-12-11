@@ -75,13 +75,11 @@ class HuggingFaceHub(HubOperation):
         if revision is None or revision == 'master':
             revision = 'main'
 
-        logger.info(f'Downloading model from HuggingFace Hub: {model_id_or_path}')
-        use_hf_transfer = strtobool(os.environ.get('USE_HF_TRANSFER', 'False'))
+        use_hf_transfer = strtobool(os.environ.get('USE_HF_TRANSFER', '1'))
         if use_hf_transfer:
             from huggingface_hub import _snapshot_download
-            logger.info("Using hf-transfer for fast downloading.")
             _snapshot_download.HF_HUB_ENABLE_HF_TRANSFER = True
         from huggingface_hub import snapshot_download
         return snapshot_download(
             model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_patterns,
-            tqdm_class=create_hfhub_tqdm('Downloading model - '), **kwargs)
+            tqdm_class=create_hfhub_tqdm('Downloading model from HuggingFace: '), **kwargs)
