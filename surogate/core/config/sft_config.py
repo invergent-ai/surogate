@@ -167,9 +167,10 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         _save_path = Path(self.save_path)
         if _save_path.exists():
             if not _save_path.is_dir():
-                raise ValueError(f"Save path {_save_path} already exists and is not a directory. Aborting.")
-            if any(_save_path.iterdir()):
-                logger.warning_once("Save path {_save_path} is not empty.")
+                raise ValueError(f"Save path '{_save_path}' already exists and is not a directory. Aborting.")
+
+            if any(item.is_dir() and item.name.startswith("checkpoint-") for item in _save_path.iterdir()):
+                logger.warning_once(f"Save path '{_save_path}' contains previously saved checkpoints.")
         else:
             if is_master():
                 _save_path.mkdir(parents=True, exist_ok=True)

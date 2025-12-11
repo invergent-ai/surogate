@@ -94,7 +94,8 @@ class SurogateSFT(SurogateCommand):
                         train_dataset = ds
                     else:
                         val_dataset = ds
-        else:
+
+        if train_dataset is None:
             seed = np.random.RandomState(self.config.seed)
             for ds_config in self.config.datasets:
                 dataset = load_dataset_with_config(ds_config, streaming=self.config.stream_datasets)

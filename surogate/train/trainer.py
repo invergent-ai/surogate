@@ -5,7 +5,7 @@ import time
 from contextlib import contextmanager
 from functools import partial
 from types import MethodType, FunctionType
-from typing import Union, Optional, Dict, Callable, List, Tuple
+from typing import Union, Optional, Dict, Callable, List, Tuple, Any
 
 import torch
 from datasets import Dataset as HfDataset
@@ -58,6 +58,10 @@ class SurogateTrainer(
         self.model_accepts_loss_kwargs = True  # fix transformers>=4.46.2
         self.template_processor = template_processor
         self.model_template = config.model_template
+
+        # for logging tokens per second
+        self._last_log_time = 0
+        self._token_count = 0
 
         if not hasattr(train_dataset, '__len__') and config.dataloader_num_workers > 1:
             config.dataloader_num_workers = 1
@@ -129,6 +133,27 @@ class SurogateTrainer(
         with self.template_processor.forward_context(self.model, inputs):
             return super().training_step(model, inputs, *args, **kwargs)
 
+    def compute_loss(
+        self,
+        model: nn.Module,
+        inputs: dict[str, Union[torch.Tensor, Any]],
+        return_outputs: bool = False,
+        num_items_in_batch: Optional[torch.Tensor] = None,
+    ):
+        if "input_ids" in inputs:
+            num_tokens = inputs["input_ids"].numel()
+            self._token_count += num_tokens
+        return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        current_time = time.time()
+        time_diff = current_time - self._last_log_time
+        if time_diff > 0:
+            tokens_per_sec = self._token_count / time_diff
+            logs["tokens_per_sec"] = round(tokens_per_sec, 2)
+            self._token_count = 0
+            self._last_log_time = current_time
+        super().log(logs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the master process, so we don't check for that.
