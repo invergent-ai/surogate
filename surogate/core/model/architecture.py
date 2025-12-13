@@ -14,7 +14,6 @@ class MLLMArchitecture:
 class ModelArchitecture(LLMArchitecture, MLLMArchitecture):
     pass
 
-
 @dataclass
 class LLMComponents:
     arch_name: str = None
@@ -62,5 +61,5 @@ def register_model_architecture(model_arch: LLMComponents) -> None:
         raise ValueError(f'The `{arch_name}` has already been registered in the MODEL_ARCH_MAPPING.')
     MODEL_ARCH_MAPPING[arch_name] = model_arch
 
-def get_model_architecture(arch_name: Optional[str]) -> Optional[MLLMComponents]:
+def get_model_architecture(arch_name: Optional[ModelArchitecture]) -> Optional[MLLMComponents]:
     return MODEL_ARCH_MAPPING.get(arch_name)

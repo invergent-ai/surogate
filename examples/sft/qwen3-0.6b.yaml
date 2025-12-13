@@ -1,6 +1,6 @@
-model: Qwen/Qwen3-4B
+model: Qwen/Qwen3-0.6B
 #model_type: qwen3
-save_path: ./output
+output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
 
@@ -10,7 +10,9 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-num_train_epochs: 1
+num_epochs: 1
+
+save_steps: 10
 
 learning_rate: 2e-4
 

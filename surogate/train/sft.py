@@ -1,12 +1,12 @@
 import os
 from functools import partial
-from typing import List
+from typing import List, Union
 
 import datasets
 import numpy as np
 import torch
 from datasets import Dataset as HfDataset
-from transformers import trainer, TrainingArguments
+from transformers import trainer, TrainingArguments, PreTrainedModel, PreTrainedTokenizerBase
 
 from surogate.core.config.dataset_config import DatasetConfig
 from surogate.core.config.sft_config import SFTConfig
@@ -17,6 +17,7 @@ from surogate.core.datasets.packing import IterablePackingDataset, PackingDatase
 from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
 from surogate.core.datasets.utils import DATASET_TYPE, LazyLLMDataset
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
+from surogate.core.model.loader import get_model_tokenizer
 from surogate.core.model.saver import save_checkpoint
 from surogate.core.model.utils import check_tie_word_embeddings
 from surogate.ray import RayHelper
@@ -42,28 +43,30 @@ trainer.PrinterCallback = NoopPrinterCallback
 class SurogateSFT(SurogateCommand):
     training_args: TrainingArguments
     template_processor: ChatTemplateProcessor
+    model: Union[PreTrainedModel, torch.nn.Module]
+    tokenizer: PreTrainedTokenizerBase
 
     def __init__(self, config: SFTConfig, args: DictDefault):
         super().__init__(config=config, args=args)
         config.__post_init__()
         self._prepare_model_tokenizer()
-        self._prepare_template()
+        self._prepare_chat_template()
         self._prepare_callbacks()
 
     @RayHelper.function(group='default')
     def _prepare_model_tokenizer(self):
-        self.model, self.processor = self.config.get_model_processor()
+        self.model, self.tokenizer = get_model_tokenizer(**self.config.get_model_kwargs())
         if self.config.sequence_parallel_size > 1:
             from sequence_parallel import sequence_parallel
             sequence_parallel.prepare(
-                self.config.sequence_parallel_size, model=self.model, tokenizer=self.processor,
+                self.config.sequence_parallel_size, model=self.model, tokenizer=self.tokenizer,
                 padding_free=self.config.padding_free)
         if self.model is None:
             return
 
     @RayHelper.function(group='default')
-    def _prepare_template(self) -> None:
-        template_processor = self.config.get_template_processor(self.processor)
+    def _prepare_chat_template(self) -> None:
+        template_processor = self.config.get_template_processor(self.tokenizer)
         template_processor.set_mode('train')
         if template_processor.use_model:
             template_processor.model = self.model
@@ -82,13 +85,13 @@ class SurogateSFT(SurogateCommand):
         train_dataset, val_dataset = None, None
         if not self.config.stream_datasets:
             for cached_ds in ['train_dataset', 'val_dataset']:
-                if os.path.exists(os.path.join(self.config.save_path, cached_ds)):
+                if os.path.exists(os.path.join(self.config.output_dir, cached_ds)):
                     logger.info(f"Loading cached {cached_ds}...")
                     load_dataset_kwargs = {
                         'streaming': False,
                     }
                     ds = _load_from_local_path(
-                        DatasetConfig(DictDefault({'path': os.path.join(self.config.save_path, cached_ds)})), load_dataset_kwargs)
+                        DatasetConfig(DictDefault({'path': os.path.join(self.config.output_dir, cached_ds)})), load_dataset_kwargs)
                     if cached_ds == 'train_dataset':
                         train_dataset = ds
                     else:
@@ -132,9 +135,9 @@ class SurogateSFT(SurogateCommand):
             train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=True)
 
             if not self.config.stream_datasets:
-                train_dataset.save_to_disk(os.path.join(self.config.save_path, 'train_dataset'))
+                train_dataset.save_to_disk(os.path.join(self.config.output_dir, 'train_dataset'))
                 if val_dataset is not None:
-                    val_dataset.save_to_disk(os.path.join(self.config.save_path, 'val_dataset'))
+                    val_dataset.save_to_disk(os.path.join(self.config.output_dir, 'val_dataset'))
 
         _datasets = [train_dataset, val_dataset]
         _datasets = self._post_process_datasets(_datasets)
@@ -166,7 +169,7 @@ class SurogateSFT(SurogateCommand):
 
         return datasets
 
-    def _post_process_datasets(self, datasets: List) -> List:
+    def _post_process_datasets(self, datasets: List[HfDataset]) -> List:
         template = self.template_processor
         for i, dataset in enumerate(datasets):
             if dataset is None:
@@ -372,7 +375,7 @@ class SurogateSFT(SurogateCommand):
             save_checkpoint(
                 model,
                 self.template_processor.processor,
-                f"{self.config.save_path}/merged",
+                f"{self.config.output_dir}/merged",
                 safe_serialization=True,
                 model_dirs=[state.last_model_checkpoint],
                 max_shard_size='5GB',

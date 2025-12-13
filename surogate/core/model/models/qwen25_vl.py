@@ -6,7 +6,7 @@ from surogate.core.config.enums import ChatTemplateType
 from surogate.core.model.chat_templates.vision_utils import load_file
 from surogate.core.model.patcher import patch_get_input_embeddings
 from surogate.core.model.registry import register_model, ModelTemplate, MLLMModelType
-from surogate.core.model.utils import get_model_tokenizer_multimodal
+from surogate.core.model.loader import get_model_tokenizer_multimodal
 from surogate.utils.env import get_env_args
 
 

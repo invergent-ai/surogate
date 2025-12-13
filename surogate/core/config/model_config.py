@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from typing import Optional, Literal, Union, Dict, Any
 
 import torch
+from transformers.utils.quantization_config import QuantizationConfigMixin
 
 from surogate.core.model.hf_config import HfConfigFactory
-from surogate.core.model.utils import get_model_info_and_template, get_model_tokenizer
+from surogate.core.model.loader import get_model_info_and_template, get_model_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.dist import get_dist_setting
 from surogate.utils.jsonl import json_parse_to_dict
@@ -163,9 +164,10 @@ class ModelConfig(ABC):
         logger.info(f'Setting args.rope_scaling: {rope_scaling}')
         logger.info(f'Setting args.max_model_len: {self.max_model_len}')
 
-    def _init_quantization_config(self):
+    def _init_quantization_config(self) -> Optional[QuantizationConfigMixin]:
         if self.quant_method is None:
             return None
+
         assert self.quant_method in {'bnb_4bit', 'falqon'}
 
         if self.quant_method == 'bnb_4bit':
@@ -207,34 +209,30 @@ class ModelConfig(ABC):
         res.append('lm_head')
         return res
 
-    def get_model_kwargs(self):
-        return {
-            'model_id_or_path': self.model,
-            'torch_dtype': self.torch_dtype,
-            'model_type': self.model_type,
-            'device_map': self.device_map,
-            'max_memory': self.max_memory,
-            'quantization_config': self._init_quantization_config(),
-            'attn_impl': self.attn_impl,
-            'rope_scaling': self.rope_scaling,
-            'max_model_len': self.max_model_len,
-            'task_type': self.task_type,
-            'num_labels': self.num_labels,
-        }
-
-    def get_model_processor(
+    def get_model_kwargs(
             self,
-            *,
-            model=None,
-            model_type=None,
-            task_type=None,
-            num_labels=None,
-            **kwargs
-    ) -> Optional[Any]:
-        res = self.get_model_kwargs()
-        res.update(kwargs)
-        res['model_id_or_path'] = model or self.model
-        res['model_type'] = model_type or self.model_type
-        res['task_type'] = task_type or self.task_type
-        res['num_labels'] = num_labels or self.num_labels
-        return get_model_tokenizer(**res)
+            model_id_or_path: Optional[str] = None,
+            torch_dtype: Optional[torch.dtype] = None,
+            model_type: Optional[str] = None,
+            device_map: Optional[Dict[str, torch.device]] = None,
+            max_memory: Optional[Dict[str, str]] = None,
+            quantization_config: Optional[QuantizationConfigMixin] = None,
+            attn_impl: Optional[str] = None,
+            rope_scaling: Optional[Union[str, dict]] = None,
+            max_model_len: Optional[int] = None,
+            task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker', None] = None,
+            num_labels: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return {
+            'model_id_or_path': model_id_or_path or self.model,
+            'torch_dtype': torch_dtype or self.torch_dtype,
+            'model_type': model_type or self.model_type,
+            'device_map': device_map or self.device_map,
+            'max_memory': max_memory or self.max_memory,
+            'quantization_config': quantization_config or self._init_quantization_config(),
+            'attn_impl': attn_impl or self.attn_impl,
+            'rope_scaling': rope_scaling or self.rope_scaling,
+            'max_model_len': max_model_len or self.max_model_len,
+            'task_type': task_type or self.task_type,
+            'num_labels': num_labels or self.num_labels,
+        }

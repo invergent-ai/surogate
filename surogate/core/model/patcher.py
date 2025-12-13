@@ -1,5 +1,6 @@
 import copy
 import inspect
+import logging
 import os
 import re
 from contextlib import contextmanager
@@ -561,3 +562,92 @@ def patch_linear_scaling(
     function = function.replace(rotary_emb, fix_rope_function, 1)
     function = exec_code + "\n\n" + function
     return init_name, function
+
+
+def patch_torch_compile(ignore_errors=False, debug=False):
+    import accelerate
+    from accelerate.utils import TorchDynamoPlugin
+
+    class TorchDynamoPluginPatched(TorchDynamoPlugin):
+        def to_kwargs(self):
+            return {
+                "dynamic": True,
+                "fullgraph": False,
+                "options": {
+                    "epilogue_fusion": True,
+                    "max_autotune": True,
+                    "shape_padding": True,
+                    "trace.enabled": False,
+                    "triton.cudagraphs": False,
+                },
+            }
+
+    accelerate.utils.dataclasses.TorchDynamoPlugin = TorchDynamoPluginPatched
+    accelerate.utils.TorchDynamoPlugin = TorchDynamoPluginPatched
+    accelerate.accelerator.TorchDynamoPlugin = TorchDynamoPluginPatched
+    del accelerate
+
+    if debug:
+        os.environ["TORCHDYNAMO_VERBOSE"] = "1"
+        os.environ["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+        torch._logging.set_logs(
+            dynamo=logging.INFO,
+            inductor=logging.INFO,
+            graph_breaks=True,
+            recompiles=True,
+            recompiles_verbose=True,
+            compiled_autograd_verbose=False,  # Produces too much code
+            aot_joint_graph=False,  # Produces too much code
+            aot_graphs=False,  # Produces too much code
+            perf_hints=True,  # Performance improvement hints
+        )
+        torch._dynamo.config.verbose = True
+    else:
+        os.environ.pop("TORCHDYNAMO_VERBOSE", None)
+        os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+        os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
+        os.environ.pop("TORCH_LOGS", None)
+        torch._logging.set_logs(all=logging.CRITICAL)
+        torch._dynamo.config.verbose = False
+    pass
+
+    # See https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
+    # Caches kernel generations for faster restarts
+    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+    os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
+    os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+    # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
+    os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
+
+    # From 'torch.compile, the missing manual'
+    # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
+    import torch._inductor.config as inductor_config
+    inductor_config.debug = debug
+    inductor_config.dce = True
+    inductor_config.memory_planning = True
+    inductor_config.memory_pool = 'none'
+    inductor_config.efficient_conv_bn_eval_fx_passes = True
+    inductor_config.autotune_multi_device = True
+    inductor_config.cuda.enable_cuda_lto = True
+    inductor_config.cuda.use_fast_math = True
+
+    import torch._dynamo.config as dynamo_config
+    dynamo_config.accumulated_cache_size_limit = 1024
+    dynamo_config.suppress_errors = not debug and ignore_errors
+    dynamo_config.do_not_emit_runtime_asserts = not debug
+    dynamo_config.numpy_default_float = 'float32'
+    # this may fail with some models (eg. gemma)
+    dynamo_config.compiled_autograd = True
+    dynamo_config.recompile_limit = 1024
+    dynamo_config.cache_size_limit = 1024
+    dynamo_config.allow_unspec_int_on_nn_module = True
+    dynamo_config.optimize_ddp = not debug
+    dynamo_config.capture_scalar_outputs = True
+    dynamo_config.capture_dynamic_output_shape_ops = True
+    dynamo_config.verbose = debug
+
+    if not debug and ignore_errors:
+        # Have to explicitly set it!
+        torch._dynamo.config.suppress_errors = True
+

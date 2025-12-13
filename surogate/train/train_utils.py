@@ -5,7 +5,7 @@ from typing import Union, List, Callable, Optional
 
 import torch
 from huggingface_hub import snapshot_download
-from peft import PeftModel, get_peft_model, PeftModelForCausalLM
+from peft import PeftModel, get_peft_model
 from peft.utils import CONFIG_NAME
 from torch import nn
 
@@ -28,13 +28,15 @@ class TrainUtils:
             *,
             task_type=None
     ):
-        apply_cross_entropy_patch(config)
-
         if config.resume_from_checkpoint:
             model = cls.from_pretrained(model, config.resume_from_checkpoint, is_trainable=True)
         else:
             model = cls.prepare_adapter(config, model, task_type=task_type)
+
+        if isinstance(model, PeftModel):
             model = patch_peft_model(model)
+
+        apply_cross_entropy_patch(config)
 
         # fix bug: Attempting to unscale FP16 gradients.
         #   peft: https://github.com/huggingface/peft/issues/1249
@@ -162,14 +164,14 @@ class TrainUtils:
             include_embedding: bool = False,
             exclude_router: bool = False,
     ) -> str:
-        model_arch = config.model_template.model_arch
+        model_components = config.model_template.model_components
         modules = []
         if not freeze_llm:
-            modules += model_arch.language_model
+            modules += model_components.language_model
         if not freeze_vit:
-            modules += model_arch.vision_tower
+            modules += model_components.vision_tower
         if not freeze_aligner:
-            modules += model_arch.aligner
+            modules += model_components.aligner
         assert len(modules) > 0, f'modules: {modules}'
 
         extra_layers = []
@@ -179,7 +181,7 @@ class TrainUtils:
         for module in modules:
             rejected_modules = []
             if not freeze_vit or not freeze_llm:
-                for aligner in model_arch.aligner:
+                for aligner in model_components.aligner:
                     if aligner.startswith(f'{module}.'):
                         rejected_modules.append(aligner)
 
@@ -187,7 +189,7 @@ class TrainUtils:
             if isinstance(sub_module, nn.Linear) and module.endswith('lm_head'):
                 target_modules = []
             else:
-                target_modules = cls._find_all_linears(config, sub_module, model_arch, extra_layers)
+                target_modules = cls._find_all_linears(config, sub_module, model_components, extra_layers)
             if exclude_router and model.model_info.is_moe_model:
                 target_modules = [tm for tm in target_modules if tm not in {'gate'}]
             if not target_modules:
@@ -200,16 +202,18 @@ class TrainUtils:
         return rf'^({"|".join(res)})$'
 
     @classmethod
-    def _find_all_linears(cls, config: SFTConfig, model, model_arch=None, extra_layers=None, sub_module=None):
-        if model_arch is None:
-            model_arch = config.model_template.model_arch
+    def _find_all_linears(cls, config: SFTConfig, model, model_components=None, extra_layers=None, sub_module=None):
+        if model_components is None:
+            model_components = config.model_template.model_components
+
         # lm_head
-        if model_arch and model_arch.lm_head:
-            output = model_arch.lm_head
+        if model_components and model_components.lm_head:
+            output = model_components.lm_head
             idx = output.rfind('.')
             lm_head_name = output[idx + 1:]
         else:
             lm_head_name = 'lm_head'
+
         # 'score', 'classifier': classification model
         # 'v_head': reward model
         ignore_layers = [lm_head_name, 'score', 'v_head', 'classifier'] + ['lora_A', 'lora_B', 'base_layer']

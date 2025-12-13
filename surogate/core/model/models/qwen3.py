@@ -5,7 +5,7 @@ from surogate.core.config.enums import LLMModelType, ChatTemplateType
 from surogate.core.model.architecture import ModelArchitecture
 from surogate.core.model.models.fast_qwen3 import FastQwen3Model
 from surogate.core.model.registry import register_model, ModelTemplate
-from surogate.core.model.utils import get_model_tokenizer_with_flash_attn
+from surogate.core.model.loader import get_model_tokenizer_with_flash_attn
 
 """
 Instruct models:

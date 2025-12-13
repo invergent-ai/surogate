@@ -1,11 +1,14 @@
 import types
 
+from peft import PeftModel
+from transformers import PreTrainedModel
+
 from surogate.core.model.kernels.fast_lora import apply_lora_qkv, apply_lora_o, apply_lora_mlp_swiglu
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
-def patch_peft_model(model):
+def patch_peft_model(model: PeftModel) -> PeftModel:
     # Do patching
     n_mlp = 0
     n_qkv = 0
@@ -23,7 +26,7 @@ def patch_peft_model(model):
     bias = model.peft_config[active_adapter].bias
 
     if lora_dropout > 0 or bias != "none":
-        return
+        return model
 
     for idx, layer in enumerate(model.model.model.layers):
         # MLP patching

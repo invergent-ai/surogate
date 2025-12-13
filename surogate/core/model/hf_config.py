@@ -160,10 +160,12 @@ class HfConfigFactory:
                 setattr(module.config, attr_name, value)
 
     @staticmethod
-    def _get_config_attrs(config: Union[PretrainedConfig, Dict[str, Any]],
-                          attr_name: str,
-                          include_vit: bool = False,
-                          parent_key: Optional[str] = None) -> List[Tuple[PretrainedConfig, Any]]:
+    def _get_config_attrs(
+            config: Union[PretrainedConfig, Dict[str, Any]],
+            attr_name: str,
+            include_vit: bool = False,
+            parent_key: Optional[str] = None
+    ) -> List[Tuple[PretrainedConfig, Any]]:
         res = []
         if isinstance(config, dict):
             keys = config.keys()
