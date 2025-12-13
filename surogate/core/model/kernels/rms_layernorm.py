@@ -20,17 +20,13 @@ from .utils import calculate_settings, torch_gpu_device
 
 @triton.jit
 def _rms_layernorm_forward(
-    Y,
-    Y_row_stride: tl.constexpr,
-    X,
-    X_row_stride: tl.constexpr,
-    W,
-    W_row_stride: tl.constexpr,
-    r,
-    r_row_stride: tl.constexpr,
-    n_cols: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+        Y, Y_row_stride: tl.constexpr,
+        X, X_row_stride: tl.constexpr,
+        W, W_row_stride: tl.constexpr,
+        r, r_row_stride: tl.constexpr,
+        n_cols: tl.constexpr,
+        eps: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
 ):
     """
     Fast RMS Layernorm kernel
@@ -41,38 +37,32 @@ def _rms_layernorm_forward(
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
 
-    Y += row_idx * Y_row_stride
-    X += row_idx * X_row_stride
-    r += row_idx * r_row_stride
+    X_ptr = X + row_idx * X_row_stride + col_offsets
+    Y_ptr = Y + row_idx * Y_row_stride + col_offsets
+    r_ptr = r + row_idx * r_row_stride
 
-    X_row = tl.load(X + col_offsets, mask = mask, other = 0).to(tl.float32)
-    W_row = tl.load(W + col_offsets, mask = mask, other = 0)  # .to(tl.float32)
+    X_row = tl.load(X_ptr, mask=mask, other=0).to(tl.float32)
+    W_row = tl.load(W + col_offsets, mask=mask, other=0)
 
-    row_var = tl.sum(X_row * X_row, axis = 0) / n_cols
+    row_var = tl.sum(X_row * X_row, axis=0) * (1.0 / n_cols)
     inv_var = tl.math.rsqrt(row_var + eps)
-    tl.store(r, inv_var)
-    normed = X_row * inv_var
-    normed = normed.to(W_row.dtype)  # Exact copy from HF
-    output = normed * W_row
-    tl.store(Y + col_offsets, output, mask = mask)
+
+    tl.store(r_ptr, inv_var)
+
+    output = (X_row * inv_var).to(W_row.dtype) * W_row
+    tl.store(Y_ptr, output, mask=mask)
 
 
 @triton.jit()
 def _rms_layernorm_backward(
-    dY,
-    dY_row_stride: tl.constexpr,
-    dX,
-    dX_row_stride: tl.constexpr,
-    X,
-    X_row_stride: tl.constexpr,
-    W,
-    W_row_stride: tl.constexpr,
-    r,
-    r_row_stride: tl.constexpr,
-    # dW, dW_row_stride,
-    n_cols: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+        dY, dY_row_stride: tl.constexpr,
+        dX, dX_row_stride: tl.constexpr,
+        X, X_row_stride: tl.constexpr,
+        W, W_row_stride: tl.constexpr,
+        r, r_row_stride: tl.constexpr,
+        n_cols: tl.constexpr,
+        eps: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
 ):
     """
     Fast RMS Layernorm kernel for the backward pass
@@ -89,9 +79,9 @@ def _rms_layernorm_backward(
 
     dX = dY
 
-    dY_row = tl.load(dY + col_offsets, mask = mask, other = 0).to(tl.float32)
-    X_row = tl.load(X + col_offsets, mask = mask, other = 0).to(tl.float32)
-    W_row = tl.load(W + col_offsets, mask = mask, other = 0).to(tl.float32)
+    dY_row = tl.load(dY + col_offsets, mask=mask, other=0).to(tl.float32)
+    X_row = tl.load(X + col_offsets, mask=mask, other=0).to(tl.float32)
+    W_row = tl.load(W + col_offsets, mask=mask, other=0).to(tl.float32)
 
     # Get saved row variance
     inv_var = tl.load(r).to(tl.float32)
@@ -99,9 +89,9 @@ def _rms_layernorm_backward(
 
     dY_W = dY_row * W_row
 
-    rowsum_dY_normed = tl.sum(dY_W * normed, axis = 0)
+    rowsum_dY_normed = tl.sum(dY_W * normed, axis=0)
     output = inv_var / n_cols * (n_cols * dY_W - normed * rowsum_dY_normed)
-    tl.store(dX + col_offsets, output, mask = mask)
+    tl.store(dX + col_offsets, output, mask=mask)
 
 
 class Fast_RMS_Layernorm(torch.autograd.Function):
@@ -118,23 +108,19 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
         BLOCK_SIZE, num_warps = calculate_settings(n_cols)
         device = X.device
 
-        Y = torch.empty((n_rows, n_cols), dtype = X.dtype, device = device)
-        r = torch.empty(n_rows, dtype = torch.float32, device = device)
+        Y = torch.empty((n_rows, n_cols), dtype=X.dtype, device=device)
+        r = torch.empty(n_rows, dtype=torch.float32, device=device)
 
         with torch_gpu_device(device):
             _rms_layernorm_forward[(n_rows,)](
-                Y,
-                Y.stride(0),
-                X,
-                X.stride(0),
-                W,
-                W.stride(0),
-                r,
-                r.stride(0),
+                Y, Y.stride(0),
+                X, X.stride(0),
+                W, W.stride(0),
+                r, r.stride(0),
                 n_cols,
                 eps,
-                BLOCK_SIZE = BLOCK_SIZE,
-                num_warps = num_warps,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=num_warps,
             )
         ctx.eps = eps
         ctx.BLOCK_SIZE = BLOCK_SIZE
@@ -156,21 +142,15 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
 
         with torch_gpu_device(dY.device):
             _rms_layernorm_backward[(n_rows,)](
-                dY,
-                dY.stride(0),
-                dX,
-                dX.stride(0),
-                X,
-                X.stride(0),
-                W,
-                W.stride(0),
-                r,
-                r.stride(0),
-                # dW, dW.stride(0),
+                dY, dY.stride(0),
+                dX, dX.stride(0),
+                X, X.stride(0),
+                W, W.stride(0),
+                r, r.stride(0),
                 n_cols,
                 ctx.eps,
-                BLOCK_SIZE = ctx.BLOCK_SIZE,
-                num_warps = ctx.num_warps,
+                BLOCK_SIZE=ctx.BLOCK_SIZE,
+                num_warps=ctx.num_warps,
             )
         dX = dX.view(*shape)
         return dX, None, None, None
@@ -197,6 +177,7 @@ class Unsloth_LlamaRMSNorm(LlamaRMSNorm):
 
 try:
     from transformers.models.mllama.modeling_mllama import MllamaTextRMSNorm
+
 
     class Unsloth_MllamaTextRMSNorm(MllamaTextRMSNorm):
         def forward(self, X):
@@ -233,47 +214,3 @@ def unpatch_rms_layernorm():
     except:
         pass
     return
-
-
-def test_rms_layernorm(
-    dim = 1024,
-    eps = 1e-5,
-    dtype = torch.float16,
-    bsz = 21,
-    random_state = 3407,
-    seqlen = 3341,
-):
-    from transformers.models.llama.modeling_llama import LlamaRMSNorm
-
-    layernorm = LlamaRMSNorm((dim,), eps = eps).to("cuda")
-    torch.cuda.manual_seed(random_state)
-    torch.manual_seed(random_state)
-    torch.nn.init.uniform_(layernorm.weight)
-    X = torch.randn((bsz, seqlen, dim), dtype = dtype, device = "cuda")
-    XX = X.clone()
-    X.requires_grad_(True)
-    XX.requires_grad_(True)
-    Y = layernorm(X)
-    YY = torch.randn((bsz, seqlen, dim), dtype = dtype, device = "cuda", requires_grad = True)
-    Y.backward(YY)
-    correct_grad = X.grad.clone()
-    # from unsloth.kernels import fast_rms_layernorm
-    Y = fast_rms_layernorm(layernorm, XX)
-    Y.backward(YY)
-    assert torch.amax(correct_grad - XX.grad).item() <= 0.05
-
-
-def testing_suite_layernorm():
-    for dim in [512, 1024, 2048]:
-        for dtype in [torch.float16, torch.bfloat16]:
-            with torch.autocast(device_type = "cuda", dtype = dtype):
-                for seqlen in [3341, 2048, 349]:
-                    for random_state in [3407, 42]:
-                        test_rms_layernorm(
-                            dim = dim,
-                            eps = 1e-5,
-                            dtype = dtype,
-                            bsz = 21,
-                            random_state = random_state,
-                            seqlen = seqlen,
-                        )

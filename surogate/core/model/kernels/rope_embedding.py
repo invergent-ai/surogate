@@ -20,21 +20,13 @@ from .utils import calculate_settings, torch_gpu_device
 ROPE_GROUP_SIZE: int = 4
 
 
-@triton.heuristics(
-    {
-        "BACKWARD_PASS": lambda args: bool(args["BACKWARD_PASS"]),
-    }
-)
+@triton.heuristics({"BACKWARD_PASS": lambda args: bool(args["BACKWARD_PASS"])})
 @triton.jit
 def _rope_embedding(
-        Q,
-        Q_row_stride: tl.constexpr,
-        cos,
-        cos_row_stride: tl.constexpr,
-        sin,
-        sin_row_stride: tl.constexpr,
-        seqlen,
-        head_dim: tl.constexpr,
+        Q, Q_row_stride: tl.constexpr,
+        cos, cos_row_stride: tl.constexpr,
+        sin, sin_row_stride: tl.constexpr,
+        seqlen, head_dim: tl.constexpr,
         n_heads: tl.constexpr,
         BACKWARD_PASS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
@@ -116,18 +108,10 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         n_groups: int = div + (mod != 0)
 
         with torch_gpu_device(Q.device):
-            _rope_embedding[
-                (
-                    n_rows,
-                    n_groups,
-                )
-            ](
-                Q,
-                Q.stride(0),
-                cos,
-                cos.stride(0),
-                sin,
-                sin.stride(0),
+            _rope_embedding[(n_rows, n_groups)](
+                Q, Q.stride(0),
+                cos, cos.stride(0),
+                sin, sin.stride(0),
                 seq_len,
                 head_dim,
                 n_heads,
@@ -159,18 +143,10 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         sin = ctx.sin
 
         with torch_gpu_device(dY.device):
-            _rope_embedding[
-                (
-                    n_rows,
-                    ctx.n_groups,
-                )
-            ](
-                dY,
-                dY.stride(0),
-                cos,
-                cos.stride(0),
-                sin,
-                sin.stride(0),
+            _rope_embedding[(n_rows, ctx.n_groups)](
+                dY, dY.stride(0),
+                cos, cos.stride(0),
+                sin, sin.stride(0),
                 seq_len,
                 head_dim,
                 n_heads,
@@ -179,15 +155,9 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
                 num_warps=ctx.num_warps,
             )
         dY = dY.view(batch, seq_len, n_heads, head_dim)
-        return (
-            dY,
-            None,
-            None,
-        )
+        return dY, None,None
 
 
-# [TODO] Unsure why RoPE Embedding is not torch.compiling properly
-@torch.compiler.disable
 def fast_rope_embedding(Q, K, cos, sin):
     Q = Fast_RoPE_Embedding.apply(Q.transpose(1, 2), cos, sin).transpose(1, 2)
     K = Fast_RoPE_Embedding.apply(K.transpose(1, 2), cos, sin).transpose(1, 2)
