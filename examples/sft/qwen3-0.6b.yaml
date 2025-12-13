@@ -12,7 +12,7 @@ sequence_len: 2048
 
 num_epochs: 1
 
-save_steps: 10
+save_steps: 1000
 
 learning_rate: 2e-4
 

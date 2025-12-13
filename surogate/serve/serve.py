@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from surogate.core.infer.infer_engine import InferEngine
 from surogate.core.infer.protocol import ChatCompletionRequest, Model, ModelList, AdapterRequest, MultiModalRequestMixin
 from surogate.core.infer.torch_engine import TorchEngine
-from surogate.core.loaders.loader import load_model_and_tokenizer
 from surogate.core.model.chat_templates.processor import get_chat_template_processor, ChatTemplateProcessor
 from surogate.core.model.loader import safe_snapshot_download
 from surogate.core.model.utils import update_generation_config_eos_token

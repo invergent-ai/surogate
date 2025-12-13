@@ -637,8 +637,8 @@ def patch_torch_compile(ignore_errors=False, debug=False):
     dynamo_config.suppress_errors = not debug and ignore_errors
     dynamo_config.do_not_emit_runtime_asserts = not debug
     dynamo_config.numpy_default_float = 'float32'
-    # this may fail with some models (eg. gemma)
-    dynamo_config.compiled_autograd = True
+    # this does NOT play well with multiple devices
+    dynamo_config.compiled_autograd = False
     dynamo_config.recompile_limit = 1024
     dynamo_config.cache_size_limit = 1024
     dynamo_config.allow_unspec_int_on_nn_module = True
