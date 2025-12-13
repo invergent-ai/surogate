@@ -3,19 +3,18 @@ from contextlib import contextmanager
 from types import MethodType
 
 from peft import PeftModel
-from transformers import Trainer
-from  transformers.integrations import is_deepspeed_zero3_enabled
+from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
 
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
-class PatchDeepspeedLoadCheckpoint(Trainer):
+class PatchDeepspeedLoadCheckpoint:
     @contextmanager
     def _patch_deepspeed_load_checkpoint(self):
         from transformers import trainer
-        if not self.args.resume_from_checkpoint or not self.args.resume_only_model or not hasattr(
+        if not self.config.resume_from_checkpoint or not self.config.resume_only_model or not hasattr(
                 trainer, 'deepspeed_load_checkpoint'):
             yield
             return
