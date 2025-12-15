@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-0.6B-FP8
 #model_type: qwen3
 output_dir: ./output
 merge_adapter: false
@@ -16,7 +16,7 @@ save_steps: 1000
 
 learning_rate: 2e-4
 
-qlora: true
+qlora: false
 lora_rank: 16
 lora_alpha: 32
 lora_target_modules:

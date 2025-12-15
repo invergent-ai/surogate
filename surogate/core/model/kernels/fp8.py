@@ -7,62 +7,25 @@ from torchao.prototype.blockwise_fp8_inference.blockwise_quantization import (
     blockwise_fp8_gemm as torchao_blockwise_gemm,
 )
 
-from surogate.core.model.kernels.utils import torch_compile, weight_dequant
+from surogate.core.model.kernels.utils import weight_dequant, torch_compile
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
-
-
-def torchao_block_matmul(
-        act_q: torch.Tensor,
-        weight_q: torch.Tensor,
-        act_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        block_size: tuple[int, int],
-        output_dtype: torch.dtype = torch.bfloat16,
-):
-    out = torchao_blockwise_gemm(
-        act_q.contiguous(),
-        act_scale.contiguous(),
-        weight_q.contiguous(),
-        weight_scale.contiguous(),
-        block_size=block_size[1],
-    )
-    return out.to(output_dtype)
 
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
 @triton.jit
 def _w8a8_block_fp8_matmul(
         # Pointers to inputs and output
-        A,
-        B,
-        C,
-        As,
-        Bs,
+        A, B, C, As, Bs,
         # Shape for matmul
-        M,
-        N,
-        K,
+        M, N, K,
         # Block size for block-wise quantization
-        group_n,
-        group_k,
+        group_n, group_k,
         # Stride for inputs and output
-        stride_am,
-        stride_ak,
-        stride_bk,
-        stride_bn,
-        stride_cm,
-        stride_cn,
-        stride_As_m,
-        stride_As_k,
-        stride_Bs_k,
-        stride_Bs_n,
+        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, stride_As_m, stride_As_k, stride_Bs_k, stride_Bs_n,
         # Meta-parameters
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -170,39 +133,13 @@ def w8a8_block_fp8_matmul_triton(
         )
 
     _w8a8_block_fp8_matmul[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
+        A, B, C, As, Bs,
+        M, N, K,
+        block_n, block_k,
+        A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1), As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
+        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=8,
     )
     return C
-
-
-fp8_block_matmul = (
-    torchao_block_matmul
-    if torchao_blockwise_gemm is not None
-    else w8a8_block_fp8_matmul_triton
-)
 
 
 def act_quant(
@@ -241,7 +178,6 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
 class FP8BlockQuantLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, weight, weight_scale):
-        # block_size = getattr(weight, 'block_size', [128,128])
         m, n = weight.shape
         p, q = weight_scale.shape
         block_size = getattr(weight, "block_size", None) or getattr(
@@ -263,9 +199,9 @@ class FP8BlockQuantLinear(torch.autograd.Function):
 
         if not weight.is_contiguous():
             weight = weight.contiguous()
-        # this is replica of https://github.com/huggingface/transformers/blob/01c9e1ba683b3e50d7c76bf92f2d470759fd5e81/src/transformers/integrations/finegrained_fp8.py#L331-L353
+
         qinput, scale = act_quant(X, block_size[1])
-        output = fp8_block_matmul(
+        output = w8a8_block_fp8_matmul_triton(
             qinput,
             weight,
             scale,
@@ -276,14 +212,8 @@ class FP8BlockQuantLinear(torch.autograd.Function):
         ctx.weight = weight
         ctx.weight_scale = weight_scale
         ctx.block_size = block_size
-        return output.to(X.dtype)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
-        grad_X = torch.matmul(grad_output, W_deq)
-        del W_deq
-        return grad_X, None, None
+        return output.to(X.dtype)
 
 
 @torch_compile
@@ -394,11 +324,9 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
 
 fp8_block_quant_linear = fp8_torch_block_quant_forward
 
-
 @torch_compile
 def fp8_fbgemm_block_linear(X, weight, weight_scale, bias=None):
     return FP8_fbgemm_block_linear.apply(X, weight, weight_scale, bias)
-
 
 try:
     import fbgemm_gpu

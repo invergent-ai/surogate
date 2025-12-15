@@ -507,9 +507,6 @@ def get_model_tokenizer_from_local(
                 problem_type = 'single_label_classification'
         model_config.problem_type = problem_type
 
-    if model_info.quant_method == 'fp8':
-        torch_dtype = 'auto'
-
     model_kwargs['dtype'] = torch_dtype
 
     model = None

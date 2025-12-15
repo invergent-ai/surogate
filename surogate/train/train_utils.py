@@ -42,7 +42,11 @@ class TrainUtils:
         #   peft: https://github.com/huggingface/peft/issues/1249
         for p in model.parameters():
             if p.requires_grad and p.dtype == torch.float16:
-                logger.info_once('Convert trainable parameters from fp16 to fp32.')
+                logger.debug_once('Convert trainable parameters from fp16 to fp32.')
+                p.data = p.data.to(dtype=torch.float32)
+
+            if p.requires_grad and p.dtype == torch.float8_e4m3fn:
+                logger.debug_once('Convert trainable parameters from fp8 to fp32.')
                 p.data = p.data.to(dtype=torch.float32)
 
         return model

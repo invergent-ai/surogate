@@ -1,7 +1,7 @@
 import inspect
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Union
 
 import torch
 from namer import generate as generate_unique_name
@@ -177,6 +177,9 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
 
     use_chat_template: Optional[bool] = None
 
+    # internal fields
+    accelerator_config: Optional[Union[dict, str]] = None
+
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
         self.run_name = cfg['run_name'] or self.generate_run_name()
@@ -193,7 +196,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         self.dataloader_num_workers = cfg.get('dataloader_num_workers', get_default_process_count())
         self.sample_packing = cfg.get('sample_packing', True)
         self.sequence_len = cfg['sequence_len']
-        self.gradient_checkpointing = cfg.get('gradient_checkpointing', True)
+        self.gradient_checkpointing = cfg.get('gradient_checkpointing', False)
         self.learning_rate = float(cfg.get('learning_rate', 1e-4))
         self.lr_scheduler_type = cfg['lr_scheduler_type'] or SchedulerType.LINEAR
         self.save_steps = cfg.get('save_steps', 50)
@@ -238,13 +241,13 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
 
         self.rank, self.local_rank, self.global_world_size, self.local_world_size = get_dist_setting()
 
+        if self.qlora:
+            self.quant_method = 'bnb_4bit'
+
         ModelConfig.__post_init__(self)
         ChatTemplateConfig.__post_init__(self)
 
         self._init_mixed_precision()
-
-        if self.qlora:
-            self.quant_method = 'bnb_4bit'
 
         self.prompt_template = self.model_template.chat_template
         if self.use_chat_template is None:
@@ -301,7 +304,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         args_dict['bf16'] = self.bf16
         args_dict['use_liger_kernel'] = False
         args_dict['dataloader_pin_memory'] = True
-        args_dict['include_tokens_per_second'] = False
+        args_dict['include_tokens_per_second'] = True
         args_dict['eval_accumulation_steps'] = 2
         args_dict['torch_empty_cache_steps'] = 250
         args_dict['disable_tqdm'] = True

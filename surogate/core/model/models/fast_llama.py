@@ -18,7 +18,7 @@ from surogate.core.model.hf_config import HfConfigFactory
 from surogate.core.model.kernels.rms_layernorm import fast_rms_layernorm
 from surogate.core.model.kernels.rope_embedding import fast_rope_embedding
 from surogate.core.model.kernels.utils import DEVICE_COUNT, DEVICE_TYPE_TORCH, \
-    dtype_from_config, _get_dtype
+    dtype_from_config, _get_dtype, get_lora_parameters
 from surogate.utils.dist import get_current_device, get_device_count
 from surogate.utils.logger import get_logger
 

@@ -1,7 +1,6 @@
 import types
 
 from peft import PeftModel
-from transformers import PreTrainedModel
 
 from surogate.core.model.kernels.fast_lora import apply_lora_qkv, apply_lora_o, apply_lora_mlp_swiglu
 from surogate.utils.logger import get_logger

@@ -29,6 +29,7 @@ from surogate.utils.utils import deep_getattr
 
 logger = get_logger()
 
+
 def patch_get_input_embeddings(model, embedding_keys: str):
     def get_input_embeddings(self) -> nn.Module:
         return deep_getattr(model, embedding_keys)
@@ -345,6 +346,7 @@ def patch_output_normalizer(module: torch.nn.Module, model_template: ModelTempla
 
     llm_model.register_forward_hook(_output_embedding_hook, with_kwargs=True)
 
+
 def deepspeed_set_z3_leaf_modules(model, z3_leaf_modules):
     if not is_deepspeed_zero3_enabled():
         return
@@ -389,6 +391,7 @@ def deepspeed_set_z3_leaf_modules(model, z3_leaf_modules):
 
 _mp_ddp_patched = False
 
+
 def patch_mp_ddp():
     """Patch ddp with device_map.
     After patching, the ddp can run with the device_map.
@@ -428,6 +431,7 @@ def patch_mp_ddp():
             self, device_placement=device_placement, *args, **kwargs))
         trainer.Accelerator.verify_device_map = lambda *args, **kwargs: False
 
+
 @contextmanager
 def patch_get_dynamic_module():
     origin_get_cached_module_file = dynamic_module_utils.get_cached_module_file
@@ -442,6 +446,7 @@ def patch_get_dynamic_module():
     finally:
         dynamic_module_utils.get_cached_module_file = origin_get_cached_module_file
 
+
 @contextmanager
 def patch_tp_plan(load_model: bool):
     if not load_model or not is_mp() or 'WORLD_SIZE' not in os.environ:
@@ -453,6 +458,7 @@ def patch_tp_plan(load_model: bool):
     os.environ.pop('WORLD_SIZE')
     yield
     os.environ['WORLD_SIZE'] = WORLD_SIZE
+
 
 def patch_getattr(obj_cls, item_name: str):
     if hasattr(obj_cls, '_patch'):  # avoid double patch
@@ -469,6 +475,7 @@ def patch_getattr(obj_cls, item_name: str):
 
     obj_cls.__getattr__ = __new_getattr__
     obj_cls._patch = True
+
 
 def detab_code(code: str) -> Tuple[str, str]:
     try:
@@ -493,12 +500,13 @@ def patch_attach_align_device_hook_on_blocks():
     finally:
         big_modeling.attach_align_device_hook_on_blocks = origin_attach_align_device_hook_on_blocks
 
+
 # Patches models to add RoPE Scaling
 def patch_linear_scaling(
-        model_name = None,
-        rope_module = None,
-        scaled_rope_module = None,
-        attention_module = None,
+        model_name=None,
+        rope_module=None,
+        scaled_rope_module=None,
+        attention_module=None,
 ):
     assert rope_module is not None and scaled_rope_module is not None
     assert attention_module is not None
@@ -547,13 +555,13 @@ def patch_linear_scaling(
     pass
     """
     fix_rope_function = fix_rope_function.format(
-        rope_function = rope_module.__name__,
-        scaled_rope_function = scaled_rope_module.__name__,
+        rope_function=rope_module.__name__,
+        scaled_rope_function=scaled_rope_module.__name__,
     )
     rotary_emb = re.findall(
         r"self\.rotary\_emb \= .+?\)",
         function,
-        flags = re.DOTALL | re.MULTILINE,
+        flags=re.DOTALL | re.MULTILINE,
     )
     if len(rotary_emb) == 0:
         return None, exec_code + "\n\n" + function
@@ -651,3 +659,9 @@ def patch_torch_compile(ignore_errors=False, debug=False):
         # Have to explicitly set it!
         torch._dynamo.config.suppress_errors = True
 
+
+def patch_torchao_fp8():
+    import torchao.float8.float8_linear_utils
+    from surogate.core.model.kernels.float8_linear import custom_convert_to_float8_training
+    torchao.float8.float8_linear_utils.convert_to_float8_training = custom_convert_to_float8_training
+    torchao.float8.convert_to_float8_training = custom_convert_to_float8_training

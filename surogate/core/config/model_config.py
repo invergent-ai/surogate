@@ -8,7 +8,7 @@ import torch
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
 from surogate.core.model.hf_config import HfConfigFactory
-from surogate.core.model.loader import get_model_info_and_template, get_model_tokenizer
+from surogate.core.model.loader import get_model_info_and_template
 from surogate.utils.dict import DictDefault
 from surogate.utils.dist import get_dist_setting
 from surogate.utils.jsonl import json_parse_to_dict
@@ -58,6 +58,7 @@ class ModelConfig(ABC):
     max_memory: Optional[Union[dict, str]] = None
     quant_method: Optional[Literal['bnb_4bit', 'falqon']] = None
     num_labels: Optional[int] = None
+    quantization_config: Optional[QuantizationConfigMixin] = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
@@ -115,6 +116,7 @@ class ModelConfig(ABC):
         self.num_labels = self.model_info.num_labels
         self.model_dir = self.model_info.model_dir
         self.model_type = self.model_info.model_type
+        self.quantization_config = self._init_quantization_config()
 
         if self.model_info.rope_scaling and self.max_model_len is not None:
             self._init_rope_scaling()
@@ -167,6 +169,12 @@ class ModelConfig(ABC):
     def _init_quantization_config(self) -> Optional[QuantizationConfigMixin]:
         if self.quant_method is None:
             return None
+        elif self.quantization_config:
+            return self.quantization_config
+
+        if self.model_info.quant_method is not None and self.model_info.quant_method != self.quant_method:
+            raise ValueError(f'Model {self.model} is pre-quantized with {self.model_info.quant_method}, '
+                             f'but you are trying to load it with {self.quant_method}.')
 
         assert self.quant_method in {'bnb_4bit', 'falqon'}
 
@@ -180,7 +188,7 @@ class ModelConfig(ABC):
 
             bnb_4bit_compute_dtype: torch.dtype = HfConfigFactory.to_torch_dtype(bnb_4bit_compute_dtype)
 
-            quantization_config = BitsAndBytesConfig(
+            self.quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
@@ -192,22 +200,15 @@ class ModelConfig(ABC):
         else:
             raise ValueError(f'Unsupported quantization method: {self.quant_method}')
 
-        return quantization_config
+        return self.quantization_config
 
     def _get_modules_to_skip_quant(self):
-        model_arch = self.model_template.model_arch
-        res = []
-        if self.model_info.is_moe_model:
-            res += ['mlp.gate', 'mlp.shared_expert_gate']
-        if model_arch is not None:
-            for key in ['vision_tower', 'aligner']:
-                value = getattr(model_arch, key, None)
-                if value:
-                    res += value
-        if not res:
-            return None
-        res.append('lm_head')
-        return res
+        return [
+            'lm_head',
+            'multi_modal_projector', 'modality_projection', 'vision_tower', 'aligner', 'merger',  # multi-modal
+            'router', 'mlp.gate', 'mlp.shared_expert_gate', 'block_sparse_moe.gate',  # MoE
+            'mamba'
+        ]
 
     def get_model_kwargs(
             self,
@@ -229,7 +230,7 @@ class ModelConfig(ABC):
             'model_type': model_type or self.model_type,
             'device_map': device_map or self.device_map,
             'max_memory': max_memory or self.max_memory,
-            'quantization_config': quantization_config or self._init_quantization_config(),
+            'quantization_config': quantization_config or self.quantization_config,
             'attn_impl': attn_impl or self.attn_impl,
             'rope_scaling': rope_scaling or self.rope_scaling,
             'max_model_len': max_model_len or self.max_model_len,

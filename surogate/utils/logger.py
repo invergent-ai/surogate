@@ -140,6 +140,14 @@ class LoggerWrapper:
         if cond:
             self.info(msg)
 
+    def debug_once(self, msg: str, **kwargs):
+        """Log info message only once."""
+        hash_id = kwargs.get('hash_id') or msg
+        if hash_id in info_set:
+            return
+        info_set.add(hash_id)
+        self.debug(msg, **kwargs)
+
     def debug(self, msg: str, *args, exc_info=None, **kwargs):
         """Log debug message in magenta."""
         prefix = f"{Colors.MAGENTA}[DEBUG]{Colors.RESET}"

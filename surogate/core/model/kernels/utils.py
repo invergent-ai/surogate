@@ -329,13 +329,8 @@ def get_lora_parameters(proj):
     base_layer = getattr(
         proj, "base_layer", proj
     )  # (proj.base_layer if hasattr(proj, "base_layer") else proj)
-    W = base_layer.weight
 
-    # Optionally apply fake quantization to base layer weights for QAT
-    if hasattr(base_layer, "weight_fake_quantizer"):
-        weight_fake_quantizer = getattr(base_layer, "weight_fake_quantizer", None)
-        if weight_fake_quantizer is not None:
-            W = weight_fake_quantizer(W)
+    W = base_layer.weight
 
     # Get quant state for 4bit or FP8
     W_quant = getattr(W, "quant_state", None)

@@ -1,3 +1,4 @@
+import functools
 import inspect
 import os
 import shutil
@@ -12,6 +13,7 @@ from datasets import Dataset as HfDataset
 from peft import PeftModel
 
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
+from surogate.core.model.kernels.utils import get_lora_parameters
 from surogate.core.model.utils import update_generation_config_eos_token
 from surogate.train.trainer_mixins.patch_deepspeed import PatchDeepspeedLoadCheckpoint
 from torch import nn
@@ -79,6 +81,8 @@ class SurogateTrainer(
         tokenizer_key = 'processing_class' if 'processing_class' in trainer_parameters else 'tokenizer'
         kwargs[tokenizer_key] = template_processor.tokenizer
 
+        model.model.is_quantized = False
+
         super().__init__(
             model=model,
             args=args,
@@ -143,6 +147,7 @@ class SurogateTrainer(
         if "input_ids" in inputs:
             num_tokens = inputs["input_ids"].numel()
             self._token_count += num_tokens
+
         return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
@@ -197,6 +202,48 @@ class SurogateTrainer(
         result = super()._save_checkpoint(*args, **kwargs)
         logger.info(f'Saving model checkpoint to {self.state.last_model_checkpoint}')
         return result
+
+
+    def create_accelerator_and_postprocess(self):
+        from accelerate import DataLoaderConfiguration, Accelerator
+        from accelerate.utils import PrecisionType
+
+        accelerator_config = self.args.accelerator_config.to_dict()
+        dataloader_params = ["split_batches", "dispatch_batches", "even_batches", "use_seedable_sampler"]
+        dataloader_config = DataLoaderConfiguration(
+            **{param: accelerator_config.pop(param) for param in dataloader_params}
+        )
+        dataloader_config.data_seed = self.args.data_seed
+        args = {
+            "deepspeed_plugin": self.args.deepspeed_plugin,
+            "dataloader_config": dataloader_config,
+            "mixed_precision": PrecisionType.FP8
+        }
+
+        self.accelerator = Accelerator(**args)
+        self.gather_function = self.accelerator.gather_for_metrics
+        if "use_gather_object" in inspect.signature(self.gather_function).parameters:
+            self.gather_function = functools.partial(
+                self.gather_function, use_gather_object=self.args.eval_use_gather_object
+            )
+
+        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.is_tp_enabled = getattr(self.accelerator.state, "torch_tp_plugin", None) is not None
+
+        if self.is_fsdp_enabled:
+            fsdp_plugin = self.accelerator.state.fsdp_plugin
+            for param in ["limit_all_gathers", "activation_checkpointing"]:
+                setattr(fsdp_plugin, param, self.args.fsdp_config.get(param, getattr(fsdp_plugin, param)))
+            if fsdp_plugin.activation_checkpointing and self.args.gradient_checkpointing:
+                raise ValueError(
+                    "The activation_checkpointing in FSDP config and the gradient_checkpointing in training arg "
+                    "can't be set to True simultaneously. Please use FSDP's activation_checkpointing logic "
+                    "when using FSDP."
+                )
+
+        if self.is_deepspeed_enabled and getattr(self.args, "hf_deepspeed_config", None) is None:
+            self.propagate_args_to_deepspeed()
 
 
 def get_function(method_or_function: Union[MethodType, FunctionType]) -> FunctionType:
