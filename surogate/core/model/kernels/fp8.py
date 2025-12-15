@@ -8,8 +8,95 @@ from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
+@triton.jit
+def _compute_pid_fp8(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
+    """Helper function to compute pid_m and pid_n from tile_id."""
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
 
-# Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
+
+@triton.jit
+def _w8a8_block_fp8_matmul_persistent(
+        # Pointers to inputs and output
+        A, B, C, As, Bs,
+        # Shape for matmul
+        M, N, K,
+        # Block size for block-wise quantization
+        group_n, group_k,
+        # Stride for inputs and output
+        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, stride_As_m, stride_As_k, stride_Bs_k, stride_Bs_n,
+        # Meta-parameters
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
+        NUM_SMS: tl.constexpr,
+):
+    """Persistent Triton kernel for block-wise FP8 matrix multiplication.
+
+    Uses a fixed number of SMs where each SM processes multiple tiles, reducing
+    kernel launch overhead and improving SM utilization through pipelining.
+    """
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, num_stages=3):
+        pid_m, pid_n = _compute_pid_fp8(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+
+        start_m = pid_m * BLOCK_SIZE_M
+        start_n = pid_n * BLOCK_SIZE_N
+        offs_am = (start_m + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (start_n + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        # Setup pointers for A and B - will be incremented in inner loop
+        a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        # Setup scale pointers
+        As_ptrs = As + offs_am * stride_As_m
+        offs_bsn = offs_bn // group_n
+        Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        for ki in range(k_tiles):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
+
+            # Load scales for this k-block
+            offs_ks = (ki * BLOCK_SIZE_K) // group_k
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+            b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+
+            # Increment pointers for next k-block
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        # Store output with proper dtype conversion
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+        if C.dtype.element_ty == tl.bfloat16:
+            c = accumulator.to(tl.bfloat16)
+        elif C.dtype.element_ty == tl.float16:
+            c = accumulator.to(tl.float16)
+        else:
+            c = accumulator.to(tl.float32)
+
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
 @triton.jit
 def _w8a8_block_fp8_matmul(
         # Pointers to inputs and output
@@ -49,6 +136,7 @@ def _w8a8_block_fp8_matmul(
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
@@ -83,6 +171,7 @@ def w8a8_block_fp8_matmul_triton(
         Bs: torch.Tensor,
         block_size: list[int],
         output_dtype: torch.dtype = torch.float32,
+        use_persistent: bool = True,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise
     quantization.
@@ -95,7 +184,9 @@ def w8a8_block_fp8_matmul_triton(
         Bs: The per-block quantization scale for `B`.
         block_size: The block size for per-block quantization. It should
         be 2-dim, e.g., [128, 128].
-        output_dytpe: The dtype of the returned tensor.
+        output_dtype: The dtype of the returned tensor.
+        use_persistent: Whether to use persistent kernel for better SM
+        utilization on larger matrices. Defaults to True.
     Returns:
         torch.Tensor: The result of matmul.
     """
@@ -123,18 +214,36 @@ def w8a8_block_fp8_matmul_triton(
     assert block_k % BLOCK_SIZE_K == 0
     BLOCK_SIZE_N = block_n
 
-    def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+    num_pid_m = triton.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = triton.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
 
-    _w8a8_block_fp8_matmul[grid](
-        A, B, C, As, Bs,
-        M, N, K,
-        block_n, block_k,
-        A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1), As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=8,
-    )
+    # Use persistent kernel for larger matrices where SM utilization benefits
+    # from pipelining. For small matrices, the overhead isn't worth it.
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    should_use_persistent = use_persistent and num_tiles >= NUM_SMS
+
+    if should_use_persistent:
+        grid = (min(NUM_SMS, num_tiles),)
+        _w8a8_block_fp8_matmul_persistent[grid](
+            A, B, C, As, Bs,
+            M, N, K,
+            block_n, block_k,
+            A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1), As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=8,
+            NUM_SMS=NUM_SMS,
+        )
+    else:
+        def grid(META):
+            return (num_tiles,)
+
+        _w8a8_block_fp8_matmul[grid](
+            A, B, C, As, Bs,
+            M, N, K,
+            block_n, block_k,
+            A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1), As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=8,
+        )
     return C
 
 
