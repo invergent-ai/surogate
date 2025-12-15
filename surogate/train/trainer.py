@@ -224,7 +224,7 @@ class SurogateTrainer(
             args.update({
                 "mixed_precision": PrecisionType.FP8,
                 "kwargs_handlers": [AORecipeKwargs(config=Float8LinearConfig(
-                    enable_fsdp_float8_all_gather=True
+                    enable_fsdp_float8_all_gather=False
                 ))]
             })
 
