@@ -6,7 +6,6 @@ apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
-deepspeed_level: zero2
 
 sample_packing: true
 sequence_len: 2048
@@ -17,7 +16,6 @@ save_steps: 1000
 
 learning_rate: 2e-4
 
-qlora: false
 lora_rank: 16
 lora_alpha: 32
 lora_target_modules:

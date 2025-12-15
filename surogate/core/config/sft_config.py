@@ -325,9 +325,6 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
 
     def _init_deepspeed(self):
         if self.deepspeed_level:
-            if self.qlora and self.deepspeed_level == 'zero3':
-                raise ValueError('DeepSpeed ZeRO-3 is not compatible with QLoRA.')
-
             if is_mp() and not self.use_ray:
                 raise ValueError('DeepSpeed is not compatible with `device_map`. '
                                  f'n_gpu: {get_device_count()}, '

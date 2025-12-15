@@ -525,7 +525,7 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
     else:
         reshape = False
 
-    if isinstance(W, Float8Tensor) or (hasattr(W, "dequantize") and hasattr(W, "block_size")):
+    if isinstance(W, Float8Tensor):
         assert W.ndim == 2
         if W.block_size[0] == W.shape[0] and W.block_size[1] == 1:
             # In the backward pass, rowwise scaled becomes colwise scaled after we
