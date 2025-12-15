@@ -537,9 +537,6 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
         out = torch.matmul(X, W.t(), out = out)
     elif W.dtype == torch.float8_e4m3fn:
         out = fp8_linear(X, W, W_quant)
-    elif W.dtype in (torch.bfloat16, torch.float16, torch.float32):
-        # No quantization needed (e.g., DeepSpeed ZeRO-2 wraps weights as regular bf16/fp16/fp32)
-        out = torch.matmul(X, W.t(), out = out)
     else:
         W = fast_dequantize(W, W_quant, use_global_buffer = True)
         out = torch.matmul(X, W.t(), out = out)
