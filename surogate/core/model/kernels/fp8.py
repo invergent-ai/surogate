@@ -3,9 +3,6 @@ import importlib
 import torch
 import triton
 import triton.language as tl
-from torchao.prototype.blockwise_fp8_inference.blockwise_quantization import (
-    blockwise_fp8_gemm as torchao_blockwise_gemm,
-)
 
 from surogate.core.model.kernels.utils import weight_dequant, torch_compile
 from surogate.utils.logger import get_logger

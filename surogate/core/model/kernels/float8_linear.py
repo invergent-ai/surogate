@@ -80,7 +80,7 @@ def custom_convert_to_float8_training(
         for layer in layers_to_filter:
             if layer in fqn:
                 return False
-        return True
+        return module_filter_fn(module, fqn) if module_filter_fn is not None else True
 
     return swap_linear_layers(
         model,
