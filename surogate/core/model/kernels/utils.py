@@ -203,6 +203,10 @@ def fast_dequantize(W, quant_state=None, out=None, use_global_buffer=False):
         return W
     if W.dtype == torch.float8_e4m3fn:
         return weight_dequant(W, quant_state)
+    # If W is already a regular floating point tensor (bf16/fp16/fp32),
+    # no dequantization is needed (e.g., DeepSpeed ZeRO-2 wraps weights as regular tensors)
+    if W.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return W
     if type(quant_state) is not list:
         # New quant_state as a class
         # https://github.com/TimDettmers/bitsandbytes/pull/763/files
@@ -342,7 +346,13 @@ def get_lora_parameters(proj):
     if getattr(base_layer, "quant_method", None) == "fp8":
         # we need to somehow store and pass this information :)
         W.block_size = getattr(base_layer, "block_size", [128, 128])
-        W_quant.block_size = W.block_size
+        if W_quant is not None:
+            W_quant.block_size = W.block_size
+
+    # If weights are already regular floating point tensors (e.g., DeepSpeed ZeRO-2
+    # converted Float8Tensor to bf16), we don't need the quant_state
+    if not isinstance(W, Float8Tensor) and W.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        W_quant = None
 
     # if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
     if getattr(proj, "disable_adapters", True) or proj.merged:

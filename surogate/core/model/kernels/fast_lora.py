@@ -525,7 +525,7 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
     else:
         reshape = False
 
-    if isinstance(W, Float8Tensor):
+    if isinstance(W, Float8Tensor) or (hasattr(W, "dequantize") and hasattr(W, "block_size")):
         assert W.ndim == 2
         if W.block_size[0] == W.shape[0] and W.block_size[1] == 1:
             # In the backward pass, rowwise scaled becomes colwise scaled after we
@@ -537,6 +537,9 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
         out = torch.matmul(X, W.t(), out = out)
     elif W.dtype == torch.float8_e4m3fn:
         out = fp8_linear(X, W, W_quant)
+    elif W.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        # No quantization needed (e.g., DeepSpeed ZeRO-2 wraps weights as regular bf16/fp16/fp32)
+        out = torch.matmul(X, W.t(), out = out)
     else:
         W = fast_dequantize(W, W_quant, use_global_buffer = True)
         out = torch.matmul(X, W.t(), out = out)

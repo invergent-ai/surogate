@@ -63,16 +63,16 @@ DEEPSPEED_CONFIGS = {
 
     "zero2": {
         "fp16": {
-            "enabled": "auto",
-            "loss_scale": 0,
+            "enabled": False,
             "loss_scale_window": 1000,
             "initial_scale_power": 16,
             "hysteresis": 2,
             "min_loss_scale": 1
         },
         "bf16": {
-            "enabled": "auto"
+            "enabled": False
         },
+        "torch_autocast": { "enabled": False },
         "zero_optimization": {
             "stage": 2,
             "offload_optimizer": {

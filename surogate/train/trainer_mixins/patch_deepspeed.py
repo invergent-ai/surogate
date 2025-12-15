@@ -13,6 +13,21 @@ logger = get_logger()
 class PatchDeepspeedLoadCheckpoint:
     @contextmanager
     def _patch_deepspeed_load_checkpoint(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointWrapper,
+        )
+        if not hasattr(CheckpointWrapper, "_sg_setattr_patched"):
+            original_setattr = CheckpointWrapper.__setattr__
+
+            def new_setattr(self, name: str, value) -> None:
+                if name.startswith("ds_") and hasattr(self, "_checkpoint_wrapped_module"):
+                    setattr(self._checkpoint_wrapped_module, name, value)
+                else:
+                    original_setattr(self, name, value)
+
+            CheckpointWrapper.__setattr__ = new_setattr
+            CheckpointWrapper._sg_setattr_patched = True
+
         from transformers import trainer
         if not self.config.resume_from_checkpoint or not self.config.resume_only_model or not hasattr(
                 trainer, 'deepspeed_load_checkpoint'):

@@ -314,7 +314,9 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         return TrainingArguments(**args_dict)
 
     def _init_mixed_precision(self):
-        if self.torch_dtype in {torch.float16, torch.float32}:
+        if self.model_info.quant_method == 'fp8':
+            self.fp16, self.bf16 = False, False
+        elif self.torch_dtype in {torch.float16, torch.float32}:
             self.fp16, self.bf16 = True, False
         elif self.torch_dtype == torch.bfloat16:
             self.fp16, self.bf16 = False, True
