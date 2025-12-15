@@ -3,7 +3,6 @@ import importlib
 import torch
 import triton
 import triton.language as tl
-
 from surogate.core.model.kernels.utils import weight_dequant, torch_compile
 from surogate.utils.logger import get_logger
 
@@ -405,8 +404,11 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
         return grad_X, None, None, None, None
 
 
-@torch_compile
 def fp8_linear(X, weight, weight_scale, bias=None):
+    # unwrapping for enable_fsdp_float8_all_gather
+    if hasattr(weight, '_tensor'):
+        weight = weight._tensor
+
     if weight_scale.ndim == 2 and weight_scale.shape[1] > 1:
         # This is block quantized FP8 matmul
         out = fp8_block_quant_linear(X, weight, weight_scale)

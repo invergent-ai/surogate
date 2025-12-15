@@ -9,11 +9,12 @@ from types import MethodType, FunctionType
 from typing import Union, Optional, Dict, Callable, List, Tuple, Any
 
 import torch
+from accelerate.utils import AORecipeKwargs
 from datasets import Dataset as HfDataset
 from peft import PeftModel
+from torchao.float8 import Float8LinearConfig
 
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
-from surogate.core.model.kernels.utils import get_lora_parameters
 from surogate.core.model.utils import update_generation_config_eos_token
 from surogate.train.trainer_mixins.patch_deepspeed import PatchDeepspeedLoadCheckpoint
 from torch import nn
@@ -217,8 +218,16 @@ class SurogateTrainer(
         args = {
             "deepspeed_plugin": self.args.deepspeed_plugin,
             "dataloader_config": dataloader_config,
-            "mixed_precision": PrecisionType.FP8
         }
+
+        if self.config.model_info.quant_method == 'fp8':
+            args.update({
+                "mixed_precision": PrecisionType.FP8,
+                "kwargs_handlers": [AORecipeKwargs(config=Float8LinearConfig(
+                    enable_fsdp_float8_all_gather=True
+                ))]
+            })
+
 
         self.accelerator = Accelerator(**args)
         self.gather_function = self.accelerator.gather_for_metrics
