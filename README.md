@@ -49,6 +49,7 @@ uv pip install -r requirements/torch29.txt
 uv pip install -r requirements/build.txt
 uv pip install -r requirements/common.txt
 MAX_JOBS=8 uv pip install -r requirements/cuda.txt
+uv pip install "nvidia-nccl-cu12==2.28.3"
 
 # build sgl-kernel
 # build lmcache

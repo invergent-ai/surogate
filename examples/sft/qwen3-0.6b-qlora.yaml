@@ -1,12 +1,12 @@
-model: meta-llama/Llama-3.2-1B
-model_type: llama3_2
+model: Qwen/Qwen3-8B
+#model_type: llama3_2
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
-
+#deepspeed_level: zero2
 sample_packing: true
 sequence_len: 2048
 

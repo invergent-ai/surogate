@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B-FP8
+model: Qwen/Qwen3-8B-FP8
 #model_type: qwen3
 output_dir: ./output
 merge_adapter: false
@@ -6,7 +6,7 @@ apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
-deepspeed_level: zero2
+#deepspeed_level: zero2
 
 sample_packing: true
 sequence_len: 2048

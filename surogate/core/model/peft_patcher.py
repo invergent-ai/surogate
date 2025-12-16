@@ -67,7 +67,7 @@ def patch_peft_model(model: PeftModel) -> PeftModel:
             n_mlp += 1
         else:
             logger.warning_once(
-                "Not an error, but Unsloth cannot patch MLP layers with our manual autograd engine since either LoRA adapters")
+                "Not an error, but cannot patch MLP layers with our manual autograd engine since either LoRA adapters")
 
         # QKV attention patching
         q_proj = layer.self_attn.q_proj
@@ -91,7 +91,7 @@ def patch_peft_model(model: PeftModel) -> PeftModel:
                 n_qkv += 1
             else:
                 logger.warning_once(
-                    "Cannot patch Attention layers with Unsloth's manual autograd engine since either LoRA adapters\n"
+                    "Cannot patch Attention layers with the manual autograd engine since either LoRA adapters\n"
                     "are not enabled or a bias term (like in Qwen) is used.")
 
         # O attention patching
@@ -105,7 +105,7 @@ def patch_peft_model(model: PeftModel) -> PeftModel:
             n_o += 1
         else:
             logger.warning_once(
-                "Not an error, but Unsloth cannot patch O projection layer with our manual autograd engine since either LoRA adapters\n"
+                "Not an error, but cannot patch O projection layer with our manual autograd engine since either LoRA adapters\n"
                 "are not enabled or a bias term (like in Qwen) is used."
             )
 

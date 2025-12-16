@@ -581,54 +581,6 @@ def apply_lora_mlp_swiglu(self, X, inplace = True):
     )
     return out
 
-def get_lora_parameters(proj):
-
-    """
-    Return a 5-tuple of (weight, weight quant_state, lora A, lora B, and lora scale).
-    If QAT is enabled, additionally fake quantize the base layer and lora weights.
-    """
-    # For DPO or disabled adapters
-    base_layer = getattr(
-        proj, "base_layer", proj
-    )  # (proj.base_layer if hasattr(proj, "base_layer") else proj)
-
-    W = base_layer.weight
-
-    # Get quant state for 4bit or FP8
-    W_quant = getattr(W, "quant_state", None)
-    if W_quant is None:
-        W_quant = getattr(base_layer, "weight_scale_inv", None)
-        if W_quant is None:
-            W_quant = getattr(base_layer, "weight_scale", None)
-
-    if isinstance(base_layer, (FP8Linear, CustomAoFloat8Linear)):
-        # we need to somehow store and pass this information :)
-        W.block_size = getattr(base_layer, "block_size", [128, 128])
-        if W_quant is not None:
-            W_quant.block_size = W.block_size
-
-    # if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
-    if getattr(proj, "disable_adapters", True) or proj.merged:
-        return W, W_quant, None, None, None
-
-    adapter = getattr(proj, "active_adapters", None)
-    if adapter is None:
-        adapter = getattr(proj, "active_adapter", ("default"))
-    adapter = adapter[0]
-
-    lora_A_linear = proj.lora_A[adapter]
-    lora_B_linear = proj.lora_B[adapter]
-    A = lora_A_linear.weight
-    B = lora_B_linear.weight
-
-    return (
-        W,
-        W_quant,
-        A,
-        B,
-        proj.scaling[adapter],
-    )
-
 
 _CUDA_STREAMS = {
     (index := torch.cuda.device(i).idx): ctypes.c_void_p(
@@ -752,3 +704,133 @@ def fast_dequantize(W, quant_state=None, out=None, use_global_buffer=False):
     # Careful returning transposed data
     is_transposed = True if W.shape[0] == 1 else False
     return out.t() if is_transposed else out
+
+
+def fast_linear_forward(proj, X, temp_lora = None, out = None):
+    W, W_quant, lora_A, lora_B, lora_S, bias = get_lora_parameters_bias(proj)
+    bsz, q_len, in_dim = X.shape
+    if q_len != 1:
+        return matmul_lora(X, W, W_quant, lora_A, lora_B, lora_S)
+
+    if W_quant is None:
+        out = torch.matmul(X, W.t(), out = out)
+    elif W.dtype == torch.float8_e4m3fn:
+        out = fp8_linear(X, W, W_quant, bias)
+    elif bsz == 1 and q_len == 1:
+        out = fast_gemv(X, W, W_quant, out = out)
+    else:
+        W = fast_dequantize(W.t(), W_quant, use_global_buffer = True)
+        out = torch.matmul(X, W, out = out)
+
+    # Add in LoRA weights
+    if lora_A is not None:
+        out_dim = out.shape[2]
+        dtype = X.dtype
+
+        if not hasattr(lora_A, "_fast_lora"):
+            lora_A._fast_lora = lora_A.to(dtype)
+            lora_B._fast_lora = lora_B.to(dtype)
+
+        if bsz == 1:
+            out = out.view(out_dim)
+            temp_lora = torch.mv(lora_A._fast_lora, X.ravel(), out = temp_lora)
+            out.addmv_(lora_B._fast_lora, temp_lora, alpha = lora_S)
+        else:
+            out = out.view(bsz, out_dim)
+            temp_lora = torch.mm(
+                X.view(bsz, in_dim), lora_A._fast_lora.t(), out = temp_lora
+            )
+            out.addmm_(temp_lora, lora_B._fast_lora.t(), alpha = lora_S)
+        out = out.view(bsz, 1, out_dim)
+
+    if bias is not None:
+        out += bias
+
+    return out
+
+
+
+def get_lora_parameters(proj):
+    """
+    Return a 5-tuple of (weight, weight quant_state, lora A, lora B, and lora scale).
+    If QAT is enabled, additionally fake quantize the base layer and lora weights.
+    """
+    # For DPO or disabled adapters
+    base_layer = getattr(
+        proj, "base_layer", proj
+    )  # (proj.base_layer if hasattr(proj, "base_layer") else proj)
+
+    W = base_layer.weight
+
+    # Get quant state for 4bit or FP8
+    W_quant = getattr(W, "quant_state", None)
+    if W_quant is None:
+        W_quant = getattr(base_layer, "weight_scale_inv", None)
+        if W_quant is None:
+            W_quant = getattr(base_layer, "weight_scale", None)
+
+    if isinstance(base_layer, (FP8Linear, CustomAoFloat8Linear)):
+        # we need to somehow store and pass this information :)
+        W.block_size = getattr(base_layer, "block_size", [128, 128])
+        if W_quant is not None:
+            W_quant.block_size = W.block_size
+
+    # if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+    if getattr(proj, "disable_adapters", True) or proj.merged:
+        return W, W_quant, None, None, None
+
+    adapter = getattr(proj, "active_adapters", None)
+    if adapter is None:
+        adapter = getattr(proj, "active_adapter", ("default"))
+    adapter = adapter[0]
+
+    lora_A_linear = proj.lora_A[adapter]
+    lora_B_linear = proj.lora_B[adapter]
+    A = lora_A_linear.weight
+    B = lora_B_linear.weight
+
+    return (
+        W,
+        W_quant,
+        A,
+        B,
+        proj.scaling[adapter],
+    )
+
+
+def get_lora_parameters_bias(proj):
+    # For DPO or disabled adapters
+    base_layer = getattr(
+        proj, "base_layer", proj
+    )  # (proj.base_layer if hasattr(proj, "base_layer") else proj)
+    W = base_layer.weight
+
+    # Get quant state for 4bit or FP8
+    W_quant = getattr(W, "quant_state", None)
+    if W_quant is None:
+        W_quant = getattr(base_layer, "weight_scale_inv", None)
+        if W_quant is None:
+            W_quant = getattr(base_layer, "weight_scale", None)
+
+    # if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+    if getattr(proj, "disable_adapters", True) or proj.merged:
+        return W, W_quant, None, None, None, base_layer.bias
+
+    if isinstance(base_layer, (FP8Linear, CustomAoFloat8Linear)):
+        # we need to somehow store and pass this information :)
+        W.block_size = getattr(base_layer, "block_size", [128, 128])
+        W_quant.block_size = W.block_size
+
+    adapter = getattr(proj, "active_adapters", None)
+    if adapter is None:
+        adapter = getattr(proj, "active_adapter", ("default"))
+    adapter = adapter[0]
+
+    return (
+        W,
+        W_quant,
+        proj.lora_A[adapter].weight,
+        proj.lora_B[adapter].weight,
+        proj.scaling[adapter],
+        base_layer.bias,
+    )
