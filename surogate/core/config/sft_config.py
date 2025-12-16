@@ -145,6 +145,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
     sample_packing: Optional[bool] = None
     sequence_len: Optional[int] = None
     gradient_checkpointing: Optional[bool] = None
+    activation_checkpointing: Optional[bool] = None
     learning_rate: Optional[float] = None
     lr_scheduler_type: Optional[str] = None
     save_steps: Optional[int] = None
@@ -197,6 +198,7 @@ class SFTConfig(ModelConfig, RayConfig, ChatTemplateConfig):
         self.sample_packing = cfg.get('sample_packing', True)
         self.sequence_len = cfg['sequence_len']
         self.gradient_checkpointing = cfg.get('gradient_checkpointing', True)
+        self.activation_checkpointing = cfg.get('activation_checkpointing', False)
         self.learning_rate = float(cfg.get('learning_rate', 1e-4))
         self.lr_scheduler_type = cfg['lr_scheduler_type'] or SchedulerType.LINEAR
         self.save_steps = cfg.get('save_steps', 50)

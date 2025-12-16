@@ -16,6 +16,7 @@ from torchao.float8 import Float8LinearConfig
 
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.core.model.utils import update_generation_config_eos_token
+from surogate.train.trainer_mixins.activation_checkpointing import ActivationCheckpointingMixin
 from surogate.train.trainer_mixins.patch_deepspeed import PatchDeepspeedLoadCheckpoint
 from torch import nn
 from torch.nn import Module
@@ -36,6 +37,7 @@ class SurogateTrainer(
     FixGradnormNan,
     PatchDeepspeedLoadCheckpoint,
     GradientCheckpointingMixin,
+    ActivationCheckpointingMixin,
     DataLoaderMixin,
     Trainer
 ):
@@ -102,6 +104,7 @@ class SurogateTrainer(
         self.label_names = self.label_names or ['labels']
         self.start_time = time.time()
         self._fix_gradient_checkpointing()
+
         update_generation_config_eos_token(self.model.generation_config, self.template_processor)
         if getattr(self.model, 'origin_generation_config', None):
             self.model.origin_generation_config.eos_token_id = self.model.generation_config.eos_token_id
@@ -126,6 +129,7 @@ class SurogateTrainer(
         # gradient_checkpointing
         gradient_checkpointing = self.args.gradient_checkpointing
         self._prepare_gradient_checkpointing(self.accelerator.unwrap_model(self.model))
+        self._apply_activation_checkpointing(self.model)
 
         with self._fix_grad_norm_nan(), self._patch_skip_first_batches(), self._patch_deepspeed_load_checkpoint():
             res = super().train(*args, **kwargs)

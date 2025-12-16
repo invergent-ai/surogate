@@ -23,11 +23,8 @@ lora_target_modules:
   - all-linear
 
 datasets:
-  - path: "invergent/alpaca-gpt4-data-en"
-    type: instruction
-    split: train
-    instruction_field: instruction
-    input_field: input
-    output_field: output
+  - path: "mlabonne/FineTome-100k"
+    samples: 10000
+    type: auto
 
 
