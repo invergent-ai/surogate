@@ -1,5 +1,5 @@
-model: Qwen/Qwen3-0.6B
-#model_type: qwen3
+model: meta-llama/Llama-3.2-1B
+model_type: llama3_2
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -23,11 +23,8 @@ lora_target_modules:
   - all-linear
 
 datasets:
-  - path: "invergent/alpaca-gpt4-data-en"
-    type: instruction
-    split: train
-    instruction_field: instruction
-    input_field: input
-    output_field: output
+  - path: "mlabonne/FineTome-100k"
+    samples: 10000
+    type: auto
 
 

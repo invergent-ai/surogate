@@ -17,8 +17,7 @@ from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
 from surogate.core.model.hf_config import HfConfigFactory
 from surogate.core.model.kernels.rms_layernorm import fast_rms_layernorm
 from surogate.core.model.kernels.rope_embedding import fast_rope_embedding
-from surogate.core.model.kernels.utils import DEVICE_COUNT, DEVICE_TYPE_TORCH, \
-    dtype_from_config, _get_dtype, get_lora_parameters
+from surogate.core.model.kernels.utils import DEVICE_COUNT, dtype_from_config, _get_dtype
 from surogate.utils.dist import get_current_device, get_device_count
 from surogate.utils.logger import get_logger
 
@@ -753,13 +752,7 @@ class LlamaExtendedRotaryEmbedding(torch.nn.Module):
         if config is not None:
             # [TODO] Hack to pass in config - need to remove later
             base = config.rope_theta
-            partial_rotary_factor = (
-                config.partial_rotary_factor
-                if hasattr(config, "partial_rotary_factor")
-                else 1.0
-            )
             dim = int((config.hidden_size // config.num_attention_heads))
-            device = DEVICE_TYPE_TORCH
             max_position_embeddings = config.max_position_embeddings
 
         self.dim = dim
@@ -889,13 +882,7 @@ class LongRopeRotaryEmbedding(torch.nn.Module):
         if config is not None:
             # [TODO] Hack to pass in config - need to remove later
             base = config.rope_theta
-            partial_rotary_factor = (
-                config.partial_rotary_factor
-                if hasattr(config, "partial_rotary_factor")
-                else 1.0
-            )
             dim = int((config.hidden_size // config.num_attention_heads))
-            device = DEVICE_TYPE_TORCH
             max_position_embeddings = config.max_position_embeddings
 
         self.dim = dim

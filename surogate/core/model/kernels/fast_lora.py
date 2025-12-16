@@ -1,9 +1,13 @@
+import ctypes
+
 import torch
 from torchao.quantization import Float8Tensor
-
-from surogate.core.model.kernels.fp8 import fp8_linear
-from surogate.core.model.kernels.utils import fast_dequantize, _maybe_fake_quantize_activations, get_lora_parameters
+from transformers.integrations import FP8Linear
+import bitsandbytes as bnb
+from surogate.core.model.kernels.float8_linear import fp8_linear, CustomAoFloat8Linear, weight_dequant
 from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
+from .utils import torch_gpu_device, DEVICE_COUNT
+
 
 class LoRA_QKV(torch.autograd.Function):
     """
@@ -201,7 +205,6 @@ class LoRA_QKV(torch.autograd.Function):
 
 
 def apply_lora_qkv(self, X, inplace = True):
-    X = _maybe_fake_quantize_activations(X, self.q_proj)
     QW, QW_quant, QA, QB, QS = get_lora_parameters(self.q_proj)
     KW, KW_quant, KA, KB, KS = get_lora_parameters(self.k_proj)
     VW, VW_quant, VA, VB, VS = get_lora_parameters(self.v_proj)
@@ -509,7 +512,6 @@ class LoRA_W(torch.autograd.Function):
 
 
 def apply_lora_o(self, X):
-    X = _maybe_fake_quantize_activations(X, self.o_proj)
     OW, OW_quant, OA, OB, OS = get_lora_parameters(self.o_proj)
     O = LoRA_W.apply(X, OW, OW_quant, OA, OB, OS)
     return O
@@ -553,7 +555,6 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
     return out.view(batch, seq_len, -1) if reshape else out
 
 def apply_lora_mlp_swiglu(self, X, inplace = True):
-    X = _maybe_fake_quantize_activations(X, self.gate_proj)
     gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
     upW, upW_quant, upA, upB, upS = get_lora_parameters(self.up_proj)
     downW, downW_quant, downA, downB, downS = get_lora_parameters(self.down_proj)
@@ -580,3 +581,174 @@ def apply_lora_mlp_swiglu(self, X, inplace = True):
     )
     return out
 
+def get_lora_parameters(proj):
+
+    """
+    Return a 5-tuple of (weight, weight quant_state, lora A, lora B, and lora scale).
+    If QAT is enabled, additionally fake quantize the base layer and lora weights.
+    """
+    # For DPO or disabled adapters
+    base_layer = getattr(
+        proj, "base_layer", proj
+    )  # (proj.base_layer if hasattr(proj, "base_layer") else proj)
+
+    W = base_layer.weight
+
+    # Get quant state for 4bit or FP8
+    W_quant = getattr(W, "quant_state", None)
+    if W_quant is None:
+        W_quant = getattr(base_layer, "weight_scale_inv", None)
+        if W_quant is None:
+            W_quant = getattr(base_layer, "weight_scale", None)
+
+    if isinstance(base_layer, (FP8Linear, CustomAoFloat8Linear)):
+        # we need to somehow store and pass this information :)
+        W.block_size = getattr(base_layer, "block_size", [128, 128])
+        if W_quant is not None:
+            W_quant.block_size = W.block_size
+
+    # if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+    if getattr(proj, "disable_adapters", True) or proj.merged:
+        return W, W_quant, None, None, None
+
+    adapter = getattr(proj, "active_adapters", None)
+    if adapter is None:
+        adapter = getattr(proj, "active_adapter", ("default"))
+    adapter = adapter[0]
+
+    lora_A_linear = proj.lora_A[adapter]
+    lora_B_linear = proj.lora_B[adapter]
+    A = lora_A_linear.weight
+    B = lora_B_linear.weight
+
+    return (
+        W,
+        W_quant,
+        A,
+        B,
+        proj.scaling[adapter],
+    )
+
+
+_CUDA_STREAMS = {
+    (index := torch.cuda.device(i).idx): ctypes.c_void_p(
+        torch._C._cuda_getCurrentRawStream(index)
+    )
+    for i in range(DEVICE_COUNT)
+}
+CUDA_STREAMS = [None] * (max(_CUDA_STREAMS.keys()) + 1)
+WEIGHT_BUFFERS = [None] * (max(_CUDA_STREAMS.keys()) + 1)
+ABSMAX_BUFFERS = [None] * (max(_CUDA_STREAMS.keys()) + 1)
+for k, v in _CUDA_STREAMS.items():
+    CUDA_STREAMS[k] = v
+CUDA_STREAMS = tuple(CUDA_STREAMS)
+del _CUDA_STREAMS
+
+@torch.inference_mode
+def fast_dequantize(W, quant_state=None, out=None, use_global_buffer=False):
+    if isinstance(W, Float8Tensor):
+        return W.dequantize()
+    if quant_state is None:
+        return W
+    if W.dtype == torch.float8_e4m3fn:
+        return weight_dequant(W, quant_state)
+    if type(quant_state) is not list:
+        # New quant_state as a class
+        # https://github.com/TimDettmers/bitsandbytes/pull/763/files
+        absmax = quant_state.absmax
+        shape = quant_state.shape
+        dtype = quant_state.dtype
+        blocksize = quant_state.blocksize
+        offset = quant_state.offset
+        state2 = quant_state.state2
+        absmax2 = state2.absmax
+        code2 = state2.code
+        blocksize2 = state2.blocksize
+    else:
+        # Old quant_state as a list of lists
+        absmax, shape, dtype, blocksize, compressed_stats, _, _ = quant_state
+        offset, state2 = compressed_stats
+        absmax2, code2, blocksize2, _, _, _, _ = state2
+    pass
+    global CUDA_STREAMS
+    device = W.device
+    device_index = device.index
+    CUDA_STREAM = CUDA_STREAMS[device_index]
+
+    n_elements_absmax = absmax.numel()
+
+    # Create weight matrix
+    if use_global_buffer:
+        # Use same buffers for faster inference
+        size = shape[0] * shape[1]
+        global WEIGHT_BUFFERS
+        global ABSMAX_BUFFERS
+        WEIGHT_BUFFER = WEIGHT_BUFFERS[device_index]
+        ABSMAX_BUFFER = ABSMAX_BUFFERS[device_index]
+        if WEIGHT_BUFFER is None:
+            WEIGHT_BUFFERS[device_index] = WEIGHT_BUFFER = torch.empty(
+                size, dtype=dtype, device=device, requires_grad=False
+            )
+            ABSMAX_BUFFERS[device_index] = ABSMAX_BUFFER = torch.empty(
+                n_elements_absmax,
+                dtype=torch.float32,
+                device=device,
+                requires_grad=False,
+            )
+
+        if size > WEIGHT_BUFFER.numel():
+            WEIGHT_BUFFER.resize_(size)
+        if n_elements_absmax > ABSMAX_BUFFER.numel():
+            ABSMAX_BUFFER.resize_(n_elements_absmax)
+
+        out = WEIGHT_BUFFER[:size].view(shape)
+        out_absmax = ABSMAX_BUFFER[:n_elements_absmax]
+    else:
+        if out is None:
+            out = torch.empty(
+                shape, dtype=dtype, device=device, requires_grad=False
+            )
+        else:
+            assert out.shape == shape
+            assert out.dtype == dtype
+        out_absmax = torch.empty(
+            n_elements_absmax,
+            dtype=torch.float32,
+            device=device,
+            requires_grad=False,
+        )
+    pass
+
+    # NF4 dequantization of statistics
+    ptr_out_absmax = bnb.functional.get_ptr(out_absmax)
+    with torch_gpu_device(device):
+        bnb.functional.lib.cdequantize_blockwise_fp32(
+            bnb.functional.get_ptr(code2),
+            bnb.functional.get_ptr(absmax),
+            bnb.functional.get_ptr(absmax2),
+            ptr_out_absmax,
+            ctypes.c_int(blocksize2),
+            ctypes.c_int(n_elements_absmax),
+            CUDA_STREAM,
+        )
+        out_absmax += offset
+
+        # Dequantize W
+        fx = (
+            bnb.functional.lib.cdequantize_blockwise_fp16_nf4
+            if dtype == torch.float16
+            else bnb.functional.lib.cdequantize_blockwise_bf16_nf4
+        )
+        fx(
+            bnb.functional.get_ptr(None),
+            bnb.functional.get_ptr(W),
+            ptr_out_absmax,
+            bnb.functional.get_ptr(out),
+            ctypes.c_int(blocksize),
+            ctypes.c_int(out.numel()),
+            CUDA_STREAM,
+        )
+    pass
+    # Careful returning transposed data
+    is_transposed = True if W.shape[0] == 1 else False
+    return out.t() if is_transposed else out

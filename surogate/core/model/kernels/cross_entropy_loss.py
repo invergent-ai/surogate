@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 import triton
 import triton.language as tl
-import torch
+
 from .utils import (
     calculate_settings,
     MAX_FUSED_SIZE,
     triton_tanh,
-    triton_cast,
     torch_gpu_device,
 )
-from packaging.version import Version
 
 
 @triton.heuristics(
@@ -66,7 +65,7 @@ def _cross_entropy_forward(
     This ensures exp(x - max(x))'s maximum is 1 as exp(0) = 1.
     """
     row_idx = tl.program_id(0)
-    logits_ptr += row_idx * triton_cast(logits_row_stride, tl.int64)
+    logits_ptr += row_idx * tl.cast(logits_row_stride, tl.int64)
     loss_ptr += row_idx
     logsumexp_ptr += row_idx
     labels_ptr += row_idx
@@ -151,7 +150,7 @@ def _chunked_cross_entropy_forward(
     """
     row_idx = tl.program_id(0)
     chunk_idx = tl.program_id(1)
-    logits_ptr += row_idx * triton_cast(logits_row_stride, tl.int64)
+    logits_ptr += row_idx * tl.cast(logits_row_stride, tl.int64)
     loss_ptr += row_idx
     logsumexp_ptr += row_idx * N_CHUNKS + chunk_idx
     labels_ptr += row_idx
@@ -231,7 +230,7 @@ def _cross_entropy_backward(
     row_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
 
-    logits_ptr += row_idx * triton_cast(logits_row_stride, tl.int64)
+    logits_ptr += row_idx * tl.cast(logits_row_stride, tl.int64)
     dloss_ptr += row_idx * dloss_row_stride
     col_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < VOCAB_SIZE
