@@ -320,6 +320,12 @@ class FP8BlockQuantLinear(torch.autograd.Function):
 
         return output.to(X.dtype)
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        grad_X = torch.matmul(grad_output, W_deq)
+        del W_deq
+        return grad_X, None, None
 
 @torch_compile
 def fp8_torch_block_quant_forward(X, weight, weight_scale):

@@ -40,22 +40,6 @@ class CustomFloat8Linear(Float8Linear):
         if hasattr(mod, "weight_scale_inv"):
             new_mod.weight_scale_inv = getattr(mod, "weight_scale_inv", None)
 
-        # If FSDP float8 all-gather is on, wrap the weight in a float8-aware
-        # tensor subclass. This must happen last because:
-        # 1. weight needs to be on the correct device to create the buffers
-        # 2. buffers need to be already created for the delayed scaling version
-        #    of the weight wrapper to be initialized
-        if config.enable_fsdp_float8_all_gather:
-            assert config.cast_config_weight.scaling_type is ScalingType.DYNAMIC
-            new_mod.weight = torch.nn.Parameter(
-                WeightWithDynamicFloat8CastTensor(
-                    new_mod.weight,
-                    new_mod.linear_mm_config,
-                    new_mod.config.cast_config_weight.target_dtype,
-                ),
-                requires_grad=new_mod.weight.requires_grad,
-            )
-
         return new_mod
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:

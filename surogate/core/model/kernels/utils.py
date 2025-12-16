@@ -199,14 +199,10 @@ def _get_dtype(dtype):
 def fast_dequantize(W, quant_state=None, out=None, use_global_buffer=False):
     if isinstance(W, Float8Tensor):
         return W.dequantize()
-    if quant_state is None:
+    if quant_state is None or W.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return W
     if W.dtype == torch.float8_e4m3fn:
         return weight_dequant(W, quant_state)
-    # If W is already a regular floating point tensor (bf16/fp16/fp32),
-    # no dequantization is needed (e.g., DeepSpeed ZeRO-2 wraps weights as regular tensors)
-    if W.dtype in (torch.bfloat16, torch.float16, torch.float32):
-        return W
     if type(quant_state) is not list:
         # New quant_state as a class
         # https://github.com/TimDettmers/bitsandbytes/pull/763/files
@@ -363,19 +359,10 @@ def get_lora_parameters(proj):
         adapter = getattr(proj, "active_adapter", ("default"))
     adapter = adapter[0]
 
-    # Optionally apply fake quantization to lora weights for QAT
     lora_A_linear = proj.lora_A[adapter]
     lora_B_linear = proj.lora_B[adapter]
     A = lora_A_linear.weight
     B = lora_B_linear.weight
-    if hasattr(lora_A_linear, "weight_fake_quantizer"):
-        lora_A_fake_quantizer = getattr(lora_A_linear, "weight_fake_quantizer", None)
-        if lora_A_fake_quantizer is not None:
-            A = lora_A_fake_quantizer(A)
-    if hasattr(lora_B_linear, "weight_fake_quantizer"):
-        lora_B_fake_quantizer = getattr(lora_B_linear, "weight_fake_quantizer", None)
-        if lora_B_fake_quantizer is not None:
-            B = lora_B_fake_quantizer(B)
 
     return (
         W,
