@@ -73,6 +73,7 @@ jobs:
 
       - name: Extract version from tag
         id: version
+        shell: bash
         run: |
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             # Strip 'v' prefix from tag (v0.1.0 -> 0.1.0)
@@ -85,6 +86,7 @@ jobs:
           fi
 
       - name: Build wheel
+        shell: bash
         run: |
           if [[ -n "${{ steps.version.outputs.version }}" ]]; then
             echo "Building with version: ${{ steps.version.outputs.version }}"
