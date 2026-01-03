@@ -1,25 +1,21 @@
 <div align="center">
 <a href="https://surogate.ai/">
-<img width="64" alt="Surogate logo" src="./assets/img/logo-white.svg" />
+<img width="120" alt="Surogate logo" src="./assets/logo.jpg" />
 </a>
-
 <h1>Surogate</h1>
-<h3>High-performance mixed-precision LLM pre-training & fine-tuning (C++/CUDA core, Python CLI/Wrapper, BF16, FP8 and NVFP4)</h3>
-
-Runs on all NVIDIA GPUs from 
+<h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NVFP4)</h3>
 <br/>
-
 <a href="https://surogate.ai">Home</a> ·
 <a href="https://docs.surogate.ai">Docs</a> ·
 <a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
-<a href="./benchmarks/unsloth.md">Benchmarks</a>
+<a href="./benchmarks/speed.md">Benchmarks</a>
+<br/><br/>
 
 [![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
 [![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
 [![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
 [![Twitter Follow](https://img.shields.io/twitter/follow/invergentai?style=social)](https://twitter.com/invergentai)
 
-<br/>
 <b>If Surogate saves you time or GPUs, consider ⭐ starring ⭐ the repo.</b>
 </div>
 
@@ -27,33 +23,30 @@ Runs on all NVIDIA GPUs from
 
 ## What is Surogate?
 
-Surogate is an **enterprise-grade LLM training framework** focused on **throughput, latency, and predictable scaling**.
-It combines a **native C++/CUDA training engine** with a **low-overhead Python interface** and a **multi-threaded scheduler** for efficient multi-GPU execution, achieving the highest SOL (Speed-Of-Light) on current NVIDIA GPUs, supassing any existing training toolkit by a large margin.
+Surogate is a **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and predictable multi-GPU scaling at scale.
 
-If you care about:
-- faster training iterations,
-- consistent multi-GPU scaling,
-- and production-minded training primitives (recipes, checkpointing, sharding/offload),
+By combining a native **C++/CUDA execution engine**, a low-overhead Python frontend, and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**. 
 
-…Surogate is built for you.
-
-> **Performance notes: Surogate targets near hardware-limited throughput.** See reproducible comparisons in [`./benchmarks`](./benchmarks/unsloth.md).
+See reproducible comparisons in [`./benchmarks`](./benchmarks/speed.md).
 
 ---
 
-## Highlights
+## ✨ Highlights
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
-- **Pre-training + Fine-tuning**: full fine-tune, LoRA, QLoRA
-- **Native multi-GPU** training
-- **Mixed-precision recipes** tuned per architecture (BF16 / FP8 / NVFP4)
-- **Optimized QLoRA** with native FP8/NVFP4 quantization for maximum performance !
-- **Modern GPU support**: sm80, sm86, sm89, sm90, sm100, sm103, sm120
-- **Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
-- **Pre-builtTaining recipes**: 
-  - [**BF16**](./csrc/src/recipes/bf16/README.md): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
-  - [**FP8**](./csrc/src/recipes/fp8_hybrid/README.md): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
-  - [**NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**sm100 and sm120**). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA RTX 5070, 5080, 5090 !!**
+- **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
+- **🖥️...🖥️ Native multi-GPU** training
+- **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
+- **⚖️ Smart CPU Offloading** for weights, gradients, activations, quants
+- **📜 Pre-built training recipes**: 
+  - [**💎 BF16**](./csrc/src/recipes/bf16/README.md): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
+  - [**🔥 FP8**](./csrc/src/recipes/fp8_hybrid/README.md): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
+  - [**🔥 NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**sm100 and sm120**). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA RTX 5070, 5080, 5090 !!**
+- **⚡ FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
+- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
+- **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
+- **🧠 Supported models**: Qwen2.5, Qwen3 Dense, LLama 3.2, more to come shortly
+
 ---
 
 ## Hardware / Requirements
