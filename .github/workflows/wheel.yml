@@ -92,6 +92,8 @@ jobs:
           if [[ -n "$VERSION" ]]; then
             echo "Building with version: $VERSION"
             echo "Using --no-build-isolation to pass environment variables"
+            # Install build dependencies since we're using --no-build-isolation
+            uv pip install scikit-build-core nanobind setuptools-scm --system
             export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"
             export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SUROGATE="$VERSION"
             uv build --wheel --no-build-isolation
