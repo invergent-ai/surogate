@@ -18,7 +18,7 @@
                 "${workspaceFolder}/csrc/src"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/clang++-18",
+            "compilerPath": "/usr/bin/g++-13",
             "cStandard": "c17",
             "cppStandard": "c++20",
             "intelliSenseMode": "linux-clang-x64"

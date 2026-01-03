@@ -11,5 +11,5 @@
         "limits": "cpp"
     },
     "makefile.configureOnOpen": false,
-    "C_Cpp.default.compilerPath": "/usr/bin/clang++-18"
+    "C_Cpp.default.compilerPath": "/usr/bin/g++-13"
 }

@@ -19,9 +19,9 @@ jobs:
       matrix:
         compiler:
           - name: clang
-            cc: clang-18
-            cxx: clang++-18
-            packages: clang-18 clang-tools-18
+            cc: gcc-13
+            cxx: g++-13
+            packages: gcc-13 g++-13
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_C_COMPILER: ${{ matrix.compiler.cc }}
