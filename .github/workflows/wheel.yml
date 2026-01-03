@@ -50,22 +50,27 @@ jobs:
         working-directory: ${{ github.workspace }}
 
     steps:
+      - name: Install git first
+        run: apt update && apt install -y git
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Install deps
-        run: apt update && apt install -y git g++-13 wget build-essential cmake ninja-build git python3-dev ccache libopenmpi-dev
+      - name: Install remaining deps
+        run: apt install -y g++-13 wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Fetch tags
+      - name: Fetch tags and debug
         run: |
           echo "Working directory: $(pwd)"
-          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          ls -la
+          ls -la .git || echo ".git not found"
+          git status
           git fetch --tags --force
           echo "Current ref: $GITHUB_REF"
           echo "Git describe: $(git describe --tags --always)"
