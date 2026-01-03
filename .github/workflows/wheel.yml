@@ -88,18 +88,22 @@ jobs:
       - name: Patch version in pyproject.toml
         if: steps.version.outputs.version != ''
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           echo "Patching pyproject.toml with version: $VERSION"
           # Replace dynamic version with static version
           python3 << EOF
           import re
+          import os
+
+          version = os.environ['VERSION']
 
           with open('pyproject.toml', 'r') as f:
               content = f.read()
 
           # Remove 'version' from dynamic list and add static version
-          content = re.sub(r'dynamic = \["version"\]', f'version = "{VERSION}"', content)
+          content = re.sub(r'dynamic = \["version"\]', f'version = "{version}"', content)
 
           # Comment out the setuptools_scm version provider
           content = re.sub(
