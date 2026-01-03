@@ -16,6 +16,7 @@
 struct cudaDeviceProp;
 typedef struct cudnnContext* cudnnHandle_t;
 typedef struct cublasLtContext* cublasLtHandle_t;
+class MatmulPlanCache;
 
 struct Tensor;
 enum class ETensorDType: int;
@@ -104,54 +105,54 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qk
 
 void matmul(float* c, const float* a, const float* b, const float* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul_strided_c(float* c, const float* a, const float* b, const float* bias, const float* scale_a, const float* scale_b,
                       cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream);
+                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(float* c, const nv_bfloat16* a, const nv_bfloat16* b, const float* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(float* c, const __nv_fp8_e4m3* a, const __nv_fp8_e4m3* b, const float* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(float* c, const __nv_fp8_e4m3* a, const __nv_fp8_e4m3* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(float* c, const __nv_fp8_e4m3* a, const __nv_fp8_e5m2* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(nv_bfloat16* c, const nv_bfloat16* a, const nv_bfloat16* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul_strided_c(nv_bfloat16* c, const nv_bfloat16* a, const nv_bfloat16* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
                       cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream);
+                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(nv_bfloat16* c, const __nv_fp8_e4m3* a, const __nv_fp8_e4m3* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(nv_bfloat16* c, const __nv_fp8_e4m3* a, const __nv_fp8_e5m2* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, Tensor& workspace,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 // Like `matmul`, but allows overriding the output leading dimension (stride between columns)
 // for the destination matrix in column-major cuBLASLt terms. Useful for writing into slices
 // of a larger fused output (e.g. QKV, gate+up).
 void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias, const float* scale_a, const float* scale_b,
                       cublasLtHandle_t handle, Tensor& workspace,
-                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream);
+                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream, MatmulPlanCache* plan_cache = nullptr);
 
 void add_bias(float* out, const float* bias, int B, int T, int OC, cudaStream_t stream);
 void add_bias(nv_bfloat16* out, const nv_bfloat16* bias, int B, int T, int OC, cudaStream_t stream);

@@ -43,7 +43,7 @@ void Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt,
            /*scale_a=*/nullptr, /*scale_b=*/nullptr,
            rs.CublasLtHandle, rs.CuBlasWorkspace,
-           N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+           N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
 }
 
 // =============================================================================
@@ -74,14 +74,14 @@ void Recipe::backward_matmul(modules::MatmulContext& ctx) const {
     matmul(*ctx.dinp, *ctx.weight, *ctx.dout, std::nullopt,
            /*scale_a=*/nullptr, /*scale_b=*/nullptr,
            rs.CublasLtHandle, rs.CuBlasWorkspace,
-           K, M, N, EMMTranspose::NN, /*accumulate=*/false, ctx.stream);
+           K, M, N, EMMTranspose::NN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
 
     // dweight = inp^T @ dout => (K, M) @ (M, N) = (K, N) => stored as (N, K)
     if (!ctx.skip_weight_grad && ctx.dweight) {
         matmul(*ctx.dweight, *ctx.inp, *ctx.dout, std::nullopt,
                /*scale_a=*/nullptr, /*scale_b=*/nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               K, N, M, EMMTranspose::NT, /*accumulate=*/ctx.accumulate, ctx.stream);
+               K, N, M, EMMTranspose::NT, /*accumulate=*/ctx.accumulate, ctx.stream, rs.MatmulPlans.get());
 
         // Bias gradient if requested
         if (ctx.dbias && ctx.dbias->Data) {

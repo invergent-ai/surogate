@@ -327,6 +327,7 @@ if (BUILD_TESTS)
 	            src/testing/test_pretrained_config.cpp
 	            src/testing/test-sol.cpp
 	            src/testing/test-qk-norm-rope.cu
+	            src/testing/test-matmul-plans.cu
 	            src/testing/test-qlora.cu
 	            src/testing/test-adamw.cu
 	            src/testing/test-fp4.cu

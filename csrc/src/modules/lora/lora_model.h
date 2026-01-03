@@ -66,14 +66,15 @@ inline void apply_lora_contribution(
     int rank,
     cublasLtHandle_t handle,
     Tensor& workspace,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    MatmulPlanCache* plan_cache) {
 
     if (!lora.has_value()) return;
     if (out_features <= 0 || BT <= 0) return;
 
     // intermediate = input @ A^T  (BT x rank)
     matmul(intermediate, lora.A, input, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+           handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
 
     // Scale intermediate so we can use GEMM accumulate for B @ intermediate^T.
     if (scaling != 1.0f) {
@@ -88,7 +89,7 @@ inline void apply_lora_contribution(
     // Packed destination: accumulate directly.
     if (output_offset == 0 && out_features == total_out_features) {
         matmul(output, lora.B, intermediate, std::nullopt, nullptr, nullptr,
-               handle, workspace, out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/true, stream);
+               handle, workspace, out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/true, stream, plan_cache);
         return;
     }
 
@@ -100,7 +101,7 @@ inline void apply_lora_contribution(
         matmul_strided_c(output_slice, lora.B, intermediate, std::nullopt, nullptr, nullptr,
                          handle, workspace,
                          out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/true,
-                         (int)total_out_features, stream);
+                         (int)total_out_features, stream, plan_cache);
         return;
     }
 
@@ -112,7 +113,7 @@ inline void apply_lora_contribution(
     for (int i = 2; i < MAX_TENSOR_DIM; ++i) packed_delta.Sizes[i] = 1;
 
     matmul(packed_delta, lora.B, intermediate, std::nullopt, nullptr, nullptr,
-           handle, workspace, out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/false, stream);
+           handle, workspace, out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
     add_2d_slice(output, packed_delta, BT, total_out_features, out_features, output_offset, stream);
 }
 
@@ -135,7 +136,8 @@ inline void backward_lora_layer(
     bool accumulate,
     cublasLtHandle_t handle,
     Tensor& workspace,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    MatmulPlanCache* plan_cache) {
 
     if (!A.Data || !B.Data) return;
 
@@ -168,29 +170,29 @@ inline void backward_lora_layer(
 
     // intermediate = x @ A^T (BT x rank)
     matmul(intermediate, A, x, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+           handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
     if (scaling != 1.0f) {
         vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
     }
 
     // dB = (x @ A^T)^T @ dL_dy
     matmul(dB, intermediate, dL_dy_slice, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+           handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
     // intermediate = B @ dL_dy^T  => (BT x rank) view
     matmul(intermediate, B, dL_dy_slice, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+           handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream, plan_cache);
     if (scaling != 1.0f) {
         vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
     }
 
     // dA = x^T @ (dL_dy @ B)
     matmul(dA, x, intermediate, std::nullopt, nullptr, nullptr,
-           handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+           handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
     // dx += (dL_dy @ B) @ A
     matmul(dx, A, intermediate, std::nullopt, nullptr, nullptr,
-           handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+           handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream, plan_cache);
 }
 
 /**
@@ -243,7 +245,8 @@ inline void backward_lora_qkv_fused(
     Tensor& slice_buffer,   // For slicing packed QKV gradients
     cublasLtHandle_t handle,
     Tensor& workspace,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    MatmulPlanCache* plan_cache) {
 
     const bool has_q = lora_q.has_value() && dA_q.Data;
     const bool has_k = lora_k.has_value() && dA_k.Data;
@@ -289,29 +292,29 @@ inline void backward_lora_qkv_fused(
 
         // intermediate1 = x @ A_q^T (BT x rank)
         matmul(intermediate1, lora_q.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
 
         // dB_q = intermediate1^T @ dL_dy_q
         matmul(dB_q, intermediate1, dL_dy_q, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, q_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, q_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // intermediate2 = B_q @ dL_dy_q^T (for dA_q and dx)
         matmul(intermediate2, lora_q.B, dL_dy_q, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, q_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, q_out_features, EMMTranspose::NN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
 
         // dA_q = x^T @ intermediate2
         matmul(dA_q, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // dx += intermediate2 @ A_q
         matmul(dx, lora_q.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream, plan_cache);
     }
 
     if (has_k) {
@@ -319,29 +322,29 @@ inline void backward_lora_qkv_fused(
 
         // intermediate1 = x @ A_k^T (BT x rank)
         matmul(intermediate1, lora_k.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
 
         // dB_k = intermediate1^T @ dL_dy_k
         matmul(dB_k, intermediate1, dL_dy_k, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // intermediate2 = B_k @ dL_dy_k^T
         matmul(intermediate2, lora_k.B, dL_dy_k, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
 
         // dA_k = x^T @ intermediate2
         matmul(dA_k, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // dx += intermediate2 @ A_k
         matmul(dx, lora_k.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream, plan_cache);
     }
 
     if (has_v) {
@@ -349,29 +352,29 @@ inline void backward_lora_qkv_fused(
 
         // intermediate1 = x @ A_v^T (BT x rank)
         matmul(intermediate1, lora_v.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
 
         // dB_v = intermediate1^T @ dL_dy_v
         matmul(dB_v, intermediate1, dL_dy_v, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // intermediate2 = B_v @ dL_dy_v^T
         matmul(intermediate2, lora_v.B, dL_dy_v, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
 
         // dA_v = x^T @ intermediate2
         matmul(dA_v, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // dx += intermediate2 @ A_v
         matmul(dx, lora_v.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream, plan_cache);
     }
 }
 
@@ -417,7 +420,8 @@ inline void backward_lora_mlp_up_gate_fused(
     Tensor& slice_buffer,
     cublasLtHandle_t handle,
     Tensor& workspace,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    MatmulPlanCache* plan_cache) {
 
     const bool has_up = lora_up.has_value() && dA_up.Data;
     const bool has_gate = lora_gate.has_value() && dA_gate.Data;
@@ -456,29 +460,29 @@ inline void backward_lora_mlp_up_gate_fused(
 
         // intermediate1 = x @ A_up^T
         matmul(intermediate1, lora_up.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
 
         // dB_up = intermediate1^T @ dL_dy_up
         matmul(dB_up, intermediate1, dL_dy_up, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // intermediate2 = B_up @ dL_dy_up^T
         matmul(intermediate2, lora_up.B, dL_dy_up, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
 
         // dA_up = x^T @ intermediate2
         matmul(dA_up, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // dx += intermediate2 @ A_up
         matmul(dx, lora_up.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream, plan_cache);
     }
 
     // Process gate projection
@@ -487,29 +491,29 @@ inline void backward_lora_mlp_up_gate_fused(
 
         // intermediate1 = x @ A_gate^T
         matmul(intermediate1, lora_gate.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
 
         // dB_gate = intermediate1^T @ dL_dy_gate
         matmul(dB_gate, intermediate1, dL_dy_gate, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // intermediate2 = B_gate @ dL_dy_gate^T
         matmul(intermediate2, lora_gate.B, dL_dy_gate, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+               handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream, plan_cache);
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
 
         // dA_gate = x^T @ intermediate2
         matmul(dA_gate, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream, plan_cache);
 
         // dx += intermediate2 @ A_gate
         matmul(dx, lora_gate.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream, plan_cache);
     }
 }
 
@@ -690,19 +694,19 @@ public:
                         detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, Hq * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                     if (lora_block.attention.k.has_value()) {
                         detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, Hkv * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                     if (lora_block.attention.v.has_value()) {
                         detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, Hkv * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
                 case ForwardHookPoint::AfterAttnOutProjection: {
@@ -710,7 +714,7 @@ public:
                         detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, Hq * Hs, C, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
                 case ForwardHookPoint::AfterMLPUpProjection: {
@@ -718,13 +722,13 @@ public:
                         detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, D, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                     if (lora_block.mlp.gate.has_value()) {
                         detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, D, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
                 case ForwardHookPoint::AfterMLPDownProjection: {
@@ -732,7 +736,7 @@ public:
                         detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, D, C, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
             }
@@ -770,19 +774,19 @@ public:
                         detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, Hq * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                     if (lora_block.attention.k.has_value()) {
                         detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, Hkv * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                     if (lora_block.attention.v.has_value()) {
                         detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, Hkv * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
                 case ForwardHookPoint::AfterAttnOutProjection: {
@@ -790,7 +794,7 @@ public:
                         detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, Hq * Hs, C, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
                 case ForwardHookPoint::AfterMLPUpProjection: {
@@ -798,13 +802,13 @@ public:
                         detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, D, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                     if (lora_block.mlp.gate.has_value()) {
                         detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, C, D, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
                 case ForwardHookPoint::AfterMLPDownProjection: {
@@ -812,7 +816,7 @@ public:
                         detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
                                                         scaling, B * T, D, C, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
                     }
                 } break;
             }
@@ -1599,7 +1603,8 @@ private:
             mLoRARunState->slice,
             rs.CublasLtHandle,
             rs.CuBlasWorkspace,
-            stream);
+            stream,
+            rs.MatmulPlans.get());
     }
 
     void backward_lora_attn_out(int layer_idx, int B, int T, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream) {
@@ -1632,7 +1637,7 @@ private:
                                    mLoRAConfig.scaling(),
                                    mLoRARunState->intermediate, mLoRARunState->slice,
                                    B * T, Hq * Hs, C, rank, lora_accum,
-                                   rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                   rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
     }
 
     void backward_lora_mlp_up(int layer_idx, int B, int T, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream) {
@@ -1683,7 +1688,8 @@ private:
             mLoRARunState->slice,
             rs.CublasLtHandle,
             rs.CuBlasWorkspace,
-            stream);
+            stream,
+            rs.MatmulPlans.get());
     }
 
     void backward_lora_mlp_down(int layer_idx, int B, int T, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream) {
@@ -1715,7 +1721,7 @@ private:
                                    mLoRAConfig.scaling(),
                                    mLoRARunState->intermediate, mLoRARunState->slice,
                                    B * T, D, C, rank, lora_accum,
-                                   rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                                   rs.CublasLtHandle, rs.CuBlasWorkspace, stream, rs.MatmulPlans.get());
     }
 
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip) {

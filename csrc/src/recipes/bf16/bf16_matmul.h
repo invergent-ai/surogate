@@ -46,7 +46,7 @@ inline void forward_matmul(Tensor& out,
         // Same dtype - direct matmul
         matmul(out, weight, inp, bias, nullptr, nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
         return;
     }
 
@@ -66,12 +66,12 @@ inline void forward_matmul(Tensor& out,
     if (weight.DType == ETensorDType::BF16) {
         matmul(out, weight, inp_q, bias, nullptr, nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
     } else {
         // FP8 weight with scale
         matmul(out, weight, inp_q, bias, weight.scale(), inp_q.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
     }
 }
 
@@ -120,7 +120,7 @@ inline void backward_matmul(Tensor& dinp,
 
     matmul(dinp, weight_tp, dout, std::nullopt, nullptr, nullptr,
            rs.CublasLtHandle, rs.CuBlasWorkspace,
-           C, BT, OC, EMMTranspose::TN, /*accumulate=*/false, stream);
+           C, BT, OC, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
 
     rs.temp_free(weight_tp);
 
@@ -138,7 +138,7 @@ inline void backward_matmul(Tensor& dinp,
         // Using TN: dweight = dout_tp @ inp_tp with N transposed
         matmul(dweight, dout_tp, inp_tp, std::nullopt, nullptr, nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, C, BT, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream);
+               OC, C, BT, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream, rs.MatmulPlans.get());
 
         rs.temp_free(dout_tp);
         rs.temp_free(inp_tp);

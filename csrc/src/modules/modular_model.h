@@ -161,13 +161,13 @@ inline void backward_qmm(Tensor& dinp,
         // Compute dinp: dinp = W^T @ dout (always needed for gradient flow)
         matmul(dinp, weight, dout, std::nullopt, nullptr, nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, B * T, OC, EMMTranspose::NN, /*accumulate=*/false, stream);
+               C, B * T, OC, EMMTranspose::NN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
 
         // Compute dweight: dW += inp^T @ dout (skip if weights are frozen in LoRA-only mode)
         if (!skip_weight_grad) {
             matmul(dweight, inp, dout, std::nullopt, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   C, OC, B * T, EMMTranspose::NT, /*accumulate=*/accumulate_gradient, stream);
+                   C, OC, B * T, EMMTranspose::NT, /*accumulate=*/accumulate_gradient, stream, rs.MatmulPlans.get());
 
             if (dbias.has_value()) {
                 if (!bias_buffer.has_value()) {
@@ -195,7 +195,7 @@ inline void backward_qmm(Tensor& dinp,
     transpose(weight_tp, weight, OC, C, stream);
     matmul(dinp, weight_tp, dout_q, std::nullopt, weight.scale(), dout_q.scale(),
            rs.CublasLtHandle, rs.CuBlasWorkspace,
-           C, B * T, OC, EMMTranspose::TN, /*accumulate=*/false, stream);
+           C, B * T, OC, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
     rs.temp_free(weight_tp);
 
     // Compute dweight: dW += inp^T @ dout (skip if weights are frozen in LoRA-only mode)
@@ -213,7 +213,7 @@ inline void backward_qmm(Tensor& dinp,
 
         matmul(dweight, activation_tp, grad_tp, std::nullopt, inp_q.scale(), dout_q.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, OC, B * T, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream);
+               C, OC, B * T, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream, rs.MatmulPlans.get());
 
         if (dbias.has_value()) {
             if (!bias_buffer.has_value()) {
@@ -1254,7 +1254,7 @@ float ModularTransformerModel<Block>::validate_with_hook(Tensor inputs, Tensor p
         // LM head matmul: logits = lnf @ lm_head.T
         matmul(rs.non_block_activations().output, mWeights->get_lm_head(main_stream), lnf_slice,
                std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-               V, nano_batch_size, C, EMMTranspose::TN, false, main_stream);
+               V, nano_batch_size, C, EMMTranspose::TN, false, main_stream, rs.MatmulPlans.get());
 
         // Fused classifier: softmax + cross-entropy loss + accuracy
         const float d_loss = 1.0f;
@@ -2541,7 +2541,7 @@ void ModularTransformerModel<Block>::backward_lmhead(long B, long T, int micro_s
         // Forward: logits = lnf @ lm_head.T
         matmul(rs.non_block_activations().output, mWeights->get_lm_head(main_stream), lnf_slice,
                std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-               V, nano_batch_size, C, EMMTranspose::TN, false, main_stream);
+               V, nano_batch_size, C, EMMTranspose::TN, false, main_stream, rs.MatmulPlans.get());
 
         // Wait for targets on first nano-step
         if (nano_step == 0) {
@@ -2564,7 +2564,7 @@ void ModularTransformerModel<Block>::backward_lmhead(long B, long T, int micro_s
             accumulate |= nano_step != 0;
             matmul(d_lmhead, lnf_slice, rs.non_block_activations().output,
                    std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   C, V, nano_batch_size, EMMTranspose::NT, accumulate, main_stream);
+                   C, V, nano_batch_size, EMMTranspose::NT, accumulate, main_stream, rs.MatmulPlans.get());
             if (nano_step == nano_batches - 1) {
                 mGrads->notify_lm_head(main_stream, comm);
             }
@@ -2573,7 +2573,7 @@ void ModularTransformerModel<Block>::backward_lmhead(long B, long T, int micro_s
         // Backward: d_lnf = dlogits @ lm_head
         matmul(dlnf_slice, mWeights->get_lm_head(main_stream), rs.non_block_activations().output,
                std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, nano_batch_size, V, EMMTranspose::NN, false, main_stream);
+               C, nano_batch_size, V, EMMTranspose::NN, false, main_stream, rs.MatmulPlans.get());
     }
 
     rs.temp_free(rs.non_block_activations().output);

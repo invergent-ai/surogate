@@ -16,6 +16,8 @@ save_steps: 1000
 learning_rate: 2e-4
 
 recipe: fp8-hybrid
+offload_residual: true
+offload_optimizer: true
 
 lora: true
 lora_rank: 16

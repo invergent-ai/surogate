@@ -79,13 +79,13 @@ inline void forward_matmul(Tensor& out,
         // Weight already FP8 (persistent quantization mode)
         matmul(out, weight, inp_fp8, bias, weight.scale(), inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
     } else if (cached_fp8_weight && cached_fp8_weight->Data) {
         // Use pre-computed FP8 weight from cache
         float* weight_scale = const_cast<Tensor*>(cached_fp8_weight)->scale();
         matmul(out, *cached_fp8_weight, inp_fp8, bias, weight_scale, inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
     } else if (weight.DType == ETensorDType::BF16) {
         // Weight is BF16 and no cache - quantize to FP8 on-the-fly for forward pass.
         Tensor weight_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {OC, C});
@@ -100,7 +100,7 @@ inline void forward_matmul(Tensor& out,
         // Perform FP8 × FP8 matmul
         matmul(out, weight_fp8, inp_fp8, bias, weight_fp8.scale(), inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
 
         rs.temp_free(weight_stats);
         rs.temp_free(weight_fp8);
@@ -108,7 +108,7 @@ inline void forward_matmul(Tensor& out,
         // Unsupported weight dtype - fall back to standard matmul
         matmul(out, weight, inp, bias, nullptr, nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
     }
 }
 
@@ -198,7 +198,7 @@ inline void backward_matmul(Tensor& dinp,
 
     matmul(dinp, weight_tp, dout_e5m2, std::nullopt, weight_tp.scale(), dout_e5m2.scale(),
            rs.CublasLtHandle, rs.CuBlasWorkspace,
-           C, B * T, OC, EMMTranspose::TN, /*accumulate=*/false, stream);
+           C, B * T, OC, EMMTranspose::TN, /*accumulate=*/false, stream, rs.MatmulPlans.get());
 
     rs.temp_free(weight_tp_stats);
     rs.temp_free(weight_tp);
@@ -230,7 +230,7 @@ inline void backward_matmul(Tensor& dinp,
 
         matmul(dweight, activation_tp, grad_tp, std::nullopt, activation_tp.scale(), grad_tp.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, OC, B * T, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream);
+               C, OC, B * T, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream, rs.MatmulPlans.get());
 
         if (dbias.has_value()) {
             if (!bias_buffer.has_value()) {

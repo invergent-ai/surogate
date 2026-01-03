@@ -90,20 +90,20 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
                weight_scale, inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
     } else if (ctx.weight->DType == ETensorDType::FP8_E4M3) {
         // Weight already FP8 (persistent quantization mode)
         matmul(*ctx.out, *ctx.weight, inp_fp8, bias_opt,
                ctx.weight->scale(), inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
     } else if (ctx.cached_weight && ctx.cached_weight->Data) {
         // Use pre-cached FP8 weight (from weight manager)
         float* weight_scale = const_cast<Tensor*>(ctx.cached_weight)->scale();
         matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
                weight_scale, inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
     } else if (ctx.weight->DType == ETensorDType::BF16) {
         // Weight is BF16 - quantize on-the-fly for this forward pass
         Tensor weight_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {N, K});
@@ -119,7 +119,7 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         matmul(*ctx.out, weight_fp8, inp_fp8, bias_opt,
                weight_fp8.scale(), inp_fp8.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
 
         // Free temporary buffers
         rs.temp_free(weight_stats);
@@ -129,7 +129,7 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt,
                /*scale_a=*/nullptr, /*scale_b=*/nullptr,
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
     }
 }
 
@@ -213,7 +213,7 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     // dinp = W^T @ dout: (K, N) × (N, M)^T = (K, M)^T -> (M, K)
     matmul(*ctx.dinp, weight_tp, dout_e5m2, std::nullopt, weight_tp.scale(), dout_e5m2.scale(),
            rs.CublasLtHandle, rs.CuBlasWorkspace,
-           K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+           K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream, rs.MatmulPlans.get());
 
     rs.temp_free(weight_tp_stats);
     rs.temp_free(weight_tp);
@@ -250,7 +250,7 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         // dweight = inp^T @ dout: (K, M) × (M, N)^T = (K, N)^T -> (N, K)
         matmul(*ctx.dweight, activation_tp, grad_tp, std::nullopt, activation_tp.scale(), grad_tp.scale(),
                rs.CublasLtHandle, rs.CuBlasWorkspace,
-               K, N, M, EMMTranspose::TN, /*accumulate=*/ctx.accumulate, ctx.stream);
+               K, N, M, EMMTranspose::TN, /*accumulate=*/ctx.accumulate, ctx.stream, rs.MatmulPlans.get());
 
         // Optional: compute dbias
         if (ctx.dbias && ctx.bias_buffer) {

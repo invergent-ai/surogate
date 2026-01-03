@@ -23,6 +23,7 @@ class DataLoader;
 struct RuntimeOptions;
 
 namespace modules { class FP8ScalingState; }
+class MatmulPlanCache;
 
 typedef struct cudnnContext* cudnnHandle_t;
 typedef struct cublasLtContext* cublasLtHandle_t;
@@ -212,6 +213,7 @@ public:
 
     cudnnHandle_t CudnnHandle = nullptr;
     cublasLtHandle_t CublasLtHandle = nullptr;
+    std::unique_ptr<MatmulPlanCache> MatmulPlans;
     Tensor CuBlasWorkspace;
     Tensor CutlassWorkspace;  ///< Workspace for CUTLASS SM120 MX FP8 operations
 

@@ -7,6 +7,7 @@
 
 #include <cmath>
 
+#include "kernels/matmul_plans.h"
 #include "utilities/allocator.h"
 
 cudnnHandle_t create_cudnn_handle();
@@ -53,6 +54,7 @@ IRunState::IRunState(PretrainedConfig config, long batch_size, long seq_len, std
 
     CudnnHandle = create_cudnn_handle();
     CublasLtHandle = create_cublaslt_handle();
+    MatmulPlans = std::make_unique<MatmulPlanCache>(DeviceId);
 
     // https://docs.nvidia.com/cuda/cublas/index.html#cublassetworkspace
     // recommended workspace size 32MB for sm_90+
@@ -94,6 +96,9 @@ void destroy_cublaslt_handle(cublasLtHandle_t handle) noexcept;
 IRunState::~IRunState() {
     // Skip cleanup if this was moved-from (MainStream will be null)
     if (!MainStream) return;
+
+    // Ensure cuBLASLt plans are destroyed before the handle.
+    MatmulPlans.reset();
     
     auto destroy_event = [](cudaEvent_t& ev) noexcept {
         if (ev) {
@@ -165,6 +170,7 @@ IRunState::IRunState(IRunState&& other) noexcept
       OptimizerDone(other.OptimizerDone),
       CudnnHandle(other.CudnnHandle),
       CublasLtHandle(other.CublasLtHandle),
+      MatmulPlans(std::move(other.MatmulPlans)),
       CuBlasWorkspace(std::move(other.CuBlasWorkspace)),
       TimingOptimizerStart(other.TimingOptimizerStart),
       TimingOptimizerEnd(other.TimingOptimizerEnd),

@@ -820,34 +820,34 @@ void fill_constant(Tensor& dest, float value, std::size_t count, cudaStream_t st
 void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
             const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, Tensor& workspace,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream) {
+            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream, MatmulPlanCache* plan_cache) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
     if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
-        matmul(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
     } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
-        matmul(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
     } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP8_E4M3) {
         if(bias.has_value()) {
             if(bias.value().DType == ETensorDType::BF16) {
-                matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias->get<nv_bfloat16>(), scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+                matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias->get<nv_bfloat16>(), scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
             } else {
-                matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias->get<float>(), scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+                matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias->get<float>(), scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
             }
         } else {
-            matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), (nv_bfloat16*)nullptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+            matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), (nv_bfloat16*)nullptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
         }
     } else if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::FP8_E4M3 && b.DType == ETensorDType::FP8_E4M3) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<nv_bfloat16>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
     } else if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::FP8_E4M3 && b.DType == ETensorDType::FP8_E5M2) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e5m2>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<nv_bfloat16>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e5m2>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
     } else if(c.DType == ETensorDType::BF16) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream, plan_cache);
     } else {
         throw std::logic_error("matmul_forward: invalid DType combination");
     }
@@ -882,7 +882,7 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
 void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
                       const float* scale_a, const float* scale_b,
                       cublasLtHandle_t handle, Tensor& workspace,
-                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream) {
+                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream, MatmulPlanCache* plan_cache) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
     if (ldc <= 0) {
@@ -890,10 +890,10 @@ void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional
     }
     if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
-        matmul_strided_c(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, ldc, stream);
+        matmul_strided_c(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, ldc, stream, plan_cache);
     } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul_strided_c(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, ldc, stream);
+        matmul_strided_c(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, ldc, stream, plan_cache);
     } else {
         throw std::logic_error("matmul_strided_c: unsupported dtype combination");
     }
