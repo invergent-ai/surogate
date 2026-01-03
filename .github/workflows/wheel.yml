@@ -58,6 +58,15 @@ jobs:
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Fetch tags
+        run: |
+          git fetch --tags --force
+          echo "Current ref: $GITHUB_REF"
+          echo "Git describe: $(git describe --tags --always)"
+          echo "Git describe exact-match: $(git describe --tags --exact-match 2>&1 || echo 'not on exact tag')"
+          echo "All tags:"
+          git tag -l | tail -10
+
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
