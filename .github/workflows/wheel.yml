@@ -2,14 +2,8 @@ name: Build Wheels
 on:
   workflow_dispatch:
   push:
-    branches:
-      - master
-      - release-*
-      - dev
-  pull_request:
-    branches:
-      - master
-      - dev
+    tags:
+      - 'v*'
 
 jobs:
   wheel:
@@ -98,7 +92,7 @@ jobs:
 
   release:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release-') || startsWith(github.ref, 'refs/tags/')
-
+    needs: wheel
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -116,4 +110,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: wheelhouse/*.whl
           generate_release_notes: true
-          draft: true
+          draft: false
