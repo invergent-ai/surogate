@@ -13,12 +13,18 @@
 ## GPU: 1x NVIDIA RTX 5090 32GB (tok/sec)
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
 |----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
-| **Qwen3 0.6B** | 19k         | 22,9k        | 31,7k         | 37,8k        | 34,3k         | 40,0k        | 35.8k         |
+| **Qwen3 0.6B** | 19k         | 22,9k        | 32k           | 38,3k        | 33,6k         | 41k          | 35.9k         |
 | **Qwen3 1.7B** | 11,7k       | 12,1k        | 15,2k         | 20,7k        | 19,0k         | 24,2k        | 19,5k         |
 | **Qwen3 4B**   | 5,6k        | 5,8k         | 7,2k          | 9,5k         | 8,8k          | 12,0k        | 9,1k          |
 | **Qwen3 8B**   | 3,6k        | 3,4k         | 4,2k          | 5,9k         | 5,3k          | 8,2k         | 5,5k          | 
 
-
+Configurations used:
+- Surogate BF16: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" bf16
+- Surogate FP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp8
+- Surogate QFP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp8
+- Surogate FP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp4
+- Surogate QFP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp4
+- 
 ## GPU: 1x NVIDIA H100 SXM (tok/sec)
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
 |----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|

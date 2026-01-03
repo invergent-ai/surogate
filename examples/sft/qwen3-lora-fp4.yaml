@@ -11,10 +11,12 @@ sample_packing: true
 sequence_len: 2048
 
 max_steps: 100
-
 save_steps: 1000
 
 learning_rate: 2e-4
+
+recipe: nvfp4
+fp4_backend: cutlass
 
 lora: true
 lora_rank: 16
