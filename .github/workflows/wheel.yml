@@ -91,15 +91,14 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           if [[ -n "$VERSION" ]]; then
             echo "Building with version: $VERSION"
-            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$VERSION"
+            echo "Using --no-build-isolation to pass environment variables"
+            export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"
+            export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SUROGATE="$VERSION"
+            uv build --wheel --no-build-isolation
           else
             echo "No version set, using setuptools-scm to determine version from git"
-            echo "SETUPTOOLS_SCM_PRETEND_VERSION is not set"
+            uv build --wheel
           fi
-          uv build --wheel
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SUROGATE: ${{ steps.version.outputs.version }}
 
       - name: Repair wheel with auditwheel
         run: |
