@@ -57,6 +57,7 @@ __device__ __forceinline__ void fp32x8_to_e2m1x8_with_dequant(
     uint32_t& out_fp4,
     float (&out_dequant)[8])
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     uint32_t dq1, dq2, dq3, dq4;
 
     asm volatile(
@@ -85,9 +86,16 @@ __device__ __forceinline__ void fp32x8_to_e2m1x8_with_dequant(
     out_dequant[5] = __half2float(__ushort_as_half((dq3 >> 16) & 0xFFFF));
     out_dequant[6] = __half2float(__ushort_as_half(dq4 & 0xFFFF));
     out_dequant[7] = __half2float(__ushort_as_half((dq4 >> 16) & 0xFFFF));
+#else
+    // Fallback for non-SM100 device compilation (should never be called at runtime)
+    out_fp4 = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) out_dequant[i] = 0.0f;
+#endif
 }
 
 __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     uint32_t val;
     asm volatile(
         "{\n"
@@ -103,6 +111,10 @@ __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
           "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7])
     );
     return val;
+#else
+    // Fallback for non-SM100 device compilation (should never be called at runtime)
+    return 0;
+#endif
 }
 
 // ============================================================================
