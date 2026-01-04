@@ -41,7 +41,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - **📜 Pre-built training recipes**: 
   - [**💎 BF16**](./csrc/src/recipes/bf16/README.md): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
   - [**🔥 FP8**](./csrc/src/recipes/fp8_hybrid/README.md): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
-  - [**🔥 NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**sm100 and sm120**). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA RTX 5070, 5080, 5090 !!**
+  - [**🔥 NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
 - **⚡ FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core

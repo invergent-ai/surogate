@@ -25,14 +25,14 @@ jobs:
           - cuda_version: "12.9"
             cuda_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu129"
-            archs: "80;86;89;90;100;120"
+            archs: "80;86;89;90;100;103;120"
             runtime_deps: |
               nvidia-cudnn-cu12>=9.10,<10
               nvidia-nccl-cu12>=2.27,<3
           - cuda_version: "13.0"
             cuda_image: "nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
-            archs: "80;86;89;90;100;120"
+            archs: "80;86;89;90;100;103;120"
             runtime_deps: |
               nvidia-cudnn-cu13>=9.13,<10
               nvidia-nccl-cu13>=2.27,<3

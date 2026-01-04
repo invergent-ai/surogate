@@ -107,10 +107,10 @@ set(CUTLASS_ENABLE_TOOLS OFF CACHE BOOL "Enable CUTLASS tools")
 set(CUTLASS_ENABLE_PROFILER OFF CACHE BOOL "Enable CUTLASS profiler")
 # set(CUTLASS_ENABLE_LIBRARY OFF CACHE BOOL "Enable CUTLASS library")
 # set(CUTLASS_LIBRARY_KERNELS "" CACHE STRING "Comma-separated list of kernel name filters")
-# Only build for SM80+ (Ampere/Hopper/Blackwell/Next-gen): 80, 86, 87, 89, 90, 90a, 100, 120
-# SM80-87: Ampere, SM89: Ada, SM90/90a: Hopper, SM100: Blackwell, SM120: RTX 50x0/DGX Spark
-set(CUTLASS_NVCC_ARCHS "89;90;90a;100;120;120a;121;121a" CACHE STRING "CUDA architectures for CUTLASS")
-set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100;120;120a;121;121a" CACHE STRING "NVCC archs to build library kernels")
+# Only build for SM80+ (Ampere/Hopper/Blackwell/Next-gen): 80, 86, 87, 89, 90, 90a, 100, 103, 120
+# SM80-87: Ampere, SM89: Ada, SM90/90a: Hopper, SM100: Blackwell B200, SM103: Blackwell B300, SM120: RTX 50x0/DGX Spark
+set(CUTLASS_NVCC_ARCHS "89;90;90a;100;103;120;120a;121;121a" CACHE STRING "CUDA architectures for CUTLASS")
+set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100;103;120;120a;121;121a" CACHE STRING "NVCC archs to build library kernels")
 
 FetchContent_Declare(
         cutlass
@@ -260,6 +260,8 @@ target_sources(surogate-common PRIVATE
     src/recipes/nvfp4/kernels/matmul_fp4_cudnn.cpp
     src/recipes/nvfp4/kernels/quant_nvfp4_cutlass.cu
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4.cu
+    src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm103.cu
+    src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm120.cu
     src/recipes/nvfp4/kernels/scaled_swiglu.cu
 )
 
