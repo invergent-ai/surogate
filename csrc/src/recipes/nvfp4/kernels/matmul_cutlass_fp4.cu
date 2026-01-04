@@ -7,12 +7,14 @@
  *
  * This file provides the public API and runtime dispatch logic for FP4 GEMM kernels.
  * Architecture-specific kernel implementations are in separate files for parallel compilation:
+ * - matmul_cutlass_fp4_sm100.cu: SM100 (B200) kernels
  * - matmul_cutlass_fp4_sm103.cu: SM103 (B300) kernels
- * - matmul_cutlass_fp4_sm120.cu: SM120/SM121 (B200, RTX 50xx) kernels
+ * - matmul_cutlass_fp4_sm120.cu: SM120/SM121 (RTX 50xx) kernels
  *
  * Architecture differences:
- * - SM100 (B200) and SM120/121: Use Sm1xxBlockScaledConfig with scale atom layout (32x4)
- * - SM103 (B300): Uses Sm103BlockScaledConfig with scale atom layout (8x4x4)
+ * - SM100 (B200): Uses Sm100 arch with KernelTmaWarpSpecialized1SmMxf4Sm100 schedule, tile K=256
+ * - SM103 (B300): Uses Sm103BlockScaledConfig with scale atom layout (8x4x4), tile K=768
+ * - SM120/121 (RTX 50xx): Uses Sm1xxBlockScaledConfig with scale atom layout (32x4), tile K=128
  */
 
 #include <cuda_runtime.h>
@@ -72,19 +74,26 @@ void matmul_cutlass_fp4(
     }
 
     // Dispatch to the appropriate kernel based on SM version
-    // SM100 (B200) and SM120/121 (GeForce RTX 50xx) use the same Sm1xxBlockScaledConfig layout.
-    // SM103 (B300) uses a different Sm103BlockScaledConfig with different scale factor atom layout.
+    // Each architecture has its own kernel with different tile sizes and schedules:
+    // - SM100 (B200): tile K=256, KernelTmaWarpSpecialized1SmMxf4Sm100
+    // - SM103 (B300): tile K=768, Sm103BlockScaledConfig
+    // - SM120+ (RTX 50xx): tile K=128, Sm1xxBlockScaledConfig
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    if (sm_version == 100) {
+        matmul_cutlass_fp4_sm100(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        return;
+    }
+#endif
+
 #if defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
     if (sm_version == 103) {
-        // SM103 (B300) uses Sm103BlockScaledConfig with different scale factor atom layout
         matmul_cutlass_fp4_sm103(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
         return;
     }
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-    if (sm_version == 100 || sm_version >= 120) {
-        // SM100 (B200) and SM120+ (RTX 50xx) share the same block-scaled layout
+    if (sm_version >= 120) {
         matmul_cutlass_fp4_sm120(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
         return;
     }
@@ -92,7 +101,7 @@ void matmul_cutlass_fp4(
 
     throw std::runtime_error("CUTLASS FP4 GEMM not compiled for this architecture. "
                              "SM100 (B200), SM103 (B300), and SM120+ (RTX 50xx) supported. "
-                             "Ensure CUDA_ARCHITECTURES includes 100, 103, 120, or 121.");
+                             "Ensure CUDA_ARCHITECTURES includes 100a, 103a, 120a, or 121a.");
 }
 
 void matmul_cutlass_fp4_f32(
@@ -115,6 +124,13 @@ void matmul_cutlass_fp4_f32(
     }
 
     // Dispatch to the appropriate kernel based on SM version
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    if (sm_version == 100) {
+        matmul_cutlass_fp4_sm100_f32(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        return;
+    }
+#endif
+
 #if defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
     if (sm_version == 103) {
         matmul_cutlass_fp4_sm103_f32(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
@@ -123,7 +139,7 @@ void matmul_cutlass_fp4_f32(
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-    if (sm_version == 100 || sm_version >= 120) {
+    if (sm_version >= 120) {
         matmul_cutlass_fp4_sm120_f32(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
         return;
     }
@@ -131,7 +147,7 @@ void matmul_cutlass_fp4_f32(
 
     throw std::runtime_error("CUTLASS FP4 GEMM (FP32 out) not compiled for this architecture. "
                              "SM100 (B200), SM103 (B300), and SM120+ (RTX 50xx) supported. "
-                             "Ensure CUDA_ARCHITECTURES includes 100, 103, 120, or 121.");
+                             "Ensure CUDA_ARCHITECTURES includes 100a, 103a, 120a, or 121a.");
 }
 
 void matmul_cutlass_fp4_alpha(
@@ -155,7 +171,13 @@ void matmul_cutlass_fp4_alpha(
     }
 
     // Dispatch to the appropriate kernel based on SM version
-    // SM100 (B200) and SM120/121 use the same layout; SM103 (B300) uses a different layout
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    if (sm_version == 100) {
+        matmul_cutlass_fp4_sm100_alpha(d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
+        return;
+    }
+#endif
+
 #if defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
     if (sm_version == 103) {
         matmul_cutlass_fp4_sm103_alpha(d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
@@ -164,7 +186,7 @@ void matmul_cutlass_fp4_alpha(
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-    if (sm_version == 100 || sm_version >= 120) {
+    if (sm_version >= 120) {
         matmul_cutlass_fp4_sm120_alpha(d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
         return;
     }
@@ -172,5 +194,5 @@ void matmul_cutlass_fp4_alpha(
 
     throw std::runtime_error("CUTLASS FP4 GEMM (alpha-ptr) not compiled for this architecture. "
                              "SM100 (B200), SM103 (B300), and SM120+ (RTX 50xx) supported. "
-                             "Ensure CUDA_ARCHITECTURES includes 100, 103, 120, or 121.");
+                             "Ensure CUDA_ARCHITECTURES includes 100a, 103a, 120a, or 121a.");
 }
