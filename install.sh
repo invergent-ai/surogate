@@ -17,7 +17,14 @@ if ! command -v uv &> /dev/null; then
     echo "uv not found. Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
     # Source the uv environment to make it available in this session
-    export PATH="$HOME/.local/bin:$PATH"
+    # Try both $HOME and common root locations
+    export PATH="$HOME/.local/bin:/root/.local/bin:$PATH"
+    # Also source the env file if it exists
+    if [ -f "$HOME/.local/bin/env" ]; then
+        source "$HOME/.local/bin/env"
+    elif [ -f "/root/.local/bin/env" ]; then
+        source "/root/.local/bin/env"
+    fi
 
     if ! command -v uv &> /dev/null; then
         echo "Error: Failed to install uv. Please install it manually from https://github.com/astral-sh/uv"
