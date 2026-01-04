@@ -1,4 +1,6 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
+//
 /**
  * @file matmul_cutlass_fp4_internal.h
  * @brief Internal declarations for architecture-specific FP4 GEMM kernels
@@ -32,6 +34,14 @@ void matmul_cutlass_fp4_sm103_alpha(
     const uint8_t* a, const uint8_t* b,
     const uint8_t* scale_a, const uint8_t* scale_b,
     const float* alpha_ptr,
+    std::byte* workspace, std::size_t workspace_size,
+    int M, int N, int K,
+    cudaStream_t stream);
+
+void matmul_cutlass_fp4_sm103_f32(
+    float* d,
+    const uint8_t* a, const uint8_t* b,
+    const uint8_t* scale_a, const uint8_t* scale_b,
     std::byte* workspace, std::size_t workspace_size,
     int M, int N, int K,
     cudaStream_t stream);

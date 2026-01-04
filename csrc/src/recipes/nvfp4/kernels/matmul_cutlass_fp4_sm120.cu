@@ -1,4 +1,6 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
+//
 /**
  * @file matmul_cutlass_fp4_sm120.cu
  * @brief CUTLASS-based FP4 GEMM kernels for SM120/SM121 (Blackwell B200, RTX 50xx)

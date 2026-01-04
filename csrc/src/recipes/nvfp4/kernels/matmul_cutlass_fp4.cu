@@ -1,4 +1,6 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
+//
 /**
  * @file matmul_cutlass_fp4.cu
  * @brief CUTLASS-based FP4 GEMM dispatcher for Blackwell architectures
@@ -113,7 +115,13 @@ void matmul_cutlass_fp4_f32(
     }
 
     // Dispatch to the appropriate kernel based on SM version
-    // SM100 (B200) and SM120/121 use the same layout; SM103 (B300) not yet implemented for f32 variant
+#if defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
+    if (sm_version == 103) {
+        matmul_cutlass_fp4_sm103_f32(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        return;
+    }
+#endif
+
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
     if (sm_version == 100 || sm_version >= 120) {
         matmul_cutlass_fp4_sm120_f32(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
@@ -122,8 +130,8 @@ void matmul_cutlass_fp4_f32(
 #endif
 
     throw std::runtime_error("CUTLASS FP4 GEMM (FP32 out) not compiled for this architecture. "
-                             "SM100 (B200) and SM120+ (RTX 50xx) supported. SM103 (B300) not yet implemented. "
-                             "Ensure CUDA_ARCHITECTURES includes 100, 120, or 121.");
+                             "SM100 (B200), SM103 (B300), and SM120+ (RTX 50xx) supported. "
+                             "Ensure CUDA_ARCHITECTURES includes 100, 103, 120, or 121.");
 }
 
 void matmul_cutlass_fp4_alpha(
