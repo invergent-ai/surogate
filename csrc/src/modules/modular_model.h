@@ -251,6 +251,9 @@ inline void backward_qmm(Tensor& dinp,
  * @param cached_weight Optional cached FP8 weight
  * @param delayed_quantizer_idx Delayed scaling quantizer index (-1 for JIT)
  * @param stream CUDA stream
+ * @param cached_fp4_data Optional cached FP4 packed weight data (CUTLASS layout)
+ * @param cached_fp4_scales Optional cached FP4 block scales (FP8 E4M3, CUTLASS layout)
+ * @param cached_fp4_amax Optional cached FP4 global amax pointer (device memory)
  */
 template<typename Block>
 inline void recipe_forward_matmul(
@@ -262,7 +265,10 @@ inline void recipe_forward_matmul(
     Tensor* inp_quant,
     const Tensor* cached_weight,
     int delayed_quantizer_idx,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const Tensor* cached_fp4_data = nullptr,
+    const Tensor* cached_fp4_scales = nullptr,
+    const float* cached_fp4_amax = nullptr)
 {
     MatmulContext ctx;
     ctx.out = &out;
@@ -280,6 +286,9 @@ inline void recipe_forward_matmul(
     ctx.inp_quant = inp_quant;
     ctx.cached_weight = cached_weight;
     ctx.delayed_quantizer_idx = delayed_quantizer_idx;
+    ctx.cached_fp4_data = cached_fp4_data;
+    ctx.cached_fp4_scales = cached_fp4_scales;
+    ctx.cached_fp4_amax = cached_fp4_amax;
 
     recipe.forward_matmul(ctx);
 }
@@ -726,6 +735,7 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     wm_config.tied_embeddings = config.TiedWordEmbeddings;
     wm_config.skip_block_allocation = options.skip_block_allocation;
     wm_config.enable_fp8_forward = options.enable_fp8_forward;
+    wm_config.enable_fp4_forward = options.enable_fp4_forward;
 
     mWeights = std::make_unique<ModularWeightManager<Block>>(wm_config, *mAllocator);
 }
@@ -910,12 +920,24 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                 const Tensor* cached_weight = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().qkv_weight : nullptr;
                 const int qidx = rs.has_fp8_delayed_scaling() ? get_quantizer_index(l, modules::QuantizerIndex::FWD_LN1) : -1;
 
+                // FP4 cached weight (CUTLASS layout) for NVFP4Recipe
+                const Tensor* fp4_data = nullptr;
+                const Tensor* fp4_scales = nullptr;
+                const float* fp4_amax = nullptr;
+                if (mWeights->has_fp4_forward_cache()) {
+                    auto& fp4_cache = mWeights->fp4_weight_cache();
+                    fp4_data = &fp4_cache.qkv_weight.data;
+                    fp4_scales = &fp4_cache.qkv_weight.scales;
+                    fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 0;  // qkv at offset 0
+                }
+
                 detail::recipe_forward_matmul(
                     *mRecipe, acts.qkv, acts.ln1, weights.attention.qkv_weight,
                     weights.attention.qkv_bias.has_value() ? &weights.attention.qkv_bias.value() : nullptr,
                     rs, (int)B, (int)T, (int)C, (int)qkv_channels,
                     l, modules::MatmulOp::QKV,
-                    inp_quant, cached_weight, qidx, main_stream);
+                    inp_quant, cached_weight, qidx, main_stream,
+                    fp4_data, fp4_scales, fp4_amax);
             }
 
             if (hook) {
@@ -979,12 +1001,24 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                 const Tensor* cached_weight = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().o_weight : nullptr;
                 const int qidx = rs.has_fp8_delayed_scaling() ? get_quantizer_index(l, modules::QuantizerIndex::FWD_ATT) : -1;
 
+                // FP4 cached weight (CUTLASS layout) for NVFP4Recipe
+                const Tensor* fp4_data = nullptr;
+                const Tensor* fp4_scales = nullptr;
+                const float* fp4_amax = nullptr;
+                if (mWeights->has_fp4_forward_cache()) {
+                    auto& fp4_cache = mWeights->fp4_weight_cache();
+                    fp4_data = &fp4_cache.o_weight.data;
+                    fp4_scales = &fp4_cache.o_weight.scales;
+                    fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 1;  // o at offset 1
+                }
+
                 detail::recipe_forward_matmul(
                     *mRecipe, acts.att_out, acts.att, weights.attention.out_weight,
                     nullptr,  // no bias
                     rs, (int)B, (int)T, (int)AttC, (int)C,
                     l, modules::MatmulOp::AttnOut,
-                    inp_quant, cached_weight, qidx, main_stream);
+                    inp_quant, cached_weight, qidx, main_stream,
+                    fp4_data, fp4_scales, fp4_amax);
             }
 
             if (hook) {
@@ -1023,11 +1057,23 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                         const Tensor* cached_weight = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().mlp_up_weight : nullptr;
                         const int qidx = rs.has_fp8_delayed_scaling() ? get_quantizer_index(l, modules::QuantizerIndex::FWD_LN2) : -1;
 
+                        // FP4 cached weight (CUTLASS layout) for NVFP4Recipe
+                        const Tensor* fp4_data = nullptr;
+                        const Tensor* fp4_scales = nullptr;
+                        const float* fp4_amax = nullptr;
+                        if (mWeights->has_fp4_forward_cache()) {
+                            auto& fp4_cache = mWeights->fp4_weight_cache();
+                            fp4_data = &fp4_cache.mlp_up_weight.data;
+                            fp4_scales = &fp4_cache.mlp_up_weight.scales;
+                            fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 2;  // mlp_up at offset 2
+                        }
+
                         detail::recipe_forward_matmul(
                             *mRecipe, acts.mlp_up, acts.ln2, weights.mlp_up_weight,
                             nullptr, rs, (int)B, (int)T, (int)C, (int)(2 * D),
                             l, modules::MatmulOp::MLPUp,
-                            inp_quant, cached_weight, qidx, main_stream);
+                            inp_quant, cached_weight, qidx, main_stream,
+                            fp4_data, fp4_scales, fp4_amax);
                     }
 
                     if (hook) {
@@ -1064,11 +1110,23 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                         const Tensor* cached_weight = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().mlp_down_weight : nullptr;
                         const int qidx = rs.has_fp8_delayed_scaling() ? get_quantizer_index(l, modules::QuantizerIndex::FWD_SWIGLU) : -1;
 
+                        // FP4 cached weight (CUTLASS layout) for NVFP4Recipe
+                        const Tensor* fp4_data = nullptr;
+                        const Tensor* fp4_scales = nullptr;
+                        const float* fp4_amax = nullptr;
+                        if (mWeights->has_fp4_forward_cache()) {
+                            auto& fp4_cache = mWeights->fp4_weight_cache();
+                            fp4_data = &fp4_cache.mlp_down_weight.data;
+                            fp4_scales = &fp4_cache.mlp_down_weight.scales;
+                            fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 3;  // mlp_down at offset 3
+                        }
+
                         detail::recipe_forward_matmul(
                             *mRecipe, acts.mlp_down, acts.swiglu, weights.mlp_down_weight,
                             nullptr, rs, (int)B, (int)T, (int)D, (int)C,
                             l, modules::MatmulOp::MLPDown,
-                            inp_quant, cached_weight, qidx, main_stream);
+                            inp_quant, cached_weight, qidx, main_stream,
+                            fp4_data, fp4_scales, fp4_amax);
                     }
                 } else {
                     // MLPUp projection (non-recompute path) - recipe handles all format decisions
@@ -1077,11 +1135,23 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                         const Tensor* cached_weight = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().mlp_up_weight : nullptr;
                         const int qidx = rs.has_fp8_delayed_scaling() ? get_quantizer_index(l, modules::QuantizerIndex::FWD_LN2) : -1;
 
+                        // FP4 cached weight (CUTLASS layout) for NVFP4Recipe
+                        const Tensor* fp4_data = nullptr;
+                        const Tensor* fp4_scales = nullptr;
+                        const float* fp4_amax = nullptr;
+                        if (mWeights->has_fp4_forward_cache()) {
+                            auto& fp4_cache = mWeights->fp4_weight_cache();
+                            fp4_data = &fp4_cache.mlp_up_weight.data;
+                            fp4_scales = &fp4_cache.mlp_up_weight.scales;
+                            fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 2;  // mlp_up at offset 2
+                        }
+
                         detail::recipe_forward_matmul(
                             *mRecipe, acts.mlp_up, acts.ln2, weights.mlp_up_weight,
                             nullptr, rs, (int)B, (int)T, (int)C, (int)(2 * D),
                             l, modules::MatmulOp::MLPUp,
-                            inp_quant, cached_weight, qidx, main_stream);
+                            inp_quant, cached_weight, qidx, main_stream,
+                            fp4_data, fp4_scales, fp4_amax);
                     }
 
                     if (hook) {
@@ -1118,11 +1188,23 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                         const Tensor* cached_weight = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().mlp_down_weight : nullptr;
                         const int qidx = rs.has_fp8_delayed_scaling() ? get_quantizer_index(l, modules::QuantizerIndex::FWD_SWIGLU) : -1;
 
+                        // FP4 cached weight (CUTLASS layout) for NVFP4Recipe
+                        const Tensor* fp4_data = nullptr;
+                        const Tensor* fp4_scales = nullptr;
+                        const float* fp4_amax = nullptr;
+                        if (mWeights->has_fp4_forward_cache()) {
+                            auto& fp4_cache = mWeights->fp4_weight_cache();
+                            fp4_data = &fp4_cache.mlp_down_weight.data;
+                            fp4_scales = &fp4_cache.mlp_down_weight.scales;
+                            fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 3;  // mlp_down at offset 3
+                        }
+
                         detail::recipe_forward_matmul(
                             *mRecipe, acts.mlp_down, acts.swiglu, weights.mlp_down_weight,
                             nullptr, rs, (int)B, (int)T, (int)D, (int)C,
                             l, modules::MatmulOp::MLPDown,
-                            inp_quant, cached_weight, qidx, main_stream);
+                            inp_quant, cached_weight, qidx, main_stream,
+                            fp4_data, fp4_scales, fp4_amax);
                     }
                 }
 
@@ -1844,12 +1926,24 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
         Tensor* inp_quant = rs.has_fp8_forward() ? &rs.fp8_forward_quants().ln1 : nullptr;
         const Tensor* cached_qkv = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().qkv_weight : nullptr;
 
+        // FP4 cached weight for recomputation
+        const Tensor* fp4_data = nullptr;
+        const Tensor* fp4_scales = nullptr;
+        const float* fp4_amax = nullptr;
+        if (mWeights->has_fp4_forward_cache()) {
+            auto& fp4_cache = mWeights->fp4_weight_cache();
+            fp4_data = &fp4_cache.qkv_weight.data;
+            fp4_scales = &fp4_cache.qkv_weight.scales;
+            fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 0;
+        }
+
         detail::recipe_forward_matmul(
             *mRecipe, a.qkv, a.ln1, weights.attention.qkv_weight,
             weights.attention.qkv_bias.has_value() ? &weights.attention.qkv_bias.value() : nullptr,
             rs, B, T, C, qkv_channels,
             layer_idx, modules::MatmulOp::QKV,
-            inp_quant, cached_qkv, /*delayed_quantizer_idx=*/-1, stream);
+            inp_quant, cached_qkv, /*delayed_quantizer_idx=*/-1, stream,
+            fp4_data, fp4_scales, fp4_amax);
 
         if (weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value()) {
             const int q_rows = Hq * Hs;
@@ -1898,12 +1992,24 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             Tensor* inp_quant = rs.has_fp8_forward() ? &rs.fp8_forward_quants().att : nullptr;
             const Tensor* cached_o = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().o_weight : nullptr;
 
+            // FP4 cached weight for recomputation
+            const Tensor* fp4_data = nullptr;
+            const Tensor* fp4_scales = nullptr;
+            const float* fp4_amax = nullptr;
+            if (mWeights->has_fp4_forward_cache()) {
+                auto& fp4_cache = mWeights->fp4_weight_cache();
+                fp4_data = &fp4_cache.o_weight.data;
+                fp4_scales = &fp4_cache.o_weight.scales;
+                fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 1;
+            }
+
             detail::recipe_forward_matmul(
                 *mRecipe, a.att_out, a.att, weights.attention.out_weight,
                 nullptr,
                 rs, B, T, Hq * Hs, C,
                 layer_idx, modules::MatmulOp::AttnOut,
-                inp_quant, cached_o, /*delayed_quantizer_idx=*/-1, stream);
+                inp_quant, cached_o, /*delayed_quantizer_idx=*/-1, stream,
+                fp4_data, fp4_scales, fp4_amax);
         }
     }
 
@@ -1941,12 +2047,24 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             Tensor* inp_quant = rs.has_fp8_forward() ? &rs.fp8_forward_quants().ln2 : nullptr;
             const Tensor* cached_mlp_up = mWeights->has_fp8_forward_cache() ? &mWeights->fp8_weight_cache().mlp_up_weight : nullptr;
 
+            // FP4 cached weight for recomputation
+            const Tensor* fp4_data = nullptr;
+            const Tensor* fp4_scales = nullptr;
+            const float* fp4_amax = nullptr;
+            if (mWeights->has_fp4_forward_cache()) {
+                auto& fp4_cache = mWeights->fp4_weight_cache();
+                fp4_data = &fp4_cache.mlp_up_weight.data;
+                fp4_scales = &fp4_cache.mlp_up_weight.scales;
+                fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 2;
+            }
+
             detail::recipe_forward_matmul(
                 *mRecipe, a.mlp_up, a.ln2, weights.mlp_up_weight,
                 nullptr,
                 rs, B, T, C, 2 * D,
                 layer_idx, modules::MatmulOp::MLPUp,
-                inp_quant, cached_mlp_up, /*delayed_quantizer_idx=*/-1, stream);
+                inp_quant, cached_mlp_up, /*delayed_quantizer_idx=*/-1, stream,
+                fp4_data, fp4_scales, fp4_amax);
         }
     }
 

@@ -106,6 +106,10 @@ public:
 
         // FP8 forward-only mode: cache FP8 weights for forward pass
         bool enable_fp8_forward = false;
+
+        // FP4 forward-only mode: cache FP4 weights for forward pass (CUTLASS layout)
+        // Optimizes datacenter GPUs where weight quantization overhead dominates
+        bool enable_fp4_forward = false;
     };
 
     /**
@@ -130,6 +134,28 @@ public:
         Tensor o_weight;        ///< FP8 E4M3, (C, Hq*Hs)
         Tensor mlp_up_weight;   ///< FP8 E4M3, (2*D, C)
         Tensor mlp_down_weight; ///< FP8 E4M3, (C, D)
+    };
+
+    /**
+     * @brief Cached FP4 weights for a single layer (CUTLASS layout).
+     *
+     * Pre-quantized weights eliminate the per-forward quantization overhead,
+     * which is critical for datacenter GPUs (B200) where matmul is fast.
+     * Each weight stores: FP4 data + block scales (FP8 E4M3) + global amax.
+     *
+     * The alpha correction factor is computed from (inp_amax * cached_weight_amax).
+     */
+    struct FP4WeightCacheEntry {
+        Tensor data;        ///< FP4 packed data, shape (N, K/2)
+        Tensor scales;      ///< Block scales, FP8 E4M3, CUTLASS layout
+        float global_amax;  ///< Global amax used during quantization (host value)
+    };
+
+    struct FP4WeightCache {
+        FP4WeightCacheEntry qkv_weight;
+        FP4WeightCacheEntry o_weight;
+        FP4WeightCacheEntry mlp_up_weight;
+        FP4WeightCacheEntry mlp_down_weight;
     };
 
     ModularWeightManager(const Config& config, TensorAllocator& allocator);
@@ -309,6 +335,45 @@ public:
     }
 
     // ========================================================================
+    // FP4 Forward Weight Cache (for datacenter GPU optimization)
+    // ========================================================================
+
+    /**
+     * @brief Check if FP4 forward weight caching is enabled
+     *
+     * When enabled, weights are pre-quantized to FP4 with CUTLASS layout,
+     * eliminating per-forward quantization overhead.
+     */
+    [[nodiscard]] bool has_fp4_forward_cache() const {
+        return mConfig.enable_fp4_forward;
+    }
+
+    /**
+     * @brief Get the FP4 weight cache for the current layer
+     *
+     * The cache contains pre-quantized FP4 weights (data + scales + global_amax).
+     * Valid only after get_block() is called for the same layer.
+     */
+    [[nodiscard]] FP4WeightCache& fp4_weight_cache() {
+        return mFP4WeightCache;
+    }
+    [[nodiscard]] const FP4WeightCache& fp4_weight_cache() const {
+        return mFP4WeightCache;
+    }
+
+    /**
+     * @brief Get the FP4 weight global amax tensor
+     *
+     * Contains 4 floats: [qkv_amax, o_amax, mlp_up_amax, mlp_down_amax]
+     */
+    [[nodiscard]] Tensor& fp4_weight_amax() {
+        return mFP4WeightAmax;
+    }
+    [[nodiscard]] const Tensor& fp4_weight_amax() const {
+        return mFP4WeightAmax;
+    }
+
+    // ========================================================================
     // Weight injection for QLoRA
     // ========================================================================
 
@@ -415,6 +480,13 @@ private:
     Tensor mFP8WeightStats{};          ///< Stats buffer for FP8 weights (4 pairs = 8 floats for abs_max/scale)
     int mFP8CacheLayerIdx = -1;        ///< Which layer is currently in the FP8 cache
 
+    // FP4 forward weight cache (when enable_fp4_forward=true)
+    // Holds FP4 quantized weights with CUTLASS layout for fast forward pass matmuls.
+    // Optimizes datacenter GPUs where weight quantization overhead dominates.
+    FP4WeightCache mFP4WeightCache{};
+    Tensor mFP4WeightAmax{};           ///< Device buffer for global amax values (4 floats)
+    int mFP4CacheLayerIdx = -1;        ///< Which layer is currently in the FP4 cache
+
     // Cache versioning
     int mVersion = 0;
 
@@ -426,6 +498,9 @@ private:
 
     // FP8 weight cache helpers
     void quantize_weights_to_fp8_cache(const BlockWeights& src, cudaStream_t stream);
+
+    // FP4 weight cache helpers
+    void quantize_weights_to_fp4_cache(const BlockWeights& src, cudaStream_t stream);
 };
 
 // ============================================================================
@@ -684,6 +759,56 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         if constexpr (has_mlp_weights<BlockWeights>::value) {
             mFP8WeightCache.mlp_up_weight.Stats = stats + 4;   // [4], [5]
             mFP8WeightCache.mlp_down_weight.Stats = stats + 6; // [6], [7]
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // FP4 forward weight cache (when enable_fp4_forward=true)
+    // ------------------------------------------------------------------------
+    // Allocate FP4 weight buffers with CUTLASS-compatible scale layout.
+    // This eliminates per-forward weight quantization overhead on datacenter GPUs.
+    if (config.enable_fp4_forward) {
+        const auto& bc = config.block_config;
+        const long C = bc.hidden_size;
+        const long Hq = bc.num_query_heads;
+        const long Hkv = bc.num_kv_heads;
+        const long Hs = bc.head_size;
+        const long D = bc.intermediate_size;
+        const long QKV_C = (Hq + 2 * Hkv) * Hs;
+
+        // Amax buffer: 4 floats for global amax values
+        mFP4WeightAmax = mAllocator->allocate(ETensorDType::FP32, "fp4_weight_amax", EAllocationType::ON_DEVICE, {4});
+
+        // Helper to compute CUTLASS scale size
+        auto cutlass_scale_size = [](long rows, long cols) -> long {
+            constexpr int kBlockSize = 16;
+            constexpr int kTileDim = 128;
+            long num_scale_cols = (cols + kBlockSize - 1) / kBlockSize;
+            long aligned_rows = ((rows + kTileDim - 1) / kTileDim) * kTileDim;
+            long aligned_cols = ((num_scale_cols + 3) / 4) * 4;
+            return aligned_rows * aligned_cols;
+        };
+
+        // QKV weight: (QKV_C, C)
+        long qkv_scale_size = cutlass_scale_size(QKV_C, C);
+        mFP4WeightCache.qkv_weight.data = mAllocator->allocate(ETensorDType::BYTE, "fp4_qkv_data", EAllocationType::ON_DEVICE, {QKV_C, C / 2});
+        mFP4WeightCache.qkv_weight.scales = mAllocator->allocate(ETensorDType::BYTE, "fp4_qkv_scales", EAllocationType::ON_DEVICE, {qkv_scale_size});
+
+        // O weight: (C, Hq*Hs)
+        long o_scale_size = cutlass_scale_size(C, Hq * Hs);
+        mFP4WeightCache.o_weight.data = mAllocator->allocate(ETensorDType::BYTE, "fp4_o_data", EAllocationType::ON_DEVICE, {C, (Hq * Hs) / 2});
+        mFP4WeightCache.o_weight.scales = mAllocator->allocate(ETensorDType::BYTE, "fp4_o_scales", EAllocationType::ON_DEVICE, {o_scale_size});
+
+        if constexpr (has_mlp_weights<BlockWeights>::value) {
+            // MLP up weight: (2*D, C)
+            long mlp_up_scale_size = cutlass_scale_size(2 * D, C);
+            mFP4WeightCache.mlp_up_weight.data = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_up_data", EAllocationType::ON_DEVICE, {2 * D, C / 2});
+            mFP4WeightCache.mlp_up_weight.scales = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_up_scales", EAllocationType::ON_DEVICE, {mlp_up_scale_size});
+
+            // MLP down weight: (C, D)
+            long mlp_down_scale_size = cutlass_scale_size(C, D);
+            mFP4WeightCache.mlp_down_weight.data = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_down_data", EAllocationType::ON_DEVICE, {C, D / 2});
+            mFP4WeightCache.mlp_down_weight.scales = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_down_scales", EAllocationType::ON_DEVICE, {mlp_down_scale_size});
         }
     }
 }
@@ -1091,6 +1216,14 @@ typename Block::Weights& ModularWeightManager<Block>::get_block(int layer_idx, c
     if (mConfig.enable_fp8_forward && mFP8CacheLayerIdx != layer_idx) {
         quantize_weights_to_fp8_cache(*result, stream);
         mFP8CacheLayerIdx = layer_idx;
+    }
+
+    // Quantize weights to FP4 cache if FP4 forward mode is enabled.
+    // Pre-quantized FP4 weights eliminate per-forward quantization overhead
+    // on datacenter GPUs (B200) where quantization dominates runtime.
+    if (mConfig.enable_fp4_forward && mFP4CacheLayerIdx != layer_idx) {
+        quantize_weights_to_fp4_cache(*result, stream);
+        mFP4CacheLayerIdx = layer_idx;
     }
 
     return *result;
@@ -2194,6 +2327,69 @@ void ModularWeightManager<Block>::quantize_weights_to_fp8_cache(const BlockWeigh
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         quantize_weight(src.mlp_up_weight, mFP8WeightCache.mlp_up_weight);
         quantize_weight(src.mlp_down_weight, mFP8WeightCache.mlp_down_weight);
+    }
+}
+
+template<typename Block>
+void ModularWeightManager<Block>::quantize_weights_to_fp4_cache(const BlockWeights& src, cudaStream_t stream) {
+    // Skip if FP4 forward caching is not enabled
+    if (!mConfig.enable_fp4_forward || !mFP4WeightCache.qkv_weight.data.Data) {
+        return;
+    }
+
+    const auto& cfg = mConfig.block_config;
+    const int C = static_cast<int>(cfg.hidden_size);
+    const int Hq = static_cast<int>(cfg.num_query_heads);
+    const int Hkv = static_cast<int>(cfg.num_kv_heads);
+    const int Hs = static_cast<int>(cfg.head_size);
+    const int D = static_cast<int>(cfg.intermediate_size);
+    const int QKV_C = (Hq + 2 * Hkv) * Hs;
+
+    // Helper lambda to quantize a single weight tensor to FP4 (CUTLASS layout)
+    // Weight shape is (N, K) where N is output channels, K is input channels
+    auto quantize_fp4_weight = [&](const Tensor& bf16_weight, FP4WeightCacheEntry& fp4_cache,
+                                   int N, int K) {
+        if (!bf16_weight.Data || !fp4_cache.data.Data) return;
+
+        // Only support BF16 source weights for now
+        if (bf16_weight.DType != ETensorDType::BF16) {
+            return;
+        }
+
+        // Use global amax buffer: 4 floats for qkv, o, mlp_up, mlp_down
+        float* amax_ptr = mFP4WeightAmax.template get<float>();
+        int amax_offset = 0;
+        if (&fp4_cache == &mFP4WeightCache.qkv_weight) amax_offset = 0;
+        else if (&fp4_cache == &mFP4WeightCache.o_weight) amax_offset = 1;
+        else if constexpr (has_mlp_weights<BlockWeights>::value) {
+            if (&fp4_cache == &mFP4WeightCache.mlp_up_weight) amax_offset = 2;
+            else if (&fp4_cache == &mFP4WeightCache.mlp_down_weight) amax_offset = 3;
+        }
+
+        // Quantize to FP4 using CUTLASS-compatible layout
+        // Output: packed FP4 data (N, K/2), block scales (FP8 E4M3), global amax
+        quantize_nvfp4_weight_cutlass_auto_scale(
+            fp4_cache.data.template get<uint8_t>(),
+            fp4_cache.scales.template get<uint8_t>(),
+            amax_ptr + amax_offset,
+            bf16_weight.template get<nv_bfloat16>(),
+            N, K,
+            mDeviceProp, stream);
+    };
+
+    // Quantize all weight tensors to FP4 cache
+    // QKV weight: (QKV_C, C) where QKV_C = (Hq + 2*Hkv) * Hs
+    quantize_fp4_weight(src.attention.qkv_weight, mFP4WeightCache.qkv_weight, QKV_C, C);
+
+    // O weight: (C, Hq*Hs)
+    quantize_fp4_weight(src.attention.out_weight, mFP4WeightCache.o_weight, C, Hq * Hs);
+
+    if constexpr (has_mlp_weights<BlockWeights>::value) {
+        // MLP up weight: (2*D, C) - gate+up fused
+        quantize_fp4_weight(src.mlp_up_weight, mFP4WeightCache.mlp_up_weight, 2 * D, C);
+
+        // MLP down weight: (C, D)
+        quantize_fp4_weight(src.mlp_down_weight, mFP4WeightCache.mlp_down_weight, C, D);
     }
 }
 

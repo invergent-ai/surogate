@@ -527,7 +527,7 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     // CUTLASS FP4 forward matmul with two-level scaling
     //
     // Optimized path using alpha-in-epilogue fusion:
-    // 1. Compute global amax for input and weight
+    // 1. Compute global amax for input and weight (or use cached weight)
     // 2. Bake global encode scale into block scales
     // 3. Compute alpha on device from amaxes
     // 4. Execute FP4 x FP4 GEMM via CUTLASS with alpha fused in epilogue (direct BF16 output)
@@ -537,6 +537,11 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     const int BT = ctx.B * ctx.T;
     const int C_in = ctx.C_in;
     const int C_out = ctx.C_out;
+
+    // Check if we have cached FP4 weights (eliminates weight quantization overhead)
+    const bool use_cached_weight = (ctx.cached_fp4_data != nullptr &&
+                                    ctx.cached_fp4_scales != nullptr &&
+                                    ctx.cached_fp4_amax != nullptr);
 
     // Step 1: Allocate FP4 input buffers with CUTLASS scale layout
     const size_t inp_scale_size = compute_nvfp4_cutlass_scale_size(BT, C_in);
@@ -553,26 +558,47 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
         BT, C_in,
         rs.DeviceProp, ctx.stream);
 
-    // Step 3: Allocate and quantize weight to FP4 with two-level scaling
-    const size_t weight_scale_size = compute_nvfp4_cutlass_scale_size(C_out, C_in);
-    Tensor weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)});
-    Tensor weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)});
-    Tensor weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+    // Step 3: Get FP4 weight (cached or quantize on-the-fly)
+    const uint8_t* weight_fp4_data_ptr;
+    const uint8_t* weight_fp4_scales_ptr;
+    const float* weight_amax_ptr;
 
-    quantize_nvfp4_weight_cutlass_auto_scale(
-        weight_fp4_data.get<uint8_t>(),
-        weight_fp4_scales.get<uint8_t>(),
-        weight_global_amax.get<float>(),
-        ctx.weight->get<nv_bfloat16>(),
-        C_out, C_in,
-        rs.DeviceProp, ctx.stream);
+    // Temporaries for on-the-fly quantization (only allocated if not using cache)
+    Tensor weight_fp4_data{};
+    Tensor weight_fp4_scales{};
+    Tensor weight_global_amax{};
+
+    if (use_cached_weight) {
+        // Use pre-quantized cached weights (eliminates 2 quantization kernels per matmul)
+        weight_fp4_data_ptr = ctx.cached_fp4_data->get<uint8_t>();
+        weight_fp4_scales_ptr = ctx.cached_fp4_scales->get<uint8_t>();
+        weight_amax_ptr = ctx.cached_fp4_amax;
+    } else {
+        // Quantize weight on-the-fly (original path)
+        const size_t weight_scale_size = compute_nvfp4_cutlass_scale_size(C_out, C_in);
+        weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)});
+        weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)});
+        weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+
+        quantize_nvfp4_weight_cutlass_auto_scale(
+            weight_fp4_data.get<uint8_t>(),
+            weight_fp4_scales.get<uint8_t>(),
+            weight_global_amax.get<float>(),
+            ctx.weight->get<nv_bfloat16>(),
+            C_out, C_in,
+            rs.DeviceProp, ctx.stream);
+
+        weight_fp4_data_ptr = weight_fp4_data.get<uint8_t>();
+        weight_fp4_scales_ptr = weight_fp4_scales.get<uint8_t>();
+        weight_amax_ptr = weight_global_amax.get<float>();
+    }
 
     // Step 4: Compute alpha on device: alpha = (amax_a * amax_b) / (6^2 * 448^2)
     Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
     compute_fp4_alpha(
         alpha.get<float>(),
         inp_global_amax.get<float>(),
-        weight_global_amax.get<float>(),
+        weight_amax_ptr,
         ctx.stream);
 
     // Step 5: Execute FP4 matmul with alpha fused in CUTLASS epilogue (direct BF16 output)
@@ -583,9 +609,9 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     matmul_cutlass_fp4_alpha(
         ctx.out->get<nv_bfloat16>(),
         inp_fp4_data.get<uint8_t>(),      // A = input (BT, C_in)
-        weight_fp4_data.get<uint8_t>(),   // B = weight (C_out, C_in) as column-major
+        weight_fp4_data_ptr,               // B = weight (C_out, C_in) as column-major
         inp_fp4_scales.get<uint8_t>(),
-        weight_fp4_scales.get<uint8_t>(),
+        weight_fp4_scales_ptr,
         alpha.get<float>(),
         rs.CuBlasWorkspace.get<std::byte>(),
         rs.CuBlasWorkspace.bytes(),
@@ -600,9 +626,11 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
 
     // Step 7: Free temporary buffers (LIFO order)
     rs.temp_free(alpha);
-    rs.temp_free(weight_global_amax);
-    rs.temp_free(weight_fp4_scales);
-    rs.temp_free(weight_fp4_data);
+    if (!use_cached_weight) {
+        rs.temp_free(weight_global_amax);
+        rs.temp_free(weight_fp4_scales);
+        rs.temp_free(weight_fp4_data);
+    }
     rs.temp_free(inp_global_amax);
     rs.temp_free(inp_fp4_scales);
     rs.temp_free(inp_fp4_data);

@@ -121,8 +121,13 @@ struct MatmulContext {
     // =========================================================================
 
     Tensor* inp_quant = nullptr;     ///< Pre-allocated quant buffer for input (FP8/FP4)
-    const Tensor* cached_weight = nullptr;  ///< Cached quantized weight (optional)
+    const Tensor* cached_weight = nullptr;  ///< Cached quantized weight (FP8, optional)
     int delayed_quantizer_idx = -1;  ///< Quantizer index for delayed scaling (-1 = JIT scaling)
+
+    // FP4 cached weight (CUTLASS layout) - used by NVFP4Recipe when available
+    const Tensor* cached_fp4_data = nullptr;    ///< Cached FP4 packed data (N, K/2)
+    const Tensor* cached_fp4_scales = nullptr;  ///< Cached FP4 block scales (FP8 E4M3, CUTLASS layout)
+    const float* cached_fp4_amax = nullptr;     ///< Pointer to cached global amax (device memory)
 
     // =========================================================================
     // Backward-specific quantization buffers (for FP8 hybrid backward)
