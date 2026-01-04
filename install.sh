@@ -3,6 +3,13 @@
 
 set -e
 
+# Ensure HOME is set (cloud-init and minimal environments may not have it)
+if [ -z "$HOME" ]; then
+    export HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+    # Fallback to /root if running as root
+    [ -z "$HOME" ] && [ "$(id -u)" -eq 0 ] && export HOME="/root"
+fi
+
 REPO="invergent-ai/surogate"
 VENV_DIR=".venv"
 
@@ -38,7 +45,12 @@ fi
 # Create virtual environment with Python 3.12 if it doesn't exist
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment with Python 3.12..."
+    echo "Using uv at: $(which uv)"
     uv venv --python 3.12 "$VENV_DIR"
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "Error: Failed to create virtual environment at $VENV_DIR"
+        exit 1
+    fi
 else
     echo "Using existing virtual environment: $VENV_DIR"
 fi
