@@ -5,11 +5,10 @@
  * @file matmul_cutlass_fp4_sm100.cu
  * @brief CUTLASS-based FP4 GEMM kernels for SM100 (Blackwell B200)
  *
- * SM100 uses Sm100 architecture with MXF4 kernel schedules. Key constraints:
- * - Tile K dimension is 256
- * - Scale factor type is float_ue8m0_t
- * - Uses tuple<float_e2m1_t, float_ue8m0_t> element type format
- * - Kernel schedules: KernelTmaWarpSpecialized1SmMxf4Sm100, KernelTmaWarpSpecialized2SmMxf4Sm100
+ * SM100 uses Sm100 architecture with NVFP4 kernel schedules. Key constraints:
+ * - Uses nv_float4_t<float_e2m1_t> element type (same as SM120)
+ * - Scale factor type is float_ue4m3_t (NVFP4 format, 16-element blocks)
+ * - Kernel schedules: KernelTmaWarpSpecialized1SmNvf4Sm100, KernelTmaWarpSpecialized2SmNvf4Sm100
  */
 
 #include <cuda_runtime.h>
@@ -38,9 +37,9 @@ namespace {
 
 namespace sm100_fp4 {
 
-// SM100 requires tuple format for element types with scale factor
-using ElementA = cute::tuple<cutlass::float_e2m1_t, cutlass::float_ue8m0_t>;
-using ElementB = cute::tuple<cutlass::float_e2m1_t, cutlass::float_ue8m0_t>;
+// SM100 uses nv_float4_t wrapper (same as SM120) with ue4m3 scale factors
+using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 using ElementC = cutlass::bfloat16_t;
 using ElementD = cutlass::bfloat16_t;
 using ElementAccumulator = float;
@@ -61,26 +60,26 @@ constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ArchTag = cutlass::arch::Sm100;
 using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-// SM100 uses K=256 for FP4 tile configurations
-constexpr int TileK = 256;
+// SM100 tile K dimension (NVFP4)
+constexpr int TileK = 128;
 
 // ============================================================================
-// 1SM Tile configuration: 128x128x256, cluster 4x2x1
-// Used for smaller problem sizes
+// 1SM Tile configuration: 128x128x128, cluster 1x1x1
+// SM100 uses 1x1x1 cluster like SM120 (no multicast TMA)
 // ============================================================================
 
 namespace config_1sm {
 using TileShape = cute::Shape<cute::_128, cute::_128, cute::Int<TileK>>;
-using ClusterShape = cute::Shape<cute::_4, cute::_2, cute::_1>;
+using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, cutlass::arch::OpClassTensorOp,
+    ArchTag, OperatorClass,
     TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccumulator, ElementAccumulator,
     ElementC, LayoutCTag, AlignmentC,
     ElementD, LayoutDTag, AlignmentD,
-    cutlass::epilogue::TmaWarpSpecialized1Sm
+    cutlass::epilogue::collective::EpilogueScheduleAuto
 >::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -91,35 +90,36 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecialized1SmMxf4Sm100
+    cutlass::gemm::collective::KernelScheduleAuto
 >::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue>;
+    CollectiveEpilogue,
+    void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace config_1sm
 
 // ============================================================================
-// 2SM Tile configuration: 256x256x256, cluster 4x2x1
-// Used for larger problem sizes with 2-SM cooperative execution
+// 2SM Tile configuration: 128x256x128, cluster 1x1x1
+// SM100 MXF4/NVF4 with 1-CTA cluster requires M=128, so we increase N instead
+// Used for larger N dimensions
 // ============================================================================
 
 namespace config_2sm {
-using TileShape = cute::Shape<cute::_256, cute::_256, cute::Int<TileK>>;
-using ClusterShape = cute::Shape<cute::_4, cute::_2, cute::_1>;
-using EpilogueTileShape = cute::Shape<cute::_128, cute::_64>;
+using TileShape = cute::Shape<cute::_128, cute::_256, cute::Int<TileK>>;
+using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, cutlass::arch::OpClassTensorOp,
+    ArchTag, OperatorClass,
     TileShape, ClusterShape,
-    EpilogueTileShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccumulator, ElementAccumulator,
     ElementC, LayoutCTag, AlignmentC,
     ElementD, LayoutDTag, AlignmentD,
-    cutlass::epilogue::TmaWarpSpecialized2Sm
+    cutlass::epilogue::collective::EpilogueScheduleAuto
 >::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -130,13 +130,14 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecialized2SmMxf4Sm100
+    cutlass::gemm::collective::KernelScheduleAuto
 >::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue>;
+    CollectiveEpilogue,
+    void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace config_2sm
@@ -149,22 +150,22 @@ namespace fp32_out {
 
 using ElementC_F32 = float;
 using ElementD_F32 = float;
-constexpr int AlignmentC_F32 = 4;
-constexpr int AlignmentD_F32 = 4;
+constexpr int AlignmentC_F32 = 128 / cutlass::sizeof_bits<ElementC_F32>::value;
+constexpr int AlignmentD_F32 = 128 / cutlass::sizeof_bits<ElementD_F32>::value;
 
 // 1SM FP32 output
 namespace config_1sm {
 using TileShape = cute::Shape<cute::_128, cute::_128, cute::Int<TileK>>;
-using ClusterShape = cute::Shape<cute::_4, cute::_2, cute::_1>;
+using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, cutlass::arch::OpClassTensorOp,
+    ArchTag, OperatorClass,
     TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccumulator, ElementAccumulator,
-    void, LayoutCTag, AlignmentC_F32,
+    ElementC_F32, LayoutCTag, AlignmentC_F32,
     ElementD_F32, LayoutDTag, AlignmentD_F32,
-    cutlass::epilogue::TmaWarpSpecialized1Sm
+    cutlass::epilogue::collective::EpilogueScheduleAuto
 >::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -175,31 +176,31 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecialized1SmMxf4Sm100
+    cutlass::gemm::collective::KernelScheduleAuto
 >::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue>;
+    CollectiveEpilogue,
+    void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace config_1sm
 
-// 2SM FP32 output
+// 2SM FP32 output (M=128, N=256 due to SM100 constraint)
 namespace config_2sm {
-using TileShape = cute::Shape<cute::_256, cute::_256, cute::Int<TileK>>;
-using ClusterShape = cute::Shape<cute::_4, cute::_2, cute::_1>;
-using EpilogueTileShape = cute::Shape<cute::_128, cute::_64>;
+using TileShape = cute::Shape<cute::_128, cute::_256, cute::Int<TileK>>;
+using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, cutlass::arch::OpClassTensorOp,
+    ArchTag, OperatorClass,
     TileShape, ClusterShape,
-    EpilogueTileShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccumulator, ElementAccumulator,
-    void, LayoutCTag, AlignmentC_F32,
+    ElementC_F32, LayoutCTag, AlignmentC_F32,
     ElementD_F32, LayoutDTag, AlignmentD_F32,
-    cutlass::epilogue::TmaWarpSpecialized2Sm
+    cutlass::epilogue::collective::EpilogueScheduleAuto
 >::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -210,13 +211,14 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecialized2SmMxf4Sm100
+    cutlass::gemm::collective::KernelScheduleAuto
 >::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue>;
+    CollectiveEpilogue,
+    void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace config_2sm
@@ -253,13 +255,13 @@ void run_gemm(
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
-        {reinterpret_cast<const cutlass::float_e2m1_t*>(a),
+        {reinterpret_cast<const typename ElementA::DataType*>(a),
          stride_A,
-         reinterpret_cast<const cutlass::float_e2m1_t*>(b),
+         reinterpret_cast<const typename ElementB::DataType*>(b),
          stride_B,
-         reinterpret_cast<const cutlass::float_ue8m0_t*>(scale_a),
+         reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
          layout_SFA,
-         reinterpret_cast<const cutlass::float_ue8m0_t*>(scale_b),
+         reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
          layout_SFB},
         {{1.0f, 0.0f},
          nullptr,
@@ -282,6 +284,12 @@ void run_gemm(
     status = gemm_op.run(stream);
     if (status != cutlass::Status::kSuccess) {
         throw std::runtime_error("CUTLASS FP4 SM100 GEMM execution failed");
+    }
+
+    cudaError_t cuda_err = cudaPeekAtLastError();
+    if (cuda_err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUTLASS FP4 SM100 GEMM launch failed: ") +
+                                 cudaGetErrorString(cuda_err));
     }
 }
 
@@ -316,21 +324,22 @@ void run_gemm_alpha_ptr(
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
-        {reinterpret_cast<const cutlass::float_e2m1_t*>(a),
+        {reinterpret_cast<const typename ElementA::DataType*>(a),
          stride_A,
-         reinterpret_cast<const cutlass::float_e2m1_t*>(b),
+         reinterpret_cast<const typename ElementB::DataType*>(b),
          stride_B,
-         reinterpret_cast<const cutlass::float_ue8m0_t*>(scale_a),
+         reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
          layout_SFA,
-         reinterpret_cast<const cutlass::float_ue8m0_t*>(scale_b),
+         reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
          layout_SFB},
-        {{},
+        {{},  // Default epilogue args, will set alpha_ptr below
          nullptr,
          stride_C,
          reinterpret_cast<ElementD*>(d),
          stride_D}
     };
 
+    // Set alpha_ptr for device-side alpha reading
     args.epilogue.thread.alpha_ptr = alpha_ptr;
 
     Gemm gemm_op;
@@ -386,13 +395,13 @@ void run_gemm_f32(
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
-        {reinterpret_cast<const cutlass::float_e2m1_t*>(a),
+        {reinterpret_cast<const typename ElementA::DataType*>(a),
          stride_A,
-         reinterpret_cast<const cutlass::float_e2m1_t*>(b),
+         reinterpret_cast<const typename ElementB::DataType*>(b),
          stride_B,
-         reinterpret_cast<const cutlass::float_ue8m0_t*>(scale_a),
+         reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
          layout_SFA,
-         reinterpret_cast<const cutlass::float_ue8m0_t*>(scale_b),
+         reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
          layout_SFB},
         {{1.0f, 0.0f},
          nullptr,
@@ -440,10 +449,11 @@ void matmul_cutlass_fp4_sm100(
     int M, int N, int K,
     cudaStream_t stream)
 {
-    // SM100 tile selection based on problem size:
-    // - Small problems (M*N <= 256*256): 1SM kernel with 128x128x256 tiles
-    // - Large problems: 2SM kernel with 256x256x256 tiles for better throughput
-    if (M <= 256 && N <= 256) {
+    // N-based tile selection for SM100:
+    // SM100 NVF4 with 1-CTA cluster requires M=128, so we can only vary N
+    // - Small N (<512): 128x128x128
+    // - Large N (>=512): 128x256x128 - better throughput for large output dimensions
+    if (N < 512) {
         sm100_fp4::run_gemm<sm100_fp4::config_1sm::Gemm>(
             d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
     } else {
@@ -460,7 +470,8 @@ void matmul_cutlass_fp4_sm100_f32(
     int M, int N, int K,
     cudaStream_t stream)
 {
-    if (M <= 256 && N <= 256) {
+    // FP32 output variant - N-based tile selection (same as BF16 variant)
+    if (N < 512) {
         sm100_fp4::run_gemm_f32<sm100_fp4::fp32_out::config_1sm::Gemm>(
             d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
     } else {
@@ -478,7 +489,8 @@ void matmul_cutlass_fp4_sm100_alpha(
     int M, int N, int K,
     cudaStream_t stream)
 {
-    if (M <= 256 && N <= 256) {
+    // Alpha-scaled BF16 output - N-based tile selection (same as other variants)
+    if (N < 512) {
         sm100_fp4::run_gemm_alpha_ptr<sm100_fp4::config_1sm::Gemm>(
             d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
     } else {

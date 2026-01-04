@@ -806,6 +806,55 @@ void dequantize_nvfp4_cutlass(Tensor& out, const Tensor& in_fp4,
                                const cudaDeviceProp& dp, cudaStream_t stream);
 
 // ============================================================================
+// Four Over Six (4/6) NVFP4 Quantization (CUTLASS layout)
+// ============================================================================
+//
+// Implements adaptive block scaling from arXiv:2512.02010:
+// "Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling"
+//
+// For each block, evaluates both max=6.0 and max=4.0 scaling, selecting the
+// option with lower quantization error. This improves representation of
+// near-maximal values where FP4's coarse quantization step (4→6) causes high error.
+
+// Forward declaration of error metric enum (defined in nvfp4_recipe.h)
+namespace recipes { enum class FourOverSixErrorMetric; }
+
+/// @brief Four Over Six NVFP4 quantization with CUTLASS-compatible scale layout.
+/// @param[out] out_fp4 Output packed FP4 data (M, K/2 bytes).
+/// @param[out] block_scales Output UE4M3 block scales in CUTLASS layout.
+/// @param[out] global_amax Output per-tensor absolute maximum.
+/// @param[in] in Input BF16 data (M, K).
+/// @param M Number of rows.
+/// @param K Number of columns.
+/// @param error_metric Error metric for 4/6 block selection (MSE, L1, AbsMax).
+void quantize_nvfp4_4o6_cutlass_auto_scale(uint8_t* out_fp4, uint8_t* block_scales,
+                                            float* global_amax, const nv_bfloat16* in,
+                                            int M, int K,
+                                            recipes::FourOverSixErrorMetric error_metric,
+                                            const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Four Over Six NVFP4 stochastic quantization with CUTLASS layout (for gradients).
+void quantize_nvfp4_4o6_stochastic_cutlass_auto_scale(uint8_t* out_fp4, uint8_t* block_scales,
+                                                       float* global_amax, const nv_bfloat16* in,
+                                                       int M, int K,
+                                                       recipes::FourOverSixErrorMetric error_metric,
+                                                       unsigned int seed,
+                                                       const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Tensor-based Four Over Six NVFP4 quantization with CUTLASS layout.
+void quantize_nvfp4_4o6_cutlass(Tensor& out_fp4, Tensor& block_scales, Tensor& global_amax,
+                                 const Tensor& in,
+                                 recipes::FourOverSixErrorMetric error_metric,
+                                 const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Tensor-based Four Over Six NVFP4 stochastic quantization with CUTLASS layout.
+void quantize_nvfp4_4o6_stochastic_cutlass(Tensor& out_fp4, Tensor& block_scales, Tensor& global_amax,
+                                            const Tensor& in,
+                                            recipes::FourOverSixErrorMetric error_metric,
+                                            unsigned int seed,
+                                            const cudaDeviceProp& dp, cudaStream_t stream);
+
+// ============================================================================
 // CUTLASS FP4 GEMM Operations (Blackwell-only: SM100+)
 // ============================================================================
 

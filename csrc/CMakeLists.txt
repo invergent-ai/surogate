@@ -265,6 +265,7 @@ target_sources(surogate-common PRIVATE
     src/recipes/nvfp4/kernels/hadamard.cu
     src/recipes/nvfp4/kernels/matmul_fp4_cudnn.cpp
     src/recipes/nvfp4/kernels/quant_nvfp4_cutlass.cu
+    src/recipes/nvfp4/kernels/quant_nvfp4_4o6.cu
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4.cu
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm100.cu
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm103.cu

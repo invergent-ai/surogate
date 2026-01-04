@@ -10,6 +10,18 @@
 namespace recipes {
 
 /**
+ * @brief Error metric for Four Over Six adaptive block scaling.
+ *
+ * Determines how quantization error is measured when selecting between
+ * scaling to 4.0 vs 6.0 for each block.
+ */
+enum class FourOverSixErrorMetric {
+    MSE,      ///< Mean squared error (default, best for training)
+    L1,       ///< L1 norm (sum of absolute errors)
+    AbsMax    ///< Maximum absolute error
+};
+
+/**
  * @brief NVFP4 block-scaled recipe for FP4 training.
  *
  * Uses FP4 E2M1 with two-level block scaling for extreme memory efficiency
@@ -23,6 +35,12 @@ namespace recipes {
  * 1. 2D block scaling for weights (16x16 blocks)
  * 2. Stochastic rounding for gradients (avoids quantization bias)
  * 3. Random Hadamard Transform (RHT) for inputs/gradients (spreads outliers)
+ *
+ * Four Over Six (4/6) Adaptive Block Scaling:
+ * Based on "Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling"
+ * (arXiv:2512.02010). For each block, evaluates both scaling to max=6.0 and max=4.0,
+ * selecting the option with lower quantization error. This improves representation
+ * of near-maximal values where FP4's large quantization step (4→6) causes high error.
  *
  * FP4 E2M1 format:
  * - Values: ±{0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
@@ -46,6 +64,10 @@ public:
         int skip_quant_first_layers = 0;         ///< Skip quantization for first N layers (embedding)
         int skip_quant_last_layers = 0;          ///< Skip quantization for last N layers (lm_head)
         EMatmulBackend backend = EMatmulBackend::CUBLASLT;  ///< cuDNN (CUBLASLT) or CUTLASS
+
+        // Four Over Six (4/6) Adaptive Block Scaling options
+        bool enable_four_over_six = false;       ///< Enable 4/6 adaptive block scaling
+        FourOverSixErrorMetric four_over_six_metric = FourOverSixErrorMetric::MSE;  ///< Error metric for 4/6 selection
     };
 
     NVFP4Recipe() : mConfig{} {}
@@ -106,10 +128,19 @@ public:
     [[nodiscard]] EMatmulBackend matmul_backend() const override { return mConfig.backend; }
 
     [[nodiscard]] std::string_view name() const override {
+        if (mConfig.enable_four_over_six) {
+            return mConfig.backend == EMatmulBackend::CUTLASS ? "nvfp4-4o6-cutlass" : "nvfp4-4o6";
+        }
         return mConfig.backend == EMatmulBackend::CUTLASS ? "nvfp4-cutlass" : "nvfp4";
     }
 
     [[nodiscard]] const Config& config() const { return mConfig; }
+
+    /// @brief Check if Four Over Six adaptive block scaling is enabled
+    [[nodiscard]] bool uses_four_over_six() const { return mConfig.enable_four_over_six; }
+
+    /// @brief Get the error metric for Four Over Six selection
+    [[nodiscard]] FourOverSixErrorMetric four_over_six_metric() const { return mConfig.four_over_six_metric; }
 
     // =========================================================================
     // Recipe-driven dispatch (Phase 7)
