@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-4B
 #model_type: qwen3
 output_dir: ./output
 merge_adapter: false
@@ -15,9 +15,9 @@ save_steps: 1000
 
 learning_rate: 2e-4
 
-recipe: fp8-hybrid
+recipe: bf16
 qlora_fp4: true
-fp4_backend: cutlass
+lmhead_chunks: 4
 
 # Layers 0 and 1 (first 2) stay in BF16
 # Layers N-8 through N-1 (last 8) stay in BF16

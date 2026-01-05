@@ -226,11 +226,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     recompute_att: Optional[bool] = True
     recompute_block: Optional[bool] = True
 
-    offload_residual: Optional[bool] = True
+    offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
     offload_quants: Optional[bool] = False
     persistent_quants: Optional[bool] = False
-    offload_optimizer: Optional[bool] = True
+    offload_optimizer: Optional[bool] = False
     offload_grads: Optional[bool] = False
     use_zero_copy: Optional[bool] = False
     use_write_combined: Optional[bool] = False
@@ -415,6 +415,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
 
     def ensure_directories(self):
+        # Convert output_dir to absolute path for consistent hash file location
+        self.output_dir = str(Path(self.output_dir).resolve())
         _output_dir = Path(self.output_dir)
         if _output_dir.exists():
             if not _output_dir.is_dir():
@@ -508,10 +510,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     def create_qlora_config(self):
         self.qlora_config = None
         if self.qlora_fp4:
+            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             self.qlora_config = _surogate.QLoRAConfig.nvfp4()
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six
         elif self.qlora_fp8:
+            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             self.qlora_config = _surogate.QLoRAConfig.fp8(block_size=self.qlora_block_size)
+            self.qlora_config.enable_four_over_six = self.qlora_four_over_six
 
     def generate_run_name(self):
         return generate_unique_name(category='science')

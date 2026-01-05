@@ -1163,7 +1163,6 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
     logger.log_message(0, fmt::format("Setup took {} seconds",
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - BeginStartup).count()));
 
-
     for (int step = latest_step; step < MaxSteps; ++step) {
         bool run_eval = false;
         if (!train_loader.has_next(GradAccSteps * B)) {

@@ -341,6 +341,13 @@ typename FP4WeightProvider<Block>::BlockWeights& FP4WeightProvider<Block>::get_b
             fp4_block.down_proj.M, fp4_block.down_proj.K,
             *mDeviceProps, stream);
 
+        // Synchronize to ensure dequantization completes before returning.
+        // This fixes an intermittent hang that occurs when the dequant kernels
+        // don't complete in time before subsequent matmul operations.
+        // TODO: Investigate root cause - all operations are on the same stream
+        // so this sync shouldn't be necessary in theory.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
         // Update cache metadata
         mCurrentLayer = layer_idx;
         mBufferVersion = mStepVersion;

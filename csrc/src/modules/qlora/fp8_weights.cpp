@@ -187,8 +187,6 @@ void FP8WeightsManager::import_and_quantize(const std::string& file_name,
 
     // Free load buffer (allocated directly, not via allocator)
     if (mLoadBuffer.Data && mLoadBufferBytes > 0) {
-        std::cerr << "[QLoRA] freeing load buffer ("
-                  << (mLoadBufferBytes / (1024.0 * 1024.0)) << " MB)\n";
         CUDA_CHECK(cudaFree(mLoadBuffer.Data));
         mLoadBuffer = Tensor{};
         mLoadBufferBytes = 0;

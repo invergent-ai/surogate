@@ -217,14 +217,10 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
 
     // Free load buffer
     if (mLoadBuffer.Data && mLoadBufferBytes > 0) {
-        std::cerr << "[FP4-QLoRA] freeing load buffer ("
-                  << (mLoadBufferBytes / (1024.0 * 1024.0)) << " MB)\n";
         CUDA_CHECK(cudaFree(mLoadBuffer.Data));
         mLoadBuffer = Tensor{};
         mLoadBufferBytes = 0;
     }
-
-    std::cerr << "[FP4-QLoRA] import and FP4 quantization complete\n";
 }
 
 void FP4WeightsManager::load_embeddings(SafeTensorsReader& reader, cudaStream_t stream) {

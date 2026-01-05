@@ -95,12 +95,15 @@ def compute_tokenize_hash(config: SFTConfig) -> str:
 def read_tokenize_hash(output_dir: str) -> Optional[str]:
     """Read the stored tokenization hash from the output directory."""
     hash_path = os.path.join(output_dir, TOKENIZE_HASH_FILE)
+    abs_hash_path = os.path.abspath(hash_path)
     if os.path.exists(hash_path):
         try:
             with open(hash_path, 'r') as f:
                 return f.read().strip()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to read tokenization hash from {abs_hash_path}: {e}")
             return None
+    logger.debug(f"Tokenization hash file not found at: {abs_hash_path}")
     return None
 
 
@@ -648,6 +651,9 @@ class TokenizeDatasets(SurogateCommand):
         # Check if we can skip tokenization based on hash
         current_hash = compute_tokenize_hash(self.config)
         stored_hash = read_tokenize_hash(self.config.output_dir)
+        files_exist = tokenized_files_exist(self.config.output_dir)
+
+        logger.debug(f"Tokenization cache check: current_hash={current_hash}, stored_hash={stored_hash}, files_exist={files_exist}")
 
         # If debug flag is set, always load and process datasets
         if self.args.get('debug', False):
@@ -659,7 +665,7 @@ class TokenizeDatasets(SurogateCommand):
                 debug_labels(row, self.tokenizer)
 
             # If tokenization can be skipped (and debug was the only reason to run), return now
-            if stored_hash == current_hash and tokenized_files_exist(self.config.output_dir):
+            if stored_hash == current_hash and files_exist:
                 logger.info(f"Tokenization hash unchanged ({current_hash}), skipping tokenization write.")
                 return
 
@@ -675,14 +681,17 @@ class TokenizeDatasets(SurogateCommand):
             return
 
         # No debug flag: check if we can skip entirely
-        if stored_hash == current_hash and tokenized_files_exist(self.config.output_dir):
+        if stored_hash == current_hash and files_exist:
             logger.info(f"Tokenization hash unchanged ({current_hash}), skipping tokenization.")
             return
 
-        if stored_hash is not None and stored_hash != current_hash:
+        # Log why we're not skipping
+        if stored_hash is None:
+            logger.info(f"No stored tokenization hash found, tokenizing dataset (hash={current_hash})...")
+        elif stored_hash != current_hash:
             logger.info(f"Tokenization config changed (old={stored_hash}, new={current_hash}), re-tokenizing...")
-        else:
-            logger.info(f"Tokenizing dataset (hash={current_hash})...")
+        elif not files_exist:
+            logger.info(f"Tokenized files not found, tokenizing dataset (hash={current_hash})...")
 
         # Load and encode datasets
         train_dataset, val_dataset = self._load_and_encode_datasets()
