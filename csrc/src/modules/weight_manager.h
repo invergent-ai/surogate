@@ -888,9 +888,9 @@ void ModularWeightManager<Block>::maybe_enable_fp4_persistent_cache(bool weights
         return;
     }
 
-    // Enable only on Blackwell datacenter GPUs by default (B200/B300).
+    // Enable only on Blackwell GPUs by default
     const int sm_version = mDeviceProp.major * 10 + mDeviceProp.minor;
-    if (sm_version != 100 && sm_version != 103) {
+    if (sm_version < 100) {
         return;
     }
 
