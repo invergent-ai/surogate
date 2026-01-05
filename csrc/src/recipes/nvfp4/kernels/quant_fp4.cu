@@ -315,6 +315,180 @@ __device__ __forceinline__ size_t scale_swizzled_offset(size_t row_idx, size_t c
 } // anonymous namespace
 
 // ============================================================================
+// Four Over Six (4/6) Adaptive Block Scaling Constants and Helpers
+// ============================================================================
+
+namespace {
+
+// 4/6 tensor scale = 1536 (= 384 * 4) instead of standard 2688 (= 448 * 6)
+constexpr float FP4_4O6_TENSOR_SCALE = 384.0f * 4.0f;  // 1536
+
+/**
+ * @brief Compute global encode scale for 4/6 quantization.
+ * Uses tensor scale 1536 instead of 2688.
+ */
+__device__ __forceinline__ float compute_global_encode_scale_4o6(float global_amax) {
+    if (global_amax == 0.0f) return 1.0f;
+    return FP4_4O6_TENSOR_SCALE * rcp_approx_ftz(fmaxf(global_amax, 1e-10f));
+}
+
+/**
+ * @brief Compute 4/6 decode scale for a block.
+ *
+ * For max=6: decode_scale = block_amax / 6 * tensor_scale / global_amax = block_amax * 256 / global_amax
+ * For max=4: decode_scale = block_amax / 4 * tensor_scale / global_amax = block_amax * 384 / global_amax
+ */
+__device__ __forceinline__ float compute_decode_scale_4o6(float block_amax, float global_encode_scale, float selected_max) {
+    return block_amax * rcp_approx_ftz(selected_max) * global_encode_scale;
+}
+
+/**
+ * @brief Compute quantization error for a set of values.
+ *
+ * @param values Input values (16 elements)
+ * @param encode_scale Scale to apply before quantization
+ * @param decode_scale Scale to apply after dequantization (reconstructs original)
+ * @param metric 0=MSE, 1=L1, 2=AbsMax
+ * @return Error value
+ */
+__device__ __forceinline__ float compute_quant_error_4o6(
+    const float* values, int count, float encode_scale, float decode_scale, int metric)
+{
+    float error = 0.0f;
+    float max_error = 0.0f;
+
+    for (int i = 0; i < count; ++i) {
+        float v = values[i];
+        float scaled = v * encode_scale;
+        uint8_t fp4 = quantize_fp4_e2m1_rn(scaled);
+        float dequant = dequantize_fp4_e2m1(fp4);
+        float reconstructed = dequant * decode_scale;
+        float diff = fabsf(v - reconstructed);
+
+        if (metric == 0) {  // MSE
+            error += diff * diff;
+        } else if (metric == 1) {  // L1
+            error += diff;
+        } else {  // AbsMax
+            max_error = fmaxf(max_error, diff);
+        }
+    }
+
+    return (metric == 2) ? max_error : error;
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// 4/6 Block Quantization Kernel
+// ============================================================================
+
+/**
+ * @brief FP4 block quantization kernel with Four Over Six (4/6) adaptive block scaling.
+ *
+ * For each 16-element block, evaluates both max=4 and max=6 scaling and selects
+ * the option with lower quantization error.
+ */
+template<int TILE_SIZE = 128>
+__global__ void quantize_fp4_block_4o6_kernel(
+    uint8_t* __restrict__ out_fp4,
+    __nv_fp8_e4m3* __restrict__ block_scales,
+    const float* __restrict__ global_amax_in,
+    const nv_bfloat16* __restrict__ in,
+    int M, int K, int scale_cols, int metric)
+{
+    const int tile_row = blockIdx.x;
+    const int tile_col = blockIdx.y;
+
+    const int row_start = tile_row * TILE_SIZE;
+    const int col_start = tile_col * TILE_SIZE;
+    const int row_end = min(row_start + TILE_SIZE, M);
+    const int col_end = min(col_start + TILE_SIZE, K);
+
+    __shared__ float s_global_encode_scale;
+    __shared__ float s_global_decode_scale;
+    if (threadIdx.x == 0) {
+        const float ga = *global_amax_in;
+        const float enc = compute_global_encode_scale_4o6(ga);
+        s_global_encode_scale = enc;
+        s_global_decode_scale = (enc != 0.0f) ? rcp_approx_ftz(enc) : 1.0f;
+    }
+    __syncthreads();
+
+    const float global_encode_scale = s_global_encode_scale;
+    const float global_decode_scale = s_global_decode_scale;
+
+    const int num_block_rows = (row_end - row_start);
+    const int num_block_cols = div_ceil(col_end - col_start, FP4_BLOCK_SIZE);
+    const int total_blocks = num_block_rows * num_block_cols;
+
+    for (int block_idx = threadIdx.x; block_idx < total_blocks; block_idx += blockDim.x) {
+        const int block_row = block_idx / num_block_cols;
+        const int block_col = block_idx % num_block_cols;
+
+        const int global_row = row_start + block_row;
+        const int block_col_start = col_start + block_col * FP4_BLOCK_SIZE;
+        const int block_col_end = min(block_col_start + FP4_BLOCK_SIZE, col_end);
+        const int count = block_col_end - block_col_start;
+
+        // Load values and compute block amax
+        float values[16];
+        float block_amax = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            if (i < count) {
+                float val = (float)in[global_row * K + block_col_start + i];
+                values[i] = val;
+                block_amax = fmaxf(block_amax, fabsf(val));
+            } else {
+                values[i] = 0.0f;
+            }
+        }
+
+        // Evaluate both max=6 and max=4 options
+        float decode_scale_6 = compute_decode_scale_4o6(block_amax, global_encode_scale, 6.0f);
+        float decode_scale_4 = compute_decode_scale_4o6(block_amax, global_encode_scale, 4.0f);
+
+        float encode_scale_6 = (decode_scale_6 * global_decode_scale != 0.0f) ?
+            rcp_approx_ftz(decode_scale_6 * global_decode_scale) : 0.0f;
+        float encode_scale_4 = (decode_scale_4 * global_decode_scale != 0.0f) ?
+            rcp_approx_ftz(decode_scale_4 * global_decode_scale) : 0.0f;
+
+        // Reconstruct scales for error computation
+        float recon_scale_6 = decode_scale_6 * global_decode_scale;
+        float recon_scale_4 = decode_scale_4 * global_decode_scale;
+
+        float error_6 = compute_quant_error_4o6(values, count, encode_scale_6, recon_scale_6, metric);
+        float error_4 = compute_quant_error_4o6(values, count, encode_scale_4, recon_scale_4, metric);
+
+        // Select the option with lower error
+        bool use_max_4 = (error_4 < error_6);
+        float selected_decode_scale = use_max_4 ? decode_scale_4 : decode_scale_6;
+        float selected_encode_scale = use_max_4 ? encode_scale_4 : encode_scale_6;
+
+        // Store scale as FP8 E4M3
+        __nv_fp8_e4m3 scale_fp8;
+        float clamped_scale = fminf(fmaxf(selected_decode_scale, 1.0f / 128.0f), 480.0f);
+        scale_fp8.__x = __nv_cvt_float_to_fp8(clamped_scale, __nv_saturation_t::__NV_SATFINITE,
+                                              __nv_fp8_interpretation_t::__NV_E4M3);
+
+        const int scale_row = global_row;
+        const int scale_col = (col_start / FP4_BLOCK_SIZE) + block_col;
+        const size_t scale_offset = scale_swizzled_offset(scale_row, scale_col, scale_cols);
+        block_scales[scale_offset] = scale_fp8;
+
+        // Quantize values
+        const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
+        for (int i = 0; i < count; i += 2) {
+            float v0 = values[i] * selected_encode_scale;
+            float v1 = (i + 1 < count) ? values[i + 1] * selected_encode_scale : 0.0f;
+            uint8_t fp4_0 = quantize_fp4_e2m1_rn(v0);
+            uint8_t fp4_1 = (i + 1 < count) ? quantize_fp4_e2m1_rn(v1) : 0;
+            out_fp4[global_row * (K / 2) + out_col_start + i / 2] = pack_fp4(fp4_0, fp4_1);
+        }
+    }
+}
+
+// ============================================================================
 // FP4 Block Quantization Kernels
 // ============================================================================
 
@@ -1263,6 +1437,37 @@ void quantize_fp4_block_auto_scale(
 }
 
 /**
+ * @brief Host launcher for FP4 block quantization with Four Over Six (4/6) adaptive block scaling.
+ *
+ * Uses tensor scale 1536 (= 384 * 4) instead of standard 2688 (= 448 * 6).
+ * For dequantization, use global_decode_scale = amax / 1536.
+ */
+void quantize_fp4_block_4o6_auto_scale(
+    uint8_t* out_fp4,
+    __nv_fp8_e4m3* block_scales,
+    float* global_amax,
+    const nv_bfloat16* in,
+    int M, int K,
+    int metric,
+    const cudaDeviceProp& dp,
+    cudaStream_t stream)
+{
+    // 1) Compute true global amax
+    abs_max(global_amax, in, (long)M * K, dp, stream);
+
+    // 2) Quantize using 4/6 adaptive scaling
+    const int scale_rows = div_ceil(M, FP4_TILE_DIM);
+    const int scale_cols = div_ceil(div_ceil(K, FP4_BLOCK_SIZE), 4) * 4;
+
+    dim3 grid(scale_rows, div_ceil(K, FP4_TILE_DIM));
+    constexpr int threads_per_block = 256;
+
+    quantize_fp4_block_4o6_kernel<128><<<grid, threads_per_block, 0, stream>>>(
+        out_fp4, block_scales, global_amax, in, M, K, scale_cols, metric);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
  * @brief Host launcher for FP4 block dequantization.
  */
 void dequantize_fp4_block(
@@ -1817,6 +2022,43 @@ void compute_fp4_alpha(
     cudaStream_t stream)
 {
     compute_fp4_alpha_kernel<<<1, 1, 0, stream>>>(
+        alpha_out, global_amax_a, global_amax_b);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Kernel to compute FP4 alpha for Four Over Six (4/6) quantization.
+ *
+ * For 4/6 quantization, the tensor scale factor is 1536 instead of 2688:
+ * alpha = (global_amax_a * global_amax_b) / (1536 * 1536)
+ */
+__global__ void compute_fp4_alpha_4o6_kernel(
+    float* __restrict__ alpha_out,
+    const float* __restrict__ global_amax_a,
+    const float* __restrict__ global_amax_b)
+{
+    // 4/6 tensor scale factor = 384 * 4 = 1536
+    // factor = 1536^2 = 2,359,296
+    constexpr float factor = 1536.0f * 1536.0f;
+
+    float amax_a = *global_amax_a;
+    float amax_b = *global_amax_b;
+    *alpha_out = (amax_a * amax_b) / factor;
+}
+
+/**
+ * @brief Compute FP4 alpha for Four Over Six (4/6) quantization.
+ *
+ * For 4/6 quantization, the tensor scale is 1536 instead of 2688.
+ * alpha = (global_amax_a * global_amax_b) / (1536^2)
+ */
+void compute_fp4_alpha_4o6(
+    float* alpha_out,
+    const float* global_amax_a,
+    const float* global_amax_b,
+    cudaStream_t stream)
+{
+    compute_fp4_alpha_4o6_kernel<<<1, 1, 0, stream>>>(
         alpha_out, global_amax_a, global_amax_b);
     CUDA_CHECK(cudaGetLastError());
 }

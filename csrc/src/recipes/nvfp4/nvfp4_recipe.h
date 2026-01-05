@@ -66,7 +66,7 @@ public:
         EMatmulBackend backend = EMatmulBackend::CUBLASLT;  ///< cuDNN (CUBLASLT) or CUTLASS
 
         // Four Over Six (4/6) Adaptive Block Scaling options
-        bool enable_four_over_six = false;       ///< Enable 4/6 adaptive block scaling
+        bool enable_four_over_six = true;       ///< Enable 4/6 adaptive block scaling
         FourOverSixErrorMetric four_over_six_metric = FourOverSixErrorMetric::MSE;  ///< Error metric for 4/6 selection
     };
 

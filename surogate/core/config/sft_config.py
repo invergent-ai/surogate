@@ -196,6 +196,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Enable FP8 QLoRA mode (base weights quantized to FP8 with per-block scales)
         qlora_block_size: (Optional[int], defaults to 128):
             Block size for QLoRA quantization. Valid values are 64, 128, 256.
+        qlora_four_over_six: (Optional[bool], defaults to True):
+            Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization.
+            Evaluates both max=4 and max=6 scaling per block and selects lower error option.
 
         use_chat_template (Optional[bool], defaults to True):
             Whether to use chat template for training.
@@ -221,11 +224,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     recompute_att: Optional[bool] = True
     recompute_block: Optional[bool] = True
 
-    offload_residual: Optional[bool] = False
+    offload_residual: Optional[bool] = True
     offload_master: Optional[bool] = False
     offload_quants: Optional[bool] = False
     persistent_quants: Optional[bool] = False
-    offload_optimizer: Optional[bool] = False
+    offload_optimizer: Optional[bool] = True
     offload_grads: Optional[bool] = False
     use_zero_copy: Optional[bool] = False
     use_write_combined: Optional[bool] = False
@@ -280,6 +283,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     qlora_fp4: Optional[bool] = False
     qlora_fp8: Optional[bool] = False
     qlora_block_size: Optional[int] = 128
+    qlora_four_over_six: Optional[bool] = True
 
     merge_adapter: Optional[bool] = False
     use_chat_template: Optional[bool] = True
@@ -362,6 +366,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.qlora_fp4 = cfg.get('qlora_fp4', self.qlora_fp4)
         self.qlora_fp8 = cfg.get('qlora_fp8', self.qlora_fp8)
         self.qlora_block_size = cfg.get('qlora_block_size', self.qlora_block_size)
+        self.qlora_four_over_six = cfg.get('qlora_four_over_six', self.qlora_four_over_six)
 
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
@@ -499,6 +504,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.qlora_config = None
         if self.qlora_fp4:
             self.qlora_config = _surogate.QLoRAConfig.nvfp4()
+            self.qlora_config.enable_four_over_six = self.qlora_four_over_six
         elif self.qlora_fp8:
             self.qlora_config = _surogate.QLoRAConfig.fp8(block_size=self.qlora_block_size)
 

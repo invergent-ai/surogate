@@ -540,6 +540,8 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     const int C_out = ctx.C_out;
 
     // Check if we have cached FP4 weights (eliminates weight quantization overhead)
+    // The weight manager's 4/6 setting is synchronized with the recipe's config at
+    // allocate_run_state(), so cached weights use the same quantization method.
     const bool use_cached_weight = (ctx.cached_fp4_data != nullptr &&
                                     ctx.cached_fp4_scales != nullptr &&
                                     ctx.cached_fp4_amax != nullptr);
@@ -566,24 +568,51 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
 
         if (precomputed_amax) {
             inp_global_amax_ptr = precomputed_amax;
-            quantize_nvfp4_cutlass_from_amax(
-                inp_fp4_data.get<uint8_t>(),
-                inp_fp4_scales.get<uint8_t>(),
-                inp_global_amax_ptr,
-                ctx.inp->get<nv_bfloat16>(),
-                BT, C_in,
-                rs.DeviceProp, ctx.stream);
+            // Note: 4/6 quantization requires computing amax internally, so we can't use the from_amax path
+            if (mConfig.enable_four_over_six) {
+                // 4/6 doesn't support from_amax, fall back to auto_scale (will recompute amax)
+                inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+                inp_global_amax_ptr = inp_global_amax.get<float>();
+                inp_amax_is_temp = true;
+                quantize_nvfp4_4o6_cutlass_auto_scale(
+                    inp_fp4_data.get<uint8_t>(),
+                    inp_fp4_scales.get<uint8_t>(),
+                    inp_global_amax_ptr,
+                    ctx.inp->get<nv_bfloat16>(),
+                    BT, C_in,
+                    mConfig.four_over_six_metric,
+                    rs.DeviceProp, ctx.stream);
+            } else {
+                quantize_nvfp4_cutlass_from_amax(
+                    inp_fp4_data.get<uint8_t>(),
+                    inp_fp4_scales.get<uint8_t>(),
+                    inp_global_amax_ptr,
+                    ctx.inp->get<nv_bfloat16>(),
+                    BT, C_in,
+                    rs.DeviceProp, ctx.stream);
+            }
         } else {
             inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
             inp_global_amax_ptr = inp_global_amax.get<float>();
             inp_amax_is_temp = true;
-            quantize_nvfp4_cutlass_auto_scale(
-                inp_fp4_data.get<uint8_t>(),
-                inp_fp4_scales.get<uint8_t>(),
-                inp_global_amax_ptr,
-                ctx.inp->get<nv_bfloat16>(),
-                BT, C_in,
-                rs.DeviceProp, ctx.stream);
+            if (mConfig.enable_four_over_six) {
+                quantize_nvfp4_4o6_cutlass_auto_scale(
+                    inp_fp4_data.get<uint8_t>(),
+                    inp_fp4_scales.get<uint8_t>(),
+                    inp_global_amax_ptr,
+                    ctx.inp->get<nv_bfloat16>(),
+                    BT, C_in,
+                    mConfig.four_over_six_metric,
+                    rs.DeviceProp, ctx.stream);
+            } else {
+                quantize_nvfp4_cutlass_auto_scale(
+                    inp_fp4_data.get<uint8_t>(),
+                    inp_fp4_scales.get<uint8_t>(),
+                    inp_global_amax_ptr,
+                    ctx.inp->get<nv_bfloat16>(),
+                    BT, C_in,
+                    rs.DeviceProp, ctx.stream);
+            }
         }
     }
 
@@ -609,26 +638,51 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
         weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)});
         weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
 
-        quantize_nvfp4_weight_cutlass_auto_scale(
-            weight_fp4_data.get<uint8_t>(),
-            weight_fp4_scales.get<uint8_t>(),
-            weight_global_amax.get<float>(),
-            ctx.weight->get<nv_bfloat16>(),
-            C_out, C_in,
-            rs.DeviceProp, ctx.stream);
+        if (mConfig.enable_four_over_six) {
+            quantize_nvfp4_4o6_cutlass_auto_scale(
+                weight_fp4_data.get<uint8_t>(),
+                weight_fp4_scales.get<uint8_t>(),
+                weight_global_amax.get<float>(),
+                ctx.weight->get<nv_bfloat16>(),
+                C_out, C_in,
+                mConfig.four_over_six_metric,
+                rs.DeviceProp, ctx.stream);
+        } else {
+            quantize_nvfp4_weight_cutlass_auto_scale(
+                weight_fp4_data.get<uint8_t>(),
+                weight_fp4_scales.get<uint8_t>(),
+                weight_global_amax.get<float>(),
+                ctx.weight->get<nv_bfloat16>(),
+                C_out, C_in,
+                rs.DeviceProp, ctx.stream);
+        }
 
         weight_fp4_data_ptr = weight_fp4_data.get<uint8_t>();
         weight_fp4_scales_ptr = weight_fp4_scales.get<uint8_t>();
         weight_amax_ptr = weight_global_amax.get<float>();
     }
 
-    // Step 4: Compute alpha on device: alpha = (amax_a * amax_b) / (6^2 * 448^2)
+    // Step 4: Compute alpha on device
+    // The alpha formula depends on which tensor scales are used:
+    // - Standard:  both use 2688 => alpha = (amax_a * amax_b) / (2688^2)
+    // - 4/6:       both use 1536 => alpha = (amax_a * amax_b) / (1536^2)
+    // Note: Cached weights use the same 4/6 setting as on-the-fly quantization
+    // (synchronized via set_four_over_six in allocate_run_state).
     Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
-    compute_fp4_alpha(
-        alpha.get<float>(),
-        inp_global_amax_ptr,
-        weight_amax_ptr,
-        ctx.stream);
+    if (mConfig.enable_four_over_six) {
+        // Both input and weight use 4/6 tensor scale (1536)
+        compute_fp4_alpha_4o6(
+            alpha.get<float>(),
+            inp_global_amax_ptr,
+            weight_amax_ptr,
+            ctx.stream);
+    } else {
+        compute_fp4_alpha(
+            alpha.get<float>(),
+            inp_global_amax_ptr,
+            weight_amax_ptr,
+            ctx.stream);
+    }
 
     // Step 5: Execute FP4 matmul with alpha fused in CUTLASS epilogue (direct BF16 output)
     if (ctx.out->DType != ETensorDType::BF16) {
@@ -688,6 +742,9 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
     // =========================================================================
     {
         // Quantize dout (A) with stochastic rounding + two-level scaling
+        // Note: For dgrad, we always use standard quantization (2688) because W^T uses standard.
+        // CUTLASS FP4 matmul requires both inputs to use the same tensor scale.
+        // 4/6 is only used for forward (input, weight) and wgrad (dout^T, inp^T).
         const size_t dout_scale_size = compute_nvfp4_cutlass_scale_size(BT, OC);
         Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)});
         Tensor dout_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_size)});
@@ -704,6 +761,7 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         // Prepare W (B) for dgrad with two-level scaling.
         // Preferred path on B200/B300: use a cached FP4 W^T (transposed layout) produced by the weight manager.
         // Fallback: quantize-and-transpose directly from the original (OC, C) BF16 weight.
+        // Note: dgrad always uses standard quantization (2688) for both dout and W^T, so we can use cached W^T.
         const bool use_cached_wt = (ctx.cached_fp4_data != nullptr &&
                                     ctx.cached_fp4_scales != nullptr &&
                                     ctx.cached_fp4_amax != nullptr);
@@ -726,6 +784,7 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
             w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
             w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
 
+            // Note: No 4/6 variant for weight transpose quantization yet, use standard path
             quantize_nvfp4_weight_cutlass_transpose_auto_scale(
                 w_fp4.get<uint8_t>(),
                 w_scales.get<uint8_t>(),
@@ -740,6 +799,7 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         }
 
         // Compute alpha on device
+        // For dgrad, both dout and W^T use standard quantization (2688), so always use standard alpha.
         Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
         compute_fp4_alpha(
             alpha.get<float>(),
@@ -791,13 +851,25 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         Tensor a_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_size)});
         Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1});
 
-        quantize_nvfp4_stochastic_cutlass_auto_scale(
-            a_fp4.get<uint8_t>(),
-            a_scales.get<uint8_t>(),
-            a_amax.get<float>(),
-            dout_tp.get<nv_bfloat16>(),
-            OC, BT, sr_seed + 1,
-            rs.DeviceProp, ctx.stream);
+        if (mConfig.enable_four_over_six) {
+            quantize_nvfp4_4o6_stochastic_cutlass_auto_scale(
+                a_fp4.get<uint8_t>(),
+                a_scales.get<uint8_t>(),
+                a_amax.get<float>(),
+                dout_tp.get<nv_bfloat16>(),
+                OC, BT,
+                mConfig.four_over_six_metric,
+                sr_seed + 1,
+                rs.DeviceProp, ctx.stream);
+        } else {
+            quantize_nvfp4_stochastic_cutlass_auto_scale(
+                a_fp4.get<uint8_t>(),
+                a_scales.get<uint8_t>(),
+                a_amax.get<float>(),
+                dout_tp.get<nv_bfloat16>(),
+                OC, BT, sr_seed + 1,
+                rs.DeviceProp, ctx.stream);
+        }
 
         // Quantize B (inp^T) with two-level scaling
         const size_t b_scale_size = compute_nvfp4_cutlass_scale_size(C, BT);
@@ -805,21 +877,42 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         Tensor b_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_size)});
         Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1});
 
-        quantize_nvfp4_weight_cutlass_auto_scale(
-            b_fp4.get<uint8_t>(),
-            b_scales.get<uint8_t>(),
-            b_amax.get<float>(),
-            inp_tp.get<nv_bfloat16>(),
-            C, BT,
-            rs.DeviceProp, ctx.stream);
+        if (mConfig.enable_four_over_six) {
+            quantize_nvfp4_4o6_cutlass_auto_scale(
+                b_fp4.get<uint8_t>(),
+                b_scales.get<uint8_t>(),
+                b_amax.get<float>(),
+                inp_tp.get<nv_bfloat16>(),
+                C, BT,
+                mConfig.four_over_six_metric,
+                rs.DeviceProp, ctx.stream);
+        } else {
+            quantize_nvfp4_weight_cutlass_auto_scale(
+                b_fp4.get<uint8_t>(),
+                b_scales.get<uint8_t>(),
+                b_amax.get<float>(),
+                inp_tp.get<nv_bfloat16>(),
+                C, BT,
+                rs.DeviceProp, ctx.stream);
+        }
 
         // Compute alpha on device
+        // - If 4/6 enabled: both A and B use 1536 => alpha = (amax_a * amax_b) / (1536^2)
+        // - Standard:       both A and B use 2688 => alpha = (amax_a * amax_b) / (2688^2)
         Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
-        compute_fp4_alpha(
-            alpha.get<float>(),
-            a_amax.get<float>(),
-            b_amax.get<float>(),
-            ctx.stream);
+        if (mConfig.enable_four_over_six) {
+            compute_fp4_alpha_4o6(
+                alpha.get<float>(),
+                a_amax.get<float>(),
+                b_amax.get<float>(),
+                ctx.stream);
+        } else {
+            compute_fp4_alpha(
+                alpha.get<float>(),
+                a_amax.get<float>(),
+                b_amax.get<float>(),
+                ctx.stream);
+        }
 
         // dW = dout^T @ inp^T => (OC, BT) @ (BT, C) = (OC, C) with alpha in epilogue
         if (ctx.dweight->DType != ETensorDType::BF16) {

@@ -592,6 +592,13 @@ public:
             model_opts.lora_only_mode = true;
             model_opts.skip_base_gradients = true;
         }
+        // Disable CUDA graphs for QLoRA FP4: the on-the-fly weight dequantization is not
+        // compatible with CUDA graph replay (weights change between steps but graphs expect
+        // consistent state). This is a temporary workaround until proper graph-aware
+        // weight caching is implemented.
+        if (qlora_enabled() && mFP4WeightProvider) {
+            model_opts.use_cuda_graphs = false;
+        }
         // Use the ModelOptions overload to apply LoRA-specific flags
         mBaseModel->allocate_run_state(model_opts, comm, B, T, /*allocate_optimizer=*/false);
         allocate_lora_run_state(comm, B, T);

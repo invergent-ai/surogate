@@ -7,6 +7,7 @@
 
 #include <utility>
 
+#include "recipes/nvfp4/nvfp4_recipe.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
@@ -104,6 +105,14 @@ struct QLoRAConfig {
 
     /// Dtype for LoRA adapter weights (A/B matrices) - NOT quantized
     ETensorDType adapter_dtype = ETensorDType::BF16;
+
+    /// Four Over Six (4/6) adaptive block scaling for NVFP4 quantization.
+    /// When enabled, evaluates both max=4 and max=6 scaling per block and
+    /// selects the option with lower quantization error.
+    bool enable_four_over_six = false;
+
+    /// Error metric for 4/6 selection (MSE, L1, or AbsMax)
+    recipes::FourOverSixErrorMetric four_over_six_metric = recipes::FourOverSixErrorMetric::MSE;
 
     /**
      * @brief Check if quantization is active
@@ -221,6 +230,13 @@ public:
 
     QLoRAConfigBuilder& adapter_dtype(ETensorDType dt) {
         mConfig.adapter_dtype = dt;
+        return *this;
+    }
+
+    QLoRAConfigBuilder& four_over_six(bool enable,
+                                       recipes::FourOverSixErrorMetric metric = recipes::FourOverSixErrorMetric::MSE) {
+        mConfig.enable_four_over_six = enable;
+        mConfig.four_over_six_metric = metric;
         return *this;
     }
 

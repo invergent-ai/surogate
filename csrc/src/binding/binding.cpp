@@ -577,6 +577,8 @@ NB_MODULE(_surogate, m) {
                      [](const modules::QLoRAConfig* cfg) { return dtype_to_str(cfg->adapter_dtype); },
                      [](modules::QLoRAConfig* cfg, const std::string& dtype_str) { cfg->adapter_dtype = dtype_from_str(dtype_str); },
                      "Dtype for LoRA adapter weights.")
+        .def_rw("enable_four_over_six", &modules::QLoRAConfig::enable_four_over_six,
+                "Enable Four Over Six (4/6) adaptive block scaling for NVFP4 quantization.")
         .def_prop_ro("is_quantized", &modules::QLoRAConfig::is_quantized,
                      "Whether quantization is active (enabled and strategy != None).")
         .def_prop_ro("is_fp4", &modules::QLoRAConfig::is_fp4,

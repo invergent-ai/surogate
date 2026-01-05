@@ -37,7 +37,23 @@ namespace nvfp4_4o6_impl {
 
 // Constants
 constexpr int kBlockSize = 16;
-constexpr float kGlobalScaleDivisor6 = 2688.0f;  // 448 * 6
+constexpr float kFP4Max = 6.0f;
+constexpr float kFP8E4M3Max = 448.0f;
+
+// For 4/6 adaptive quantization, we use tensor scale = 1536 (= 384 * 4).
+// This is different from standard NVFP4 which uses 2688 (= 448 * 6).
+//
+// Why 1536? From arXiv:2512.02010:
+// - For max=6 blocks: decode_scale = block_amax * 256 / global_amax (256 = 1536/6)
+// - For max=4 blocks: decode_scale = block_amax * 384 / global_amax (384 = 1536/4)
+// Both 256 and 384 fit in UE4M3 (max ~480), avoiding clamping issues.
+//
+// If we used 2688:
+// - For max=4: decode_scale = block_amax * 672 / global_amax (672 > 480 = UE4M3 max!)
+//   This would cause clamping and incorrect reconstruction.
+//
+// The alpha formula for 4/6 matmul is: (amax_A * amax_B) / (1536^2)
+constexpr float k4o6TensorScaleFactor = 384.0f * 4.0f;  // = 1536 for adaptive 4/6
 
 // Error metric enum
 enum class ErrorMetric { MSE, L1, AbsMax };
@@ -152,10 +168,11 @@ __device__ __forceinline__ float compute_error(
 template <ErrorMetric Metric>
 __device__ __forceinline__ void quantize_block_4o6(
     float (&vals)[16],
-    float global_scale,
+    float global_encode_scale,
     uint8_t (&out_fp4)[8],
     uint8_t& out_block_scale)
 {
+    // Find block amax
     float block_amax = 0.0f;
     #pragma unroll
     for (int i = 0; i < 16; ++i) {
@@ -169,14 +186,15 @@ __device__ __forceinline__ void quantize_block_4o6(
         return;
     }
 
-    float block_scale_6 = block_amax * rcp_approx_ftz(6.0f);
-    float block_scale_4 = block_amax * rcp_approx_ftz(4.0f);
+    // Compute encode scales for both max=6.0 and max=4.0 options
+    // encode_scale = FP4_MAX / block_amax (scales values to [-FP4_MAX, FP4_MAX] range)
+    float encode_scale_6 = 6.0f * rcp_approx_ftz(fmaxf(block_amax, 1e-12f));
+    float encode_scale_4 = 4.0f * rcp_approx_ftz(fmaxf(block_amax, 1e-12f));
 
-    float full_scale_6 = block_scale_6 * global_scale;
-    float full_scale_4 = block_scale_4 * global_scale;
-
-    float encode_scale_6 = rcp_approx_ftz(fmaxf(full_scale_6, 1e-12f));
-    float encode_scale_4 = rcp_approx_ftz(fmaxf(full_scale_4, 1e-12f));
+    // Block decode scales for reconstructing original values from dequant (which is in [-6, 6])
+    // recon_scale = block_amax / FP4_MAX
+    float recon_scale_6 = block_amax * rcp_approx_ftz(6.0f);
+    float recon_scale_4 = block_amax * rcp_approx_ftz(4.0f);
 
     float err_6 = 0.0f, err_4 = 0.0f;
     uint32_t fp4_6[2], fp4_4[2];
@@ -189,26 +207,30 @@ __device__ __forceinline__ void quantize_block_4o6(
             group[i] = vals[g * 8 + i];
         }
 
+        // Quantize with max=6.0
         float scaled_6[8];
         #pragma unroll
         for (int i = 0; i < 8; ++i) scaled_6[i] = group[i] * encode_scale_6;
 
         float dequant_6[8];
         fp32x8_to_e2m1x8_with_dequant(scaled_6, fp4_6[g], dequant_6);
-        err_6 += compute_error<Metric>(group, dequant_6, full_scale_6);
+        // dequant_6 is in [-6, 6] range, multiply by recon_scale_6 to get original scale
+        err_6 += compute_error<Metric>(group, dequant_6, recon_scale_6);
 
+        // Quantize with max=4.0
         float scaled_4[8];
         #pragma unroll
         for (int i = 0; i < 8; ++i) scaled_4[i] = group[i] * encode_scale_4;
 
         float dequant_4[8];
         fp32x8_to_e2m1x8_with_dequant(scaled_4, fp4_4[g], dequant_4);
-        err_4 += compute_error<Metric>(group, dequant_4, full_scale_4);
+        // dequant_4 is in [-4, 4] range (clipped to representable FP4 values), multiply by recon_scale_4
+        err_4 += compute_error<Metric>(group, dequant_4, recon_scale_4);
     }
 
     bool use_scale_4 = (err_4 < err_6);
     uint32_t* selected_fp4 = use_scale_4 ? fp4_4 : fp4_6;
-    float selected_block_scale = use_scale_4 ? block_scale_4 : block_scale_6;
+    float selected_recon_scale = use_scale_4 ? recon_scale_4 : recon_scale_6;
 
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -216,18 +238,39 @@ __device__ __forceinline__ void quantize_block_4o6(
         out_fp4[i + 4] = (selected_fp4[1] >> (i * 8)) & 0xFF;
     }
 
-    __nv_fp8_e4m3 fp8_scale = __nv_fp8_e4m3(selected_block_scale);
-    out_block_scale = *reinterpret_cast<uint8_t*>(&fp8_scale);
+    // Compute the CUTLASS-compatible decode scale.
+    // Uses tensor scale 1536 (= 384 * 4) for 4/6 adaptive quantization.
+    //
+    // For max=6: decode_scale = block_amax / 6 * (1536 / global_amax) = block_amax * 256 / global_amax
+    // For max=4: decode_scale = block_amax / 4 * (1536 / global_amax) = block_amax * 384 / global_amax
+    //
+    // Both 256 and 384 fit in UE4M3 (max ~480), avoiding clamping.
+    //
+    // CUTLASS dequant: fp4 * decode_scale * alpha
+    //   where alpha = (amax_A * amax_B) / 1536^2
+    //
+    // For max=4: fp4 * (block_amax * 384 / amax) * (amax_A * amax_B) / 1536^2
+    //          = fp4 * block_amax / 4 ✓
+    // For max=6: fp4 * (block_amax * 256 / amax) * (amax_A * amax_B) / 1536^2
+    //          = fp4 * block_amax / 6 ✓
+    float decode_scale = selected_recon_scale * global_encode_scale;
+
+    // Convert to UE4M3 using the same method as standard quantization
+    // Clamp to representable range and use hardware conversion
+    decode_scale = fminf(fmaxf(decode_scale, 1.0f / 128.0f), 480.0f);
+    out_block_scale = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
+                                            __nv_fp8_interpretation_t::__NV_E4M3);
 }
 
 template <ErrorMetric Metric>
 __device__ __forceinline__ void quantize_block_4o6_stochastic(
     float (&vals)[16],
-    float global_scale,
+    float global_encode_scale,
     uint32_t (&random)[4],
     uint8_t (&out_fp4)[8],
     uint8_t& out_block_scale)
 {
+    // Find block amax
     float block_amax = 0.0f;
     #pragma unroll
     for (int i = 0; i < 16; ++i) {
@@ -241,14 +284,13 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
         return;
     }
 
-    float block_scale_6 = block_amax * rcp_approx_ftz(6.0f);
-    float block_scale_4 = block_amax * rcp_approx_ftz(4.0f);
+    // Compute encode scales for both max=6.0 and max=4.0 options
+    float encode_scale_6 = 6.0f * rcp_approx_ftz(fmaxf(block_amax, 1e-12f));
+    float encode_scale_4 = 4.0f * rcp_approx_ftz(fmaxf(block_amax, 1e-12f));
 
-    float full_scale_6 = block_scale_6 * global_scale;
-    float full_scale_4 = block_scale_4 * global_scale;
-
-    float encode_scale_6 = rcp_approx_ftz(fmaxf(full_scale_6, 1e-12f));
-    float encode_scale_4 = rcp_approx_ftz(fmaxf(full_scale_4, 1e-12f));
+    // Block decode scales for reconstructing original values from dequant (which is in [-6, 6])
+    float recon_scale_6 = block_amax * rcp_approx_ftz(6.0f);
+    float recon_scale_4 = block_amax * rcp_approx_ftz(4.0f);
 
     float err_6 = 0.0f, err_4 = 0.0f;
     uint32_t fp4_6[2], fp4_4[2];
@@ -272,14 +314,16 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
         fp32x8_to_e2m1x8_with_dequant(scaled_6, fp4_6[g], dequant_6);
         fp32x8_to_e2m1x8_with_dequant(scaled_4, fp4_4[g], dequant_4);
 
-        err_6 += compute_error<Metric>(group, dequant_6, full_scale_6);
-        err_4 += compute_error<Metric>(group, dequant_4, full_scale_4);
+        // Use recon_scale (block_amax / FP4_MAX) for error computation
+        err_6 += compute_error<Metric>(group, dequant_6, recon_scale_6);
+        err_4 += compute_error<Metric>(group, dequant_4, recon_scale_4);
     }
 
     bool use_scale_4 = (err_4 < err_6);
-    float selected_block_scale = use_scale_4 ? block_scale_4 : block_scale_6;
     float selected_encode_scale = use_scale_4 ? encode_scale_4 : encode_scale_6;
+    float selected_recon_scale = use_scale_4 ? recon_scale_4 : recon_scale_6;
 
+    // Apply stochastic rounding with the selected scale
     uint32_t fp4_stochastic[2];
 
     #pragma unroll
@@ -301,24 +345,66 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
         out_fp4[i + 4] = (fp4_stochastic[1] >> (i * 8)) & 0xFF;
     }
 
-    __nv_fp8_e4m3 fp8_scale = __nv_fp8_e4m3(selected_block_scale);
-    out_block_scale = *reinterpret_cast<uint8_t*>(&fp8_scale);
+    // Compute the CUTLASS-compatible decode scale (same formula as non-stochastic version).
+    // Uses tensor scale 1536 for 4/6 adaptive quantization.
+    float decode_scale = selected_recon_scale * global_encode_scale;
+
+    // Convert to UE4M3 using the same method as standard quantization
+    decode_scale = fminf(fmaxf(decode_scale, 1.0f / 128.0f), 480.0f);
+    out_block_scale = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
+                                            __nv_fp8_interpretation_t::__NV_E4M3);
 }
 
 // ============================================================================
-// CUTLASS Layout Scale Index
+// CUTLASS Layout Scale Index (Sm1xxBlkScaledConfig SfKMajorAtom layout)
 // ============================================================================
 
+/**
+ * @brief Compute scale swizzled offset for CUTLASS Sm1xxBlkScaledConfig layout.
+ *
+ * CUTLASS SM120 block-scaled GEMM expects scales in a specific swizzled layout
+ * defined by SfKMajorAtom:
+ *   Layout<Shape<Shape<_32,_4>, Shape<Int<16>, _4>>,
+ *         Stride<Stride<_16,_4>, Stride<_0, _1>>>
+ *
+ * This maps logical (row, scale_col) to physical offset within 128-row atoms.
+ * The layout tiles the M dimension into 128-row blocks and K dimension into
+ * 4-scale-column blocks, with swizzling within each atom.
+ *
+ * For K-major layout:
+ * - Shape: ((32,4), (16,4)) - 128 rows x 4 scale columns per atom
+ * - Stride: ((16,4), (0,1)) - row_in_32 * 16 + row_blk32 * 4 + scale_col
+ */
 __device__ __forceinline__ int cutlass_scale_index(int row, int scale_col, int num_scale_cols) {
-    int group_row = row / 128;
-    int local_row = row % 128;
-    int group_col = scale_col / 4;
-    int local_col = scale_col % 4;
+    // CUTLASS Sm1xxBlkScaledConfig atom dimensions
+    constexpr int kRowsPerAtom = 128;  // Blk_MN
+    constexpr int kColsPerAtom = 4;    // Blk_SF
+    constexpr int kAtomSize = kRowsPerAtom * kColsPerAtom;  // 512 scales per atom
 
-    int atom_idx = group_row * ((num_scale_cols + 3) / 4) + group_col;
-    int intra_atom_idx = local_row * 4 + local_col;
+    // Which atom are we in?
+    int row_atom = row / kRowsPerAtom;
+    int col_atom = scale_col / kColsPerAtom;
 
-    return atom_idx * (128 * 4) + intra_atom_idx;
+    // Position within the atom
+    int row_in_atom = row % kRowsPerAtom;
+    int col_in_atom = scale_col % kColsPerAtom;
+
+    // How many column atoms per row of atoms?
+    int atoms_per_row = (num_scale_cols + kColsPerAtom - 1) / kColsPerAtom;
+
+    // Compute atom start offset (row-major order of atoms)
+    int atom_offset = (row_atom * atoms_per_row + col_atom) * kAtomSize;
+
+    // Within-atom offset using SfKMajorAtom stride pattern: ((16,4), (0,1))
+    // Decompose row_in_atom into (row_in_32, row_blk32) where row_blk32 = row_in_atom / 32
+    int row_in_32 = row_in_atom % 32;
+    int row_blk32 = row_in_atom / 32;  // 0-3
+
+    // SfKMajorAtom mapping: stride<0,0> = 16, stride<0,1> = 4, stride<1,1> = 1
+    // Physical offset = row_in_32 * 16 + row_blk32 * 4 + col_in_atom
+    int intra_offset = row_in_32 * 16 + row_blk32 * 4 + col_in_atom;
+
+    return atom_offset + intra_offset;
 }
 
 // ============================================================================
@@ -342,8 +428,14 @@ __global__ void quantize_4o6_cutlass_kernel(
     int scale_col = block_idx % num_scale_cols;
     int col_start = scale_col * kBlockSize;
 
+    // Compute global encode scale for 4/6 quantization.
+    // We use tensor scale 1536 (= 384 * 4) for adaptive 4/6 mode.
+    // - For max=6: decode_scale = block_amax / 6 * 1536 / global_amax = block_amax * 256 / global_amax
+    // - For max=4: decode_scale = block_amax / 4 * 1536 / global_amax = block_amax * 384 / global_amax
+    // Both 256 and 384 fit in UE4M3 (max ~480).
     float g_amax = *global_amax;
-    float global_scale = (g_amax > 0.0f) ? g_amax / kGlobalScaleDivisor6 : 1.0f;
+    float global_encode_scale = (g_amax > 0.0f) ?
+        k4o6TensorScaleFactor * rcp_approx_ftz(fmaxf(g_amax, 1e-12f)) : 1.0f;
 
     float vals[16];
     #pragma unroll
@@ -358,7 +450,7 @@ __global__ void quantize_4o6_cutlass_kernel(
 
     uint8_t fp4_out[8];
     uint8_t block_scale;
-    quantize_block_4o6<Metric>(vals, global_scale, fp4_out, block_scale);
+    quantize_block_4o6<Metric>(vals, global_encode_scale, fp4_out, block_scale);
 
     int fp4_col_start = col_start / 2;
     #pragma unroll
@@ -391,8 +483,10 @@ __global__ void quantize_4o6_stochastic_cutlass_kernel(
     int scale_col = block_idx % num_scale_cols;
     int col_start = scale_col * kBlockSize;
 
+    // Compute global encode scale for 4/6 quantization (same as non-stochastic version).
     float g_amax = *global_amax;
-    float global_scale = (g_amax > 0.0f) ? g_amax / kGlobalScaleDivisor6 : 1.0f;
+    float global_encode_scale = (g_amax > 0.0f) ?
+        k4o6TensorScaleFactor * rcp_approx_ftz(fmaxf(g_amax, 1e-12f)) : 1.0f;
 
     float vals[16];
     #pragma unroll
@@ -415,7 +509,7 @@ __global__ void quantize_4o6_stochastic_cutlass_kernel(
 
     uint8_t fp4_out[8];
     uint8_t block_scale;
-    quantize_block_4o6_stochastic<Metric>(vals, global_scale, random, fp4_out, block_scale);
+    quantize_block_4o6_stochastic<Metric>(vals, global_encode_scale, random, fp4_out, block_scale);
 
     int fp4_col_start = col_start / 2;
     #pragma unroll

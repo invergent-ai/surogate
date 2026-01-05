@@ -229,7 +229,7 @@ struct TrainingRunner {
     /// Every Nth checkpoint is marked “major” and not cleaned up (-1 disables).
     int MajorCkptEvery = -1;
     /// Log GPU utilization every N steps (0 disables).
-    int LogGPUEvery = 25;
+    int LogGPUEvery = 0;
     /// If true, export final model weights/config after training.
     bool SaveFinalModel = true;
 
@@ -267,6 +267,8 @@ struct TrainingRunner {
     bool UseQLoRAFP4 = false;
     /// Block size for per-block quantization in FP8 QLoRA (64, 128, or 256).
     int QLoRABlockSize = 128;
+    /// Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization.
+    bool QLoRAFourOverSix = true;
 
     // Modular architecture system
     /// Architecture type for modular system: "dense", "moe", or "hybrid".
@@ -539,6 +541,9 @@ void TrainingRunner::load_training_config(int argc, const char** argv) {
         ->excludes("--qlora-fp8");
     app.add_option("--qlora-block-size", QLoRABlockSize, "Block size for per-block quantization in FP8 QLoRA (64, 128, or 256)")
         ->check(CLI::IsMember({64, 128, 256}));
+    app.add_flag("--qlora-four-over-six,!--no-qlora-four-over-six", QLoRAFourOverSix,
+        "Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA (default: enabled)")
+        ->needs("--qlora-fp4");
 
     // Modular architecture system
     app.add_option("--arch", ArchType, "Architecture type: dense, moe, or hybrid")
@@ -671,10 +676,6 @@ void TrainingRunner::load_training_config(int argc, const char** argv) {
     }
     if (Options.RecomputeFFN) {
         Options.RecomputeSwiGLu = true;
-    }
-
-    if ((Options.OffloadMaster || Options.OffloadOptimizer || Options.OffloadQuants) && use_zero_copy->count() == 0) {
-        Options.UseZeroCopy = true;
     }
 
     LogAllocations *= 1024 * 1024;
@@ -857,7 +858,8 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
         // QLoRA configuration
         {"qlora-fp8",          UseQLoRAFP8},
         {"qlora-fp4",          UseQLoRAFP4},
-        
+        {"qlora-four-over-six", QLoRAFourOverSix},
+
         {"arch-type",          ArchType},
         {"num-experts",        NumExperts},
         {"moe-top-k",          MoETopK},
@@ -985,8 +987,10 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
             } else if (UseQLoRAFP4) {
                 qlora_config = modules::QLoRAConfigBuilder()
                     .nvfp4()
+                    .four_over_six(QLoRAFourOverSix)
                     .build();
-                printf("QLoRA-FP4 enabled: NVFP4 (E2M1) with two-level block scaling\n");
+                printf("QLoRA-FP4 enabled: NVFP4 (E2M1) with two-level block scaling%s\n",
+                       QLoRAFourOverSix ? " + 4/6 adaptive scaling" : "");
                 printf("Expected memory savings: ~75%% for base model weights\n");
             }
 

@@ -22,6 +22,7 @@
 #include "utilities/tensor_container.h"
 
 #include "kernels/kernels.h"
+#include "recipes/nvfp4/nvfp4_recipe.h"
 
 class NCCLCommunicator;
 class DeviceMemoryStack;
@@ -111,6 +112,12 @@ public:
         // FP4 forward-only mode: cache FP4 weights for forward pass (CUTLASS layout)
         // Optimizes datacenter GPUs where weight quantization overhead dominates
         bool enable_fp4_forward = false;
+
+        // Four Over Six (4/6) adaptive block scaling for FP4 quantization.
+        // When enabled, uses error-minimizing block scale selection (4.0 vs 6.0).
+        // Only affects cached weight quantization when enable_fp4_forward is true.
+        bool enable_four_over_six = false;
+        recipes::FourOverSixErrorMetric four_over_six_metric = recipes::FourOverSixErrorMetric::MSE;
     };
 
     /**
@@ -397,7 +404,22 @@ public:
     void maybe_enable_fp4_persistent_cache(bool weights_static);
 
     /**
-     * @brief Get the FP4 weight global amax tensor
+     * @brief Configure Four Over Six (4/6) adaptive block scaling for FP4 quantization.
+     *
+     * Call this to synchronize the 4/6 setting from the training recipe before
+     * FP4 weight caching begins. Only affects cached weight quantization when
+     * enable_fp4_forward is already enabled.
+     *
+     * @param enable Whether to enable 4/6 adaptive block scaling
+     * @param metric Error metric for 4/6 selection (MSE, L1, or AbsMax)
+     */
+    void set_four_over_six(bool enable, recipes::FourOverSixErrorMetric metric = recipes::FourOverSixErrorMetric::MSE) {
+        mConfig.enable_four_over_six = enable;
+        mConfig.four_over_six_metric = metric;
+    }
+
+    /**
+     * @brief Get the FP4 weight global amax tensor (forward cache)
      *
      * Contains 4 floats: [qkv_amax, o_amax, mlp_up_amax, mlp_down_amax]
      */
@@ -406,6 +428,20 @@ public:
     }
     [[nodiscard]] const Tensor& fp4_weight_amax() const {
         return mFP4WeightAmax;
+    }
+
+    /**
+     * @brief Get the FP4 weight global amax tensor (transposed cache, for dgrad)
+     *
+     * Contains 4 floats: [qkv_amax, o_amax, mlp_up_amax, mlp_down_amax]
+     * Separate from forward amax because forward may use 4/6 quantization while
+     * transposed uses standard quantization, producing different amax values.
+     */
+    [[nodiscard]] Tensor& fp4_weight_amax_transposed() {
+        return mFP4WeightAmaxT;
+    }
+    [[nodiscard]] const Tensor& fp4_weight_amax_transposed() const {
+        return mFP4WeightAmaxT;
     }
 
     // ========================================================================
@@ -520,14 +556,16 @@ private:
     // Optimizes datacenter GPUs where weight quantization overhead dominates.
     FP4WeightCache mFP4WeightCache{};
     FP4WeightCache mFP4WeightCacheT{};   ///< FP4 weights in transposed layout (dgrad GEMM)
-    Tensor mFP4WeightAmax{};           ///< Device buffer for global amax values (4 floats)
+    Tensor mFP4WeightAmax{};           ///< Device buffer for global amax values (4 floats) - forward cache
+    Tensor mFP4WeightAmaxT{};          ///< Device buffer for global amax values (4 floats) - transposed cache
     int mFP4CacheLayerIdx = -1;        ///< Which layer is currently in the FP4 cache
 
     // Persistent per-layer FP4 caches (opt-in, for Blackwell datacenter GPUs).
     bool mFP4PersistentCacheEnabled = false;
     bool mFP4PersistentCacheStatic = false;
     std::vector<int> mFP4PersistentCacheVersion;  ///< Per-layer version tracking (-1 = not cached)
-    Tensor mFP4WeightAmaxAll{};                   ///< (num_layers*4,) global amax storage for all layers
+    Tensor mFP4WeightAmaxAll{};                   ///< (num_layers*4,) global amax storage for all layers - forward
+    Tensor mFP4WeightAmaxAllT{};                  ///< (num_layers*4,) global amax storage for all layers - transposed
     std::array<Tensor, 4> mFP4WeightDataAll{};    ///< Forward FP4 packed weights for all layers
     std::array<Tensor, 4> mFP4WeightScalesAll{};  ///< Forward FP4 block scales for all layers
     std::array<Tensor, 4> mFP4WeightDataAllT{};   ///< Transposed FP4 packed weights for dgrad
@@ -823,8 +861,10 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         const long D = bc.intermediate_size;
         const long QKV_C = (Hq + 2 * Hkv) * Hs;
 
-        // Amax buffer: 4 floats for global amax values
+        // Amax buffer: 4 floats for global amax values (forward cache)
         mFP4WeightAmax = mAllocator->allocate(ETensorDType::FP32, "fp4_weight_amax", EAllocationType::ON_DEVICE, {4});
+        // Separate amax buffer for transposed cache (needed when forward uses 4/6 but transposed uses standard)
+        mFP4WeightAmaxT = mAllocator->allocate(ETensorDType::FP32, "fp4_weight_amax_t", EAllocationType::ON_DEVICE, {4});
 
         // Helper to compute CUTLASS scale size
         auto cutlass_scale_size = [](long rows, long cols) -> long {
@@ -919,9 +959,12 @@ void ModularWeightManager<Block>::maybe_enable_fp4_persistent_cache(bool weights
 
     const long L = mConfig.num_layers;
 
-    // Amax storage: 4 floats per layer [qkv, o, mlp_up, mlp_down]
+    // Amax storage: 4 floats per layer [qkv, o, mlp_up, mlp_down] - forward cache
     mFP4WeightAmaxAll = mAllocator->allocate(
         ETensorDType::FP32, "fp4_weight_amax_all", EAllocationType::ON_DEVICE, {L * 4});
+    // Separate amax storage for transposed cache (needed when forward uses 4/6 but transposed uses standard)
+    mFP4WeightAmaxAllT = mAllocator->allocate(
+        ETensorDType::FP32, "fp4_weight_amax_all_t", EAllocationType::ON_DEVICE, {L * 4});
 
     // Forward (W) caches
     mFP4WeightDataAll[0] = mAllocator->allocate(
@@ -1411,8 +1454,10 @@ typename Block::Weights& ModularWeightManager<Block>::get_block(int layer_idx, c
             }
 
             auto set_views = [&](int l) {
-                // Amax view: (4,) for this layer
+                // Amax view: (4,) for this layer - forward cache
                 mFP4WeightAmax = slice(mFP4WeightAmaxAll, 0, l * 4, l * 4 + 4);
+                // Amax view: (4,) for this layer - transposed cache
+                mFP4WeightAmaxT = slice(mFP4WeightAmaxAllT, 0, l * 4, l * 4 + 4);
 
                 // Forward weights (W)
                 mFP4WeightCache.qkv_weight.data = slice(mFP4WeightDataAll[0], 0, l * QKV_C, (l + 1) * QKV_C);
@@ -2608,13 +2653,24 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache(const BlockWeigh
 
         // Quantize to FP4 using CUTLASS-compatible layout
         // Output: packed FP4 data (N, K/2), block scales (FP8 E4M3), global amax
-        quantize_nvfp4_weight_cutlass_auto_scale(
-            fp4_cache.data.template get<uint8_t>(),
-            fp4_cache.scales.template get<uint8_t>(),
-            amax_ptr + amax_offset,
-            bf16_weight.template get<nv_bfloat16>(),
-            N, K,
-            mDeviceProp, stream);
+        if (mConfig.enable_four_over_six) {
+            quantize_nvfp4_4o6_cutlass_auto_scale(
+                fp4_cache.data.template get<uint8_t>(),
+                fp4_cache.scales.template get<uint8_t>(),
+                amax_ptr + amax_offset,
+                bf16_weight.template get<nv_bfloat16>(),
+                N, K,
+                mConfig.four_over_six_metric,
+                mDeviceProp, stream);
+        } else {
+            quantize_nvfp4_weight_cutlass_auto_scale(
+                fp4_cache.data.template get<uint8_t>(),
+                fp4_cache.scales.template get<uint8_t>(),
+                amax_ptr + amax_offset,
+                bf16_weight.template get<nv_bfloat16>(),
+                N, K,
+                mDeviceProp, stream);
+        }
     };
 
     // Quantize all weight tensors to FP4 cache
@@ -2659,8 +2715,9 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache_transposed(const
             return;
         }
 
-        // Use global amax buffer: 4 floats for qkv, o, mlp_up, mlp_down
-        float* amax_ptr = mFP4WeightAmax.template get<float>();
+        // Use separate amax buffer for transposed cache (4 floats: qkv, o, mlp_up, mlp_down)
+        // This prevents overwriting the forward cache amax when using 4/6 quantization.
+        float* amax_ptr = mFP4WeightAmaxT.template get<float>();
         int amax_offset = 0;
         if (&fp4_cache_t == &mFP4WeightCacheT.qkv_weight) amax_offset = 0;
         else if (&fp4_cache_t == &mFP4WeightCacheT.o_weight) amax_offset = 1;
@@ -2669,6 +2726,9 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache_transposed(const
             else if (&fp4_cache_t == &mFP4WeightCacheT.mlp_down_weight) amax_offset = 3;
         }
 
+        // Note: No 4/6 variant for transpose quantization yet.
+        // The transposed weights are used for dgrad, where dout (the A operand) uses 4/6.
+        // Using standard quantization here is acceptable since the weights are relatively static.
         quantize_nvfp4_weight_cutlass_transpose_auto_scale(
             fp4_cache_t.data.template get<uint8_t>(),
             fp4_cache_t.scales.template get<uint8_t>(),

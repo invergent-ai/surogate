@@ -454,6 +454,15 @@ void quantize_fp4_block_auto_scale(uint8_t* out_fp4, __nv_fp8_e4m3* block_scales
                                     const nv_bfloat16* in, int M, int K,
                                     const cudaDeviceProp& dp, cudaStream_t stream);
 
+/// @brief FP4 block quantization with Four Over Six (4/6) adaptive block scaling.
+/// For each block, evaluates both max=4 and max=6 scaling and selects the one with lower error.
+/// Uses tensor scale 1536 (vs 2688 for standard) for correct dequantization.
+/// @param metric Error metric for 4/6 selection (0=MSE, 1=L1, 2=AbsMax)
+void quantize_fp4_block_4o6_auto_scale(uint8_t* out_fp4, __nv_fp8_e4m3* block_scales, float* global_amax,
+                                        const nv_bfloat16* in, int M, int K,
+                                        int metric,
+                                        const cudaDeviceProp& dp, cudaStream_t stream);
+
 /// @brief FP4 weight quantization with column-major scale layout for cuDNN.
 /// Produces scales in (K/16, N) layout with F8_128x4 swizzle, as expected by cuDNN B operand.
 void quantize_fp4_weight(uint8_t* out_fp4, __nv_fp8_e4m3* block_scales, float* global_amax,
@@ -540,6 +549,18 @@ void fp4_alpha_scale(Tensor& out, const Tensor& global_amax_a, const Tensor& glo
 /// @param stream CUDA stream
 void compute_fp4_alpha(float* alpha_out, const float* global_amax_a, const float* global_amax_b,
                        cudaStream_t stream);
+
+/// @brief Compute FP4 alpha for Four Over Six (4/6) quantization.
+///
+/// For 4/6 quantization, the tensor scale factor is 1536 (= 384 * 4) instead of
+/// 2688 (= 448 * 6). This gives: alpha = (amax_a * amax_b) / (1536 * 1536)
+///
+/// @param alpha_out Output alpha value (device pointer to single float)
+/// @param global_amax_a Global amax of tensor A (device pointer)
+/// @param global_amax_b Global amax of tensor B (device pointer)
+/// @param stream CUDA stream
+void compute_fp4_alpha_4o6(float* alpha_out, const float* global_amax_a, const float* global_amax_b,
+                           cudaStream_t stream);
 
 /// @brief Fused FP4 alpha scaling + FP32→BF16 conversion.
 ///

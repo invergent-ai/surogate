@@ -26,6 +26,7 @@
 
 #include "recipes/recipe.h"
 #include "recipes/bf16/bf16_recipe.h"
+#include "recipes/nvfp4/nvfp4_recipe.h"
 #include "recipes/nvfp4/kernels/scaled_swiglu.h"
 
 #include "primitives/attention.h"
@@ -871,6 +872,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
         }
 
         auto& weights = mWeights->get_block(l, main_stream);
+        
         auto& acts = rs.simplified_acts(l);
         auto& q = rs.simplified_quant_acts(l);
 
@@ -2244,7 +2246,8 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                     auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                     ctx.cached_fp4_data = &fp4_t.mlp_down_weight.data;
                     ctx.cached_fp4_scales = &fp4_t.mlp_down_weight.scales;
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 3;
+                    // Use transposed amax (separate from forward) for dgrad
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 3;
                 }
 
                 mRecipe->backward_matmul(ctx);
@@ -2333,7 +2336,8 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                     auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                     ctx.cached_fp4_data = &fp4_t.mlp_up_weight.data;
                     ctx.cached_fp4_scales = &fp4_t.mlp_up_weight.scales;
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 2;
+                    // Use transposed amax (separate from forward) for dgrad
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 2;
                 }
 
                 mRecipe->backward_matmul(ctx);
@@ -2413,7 +2417,8 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                     auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                     ctx.cached_fp4_data = &fp4_t.o_weight.data;
                     ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 1;
+                    // Use transposed amax (separate from forward) for dgrad
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 1;
                 }
 
                 mRecipe->backward_matmul(ctx);
@@ -2615,7 +2620,8 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                     auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                     ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
                     ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 0;
+                    // Use transposed amax (separate from forward) for dgrad
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 0;
                 }
 
                 mRecipe->backward_matmul(ctx);
@@ -2941,6 +2947,17 @@ template<typename Block>
 void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& options, NCCLCommunicator& comm,
                                                          int B, int T, bool allocate_optimizer) {
     NVTX_RANGE_FN();
+
+    // Synchronize Four Over Six (4/6) setting from recipe to weight manager.
+    // This ensures cached FP4 weights use the same quantization method as the recipe.
+    if (mRecipe) {
+        if (auto* nvfp4_recipe = dynamic_cast<recipes::NVFP4Recipe*>(mRecipe.get())) {
+            mWeights->set_four_over_six(
+                nvfp4_recipe->uses_four_over_six(),
+                nvfp4_recipe->four_over_six_metric()
+            );
+        }
+    }
 
     // B200/B300 optimization: persist FP4 base weights across steps in LoRA/frozen-base mode.
     // This avoids re-quantizing/transposing BF16 base weights every iteration, which can make

@@ -402,15 +402,32 @@ void FP4WeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
 
 void FP4WeightsManager::quantize_fp4_and_store(FP4BlockQuantizedWeight& dest, const Tensor& src,
                                                 int M, int K, cudaStream_t stream) {
-    // Use FP4 block quantization with on-device auto scaling (NVFP4 recipe).
-    quantize_fp4_block_auto_scale(
-        dest.data.get<uint8_t>(),
-        dest.block_scales_rowwise.get<__nv_fp8_e4m3>(),
-        dest.global_amax_rowwise,
-        src.get<nv_bfloat16>(),
-        M, K,
-        *mDeviceProps,
-        stream);
+    const auto& qlora_cfg = mConfig.qlora_config;
+
+    if (qlora_cfg.enable_four_over_six) {
+        // Four Over Six (4/6) adaptive block scaling quantization.
+        // Uses tensor scale 1536 instead of 2688.
+        int metric = static_cast<int>(qlora_cfg.four_over_six_metric);
+        quantize_fp4_block_4o6_auto_scale(
+            dest.data.get<uint8_t>(),
+            dest.block_scales_rowwise.get<__nv_fp8_e4m3>(),
+            dest.global_amax_rowwise,
+            src.get<nv_bfloat16>(),
+            M, K,
+            metric,
+            *mDeviceProps,
+            stream);
+    } else {
+        // Standard NVFP4 quantization with tensor scale 2688.
+        quantize_fp4_block_auto_scale(
+            dest.data.get<uint8_t>(),
+            dest.block_scales_rowwise.get<__nv_fp8_e4m3>(),
+            dest.global_amax_rowwise,
+            src.get<nv_bfloat16>(),
+            M, K,
+            *mDeviceProps,
+            stream);
+    }
 
     // Cache a host copy of amax and the corresponding global decode scale for dequantization.
     // This runs at import time (outside CUDA graph capture) and avoids syncs during training.
@@ -420,8 +437,15 @@ void FP4WeightsManager::quantize_fp4_and_store(FP4BlockQuantizedWeight& dest, co
 
     dest.global_amax_rowwise_host = amax_h;
     if (amax_h > 0.0f && std::isfinite(amax_h)) {
-        dest.global_decode_scale_rowwise_host =
-            amax_h / (FP4_E2M1_MAX * fp8_max_v<__nv_fp8_e4m3>);
+        if (qlora_cfg.enable_four_over_six) {
+            // 4/6 tensor scale = 1536 (= 384 * 4)
+            constexpr float FP4_4O6_TENSOR_SCALE = 384.0f * 4.0f;
+            dest.global_decode_scale_rowwise_host = amax_h / FP4_4O6_TENSOR_SCALE;
+        } else {
+            // Standard tensor scale = 2688 (= 6 * 448)
+            dest.global_decode_scale_rowwise_host =
+                amax_h / (FP4_E2M1_MAX * fp8_max_v<__nv_fp8_e4m3>);
+        }
     } else {
         dest.global_decode_scale_rowwise_host = 1.0f;
     }
