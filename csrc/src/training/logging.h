@@ -18,7 +18,23 @@ struct GPUUtilInfo;
 struct sSegmentMemory;
 class NCCLCommunicator;
 class DataLoader;
+class TensorAllocator;
 enum class ETensorDType : int;
+
+/**
+ * @brief Context for detailed memory breakdown analysis (QLoRA optimization).
+ */
+struct MemoryBreakdownContext {
+    const TensorAllocator* allocator = nullptr;  ///< Allocator for tensor stats
+    int hidden_size = 0;
+    int intermediate_size = 0;
+    int num_layers = 0;
+    int batch_size = 0;
+    int seq_length = 0;
+    std::size_t qlora_quantized_bytes = 0;  ///< QLoRA quantized weight bytes (0 if not QLoRA)
+    float qlora_savings_ratio = 0.0f;       ///< QLoRA memory savings ratio (0 if not QLoRA)
+    bool enabled = false;                    ///< Whether to print detailed breakdown
+};
 
 class TrainingRunLogger
 {
@@ -46,6 +62,11 @@ public:
     void log_allocator(
         const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
         const std::vector<std::pair<std::string, long>>& stack_info
+        );
+    void log_allocator(
+        const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
+        const std::vector<std::pair<std::string, long>>& stack_info,
+        const MemoryBreakdownContext& breakdown_ctx
         );
     void log_abs_maxes(int step, const std::vector<std::pair<std::string, float>>& abs_maxes);
 

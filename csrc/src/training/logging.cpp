@@ -7,9 +7,12 @@
 
 #include <cmath>
 #include <filesystem>
+#include <map>
+#include <algorithm>
 
 #include <fmt/core.h>
 #include <fmt/chrono.h>
+#include <cuda_runtime.h>
 
 #include "dataloader.h"
 #include "utilities/comm.h"
@@ -503,6 +506,266 @@ void TrainingRunLogger::log_line(std::string_view line) {
     mFirst = false;
 }
 
+namespace {
+/**
+ * @brief Print detailed memory breakdown for QLoRA/LoRA training optimization.
+ *
+ * Analyzes memory usage by category and compares against Unsloth's baseline.
+ */
+void print_memory_breakdown(
+    const MemoryBreakdownContext& ctx,
+    const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
+    const std::vector<std::pair<std::string, long>>& stack_stats)
+{
+    printf("\n");
+    printf("================================================================================\n");
+    printf("                         MEMORY BREAKDOWN (QLoRA Debug)\n");
+    printf("================================================================================\n\n");
+
+    // Query CUDA memory stats
+    std::size_t cuda_free = 0, cuda_total = 0;
+    cudaMemGetInfo(&cuda_free, &cuda_total);
+    const std::size_t cuda_used = cuda_total - cuda_free;
+
+    // Print allocator segment summary
+    printf("[Allocator Segments]\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("%-35s %12s %12s %12s\n", "Segment", "Device", "Managed", "Pinned");
+    printf("--------------------------------------------------------------------------------\n");
+    for (const auto& [name, amount]: stats) {
+        printf("%-35s %12.1f %12.1f %12.1f\n", name.c_str(),
+               amount.OnDevice / 1024.0 / 1024.0,
+               amount.Managed / 1024.0 / 1024.0,
+               amount.PinnedHost / 1024.0 / 1024.0);
+    }
+    printf("--------------------------------------------------------------------------------\n");
+    printf("\n");
+
+    // Get per-tensor stats for detailed breakdown
+    auto tensor_stats = ctx.allocator->get_tensor_stats();
+
+    // Categorize tensors
+    struct CategoryInfo {
+        std::size_t bytes = 0;
+        std::vector<std::pair<std::string, std::size_t>> items;
+    };
+    std::map<std::string, CategoryInfo> categories;
+    std::size_t total_device = 0;
+
+    auto categorize = [](const std::string& name) -> std::string {
+        // QLoRA-specific buffers
+        if (name.find("dequant") != std::string::npos ||
+            name.find("fp8_quant") != std::string::npos ||
+            name.find("fp4_quant") != std::string::npos) {
+            return "QLoRA Dequant Buffers";
+        }
+        if (name.find("qlora") != std::string::npos ||
+            name.find("fp8_weight") != std::string::npos ||
+            name.find("fp4_weight") != std::string::npos ||
+            name.find("_scales") != std::string::npos) {
+            return "QLoRA Quantized Weights";
+        }
+        // LoRA adapters
+        if (name.find("lora_") != std::string::npos) {
+            return "LoRA Adapters";
+        }
+        // Activations (per-layer tensors)
+        if (name == "ln1" || name == "ln2" || name == "qkv" || name == "att" ||
+            name == "att_out" || name == "residual_att" || name == "mlp_up" ||
+            name == "swiglu" || name == "mlp_down" || name == "lse" ||
+            name.find("_rstd") != std::string::npos ||
+            name.find("_shared") != std::string::npos) {
+            return "Activations (per-layer)";
+        }
+        // Gradients
+        if (name.find("d_") == 0 || name.find("grad") != std::string::npos) {
+            return "Gradients";
+        }
+        // Optimizer state
+        if (name.find("opt_") == 0 || name.find("momentum") != std::string::npos ||
+            name.find("variance") != std::string::npos) {
+            return "Optimizer State";
+        }
+        // Model weights (embeddings, projections)
+        if (name.find("embed") != std::string::npos || name.find("wte") != std::string::npos ||
+            name.find("lm_head") != std::string::npos || name.find("_proj") != std::string::npos ||
+            name.find("_weight") != std::string::npos || name.find("_bias") != std::string::npos) {
+            return "Model Weights";
+        }
+        // Workspace/temporary buffers
+        if (name.find("workspace") != std::string::npos || name.find("_ws") != std::string::npos ||
+            name.find("tmp") != std::string::npos || name.find("buffer") != std::string::npos) {
+            return "Workspace/Temp";
+        }
+        return "Other";
+    };
+
+    for (const auto& [name, bytes] : tensor_stats) {
+        if (bytes == 0) continue;
+        total_device += bytes;
+        std::string category = categorize(name);
+        categories[category].bytes += bytes;
+        if (bytes >= 1024 * 1024) {  // Track items >= 1MB
+            categories[category].items.emplace_back(name, bytes);
+        }
+    }
+
+    // Print category summary
+    printf("Memory by Category:\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("%-35s %12s   %s\n", "Category", "Size (MiB)", "Top Tensors");
+    printf("--------------------------------------------------------------------------------\n");
+
+    std::vector<std::pair<std::string, CategoryInfo*>> sorted_cats;
+    for (auto& [cat, info] : categories) {
+        sorted_cats.emplace_back(cat, &info);
+    }
+    std::sort(sorted_cats.begin(), sorted_cats.end(),
+              [](const auto& a, const auto& b) { return a.second->bytes > b.second->bytes; });
+
+    for (const auto& [cat, info] : sorted_cats) {
+        printf("%-35s %12.1f", cat.c_str(), info->bytes / 1024.0 / 1024.0);
+
+        // Show top 3 tensors in this category
+        if (!info->items.empty()) {
+            printf("   ");
+            int count = 0;
+            for (const auto& [name, bytes] : info->items) {
+                if (count++ >= 3) break;
+                if (count > 1) printf(", ");
+                printf("%s(%.0fM)", name.c_str(), bytes / 1024.0 / 1024.0);
+            }
+        }
+        printf("\n");
+    }
+    printf("--------------------------------------------------------------------------------\n");
+    printf("%-35s %12.1f\n", "TOTAL DEVICE MEMORY", total_device / 1024.0 / 1024.0);
+    printf("\n");
+
+    // QLoRA-specific breakdown
+    if (ctx.qlora_quantized_bytes > 0) {
+        printf("QLoRA-Specific Memory:\n");
+        printf("  Quantized base weights:     %8.1f MiB\n",
+               ctx.qlora_quantized_bytes / 1024.0 / 1024.0);
+        printf("  Memory savings ratio:       %8.1fx vs FP16\n",
+               ctx.qlora_savings_ratio);
+        printf("\n");
+    }
+
+    // Stack breakdown (temporary allocations during forward/backward)
+    if (!stack_stats.empty()) {
+        printf("Stack Allocations (high-water mark):\n");
+        printf("--------------------------------------------------------------------------------\n");
+        std::size_t stack_total = 0;
+        for (const auto& [name, bytes] : stack_stats) {
+            stack_total += bytes;
+            if (bytes >= 1024 * 1024) {  // Show items >= 1MB
+                printf("  %-40s %10.1f MiB\n", name.c_str(), bytes / 1024.0 / 1024.0);
+            }
+        }
+        printf("--------------------------------------------------------------------------------\n");
+        printf("  %-40s %10.1f MiB\n", "STACK TOTAL", stack_total / 1024.0 / 1024.0);
+        printf("\n");
+    }
+
+    // Detailed tensor list (top 20 largest)
+    printf("Top 20 Largest Tensors:\n");
+    printf("--------------------------------------------------------------------------------\n");
+    int count = 0;
+    for (const auto& [name, bytes] : tensor_stats) {
+        if (bytes < 1024 * 1024 || count++ >= 20) break;
+        printf("  %-40s %10.1f MiB\n", name.c_str(), bytes / 1024.0 / 1024.0);
+    }
+    printf("\n");
+
+    // Model info
+    const std::size_t C = ctx.hidden_size;
+    const std::size_t L = ctx.num_layers;
+    const std::size_t D = ctx.intermediate_size;
+    const int B = ctx.batch_size;
+    const int T = ctx.seq_length;
+
+    printf("Model Configuration:\n");
+    printf("  Hidden size (C):            %8zu\n", C);
+    printf("  Intermediate size (D):      %8zu\n", D);
+    printf("  Num layers (L):             %8zu\n", L);
+    printf("  Batch size (B):             %8d\n", B);
+    printf("  Sequence length (T):        %8d\n", T);
+    printf("\n");
+
+    // Theoretical memory estimates
+    const std::size_t activation_per_layer_bf16 = B * T * (
+        C +       // ln1
+        C +       // ln2
+        C * 3 +   // qkv (approx, depends on GQA)
+        C +       // att
+        C +       // att_out
+        C +       // residual_att
+        2 * D +   // mlp_up (gate + up)
+        D +       // swiglu
+        C         // mlp_down
+    ) * 2;  // BF16 = 2 bytes
+
+    printf("Theoretical Activation Memory (BF16, no sharing):\n");
+    printf("  Per layer:                  %8.1f MiB\n", activation_per_layer_bf16 / 1024.0 / 1024.0);
+    printf("  All %zu layers:              %8.1f MiB\n", L, (activation_per_layer_bf16 * L) / 1024.0 / 1024.0);
+    printf("\n");
+
+    // CUDA Memory Breakdown (tracked vs untracked)
+    printf("CUDA Memory Analysis:\n");
+    printf("--------------------------------------------------------------------------------\n");
+    const double cuda_used_mib = cuda_used / 1024.0 / 1024.0;
+    const double tracked_mib = total_device / 1024.0 / 1024.0;
+    const double untracked_mib = cuda_used_mib - tracked_mib;
+    printf("  CUDA total used (nvidia-smi): %8.1f MiB\n", cuda_used_mib);
+    printf("  Tracked by TensorAllocator:   %8.1f MiB\n", tracked_mib);
+    printf("  Untracked CUDA overhead:      %8.1f MiB (%.1f%%)\n",
+           untracked_mib, (untracked_mib / cuda_used_mib) * 100.0);
+    printf("\n");
+    printf("  Untracked memory breakdown (estimated):\n");
+    printf("    - CUDA context:             ~200-400 MiB\n");
+    printf("    - cuDNN handles/workspace:  ~200-500 MiB\n");
+    printf("    - cuBLAS handles:           ~50-100 MiB\n");
+    printf("    - Memory fragmentation:     variable\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("\n");
+
+    // Optimization suggestions based on actual memory usage
+    printf("Optimization Suggestions:\n");
+    bool has_suggestions = false;
+    if (categories["Activations (per-layer)"].bytes > 2ULL * 1024 * 1024 * 1024) {
+        printf("  - High activation memory (%.0f MiB): try --recompute-block or --recompute-ffn\n",
+               categories["Activations (per-layer)"].bytes / 1024.0 / 1024.0);
+        has_suggestions = true;
+    }
+    if (categories["Gradients"].bytes > 1ULL * 1024 * 1024 * 1024) {
+        printf("  - High gradient memory (%.0f MiB): try --offload-gradients or --shard-gradients\n",
+               categories["Gradients"].bytes / 1024.0 / 1024.0);
+        has_suggestions = true;
+    }
+    if (categories["Optimizer State"].bytes > 1ULL * 1024 * 1024 * 1024) {
+        printf("  - High optimizer memory (%.0f MiB): try --offload-optimizer\n",
+               categories["Optimizer State"].bytes / 1024.0 / 1024.0);
+        has_suggestions = true;
+    }
+    if (categories["QLoRA Dequant Buffers"].bytes > 500ULL * 1024 * 1024) {
+        printf("  - Large dequant buffers (%.0f MiB): consider fusing dequant into matmul kernels\n",
+               categories["QLoRA Dequant Buffers"].bytes / 1024.0 / 1024.0);
+        has_suggestions = true;
+    }
+    if (categories["Model Weights"].bytes > 1ULL * 1024 * 1024 * 1024 && ctx.qlora_quantized_bytes > 0) {
+        printf("  - Non-quantized weights detected (%.0f MiB): verify QLoRA is enabled correctly\n",
+               categories["Model Weights"].bytes / 1024.0 / 1024.0);
+        has_suggestions = true;
+    }
+    if (!has_suggestions) {
+        printf("  (No major optimization opportunities detected)\n");
+    }
+
+    printf("\n================================================================================\n\n");
+}
+} // anonymous namespace
+
 /**
  * @brief Log allocator statistics and (optionally) print a readable summary (rank 0 only).
  *
@@ -512,6 +775,17 @@ void TrainingRunLogger::log_line(std::string_view line) {
 void TrainingRunLogger::log_allocator(
         const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
         const std::vector<std::pair<std::string, long>>& stack_info)
+{
+    // Call the extended version with disabled breakdown
+    MemoryBreakdownContext ctx{};
+    ctx.enabled = false;
+    log_allocator(stats, stack_info, ctx);
+}
+
+void TrainingRunLogger::log_allocator(
+        const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
+        const std::vector<std::pair<std::string, long>>& stack_info,
+        const MemoryBreakdownContext& breakdown_ctx)
 {
     if (mRank != 0) return;
     std::string stat_str = "[";
@@ -526,21 +800,9 @@ void TrainingRunLogger::log_allocator(
     std::string line = fmt::format(R"(  {{"log": "allocator", "time": "{}", "step": 0, "stats": {}}})", std::chrono::system_clock::now(), stat_str);
     log_line(line);
 
-    if (mVerbosity >= 0) {
-        printf("[Allocator State]\n");
-        printf(" %17s  Device | Managed | Pinned \n", "in MiB");
-        for (auto& [name, amount]: stats) {
-            printf("  %16s: %6zu | %7zu | %6zu \n", name.c_str(), amount.OnDevice / 1024 / 1024, amount.Managed / 1024 / 1024, amount.PinnedHost / 1024 / 1024);
-        }
-        printf("\n");
-        for (const auto& [name, amount]: stack_info) {
-            std::string stack_name = fmt::format("stack.{}", name);
-            int mib = static_cast<int>(amount / 1024 / 1024);
-            if(mib > 0) {
-                printf("  %16s: %6d \n", stack_name.c_str(), mib);
-            }
-        }
-        printf("\n");
+    // Print detailed memory breakdown if enabled (includes [Allocator State])
+    if (breakdown_ctx.enabled && breakdown_ctx.allocator) {
+        print_memory_breakdown(breakdown_ctx, stats, stack_info);
     }
 }
 

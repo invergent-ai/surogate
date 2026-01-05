@@ -27,6 +27,7 @@
 #include <chrono>
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <cuda_runtime.h>
@@ -151,9 +152,30 @@ void validate_zero_copy_support_or_throw() {
 } // namespace
 
 /**
+ * @brief Helper to print CUDA memory usage at a checkpoint (for debugging untracked memory).
+ * @param label Description of this checkpoint
+ * @param prev_used Previous memory usage (to show delta), or 0 for first call
+ * @return Current CUDA memory used in bytes
+ */
+std::size_t print_cuda_memory_checkpoint(const char* label, std::size_t prev_used = 0) {
+    std::size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    const std::size_t used = total_mem - free_mem;
+    const double used_mib = used / 1024.0 / 1024.0;
+
+    if (prev_used > 0) {
+        const double delta_mib = (static_cast<double>(used) - static_cast<double>(prev_used)) / 1024.0 / 1024.0;
+        printf("  [CUDA] %-40s %8.1f MiB (delta: %+.1f MiB)\n", label, used_mib, delta_mib);
+    } else {
+        printf("  [CUDA] %-40s %8.1f MiB\n", label, used_mib);
+    }
+    return used;
+}
+
+/**
  * @brief End-to-end training runner: CLI config parsing, distributed setup, training loop, eval/checkpoint/export.
  *
- * “Parameters” are stored as public fields so CLI11 can bind options directly.
+ * "Parameters" are stored as public fields so CLI11 can bind options directly.
  */
 struct TrainingRunner {
     /// Micro-batch size per optimizer micro-step (per rank).
@@ -293,6 +315,8 @@ struct TrainingRunner {
     /// If >=0, log allocations >= this many bytes (set from MiB CLI value).
     int LogAllocations = -1;
     int DebugLogAbsMaxes = -1;
+    /// Print detailed memory breakdown after model allocation.
+    bool DebugMemoryBreakdown = false;
 
     /// True if the user specified --use-zero-copy or --no-use-zero-copy.
     bool UseZeroCopySpecified = false;
@@ -437,6 +461,7 @@ void TrainingRunner::load_training_config(int argc, const char** argv) {
     app.add_option("--debug-log-allocations", LogAllocations, "Log all memory allocations larger than the given number (in MiB)");
     app.add_flag("--debug-time-breakdown", Options.TriggerTimingEvents, "Log additional timing information");
     app.add_flag("--debug-log-abs-max", DebugLogAbsMaxes, "Log abs-maxes every n steps");
+    app.add_flag("--debug-memory-breakdown", DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation (useful for QLoRA optimization)");
 
     // optimizer
     app.add_option("--lr,--learning-rate", LearningRate, "Base learning rate")->check(CLI::NonNegativeNumber);
@@ -961,9 +986,21 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
 	    }
 	    printf("Architecture: %s\n", arch_name);
 
+	    // Memory checkpoint: before model creation
+	    std::size_t cuda_mem_before_model = 0;
+	    if (DebugMemoryBreakdown && comm.rank() == 0) {
+	        printf("\nCUDA Memory Checkpoints (tracking untracked overhead):\n");
+	        printf("--------------------------------------------------------------------------------\n");
+	        cuda_mem_before_model = print_cuda_memory_checkpoint("Before ModelFactory::create");
+	    }
+
 	    // Create model via factory
 	    model_storage = modules::ModelFactory::create(
 	        mod_config, mod_options, comm.rank(), comm.world_size(), allocator);
+
+	    if (DebugMemoryBreakdown && comm.rank() == 0) {
+	        cuda_mem_before_model = print_cuda_memory_checkpoint("After ModelFactory::create", cuda_mem_before_model);
+	    }
 	    if (UseLora) {
 	        if (mod_config.architecture != modules::ArchitectureType::Dense) {
 	            throw std::runtime_error("--lora currently supports only --arch=dense");
@@ -983,7 +1020,6 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
                     .build();
                 printf("QLoRA-FP8 enabled: block_size=%d (base weights quantized to FP8 with per-block scales)\n",
                        QLoRABlockSize);
-                printf("Expected memory savings: ~50%% for base model weights\n");
             } else if (UseQLoRAFP4) {
                 qlora_config = modules::QLoRAConfigBuilder()
                     .nvfp4()
@@ -991,7 +1027,6 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
                     .build();
                 printf("QLoRA-FP4 enabled: NVFP4 (E2M1) with two-level block scaling%s\n",
                        QLoRAFourOverSix ? " + 4/6 adaptive scaling" : "");
-                printf("Expected memory savings: ~75%% for base model weights\n");
             }
 
 	        // Convert LoRAAdapterConfig -> modular LoRA config (modules/lora).
@@ -1046,8 +1081,16 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
 	        model = model_storage.get();
 	    }
 
+	    if (DebugMemoryBreakdown && comm.rank() == 0) {
+	        cuda_mem_before_model = print_cuda_memory_checkpoint("After LoRA/model setup", cuda_mem_before_model);
+	    }
+
 	    // Allocate run state for the selected model (base or LoRA wrapper)
 	    model->allocate_run_state(Options, comm, B, T, /*allocate_optimizer=*/true);
+
+	    if (DebugMemoryBreakdown && comm.rank() == 0) {
+	        cuda_mem_before_model = print_cuda_memory_checkpoint("After allocate_run_state", cuda_mem_before_model);
+	    }
 
 	    if (latest_step >= 0) {
 	        auto log = logger.log_section_start(0, fmt::format("Loading checkpoint {} from `{}`", latest_step, CkptDir.c_str()));
@@ -1062,13 +1105,40 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
 	        latest_step = 0;
 	    }
 
+	    if (DebugMemoryBreakdown && comm.rank() == 0) {
+	        cuda_mem_before_model = print_cuda_memory_checkpoint("After import_weights", cuda_mem_before_model);
+	        printf("--------------------------------------------------------------------------------\n\n");
+	    }
+
     logger.log_dataset(train_loader, test_loader);
 
-	    // Log allocator stats (modular and legacy)
+	    // Log allocator stats and optionally print detailed memory breakdown
 	    {
 	        auto& rs = model->get_run_state();
 	        if (rs.Allocator) {
-	            logger.log_allocator(rs.Allocator->get_allocation_segments(), rs.Stack.get_allocation_stats());
+	            auto stack_stats = rs.Stack.get_allocation_stats();
+
+	            // Build memory breakdown context (enabled only when DebugMemoryBreakdown is set)
+	            MemoryBreakdownContext breakdown_ctx;
+	            breakdown_ctx.enabled = DebugMemoryBreakdown;
+	            breakdown_ctx.allocator = rs.Allocator.get();
+	            breakdown_ctx.hidden_size = mod_config.HiddenSize;
+	            breakdown_ctx.intermediate_size = mod_config.IntermediateSize;
+	            breakdown_ctx.num_layers = mod_config.NumLayers;
+	            breakdown_ctx.batch_size = B;
+	            breakdown_ctx.seq_length = T;
+
+	            // Get QLoRA stats if applicable
+	            if (UseLora) {
+	                using DenseBlock = modules::DenseTransformerBlock<>;
+	                auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(model);
+	                if (lora_model && lora_model->qlora_enabled()) {
+	                    breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
+	                    breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
+	                }
+	            }
+
+	            logger.log_allocator(rs.Allocator->get_allocation_segments(), stack_stats, breakdown_ctx);
 	        }
 	    }
 

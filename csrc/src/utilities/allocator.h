@@ -77,6 +77,12 @@ public:
     [[nodiscard]] AllocationMonitor with_context(const std::string& ctx) { return AllocationMonitor(ctx, this); }
 
     std::vector<std::pair<std::string, sSegmentMemory>> get_allocation_segments() const;
+
+    /**
+     * @brief Get per-tensor allocation statistics.
+     * @return Vector of (tensor_name, device_bytes) pairs sorted by size descending.
+     */
+    std::vector<std::pair<std::string, std::size_t>> get_tensor_stats() const;
 private:
 
     template<typename Container>

@@ -207,6 +207,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         debug_time_breakdown (Optional[bool], defaults to False):
             Whether to enable detailed training timing breakdown for debugging.
+        debug_memory_breakdown (Optional[bool], defaults to False):
+            Print detailed memory breakdown after model allocation (useful for QLoRA optimization).
     """
     run_name: Optional[str] = None
     apply_recommended_values: Optional[bool] = False
@@ -288,6 +290,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     merge_adapter: Optional[bool] = False
     use_chat_template: Optional[bool] = True
     debug_time_breakdown: Optional[bool] = False
+    debug_memory_breakdown: Optional[bool] = False
     log_gpu_util: Optional[int] = 100
 
     def __init__(self, cfg: DictDefault):
@@ -371,6 +374,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
+        self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
 
     def __post_init__(self):
         ModelConfig.__post_init__(self)
@@ -473,6 +477,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             shard_gradients=shard_gradients,
             use_all_to_all_reduce=self.use_all_to_all_reduce,
             init_projections_to_zero=self.init_projections_to_zero,
+            debug_memory_breakdown=self.debug_memory_breakdown,
             lmhead_chunks=self.lmhead_chunks,
             attn_bwd_chunks=self.attn_bwd_chunks,
             matmul_type="",

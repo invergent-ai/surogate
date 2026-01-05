@@ -25,7 +25,7 @@ struct RuntimeOptions {
     bool RecomputeFFN = false;
     bool RecomputeQKV = false;
     bool RecomputeAtt = false;
-    bool RecomputeBlock = false;
+    bool RecomputeBlock = true;
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;
@@ -45,6 +45,9 @@ struct RuntimeOptions {
     bool UseAllToAllReduce = false;
 
     bool InitProjectionsToZero = false;
+
+    // Debug: print detailed memory breakdown after model allocation (useful for QLoRA optimization)
+    bool DebugMemoryBreakdown = false;
 
     // Training recipe - defines quantization strategy for forward/backward passes.
     // Default is BF16 (no quantization). Set via --recipe=<name> CLI flag.

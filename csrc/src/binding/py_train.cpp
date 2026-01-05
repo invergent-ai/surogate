@@ -12,6 +12,7 @@
 #include "utilities/gpu_info.h"
 #include "training/checkpoint.h"
 #include "training/dataloader.h"
+#include "training/logging.h"
 #include "utilities/comm.h"
 #include "kernels/kernels.h"
 #include "training/model.h"
@@ -95,8 +96,40 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
  * @param path Path to the weights source (format handled by IModel::import_weights()).
  */
 void MultiGPUPyTrainer::import_weights(std::string path) {
-    run_work([path](sThreadContext& ctx) {
+    run_work([this, path](sThreadContext& ctx) {
         ctx.Model->import_weights(path, true, *ctx.Communicator);
+
+        // Print memory breakdown if enabled (rank 0 only)
+        if (mOptions.DebugMemoryBreakdown && ctx.Communicator->rank() == 0) {
+            auto& rs = ctx.Model->get_run_state();
+            if (rs.Allocator) {
+                auto stats = rs.Allocator->get_allocation_segments();
+                auto stack_stats = rs.Stack.get_allocation_stats();
+
+                // Build memory breakdown context
+                MemoryBreakdownContext breakdown_ctx;
+                breakdown_ctx.enabled = true;
+                breakdown_ctx.allocator = rs.Allocator.get();
+                breakdown_ctx.hidden_size = mConfig.HiddenSize;
+                breakdown_ctx.intermediate_size = mConfig.IntermediateSize;
+                breakdown_ctx.num_layers = mConfig.NumLayers;
+                breakdown_ctx.batch_size = B;
+                breakdown_ctx.seq_length = T;
+
+                // Get QLoRA stats if applicable
+                using DenseBlock = modules::DenseTransformerBlock<>;
+                if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get())) {
+                    if (lora_model->qlora_enabled()) {
+                        breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
+                        breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
+                    }
+                }
+
+                // Use a temporary logger to print the breakdown
+                TrainingRunLogger logger("", 0, TrainingRunLogger::VERBOSE);
+                logger.log_allocator(stats, stack_stats, breakdown_ctx);
+            }
+        }
     });
 }
 

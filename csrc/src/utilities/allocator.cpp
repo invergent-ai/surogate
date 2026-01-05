@@ -566,3 +566,19 @@ std::vector<std::pair<std::string, sSegmentMemory>> TensorAllocator::get_allocat
 void TensorAllocator::set_callback(std::function<void(const std::string&, const std::string&, EAllocationType, std::size_t)> cb) {
     mCallback = std::move(cb);
 }
+
+/**
+ * @brief Get per-tensor allocation statistics sorted by device memory usage.
+ *
+ * @return Vector of (tensor_name, device_bytes) pairs sorted by size descending.
+ */
+std::vector<std::pair<std::string, std::size_t>> TensorAllocator::get_tensor_stats() const {
+    std::vector<std::pair<std::string, std::size_t>> result;
+    result.reserve(m_Stats->TensorStats.size());
+    for (const auto& [name, allocs] : m_Stats->TensorStats) {
+        result.emplace_back(name, static_cast<std::size_t>(allocs.ON_DEVICE));
+    }
+    std::sort(result.begin(), result.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    return result;
+}

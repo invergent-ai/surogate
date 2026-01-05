@@ -296,30 +296,30 @@ ModularGradientManager<Block>::ModularGradientManager(
     if (!config.skip_allocation) {
         allocate_non_block_gradients(mFullNonBlock, config.grad_dtype);
     } else {
-        // LoRA mode: allocate minimal buffers - only final_norm is small
-        // d_embeddings and d_lm_head need to be allocated because backward kernels write to them,
-        // but they're discarded immediately (not accumulated or used for optimizer)
-        long V = config.vocab_size;
+        // LoRA mode: only allocate d_final_norm (small: hidden_size elements)
+        // d_embeddings and d_lm_head are NOT needed because:
+        // - encoder_backward is skipped when lora_only=true (modular_model.h:1564-1580)
+        // - lm_head backward is skipped when lora_only=true (modular_model.h:2743-2750)
+        // This saves ~762 MiB for a 4B model (vocab_size * hidden_size * 2 bytes)
         long C = config.hidden_size;
         mFullNonBlock.d_final_norm = mAllocator->allocate(config.grad_dtype, "d_final_norm", EAllocationType::ON_DEVICE, {C});
-        // For embeddings and lm_head, we unfortunately still need to allocate them because
-        // encoder_backward and lm_head backward need destination buffers
-        mFullNonBlock.d_embeddings = mAllocator->allocate(config.grad_dtype, "d_embeddings", EAllocationType::ON_DEVICE, {V, C});
-        if (config.tied_embeddings) {
-            mFullNonBlock.d_lm_head = mFullNonBlock.d_embeddings;
-        } else {
-            mFullNonBlock.d_lm_head = mAllocator->allocate(config.grad_dtype, "d_lm_head", EAllocationType::ON_DEVICE, {V, C});
-        }
+        // Leave d_embeddings and d_lm_head as empty tensors (Data = nullptr)
+        mFullNonBlock.d_embeddings = {};
+        mFullNonBlock.d_lm_head = {};
     }
 
-    // Create shard views for non-block gradients
+    // Create shard views for non-block gradients (skip embeddings/lm_head in LoRA mode)
     if (config.num_shards > 1) {
-        mEmbeddingsShardView = shard_view(mFullNonBlock.d_embeddings, config.shard_idx, config.num_shards);
-        mLMHeadShardView = shard_view(mFullNonBlock.d_lm_head, config.shard_idx, config.num_shards);
+        if (!config.skip_allocation) {
+            mEmbeddingsShardView = shard_view(mFullNonBlock.d_embeddings, config.shard_idx, config.num_shards);
+            mLMHeadShardView = shard_view(mFullNonBlock.d_lm_head, config.shard_idx, config.num_shards);
+        }
         mFinalNormShardView = shard_view(mFullNonBlock.d_final_norm, config.shard_idx, config.num_shards);
     } else {
-        mEmbeddingsShardView = TensorShard(mFullNonBlock.d_embeddings);
-        mLMHeadShardView = TensorShard(mFullNonBlock.d_lm_head);
+        if (!config.skip_allocation) {
+            mEmbeddingsShardView = TensorShard(mFullNonBlock.d_embeddings);
+            mLMHeadShardView = TensorShard(mFullNonBlock.d_lm_head);
+        }
         mFinalNormShardView = TensorShard(mFullNonBlock.d_final_norm);
     }
 
@@ -418,8 +418,11 @@ template<typename Block>
     }
 
     // Non-block gradients are accumulated in-place across micro-steps.
-    fill_zero(mFullNonBlock.d_embeddings, stream);
-    if (mFullNonBlock.d_lm_head.Data != mFullNonBlock.d_embeddings.Data) {
+    // Skip embeddings/lm_head in LoRA mode (not allocated)
+    if (mFullNonBlock.d_embeddings.Data) {
+        fill_zero(mFullNonBlock.d_embeddings, stream);
+    }
+    if (mFullNonBlock.d_lm_head.Data && mFullNonBlock.d_lm_head.Data != mFullNonBlock.d_embeddings.Data) {
         fill_zero(mFullNonBlock.d_lm_head, stream);
     }
     fill_zero(mFullNonBlock.d_final_norm, stream);
@@ -522,12 +525,16 @@ typename Block::Gradients& ModularGradientManager<Block>::get_block_shard(int la
 template<typename Block>
 void ModularGradientManager<Block>::notify_embeddings(cudaStream_t stream, NCCLCommunicator& comm) {
     if (!mIsLastMicroStep) return;
+    // Skip in LoRA mode (embeddings not allocated)
+    if (!mFullNonBlock.d_embeddings.Data) return;
     scatter_reduce(mFullNonBlock.d_embeddings, stream, mEmbeddingsReduceEvent, comm);
 }
 
 template<typename Block>
 void ModularGradientManager<Block>::notify_lm_head(cudaStream_t stream, NCCLCommunicator& comm) {
     if (!mIsLastMicroStep) return;
+    // Skip in LoRA mode (lm_head not allocated)
+    if (!mFullNonBlock.d_lm_head.Data) return;
     if (mFullNonBlock.d_lm_head.Data == mFullNonBlock.d_embeddings.Data) {
         CUDA_CHECK(cudaEventRecord(mLMHeadReduceEvent, stream));
         return;

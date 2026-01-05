@@ -292,7 +292,7 @@ NB_MODULE(_surogate, m) {
             bool use_cuda_graphs, bool trigger_timing_events,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
-            bool init_projections_to_zero, int lmhead_chunks, int attn_bwd_chunks,
+            bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks,
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope,
             int fp8_amax_history, const std::string& fp4_backend,
@@ -338,6 +338,7 @@ NB_MODULE(_surogate, m) {
                 .ShardGradients = shard_gradients,
                 .UseAllToAllReduce = use_all_to_all_reduce,
                 .InitProjectionsToZero = init_projections_to_zero,
+                .DebugMemoryBreakdown = debug_memory_breakdown,
                 .TrainingRecipe = std::move(training_recipe),
                 .RecipeOptions = recipe_options,
                 .UseFusedRope = use_fused_rope,
@@ -367,6 +368,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("shard_gradients") = false,
              nb::arg("use_all_to_all_reduce") = false,
              nb::arg("init_projections_to_zero") = false,
+             nb::arg("debug_memory_breakdown") = false,
              nb::arg("lmhead_chunks") = 1,
              nb::arg("attn_bwd_chunks") = 1,
              nb::arg("matmul_type") = "",
@@ -421,6 +423,7 @@ NB_MODULE(_surogate, m) {
         .def_rw("shard_gradients", &RuntimeOptions::ShardGradients, "Shard gradients across GPUs.")
         .def_rw("use_all_to_all_reduce", &RuntimeOptions::UseAllToAllReduce, "Use all-to-all reduce strategy when reducing gradients.")
         .def_rw("init_projections_to_zero", &RuntimeOptions::InitProjectionsToZero, "Initialize certain projections to zero (for experiments).")
+        .def_rw("debug_memory_breakdown", &RuntimeOptions::DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation.")
         .def_rw("use_fused_rope", &RuntimeOptions::UseFusedRope, "Use fused RoPE kernel with on-the-fly cos/sin computation.")
         .def_prop_rw("matmul_type", [](const RuntimeOptions* opt){ return opt->matmul_dtype(); },
                      [](RuntimeOptions* opt, const std::string& dtype_str){ opt->MatmulType = opt_dtype_from_str(dtype_str); },
