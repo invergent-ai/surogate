@@ -19,6 +19,12 @@ recipe: fp8-hybrid
 qlora_fp4: true
 fp4_backend: cutlass
 
+# Layers 0 and 1 (first 2) stay in BF16
+# Layers N-8 through N-1 (last 8) stay in BF16
+# All middle layers use FP4
+skip_quant_first_layers: 2
+skip_quant_last_layers: 8
+
 lora: true
 lora_rank: 16
 lora_alpha: 32
