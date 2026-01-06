@@ -484,3 +484,186 @@ TEST_CASE("BnB QLoRAConfig factory method", "[bnb][config]") {
     REQUIRE(cfg2.scale_config.block_size == 128);
     REQUIRE(cfg2.bnb_double_quant == false);
 }
+
+TEST_CASE("BnB NF4 quantization performance", "[bnb][nf4][benchmark]") {
+    // Test different matrix sizes typical for LLM weight matrices
+    struct TestCase {
+        int M;
+        int K;
+        const char* name;
+    };
+
+    std::vector<TestCase> test_cases = {
+        {4096, 4096, "4K x 4K"},
+        {4096, 11008, "gate_up (4K x 11K)"},
+        {11008, 4096, "down (11K x 4K)"},
+        {4096, 14336, "large MLP (4K x 14K)"},
+    };
+
+    auto dp = get_device_props();
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    const int block_size = 64;
+    const int warmup_iterations = 10;
+    const int benchmark_iterations = 100;
+
+    for (const auto& tc : test_cases) {
+        SECTION(tc.name) {
+            const int M = tc.M;
+            const int K = tc.K;
+            const int num_elements = M * K;
+            const int packed_size = (num_elements + 1) / 2;
+            const int num_blocks = (num_elements + block_size - 1) / block_size;
+
+            // Generate random input
+            auto h_input = generate_random_bf16(num_elements);
+
+            // Allocate device memory
+            nv_bfloat16* d_input = nullptr;
+            unsigned char* d_quantized = nullptr;
+            float* d_absmax = nullptr;
+
+            CUDA_CHECK(cudaMalloc(&d_input, num_elements * sizeof(nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&d_quantized, packed_size));
+            CUDA_CHECK(cudaMalloc(&d_absmax, num_blocks * sizeof(float)));
+
+            CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
+                                       num_elements * sizeof(nv_bfloat16),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Warmup
+            for (int i = 0; i < warmup_iterations; ++i) {
+                quantize_bnb_nf4(d_quantized, d_absmax, d_input, M, K, block_size, dp, stream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Benchmark
+            cudaEvent_t start, stop;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            for (int i = 0; i < benchmark_iterations; ++i) {
+                quantize_bnb_nf4(d_quantized, d_absmax, d_input, M, K, block_size, dp, stream);
+            }
+            CUDA_CHECK(cudaEventRecord(stop, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+
+            float avg_time_us = (elapsed_ms * 1000.0f) / benchmark_iterations;
+            float throughput_gb_s = (num_elements * sizeof(nv_bfloat16) / 1e9f) / (avg_time_us / 1e6f);
+
+            INFO(tc.name << " quant: " << avg_time_us << " us/iter, " << throughput_gb_s << " GB/s");
+
+            // Just verify it completes without error
+            REQUIRE(avg_time_us > 0.0f);
+
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaFree(d_quantized));
+            CUDA_CHECK(cudaFree(d_absmax));
+        }
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST_CASE("BnB NF4 dequantization performance", "[bnb][nf4][benchmark]") {
+    // Test different matrix sizes typical for LLM weight matrices
+    struct TestCase {
+        int M;
+        int K;
+        const char* name;
+    };
+
+    std::vector<TestCase> test_cases = {
+        {4096, 4096, "4K x 4K"},
+        {4096, 11008, "gate_up (4K x 11K)"},
+        {11008, 4096, "down (11K x 4K)"},
+        {4096, 14336, "large MLP (4K x 14K)"},
+    };
+
+    auto dp = get_device_props();
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    const int block_size = 64;
+    const int warmup_iterations = 10;
+    const int benchmark_iterations = 100;
+
+    for (const auto& tc : test_cases) {
+        SECTION(tc.name) {
+            const int M = tc.M;
+            const int K = tc.K;
+            const int num_elements = M * K;
+            const int packed_size = (num_elements + 1) / 2;
+            const int num_blocks = (num_elements + block_size - 1) / block_size;
+
+            // Generate random input and quantize it first
+            auto h_input = generate_random_bf16(num_elements);
+
+            // Allocate device memory
+            nv_bfloat16* d_input = nullptr;
+            unsigned char* d_quantized = nullptr;
+            float* d_absmax = nullptr;
+            nv_bfloat16* d_output = nullptr;
+
+            CUDA_CHECK(cudaMalloc(&d_input, num_elements * sizeof(nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&d_quantized, packed_size));
+            CUDA_CHECK(cudaMalloc(&d_absmax, num_blocks * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_output, num_elements * sizeof(nv_bfloat16)));
+
+            CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
+                                       num_elements * sizeof(nv_bfloat16),
+                                       cudaMemcpyHostToDevice, stream));
+
+            // Quantize once
+            quantize_bnb_nf4(d_quantized, d_absmax, d_input, M, K, block_size, dp, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Warmup dequantization
+            for (int i = 0; i < warmup_iterations; ++i) {
+                dequantize_bnb_nf4(d_output, d_quantized, d_absmax, M, K, block_size, dp, stream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Benchmark dequantization
+            cudaEvent_t start, stop;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            for (int i = 0; i < benchmark_iterations; ++i) {
+                dequantize_bnb_nf4(d_output, d_quantized, d_absmax, M, K, block_size, dp, stream);
+            }
+            CUDA_CHECK(cudaEventRecord(stop, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+
+            float avg_time_us = (elapsed_ms * 1000.0f) / benchmark_iterations;
+            // Output throughput: n BF16 elements written
+            float throughput_gb_s = (num_elements * sizeof(nv_bfloat16) / 1e9f) / (avg_time_us / 1e6f);
+
+            INFO(tc.name << " dequant: " << avg_time_us << " us/iter, " << throughput_gb_s << " GB/s");
+
+            // Just verify it completes without error
+            REQUIRE(avg_time_us > 0.0f);
+
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaFree(d_quantized));
+            CUDA_CHECK(cudaFree(d_absmax));
+            CUDA_CHECK(cudaFree(d_output));
+        }
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
