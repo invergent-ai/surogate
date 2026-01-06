@@ -155,7 +155,7 @@ public:
 private:
     Config mConfig;
     TensorAllocator* mAllocator;
-    const cudaDeviceProp* mDeviceProps;
+    cudaDeviceProp mDeviceProps;  // Store by value to avoid dangling pointer
 
     // The underlying FP4 weights manager (owns quantized weights)
     std::unique_ptr<FP4WeightsManager> mFP4Weights;
@@ -190,7 +190,7 @@ FP4WeightProvider<Block>::FP4WeightProvider(
     const Config& config, TensorAllocator& allocator, const cudaDeviceProp& device_props)
     : mConfig(config)
     , mAllocator(&allocator)
-    , mDeviceProps(&device_props)
+    , mDeviceProps(device_props)  // Copy by value
 {
     // Create FP4 weights manager
     FP4WeightsManager::Config fp4_config{
@@ -309,7 +309,7 @@ typename FP4WeightProvider<Block>::BlockWeights& FP4WeightProvider<Block>::get_b
             fp4_block.qkv_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
             qkv_scale,
             fp4_block.qkv_proj.M, fp4_block.qkv_proj.K,
-            *mDeviceProps, stream);
+            mDeviceProps, stream);
 
         // Output projection
         float out_scale = fp4_block.out_proj.global_decode_scale_rowwise();
@@ -319,7 +319,7 @@ typename FP4WeightProvider<Block>::BlockWeights& FP4WeightProvider<Block>::get_b
             fp4_block.out_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
             out_scale,
             fp4_block.out_proj.M, fp4_block.out_proj.K,
-            *mDeviceProps, stream);
+            mDeviceProps, stream);
 
         // Gate+Up projection
         float gate_up_scale = fp4_block.gate_up_proj.global_decode_scale_rowwise();
@@ -329,7 +329,7 @@ typename FP4WeightProvider<Block>::BlockWeights& FP4WeightProvider<Block>::get_b
             fp4_block.gate_up_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
             gate_up_scale,
             fp4_block.gate_up_proj.M, fp4_block.gate_up_proj.K,
-            *mDeviceProps, stream);
+            mDeviceProps, stream);
 
         // Down projection
         float down_scale = fp4_block.down_proj.global_decode_scale_rowwise();
@@ -339,7 +339,7 @@ typename FP4WeightProvider<Block>::BlockWeights& FP4WeightProvider<Block>::get_b
             fp4_block.down_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
             down_scale,
             fp4_block.down_proj.M, fp4_block.down_proj.K,
-            *mDeviceProps, stream);
+            mDeviceProps, stream);
 
         // Synchronize to ensure dequantization completes before returning.
         // This fixes an intermittent hang that occurs when the dequant kernels

@@ -165,7 +165,7 @@ public:
 private:
     Config mConfig;
     TensorAllocator* mAllocator;
-    const cudaDeviceProp* mDeviceProps;
+    cudaDeviceProp mDeviceProps;  // Store by value to avoid dangling pointer
 
     // The underlying BnB weights manager (owns quantized weights)
     std::unique_ptr<BnBWeightsManager> mBnBWeights;
@@ -206,7 +206,7 @@ BnBWeightProvider<Block>::BnBWeightProvider(
     const Config& config, TensorAllocator& allocator, const cudaDeviceProp& device_props)
     : mConfig(config)
     , mAllocator(&allocator)
-    , mDeviceProps(&device_props)
+    , mDeviceProps(device_props)  // Copy by value
 {
     // Create BnB weights manager
     BnBWeightsManager::Config bw_config{
@@ -299,7 +299,7 @@ void BnBWeightProvider<Block>::dequantize_weight(const BnBBlockQuantizedWeight& 
             src.absmax_offset.get<float>(),
             src.M, src.K,
             src.block_size, src.double_quant_group_size,
-            *mDeviceProps, stream);
+            mDeviceProps, stream);
     } else {
         // Standard dequantization: FP32 absmax → NF4 dequant
         dequantize_bnb_nf4(
@@ -308,7 +308,7 @@ void BnBWeightProvider<Block>::dequantize_weight(const BnBBlockQuantizedWeight& 
             src.absmax.get<float>(),
             src.M, src.K,
             src.block_size,
-            *mDeviceProps, stream);
+            mDeviceProps, stream);
     }
 }
 

@@ -204,7 +204,7 @@ public:
 private:
     Config mConfig;
     TensorAllocator* mAllocator;
-    const cudaDeviceProp* mDeviceProps;
+    cudaDeviceProp mDeviceProps;  // Store by value to avoid dangling pointer
 
     // The underlying QLoRA weights manager (owns quantized weights + LoRA adapters)
     std::unique_ptr<FP8WeightsManager> mFP8Weights;
@@ -268,7 +268,7 @@ FP8WeightProvider<Block>::FP8WeightProvider(
     const Config& config, TensorAllocator& allocator, const cudaDeviceProp& device_props)
     : mConfig(config)
     , mAllocator(&allocator)
-    , mDeviceProps(&device_props)
+    , mDeviceProps(device_props)  // Copy by value
 {
     // Create QLoRA weights manager
     FP8WeightsManager::Config qw_config{
@@ -455,7 +455,7 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
                 qblock.qkv_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.qkv_proj.block_scales.get<float>(),
                 qblock.qkv_proj.M, qblock.qkv_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
             fused_dequant_requant_per_block_to_tensor(
                 mDequantOut.get<__nv_fp8_e4m3>(),
@@ -463,7 +463,7 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
                 qblock.out_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.out_proj.block_scales.get<float>(),
                 qblock.out_proj.M, qblock.out_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
             fused_dequant_requant_per_block_to_tensor(
                 mDequantGateUp.get<__nv_fp8_e4m3>(),
@@ -471,7 +471,7 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
                 qblock.gate_up_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.gate_up_proj.block_scales.get<float>(),
                 qblock.gate_up_proj.M, qblock.gate_up_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
             fused_dequant_requant_per_block_to_tensor(
                 mDequantDown.get<__nv_fp8_e4m3>(),
@@ -479,7 +479,7 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
                 qblock.down_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.down_proj.block_scales.get<float>(),
                 qblock.down_proj.M, qblock.down_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
         } else {
             // **BF16 LEGACY PATH**: Dequantize to BF16
@@ -488,28 +488,28 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
                 qblock.qkv_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.qkv_proj.block_scales.get<float>(),
                 qblock.qkv_proj.M, qblock.qkv_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
             dequantize_per_block(
                 mDequantOut.get<nv_bfloat16>(),
                 qblock.out_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.out_proj.block_scales.get<float>(),
                 qblock.out_proj.M, qblock.out_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
             dequantize_per_block(
                 mDequantGateUp.get<nv_bfloat16>(),
                 qblock.gate_up_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.gate_up_proj.block_scales.get<float>(),
                 qblock.gate_up_proj.M, qblock.gate_up_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
 
             dequantize_per_block(
                 mDequantDown.get<nv_bfloat16>(),
                 qblock.down_proj.data.get<__nv_fp8_e4m3>(),
                 qblock.down_proj.block_scales.get<float>(),
                 qblock.down_proj.M, qblock.down_proj.K,
-                block_size, *mDeviceProps, stream);
+                block_size, mDeviceProps, stream);
         }
 
         // Update cache metadata
