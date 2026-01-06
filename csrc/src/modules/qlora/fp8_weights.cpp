@@ -39,14 +39,15 @@ FP8WeightsManager::FP8WeightsManager(const Config& config, TensorAllocator& allo
         throw std::runtime_error("FP8WeightsManager: QLoRA must be enabled");
     }
 
-    // Allocate quantized weight storage
-    allocate_quantized_blocks();
+    // Pre-size the vector but don't allocate GPU memory yet.
+    // Each layer's storage will be allocated lazily in load_and_quantize_block()
+    // to reduce peak memory during initialization.
+    mQuantizedBlocks.resize(mConfig.num_layers);
 }
 
-void FP8WeightsManager::allocate_quantized_blocks() {
+void FP8WeightsManager::allocate_single_block(int layer_idx) {
     auto ctx = mAllocator->with_context("FP8_Weights");
 
-    const int num_layers = mConfig.num_layers;
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
     const int num_q_heads = mConfig.num_query_heads;
@@ -54,87 +55,81 @@ void FP8WeightsManager::allocate_quantized_blocks() {
     const int head_size = mConfig.head_size;
     const int block_size = mConfig.qlora_config.block_size();
 
-    mQuantizedBlocks.resize(num_layers);
+    auto& block = mQuantizedBlocks[layer_idx];
 
-    for (int layer = 0; layer < num_layers; ++layer) {
-        auto& block = mQuantizedBlocks[layer];
+    // QKV projection: (hidden, (num_q + 2*num_kv) * head_size)
+    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+    {
+        auto& w = block.qkv_proj;
+        w.M = qkv_out;
+        w.K = hidden;
+        w.block_size = block_size;
+        auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
 
-        // QKV projection: (hidden, (num_q + 2*num_kv) * head_size)
-        const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-        {
-            auto& w = block.qkv_proj;
-            w.M = qkv_out;
-            w.K = hidden;
-            w.block_size = block_size;
-            auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
+        // Allocate FP8 data
+        w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "qkv_fp8",
+                                      EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
 
-            // Allocate FP8 data
-            w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "qkv_fp8",
-                                          EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
-
-            // Allocate block scales
-            w.block_scales = mAllocator->allocate(ETensorDType::FP32, "qkv_scales",
-                                                   EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
-        }
-
-        // Output projection: (hidden, num_q * head_size)
-        {
-            auto& w = block.out_proj;
-            w.M = hidden;
-            w.K = num_q_heads * head_size;
-            w.block_size = block_size;
-            auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
-
-            w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "out_fp8",
-                                          EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
-            w.block_scales = mAllocator->allocate(ETensorDType::FP32, "out_scales",
-                                                   EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
-        }
-
-        // Gate+Up projection: (2 * intermediate, hidden)
-        {
-            auto& w = block.gate_up_proj;
-            w.M = 2 * intermediate;
-            w.K = hidden;
-            w.block_size = block_size;
-            auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
-
-            w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "gate_up_fp8",
-                                          EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
-            w.block_scales = mAllocator->allocate(ETensorDType::FP32, "gate_up_scales",
-                                                   EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
-        }
-
-        // Down projection: (hidden, intermediate)
-        {
-            auto& w = block.down_proj;
-            w.M = hidden;
-            w.K = intermediate;
-            w.block_size = block_size;
-            auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
-
-            w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "down_fp8",
-                                          EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
-            w.block_scales = mAllocator->allocate(ETensorDType::FP32, "down_scales",
-                                                   EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
-        }
-
-        // Layer norm weights (BF16, not quantized)
-        block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
-                                                 EAllocationType::ON_DEVICE, {(long)hidden});
-        block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
-                                                 EAllocationType::ON_DEVICE, {(long)hidden});
-
-        // QK-norm weights (BF16, not quantized) - only for models like Qwen3
-        if (mConfig.use_qk_norm) {
-            block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
-                                                        EAllocationType::ON_DEVICE, {(long)head_size});
-            block.k_norm_weight = mAllocator->allocate(ETensorDType::BF16, "k_norm",
-                                                        EAllocationType::ON_DEVICE, {(long)head_size});
-        }
+        // Allocate block scales
+        w.block_scales = mAllocator->allocate(ETensorDType::FP32, "qkv_scales",
+                                               EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
     }
 
-    std::cerr << "[QLoRA] allocated " << num_layers << " quantized blocks\n";
+    // Output projection: (hidden, num_q * head_size)
+    {
+        auto& w = block.out_proj;
+        w.M = hidden;
+        w.K = num_q_heads * head_size;
+        w.block_size = block_size;
+        auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
+
+        w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "out_fp8",
+                                      EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
+        w.block_scales = mAllocator->allocate(ETensorDType::FP32, "out_scales",
+                                               EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
+    }
+
+    // Gate+Up projection: (2 * intermediate, hidden)
+    {
+        auto& w = block.gate_up_proj;
+        w.M = 2 * intermediate;
+        w.K = hidden;
+        w.block_size = block_size;
+        auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
+
+        w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "gate_up_fp8",
+                                      EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
+        w.block_scales = mAllocator->allocate(ETensorDType::FP32, "gate_up_scales",
+                                               EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
+    }
+
+    // Down projection: (hidden, intermediate)
+    {
+        auto& w = block.down_proj;
+        w.M = hidden;
+        w.K = intermediate;
+        w.block_size = block_size;
+        auto [scale_rows, scale_cols] = mConfig.qlora_config.scale_config.num_blocks(w.M, w.K);
+
+        w.data = mAllocator->allocate(ETensorDType::FP8_E4M3, "down_fp8",
+                                      EAllocationType::ON_DEVICE, {(long)w.M, (long)w.K});
+        w.block_scales = mAllocator->allocate(ETensorDType::FP32, "down_scales",
+                                               EAllocationType::ON_DEVICE, {(long)scale_rows, (long)scale_cols});
+    }
+
+    // Layer norm weights (BF16, not quantized)
+    block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
+                                             EAllocationType::ON_DEVICE, {(long)hidden});
+    block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
+                                             EAllocationType::ON_DEVICE, {(long)hidden});
+
+    // QK-norm weights (BF16, not quantized) - only for models like Qwen3
+    if (mConfig.use_qk_norm) {
+        block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
+                                                    EAllocationType::ON_DEVICE, {(long)head_size});
+        block.k_norm_weight = mAllocator->allocate(ETensorDType::BF16, "k_norm",
+                                                    EAllocationType::ON_DEVICE, {(long)head_size});
+    }
 }
 
 void FP8WeightsManager::import_and_quantize(const std::string& file_name,
@@ -192,7 +187,7 @@ void FP8WeightsManager::import_and_quantize(const std::string& file_name,
         mLoadBufferBytes = 0;
     }
 
-    std::cerr << "[QLoRA] import and quantization complete\n";
+    std::cerr << "[QLoRA] import and quantization complete (" << mConfig.num_layers << " layers)\n";
 }
 
 void FP8WeightsManager::load_embeddings(SafeTensorsReader& reader, cudaStream_t stream) {
@@ -257,6 +252,11 @@ void FP8WeightsManager::load_embeddings(SafeTensorsReader& reader, cudaStream_t 
 
 void FP8WeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader& reader,
                                                    cudaStream_t stream) {
+    // Lazily allocate this layer's FP8 storage just before we need it.
+    // This reduces peak memory during initialization by avoiding upfront allocation
+    // of all layers at once.
+    allocate_single_block(layer_idx);
+
     auto& block = mQuantizedBlocks[layer_idx];
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;

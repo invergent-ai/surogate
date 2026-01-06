@@ -126,7 +126,7 @@ private:
     std::size_t mLoadBufferBytes = 0;
 
     // Allocation helpers
-    void allocate_quantized_blocks();
+    void allocate_single_block(int layer_idx);
 
     // Quantization helpers
     void quantize_and_store(BlockQuantizedWeight& dest, const Tensor& src,
