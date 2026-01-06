@@ -269,7 +269,7 @@ def make_multi_backend_log_callback(handlers: List[Callable[[dict], None]]):
 def _aim_run_context(config: SFTConfig):
     import aim
 
-    experiment = getattr(config, "aim_experiment", None) or "surogate"
+    experiment = getattr(config, "aim_experiment", None) or "Surogate"
     repo = getattr(config, "aim_repo", None)
 
     kwargs: Dict[str, Any] = {"experiment": experiment}

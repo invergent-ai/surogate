@@ -184,9 +184,12 @@ class SurogateTrainerWrapper():
 
             # Periodic evaluation (before training step)
             if self.eval_loader and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
-                val_loss, elapsed_ms = self.run_evaluation(in_tokens, out_tokens, self.config.eval_num_steps)
+                # Limit periodic eval to 100 batches for speed; full eval runs at end of training
+                val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, max_steps=100)
                 epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
-                eval_tokens = self.config.eval_num_steps * self.config.per_device_eval_batch_size * self.config.sequence_len * self.config.gpus
+                # Calculate actual tokens processed based on batches run
+                # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
+                eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
 
             # Periodic checkpointing (before training step)
@@ -236,27 +239,27 @@ class SurogateTrainerWrapper():
             train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
                                   result['norm'], result['loss'], lr)
 
-    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, max_steps: int) -> Tuple[float, float]:
+    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
         """
         Run evaluation on test set.
         Args:
             in_tokens (np.ndarray): Input token buffer.
             out_tokens (np.ndarray): Output token buffer.
-            max_steps (int): Maximum number of eval batches to process.
+            max_steps (int): Maximum number of eval batches to process. Pass -1 to process all available batches.
         Returns:
-            Tuple of (mean_loss, elapsed_ms)
+            Tuple of (mean_loss, elapsed_ms, batches_processed)
         """
         if max_steps == 0:
-            return 0.0, 0
+            return 0.0, 0, 0
 
         start_time = time.time()
         self.eval_loader.set_state(self.eval_loader.seed, 0, 0, 0)
         total_loss = 0.0
         batches = 0
 
-        # Determine effective max batches
-        effective_max = self.eval_loader.num_chunks if max_steps < 0 else max_steps
-        while batches < effective_max and batches < self.eval_loader.num_chunks:
+        # Use has_next() to check data availability (matches C++ implementation)
+        # max_steps < 0 means process all available batches
+        while self.eval_loader.has_next() and (max_steps < 0 or batches < max_steps):
             self.eval_loader.load_batch(in_tokens, out_tokens)
             loss = self.trainer.validate(in_tokens, out_tokens)
             total_loss += loss
@@ -264,6 +267,6 @@ class SurogateTrainerWrapper():
 
         if batches == 0:
             logger.warning("Insufficient validation data")
-            return 0.0, 0
+            return 0.0, 0, 0
 
-        return total_loss / batches, int((time.time() - start_time) * 1000)
+        return total_loss / batches, int((time.time() - start_time) * 1000), batches

@@ -7,18 +7,14 @@ from namer import generate as generate_unique_name
 
 from surogate import _surogate
 from surogate.core.config.ct_config import ChatTemplateConfig
-from surogate.core.config.dataset_config import SurogateDatasetConfig, create_dataset_config
 from surogate.core.config.model_config import ModelConfig
 from surogate.core.config.train_dataset_config import TrainDatasetConfig
-from surogate.core.datasets.datasets import get_default_process_count
 from surogate.utils.dict import DictDefault
 from surogate.utils.fs import to_abspath
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters
-from surogate.utils.seed import RAND_SEED
 
 logger = get_logger()
-
 
 @dataclass
 class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
@@ -155,8 +151,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Maximum gradient norm (for gradient clipping).
         per_device_train_batch_size (Optional[int], defaults to 2):
             Batch size per device during training.
-        per_device_eval_batch_size (Optional[int], defaults to 2):
-            Batch size per device during training.
         weight_decay (Optional[float], defaults to 0.1):
             The weight decay to apply (if not zero) to all layers except all bias and LayerNorm weights in [`AdamW`]
             optimizer.
@@ -170,9 +164,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             The epsilon parameter for the AdamW optimizer.
 
         eval_steps (Optional[int], defaults to 100):
-             Run evaluation every N optimizer steps.
-        eval_num_steps (Optional[int], defaults to 100):
-             Number of evaluation batches to process.
+             Run evaluation every N optimizer steps. Evaluation runs on the full eval dataset.
         report_to (Optional[Literal['wandb', 'aim']], *optional*, defaults to None):
             Report the results and logs to. Supported platforms are `"wandb"`, `"aim"`.
         warmup_ratio (Optional[float], defaults to 0.0):
@@ -220,6 +212,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Whether to enable detailed training timing breakdown for debugging.
         debug_memory_breakdown (Optional[bool], defaults to False):
             Print detailed memory breakdown after model allocation (useful for QLoRA optimization).
+            
+        wandb_project (Optional[str], defaults to "Surogate"):
+            WandB project name for logging.
+        wandb_name (Optional[str], defaults to run_name):
+            WandB run name for logging.
+        aim_experiment: (Optional[str], defaults to "Surogate"):
+            Aim experiment name for logging.
+        aim_repo: (Optional[str], defaults to None):
+            Aim repository path for logging.
+        aim_name: (Optional[str], defaults to run_name):
+            Aim run name for logging.
     """
     run_name: Optional[str] = None
     apply_recommended_values: Optional[bool] = False
@@ -282,7 +285,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     adamw_epsilon: Optional[float] = 1e-8
     eval_steps: Optional[int] = 100
     per_device_train_batch_size: Optional[int] = 2
-    per_device_eval_batch_size: Optional[int] = 2
     report_to: Optional[List[Literal['wandb', 'aim']]] = None
     warmup_ratio: Optional[float] = 0
     warmup_steps: Optional[int] = 0
@@ -307,6 +309,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     debug_time_breakdown: Optional[bool] = False
     debug_memory_breakdown: Optional[bool] = False
     log_gpu_util: Optional[int] = 100
+    
+    wandb_project: Optional[str] = None
+    wandb_name: Optional[str] = None
+    aim_experiment: Optional[str] = None
+    aim_repo: Optional[str] = None
+    aim_name: Optional[str] = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
@@ -370,7 +378,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.adamw_epsilon = float(cfg.get('adamw_epsilon', self.adamw_epsilon))
         self.eval_steps = cfg.get('eval_steps', self.eval_steps)
         self.per_device_train_batch_size = cfg.get('per_device_train_batch_size', self.per_device_train_batch_size)
-        self.per_device_eval_batch_size = cfg.get('per_device_eval_batch_size', self.per_device_eval_batch_size)
         self.report_to = cfg.get('report_to', self.report_to)
         self.warmup_ratio = float(cfg.get('warmup_ratio', self.warmup_ratio))
         self.warmup_steps = cfg.get('warmup_steps', self.warmup_steps)
@@ -394,6 +401,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
         self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
+        
+        self.wandb_project = cfg.get('wandb_project', self.wandb_project)
+        self.wandb_name = cfg.get('wandb_name', self.wandb_name or self.run_name)
+        self.aim_experiment = cfg.get('aim_experiment', self.aim_experiment)
+        self.aim_repo = cfg.get('aim_repo', self.aim_repo)
+        self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
 
     def __post_init__(self):
         ModelConfig.__post_init__(self)
