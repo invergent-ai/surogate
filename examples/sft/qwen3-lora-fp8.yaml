@@ -1,5 +1,4 @@
 model: Qwen/Qwen3-0.6B
-#model_type: qwen3
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -10,18 +9,13 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 100
-save_steps: 1000
+num_epochs: 2
+eval_steps: 25
+save_steps: 0
 
 learning_rate: 2e-4
 
 recipe: fp8-hybrid
-
-# Layer 0 stays in BF16
-# Layers N-2 and N-1 (last 2) stay in BF16
-# All middle layers use E4M3
-skip_quant_first_layers: 1
-skip_quant_last_layers: 2
 
 lora: true
 lora_rank: 16
@@ -37,8 +31,5 @@ lora_target_modules:
 
 dataloader_num_workers: 4
 datasets:
-  - path: "mlabonne/FineTome-100k"
-    samples: 1000
+  - path: "OpenLLM-Ro/ro_gsm8k"
     type: auto
-
-
