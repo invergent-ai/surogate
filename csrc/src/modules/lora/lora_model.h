@@ -600,6 +600,14 @@ public:
         if (qlora_enabled() && mFP4WeightProvider) {
             model_opts.use_cuda_graphs = false;
         }
+        // recompute_lora + offload_residuals: CUDA graphs must be disabled.
+        // recompute_lora needs to read residuals during LoRA backward to recompute ln1/ln2.
+        // offload_residuals uses cudaStreamWaitEvent for async D2H/H2D copies, which
+        // breaks CUDA graph capture isolation. Allow both memory optimizations to work
+        // together by sacrificing CUDA graph performance.
+        if (model_opts.recompute_lora && model_opts.offload_residuals) {
+            model_opts.use_cuda_graphs = false;
+        }
         // Use the ModelOptions overload to apply LoRA-specific flags
         mBaseModel->allocate_run_state(model_opts, comm, B, T, /*allocate_optimizer=*/false);
         allocate_lora_run_state(comm, B, T);
@@ -1330,6 +1338,8 @@ private:
         Tensor intermediate2;  // (BT, rank) - second intermediate buffer for fused ops
         Tensor slice;
         Tensor norm_buffer;
+        Tensor recompute_ln;   // (B, T, C) - buffer for recomputed ln1/ln2 activations
+        Tensor recompute_rstd; // (B, T) - buffer for recomputed rstd (unused but required by kernel)
         int B = 0;
         int T = 0;
     };
@@ -1407,10 +1417,19 @@ private:
         mLoRARunState->slice = mAllocator->allocate(
             work_dtype, "lora_slice", EAllocationType::ON_DEVICE, {max_slice_elems});
 
-        auto& rs = mBaseModel->get_run_state();
+        auto& rs = mBaseModel->run_state();
         const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(rs.DeviceProp)));
         mLoRARunState->norm_buffer = mAllocator->allocate(
             ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 2});
+
+        // Allocate recompute buffers only when recompute_lora is enabled
+        if (rs.config().recompute_lora) {
+            const int C = cfg.HiddenSize;
+            mLoRARunState->recompute_ln = mAllocator->allocate(
+                work_dtype, "lora_recompute_ln", EAllocationType::ON_DEVICE, {B, T, C});
+            mLoRARunState->recompute_rstd = mAllocator->allocate(
+                ETensorDType::FP32, "lora_recompute_rstd", EAllocationType::ON_DEVICE, {B, T});
+        }
     }
 
     void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T) {
@@ -1418,6 +1437,28 @@ private:
         if (!mLoRARunState || mLoRARunState->B != B || mLoRARunState->T != T) {
             allocate_lora_run_state(comm, B, T);
         }
+    }
+
+    /**
+     * @brief Recompute RMSNorm output for LoRA backward when recompute_lora is enabled.
+     *
+     * Instead of storing ln1/ln2 per-layer, we recompute them from the residual stream
+     * during LoRA backward. This trades compute for memory (~350MB for 4B model).
+     *
+     * @param residual Input residual tensor (B, T, C)
+     * @param ln_weight RMSNorm weight tensor (C,)
+     * @param epsilon RMSNorm epsilon
+     * @param B Batch size
+     * @param T Sequence length
+     * @param C Hidden size
+     * @param stream CUDA stream
+     * @return Reference to the recomputed LN output in mLoRARunState->recompute_ln
+     */
+    Tensor& recompute_rmsnorm(const Tensor& residual, const Tensor& ln_weight,
+                              float epsilon, int B, int T, int C, cudaStream_t stream) {
+        rmsnorm_forward(mLoRARunState->recompute_ln, mLoRARunState->recompute_rstd,
+                        residual, ln_weight, nullptr, epsilon, B, T, C, stream);
+        return mLoRARunState->recompute_ln;
     }
 
     /**
@@ -1677,6 +1718,18 @@ private:
         auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
         lora_accum = lora_accum || accumulate;
 
+        // Get ln1 input: either from stored activation or recompute from residual
+        Tensor ln1_input;
+        if (rs.config().recompute_lora) {
+            // Recompute ln1 from the residual input
+            Tensor& residual = rs.get_residual(layer_idx, stream);
+            auto& block_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
+            ln1_input = recompute_rmsnorm(residual, block_weights.ln1.weight,
+                                          cfg.RmsNormEps, B, T, C, stream);
+        } else {
+            ln1_input = a.ln1;
+        }
+
         // Prepare gradient tensors (use empty tensor if projection not enabled)
         Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
         LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
@@ -1703,7 +1756,7 @@ private:
             dA_v, dB_v,
             da.d_ln1,
             da.d_qkv,
-            a.ln1,
+            ln1_input,
             lora_q, lora_k, lora_v,
             mLoRAConfig.scaling(),
             B * T,
@@ -1768,6 +1821,18 @@ private:
         auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
         lora_accum = lora_accum || accumulate;
 
+        // Get ln2 input: either from stored activation or recompute from residual_att
+        Tensor ln2_input;
+        if (rs.config().recompute_lora) {
+            // Recompute ln2 from residual_att (which is residual + att_out)
+            // Note: residual_att is always stored even in recompute_block mode
+            auto& block_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
+            ln2_input = recompute_rmsnorm(a.residual_att, block_weights.ln2.weight,
+                                          cfg.RmsNormEps, B, T, C, stream);
+        } else {
+            ln2_input = a.ln2;
+        }
+
         // Prepare gradient tensors (use empty tensor if projection not enabled)
         Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
         LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
@@ -1788,7 +1853,7 @@ private:
             dA_gate, dB_gate,
             da.d_ln2,
             da.d_mlp_up,
-            a.ln2,
+            ln2_input,
             lora_up, lora_gate,
             mLoRAConfig.scaling(),
             B * T,

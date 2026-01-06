@@ -26,6 +26,7 @@ struct RuntimeOptions {
     bool RecomputeQKV = false;
     bool RecomputeAtt = false;
     bool RecomputeBlock = true;
+    bool RecomputeLoRA = false;  // Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models)
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;

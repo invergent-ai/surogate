@@ -126,6 +126,16 @@ public:
         // - att_out, mlp_down (not needed for LoRA)
         bool lora_only_mode = false;
 
+        // LoRA activation recomputation mode: recompute ln1/ln2/att during LoRA backward
+        // instead of storing per-layer. This allows activation buffer sharing across layers
+        // even in LoRA mode, trading compute for memory (~600MB savings for 4B model).
+        // When enabled:
+        // - ln1/ln2 are recomputed from residual stream during LoRA QKV/MLP backward
+        // - att is recomputed during LoRA O backward
+        // - swiglu is recomputed during LoRA down backward (uses existing recompute_swiglu)
+        // Requires: recompute_block or (recompute_attention + recompute_ffn)
+        bool recompute_lora = false;
+
         // PretrainedConfig for IRunState base class initialization
         PretrainedConfig pretrained_config;
     };
@@ -1026,13 +1036,21 @@ void ModularRunState<Block>::allocate_simplified_activations() {
     // IMPORTANT: In LoRA-only mode, we CANNOT share ln1, ln2, att, swiglu across layers because
     // LoRA backward hooks read these activations from each layer. If they're shared, they get
     // overwritten by the forward pass of subsequent layers before we can use them in backward.
+    // EXCEPTION: When recompute_lora is enabled, we CAN share ln1/ln2 because LoRA backward will
+    // recompute them on-the-fly instead of reading stored per-layer values.
+    // NOTE: att is still kept per-layer in LoRA mode even with recompute_lora because recomputing
+    // attention is expensive (requires full QKV + attention forward). This is only needed when
+    // O projection has LoRA adapters. Future optimization: skip sharing att only when O is targeted.
     const bool lora_only = mConfig.lora_only_mode;
-    const bool share_ln1 = !lora_only && (mConfig.recompute_rmsnorm || mConfig.recompute_attention || mConfig.recompute_block);
-    const bool share_ln2 = !lora_only && (mConfig.recompute_rmsnorm || mConfig.recompute_ffn || mConfig.recompute_block);
+    const bool lora_can_share_ln = !lora_only || mConfig.recompute_lora;  // ln1/ln2 can be shared with recompute_lora
+    const bool lora_can_share_att = !lora_only;  // att still needs per-layer storage in LoRA mode (for O proj)
+    const bool lora_can_share_swiglu = !lora_only;  // swiglu needs per-layer storage in LoRA mode (for down proj)
+    const bool share_ln1 = lora_can_share_ln && (mConfig.recompute_rmsnorm || mConfig.recompute_attention || mConfig.recompute_block);
+    const bool share_ln2 = lora_can_share_ln && (mConfig.recompute_rmsnorm || mConfig.recompute_ffn || mConfig.recompute_block);
     const bool share_qkv = mConfig.recompute_qkv || mConfig.recompute_attention || mConfig.recompute_block;
-    const bool share_att = !lora_only && (mConfig.recompute_attention || mConfig.recompute_block);
+    const bool share_att = lora_can_share_att && (mConfig.recompute_attention || mConfig.recompute_block);
     const bool share_mlp_up = mConfig.recompute_ffn || mConfig.recompute_block;
-    const bool share_swiglu = !lora_only && (mConfig.recompute_swiglu || mConfig.recompute_ffn || mConfig.recompute_block);
+    const bool share_swiglu = lora_can_share_swiglu && (mConfig.recompute_swiglu || mConfig.recompute_ffn || mConfig.recompute_block);
     const bool ffn_temps_on_stack = mConfig.recompute_block;
     const bool share_residual_intermediates = mConfig.recompute_block;
 

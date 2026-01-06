@@ -1,13 +1,13 @@
 # Quantized LoRA (QLoRA)
 
-QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model weights while training LoRA adapters in higher precision. Surogate supports two QLoRA quantization formats:
+QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model weights while training LoRA adapters in higher precision. Surogate supports three QLoRA quantization formats:
 
-| Aspect                 | FP8 QLoRA                      | FP4 QLoRA                    |
-| ---------------------- | ------------------------------ | ---------------------------- |
-| **Format**             | E4M3 (fwd), E5M2 (bwd)         | E2M1 (both)                  |
-| **Scaling**            | Per-tensor delayed             | Two-level block (FP8 + FP32) |
-| **GPU Requirement**    | SM89+ (Ada, Hopper, Blackwell) | SM100+ (Blackwell only)      |
-| **Memory Compression** | ~50% vs FP16                   | ~75% vs FP16                 |
+| Aspect                 | FP8 QLoRA                      | FP4 QLoRA                    | NF4 QLoRA (BitsAndBytes)          |
+| ---------------------- | ------------------------------ | ---------------------------- | --------------------------------- |
+| **Format**             | E4M3 (fwd), E5M2 (bwd)         | E2M1 (both)                  | NF4 (4-bit normal float)          |
+| **Scaling**            | Per-tensor delayed             | Two-level block (FP8 + FP32) | Per-block absmax (+ double quant) |
+| **GPU Requirement**    | SM89+ (Ada, Hopper, Blackwell) | SM100+ (Blackwell only)      | Any CUDA GPU                      |
+| **Memory Compression** | ~50% vs FP16                   | ~75% vs FP16                 | ~75% vs FP16                      |
 
 ## QLoRA vs Recipes
 
@@ -96,17 +96,17 @@ FP4 E2M1 provides extreme compression with only 8 representable values per sign:
 
 ### Parameters
 
-| Parameter                     | Default  | Description                          |
-| ----------------------------- | -------- | ------------------------------------ |
-| `qlora_fp4`                   | false    | Enable FP4 QLoRA                     |
-| `disable_rht`                 | false    | Disable Random Hadamard Transform    |
-| `disable_stochastic_rounding` | false    | Disable stochastic rounding          |
-| `disable_2d_quantization`     | false    | Use 1D instead of 2D weight scaling  |
-| `skip_quant_first_layers`     | 0        | Skip FP4 for first N layers          |
-| `skip_quant_last_layers`      | 0        | Skip FP4 for last N layers           |
-| `backend`                     | cutlass  | Backend: cudnn or cutlass |
-| `enable_four_over_six`        | true     | Enable 4/6 adaptive scaling          |
-| `four_over_six_metric`        | MSE      | Error metric: MSE, L1, or AbsMax     |
+| Parameter                     | Default | Description                         |
+| ----------------------------- | ------- | ----------------------------------- |
+| `qlora_fp4`                   | false   | Enable FP4 QLoRA                    |
+| `disable_rht`                 | false   | Disable Random Hadamard Transform   |
+| `disable_stochastic_rounding` | false   | Disable stochastic rounding         |
+| `disable_2d_quantization`     | false   | Use 1D instead of 2D weight scaling |
+| `skip_quant_first_layers`     | 0       | Skip FP4 for first N layers         |
+| `skip_quant_last_layers`      | 0       | Skip FP4 for last N layers          |
+| `backend`                     | cutlass | Backend: cudnn or cutlass           |
+| `enable_four_over_six`        | true    | Enable 4/6 adaptive scaling         |
+| `four_over_six_metric`        | MSE     | Error metric: MSE, L1, or AbsMax    |
 
 ### Recommended Recipe Combinations
 
@@ -125,4 +125,75 @@ lora: true
 lora_rank: 16
 skip_quant_first_layers: 1
 skip_quant_last_layers: 4
+```
+
+## NF4 QLoRA (BitsAndBytes)
+
+NF4 QLoRA uses the BitsAndBytes NF4 (NormalFloat4) quantization format, providing ~75% memory reduction with broad GPU compatibility. This is the same quantization format used by the popular BitsAndBytes library.
+
+### How It Works
+
+NF4 is a 4-bit data type optimized for normally distributed weights:
+
+| Property           | Value                                             |
+| ------------------ | ------------------------------------------------- |
+| **Bits per value** | 4                                                 |
+| **Storage**        | 2 values per byte                                 |
+| **Quantile-based** | 16 levels mapped to normal distribution quantiles |
+| **Block size**     | Configurable (default: 64 values per block)       |
+
+**Block-wise Quantization**:
+
+- Weights are divided into blocks (default 64 values)
+- Each block stores an FP32 absmax scale factor
+- Values are quantized to 4-bit indices into a fixed NF4 lookup table
+
+**Double Quantization** (optional):
+
+- Absmax scales are further quantized to INT8
+- Groups of 256 blocks share an FP32 scale and offset
+- Reduces scale overhead from 4 bytes to ~1 byte per block
+
+### Memory Layout
+
+For a weight tensor with N elements using block size 64:
+
+| Component     | Size (bytes) | With Double Quant  |
+| ------------- | ------------ | ------------------ |
+| NF4 data      | N / 2        | N / 2              |
+| Absmax scales | (N / 64) × 4 | (N / 64) × 1       |
+| Double quant  | —            | (N / 64 / 256) × 8 |
+
+### Parameters
+
+| Parameter                | Default | Description                             |
+| ------------------------ | ------- | --------------------------------------- |
+| `qlora_bnb`              | false   | Enable BitsAndBytes NF4 QLoRA           |
+| `qlora_bnb_block_size`   | 64      | Block size for quantization (64 or 128) |
+| `qlora_bnb_double_quant` | true    | Enable double quantization for scales   |
+
+### GPU Compatibility
+
+Unlike FP8 and FP4 QLoRA which require specific GPU architectures, NF4 QLoRA works on any CUDA GPU. The dequantization happens on-the-fly during forward and backward passes.
+
+### Recommended Recipe Combinations
+
+| Recipe     | Use Case                                         |
+| ---------- | ------------------------------------------------ |
+| **bf16**   | Best accuracy, broad compatibility (Recommended) |
+| fp8-hybrid | Faster compute on SM89+ GPUs                     |
+
+### Example
+
+```yaml
+model: Qwen/Qwen3-4B
+lora: true
+lora_rank: 16
+lora_alpha: 32
+
+qlora_bnb: true
+qlora_bnb_block_size: 64
+qlora_bnb_double_quant: true
+
+recipe: bf16
 ```

@@ -223,6 +223,10 @@ struct ModelOptions {
     // When enabled, only stores activations needed for LoRA gradient computation
     bool lora_only_mode = false;
 
+    // LoRA activation recomputation: recompute ln1/ln2/att during LoRA backward
+    // instead of storing per-layer. Enables activation sharing even in LoRA mode.
+    bool recompute_lora = false;
+
     // Skip base model gradient allocation (used in LoRA mode where base weights are frozen)
     bool skip_base_gradients = false;
 
@@ -363,6 +367,7 @@ struct ModelOptions {
         options.recompute_qkv = opts.RecomputeQKV;
         options.recompute_attention = opts.RecomputeAtt;
         options.recompute_block = opts.RecomputeBlock;
+        options.recompute_lora = opts.RecomputeLoRA;
         options.offload_residuals = opts.OffloadResidual;
         options.lmhead_chunks = opts.LMHeadChunks;
         options.attention_bwd_chunks = opts.AttBwdChunks;
