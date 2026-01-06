@@ -85,12 +85,28 @@ struct RuntimeOptions {
         return GradientType.value_or(matmul_dtype());
     }
 
-    // Returns FP8 E4M3 when FP8 recipe is active, otherwise falls back to matmul_dtype()
+    // Returns FP4 E2M1 when FP4 recipe is active, FP8 E4M3 when FP8 recipe is active,
+    // otherwise falls back to matmul_dtype()
     [[nodiscard]] ETensorDType forward_matmul_dtype() const {
+        if (TrainingRecipe && (TrainingRecipe->is_nvfp4() || TrainingRecipe->is_nvfp4_cutlass())) {
+            return ETensorDType::FP4_E2M1;
+        }
         if (TrainingRecipe && TrainingRecipe->is_fp8_hybrid()) {
             return ETensorDType::FP8_E4M3;
         }
         return matmul_dtype();
+    }
+
+    // Returns the actual compute dtype for speed-of-light (SOL) estimation.
+    // For QLoRA, this returns BF16 because QLoRA dequantizes FP4/FP8 weights to BF16
+    // before matmul (the quantized format is for storage, not compute).
+    // For non-QLoRA FP8/FP4 recipes, returns the actual compute dtype.
+    [[nodiscard]] ETensorDType sol_compute_dtype(bool is_qlora) const {
+        if (is_qlora) {
+            // QLoRA always dequantizes to BF16 for compute
+            return ETensorDType::BF16;
+        }
+        return forward_matmul_dtype();
     }
 
     // Returns FP8 E5M2 when FP8 HYBRID recipe is set, otherwise falls back to grad_dtype()

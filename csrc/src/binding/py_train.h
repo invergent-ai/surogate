@@ -67,6 +67,7 @@ public:
     int seq_length() const { return T; }
     const PretrainedConfig& config() const { return mConfig; }
     const RuntimeOptions& options() const { return mOptions; }
+    bool is_qlora() const { return mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized(); }
 
     std::vector<std::pair<std::string, sSegmentMemory>> get_allocations(int gpu_id);
     std::vector<std::pair<std::string, long>> get_stack_info(int gpu_id);

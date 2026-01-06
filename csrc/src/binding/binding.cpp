@@ -984,12 +984,16 @@ NB_MODULE(_surogate, m) {
          .def("set_expected_time_per_token", [](TrainingRunLogger* logger, const MultiGPUPyTrainer* trainer){
              auto& config = trainer->config();
              auto& options = trainer->options();
-                auto ops = get_transformer_ops(
-                    config.NumLayers * ((long)config.HiddenSize * (config.IntermediateSize * 3 + config.HiddenSize * 1 + config.qkv_channels())),
-                    options.matmul_dtype(), (long)config.VocabSize * config.HiddenSize, config.DType,
-                    config.NumQueryHeads * config.head_size(), config.NumLayers, trainer->seq_length());
-                 logger->log_sol_estimate(ops, trainer->world_size());
-             }, nb::arg("trainer"),
+             // Use sol_compute_dtype() for accurate SOL estimation:
+             // - QLoRA FP4/FP8: dequantizes to BF16, so actual compute is BF16
+             // - Non-QLoRA FP8/FP4 recipes: actual compute in FP8/FP4
+             const bool is_qlora = trainer->is_qlora();
+             auto ops = get_transformer_ops(
+                 config.NumLayers * ((long)config.HiddenSize * (config.IntermediateSize * 3 + config.HiddenSize * 1 + config.qkv_channels())),
+                 options.sol_compute_dtype(is_qlora), (long)config.VocabSize * config.HiddenSize, config.DType,
+                 config.NumQueryHeads * config.head_size(), config.NumLayers, trainer->seq_length());
+             logger->log_sol_estimate(ops, trainer->world_size());
+         }, nb::arg("trainer"),
              "Log a compute/throughput estimate based on the current model/trainer configuration.\n\n"
              "Parameters:\n- trainer: SurogateTrainer instance to read config/options/shape from.")
         ;

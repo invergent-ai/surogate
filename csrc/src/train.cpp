@@ -923,10 +923,14 @@ void TrainingRunner::run_training(int argc, const char** argv, NCCLCommunicator&
             }
         });
     }
-
+    
+    // Use sol_compute_dtype() for accurate SOL estimation:
+    // - QLoRA FP4/FP8: dequantizes to BF16, so actual compute is BF16
+    // - Non-QLoRA FP8/FP4 recipes: actual compute in FP8/FP4
+    const bool is_qlora = UseLora && (UseQLoRAFP8 || UseQLoRAFP4);
     logger.log_sol_estimate(get_transformer_ops(
                                 config.NumLayers * ((long)config.HiddenSize * (config.IntermediateSize * 3 + config.HiddenSize * 1 + config.qkv_channels())),
-                                Options.forward_matmul_dtype(), (long)config.VocabSize * config.HiddenSize, config.DType,
+                                Options.sol_compute_dtype(is_qlora), (long)config.VocabSize * config.HiddenSize, config.DType,
                                 config.NumQueryHeads * config.head_size(), config.NumLayers, T),
                             comm.world_size());
 

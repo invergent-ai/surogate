@@ -307,6 +307,8 @@ float get_peak_rate(const sPerfSpecs& spec, ETensorDType dtype) {
                 return g_measured_fp8_peak_tflops;
             }
             return spec.FP8_32_TFlops;
+        case ETensorDType::FP4_E2M1:
+            return spec.FP4_32_TFlops;
         case ETensorDType::BYTE:
         default:
             // Speed-of-light estimation is best-effort; never crash training for an unsupported dtype.

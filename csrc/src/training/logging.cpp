@@ -448,6 +448,7 @@ void TrainingRunLogger::log_sol_estimate(std::vector<std::pair<ETensorDType, lon
         log_speed_if_needed(ETensorDType::BF16, "BF16");
         log_speed_if_needed(ETensorDType::FP16, "FP16");
         log_speed_if_needed(ETensorDType::FP8_E4M3, " FP8");
+        log_speed_if_needed(ETensorDType::FP4_E2M1, " FP4");
 
         // Show benchmark results for the dtype being used
         if (uses_fp8 && spec_fp8_peak > 0.0f && true_fp8_rate > 0.0) {
