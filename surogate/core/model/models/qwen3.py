@@ -1,6 +1,3 @@
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
-
 from surogate.core.config.enums import LLMModelType, ChatTemplateType
 from surogate.core.model.architecture import ModelArchitecture
 from surogate.core.model.registry import register_model, ModelTemplate
@@ -28,7 +25,7 @@ register_model(
         ChatTemplateType.qwen3,
         get_model_tokenizer_with_flash_attn,
         architectures=['Qwen3ForCausalLM'],
-        attention_cls=Qwen3Attention,
+        attention_cls='Qwen3Attention',
         model_arch=ModelArchitecture.llama))
 
 
@@ -42,7 +39,7 @@ register_model(
         LLMModelType.qwen3_moe,
         ChatTemplateType.qwen3,
         get_model_tokenizer_with_flash_attn,
-        attention_cls=Qwen3MoeAttention,
+        attention_cls='Qwen3MoeAttention',
         architectures=['Qwen3MoeForCausalLM']))
 
 """
@@ -53,7 +50,7 @@ register_model(
         LLMModelType.qwen3_thinking,
         ChatTemplateType.qwen3_thinking,
         get_model_tokenizer_with_flash_attn,
-        attention_cls=Qwen3Attention,
+        attention_cls='Qwen3Attention',
         architectures=['Qwen3ForCausalLM']))
 
 """
@@ -65,5 +62,5 @@ register_model(
         LLMModelType.qwen3_nothinking,
         ChatTemplateType.qwen3_nothinking,
         get_model_tokenizer_with_flash_attn,
-        attention_cls=Qwen3MoeAttention,
+        attention_cls='Qwen3MoeAttention',
         architectures=['Qwen3MoeForCausalLM', 'Qwen3ForCausalLM']))

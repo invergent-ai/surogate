@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal, List, Optional
 
-from surogate.core.config.dataset_config import DatasetConfig, SurogateDatasetConfig, create_dataset_config
+from surogate.core.config.dataset_config import SurogateDatasetConfig, create_dataset_config
 from surogate.core.config.model_config import ModelConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.seed import RAND_SEED

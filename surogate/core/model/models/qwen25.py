@@ -1,5 +1,3 @@
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
-
 from surogate.core.config.enums import LLMModelType, ChatTemplateType
 from surogate.core.model.architecture import register_model_architecture, LLMComponents, LLMArchitecture, \
     MLLMComponents, MLLMArchitecture, ModelArchitecture
@@ -55,7 +53,7 @@ register_model(
         ChatTemplateType.qwen2_5,
         get_model_tokenizer_with_flash_attn,
         architectures=['Qwen2ForCausalLM'],
-        attention_cls=Qwen2Attention,
+        attention_cls='Qwen2Attention',
         model_arch=ModelArchitecture.llama))
 
 

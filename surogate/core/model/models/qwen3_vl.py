@@ -4,8 +4,6 @@ from typing import Optional, Union
 import torch
 from PIL import Image
 
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextAttention
-
 from surogate.core.config.enums import ChatTemplateType
 from surogate.core.model.models.qwen25_vl import compat_qwen_vl_utils, get_model_tokenizer_qwen2_vl
 from surogate.core.model.registry import register_model, ModelTemplate, MLLMModelType
@@ -212,5 +210,5 @@ register_model(
         ChatTemplateType.qwen3_vl,
         get_model_tokenizer_qwen3_vl,
         architectures=['Qwen3VLForConditionalGeneration'],
-        attention_cls=Qwen3VLTextAttention,
+        attention_cls='Qwen3VLTextAttention',
         tags=['vision', 'video']))

@@ -1,5 +1,3 @@
-from transformers.models.llama.modeling_llama import LlamaAttention
-
 from surogate.core.config.enums import LLMModelType, ChatTemplateType
 from surogate.core.model.architecture import register_model_architecture, LLMComponents, LLMArchitecture, \
     ModelArchitecture
@@ -33,7 +31,7 @@ register_model(
         LLMModelType.llama3,
         ChatTemplateType.llama3,
         get_model_tokenizer_with_flash_attn,
-        attention_cls=LlamaAttention,
+        attention_cls='LlamaAttention',
         architectures=['LlamaForCausalLM'],
         model_arch=ModelArchitecture.llama,
     )
@@ -52,7 +50,7 @@ register_model(
         LLMModelType.llama3_1,
         ChatTemplateType.llama3_2,
         get_model_tokenizer_with_flash_attn,
-        attention_cls=LlamaAttention,
+        attention_cls='LlamaAttention',
         architectures=['LlamaForCausalLM'],
         model_arch=ModelArchitecture.llama,
     )
@@ -72,7 +70,7 @@ register_model(
         LLMModelType.llama3_2,
         ChatTemplateType.llama3_2,
         get_model_tokenizer_with_flash_attn,
-        attention_cls=LlamaAttention,
+        attention_cls='LlamaAttention',
         architectures=['LlamaForCausalLM'],
         model_arch=ModelArchitecture.llama,
     )

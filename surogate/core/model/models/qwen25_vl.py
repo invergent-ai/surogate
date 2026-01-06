@@ -1,7 +1,5 @@
 import os
 
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLAttention
-
 from surogate.core.config.enums import ChatTemplateType
 from surogate.core.model.chat_templates.vision_utils import load_file
 from surogate.core.model.patcher import patch_get_input_embeddings
@@ -112,5 +110,5 @@ register_model(
         ChatTemplateType.qwen2_5_vl,
         get_model_tokenizer_qwen2_5_vl,
         architectures=['Qwen2_5_VLForConditionalGeneration'],
-        attention_cls=Qwen2_5_VLAttention,
+        attention_cls='Qwen2_5_VLAttention',
         tags=['vision', 'video']))

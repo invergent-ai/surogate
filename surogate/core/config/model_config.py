@@ -1,7 +1,7 @@
 import math
 from abc import ABC
 from dataclasses import dataclass
-from typing import Optional, Literal, Union, Any
+from typing import Optional, Union, Any
 
 import torch
 from transformers.utils.quantization_config import QuantizationConfigMixin

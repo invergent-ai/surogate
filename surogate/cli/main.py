@@ -4,7 +4,7 @@ import importlib.util
 import os
 import subprocess
 import sys
-from typing import Optional, List, Dict
+from typing import Dict
 import signal
 
 from surogate.utils.logger import get_logger

@@ -1,22 +1,19 @@
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Callable, Tuple, List, Type, Any
+from typing import Dict, Optional, Callable, Tuple, List, Type, Any, Union
 
 import torch
 from torch import nn
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
-
 from surogate.core.config.enums import MLLMModelType, RMModelType, RerankerModelType
 from surogate.core.model.architecture import ModelArchitecture, MLLMComponents
 
 MODEL_MAPPING: Dict[str, 'ModelTemplate'] = {}
 
-GetModelTokenizerFunction = Callable[..., Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]]
-
 @dataclass
 class ModelTemplate:
     model_type: Optional[str]
     chat_template: Optional[str]
-    get_function: GetModelTokenizerFunction
+    get_function: Callable[..., Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]]
     model_arch: Optional[ModelArchitecture] = None
     model_components: Optional[MLLMComponents] = None
     architectures: List[str] = field(default_factory=list)
@@ -27,7 +24,7 @@ class ModelTemplate:
     is_reranker: bool = False
     tags: List[str] = field(default_factory=list)
     task_type: Optional[str] = None
-    attention_cls: Type[nn.Module] = None
+    attention_cls: Union[Type[nn.Module], str] = None
     fast_cls: Optional[Any] = None
 
     def __post_init__(self):
