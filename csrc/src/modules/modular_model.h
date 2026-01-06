@@ -2455,6 +2455,12 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 	            if (chunks < 1) {
 	                throw std::invalid_argument("attention_bwd_chunks must be >= 1");
 	            }
+	            if (chunks > 1 && B % chunks != 0) {
+	                throw std::invalid_argument(fmt::format(
+	                    "attn_bwd_chunks ({}) must evenly divide per_device_train_batch_size ({}). "
+	                    "Either increase batch size to a multiple of {} or reduce attn_bwd_chunks.",
+	                    chunks, B, chunks));
+	            }
 	            if (chunks == 1) {
 	                attention_backward_cudnn(
 	                    da.d_qkv,

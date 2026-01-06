@@ -407,11 +407,34 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             logger.warning(
                 f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!")
 
+        self._validate_chunking_config()
+
         self.create_runtime_config()
         self.create_lora_config()
         self.create_qlora_config()
 
         self.ensure_directories()
+
+    def _validate_chunking_config(self):
+        """Validate that chunking parameters are compatible with batch size and sequence length."""
+        batch_size = self.per_device_train_batch_size
+        seq_len = self.sequence_len
+        total_tokens = batch_size * seq_len
+
+        if self.attn_bwd_chunks > 1 and batch_size % self.attn_bwd_chunks != 0:
+            raise ValueError(
+                f"attn_bwd_chunks ({self.attn_bwd_chunks}) must evenly divide "
+                f"per_device_train_batch_size ({batch_size}). "
+                f"Either increase batch size to a multiple of {self.attn_bwd_chunks} "
+                f"or reduce attn_bwd_chunks."
+            )
+
+        if self.lmhead_chunks > 1 and total_tokens % self.lmhead_chunks != 0:
+            raise ValueError(
+                f"lmhead_chunks ({self.lmhead_chunks}) must evenly divide "
+                f"per_device_train_batch_size * sequence_len ({batch_size} * {seq_len} = {total_tokens}). "
+                f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
+            )
 
 
     def ensure_directories(self):

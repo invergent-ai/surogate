@@ -778,7 +778,8 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
     // ------------------------------------------------------------------------
     // Optimizer staging buffers for offloaded master weights (device copies)
     // ------------------------------------------------------------------------
-    if (config.offload_master && !config.use_zero_copy) {
+    // QLoRA mode: skip staging buffer allocation - base weights are frozen and stored externally
+    if (config.offload_master && !config.use_zero_copy && !config.skip_block_allocation) {
         for (int i = 0; i < 2; ++i) {
             allocate_block_weights(mMasterBuffer[i], config.master_dtype, config.master_dtype, /*on_host=*/false, /*sharded=*/sharded_master);
             CUDA_CHECK(cudaEventCreate(&mMasterStatus[i].done_event));
