@@ -1,0 +1,7 @@
+.git
+build/
+csrc/build/
+assets/
+.venv/
+.idea/
+.vscode/
