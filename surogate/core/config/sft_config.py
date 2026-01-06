@@ -507,7 +507,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             if self.offload_residual:
                 self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with LoRA recompute
             
-        
+        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
+            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
+            
         self.runtime_config = _surogate.RuntimeOptions(
             recompute_swiglu=recompute_swiglu,
             recompute_rmsnorm=recompute_rmsnorm,
@@ -559,15 +561,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     def create_qlora_config(self):
         self.qlora_config = None
         if self.qlora_fp4:
-            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             self.qlora_config = _surogate.QLoRAConfig.nvfp4()
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six
         elif self.qlora_fp8:
-            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             self.qlora_config = _surogate.QLoRAConfig.fp8(block_size=self.qlora_block_size)
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six
         elif self.qlora_bnb:
-            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             self.qlora_config = _surogate.QLoRAConfig.bnb(
                 block_size=self.qlora_bnb_block_size,
                 double_quant=self.qlora_bnb_double_quant
