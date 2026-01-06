@@ -508,7 +508,7 @@ void TrainingRunLogger::log_line(std::string_view line) {
 
 namespace {
 /**
- * @brief Print detailed memory breakdown for QLoRA/LoRA training optimization.
+ * @brief Print detailed memory breakdown for raining optimization.
  *
  * Analyzes memory usage by category and compares against Unsloth's baseline.
  */
@@ -519,7 +519,7 @@ void print_memory_breakdown(
 {
     printf("\n");
     printf("================================================================================\n");
-    printf("                         MEMORY BREAKDOWN (QLoRA Debug)\n");
+    printf("                              MEMORY BREAKDOWN \n");
     printf("================================================================================\n\n");
 
     // Query CUDA memory stats

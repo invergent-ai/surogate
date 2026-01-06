@@ -357,6 +357,16 @@ void destroy_cublaslt_handle(cublasLtHandle_t handle) noexcept;
 
 double measure_real_peak() {
     constexpr int N = 32768;  // Use larger matrix for more accurate peak measurement
+    constexpr size_t REQUIRED_MEMORY = 3 * 2ull * N * N + 32 * 1024 * 1024;  // 3 matrices + workspace
+
+    // Check if we have enough free memory before allocating
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if (free_mem < REQUIRED_MEMORY + 256 * 1024 * 1024) {  // Need 256MB headroom
+        // Not enough memory for benchmark, skip and return 0 (will use spec sheet values)
+        return 0.0;
+    }
+
     nv_bfloat16* a;
     nv_bfloat16* b;
     nv_bfloat16* c;
@@ -417,6 +427,17 @@ double measure_real_peak() {
 
 double measure_real_peak_fp8() {
     constexpr int N = 32768;  // Use larger matrix for more accurate peak measurement
+    // FP8: 2 × 1-byte matrices + 1 × 4-byte output matrix + workspace
+    constexpr size_t REQUIRED_MEMORY = 2 * 1ull * N * N + 4ull * N * N + 32 * 1024 * 1024;
+
+    // Check if we have enough free memory before allocating
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if (free_mem < REQUIRED_MEMORY + 256 * 1024 * 1024) {  // Need 256MB headroom
+        // Not enough memory for benchmark, skip and return 0 (will use spec sheet values)
+        return 0.0;
+    }
+
     __nv_fp8_e4m3* a;
     __nv_fp8_e4m3* b;
     float* c;
