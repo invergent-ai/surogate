@@ -24,6 +24,11 @@ def training_logger_context(config: SFTConfig):
     # NOTE: Avoid `dataclasses.asdict` here: it deep-copies fields and can choke on
     # nanobind/extension objects (e.g., RuntimeOptions).
     log_options = dict(vars(config))
+    log_options.pop("model_info")
+    log_options.pop("model_template")
+    log_options.pop("model")
+    log_options.pop("tokenizer")
+    
     filtered_options: Dict[str, Union[bool, int, float, str]] = {}
     for k, v in log_options.items():
         if v is None:
