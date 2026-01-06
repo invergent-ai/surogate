@@ -902,23 +902,47 @@ public:
         // Update grad pointers each step (grads change between steps due to accumulation)
         update_grad_pointers(comm, main_stream);
 
-        // Single kernel launch for all LoRA tensors!
-        adamw_update_8bit_multi_tensor(
-            reinterpret_cast<float**>(state.param_ptrs.Data),
-            reinterpret_cast<float**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            reinterpret_cast<unsigned char*>(state.state1.Data),
-            reinterpret_cast<unsigned char*>(state.state2.Data),
-            state.absmax1.template get<float>(),
-            state.absmax2.template get<float>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            state.quantiles1.template get<float>(),
-            state.quantiles2.template get<float>(),
-            main_stream
-        );
+        // Single kernel launch for all LoRA tensors - dispatch based on lora_dtype
+        const ETensorDType lora_dtype = mLoRAConfig.dtype;
+        if (lora_dtype == ETensorDType::FP32) {
+            adamw_update_8bit_multi_tensor(
+                reinterpret_cast<float**>(state.param_ptrs.Data),
+                reinterpret_cast<float**>(state.grad_ptrs.Data),
+                state.tensor_sizes.template get<int>(),
+                state.num_tensors,
+                reinterpret_cast<unsigned char*>(state.state1.Data),
+                reinterpret_cast<unsigned char*>(state.state2.Data),
+                state.absmax1.template get<float>(),
+                state.absmax2.template get<float>(),
+                state.state_offsets.template get<int>(),
+                state.total_params,
+                learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
+                state.quantiles1.template get<float>(),
+                state.quantiles2.template get<float>(),
+                main_stream
+            );
+        } else if (lora_dtype == ETensorDType::BF16) {
+            adamw_update_8bit_multi_tensor(
+                reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
+                reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
+                state.tensor_sizes.template get<int>(),
+                state.num_tensors,
+                reinterpret_cast<unsigned char*>(state.state1.Data),
+                reinterpret_cast<unsigned char*>(state.state2.Data),
+                state.absmax1.template get<float>(),
+                state.absmax2.template get<float>(),
+                state.state_offsets.template get<int>(),
+                state.total_params,
+                learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
+                state.quantiles1.template get<float>(),
+                state.quantiles2.template get<float>(),
+                main_stream
+            );
+        } else {
+            throw std::runtime_error(fmt::format(
+                "ModularLoRAModel: unsupported lora_dtype {} for 8-bit AdamW optimizer",
+                dtype_to_str(lora_dtype)));
+        }
 
         CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, main_stream));
     }
@@ -933,22 +957,22 @@ public:
         auto& state = *mLoRAAdamW8BitState;
         const int L = (int)mBaseModel->config().NumLayers;
 
-        // Count tensors and total params
-        std::vector<float*> h_param_ptrs;
+        // Count tensors and total params - use void* to handle both FP32 and BF16
+        std::vector<void*> h_param_ptrs;
         std::vector<int> h_sizes;
         std::vector<int> h_state_offsets;
         size_t total_params = 0;
 
         auto collect_tensor = [&](Tensor& param) {
             if (!param.Data) return;
-            h_param_ptrs.push_back(param.template get<float>());
+            h_param_ptrs.push_back(param.Data);  // Store raw pointer, type-checked at kernel dispatch
             int n = (int)param.nelem();
             h_sizes.push_back(n);
             h_state_offsets.push_back((int)total_params);
             total_params += n;
         };
 
-        // Collect all LoRA tensors (master weights are FP32)
+        // Collect all LoRA tensors (master weights dtype matches lora_dtype)
         for (int l = 0; l < L; ++l) {
             auto& lora_w = mLoRAWeights->get_master_block(l, stream);
 
@@ -987,11 +1011,11 @@ public:
         constexpr size_t BLOCK_SIZE = 2048;
         state.num_blocks = (total_params + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-        // Allocate device buffers for pointer arrays
+        // Allocate device buffers for pointer arrays (pointer size is same for all types)
         state.param_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_mt_param_ptrs",
-            EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(float*))});
+            EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
         state.grad_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_mt_grad_ptrs",
-            EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(float*))});
+            EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
         state.tensor_sizes = mAllocator->allocate(ETensorDType::INT32, "lora_mt_sizes",
             EAllocationType::ON_DEVICE, {(long)state.num_tensors});
         state.state_offsets = mAllocator->allocate(ETensorDType::INT32, "lora_mt_offsets",
@@ -999,7 +1023,7 @@ public:
 
         // Copy param pointers, sizes, and offsets to device
         CUDA_CHECK(cudaMemcpyAsync(state.param_ptrs.Data, h_param_ptrs.data(),
-            h_param_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice, stream));
+            h_param_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(state.tensor_sizes.Data, h_sizes.data(),
             h_sizes.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(state.state_offsets.Data, h_state_offsets.data(),
@@ -1050,15 +1074,16 @@ public:
         auto& state = *mLoRAAdamW8BitState;
         const int L = (int)mBaseModel->config().NumLayers;
 
-        std::vector<float*> h_grad_ptrs;
+        // Use void* to handle both FP32 and BF16 gradient pointers
+        std::vector<void*> h_grad_ptrs;
         h_grad_ptrs.reserve(state.num_tensors);
 
         bool unused_acc = false;
 
         auto collect_grad = [&](std::optional<LoRALayerWeights<Tensor>>& grad_opt) {
             if (!grad_opt.has_value()) return;
-            if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.template get<float>());
-            if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.template get<float>());
+            if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
+            if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
         };
 
         for (int l = 0; l < L; ++l) {
@@ -1075,7 +1100,7 @@ public:
 
         // Copy gradient pointers to device
         CUDA_CHECK(cudaMemcpyAsync(state.grad_ptrs.Data, h_grad_ptrs.data(),
-            h_grad_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice, stream));
+            h_grad_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
     }
 
     float get_loss() const override { return mBaseModel->get_loss(); }
