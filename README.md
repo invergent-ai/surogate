@@ -42,8 +42,9 @@ Surogate is built for developers and enterprises that need fast experimentation 
   - [**💎 BF16**](./csrc/src/recipes/bf16/README.md): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
   - [**🔥 FP8**](./csrc/src/recipes/fp8_hybrid/README.md): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
   - [**🔥 NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- **⚡ FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
-- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
+- **⚡ BnB/FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
+- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121 (WIP)
+- **🧪 Fast Experimentation**: Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
 - **🧠 Supported models**: Qwen2.5, Qwen3 Dense, LLama 3.2, more to come shortly
 
@@ -52,8 +53,8 @@ Surogate is built for developers and enterprises that need fast experimentation 
 ## Hardware / Requirements
 
 - NVIDIA GPU + recent driver
-- CUDA **12/13**, NCCL, cuDNN
-- Linux
+- CUDA **12.8, 12.9, 13**, NCCL, cuDNN
+- Linux x86_64
 
 ### Supported NVIDIA GPUs:
 - `SM80`: A100, A30
