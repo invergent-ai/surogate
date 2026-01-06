@@ -434,7 +434,12 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
     auto allocator = std::make_shared<TensorAllocator>();
 
     modules::ModelConfig mod_config = modules::ModelConfig::from_llama_config(mConfig);
-            modules::ModelOptions mod_options = modules::ModelOptions::from_runtime_options(mOptions);
+    modules::ModelOptions mod_options = modules::ModelOptions::from_runtime_options(mOptions);
+
+    // QLoRA: skip block weight allocation since weights are provided by QLoRA weight provider
+    if (mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized()) {
+        mod_options.skip_block_allocation = true;
+    }
 
     std::unique_ptr<IModel> model_storage = modules::ModelFactory::create(
         mod_config, mod_options, comm.rank(), comm.world_size(), allocator);
