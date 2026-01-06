@@ -99,16 +99,6 @@ public:
     [[nodiscard]] const Config& config() const { return mConfig; }
 
     // =========================================================================
-    // Recipe-driven dispatch (Phase 6)
-    // =========================================================================
-
-    /// @brief FP8HybridRecipe handles all forward matmul dispatch
-    [[nodiscard]] bool handles_forward_matmul() const override { return true; }
-
-    /// @brief FP8HybridRecipe handles all backward matmul dispatch
-    [[nodiscard]] bool handles_backward_matmul() const override { return true; }
-
-    // =========================================================================
     // Matmul dispatch overrides
     // =========================================================================
 

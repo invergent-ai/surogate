@@ -42,16 +42,6 @@ public:
     }
 
     [[nodiscard]] std::string_view name() const override { return "bf16"; }
-
-    // =========================================================================
-    // Recipe-driven dispatch
-    // =========================================================================
-
-    /// @brief BF16Recipe handles all forward matmul dispatch (uses base class BF16 implementation)
-    [[nodiscard]] bool handles_forward_matmul() const override { return true; }
-
-    /// @brief BF16Recipe handles all backward matmul dispatch (uses base class BF16 implementation)
-    [[nodiscard]] bool handles_backward_matmul() const override { return true; }
 };
 
 }  // namespace recipes

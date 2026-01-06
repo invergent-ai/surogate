@@ -133,100 +133,6 @@ inline float* abs_max_ptr(Tensor& maybe_quant) {
 }
 
 /**
- * @brief Legacy backward matmul for BF16/FP8 quantized paths
- *
- * This function is only called when the active recipe returns handles_backward_matmul() = false.
- * With all current recipes (BF16, FP8 Hybrid, MXFP8, NVFP4, NVFP4Simple) returning true,
- * this is effectively dead code but kept for backwards compatibility with custom recipes.
- */
-template<typename Block>
-inline void backward_qmm(Tensor& dinp,
-                         Tensor& dweight, std::optional<Tensor> dbias,
-                         Tensor& dout, Tensor& dout_q,
-                         Tensor& inp, Tensor& inp_q,
-                         Tensor& weight, std::optional<Tensor> bias_buffer,
-                         bool accumulate_gradient,
-                         ModularRunState<Block>& rs,
-                         int B, int T, int C, int OC,
-                         bool reuse_inp_quant,
-                         bool /*allow_fp4*/,  // unused - FP4 backward now handled by recipes
-                         unsigned int /*seed*/,  // unused - FP4 backward now handled by recipes
-                         cudaStream_t stream,
-                         bool skip_weight_grad = false) {
-    // This function only handles BF16/FP8 paths.
-
-    if (weight.DType == inp.DType) {
-        // Compute dinp: dinp = W^T @ dout (always needed for gradient flow)
-        matmul(dinp, weight, dout, std::nullopt, nullptr, nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, B * T, OC, EMMTranspose::NN, /*accumulate=*/false, stream);
-
-        // Compute dweight: dW += inp^T @ dout (skip if weights are frozen in LoRA-only mode)
-        if (!skip_weight_grad) {
-            matmul(dweight, inp, dout, std::nullopt, nullptr, nullptr,
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   C, OC, B * T, EMMTranspose::NT, /*accumulate=*/accumulate_gradient, stream);
-
-            if (dbias.has_value()) {
-                if (!bias_buffer.has_value()) {
-                    throw std::runtime_error("backward_qmm: dbias requested but bias_buffer not provided");
-                }
-                backward_bias(dbias.value(), dout, nullptr, nullptr, bias_buffer.value(),
-                              B, T, OC, rs.DeviceProp, stream);
-            }
-        }
-        return;
-    }
-
-    if (!dout_q.Data || !inp_q.Data) {
-        throw std::runtime_error("backward_qmm: quant buffers not allocated");
-    }
-    if (!dout_q.abs_max()) {
-        throw std::runtime_error("backward_qmm: dout_q missing abs_max/scale Stats");
-    }
-
-    // Quantize dout using precomputed absmax (filled by upstream kernels when grad quants are enabled).
-    quantize_with_abs_max(dout_q, dout_q.scale(), dout, dout_q.abs_max(), (long)B * T * OC, rs.DeviceProp, stream);
-
-    // Compute dinp: dinp = W^T @ dout (always needed for gradient flow)
-    auto weight_tp = rs.temp_alloc(inp_q.DType, {C, OC});
-    transpose(weight_tp, weight, OC, C, stream);
-    matmul(dinp, weight_tp, dout_q, std::nullopt, weight.scale(), dout_q.scale(),
-           rs.CublasLtHandle, rs.CuBlasWorkspace,
-           C, B * T, OC, EMMTranspose::TN, /*accumulate=*/false, stream);
-    rs.temp_free(weight_tp);
-
-    // Compute dweight: dW += inp^T @ dout (skip if weights are frozen in LoRA-only mode)
-    if (!skip_weight_grad) {
-        auto activation_tp = rs.temp_alloc(inp_q.DType, {C, B * T});
-        auto grad_tp = rs.temp_alloc(dout_q.DType, {OC, B * T});
-        if (reuse_inp_quant) {
-            transpose(activation_tp, inp_q, B * T, C, stream);
-        } else {
-            // Quantize-and-transpose using absmax from the forward pass (produced by fused ops).
-            quantize_and_transpose_with_abs_max(activation_tp, activation_tp.scale(), inp, inp_q.abs_max(),
-                                                B * T, C, rs.DeviceProp, stream);
-        }
-        transpose(grad_tp, dout_q, B * T, OC, stream);
-
-        matmul(dweight, activation_tp, grad_tp, std::nullopt, inp_q.scale(), dout_q.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, OC, B * T, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream);
-
-        if (dbias.has_value()) {
-            if (!bias_buffer.has_value()) {
-                throw std::runtime_error("backward_qmm: dbias requested but bias_buffer not provided");
-            }
-            backward_bias(dbias.value(), dout_q, inp_q.scale(), dout_q.scale(), bias_buffer.value(),
-                          B, T, OC, rs.DeviceProp, stream);
-        }
-
-        rs.temp_free(grad_tp);
-        rs.temp_free(activation_tp);
-    }
-}
-
-/**
  * @brief Helper to execute recipe-driven forward matmul with full context setup
  *
  * This function handles the setup of MatmulContext for recipe->forward_matmul(),
@@ -297,7 +203,7 @@ inline void recipe_forward_matmul(
 /**
  * @brief Helper to execute recipe-driven backward matmul with full context setup
  *
- * @param recipe The training recipe (must have handles_backward_matmul() == true)
+ * @param recipe The training recipe
  * @param dinp Gradient w.r.t. input
  * @param dweight Gradient w.r.t. weight
  * @param dbias Optional gradient w.r.t. bias (nullptr if no bias)
@@ -2229,60 +2135,39 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 
         // MLP down: swiglu -> mlp_down_weight -> d_res_ffn
         with_ctx("mlp_down:qmm", [&]() {
-            if (mRecipe->handles_backward_matmul()) {
-                // Recipe-driven backward (FP8 HYBRID or MXFP8)
-                modules::MatmulContext ctx;
-                ctx.dinp = &da.d_swiglu;
-                ctx.dweight = &grads.d_mlp_down_weight;
-                ctx.dbias = nullptr;
-                ctx.dout = &da.d_res_ffn;
-                ctx.inp = &a.swiglu;
-                ctx.weight = &weights.mlp_down_weight;
-                ctx.inp_quant = &qa.swiglu;
-                ctx.dout_quant = &qg.d_res_ffn;
-                ctx.bias_buffer = nullptr;
-                ctx.B = (int)B;
-                ctx.T = (int)T;
-                ctx.C_in = (int)D;
-                ctx.C_out = (int)C;
-                ctx.run_state = &rs;
-                ctx.stream = stream;
-                ctx.layer_idx = layer_idx;
-                ctx.op = modules::MatmulOp::MLPDown;
-                ctx.accumulate = accumulate;
-                ctx.skip_weight_grad = lora_only;
-                ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-                ctx.allow_fp4 = allow_fp4_layer;
-                ctx.allow_fp8 = allow_fp4_layer;
+            modules::MatmulContext ctx;
+            ctx.dinp = &da.d_swiglu;
+            ctx.dweight = &grads.d_mlp_down_weight;
+            ctx.dbias = nullptr;
+            ctx.dout = &da.d_res_ffn;
+            ctx.inp = &a.swiglu;
+            ctx.weight = &weights.mlp_down_weight;
+            ctx.inp_quant = &qa.swiglu;
+            ctx.dout_quant = &qg.d_res_ffn;
+            ctx.bias_buffer = nullptr;
+            ctx.B = (int)B;
+            ctx.T = (int)T;
+            ctx.C_in = (int)D;
+            ctx.C_out = (int)C;
+            ctx.run_state = &rs;
+            ctx.stream = stream;
+            ctx.layer_idx = layer_idx;
+            ctx.op = modules::MatmulOp::MLPDown;
+            ctx.accumulate = accumulate;
+            ctx.skip_weight_grad = lora_only;
+            ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+            ctx.allow_fp4 = allow_fp4_layer;
+            ctx.allow_fp8 = allow_fp4_layer;
 
-                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-                if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
-                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
-                    ctx.cached_fp4_data = &fp4_t.mlp_down_weight.data;
-                    ctx.cached_fp4_scales = &fp4_t.mlp_down_weight.scales;
-                    // Use transposed amax (separate from forward) for dgrad
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 3;
-                }
-
-                mRecipe->backward_matmul(ctx);
-            } else {
-                // BF16/FP4 backward (used by NVFP4Recipe, NVFP4SimpleRecipe)
-                detail::backward_qmm(
-                    /*dinp=*/da.d_swiglu,
-                    /*dweight=*/grads.d_mlp_down_weight, /*dbias=*/std::nullopt,
-                    /*dout=*/da.d_res_ffn, /*dout_q=*/qg.d_res_ffn,
-                    /*inp=*/a.swiglu, /*inp_q=*/qa.swiglu,
-                    /*weight=*/weights.mlp_down_weight, /*bias_buffer=*/std::nullopt,
-                    /*accumulate_gradient=*/accumulate,
-                    rs,
-                    /*B=*/B, /*T=*/T, /*C(in)=*/D, /*OC(out)=*/C,
-                    /*reuse_inp_quant=*/false,
-                    /*allow_fp4=*/allow_fp4_layer,
-                    static_cast<unsigned int>(mOptimizerRNG()),
-                    stream,
-                    /*skip_weight_grad=*/lora_only
-                );
+            // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+                auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                ctx.cached_fp4_data = &fp4_t.mlp_down_weight.data;
+                ctx.cached_fp4_scales = &fp4_t.mlp_down_weight.scales;
+                ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 3;
             }
+
+            mRecipe->backward_matmul(ctx);
         });
 
         if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward);
@@ -2321,60 +2206,39 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 
         // MLP up: ln2 -> mlp_up_weight -> d_mlp_up
         with_ctx("mlp_up:qmm", [&]() {
-            if (mRecipe->handles_backward_matmul()) {
-                // Recipe-driven backward (FP8 HYBRID or MXFP8)
-                modules::MatmulContext ctx;
-                ctx.dinp = &da.d_ln2;
-                ctx.dweight = &grads.d_mlp_up_weight;
-                ctx.dbias = nullptr;
-                ctx.dout = &da.d_mlp_up;
-                ctx.inp = &a.ln2;
-                ctx.weight = &weights.mlp_up_weight;
-                ctx.inp_quant = &qa.ln2;
-                ctx.dout_quant = &qg.d_mlp_up;
-                ctx.bias_buffer = nullptr;
-                ctx.B = (int)B;
-                ctx.T = (int)T;
-                ctx.C_in = (int)C;
-                ctx.C_out = (int)(2 * D);
-                ctx.run_state = &rs;
-                ctx.stream = stream;
-                ctx.layer_idx = layer_idx;
-                ctx.op = modules::MatmulOp::MLPUp;
-                ctx.accumulate = accumulate;
-                ctx.skip_weight_grad = lora_only;
-                ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-                ctx.allow_fp4 = allow_fp4_layer;
-                ctx.allow_fp8 = allow_fp4_layer;
+            modules::MatmulContext ctx;
+            ctx.dinp = &da.d_ln2;
+            ctx.dweight = &grads.d_mlp_up_weight;
+            ctx.dbias = nullptr;
+            ctx.dout = &da.d_mlp_up;
+            ctx.inp = &a.ln2;
+            ctx.weight = &weights.mlp_up_weight;
+            ctx.inp_quant = &qa.ln2;
+            ctx.dout_quant = &qg.d_mlp_up;
+            ctx.bias_buffer = nullptr;
+            ctx.B = (int)B;
+            ctx.T = (int)T;
+            ctx.C_in = (int)C;
+            ctx.C_out = (int)(2 * D);
+            ctx.run_state = &rs;
+            ctx.stream = stream;
+            ctx.layer_idx = layer_idx;
+            ctx.op = modules::MatmulOp::MLPUp;
+            ctx.accumulate = accumulate;
+            ctx.skip_weight_grad = lora_only;
+            ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+            ctx.allow_fp4 = allow_fp4_layer;
+            ctx.allow_fp8 = allow_fp4_layer;
 
-                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-                if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
-                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
-                    ctx.cached_fp4_data = &fp4_t.mlp_up_weight.data;
-                    ctx.cached_fp4_scales = &fp4_t.mlp_up_weight.scales;
-                    // Use transposed amax (separate from forward) for dgrad
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 2;
-                }
-
-                mRecipe->backward_matmul(ctx);
-            } else {
-                // BF16/FP4 backward (used by NVFP4Recipe, NVFP4SimpleRecipe)
-                detail::backward_qmm(
-                    /*dinp=*/da.d_ln2,
-                    /*dweight=*/grads.d_mlp_up_weight, /*dbias=*/std::nullopt,
-                    /*dout=*/da.d_mlp_up, /*dout_q=*/qg.d_mlp_up,
-                    /*inp=*/a.ln2, /*inp_q=*/qa.ln2,
-                    /*weight=*/weights.mlp_up_weight, /*bias_buffer=*/std::nullopt,
-                    /*accumulate_gradient=*/accumulate,
-                    rs,
-                    /*B=*/B, /*T=*/T, /*C(in)=*/C, /*OC(out)=*/2 * D,
-                    /*reuse_inp_quant=*/false,
-                    /*allow_fp4=*/allow_fp4_layer,
-                    static_cast<unsigned int>(mOptimizerRNG()),
-                    stream,
-                    /*skip_weight_grad=*/lora_only
-                );
+            // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+                auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                ctx.cached_fp4_data = &fp4_t.mlp_up_weight.data;
+                ctx.cached_fp4_scales = &fp4_t.mlp_up_weight.scales;
+                ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 2;
             }
+
+            mRecipe->backward_matmul(ctx);
         });
 
         // LoRA's `AfterMLPUpBackward` hook consumes `da.d_mlp_up`. In recompute-block mode
@@ -2404,60 +2268,39 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 
         // Output projection backward
         with_ctx("att_out:qmm", [&]() {
-            if (mRecipe->handles_backward_matmul()) {
-                // Recipe-driven backward (FP8 HYBRID or MXFP8)
-                modules::MatmulContext ctx;
-                ctx.dinp = &da.d_att;
-                ctx.dweight = &grads.attention_grads.d_out_weight;
-                ctx.dbias = nullptr;
-                ctx.dout = &da.d_res_att;
-                ctx.inp = &a.att;
-                ctx.weight = &weights.attention.out_weight;
-                ctx.inp_quant = &qa.att;
-                ctx.dout_quant = &qg.d_res_att;
-                ctx.bias_buffer = nullptr;
-                ctx.B = (int)B;
-                ctx.T = (int)T;
-                ctx.C_in = (int)(Hq * Hs);
-                ctx.C_out = (int)C;
-                ctx.run_state = &rs;
-                ctx.stream = stream;
-                ctx.layer_idx = layer_idx;
-                ctx.op = modules::MatmulOp::AttnOut;
-                ctx.accumulate = accumulate;
-                ctx.skip_weight_grad = lora_only;
-                ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-                ctx.allow_fp4 = allow_fp4_layer;
-                ctx.allow_fp8 = allow_fp4_layer;
+            modules::MatmulContext ctx;
+            ctx.dinp = &da.d_att;
+            ctx.dweight = &grads.attention_grads.d_out_weight;
+            ctx.dbias = nullptr;
+            ctx.dout = &da.d_res_att;
+            ctx.inp = &a.att;
+            ctx.weight = &weights.attention.out_weight;
+            ctx.inp_quant = &qa.att;
+            ctx.dout_quant = &qg.d_res_att;
+            ctx.bias_buffer = nullptr;
+            ctx.B = (int)B;
+            ctx.T = (int)T;
+            ctx.C_in = (int)(Hq * Hs);
+            ctx.C_out = (int)C;
+            ctx.run_state = &rs;
+            ctx.stream = stream;
+            ctx.layer_idx = layer_idx;
+            ctx.op = modules::MatmulOp::AttnOut;
+            ctx.accumulate = accumulate;
+            ctx.skip_weight_grad = lora_only;
+            ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+            ctx.allow_fp4 = allow_fp4_layer;
+            ctx.allow_fp8 = allow_fp4_layer;
 
-                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-                if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
-                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
-                    ctx.cached_fp4_data = &fp4_t.o_weight.data;
-                    ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
-                    // Use transposed amax (separate from forward) for dgrad
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 1;
-                }
-
-                mRecipe->backward_matmul(ctx);
-            } else {
-                // BF16/FP4 backward (used by NVFP4Recipe, NVFP4SimpleRecipe)
-                detail::backward_qmm(
-                    /*dinp=*/da.d_att,
-                    /*dweight=*/grads.attention_grads.d_out_weight, /*dbias=*/std::nullopt,
-                    /*dout=*/da.d_res_att, /*dout_q=*/qg.d_res_att,
-                    /*inp=*/a.att, /*inp_q=*/qa.att,
-                    /*weight=*/weights.attention.out_weight, /*bias_buffer=*/std::nullopt,
-                    /*accumulate_gradient=*/accumulate,
-                    rs,
-                    /*B=*/B, /*T=*/T, /*C(in)=*/(Hq * Hs), /*OC(out)=*/C,
-                    /*reuse_inp_quant=*/false,
-                    /*allow_fp4=*/allow_fp4_layer,
-                    static_cast<unsigned int>(mOptimizerRNG()),
-                    stream,
-                    /*skip_weight_grad=*/lora_only
-                );
+            // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+                auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                ctx.cached_fp4_data = &fp4_t.o_weight.data;
+                ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
+                ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 1;
             }
+
+            mRecipe->backward_matmul(ctx);
         });
 
         if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward);
@@ -2615,60 +2458,39 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             if (!lora_only && weights.attention.qkv_bias.has_value() && grads.attention_grads.d_qkv_bias.has_value()) {
                 dbias = grads.attention_grads.d_qkv_bias.value();
             }
-            if (mRecipe->handles_backward_matmul()) {
-                // Recipe-driven backward (FP8 HYBRID or MXFP8)
-                modules::MatmulContext ctx;
-                ctx.dinp = &da.d_ln1;
-                ctx.dweight = &grads.attention_grads.d_qkv_weight;
-                ctx.dbias = dbias.has_value() ? &dbias.value() : nullptr;
-                ctx.dout = &da.d_qkv;
-                ctx.inp = &a.ln1;
-                ctx.weight = &weights.attention.qkv_weight;
-                ctx.inp_quant = &qa.ln1;
-                ctx.dout_quant = &qg.d_qkv;
-                ctx.bias_buffer = &rs.scratch().matmul_bias_scratch;
-                ctx.B = (int)B;
-                ctx.T = (int)T;
-                ctx.C_in = (int)C;
-                ctx.C_out = (int)qkv_channels;
-                ctx.run_state = &rs;
-                ctx.stream = stream;
-                ctx.layer_idx = layer_idx;
-                ctx.op = modules::MatmulOp::QKV;
-                ctx.accumulate = accumulate;
-                ctx.skip_weight_grad = lora_only;
-                ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-                ctx.allow_fp4 = allow_fp4_layer;
-                ctx.allow_fp8 = allow_fp4_layer;
+            modules::MatmulContext ctx;
+            ctx.dinp = &da.d_ln1;
+            ctx.dweight = &grads.attention_grads.d_qkv_weight;
+            ctx.dbias = dbias.has_value() ? &dbias.value() : nullptr;
+            ctx.dout = &da.d_qkv;
+            ctx.inp = &a.ln1;
+            ctx.weight = &weights.attention.qkv_weight;
+            ctx.inp_quant = &qa.ln1;
+            ctx.dout_quant = &qg.d_qkv;
+            ctx.bias_buffer = &rs.scratch().matmul_bias_scratch;
+            ctx.B = (int)B;
+            ctx.T = (int)T;
+            ctx.C_in = (int)C;
+            ctx.C_out = (int)qkv_channels;
+            ctx.run_state = &rs;
+            ctx.stream = stream;
+            ctx.layer_idx = layer_idx;
+            ctx.op = modules::MatmulOp::QKV;
+            ctx.accumulate = accumulate;
+            ctx.skip_weight_grad = lora_only;
+            ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+            ctx.allow_fp4 = allow_fp4_layer;
+            ctx.allow_fp8 = allow_fp4_layer;
 
-                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-                if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
-                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
-                    ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
-                    ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;
-                    // Use transposed amax (separate from forward) for dgrad
-                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 0;
-                }
-
-                mRecipe->backward_matmul(ctx);
-            } else {
-                // BF16/FP4 backward (used by NVFP4Recipe, NVFP4SimpleRecipe)
-                detail::backward_qmm(
-                    /*dinp=*/da.d_ln1,
-                    /*dweight=*/grads.attention_grads.d_qkv_weight, /*dbias=*/dbias,
-                    /*dout=*/da.d_qkv, /*dout_q=*/qg.d_qkv,
-                    /*inp=*/a.ln1, /*inp_q=*/qa.ln1,
-                    /*weight=*/weights.attention.qkv_weight, /*bias_buffer=*/std::make_optional(rs.scratch().matmul_bias_scratch),
-                    /*accumulate_gradient=*/accumulate,
-                    rs,
-                    /*B=*/B, /*T=*/T, /*C(in)=*/C, /*OC(out)=*/qkv_channels,
-                    /*reuse_inp_quant=*/false,
-                    /*allow_fp4=*/allow_fp4_layer,
-                    static_cast<unsigned int>(mOptimizerRNG()),
-                    stream,
-                    /*skip_weight_grad=*/lora_only
-                );
+            // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+                auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
+                ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;
+                ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 0;
             }
+
+            mRecipe->backward_matmul(ctx);
         });
 
         if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward);

@@ -143,20 +143,6 @@ public:
     [[nodiscard]] FourOverSixErrorMetric four_over_six_metric() const { return mConfig.four_over_six_metric; }
 
     // =========================================================================
-    // Recipe-driven dispatch (Phase 7)
-    // =========================================================================
-
-    /// @brief NVFP4Recipe handles forward matmul dispatch for both cuDNN and CUTLASS paths
-    [[nodiscard]] bool handles_forward_matmul() const override {
-        return true;  // Handles both CUBLASLT (cuDNN) and CUTLASS backends
-    }
-
-    /// @brief NVFP4Recipe handles backward matmul with FP4 quantization for both backends
-    [[nodiscard]] bool handles_backward_matmul() const override {
-        return true;  // Handles both CUBLASLT (cuDNN) and CUTLASS backends
-    }
-
-    // =========================================================================
     // Matmul dispatch overrides
     // =========================================================================
 

@@ -189,16 +189,6 @@ public:
      */
     [[nodiscard]] virtual bool handles_forward_matmul() const { return false; }
 
-    /**
-     * @brief Whether this recipe handles backward matmul dispatch
-     *
-     * When true, the model should use recipe->backward_matmul() for all projections
-     * instead of the legacy conditional logic.
-     *
-     * Default: false (use legacy code path for backward compatibility)
-     */
-    [[nodiscard]] virtual bool handles_backward_matmul() const { return false; }
-
     // =========================================================================
     // Active matmul dispatch (new recipe-driven approach)
     // =========================================================================
