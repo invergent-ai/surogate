@@ -131,8 +131,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         use_cuda_graphs (Optional[bool], defaults to True):
             Enable or disable CUDA graphs for performance.
 
+        optimizer (Optional[Literal['adamw_8bit']], defaults to 'adamw_8bit'):
+            Optimizer type to use for training. Currently supports 'adamw_8bit' (8-bit blockwise quantized AdamW).
         learning_rate (Optional[float], defaults to 1e-4):
-            The initial learning rate for [`AdamW`] optimizer.
+            The initial learning rate for the optimizer.
         lr_scheduler_type (Optional[Literal['linear', 'cosine', 'wsd']]*, defaults to `"linear"`):
            Learning rate schedule function: Cosine or Linear
         cooldown_steps (Optional[int], defaults to 0):
@@ -266,6 +268,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
 
+    optimizer: Optional[Literal['adamw_8bit']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
     lr_scheduler_type: Optional[Literal['linear', 'cosine', 'wsd']] = 'linear'
     cooldown_steps: Optional[int] = 0
@@ -357,6 +360,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.gpus = cfg.get('gpus', self.gpus)
         self.use_cuda_graphs = cfg.get('use_cuda_graphs', self.use_cuda_graphs)
 
+        self.optimizer = cfg.get('optimizer', self.optimizer)
         self.learning_rate = float(cfg.get('learning_rate', self.learning_rate))
         self.lr_scheduler_type = cfg.get('lr_scheduler_type', self.lr_scheduler_type)
         self.cooldown_steps = cfg.get('cooldown_steps', self.cooldown_steps)

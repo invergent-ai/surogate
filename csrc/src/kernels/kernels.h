@@ -267,70 +267,15 @@ void deterministic_sum(float* out, const float* values, std::size_t count, cudaS
 void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count, cudaStream_t stream);
 
 
-// 8-bit AdamW optimizer (bitsandbytes-style blockwise quantization)
-// Uses 8-bit quantized optimizer states with per-block scaling factors
-// Note: gnorm_scale is a device pointer to enable CUDA graph capture (avoids host sync)
+// 8-bit AdamW optimizer - functions moved to modules/optimizers/adamw_8bit.h
+// Bring them into global namespace for backward compatibility
+#include "modules/optimizers/adamw_8bit.h"
 
-void adamw_update_8bit(float* p, const float* g, unsigned char* state1, unsigned char* state2, size_t n,
-                       float lr, float beta1, float beta2, int step, float eps, float weight_decay, const float* gnorm_scale,
-                       const float* quantiles1, const float* quantiles2, float* absmax1, float* absmax2, cudaStream_t stream);
-
-// Mixed precision: FP32 params with BF16 gradients
-void adamw_update_8bit(float* p, const nv_bfloat16* g, unsigned char* state1, unsigned char* state2, size_t n,
-                       float lr, float beta1, float beta2, int step, float eps, float weight_decay, const float* gnorm_scale,
-                       const float* quantiles1, const float* quantiles2, float* absmax1, float* absmax2, cudaStream_t stream);
-
-void adamw_update_8bit(nv_bfloat16* p, const nv_bfloat16* g, unsigned char* state1, unsigned char* state2, size_t n,
-                       float lr, float beta1, float beta2, int step, float eps, float weight_decay, const float* gnorm_scale,
-                       const float* quantiles1, const float* quantiles2, float* absmax1, float* absmax2, cudaStream_t stream);
-
-void adamw_update_8bit(half* p, const half* g, unsigned char* state1, unsigned char* state2, size_t n,
-                       float lr, float beta1, float beta2, int step, float eps, float weight_decay, const float* gnorm_scale,
-                       const float* quantiles1, const float* quantiles2, float* absmax1, float* absmax2, cudaStream_t stream);
-
-// Initialize 8-bit optimizer states and create quantization maps
-void init_adamw8bit_state(unsigned char* state1, unsigned char* state2, float* absmax1, float* absmax2, size_t n, cudaStream_t stream);
-void create_adamw8bit_quantiles1(float* code);  // Signed quantization map for first moment (m)
-void create_adamw8bit_quantiles2(float* code);  // Unsigned quantization map for second moment (v)
-
-// Multi-tensor 8-bit AdamW optimizer (processes multiple tensors in a single kernel launch)
-// Critical for LoRA training where we have hundreds of small adapter tensors.
-// All pointer arrays and metadata arrays must be in device memory.
-void adamw_update_8bit_multi_tensor(
-    float** params,              // Device array of param pointers
-    float** grads,               // Device array of grad pointers
-    const int* sizes,            // Device array of tensor sizes
-    int num_tensors,             // Number of tensors
-    unsigned char* state1,       // Combined first moment state buffer
-    unsigned char* state2,       // Combined second moment state buffer
-    float* absmax1,              // Combined per-block absmax for m
-    float* absmax2,              // Combined per-block absmax for v
-    const int* state_offsets,    // Device array of element offsets in state buffers
-    size_t total_params,         // Total parameters across all tensors
-    float lr, float beta1, float beta2, int step, float eps, float weight_decay,
-    const float* gnorm_scale,    // Device pointer to grad scale (for graph capture)
-    const float* quantiles1,     // Quantization map for m
-    const float* quantiles2,     // Quantization map for v
-    cudaStream_t stream
-);
-
-void adamw_update_8bit_multi_tensor(
-    nv_bfloat16** params,
-    nv_bfloat16** grads,
-    const int* sizes,
-    int num_tensors,
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    const int* state_offsets,
-    size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps, float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    cudaStream_t stream
-);
+using optimizers::adamw_update_8bit;
+using optimizers::adamw_update_8bit_multi_tensor;
+using optimizers::init_adamw8bit_state;
+using optimizers::create_adamw8bit_quantiles1;
+using optimizers::create_adamw8bit_quantiles2;
 
 // quantization
 void abs_max(float* scale, const float* in, long N, const cudaDeviceProp& dp, cudaStream_t stream);

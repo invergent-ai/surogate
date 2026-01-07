@@ -8,7 +8,8 @@ if [ -z "$MODEL" ] || [ -z "$RECIPE" ]; then
     exit 1
 fi
 
-rm -rf ./output /tmp/benchmark_${RECIPE}.yaml
+rm -rf ./output/benchmark_${RECIPE} /tmp/benchmark_${RECIPE}.yaml
 cp examples/sft/qwen3-lora-${RECIPE}.yaml /tmp/benchmark_${RECIPE}.yaml
 sed -i "s|^model: .*|model: ${MODEL}|" /tmp/benchmark_${RECIPE}.yaml
+sed -i "s|^output_dir: .*|output_dir: ./output/benchmark_${RECIPE}|" /tmp/benchmark_${RECIPE}.yaml
 surogate sft --config /tmp/benchmark_${RECIPE}.yaml

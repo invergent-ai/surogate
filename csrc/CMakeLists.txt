@@ -248,7 +248,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu
-    src/kernels/adamw8bit.cu
+    src/modules/optimizers/adamw_8bit.cu
     src/kernels/attention.cu
     src/kernels/fused_classifier.cu
     src/kernels/transpose.cu

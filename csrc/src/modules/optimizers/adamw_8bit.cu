@@ -9,17 +9,21 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "squirrel_noise.cuh"
-#include "kernel_utils.cuh"
+#include "kernels/squirrel_noise.cuh"
+#include "kernels/kernel_utils.cuh"
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
+
+#include "adamw_8bit.h"
+
+namespace optimizers {
 
 // ----------------------------------------------------------------------------
 // Constants and configuration
 
 // Block size for 8-bit optimizer (number of elements processed per block)
 // This determines the granularity of quantization - each block has its own absmax
-constexpr int ADAMW8BIT_BLOCK_SIZE = 2048;
+constexpr int ADAMW8BIT_BLOCK_SIZE_INTERNAL = 2048;
 
 // Number of elements processed per thread
 constexpr int ADAMW8BIT_NUM_PER_THREAD = 8;
@@ -610,7 +614,7 @@ void adamw_update_8bit(
     float* absmax2,
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE;
+    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
     int num_blocks = div_ceil(n, (size_t)BLOCK_SIZE);
@@ -649,7 +653,7 @@ void adamw_update_8bit(
     float* absmax2,
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE;
+    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
     int num_blocks = div_ceil(n, (size_t)BLOCK_SIZE);
@@ -691,7 +695,7 @@ void adamw_update_8bit(
     float* absmax2,
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE;
+    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
     int num_blocks = div_ceil(n, (size_t)BLOCK_SIZE);
@@ -731,7 +735,7 @@ void adamw_update_8bit(
     float* absmax2,
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE;
+    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
     int num_blocks = div_ceil(n, (size_t)BLOCK_SIZE);
@@ -900,7 +904,7 @@ void init_adamw8bit_state(
     size_t n,
     cudaStream_t stream
 ) {
-    const size_t num_blocks = div_ceil(n, (size_t)ADAMW8BIT_BLOCK_SIZE);
+    const size_t num_blocks = div_ceil(n, (size_t)ADAMW8BIT_BLOCK_SIZE_INTERNAL);
     const size_t total_elements = std::max(n, num_blocks);
 
     int threads = 256;
@@ -1213,7 +1217,7 @@ void adamw_update_8bit_multi_tensor(
     const float* quantiles2,
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE;
+    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
     // Calculate total blocks needed across all tensors
@@ -1255,7 +1259,7 @@ void adamw_update_8bit_multi_tensor(
     const float* quantiles2,
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE;
+    constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
     int total_blocks = (int)div_ceil(total_params, (size_t)BLOCK_SIZE);
@@ -1272,3 +1276,5 @@ void adamw_update_8bit_multi_tensor(
         );
     CUDA_CHECK(cudaGetLastError());
 }
+
+} // namespace optimizers

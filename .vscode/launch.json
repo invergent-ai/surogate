@@ -19,7 +19,7 @@
             "type": "debugpy",
             "request": "launch",
             "module": "surogate.cli.main",
-            "args": ["sft", "--config", "${workspaceFolder}/examples/sft/qwen3-0.6b.yaml"],
+            "args": ["sft", "--config", "${workspaceFolder}/examples/sft/qwen3-lora-bf16.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"}
