@@ -897,6 +897,19 @@ public:
         update_adamw_8bit(comm, learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_clip);
     }
 
+    void update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) override {
+        if (!lora_enabled()) {
+            // Delegate to base model which supports NorMuon for full fine-tuning
+            mBaseModel->update_with_config(comm, config, step);
+            return;
+        }
+        if (!mLoRAAdamW8BitState) {
+            throw std::logic_error("ModularLoRAModel::update_with_config: 8-bit optimizer state not allocated");
+        }
+        update_adamw_8bit(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
+                         step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+    }
+
     void update_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
                            int t, float epsilon, float weight_decay, float grad_clip) {
         NVTX_RANGE_FN();

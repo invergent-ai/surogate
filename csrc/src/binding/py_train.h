@@ -15,6 +15,7 @@
 #include "training/runtime_options.h"
 #include "config/lora_adapter_config.h"
 #include "modules/qlora/qlora_config.h"
+#include "modules/optimizers/optimizer_config.h"
 
 class DataLoader;
 class IModel;
@@ -57,7 +58,7 @@ public:
     void save_checkpoint(std::string directory, int step);
     void step(const std::int32_t* inputs, const std::int32_t* targets);
     float validate(const std::int32_t* inputs, const std::int32_t* targets);
-    std::pair<float, float> update(float lr, float beta1, float beta2, int step, float epsilon, float weight_decay, float grad_clip);
+    std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
     void stop();
 
     std::vector<GPUUtilInfo> get_gpu_info();

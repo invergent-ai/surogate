@@ -294,30 +294,23 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t
 }
 
 /**
- * @brief Apply optimizer update after gradient accumulation.
+ * @brief Apply optimizer update with full configuration support.
  *
- * Executes the optimizer step on all ranks, synchronizes the device, then reads back
- * loss and norm from rank 0 context. Resets internal micro-step counters so the next
- * forward will re-gather as needed.
+ * Supports AdamW 8-bit and NorMuon optimizers based on config.type.
+ * NorMuon uses orthogonalized momentum for 2D weights (attention, MLP)
+ * and AdamW 8-bit for embeddings, norms, and lm_head.
  *
- * Note: The implementation passes `step + 1` to the model update (1-based step).
- *
- * @param lr Learning rate.
- * @param beta1 Adam beta1 coefficient.
- * @param beta2 Adam beta2 coefficient.
+ * @param config Optimizer configuration with all hyperparameters.
  * @param step Zero-based global optimization step index (converted to 1-based internally).
- * @param weight_decay Weight decay coefficient.
- * @param grad_clip Gradient clipping threshold (implementation-defined norm type).
- * @return Pair of (loss, grad_norm). Loss is already normalized by valid token count from get_loss().
+ * @return Pair of (loss, grad_norm).
  */
-std::pair<float, float> MultiGPUPyTrainer::update(float lr, float beta1, float beta2, int step, float epsilon, float weight_decay, float grad_clip) {
-    run_work([=](sThreadContext& ctx) {
-        ctx.Model->update(*ctx.Communicator, lr, beta1, beta2, step + 1, epsilon, weight_decay, grad_clip);
+std::pair<float, float> MultiGPUPyTrainer::update_with_config(const optimizers::OptimizerConfig& config, int step) {
+    run_work([&](sThreadContext& ctx) {
+        ctx.Model->update_with_config(*ctx.Communicator, config, step + 1);
         CUDA_CHECK(cudaDeviceSynchronize());
-
     });
-    float step_loss, step_norm;
 
+    float step_loss, step_norm;
     auto& ctx = mContexts.at(0);
     step_loss = ctx.Model->get_loss();
     step_norm = ctx.Model->get_norm();
@@ -326,8 +319,6 @@ std::pair<float, float> MultiGPUPyTrainer::update(float lr, float beta1, float b
     mTrainMicroStep = 0;
     mEvalStep = 0;
 
-    // Note: get_loss() already returns loss normalized by valid token count,
-    // so we don't normalize further here (unlike the old code that divided by B*T*grad_accum)
     return {step_loss, step_norm};
 }
 

@@ -249,6 +249,8 @@ target_sources(surogate-common PRIVATE
     src/kernels/global_norm.cu
     src/kernels/bias.cu
     src/modules/optimizers/adamw_8bit.cu
+    src/modules/optimizers/polar_express.cu
+    src/modules/optimizers/normuon.cu
     src/kernels/attention.cu
     src/kernels/fused_classifier.cu
     src/kernels/transpose.cu
@@ -276,7 +278,7 @@ target_sources(surogate-common PRIVATE
 )
 
 target_link_libraries(surogate-common PRIVATE ${CUFILE_LIBS} cudnn_frontend ${CUDNN_LIBRARY} nvidia::nccl fmt::fmt-header-only)
-target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublasLt ${NVML_LIBS} nlohmann_json::nlohmann_json)
+target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt ${NVML_LIBS} nlohmann_json::nlohmann_json)
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
 target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
@@ -341,6 +343,7 @@ if (BUILD_TESTS)
 	            src/testing/test-qk-norm-rope.cu
 	            src/testing/test-qlora.cu
 	            src/testing/test-adamw.cu
+	            src/testing/test-normuon.cu
 	            src/testing/test-fp4.cu
 	            src/testing/test-bnb-quant.cpp
 	    )

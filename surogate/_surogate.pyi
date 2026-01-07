@@ -6,7 +6,125 @@ import typing
 import numpy as np
 import numpy.typing as npt
 
-__all__: list[str] = ['DataLoader', 'GPUInfo', 'GPUUtilInfo', 'LoRAAdapterConfig', 'LogVerbosity', 'PretrainedConfig', 'QLoRAConfig', 'QLoRAQuantStrategy', 'RuntimeOptions', 'SurogateTrainer', 'SystemInfo', 'TrainingRunLogger', 'clean_old_checkpoints', 'find_latest_checkpoint', 'get_all_checkpoints', 'get_checkpoint_path', 'get_num_gpus']
+__all__: list[str] = ['DataLoader', 'GPUInfo', 'GPUUtilInfo', 'LoRAAdapterConfig', 'LogVerbosity', 'OptimizerConfig', 'OptimizerType', 'PretrainedConfig', 'QLoRAConfig', 'QLoRAQuantStrategy', 'RuntimeOptions', 'SurogateTrainer', 'SystemInfo', 'TrainingRunLogger', 'clean_old_checkpoints', 'find_latest_checkpoint', 'get_all_checkpoints', 'get_checkpoint_path', 'get_num_gpus']
+
+class OptimizerType(enum.Enum):
+    """
+    Optimizer algorithm types.
+
+    Values:
+    - ADAMW_8BIT: 8-bit AdamW with blockwise quantization.
+    - NORMUON: NorMuon hybrid optimizer (orthogonalized momentum for 2D weights, AdamW for others).
+    """
+    ADAMW_8BIT: typing.ClassVar[OptimizerType]  # value = OptimizerType.ADAMW_8BIT
+    NORMUON: typing.ClassVar[OptimizerType]  # value = OptimizerType.NORMUON
+
+class OptimizerConfig:
+    """
+    Optimizer configuration.
+
+    Contains all hyperparameters for supported optimizers.
+    Parameters for unused optimizers are ignored.
+    """
+    @staticmethod
+    def __new__(type, *args, **kwargs):
+        """
+        Create and return a new object.  See help(type) for accurate signature.
+        """
+    def __init__(self, *, optimizer: str = 'adamw_8bit', learning_rate: float = 2e-4, weight_decay: float = 0.1, grad_clip: float = 0.0, adamw_beta1: float = 0.9, adamw_beta2: float = 0.999, adamw_epsilon: float = 1e-8, normuon_momentum: float = 0.95, normuon_beta2: float = 0.95, normuon_lr: float = 0.02, normuon_cautious_wd: bool = True) -> None:
+        """
+        Create an optimizer configuration.
+
+        Parameters:
+        - optimizer: Type of optimizer ('adamw_8bit' or 'normuon').
+        - learning_rate: Base learning rate.
+        - weight_decay: Weight decay coefficient.
+        - grad_clip: Gradient clipping threshold (0 = disabled).
+        - adamw_beta1/beta2/epsilon: AdamW hyperparameters.
+        - normuon_momentum/beta2/lr/cautious_wd: NorMuon hyperparameters.
+        """
+    def __repr__(self) -> str:
+        """
+        Return a debug string representation.
+        """
+    @staticmethod
+    def adamw_8bit(lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.999, epsilon: float = 1e-8, weight_decay: float = 0.1, grad_clip: float = 0.0) -> OptimizerConfig:
+        """
+        Create AdamW 8-bit configuration.
+        """
+    @staticmethod
+    def normuon(lr: float = 0.02, momentum: float = 0.95, beta2: float = 0.95, weight_decay: float = 0.01, grad_clip: float = 0.0, cautious_wd: bool = True) -> OptimizerConfig:
+        """
+        Create NorMuon configuration.
+
+        NorMuon uses orthogonalized momentum for 2D weight matrices and AdamW for other parameters.
+        """
+    @property
+    def learning_rate(self) -> float:
+        """Base learning rate."""
+    @learning_rate.setter
+    def learning_rate(self, arg: float) -> None:
+        """Base learning rate."""
+    @property
+    def weight_decay(self) -> float:
+        """Weight decay coefficient."""
+    @weight_decay.setter
+    def weight_decay(self, arg: float) -> None:
+        """Weight decay coefficient."""
+    @property
+    def grad_clip(self) -> float:
+        """Gradient clipping threshold."""
+    @grad_clip.setter
+    def grad_clip(self, arg: float) -> None:
+        """Gradient clipping threshold."""
+    @property
+    def adamw_beta1(self) -> float:
+        """AdamW beta1."""
+    @adamw_beta1.setter
+    def adamw_beta1(self, arg: float) -> None:
+        """AdamW beta1."""
+    @property
+    def adamw_beta2(self) -> float:
+        """AdamW beta2."""
+    @adamw_beta2.setter
+    def adamw_beta2(self, arg: float) -> None:
+        """AdamW beta2."""
+    @property
+    def adamw_epsilon(self) -> float:
+        """AdamW epsilon."""
+    @adamw_epsilon.setter
+    def adamw_epsilon(self, arg: float) -> None:
+        """AdamW epsilon."""
+    @property
+    def normuon_momentum(self) -> float:
+        """NorMuon momentum (beta1)."""
+    @normuon_momentum.setter
+    def normuon_momentum(self, arg: float) -> None:
+        """NorMuon momentum (beta1)."""
+    @property
+    def normuon_beta2(self) -> float:
+        """NorMuon variance EMA (beta2)."""
+    @normuon_beta2.setter
+    def normuon_beta2(self, arg: float) -> None:
+        """NorMuon variance EMA (beta2)."""
+    @property
+    def normuon_lr(self) -> float:
+        """NorMuon learning rate."""
+    @normuon_lr.setter
+    def normuon_lr(self, arg: float) -> None:
+        """NorMuon learning rate."""
+    @property
+    def normuon_cautious_wd(self) -> bool:
+        """Use cautious weight decay."""
+    @normuon_cautious_wd.setter
+    def normuon_cautious_wd(self, arg: bool) -> None:
+        """Use cautious weight decay."""
+    @property
+    def type(self) -> str:
+        """Optimizer type as string."""
+    @type.setter
+    def type(self, arg: str) -> None:
+        """Optimizer type as string."""
 class DataLoader:
     """
     Streaming token dataset loader.
@@ -1171,20 +1289,17 @@ class SurogateTrainer:
         - inputs: int32 token ids shaped [batch_size * world_size, seq_length].
         - targets: int32 token ids shaped [batch_size * world_size, seq_length].
         """
-    def update(self, learning_rate: float, beta1: float, beta2: float, step: int, adam_epsilon: float = 9.99999993922529e-09, weight_decay: float, grad_clip: float) -> dict:
+    def update_with_config(self, config: OptimizerConfig, step: int) -> dict:
         """
-        Run the optimizer step and return metrics.
-        
+        Run the optimizer step with full configuration and return metrics.
+
         This call blocks until the optimizer step is complete.
-        
+        Supports both AdamW 8-bit and NorMuon optimizers based on config.type.
+
         Parameters:
-        - learning_rate: Optimizer learning rate.
-        - beta1/beta2: Adam betas.
+        - config: OptimizerConfig with all hyperparameters.
         - step: Global step index.
-        - adam_epsilon: Adam epsilon for numerical stability.
-        - weight_decay: Weight decay factor.
-        - grad_clip: Gradient clipping threshold.
-        
+
         Returns: dict with keys {loss: float, norm: float}.
         """
     def validate(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32]) -> float:

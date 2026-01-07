@@ -131,8 +131,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         use_cuda_graphs (Optional[bool], defaults to True):
             Enable or disable CUDA graphs for performance.
 
-        optimizer (Optional[Literal['adamw_8bit']], defaults to 'adamw_8bit'):
-            Optimizer type to use for training. Currently supports 'adamw_8bit' (8-bit blockwise quantized AdamW).
+        optimizer (Optional[Literal['adamw_8bit', 'normuon']], defaults to 'adamw_8bit'):
+            Optimizer type to use for training. Supports:
+            - 'adamw_8bit': 8-bit blockwise quantized AdamW (default)
+            - 'normuon': NorMuon optimizer with orthogonalized momentum for 2D weights
+              (uses AdamW for embeddings, norms, and lm_head; NorMuon for attention/MLP weights)
         learning_rate (Optional[float], defaults to 1e-4):
             The initial learning rate for the optimizer.
         lr_scheduler_type (Optional[Literal['linear', 'cosine', 'wsd']]*, defaults to `"linear"`):
@@ -160,6 +163,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             The beta2 parameter for the AdamW optimizer.
         adamw_epsilon: (Optional[float], defaults to 1e-8):
             The epsilon parameter for the AdamW optimizer.
+        normuon_momentum: (Optional[float], defaults to 0.95):
+            The momentum (beta1) parameter for NorMuon optimizer.
+        normuon_beta2: (Optional[float], defaults to 0.95):
+            The beta2 parameter for NorMuon variance estimation EMA.
+        normuon_cautious_wd: (Optional[bool], defaults to True):
+            Whether to use cautious (sign-aware) weight decay in NorMuon.
 
         eval_steps (Optional[int], defaults to 100):
              Run evaluation every N optimizer steps. Evaluation runs on the full eval dataset.
@@ -268,7 +277,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
 
-    optimizer: Optional[Literal['adamw_8bit']] = 'adamw_8bit'
+    optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
     lr_scheduler_type: Optional[Literal['linear', 'cosine', 'wsd']] = 'linear'
     cooldown_steps: Optional[int] = 0
@@ -280,6 +289,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     adamw_beta1: Optional[float] = 0.9
     adamw_beta2: Optional[float] = 0.999
     adamw_epsilon: Optional[float] = 1e-8
+    # NorMuon optimizer parameters (used when optimizer='normuon')
+    # NorMuon uses a hybrid approach: AdamW for embeddings/norms/lm_head,
+    # orthogonalized momentum for 2D weight matrices
+    normuon_momentum: Optional[float] = 0.95
+    normuon_beta2: Optional[float] = 0.95
+    normuon_cautious_wd: Optional[bool] = True
     eval_steps: Optional[int] = 100
     per_device_train_batch_size: Optional[int] = 2
     report_to: Optional[List[Literal['wandb', 'aim']]] = None
@@ -372,6 +387,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.adamw_beta1 = float(cfg.get('adamw_beta1', self.adamw_beta1))
         self.adamw_beta2 = float(cfg.get('adamw_beta2', self.adamw_beta2))
         self.adamw_epsilon = float(cfg.get('adamw_epsilon', self.adamw_epsilon))
+        self.normuon_momentum = float(cfg.get('normuon_momentum', self.normuon_momentum))
+        self.normuon_beta2 = float(cfg.get('normuon_beta2', self.normuon_beta2))
+        self.normuon_cautious_wd = cfg.get('normuon_cautious_wd', self.normuon_cautious_wd)
         self.eval_steps = cfg.get('eval_steps', self.eval_steps)
         self.per_device_train_batch_size = cfg.get('per_device_train_batch_size', self.per_device_train_batch_size)
         self.report_to = cfg.get('report_to', self.report_to)
@@ -557,8 +575,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.runtime_config.use_write_combined = self.use_write_combined
 
     def create_lora_config(self):
+        # Only create LoRA config when lora is enabled
+        # When lora=False, lora_config must be None so C++ uses full fine-tuning path
+        if not self.lora:
+            self.lora_config = None
+            return
         self.lora_config = _surogate.LoRAAdapterConfig(
-            rank=self.lora_rank if self.lora else 0,
+            rank=self.lora_rank,
             alpha=self.lora_alpha,
             dropout=self.lora_dropout,
             dtype=self.lora_dtype,

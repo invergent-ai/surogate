@@ -1,6 +1,8 @@
 .idea/
 cmake-build-debug/**
 build/**
+docs/structure.md
+/**/CLAUDE.md
 data/**
 logs/**
 *.log
@@ -17,3 +19,4 @@ __pycache__/
 study/**
 unit-test-sol.json
 uv.lock
+.aim/

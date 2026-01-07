@@ -22,6 +22,13 @@ float IModel::get_accuracy() const {
     return get_run_state().get_accuracy();
 }
 
+void IModel::update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
+    // Default implementation: dispatch to legacy AdamW update
+    // Derived classes can override to support NorMuon and other optimizers
+    update(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
+           step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+}
+
 Tensor& IModel::get_input_buffer() {
     return get_run_state().Inputs_CPU;
 }
