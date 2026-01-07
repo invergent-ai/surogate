@@ -5,14 +5,16 @@ from surogate.core.model.chat_templates.base import ChatTemplateProcessor
 
 
 class EncodePreprocessor(RowPreprocessor):
-    def __init__(self, template: 'ChatTemplateProcessor', pre_tokenize: bool = False):
+    def __init__(self, template: 'ChatTemplateProcessor'):
         super().__init__()
         self.template = template
-        self.pre_tokenize = pre_tokenize
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        encoded = self.template.encode(row, return_length=True)
-        if self.pre_tokenize:
-            row['length'] = encoded['length']
-            encoded = row
-        return encoded
+        return self.template.encode(row, return_length=True)
+
+class AddLengthPreprocessor(EncodePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        encoded = super().preprocess(row)
+        row['length'] = encoded['length']
+        return row

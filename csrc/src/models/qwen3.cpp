@@ -10,6 +10,34 @@
 
 namespace models {
 
+static PretrainedConfig create_qwen3_config(
+    int head_dim, int hidden_size, int intermediate_size, int max_position_embeddings,
+    int num_attention_heads, int num_hidden_layers, int num_key_value_heads,
+    float rms_norm_eps, float rope_theta, bool tie_word_embeddings, int vocab_size, 
+    ETensorDType dtype
+) {
+    return {
+        .Architecture = PretrainedConfig::QWEN3,
+        .BosTokenId = 151643,
+        .EosTokenId = 151645,
+        .PadTokenId = 151643,
+        .HiddenSize = hidden_size,
+        .IntermediateSize = intermediate_size,
+        .VocabSize = vocab_size,
+        .NumQueryHeads = num_attention_heads,
+        .NumKeyValHeads = num_key_value_heads,
+        .NumLayers = num_hidden_layers,
+        .HeadDim = head_dim,
+        .MaxPositionEmbeddings = max_position_embeddings,
+        .RopeTheta = rope_theta,
+        .RmsNormEps = rms_norm_eps,
+        .TiedWordEmbeddings = tie_word_embeddings,
+        .UseQKVBias = true,
+        .UseQKNorm = false,
+        .DType = dtype
+    };
+}
+
 PretrainedConfig Qwen3Architecture::load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype) {
     PretrainedConfig result;
     result.Architecture = PretrainedConfig::QWEN3;
@@ -62,7 +90,26 @@ void Qwen3Architecture::save_to_hf_config_json(const PretrainedConfig& config, n
     config_json["torch_dtype"] = dtype_to_torch_str(config.DType);
 }
 
-std::optional<PretrainedConfig> Qwen3Architecture::create_from_preset_name(std::string_view, ETensorDType) {
+std::optional<PretrainedConfig> Qwen3Architecture::create_from_preset_name(std::string_view name, ETensorDType dtype) {
+    if (iequals(name, "Qwen3-0.6B")) {
+        return create_qwen3_config(128, 1024, 3072, 40960, 16, 28, 8, 1e-6f, 1000000.0f, true, 151936, dtype);
+    }
+    if (iequals(name, "Qwen3-1.7B")) {
+        return create_qwen3_config(128, 2048, 6144, 40960, 16, 28, 8, 1e-6f, 1000000.0f, true, 151936, dtype);
+    }
+    if (iequals(name, "Qwen3-4B")) {
+        return create_qwen3_config(128, 2560, 9728, 40960, 32, 36, 8, 1e-6f, 1000000.0f, true, 151936, dtype);
+    }
+    if (iequals(name, "Qwen3-8B")) {
+        return create_qwen3_config(128, 4096, 12288, 40960, 32, 36, 8, 1e-6f, 1000000.0f, true, 151936, dtype);
+    }
+    if (iequals(name, "Qwen3-14B")) {
+        return create_qwen3_config(128, 5120, 17408, 40960, 40, 40, 8, 1e-6f, 1000000.0f, true, 151936, dtype);
+    }
+    if (iequals(name, "Qwen3-32B")) {
+        return create_qwen3_config(128, 5120, 25600, 40960, 64, 64, 8, 1e-6f, 1000000.0f, true, 151936, dtype);
+    }
+
     return std::nullopt;
 }
 

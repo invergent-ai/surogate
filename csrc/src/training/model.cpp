@@ -63,7 +63,12 @@ IRunState::IRunState(PretrainedConfig config, long batch_size, long seq_len, std
 
     // https://docs.nvidia.com/cuda/cublas/index.html#cublassetworkspace
     // recommended workspace size 32MB for sm_90+
-    CuBlasWorkspace = Allocator->allocate(ETensorDType::BYTE, "cublas_ws", {32*1024*1024});
+    // SM120+ (Blackwell) FP8 operations may require larger workspace
+    std::size_t cublas_ws_size = 32*1024*1024;  // 32MB default
+    if (DeviceProp.major >= 12) {
+        cublas_ws_size = 128*1024*1024;  // 128MB for Blackwell FP8
+    }
+    CuBlasWorkspace = Allocator->allocate(ETensorDType::BYTE, "cublas_ws", {static_cast<long>(cublas_ws_size)});
 
     // CUTLASS workspace for SM120 MX FP8 operations
     // Size includes: FP8 A buffer, FP8 B buffer, MX scales, GEMM workspace

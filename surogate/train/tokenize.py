@@ -12,7 +12,7 @@ from surogate.core.config.sft_config import SFTConfig
 from surogate.core.datasets.datasets import disable_datasets_caching
 from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \
     shuffle_dataset
-from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
+from surogate.core.datasets.preprocessor.encode import EncodePreprocessor, AddLengthPreprocessor
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
@@ -81,6 +81,14 @@ def compute_tokenize_hash(config: SFTConfig) -> str:
         # Chat template configuration
         "template": config.template,
         "use_chat_template": config.use_chat_template,
+        "loss_scale": config.loss_scale,
+        "padding_free": config.padding_free,
+        "padding_side": config.padding_side,
+        "sequence_parallel_size": config.sequence_parallel_size,
+        "truncation_strategy": config.truncation_strategy,
+        "max_length": config.max_length,
+        "max_pixels": config.max_pixels,
+        "norm_bbox": config.norm_bbox,
         # Dataset configurations
         "datasets": [_dataset_config_to_dict(ds) for ds in config.datasets],
         "validation_datasets": [_dataset_config_to_dict(ds) for ds in config.validation_datasets],
@@ -593,11 +601,11 @@ class TokenizeDatasets(SurogateCommand):
         template_processor.set_mode('train')
         if template_processor.use_model:
             template_processor.model = self.config.model
-        pass
+        
         if self.config.model_template.is_multimodal and (
                 self.config.padding_free or self.config.sample_packing) and not template_processor.support_padding_free:
             raise ValueError(f'Template `{self.config.template}` does not support padding free or packing.')
-        pass
+        
         self.template_processor = template_processor
 
     def _load_and_encode_datasets(self):
@@ -619,7 +627,6 @@ class TokenizeDatasets(SurogateCommand):
                 )
                 train_datasets.append(train_dataset)
                 val_datasets.append(val_dataset)
-            pass
 
             for ds_config in self.config.validation_datasets:
                 dataset = load_dataset_with_config(ds_config)
@@ -631,7 +638,6 @@ class TokenizeDatasets(SurogateCommand):
                     random_state=eval_seed,
                 )
                 val_datasets.append(val_dataset)
-            pass
 
             train_dataset = concat_datasets(train_datasets)
             train_dataset = shuffle_dataset(
@@ -709,12 +715,19 @@ class TokenizeDatasets(SurogateCommand):
         datasets = [train_dataset, val_dataset]
         origin_template_model = template_processor.model
         template_processor.model = None  # Avoid serializing the model.
+        
+        if self.config.truncation_strategy == 'split':
+            if self.config.use_chat_template:
+                raise ValueError(
+                    'truncation_strategy=split is currently only supported for plain text model pretraining')
+            
         for i, dataset in enumerate(datasets):
             if dataset is None:
                 continue
-            preprocessor = EncodePreprocessor(template=template_processor,
-                                              pre_tokenize=self.config.model_template.is_multimodal)
+            preprocessor_cls = EncodePreprocessor if self.config.truncation_strategy == 'split' else AddLengthPreprocessor
+            preprocessor = preprocessor_cls(template=template_processor)
             batch_size = 100 if self.config.model_template.is_multimodal else 1000
+            
             dataset = preprocessor(
                 dataset,
                 num_proc=self.config.dataloader_num_workers,
@@ -723,7 +736,6 @@ class TokenizeDatasets(SurogateCommand):
                 batch_size=batch_size)
 
             datasets[i] = dataset
-        pass
 
         template_processor.model = origin_template_model
         return datasets

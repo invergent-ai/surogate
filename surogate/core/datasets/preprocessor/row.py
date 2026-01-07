@@ -33,12 +33,12 @@ class RowPreprocessor:
                     ]
 
     def __init__(
-            self,
-            *,
-            columns: Optional[Dict[str, str]] = None,
-            dataset_sample: Optional[int] = None,
-            random_state: Optional[Union[np.random.RandomState, int]] = RAND_SEED,
-            traceback_limit: int = 10
+        self,
+        *,
+        columns: Optional[Dict[str, str]] = None,
+        dataset_sample: Optional[int] = None,
+        random_state: Optional[Union[np.random.RandomState, int]] = RAND_SEED,
+        traceback_limit: int = 10
     ) -> None:
         self.columns = columns or {}
         self.origin_columns = self.columns.copy()

@@ -163,8 +163,11 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
     }
 
     // find a suitable algorithm (cached internally so shouldn't take much CPU time in practice)
+    // Request multiple algorithms to allow fallback if primary fails
+    constexpr int kMaxAlgos = 8;
+    cublasLtMatmulHeuristicResult_t heuristics[kMaxAlgos];
     cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
-                                   preference, 1, &heuristic, &returnedResults);
+                                   preference, kMaxAlgos, heuristics, &returnedResults);
     if (returnedResults == 0) {
         throw std::runtime_error(fmt::format("No cuBLASLt algorithm: m: {}, n: {}, k: {}, bias: {}", n, m, k, has_bias));
     }
@@ -175,10 +178,31 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
     float* alpha = &one;
     float* beta = accumulate ? &one : &zero;
 
-    // call the matmul
-    CUBLAS_CHECK(cublasLtMatmul(handle, operationDesc,
-                               alpha, a, ALayout, b, BLayout, beta, d, CLayout, d, DLayout,
-                               &heuristic.algo, workspace, workspace_size, stream));
+    // Try algorithms in order until one succeeds
+    // FP8 on Blackwell multi-GPU can have issues with certain algorithms
+    cublasStatus_t matmul_status = CUBLAS_STATUS_NOT_SUPPORTED;
+    int algo_tried = 0;
+    for (int i = 0; i < returnedResults; ++i) {
+        matmul_status = cublasLtMatmul(handle, operationDesc,
+                                   alpha, a, ALayout, b, BLayout, beta, d, CLayout, d, DLayout,
+                                   &heuristics[i].algo, workspace, workspace_size, stream);
+        algo_tried = i;
+        if (matmul_status == CUBLAS_STATUS_SUCCESS) {
+            break;
+        }
+        // Algorithm failed, try next one (only for FP8 where we see multi-GPU issues)
+        if constexpr (sizeof(FloatA) != 1 && sizeof(FloatB) != 1) {
+            break;  // For non-FP8, don't retry with other algorithms
+        }
+    }
+    if (matmul_status != CUBLAS_STATUS_SUCCESS) {
+        int device_id = -1;
+        cudaGetDevice(&device_id);
+        throw std::runtime_error(fmt::format(
+            "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, ws_size: {}, A_type: {}, B_type: {}, algos_tried: {}/{}",
+            (int)matmul_status, __FILE__, __LINE__, device_id, m, n, k, workspace_size,
+            (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, algo_tried + 1, returnedResults));
+    }
     CUDA_CHECK(cudaGetLastError());
 
     // cleanups

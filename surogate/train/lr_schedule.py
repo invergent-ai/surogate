@@ -21,7 +21,7 @@ class LRSchedule:
     def get_lr(self, step: int) -> float:
         # Warmup phase: linear ramp from 0 to base_lr
         if step < self.warmup_steps:
-            return self.base_lr * (step + 1) / self.warmup_steps
+            return self.base_lr * step / self.warmup_steps
         
         # Cooldown phase: 1-sqrt schedule to zero
         if self.cooldown_steps > 0 and step >= (self.max_steps - self.cooldown_steps):

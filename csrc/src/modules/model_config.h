@@ -395,10 +395,6 @@ struct ModelOptions {
         options.master_dtype = opts.MasterDType;
         return options;
     }
-
-    // Backwards-compatible names (type is now RuntimeOptions).
-    [[nodiscard]] RuntimeOptions to_llama_options() const { return to_runtime_options(); }
-    static ModelOptions from_llama_options(const RuntimeOptions& opts) { return from_runtime_options(opts); }
 };
 
 } // namespace modules

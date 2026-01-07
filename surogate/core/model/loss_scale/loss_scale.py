@@ -1,12 +1,14 @@
 import json
 import os
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Literal
 
-from surogate.core.model.chat_templates.utils import split_str_parts_by, Messages
+from surogate.core.model.chat_templates.utils import split_str_parts_by, Messages, get_last_user_round
 from surogate.core.model.utils import ContextType
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
+ALL_BASE_STRATEGY = ['default', 'last_round', 'all']
 
 class LossScale:
     # Indicates whether loss_scale contains only 0 and 1.
@@ -17,28 +19,37 @@ class LossScale:
     loss_scale_config = None  # path
     is_binary = None
 
-    def __init__(self):
+    def __init__(self, base_strategy: Literal['default', 'last_round', 'all'] = 'default'):
+        assert base_strategy in ALL_BASE_STRATEGY, (
+            f'ALL_BASE_STRATEGY: {ALL_BASE_STRATEGY}, base_strategy: {base_strategy}')
+        self.base_strategy = base_strategy
+        self.loss_scale_map = None
         if self.loss_scale_config is not None:
             path = os.path.dirname(os.path.abspath(__file__))
             config_path = os.path.join(path, 'loss_scales', self.loss_scale_config)
             with open(config_path, 'r', encoding='utf-8') as json_file:
                 self.loss_scale_map = json.load(json_file)
-        else:
-            self.loss_scale_map = None
 
-    def __call__(
-            self,
-            context_list: List[str],
-            context_types: List[ContextType],
-            messages: Messages,
-            **kwargs
-    ) -> Tuple[List[str], List[float]]:
+    def get_loss_scale(self, context: str, **kwargs) -> Tuple[List[str], List[float]]:
+        """Calculate loss scale
+
+        Args:
+            context: The input context
+            query: The query of this round.
+
+        Returns:
+            A tuple, list of context and list of loss_scales
+        """
+        return [context], [1.]
+
+    def __call__(self, context_list: List[str], context_types: List[ContextType], messages: Messages,
+                 **kwargs) -> Tuple[List[str], List[float]]:
         res_context_list = []
         res_loss_scale = []
         i = 0
-        n_round = len(messages) // 2
+        last_user_round = get_last_user_round(messages)
         for context, context_type in zip(context_list, context_types):
-            is_last_round = i + 1 == n_round
+            is_last_round = 2 * i >= last_user_round
             query, loss = None, None
             if context_type == ContextType.RESPONSE:
                 query = messages[2 * i]['content']
@@ -55,34 +66,16 @@ class LossScale:
                 if context_type == ContextType.RESPONSE and loss is not None:
                     new_context, loss_scale = [context], [float(loss)]
                 else:
-                    new_context, loss_scale = self.get_loss_scale(context, context_type, is_last_round, query=query)
+                    is_assistant = context_type in {ContextType.RESPONSE, ContextType.SUFFIX}
+                    if self.base_strategy == 'all' or (self.base_strategy == 'default'
+                                                       and is_assistant) or (self.base_strategy == 'last_round'
+                                                                             and is_assistant and is_last_round):
+                        new_context, loss_scale = self.get_loss_scale(context, query=query)
+                    else:
+                        new_context, loss_scale = [context], [0.]
             res_context_list += new_context
             res_loss_scale += loss_scale
         return res_context_list, res_loss_scale
-
-    def get_loss_scale(
-            self,
-            context: str,
-            context_type: ContextType,
-            is_last_round: bool,
-            **kwargs
-    ) -> Tuple[List[str], List[float]]:
-        """Calculate loss scale
-
-        Args:
-            context: The input context
-            context_type: The type of this context, like response/suffix(eos token)/other(query/system, etc.)
-            is_last_round: If this is the last round of messages.
-            query: The query of this round.
-
-        Returns:
-            A tuple, list of context and list of loss_scales
-        """
-        if context_type in {ContextType.RESPONSE, ContextType.SUFFIX}:
-            loss_scale = 1.
-        else:
-            loss_scale = 0.
-        return [context], [loss_scale]
 
     @property
     def is_loss_scale_binary(self):
@@ -193,6 +186,7 @@ def calculate_loss_scale(
 
 
 loss_scale_map = {
+    '-': LossScale,
     'last_round': LastRoundLossScale,
     'default': DefaultLossScale,
     'all': TrainAllLossScale,
@@ -206,3 +200,15 @@ loss_scale_map = {
 
 for k, v in loss_scale_map.items():
     v.name = k
+    
+    
+def get_loss_scale(loss_scale: str) -> LossScale:
+    splited = loss_scale.split('+', 1)
+    if len(splited) == 1:
+        if splited[0] in ALL_BASE_STRATEGY:
+            base_strategy, loss_scale = splited[0], '-'
+        else:
+            base_strategy, loss_scale = 'default', splited[0]
+    else:
+        base_strategy, loss_scale = splited
+    return loss_scale_map[loss_scale](base_strategy)

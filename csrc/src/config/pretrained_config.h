@@ -9,7 +9,7 @@
 
 #include "utilities/dtype.h"
 
-// Configuration describing a pretrained decoder-only transformer model (LLaMA/Qwen-style).
+// Configuration describing a pretrained decoder-only transformer model.
 // This mirrors the subset of HuggingFace config.json fields that the trainer/runtime needs.
 struct PretrainedConfig {
     enum ArchitectureId {
@@ -29,7 +29,7 @@ struct PretrainedConfig {
     int NumKeyValHeads;
     int NumLayers;
 
-    // Attention head dimension. If 0, defaults to HiddenSize / NumQueryHeads (LLaMA/Qwen2 style).
+    // Attention head dimension. If 0, defaults to HiddenSize / NumQueryHeads.
     // Some architectures (e.g., Qwen3) use an explicit head_dim that may not match HiddenSize/NumQueryHeads.
     int HeadDim = 0;
 
@@ -51,11 +51,5 @@ struct PretrainedConfig {
 PretrainedConfig load_pretrained_config(const char* file_name, ETensorDType dtype);
 void save_pretrained_config(const PretrainedConfig& config, const char* file_name);
 PretrainedConfig create_pretrained_config_from_name(std::string_view name, ETensorDType dtype);
-
-// Backwards-compatible API (will be removed once downstream code updates).
-using LLamaConfig = PretrainedConfig;
-inline LLamaConfig load_llama_config(const char* file_name, ETensorDType dtype) { return load_pretrained_config(file_name, dtype); }
-inline void save_llama_config(const LLamaConfig& config, const char* file_name) { save_pretrained_config(config, file_name); }
-inline LLamaConfig create_config_from_name(std::string_view name, ETensorDType dtype) { return create_pretrained_config_from_name(name, dtype); }
 
 #endif // SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H

@@ -39,11 +39,18 @@ class ChatTemplate:
     template_processor_cls: Type[ChatTemplateProcessor] = ChatTemplateProcessor
     system_prefix: Optional[Prompt] = None
     default_system: Optional[str] = None
-    response_prefix: str = ''
 
     auto_add_bos: bool = False
     stop_words: List[Word] = field(default_factory=list)
     agent_template: str = 'react'
+    
+    # thinking
+    is_thinking: bool = False  # Automatically remove think content
+    thinking_prefix: str = ''
+    non_thinking_prefix: str = ''  # Automatically add non_thinking_prefix for hybrid thinking models
+    # During encoding, historical thinking content will be removed.
+    # This parameter represents the prefix for the historical part.
+    history_thinking_prefix: str = ''
 
     def __post_init__(self):
         if self._has_system(self.prefix):

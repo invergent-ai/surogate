@@ -16,9 +16,6 @@ logger = get_logger()
 class ChatTemplateConfig(ABC):
     # from parent config
     model_template: ModelTemplate = None
-    task_type: Optional[Literal['generative', 'reranker', 'generative_reranker']] = None
-    remove_unused_columns: Optional[bool] = None
-    rlhf_type: Optional[str] = None
 
     """
     Configuration for chat templates.
@@ -31,7 +28,7 @@ class ChatTemplateConfig(ABC):
     system: Optional[str] = None  # Override the default_system in the template.
     max_length: Optional[int] = None
 
-    truncation_strategy: Optional[Literal['delete', 'left', 'right']] = None
+    truncation_strategy: Optional[Literal['delete', 'left', 'right', 'split']] = None
     max_pixels: Optional[int] = None
     agent_template: Optional[str] = None
     norm_bbox: Literal['norm1000', 'none', None] = None
@@ -44,8 +41,11 @@ class ChatTemplateConfig(ABC):
     sequence_parallel_size: Optional[int] = None
 
     # infer/deploy
+    # thinking
     response_prefix: Optional[str] = None
-
+    enable_thinking: Optional[bool] = None
+    add_non_thinking_prefix: bool = True
+    
     def __init__(self, cfg: DictDefault):
         self.template = cfg.get('template', None)
         self.system = cfg.get('system', None)
@@ -68,12 +68,11 @@ class ChatTemplateConfig(ABC):
             self.system = self.system.replace('\\n', '\n')
         if self.response_prefix is not None:
             self.response_prefix = self.response_prefix.replace('\\n', '\n')
+        if self.truncation_strategy is None:
+            self.truncation_strategy = 'delete'
         if self.padding_side is None:
-            if getattr(self, 'task_type', None) in ('reranker', 'generative_reranker'):
-                self.padding_side = 'left'
-                logger.info(f'Setting args.padding_side to {self.padding_side} for task_type={self.task_type}')
-            else:
-                self.padding_side = 'right'
+            self.padding_side = 'right'
+                
 
     def get_template_kwargs(self):
         from surogate.core.config.sft_config import SFTConfig
@@ -81,12 +80,6 @@ class ChatTemplateConfig(ABC):
         truncation_strategy = self.truncation_strategy
         if truncation_strategy == 'delete':
             truncation_strategy = 'raise'
-
-        remove_unused_columns = None
-        if hasattr(self, 'remove_unused_columns'):
-            remove_unused_columns = self.remove_unused_columns
-        if not isinstance(self, SFTConfig) or hasattr(self, 'rlhf_type') and self.rlhf_type == 'grpo':
-            remove_unused_columns = True
 
         return {
             'default_system': self.system,
@@ -96,7 +89,6 @@ class ChatTemplateConfig(ABC):
             'agent_template': self.agent_template,
             'norm_bbox': self.norm_bbox,
             'use_chat_template': self.use_chat_template,
-            'remove_unused_columns': remove_unused_columns,
             # train
             'padding_free': self.padding_free,
             'padding_side': self.padding_side,
@@ -104,6 +96,8 @@ class ChatTemplateConfig(ABC):
             'sequence_parallel_size': self.sequence_parallel_size,
             # infer/deploy
             'response_prefix': self.response_prefix,
+            'enable_thinking': self.enable_thinking,
+            'add_non_thinking_prefix': self.add_non_thinking_prefix,
         }
 
     def get_template_processor(

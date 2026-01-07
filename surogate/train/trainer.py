@@ -61,7 +61,7 @@ class SurogateTrainerWrapper():
             else:
                 logger.error("No checkpoint found to resume from.")
                 sys.exit(1)
-        elif config.lora_rank and config.lora_alpha and config.lora_target_modules:
+        elif config.lora and config.lora_rank and config.lora_alpha and config.lora_target_modules:
             self.trainer = _surogate.SurogateTrainer(
                 ngpu=config.gpus,
                 config=_surogate.PretrainedConfig.from_pretrained(config.model.model_dir, to_surogate_dtype(config.torch_dtype)),
@@ -75,6 +75,18 @@ class SurogateTrainerWrapper():
                 qlora_config=config.qlora_config
             )
             self.trainer.import_weights(model_weights_path)
+        elif config.from_scratch:
+            self.trainer = _surogate.SurogateTrainer(
+                ngpu=config.gpus,
+                config=_surogate.PretrainedConfig.from_name(config.model_info.model_name, to_surogate_dtype(config.torch_dtype)),
+                options=config.runtime_config,
+                batch_size=config.per_device_train_batch_size,
+                seq_len=config.sequence_len,
+                grad_accum=config.gradient_accumulation_steps,
+                memcpy_all_gather=config.memcpy_all_gather,
+                memcpy_send_recv=config.memcpy_send_recv
+            )
+            self.trainer.init_weights()
         else:
             self.trainer = _surogate.SurogateTrainer.from_pretrained(
                 name=config.model.model_dir,

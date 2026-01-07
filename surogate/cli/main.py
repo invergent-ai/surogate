@@ -14,6 +14,7 @@ logger = get_logger()
 
 COMMAND_MAPPING: Dict[str, str] = {
     'sft': 'surogate.cli.sft',
+    'pt': 'surogate.cli.pt',
     'tokenize': 'surogate.cli.tokenize_cmd',
     'serve': 'surogate.cli.serve',
     'eval': 'surogate.cli.eval',
@@ -30,6 +31,10 @@ def parse_args():
     # sft command
     from surogate.cli.sft import prepare_command_parser as sft_prepare_command_parser
     sft_prepare_command_parser(subparsers.add_parser('sft', help="Supervised Fine-Tuning"))
+    
+    # pretrain command
+    from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
+    pt_prepare_command_parser(subparsers.add_parser('pt', help="Pretraining"))
 
     # tokenize command
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser
@@ -40,7 +45,7 @@ def parse_args():
         parser.print_help()
         sys.exit(1)
     
-    commands_with_config = ['serve', 'pretrain', 'sft', 'tokeninze']
+    commands_with_config = ['serve', 'pretrain', 'sft', 'pt','tokenize']
     if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
         sys.exit(1)

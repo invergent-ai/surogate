@@ -62,11 +62,3 @@ Respond in the format {"name": function name, "parameters": dictionary of argume
             tool_call['parameters'] = tool_call.pop('arguments')
             tool_calls.append(json.dumps(tool_call, ensure_ascii=False))
         return '\n'.join(tool_calls)
-
-
-class Llama4AgentTemplate(Llama3AgentTemplate):
-    eom_token = '<|eom|>'
-    start_token = '<|header_start|>'
-    end_token = '<|header_end|>'
-    eot_token = '<|eot|>'
-    toolcall_pattern = r'(.+?)<\|eom\|>'

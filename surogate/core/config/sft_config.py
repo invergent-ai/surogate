@@ -77,7 +77,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         persistent_quants (Optional[bool], defaults to False):
             Allows avoiding re-quantization of weights; this increases memory, however, when combined with --offload-quants, the additional memory is placed on the host.
             In a PCIe setting where any GPU-to-GPU communication has to pass through host memory anway, this can actually lead to significant speed-ups, especially if combined with the --memcpy-all-gather option.
-            Requires --shard-weights.
+            Requires shard-weights.
         offload_optimizer (Optional[bool], defaults to False):
             Store optimizer state in pinned host memory.
             This will slow down the optimizer step drastically (memory-bound operation), but if enough gradient accumulation steps are performed, the overall contribution of the optimizer step will be negligible.
@@ -92,7 +92,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             1: Sharded optimizer states (default)
             2: Sharded gradients + optimizer states
             3: Sharded weights + gradients + optimizer states
-            You can also configure weights and gradients individually, using the --shard-weights and --shard-gradients flags. When training in fp8, for example, it makes sense to enable weight sharding before gradient sharding, as weights need only half the amount of bandwidth.
+            You can also configure weights and gradients individually, using the shard-weights and shard-gradients flags. When training in fp8, for example, it makes sense to enable weight sharding before gradient sharding, as weights need only half the amount of bandwidth.
         shard_weights (Optional[bool], defaults to False):
             Whether to shard model weights across data-parallel processes. Enables more effective use of offloading and reduces memory consumption.
         shard_gradients (Optional[bool], defaults to False):
@@ -105,6 +105,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Use memcpy for send/receive operations (threads backend only).
         init_projections_to_zero (Optional[bool], defaults to False):
             Initialize projection weights (FFN down and attention out) to zero. Only used when training from scratch.
+        from_scratch (Optional[bool], defaults to False):
+            Whether to train the model from scratch (random initialization) rather than fine-tuning a pre-trained model.
         lmhead_chunks (Optional[int], defaults to 1):
             Split LM-head computation into N chunks, so that the required size of the logit tensor is reduced by a factor of N.
         attn_bwd_chunks (Optional[int], defaults to 1):
@@ -263,6 +265,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     memcpy_all_gather: Optional[bool] = False
     memcpy_send_recv: Optional[bool] = False
     init_projections_to_zero: Optional[bool] = False
+    from_scratch: Optional[bool] = False
     lmhead_chunks: Optional[int] = 1
     attn_bwd_chunks: Optional[int] = 1
     gradient_dtype: Optional[str] = None
@@ -361,6 +364,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.memcpy_all_gather = cfg.get('memcpy_all_gather', self.memcpy_all_gather)
         self.memcpy_send_recv = cfg.get('memcpy_send_recv', self.memcpy_send_recv)
         self.init_projections_to_zero = cfg.get('init_projections_to_zero', self.init_projections_to_zero)
+        self.from_scratch = cfg.get('from_scratch', self.from_scratch)
         self.lmhead_chunks = cfg.get('lmhead_chunks', self.lmhead_chunks)
         self.attn_bwd_chunks = cfg.get('attn_bwd_chunks', self.attn_bwd_chunks)
         self.gradient_dtype = cfg.get('gradient_dtype', self.gradient_dtype)

@@ -25,6 +25,16 @@
             "env": {"PYTHONPATH": "${workspaceFolder}"}
         },
         {
+            "name": "Surogate CLI - PT",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surogate.cli.main",
+            "args": ["pt", "--config", "${workspaceFolder}/examples/pt/qwen3-bf16.yaml"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"}
+        },
+        {
             "name": "train",
             "type": "cppdbg",
             "request": "launch",

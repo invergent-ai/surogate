@@ -1,31 +1,25 @@
 import hashlib
 import inspect
-import math
 import os
-import random
 import re
-from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
-from functools import wraps, partial
+from functools import partial
 from typing import Optional, Literal, List, Dict, Any, Union, Tuple
 
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from peft import PeftModel
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizerBase
-from transformers.integrations import is_deepspeed_zero3_enabled
 
 from surogate.core.datasets.preprocessor.row import MaxLengthError, RowPreprocessor
 from surogate.core.model.agent_templates import agent_templates
 from surogate.core.model.agent_templates.base import BaseAgentTemplate
 from surogate.core.model.chat_templates.inputs import InferRequest, ChatTemplateInputs, StdChatTemplateInputs
-from surogate.core.model.loss_scale.loss_scale import LossScale, loss_scale_map
-from surogate.core.model.chat_templates.utils import fetch_one, split_str_parts_by
+from surogate.core.model.chat_templates.utils import fetch_one, get_last_user_round, split_str_parts_by
 from surogate.core.model.chat_templates.vision_utils import load_image, rescale_image, load_batch, load_audio
+from surogate.core.model.loss_scale.loss_scale import LossScale, get_loss_scale
 from surogate.core.model.utils import Processor, Context, ContextType
 from surogate.utils.env import get_env_args
 from surogate.utils.fs import get_cache_dir
@@ -67,7 +61,6 @@ class ChatTemplateProcessor:
             agent_template: Optional[str] = None,
             norm_bbox: Literal['norm1000', 'none', None] = None,
             use_chat_template: bool = True,
-            remove_unused_columns: bool = True,
             # only for train
             padding_free: bool = False,
             padding_side: Literal['left', 'right'] = 'right',
@@ -75,6 +68,8 @@ class ChatTemplateProcessor:
             sequence_parallel_size: int = 1,
             # infer/deploy
             response_prefix: Optional[str] = None,
+            enable_thinking: Optional[bool] = None,
+            add_non_thinking_prefix: bool = True,
     ) -> None:
         self._processor_inited = False
         self.max_length = max_length
@@ -91,15 +86,23 @@ class ChatTemplateProcessor:
 
         if default_system is not None:
             chat_template.default_system = default_system
-        if response_prefix is not None:
-            chat_template.response_prefix = response_prefix
+        if enable_thinking is None:
+            enable_thinking = chat_template.is_thinking
+        if response_prefix is None:
+            if use_chat_template:
+                response_prefix = (
+                    chat_template.thinking_prefix if enable_thinking else chat_template.non_thinking_prefix)
+            else:
+                response_prefix = ''
 
+        self.response_prefix = response_prefix
         self.chat_template = chat_template
         self.use_chat_template = use_chat_template
-        self.remove_unused_columns = remove_unused_columns
+        self.enable_thinking = enable_thinking
+        self.add_non_thinking_prefix = add_non_thinking_prefix
         self.max_length = max_length
         self.truncation_strategy = truncation_strategy
-        self.loss_scale: 'LossScale' = loss_scale_map[loss_scale]()
+        self.loss_scale: 'LossScale' = get_loss_scale(loss_scale)
         self.max_pixels = max_pixels
         self.padding_side = padding_side
         self.sequence_parallel_size = sequence_parallel_size
@@ -172,38 +175,39 @@ class ChatTemplateProcessor:
         assert isinstance(inputs, ChatTemplateInputs)
 
         chosen = inputs.chosen
-        encoded = {}
+        encoded = self._encode_truncated(chosen)
 
-        if self.mode in {'train', 'pt', 'vllm', 'sglang'}:
-            encoded = self._encode_truncated(chosen)
-        elif self.mode == 'rlhf':
-            encoded = self._rlhf_encode(inputs)
-        elif self.mode == 'gkd':
-            encoded = self._gkd_encode(chosen)
+        batched = encoded
+        if not isinstance(batched, (list, tuple)):
+            batched = [batched]
+        for encoded in batched:
+            if chosen.channel is not None:
+                encoded['channel'] = chosen.channel
 
-        if chosen.channel is not None:
-            encoded['channel'] = chosen.channel
+            lengths = []
+            for key in list(encoded.keys()):
+                if encoded[key] is None:
+                    encoded.pop(key)
+                elif key.endswith('length'):
+                    value = encoded[key]
+                    if isinstance(value, int):
+                        lengths.append(value)
+                    elif isinstance(value, (tuple, list)):
+                        lengths += value
+            if return_length:
+                if not lengths:
+                    raise ValueError(f'lengths should not be empty. batched: {batched}')
+                encoded['length'] = lengths[0] if len(lengths) == 1 else lengths
+            else:
+                encoded.pop('length', None)
 
-        lengths = [0]
-        for key in list(encoded.keys()):
-            if encoded[key] is None:
-                encoded.pop(key)
-            elif key.endswith('length'):
-                value = encoded[key]
-                if isinstance(value, int):
-                    lengths.append(value)
-                elif isinstance(value, (tuple, list)):
-                    lengths += value
+            if return_template_inputs:
+                encoded['template_inputs'] = chosen
 
-        if return_length:
-            encoded['length'] = sum(lengths)
-        else:
-            encoded.pop('length', None)
-        if return_template_inputs:
-            encoded['template_inputs'] = chosen
-        if not self.remove_unused_columns:
             encoded['_extra_kwargs'] = chosen.extra_kwargs
-        return encoded
+
+        return batched[0] if len(batched) == 1 else batched
+ 
 
     def _encode_truncated(self, inputs: StdChatTemplateInputs):
         self._preprocess_inputs(inputs)
@@ -233,123 +237,32 @@ class ChatTemplateProcessor:
             elif self.truncation_strategy == 'raise':
                 raise MaxLengthError(f'Current length of row({length}) is larger'
                                      f' than the max_length({self.max_length}).')
+            elif self.truncation_strategy == 'split':
+                i = 0
+                batched = []
+                while i < length:
+                    splited = {}
+                    for key in ['input_ids', 'labels', 'loss_scale']:
+                        value = encoded.get(key)
+                        if value is not None:
+                            value = value[i:i + self.max_length]
+                            if key == 'labels' and len(value) > 0:
+                                value[0] = -100
+                            elif key == 'loss_scale' and len(value) > 0:
+                                value[0] = 0
+                        splited[key] = value
+                    splited['length'] = self._get_length(splited.get('input_ids'), splited.get('labels'))
+                    batched.append(splited)
+                    i += self.max_length
+                return batched
+            else:
+                raise ValueError(f'Invalid truncation_strategy: {self.truncation_strategy}')
+            
         encoded['length'] = length
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
         return encoded
-
-    def _rlhf_encode(self, inputs: ChatTemplateInputs) -> Dict[str, Any]:
-        chosen = inputs.chosen
-        margin = chosen.margin
-        chosen_encoded = self._encode_truncated(chosen)
-        rejected_encoded = self._encode_truncated(inputs.rejected)
-
-        encoded = {}
-        for prefix in ['chosen', 'rejected']:
-            data = locals()[f'{prefix}_encoded']
-            for k, v in data.items():
-                encoded[f'{prefix}_{k}'] = v
-        if margin is not None:
-            encoded['margin'] = float(margin)
-        return encoded
-
-    def _gkd_encode(self, inputs: StdChatTemplateInputs) -> Dict[str, Any]:
-        encoded = self._encode_truncated(inputs)
-        encoded['prompts'] = encoded['input_ids'][:-len(encoded.pop('answer_input_ids'))]
-        for k in list(encoded.keys()):
-            if k.startswith('prompt_') or k.endswith('answer_'):
-                encoded.pop(k, None)
-        return encoded
-
-    def _seq_cls_encode(self, inputs: StdChatTemplateInputs) -> Dict[str, Any]:
-        encoded = self._encode_truncated(inputs)
-        encoded.pop('labels', None)
-        if inputs.label is not None:
-            labels = inputs.label
-            problem_type = self.config.problem_type
-            if problem_type == 'single_label_classification':
-                labels = int(labels)
-            encoded['labels'] = labels
-        return encoded
-
-    def _embedding_encode(self, inputs: ChatTemplateInputs) -> Dict[str, Any]:
-        _encoded = {}
-        labels = []
-
-        if self.is_training:
-            anchor = inputs.chosen
-            anchor_encoded = self._encode_truncated(anchor)
-            for key in anchor_encoded:
-                _encoded[f'anchor_{key}'] = anchor_encoded[key]
-            positive = inputs.positive
-            if isinstance(positive, list):
-                positive = positive[0]
-            positive_encoded = self._encode_truncated(positive)
-            for key in positive_encoded:
-                _encoded[f'positive_{key}'] = positive_encoded[key]
-            labels.append(float(inputs.chosen.label) if inputs.chosen.label is not None else 1.0)
-
-            _all_negative_keys = set()
-            for idx, negative in enumerate(inputs.negative):
-                _tmp_negative_keys = set()
-                negative_encoded = self._encode_truncated(negative)
-                for key in negative_encoded:
-                    negative_key = f'negative_{key}'
-                    _all_negative_keys.add(negative_key)
-                    _tmp_negative_keys.add(negative_key)
-                    if negative_key not in _encoded:
-                        _encoded[negative_key] = [None] * idx
-                    _encoded[negative_key].append(negative_encoded[key])
-                for miss_key in (_all_negative_keys - _tmp_negative_keys):
-                    _encoded[miss_key].append(None)
-                labels.append(0.0)
-
-            _encoded['labels'] = labels
-        else:
-            anchor = inputs.chosen
-            _encoded = self._encode_truncated(anchor)
-            _encoded.pop('labels', None)
-        return _encoded
-
-    def _reranker_encode(self, inputs: ChatTemplateInputs) -> Dict[str, Any]:
-        if self.is_training:
-            chosen = inputs.chosen
-            instruction = chosen.system
-
-            _encoded = defaultdict(list)
-            labels = []
-
-            for positive in inputs.positive:
-                if instruction is not None and positive.system is None:
-                    positive.system = instruction
-                positive.messages = chosen.messages + positive.messages
-                positive.images = chosen.images + positive.images
-                positive.audios = chosen.audios + positive.audios
-                positive.videos = chosen.videos + positive.videos
-                positive_encoded = self._encode_truncated(positive)
-                labels.append(1)
-                for key in positive_encoded:
-                    _encoded[key].append(positive_encoded[key])
-
-            for negative in inputs.negative:
-                if instruction is not None and negative.system is None:
-                    negative.system = instruction
-                negative.messages = chosen.messages + negative.messages
-                negative.images = chosen.images + negative.images
-                negative.audios = chosen.audios + negative.audios
-                negative.videos = chosen.videos + negative.videos
-                negative_encoded = self._encode_truncated(negative)
-                labels.append(0)
-                for key in negative_encoded:
-                    _encoded[key].append(negative_encoded[key])
-
-            _encoded['labels'] = labels
-        else:
-            anchor = inputs.chosen
-            _encoded = self._encode_truncated(anchor)
-            _encoded.pop('labels', None)
-        return _encoded
 
     def _preprocess_inputs(self, inputs: StdChatTemplateInputs, ) -> None:
         self._preprocess_function_call(inputs)
@@ -575,6 +488,7 @@ class ChatTemplateProcessor:
         if (self.chat_template.template_type == 'dummy' and self.use_chat_template and not self.is_training):
             template_backend = 'jinja'
             logger.info_once(f'Setting template_backend: {template_backend}')
+        self._native_prepare_inputs(inputs)
         res_context_list, loss_scale_list, answer_len = (
             self._native_encode(inputs) if template_backend == 'native' else self._jinja_encode(inputs))
         encoded = {}
@@ -651,7 +565,12 @@ class ChatTemplateProcessor:
 
     def _native_encode(self, inputs: StdChatTemplateInputs):
         chat_template = self.chat_template
-        self._native_prepare_inputs(inputs)
+        if self.use_chat_template:
+            if self.add_non_thinking_prefix:
+                self._add_non_thinking_prefix(inputs)
+            if chat_template.is_thinking or self.enable_thinking:
+                self._remove_history_thinking(inputs)
+                
         system = self._get_system(inputs)
 
         self._get_std_messages(inputs.messages)
@@ -676,7 +595,7 @@ class ChatTemplateProcessor:
                 res_context_list.append(bos_token)
                 res_context_types.append(ContextType.OTHER)
 
-        if self.chat_template.is_post_system or not system:
+        if not system:
             prefix = chat_template.prefix
         else:
             prefix = chat_template.system_prefix
@@ -731,7 +650,7 @@ class ChatTemplateProcessor:
                 if add_eos:
                     extra_context_list = chat_template.suffix
                     extra_context_type = ContextType.SUFFIX
-            elif chat_template.response_prefix:
+            elif self.response_prefix:
                 # final round and during inference.
                 context_list.append(chat_template.response_prefix)
 
@@ -756,6 +675,37 @@ class ChatTemplateProcessor:
             answer_len = 0
         return res_context_list, loss_scale_list, answer_len
 
+    def _add_non_thinking_prefix(self, inputs) -> None:
+        messages = inputs.messages
+        non_thinking_prefix = self.chat_template.non_thinking_prefix
+        if non_thinking_prefix:
+            if not self.is_training or self.loss_scale.base_strategy == 'last_round':
+                start_idx = get_last_user_round(messages)
+            else:
+                start_idx = -1
+            for i, message in enumerate(messages):
+                if i < start_idx:
+                    continue
+                if message['role'] == 'assistant' and isinstance(message['content'], str):
+                    if not message['content'].startswith(('<think>', non_thinking_prefix)):
+                        # During multi-turn SFT training/validation:
+                        # If the message has no <think> block and does not start with the non_thinking_prefix,
+                        # prepend the non_thinking_prefix to the content.
+                        message['content'] = non_thinking_prefix + message['content']
+                        
+    def _remove_history_thinking(self, inputs) -> None:
+        if self.is_training and self.loss_scale.base_strategy != 'last_round':
+            return
+        messages = inputs.messages
+        # Only during inference or training, and only if the loss_scale is set to 'last_round',
+        # will the previous 'think' entries be deleted.
+        last_user_round = get_last_user_round(messages)
+        for i, message in enumerate(messages):
+            # Delete the content before '</think>' in all assistant turns except the last round.
+            if message['role'] == 'assistant' and isinstance(message['content'], str) and i < last_user_round:
+                message['content'] = self._remove_thinking_content(message['content'])
+                
+    
     def _native_prepare_inputs(self, inputs: StdChatTemplateInputs):
         """
         Preprocesses the list of messages in the input by merging and formatting consecutive messages
@@ -919,345 +869,6 @@ class ChatTemplateProcessor:
         if loss_mask is not None:
             loss_mask = torch.tensor(loss_mask)[protected].tolist()
         return input_ids, labels, loss_mask
-
-    def data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
-        if self.packing and isinstance(batch[0], list):
-            batch = sum(batch, start=[])
-
-        if self.mode in {'pt', 'train'}:
-            res = self._data_collator(batch, padding_to=padding_to)
-
-        if not self.remove_unused_columns:
-            extra_kwargs = [b['_extra_kwargs'] for b in batch if b.get('_extra_kwargs') is not None]
-            extra_kwargs = RowPreprocessor.rows_to_batched(extra_kwargs)
-            res.update({k: v for k, v in extra_kwargs.items() if k not in res})
-
-        return res
-
-    def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Args:
-            batch(`List[Dict[str, Any]]`): The input data in batch
-            padding_to(`int`, optional): Whether padding the batch to a fixed length, if none, the batch
-                will be padded to the `longest`
-        """
-        assert self.tokenizer.pad_token_id is not None
-        padding_side = self.padding_side if self.is_training else 'left'
-        padding_right = padding_side == 'right'
-        if self.padding_free:
-            batch[:] = [self.packing_row(batch)]
-            assert 'position_ids' in batch[0], f'batch[0]: {batch[0]}'
-
-        res = {}
-        if self.padding_free:
-            assert len(batch) == 1, f'batch: {batch}'
-            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel']:
-                v = batch[0].get(k)
-                if v is not None:
-                    res[k] = v if k == 'channel' else [v]
-        else:
-            inputs_embeds = [b['inputs_embeds'] for b in batch if b.get('inputs_embeds') is not None]
-            input_ids = [b['input_ids'] for b in batch if b.get('input_ids') is not None]
-            channel = [b.get('channel') for b in batch]
-
-            if inputs_embeds:
-                res['inputs_embeds'] = inputs_embeds
-            if input_ids:
-                res['input_ids'] = input_ids
-            if any(channel):
-                res['channel'] = channel
-
-            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids']:
-                val = [b[key] for b in batch if b.get(key) is not None]
-                if val:
-                    res[key] = val
-
-        keys = [
-            'input_ids',
-            'inputs_embeds',
-            'attention_mask',
-            'labels',
-            'loss_scale',
-            'position_ids',
-            'token_type_ids',
-            'attention_mask_2d',
-        ]
-        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0]
-        # Convert to tensor and remove unnecessary dimensions.
-        seq_lens = None
-        for key in keys:
-            if key not in res:
-                continue
-            for i, val in enumerate(res[key]):
-                if isinstance(val, (list, tuple)):
-                    val = torch.tensor(val)
-                elif key == 'inputs_embeds' and val.ndim == 3 or key != 'inputs_embeds' and val.ndim == 2:
-                    val = val[0]
-                res[key][i] = val
-            if not seq_lens:
-                seq_lens = [seq.shape[0] for seq in res[key]]
-        if not self.padding_free and seq_lens and ('input_ids' in res or 'inputs_embeds' in res):
-            attention_mask_key = 'attention_mask_2d' if self.use_megatron else 'attention_mask'
-            res[attention_mask_key] = [torch.ones(seq_len, dtype=torch.int64) for seq_len in seq_lens]
-            if self.is_training and self.padding_side == 'left':
-                res['position_ids'] = [torch.arange(seq_len, dtype=torch.int64) for seq_len in seq_lens]
-
-        if self.use_megatron:
-            # For code simplicity, only the attention_backend 'flash' is supported here.
-            if padding_to is not None:
-                padding_to = math.ceil(max(seq_lens) / padding_to) * padding_to
-            if self.padding_free:
-                cp_size = self.sequence_parallel_size
-                if cp_size > 1:
-                    padding_len = padding_to - seq_lens[0]
-                    position_ids = res['position_ids'][0]
-                    extended_position_ids = torch.arange(cp_size * 2).repeat(padding_len // (cp_size * 2))
-                    if position_ids.ndim == 3:  # compat mrope
-                        extended_position_ids = extended_position_ids[None,
-                        None, :].expand(position_ids.shape[0], 1, -1)
-                    res['position_ids'] = [torch.concat([position_ids, extended_position_ids], dim=-1)]
-            else:
-                seq_len = max(seq_lens) if padding_to is None else padding_to
-                res['attention_mask'] = torch.tril(torch.ones(
-                    (len(seq_lens), seq_len, seq_len), dtype=torch.bool)).view(len(seq_lens), 1, seq_len, seq_len)
-                assert res['attention_mask'].dtype is torch.bool, f'attention_mask.dtype: {res["attention_mask"].dtype}'
-                for i, seq_len in enumerate(seq_lens):
-                    res['attention_mask'][i, :, seq_len:] = 0
-                res['attention_mask'] = ~res['attention_mask']
-
-        for key, pad_value in zip(keys, pad_values):
-            if key not in res:
-                continue
-            if self.use_megatron and not self.padding_free and key == 'attention_mask':
-                continue
-            if padding_to is not None and not (self.padding_free and key == 'position_ids'
-                                               and self.sequence_parallel_size > 1):
-                padding_len = padding_to - seq_lens[0]
-                if padding_len > 0:
-                    res[key][0] = F.pad(res[key][0], (0, padding_len) if padding_right else (padding_len, 0),
-                                        'constant', pad_value)
-            if key == 'position_ids' and res[key][0].ndim == 3:
-                res[key] = torch.concat(res[key], dim=-1)
-            else:
-                res[key] = self._pad_sequence(res[key], pad_value)
-
-        # multimodal
-        res.update(self._data_collator_mm_data(batch))
-        if not self.use_megatron and self.sequence_parallel_size > 1:
-            res = self._sp_data_collator(res, padding_to, self.tokenizer, padding_side)
-
-        return res
-
-    def _rlhf_data_collator(self,
-                            batch: List[Dict[str, Any]],
-                            *,
-                            chosen_prefix: str = 'chosen_',
-                            rejected_prefix: str = 'rejected_',
-                            padding_to: Optional[int] = None) -> Dict[str, Any]:
-        new_batch = []
-        for prefix in [chosen_prefix, rejected_prefix]:
-            new_batch += self._fetch_inputs_startswith(batch, prefix)
-        res = self._data_collator(new_batch, padding_to=padding_to)
-
-        # reward modeling
-        margin = [b['margin'] for b in batch if b.get('margin') is not None]
-        if margin:
-            res['margin'] = torch.tensor(margin, dtype=torch.float)
-
-        return res
-
-    def _gkd_data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
-        res = self._data_collator(batch, padding_to=padding_to)
-        prompts_batch = [{'input_ids': b['prompts']} for b in batch if b.get('prompts') is not None]
-        if prompts_batch:
-            prompts_res = self._data_collator(prompts_batch, padding_to=padding_to)
-            res['prompts'] = prompts_res.pop('input_ids')
-            res.update({f'prompt_{k}': v for k, v in prompts_res.items()})
-        return res
-
-    def _embedding_data_collator(self,
-                                 batch: List[Dict[str, Any]],
-                                 *,
-                                 padding_to: Optional[int] = None) -> Dict[str, Any]:
-        labels = []
-        new_batch = []
-        for b in batch:
-            if 'input_ids' in b:
-                new_batch += [b]
-            else:
-                keys = [key for key in b.keys() if 'negative' in key]
-                max_neg = None
-                for key in keys:
-                    value_list = b[key]
-                    suffix = key[len('negative_'):]
-                    max_neg = len(value_list)
-                    for i, value in enumerate(value_list):
-                        b[f'negative{i}_{suffix}'] = value
-                    b.pop(key)
-
-                indexes = ['anchor_', 'positive_']
-                if max_neg is not None:
-                    for i in range(0, max_neg):
-                        indexes.append(f'negative{i}_')
-                for prefix in indexes:
-                    new_batch += self._fetch_inputs_startswith([b], prefix)
-            labels.extend(b.get('labels', []))
-        res = self._data_collator(new_batch, padding_to=padding_to)
-        if labels:
-            res['labels'] = torch.tensor(labels, dtype=torch.float32)
-        return res
-
-    def _reranker_data_collator(self,
-                                batch: List[Dict[str, Any]],
-                                *,
-                                padding_to: Optional[int] = None) -> Dict[str, Any]:
-        if self.is_training:
-            max_positive_samples = int(os.environ.get('MAX_POSITIVE_SAMPLES', 1))
-            max_negative_samples = int(os.environ.get('MAX_NEGATIVE_SAMPLES', 7))
-            labels_list = []
-            new_batch = []
-            for b in batch:
-                labels = b.pop('labels', None)
-                positive_num = sum(labels)
-                negative_num = len(labels) - positive_num
-                max_positive = min(positive_num, max_positive_samples)
-                max_negative = min(negative_num, max_negative_samples)
-                for i in random.sample(range(positive_num), max_positive):
-                    new_batch.append(
-                        {key: b[key][i]
-                         for key in b.keys() if isinstance(b[key], list) and b[key][i] is not None})
-                    labels_list.append(1)
-                    for j in random.sample(range(negative_num), max_negative):
-                        new_batch.append({
-                            key: b[key][j + positive_num]
-                            for key in b.keys() if isinstance(b[key], list) and b[key][j + positive_num] is not None
-                        })
-                        labels_list.append(0)
-
-            res = self._data_collator(new_batch, padding_to=padding_to)
-            if labels_list:
-                res['labels'] = torch.tensor(labels_list, dtype=torch.long)
-        else:
-            new_batch = []
-            for b in batch:
-                new_batch.append({key: val for key, val in b.items() if isinstance(val, list)})
-            res = self._data_collator(new_batch, padding_to=padding_to)
-        return res
-
-    def _seq_cls_data_collator(self,
-                               batch: List[Dict[str, Any]],
-                               *,
-                               padding_to: Optional[int] = None) -> Dict[str, Any]:
-        labels = [b.pop('labels') for b in batch if b.get('labels') is not None]
-        res = self._data_collator(batch, padding_to=padding_to)
-        if labels:
-            problem_type = self.config.problem_type
-            if problem_type == 'regression':
-                labels = torch.tensor(labels, dtype=torch.float32)
-            elif problem_type == 'multi_label_classification':
-                one_hot_labels = torch.zeros((len(labels), self.config.num_labels), dtype=torch.float32)
-                for i, label in enumerate(labels):
-                    one_hot_labels[i, label] = 1
-                labels = one_hot_labels
-            else:
-                labels = torch.tensor(labels, dtype=torch.long)
-            res['labels'] = labels
-        return res
-
-    def packing_row(self, row: List[Dict[str, Any]]) -> Dict[str, Any]:
-        packed = {}
-        keys = set()
-        length = []
-        for r in row:
-            keys.update(r.keys())
-            length.append(r['length'])
-        for key in keys:
-            if key in {'input_ids', 'labels', 'loss_scale'}:
-                packed[key] = sum((x.get(key) or [] for x in row), start=[])
-            elif key == 'length':
-                packed[key] = sum((x[key] for x in row))
-            elif key == 'channel':
-                packed[key] = [x.get(key) for x in row]
-        if 'position_ids' not in packed:
-            packed['position_ids'] = sum((list(range(x)) for x in length), start=[])
-
-        packed.update(self._data_collator_mm_data(row))
-        return packed
-
-    def _pad_sequence(self, sequences: List[torch.Tensor], padding_value: float = 0.) -> torch.Tensor:
-        """Pad sequence by some side
-
-        Args:
-            sequences: The input sequences in tensor.
-            padding_value: The padding value
-
-        Returns:
-            A tensor after padding
-        """
-        padding_side = self.padding_side if self.is_training else 'left'
-        padding_right = padding_side == 'right'
-        if padding_right:
-            return pad_sequence(sequences, batch_first=True, padding_value=padding_value)
-
-        max_len = max([s.shape[0] for s in sequences])
-
-        padded_sequences = []
-        for seq in sequences:
-            pad_length = max_len - seq.shape[0]
-            pad_tuple = [0] * ((seq.dim() - 1) * 2) + [pad_length, 0]
-            padded_seq = F.pad(seq, tuple(pad_tuple), 'constant', padding_value)
-            padded_sequences.append(padded_seq)
-
-        return torch.stack(padded_sequences)
-
-    def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # multimodal
-        res = {}
-        pixel_values = [b['pixel_values'] for b in batch if b.get('pixel_values') is not None]
-        if len(pixel_values) > 0:
-            res['pixel_values'] = torch.concat(pixel_values)
-
-            image_sizes = [b['image_sizes'] for b in batch if b.get('image_sizes') is not None]
-            if len(image_sizes) > 0:
-                res['image_sizes'] = torch.concat(image_sizes)
-
-        pixel_values_videos = [b['pixel_values_videos'] for b in batch if b.get('pixel_values_videos') is not None]
-        if len(pixel_values_videos) > 0:
-            res['pixel_values_videos'] = torch.concat(pixel_values_videos)
-
-        for media_type in ['image', 'video']:
-            grid_thw = self.concat_tensor(batch, f'{media_type}_grid_thw', 0)
-            if grid_thw is not None:
-                res[f'{media_type}_grid_thw'] = grid_thw
-        return res
-
-    def _sp_data_collator(self, res, padding_to, tokenizer, padding_side):
-        input_ids = res.get('input_ids')
-        attention_mask = res.get('attention_mask')
-        labels = res.get('labels')
-        loss_scale = res.get('loss_scale')
-        if self.sequence_parallel_size > 1 and input_ids is not None:
-            bs, seq_len = input_ids.shape
-            if 'position_ids' not in res:
-                position_ids = torch.arange(seq_len).unsqueeze(0).long().repeat(bs, 1)
-            else:
-                position_ids = res['position_ids']
-            assert padding_side == 'right' or bs == 1, 'Sequence parallel only support padding_side=right'
-            res['position_ids'] = position_ids
-        _local_var = locals()
-        for key in ['input_ids', 'attention_mask', 'labels', 'loss_scale']:
-            value = _local_var[key]
-            if value is not None:
-                res[key] = value
-        return res
-
-    @staticmethod
-    def concat_tensor(batch: List[Dict[str, Any]], attr_name: str, dim: int) -> Optional[torch.Tensor]:
-        res = []
-        for b in batch:
-            if b.get(attr_name) is not None:
-                res.append(b.pop(attr_name))
-        return torch.concat(res, dim=dim) if res else None
 
     @staticmethod
     def _concat_context_list(
@@ -1488,7 +1099,6 @@ def get_chat_template_processor(
         agent_template: Optional[str] = None,
         norm_bbox: Literal['norm1000', 'none', None] = None,
         use_chat_template: bool = True,
-        remove_unused_columns: bool = True,
         # train
         padding_free: bool = False,
         padding_side: Literal['left', 'right'] = 'right',
@@ -1496,6 +1106,8 @@ def get_chat_template_processor(
         sequence_parallel_size: int = 1,
         # infer/deploy
         response_prefix: Optional[str] = None,
+        enable_thinking: Optional[bool] = None,
+        add_non_thinking_prefix: bool = True,
 ) -> 'ChatTemplateProcessor':
     from .base import CHAT_TEMPLATE_MAPPING
 
@@ -1511,7 +1123,6 @@ def get_chat_template_processor(
         agent_template=agent_template,
         norm_bbox=norm_bbox,
         use_chat_template=use_chat_template,
-        remove_unused_columns=remove_unused_columns,
         # train
         padding_free=padding_free,
         padding_side=padding_side,
@@ -1519,4 +1130,6 @@ def get_chat_template_processor(
         sequence_parallel_size=sequence_parallel_size,
         # infer/deploy
         response_prefix=response_prefix,
+        enable_thinking=enable_thinking,
+        add_non_thinking_prefix=add_non_thinking_prefix,
     )

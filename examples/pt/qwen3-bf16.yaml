@@ -8,36 +8,29 @@ gradient_accumulation_steps: 4
 
 sample_packing: true
 sequence_len: 2048
+truncation_strategy: split
+use_chat_template: false
+loss_scale: all
 
-num_epochs: 2
-eval_steps: 25
+num_epochs: 10
+eval_steps: 100
 save_steps: 0
 
-learning_rate: 2e-5
-
-recipe: bf16
-optimizer: normuon
-warmup_steps: 20
+learning_rate: 6e-4
 lr_scheduler_type: cosine
+final_lr_fraction: 0.1
+warmup_steps: 10
 max_grad_norm: 1.0
+
+recipe: fp8-hybrid
+optimizer: adamw_8bit
 gpus: 4
-
 lora: false
-lora_rank: 16
-lora_alpha: 32
-lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
 
-dataloader_num_workers: 4
+dataloader_num_workers: 1
 datasets:
-  - path: "OpenLLM-Ro/ro_gsm8k"
-    type: auto
+  - path: "winglian/tiny-shakespeare"
+    type: text
 
 # report_to: aim
 # aim_experiment: qwen3-0.6b-fft

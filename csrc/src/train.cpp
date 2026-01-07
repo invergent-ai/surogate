@@ -227,11 +227,11 @@ struct TrainingRunner {
     /// Training token file path.
     std::string TrainFile = "";
     /// RNG seed for training dataloader sharding/order.
-    std::uint64_t TrainLoaderSeed = 0x83b45442ull;
+    std::uint64_t TrainLoaderSeed = 1234;
     /// Evaluation token file path.
     std::string EvalFile = "";
     /// RNG seed for evaluation dataloader sharding/order.
-    std::uint64_t EvalLoaderSeed = 0x384b4524ull;
+    std::uint64_t EvalLoaderSeed = 1234;
     /// Output directory template for final exported model (%n expanded).
     std::string OutDir = "output/%n";
     /// Checkpoint directory template (%n expanded).
