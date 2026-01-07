@@ -77,7 +77,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         persistent_quants (Optional[bool], defaults to False):
             Allows avoiding re-quantization of weights; this increases memory, however, when combined with --offload-quants, the additional memory is placed on the host.
             In a PCIe setting where any GPU-to-GPU communication has to pass through host memory anway, this can actually lead to significant speed-ups, especially if combined with the --memcpy-all-gather option.
-            Requires --shard-weights.
+            Requires shard-weights.
         offload_optimizer (Optional[bool], defaults to False):
             Store optimizer state in pinned host memory.
             This will slow down the optimizer step drastically (memory-bound operation), but if enough gradient accumulation steps are performed, the overall contribution of the optimizer step will be negligible.
@@ -92,7 +92,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             1: Sharded optimizer states (default)
             2: Sharded gradients + optimizer states
             3: Sharded weights + gradients + optimizer states
-            You can also configure weights and gradients individually, using the --shard-weights and --shard-gradients flags. When training in fp8, for example, it makes sense to enable weight sharding before gradient sharding, as weights need only half the amount of bandwidth.
+            You can also configure weights and gradients individually, using the shard-weights and shard-gradients flags. When training in fp8, for example, it makes sense to enable weight sharding before gradient sharding, as weights need only half the amount of bandwidth.
         shard_weights (Optional[bool], defaults to False):
             Whether to shard model weights across data-parallel processes. Enables more effective use of offloading and reduces memory consumption.
         shard_gradients (Optional[bool], defaults to False):
