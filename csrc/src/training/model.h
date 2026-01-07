@@ -15,6 +15,7 @@
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "config/pretrained_config.h"
+#include "modules/optimizers/optimizer_config.h"
 
 class ITensorContainer;
 class NCCLCommunicator;
@@ -56,6 +57,12 @@ public:
     //! \brief Runs the AdamW update step.
     //! \details Runs asynchronously, signalling completion through the OptimizerDone event.
     virtual void update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon, float weight_decay, float grad_clip) = 0;
+
+    //! \brief Runs the optimizer update with full configuration.
+    //! \details Supports AdamW 8-bit and NorMuon (hybrid AdamW/NorMuon) optimizers.
+    //! NorMuon uses orthogonalized momentum for 2D weights and AdamW for other parameters.
+    //! Default implementation dispatches to AdamW update for backwards compatibility.
+    virtual void update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
 
     //! Gets the loss of the preceding validate or backward call (forward does _not_ calculate the loss)
     virtual float get_loss() const;

@@ -50,6 +50,11 @@ inline std::string_view optimizer_type_to_str(OptimizerType type) {
     return "unknown";
 }
 
+// Alias for consistency with other to_string functions in the codebase
+inline std::string to_string(OptimizerType type) {
+    return std::string(optimizer_type_to_str(type));
+}
+
 } // namespace optimizers
 
 #endif // SUROGATE_SRC_MODULES_OPTIMIZERS_OPTIMIZER_BASE_H

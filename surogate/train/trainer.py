@@ -10,7 +10,7 @@ from surogate.core.config.sft_config import SFTConfig
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.reporter import training_logger_context
 from surogate.train.training_plot import generate_training_plot
-from surogate.utils.hf import get_model_weights_path, resolve_model_path
+from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
 from surogate.utils.tensor import to_surogate_dtype
 
@@ -122,6 +122,7 @@ class SurogateTrainerWrapper():
             # Print training info
             logger.info(f"Starting training from step {self.start_step}...")
             logger.info(f"Recipe: {self.config.recipe}")
+            logger.info(f"Optimizer: {self.config.optimizer}")
             logger.info(f"Total batch size: {self.total_batch_size} tokens")
             logger.info(f"Steps per epoch: {self.steps_per_epoch}")
             logger.info(f"Max steps: {self.max_steps}")
@@ -225,10 +226,22 @@ class SurogateTrainerWrapper():
 
             # Optimizer update
             lr = self.lr_schedule.get_lr(step)
-            result = self.trainer.update(
-                lr, self.config.adamw_beta1, self.config.adamw_beta2, step + 1,
-                self.config.adamw_epsilon, self.config.weight_decay, self.config.max_grad_norm
+
+            # Create optimizer config based on selected optimizer
+            opt_config = _surogate.OptimizerConfig(
+                optimizer=self.config.optimizer,
+                learning_rate=lr,
+                weight_decay=self.config.weight_decay,
+                grad_clip=self.config.max_grad_norm,
+                adamw_beta1=self.config.adamw_beta1,
+                adamw_beta2=self.config.adamw_beta2,
+                adamw_epsilon=self.config.adamw_epsilon,
+                normuon_momentum=self.config.normuon_momentum,
+                normuon_beta2=self.config.normuon_beta2,
+                normuon_lr=lr,  # Use same LR for NorMuon
+                normuon_cautious_wd=self.config.normuon_cautious_wd
             )
+            result = self.trainer.update_with_config(opt_config, step + 1)
 
             step_time = time.time() - step_start
             elapsed_ms = int(step_time * 1000)

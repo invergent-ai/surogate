@@ -635,6 +635,99 @@ NB_MODULE(_surogate, m) {
         }, "Return a debug string representation.")
         ;
 
+    // Optimizer type enum
+    nb::enum_<optimizers::OptimizerType>(m, "OptimizerType",
+        "Optimizer algorithm types.\n\n"
+        "Values:\n"
+        "- ADAMW_8BIT: 8-bit AdamW with blockwise quantization.\n"
+        "- NORMUON: NorMuon hybrid optimizer (orthogonalized momentum for 2D weights, AdamW for others).")
+        .value("ADAMW_8BIT", optimizers::OptimizerType::ADAMW_8BIT, "8-bit AdamW with blockwise quantization")
+        .value("NORMUON", optimizers::OptimizerType::NORMUON, "NorMuon hybrid optimizer")
+        ;
+
+    nb::class_<optimizers::OptimizerConfig>(m, "OptimizerConfig",
+        "Optimizer configuration.\n\n"
+        "Contains all hyperparameters for supported optimizers.\n"
+        "Parameters for unused optimizers are ignored.")
+        .def("__init__", [](optimizers::OptimizerConfig *t,
+                           const std::string& optimizer,
+                           float learning_rate, float weight_decay, float grad_clip,
+                           float adamw_beta1, float adamw_beta2, float adamw_epsilon,
+                           float normuon_momentum, float normuon_beta2, float normuon_lr, bool normuon_cautious_wd) {
+            auto cfg = optimizers::OptimizerConfig{};
+            if (optimizer == "adamw_8bit" || optimizer == "adamw") {
+                cfg.type = optimizers::OptimizerType::ADAMW_8BIT;
+            } else if (optimizer == "normuon") {
+                cfg.type = optimizers::OptimizerType::NORMUON;
+            } else {
+                throw std::runtime_error("Unknown optimizer type: " + optimizer + " (valid: adamw_8bit, normuon)");
+            }
+            cfg.learning_rate = learning_rate;
+            cfg.weight_decay = weight_decay;
+            cfg.grad_clip = grad_clip;
+            cfg.adamw_beta1 = adamw_beta1;
+            cfg.adamw_beta2 = adamw_beta2;
+            cfg.adamw_epsilon = adamw_epsilon;
+            cfg.normuon_momentum = normuon_momentum;
+            cfg.normuon_beta2 = normuon_beta2;
+            cfg.normuon_lr = normuon_lr;
+            cfg.normuon_cautious_wd = normuon_cautious_wd;
+            new (t) optimizers::OptimizerConfig(cfg);
+        }, nb::kw_only(),
+             nb::arg("optimizer") = "adamw_8bit",
+             nb::arg("learning_rate") = 2e-4f,
+             nb::arg("weight_decay") = 0.1f,
+             nb::arg("grad_clip") = 0.0f,
+             nb::arg("adamw_beta1") = 0.9f,
+             nb::arg("adamw_beta2") = 0.999f,
+             nb::arg("adamw_epsilon") = 1e-8f,
+             nb::arg("normuon_momentum") = 0.95f,
+             nb::arg("normuon_beta2") = 0.95f,
+             nb::arg("normuon_lr") = 0.02f,
+             nb::arg("normuon_cautious_wd") = true,
+             "Create an optimizer configuration.\n\n"
+             "Parameters:\n"
+             "- optimizer: Type of optimizer ('adamw_8bit' or 'normuon').\n"
+             "- learning_rate: Base learning rate.\n"
+             "- weight_decay: Weight decay coefficient.\n"
+             "- grad_clip: Gradient clipping threshold (0 = disabled).\n"
+             "- adamw_beta1/beta2/epsilon: AdamW hyperparameters.\n"
+             "- normuon_momentum/beta2/lr/cautious_wd: NorMuon hyperparameters.\n")
+        .def_rw("learning_rate", &optimizers::OptimizerConfig::learning_rate, "Base learning rate.")
+        .def_rw("weight_decay", &optimizers::OptimizerConfig::weight_decay, "Weight decay coefficient.")
+        .def_rw("grad_clip", &optimizers::OptimizerConfig::grad_clip, "Gradient clipping threshold.")
+        .def_rw("adamw_beta1", &optimizers::OptimizerConfig::adamw_beta1, "AdamW beta1.")
+        .def_rw("adamw_beta2", &optimizers::OptimizerConfig::adamw_beta2, "AdamW beta2.")
+        .def_rw("adamw_epsilon", &optimizers::OptimizerConfig::adamw_epsilon, "AdamW epsilon.")
+        .def_rw("normuon_momentum", &optimizers::OptimizerConfig::normuon_momentum, "NorMuon momentum (beta1).")
+        .def_rw("normuon_beta2", &optimizers::OptimizerConfig::normuon_beta2, "NorMuon variance EMA (beta2).")
+        .def_rw("normuon_lr", &optimizers::OptimizerConfig::normuon_lr, "NorMuon learning rate.")
+        .def_rw("normuon_cautious_wd", &optimizers::OptimizerConfig::normuon_cautious_wd, "Use cautious weight decay.")
+        .def_prop_rw("type",
+                     [](const optimizers::OptimizerConfig* cfg) { return optimizers::to_string(cfg->type); },
+                     [](optimizers::OptimizerConfig* cfg, const std::string& type) {
+                         if (type == "adamw_8bit" || type == "adamw") {
+                             cfg->type = optimizers::OptimizerType::ADAMW_8BIT;
+                         } else if (type == "normuon") {
+                             cfg->type = optimizers::OptimizerType::NORMUON;
+                         }
+                     },
+                     "Optimizer type as string.")
+        .def_static("adamw_8bit", &optimizers::OptimizerConfig::adamw_8bit,
+             nb::arg("lr") = 2e-4f, nb::arg("beta1") = 0.9f, nb::arg("beta2") = 0.999f,
+             nb::arg("epsilon") = 1e-8f, nb::arg("weight_decay") = 0.1f, nb::arg("grad_clip") = 0.0f,
+             "Create AdamW 8-bit configuration.")
+        .def_static("normuon", &optimizers::OptimizerConfig::normuon,
+             nb::arg("lr") = 0.02f, nb::arg("momentum") = 0.95f, nb::arg("beta2") = 0.95f,
+             nb::arg("weight_decay") = 0.01f, nb::arg("grad_clip") = 0.0f, nb::arg("cautious_wd") = true,
+             "Create NorMuon configuration.\n\n"
+             "NorMuon uses orthogonalized momentum for 2D weight matrices and AdamW for other parameters.")
+        .def("__repr__", [](const optimizers::OptimizerConfig& cfg) {
+            return fmt::format("OptimizerConfig(type='{}', lr={}, weight_decay={}, grad_clip={})",
+                              optimizers::to_string(cfg.type), cfg.learning_rate, cfg.weight_decay, cfg.grad_clip);
+        }, "Return a debug string representation.")
+        ;
+
     nb::class_<MultiGPUPyTrainer>(m, "SurogateTrainer",
         "Multi-GPU trainer wrapper.\n\n"
         "Provides training/evaluation steps and checkpoint/weight import/export.\n"
@@ -725,23 +818,18 @@ NB_MODULE(_surogate, m) {
              "- inputs: int32 token ids shaped [batch_size * world_size, seq_length].\n"
              "- targets: int32 token ids shaped [batch_size * world_size, seq_length].\n\n"
              "Returns: loss (float).")
-        .def("update", [](MultiGPUPyTrainer* trainer, float lr, float beta1, float beta2, int step, float epsilon, float weight_decay, float grad_clip){
-            auto [loss, norm] = trainer->update(lr, beta1, beta2, step, epsilon, weight_decay, grad_clip);
+        .def("update_with_config", [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& config, int step){
+            auto [loss, norm] = trainer->update_with_config(config, step);
             nb::dict ret;
             ret["loss"] = loss;
             ret["norm"] = norm;
             return ret;
-        }, nb::arg("learning_rate"), nb::arg("beta1"), nb::arg("beta2"), nb::arg("step"),
-           nb::arg("adam_epsilon") = 1e-8f, nb::arg("weight_decay"), nb::arg("grad_clip"),
-             "Run the optimizer step and return metrics.\n\n"
-             "This call blocks until the optimizer step is complete.\n\n"
+        }, nb::arg("config"), nb::arg("step"),
+             "Run the optimizer step with full configuration.\n\n"
+             "Supports AdamW 8-bit and NorMuon optimizers based on config.type.\n\n"
              "Parameters:\n"
-             "- learning_rate: Optimizer learning rate.\n"
-             "- beta1/beta2: Adam betas.\n"
-             "- step: Global step index.\n"
-             "- adam_epsilon: Adam epsilon for numerical stability.\n"
-             "- weight_decay: Weight decay factor.\n"
-             "- grad_clip: Gradient clipping threshold.\n\n"
+             "- config: OptimizerConfig with all hyperparameters.\n"
+             "- step: Global step index.\n\n"
              "Returns: dict with keys {loss: float, norm: float}.")
         .def("get_gradients", [](MultiGPUPyTrainer* trainer, int gpu_id)
         {
