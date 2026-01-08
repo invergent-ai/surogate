@@ -3,8 +3,8 @@ output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
 
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 1
 
 sample_packing: true
 sequence_len: 2048
@@ -23,16 +23,18 @@ warmup_steps: 10
 max_grad_norm: 1.0
 
 recipe: fp8-hybrid
-optimizer: adamw_8bit
+optimizer: normuon
 gpus: 4
 lora: false
 
-dataloader_num_workers: 1
+dataloader_num_workers: 48
 datasets:
-  - path: "winglian/tiny-shakespeare"
+  - path: "HuggingFaceFW/fineweb-2"
+    subset: ron_Latn
+    split: train
     type: text
-
-# report_to: aim
-# aim_experiment: qwen3-0.6b-fft
-# aim_repo: /home/densemax2/work/flavius/surogate/.aim
-# aim_name: fft-bf16-adamw
+validation_datasets:
+  - path: "HuggingFaceFW/fineweb-2"
+    subset: ron_Latn
+    split: test
+    type: text

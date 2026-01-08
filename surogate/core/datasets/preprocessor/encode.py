@@ -11,10 +11,3 @@ class EncodePreprocessor(RowPreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return self.template.encode(row, return_length=True)
-
-class AddLengthPreprocessor(EncodePreprocessor):
-
-    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        encoded = super().preprocess(row)
-        row['length'] = encoded['length']
-        return row

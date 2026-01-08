@@ -35,12 +35,15 @@ EXTENSIONS_TO_DATASET_TYPES = {
 
 def load_dataset_with_config(
         dataset_config: DatasetConfig,
-        streaming=False
+        *,
+        streaming=False,
+        num_workers: int = 1,
 ) -> Dataset | IterableDataset:
     load_dataset_kwargs = {
         "split": dataset_config.split if dataset_config.split else None,
         "name": dataset_config.subset,
-        "streaming": streaming
+        "streaming": streaming,
+        "num_proc": num_workers,
     }
 
     if Path(dataset_config.path).exists():

@@ -12,7 +12,7 @@ from surogate.core.config.sft_config import SFTConfig
 from surogate.core.datasets.datasets import disable_datasets_caching
 from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \
     shuffle_dataset
-from surogate.core.datasets.preprocessor.encode import EncodePreprocessor, AddLengthPreprocessor
+from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
@@ -28,11 +28,6 @@ TOKENIZE_HASH_FILE = ".tokenize_hash"
 
 # Default maximum tokens per output file (100M tokens)
 DEFAULT_MAX_TOKENS_PER_FILE = 100_000_000
-
-# Global variable for multiprocessing worker
-_worker_template_processor = None
-_worker_tokenizer = None
-
 
 def _dataset_config_to_dict(ds_config) -> dict:
     """Extract hashable fields from a dataset config."""
@@ -127,37 +122,6 @@ def tokenized_files_exist(output_dir: str) -> bool:
     # Also check for sharded files (train-000.bin, train-001.bin, etc.)
     train_shard_path = os.path.join(output_dir, 'train-000.bin')
     return os.path.exists(train_path) or os.path.exists(train_shard_path)
-
-
-def _init_worker(model_name: str, template_processor_state: Optional[dict] = None):
-    """Initialize worker process with tokenizer and optional template processor."""
-    from transformers import AutoTokenizer
-    global _worker_tokenizer, _worker_template_processor
-    _worker_tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # Template processor state can be passed if needed for complex processing
-    _worker_template_processor = template_processor_state
-
-
-def _tokenize_example_worker(args: tuple) -> dict:
-    """Worker function for multiprocessing tokenization.
-
-    Args:
-        args: Tuple of (example_dict, seq_len) where example_dict contains
-              'input_ids' and 'labels' keys.
-
-    Returns:
-        Dictionary with 'tokens', 'mask', and 'position_ids' arrays.
-    """
-    example, seq_len = args
-    input_ids = np.asarray(example['input_ids'], dtype=np.int32)
-    labels = np.asarray(example['labels'], dtype=np.int32)
-
-    # Create mask: 1 where we want to compute loss (labels != -100), 0 otherwise
-    assistant_mask = (labels != -100).astype(np.int32)
-    mask = _to_input_mask(assistant_mask)
-
-    return {'tokens': input_ids, 'mask': mask}
-
 
 class TokenizedDataFileWriter:
     def __init__(self, file_name: str,  vocab_size: int, masking: bool = False, non_overlapping: bool = False):
@@ -282,110 +246,6 @@ def _to_input_mask(assistant_token_mask: np.ndarray) -> np.ndarray:
     out[-1] = 0
     return out
 
-
-def tokenize_messages(tokenizer: PreTrainedTokenizerBase, messages: list[dict], seq_len: int) -> dict:
-    """
-    Tokenize a chat conversation and pad/truncate to fixed seq_len.
-
-    Returns tokens, mask, and position_ids all of length seq_len.
-    """
-    # Apply chat template to get the full conversation tokens.
-    tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors="np")[0]
-
-    # Determine where the final assistant response begins.
-    # Convention: only train on the final assistant message.
-    if not messages or messages[-1].get("role") != "assistant":
-        raise ValueError("Expected last message role == 'assistant'")
-    prompt_messages = messages[:-1]
-    prompt_tokens = tokenizer.apply_chat_template(
-        prompt_messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="np",
-    )[0]
-    prompt_len = len(prompt_tokens)
-
-    # Create token-level assistant mask: 0 for prompt, 1 for assistant response tokens.
-    # NOTE: Our DataLoader applies mask bits to the *input* positions, but targets are
-    # shifted by +1 token (next-token prediction). To train on assistant tokens as
-    # targets, we later shift this mask by one position (see `_to_input_mask`).
-    assistant_mask = np.zeros(len(tokens), dtype=np.int32)
-    if prompt_len < len(tokens):
-        assistant_mask[prompt_len:] = 1
-
-    # Generate Position IDs (0, 1, ..., N-1)
-    position_ids = np.arange(len(tokens), dtype=np.int32)
-
-    # Pad/truncate to seq_len.
-    if len(tokens) > seq_len:
-        tokens = tokens[:seq_len]
-        assistant_mask = assistant_mask[:seq_len]
-        position_ids = position_ids[:seq_len]
-        # Ensure last token is EOS and included in loss.
-        if tokenizer.eos_token_id is not None:
-            tokens[-1] = tokenizer.eos_token_id
-            assistant_mask[-1] = 1
-    else:
-        pad_len = seq_len - len(tokens)
-        pad_val = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_val)
-        assistant_mask = np.pad(assistant_mask, (0, pad_len), mode="constant", constant_values=0)
-        # For padding, we usually set position_ids to 0
-        position_ids = np.pad(position_ids, (0, pad_len), mode="constant", constant_values=0)
-
-    # Shift token-level mask to input-aligned mask bits used by DataLoader.
-    mask = _to_input_mask(assistant_mask)
-    return {"tokens": tokens, "mask": mask, "position_ids": position_ids}
-
-
-def tokenize_messages_unpadded(tokenizer: PreTrainedTokenizerBase, messages: list[dict], max_len: int) -> dict:
-    """
-    Tokenize a single chat record without padding.
-
-    Returns variable-length `tokens` and an input-aligned `mask` (same length as tokens),
-    suitable for later packing into fixed-size chunks.
-    """
-    tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors="np")[0]
-
-    if not messages or messages[-1].get("role") != "assistant":
-        raise ValueError("Expected last message role == 'assistant'")
-    prompt_messages = messages[:-1]
-    prompt_tokens = tokenizer.apply_chat_template(
-        prompt_messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="np",
-    )[0]
-    prompt_len = len(prompt_tokens)
-
-    assistant_mask = np.zeros(len(tokens), dtype=np.int32)
-    if prompt_len < len(tokens):
-        assistant_mask[prompt_len:] = 1
-
-    # Generate Position IDs unpadded (0, ..., N-1)
-    position_ids = np.arange(len(tokens), dtype=np.int32)
-
-    # Truncate very long records to max_len, force EOS as a terminator.
-    if len(tokens) > max_len:
-        tokens = tokens[:max_len]
-        assistant_mask = assistant_mask[:max_len]
-        position_ids = position_ids[:max_len]
-        if tokenizer.eos_token_id is not None:
-            tokens[-1] = tokenizer.eos_token_id
-            assistant_mask[-1] = 1
-
-    # Ensure the record ends with EOS so boundaries are well-defined for packing.
-    if tokenizer.eos_token_id is not None and (len(tokens) == 0 or int(tokens[-1]) != int(tokenizer.eos_token_id)):
-        tokens = np.concatenate([tokens, np.array([tokenizer.eos_token_id], dtype=tokens.dtype)])
-        assistant_mask = np.concatenate([assistant_mask, np.array([1], dtype=assistant_mask.dtype)])
-        # Extend position_ids
-        next_pos = position_ids[-1] + 1 if len(position_ids) > 0 else 0
-        position_ids = np.concatenate([position_ids, np.array([next_pos], dtype=position_ids.dtype)])
-
-    mask = _to_input_mask(assistant_mask)
-    return {"tokens": tokens.astype(np.int32), "mask": mask.astype(np.int32), "position_ids": position_ids.astype(np.int32)}
-
-
 def pack_and_write(
     writer: TokenizedDataFileWriter,
     docs: Iterable[dict],
@@ -449,7 +309,6 @@ def pack_and_write(
         cur_len += tokens.size
 
     flush()
-
 
 def write_padded(
     writer: TokenizedDataFileWriter,
@@ -613,23 +472,25 @@ class TokenizeDatasets(SurogateCommand):
         train_datasets, val_datasets = [], []
         train_seed = np.random.RandomState(self.config.train_seed)
         eval_seed = np.random.RandomState(self.config.eval_seed)
-
+        has_validation_datasets = len(self.config.validation_datasets) > 0
+        
         with disable_datasets_caching():
             for ds_config in self.config.datasets:
-                dataset = load_dataset_with_config(ds_config)
+                dataset = load_dataset_with_config(ds_config, num_workers=self.config.dataloader_num_workers)
 
                 dataset = pre_process(dataset, ds_config, num_proc=self.config.dataloader_num_workers)
                 train_dataset, val_dataset = post_process(
                     dataset,
                     dataset_sample=ds_config.samples,
-                    split_dataset_ratio=self.config.validation_split_ratio,
+                    split_dataset_ratio=self.config.validation_split_ratio if not has_validation_datasets else 0.0,
                     random_state=train_seed,
                 )
                 train_datasets.append(train_dataset)
-                val_datasets.append(val_dataset)
+                if val_dataset is not None:
+                    val_datasets.append(val_dataset)
 
             for ds_config in self.config.validation_datasets:
-                dataset = load_dataset_with_config(ds_config)
+                dataset = load_dataset_with_config(ds_config, num_workers=self.config.dataloader_num_workers)
                 dataset = pre_process(dataset, ds_config, num_proc=self.config.dataloader_num_workers)
                 _, val_dataset = post_process(
                     dataset,
@@ -701,8 +562,10 @@ class TokenizeDatasets(SurogateCommand):
         train_dataset, val_dataset = self._load_and_encode_datasets()
 
         # Write BIN.TOK files
+        logger.info("Writing tokenized train files...")
         self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=True)
         if val_dataset is not None:
+            logger.info("Writing tokenized validation files...")
             self._write_bin_tok(val_dataset, os.path.join(self.config.output_dir, 'eval.bin'), packing=False)
 
         # Write the hash after successful tokenization
@@ -716,16 +579,11 @@ class TokenizeDatasets(SurogateCommand):
         origin_template_model = template_processor.model
         template_processor.model = None  # Avoid serializing the model.
         
-        if self.config.truncation_strategy == 'split':
-            if self.config.use_chat_template:
-                raise ValueError(
-                    'truncation_strategy=split is currently only supported for plain text model pretraining')
-            
         for i, dataset in enumerate(datasets):
             if dataset is None:
                 continue
-            preprocessor_cls = EncodePreprocessor if self.config.truncation_strategy == 'split' else AddLengthPreprocessor
-            preprocessor = preprocessor_cls(template=template_processor)
+            logger.info(f"Encoding {'train' if i == 0 else 'validation'} dataset...")
+            preprocessor = EncodePreprocessor(template=template_processor)
             batch_size = 100 if self.config.model_template.is_multimodal else 1000
             
             dataset = preprocessor(
@@ -782,7 +640,6 @@ class TokenizeDatasets(SurogateCommand):
         out_dir = os.path.dirname(out_path)
         base_name = os.path.basename(out_path)
         name_without_ext = base_name.rsplit('.', 1)[0] if '.' in base_name else base_name
-        ext = '.bin'
 
         # non_overlapping=True for validation (padded, non-packed) so dataloader uses correct chunk count
         non_overlapping = not packing

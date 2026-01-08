@@ -8,10 +8,9 @@ from surogate.core.datasets.progress import create_hfhub_tqdm
 from surogate.core.hub.base_hub import HubOperation
 from surogate.utils.logger import get_logger
 
-from huggingface_hub.hf_api import api
-
 logger = get_logger()
 
+from huggingface_hub.hf_api import api
 class HuggingFaceHub(HubOperation):
     @classmethod
     def try_login(cls, token: Optional[str] = None) -> bool:

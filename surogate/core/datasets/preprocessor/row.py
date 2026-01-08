@@ -93,9 +93,6 @@ class RowPreprocessor:
             dataset = dataset.map(lambda x: {'__#solution': x['solution']}, **map_kwargs)
             map_kwargs.pop('cache_file_name', None)
 
-        # import pydevd_pycharm
-        # pydevd_pycharm.settrace('localhost', port=5678, stdout_to_server=True, stderr_to_server=True)
-
         dataset = self.safe_rename_columns(dataset, self.origin_columns)
         dataset = self.safe_rename_columns(dataset, self.columns)
         dataset = self.prepare_dataset(dataset)
