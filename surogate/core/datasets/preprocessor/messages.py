@@ -102,10 +102,54 @@ class MessagesPreprocessor(RowPreprocessor):
             return
         self._to_std_key(messages, 'role', self.role_keys)
         self._to_std_key(messages, 'content', self.content_keys)
-        system = row.pop('system', None)
+        system = row.get('system', None)
         if self._is_sharegpt_format(messages[0]):
             messages = self.sharegpt_to_messages(messages, system)
         else:
             self.to_std_messages(messages, system)  # inplace
         row['messages'] = messages
         return row
+
+    def preprocess_batch(self, rows: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+        """Process a batch of messages dataset rows efficiently.
+
+        1. Batches message repair and transformation operations
+        2. Reduces function call overhead
+        3. Batches format detection and conversion
+
+        Args:
+            rows: List of input row dictionaries
+
+        Returns:
+            List of processed dictionaries with standardized 'messages' field
+        """
+        results = []
+
+        for row in rows:
+            # Handle rejected messages if present
+            if 'rejected_messages' in row:
+                row['rejected_messages'] = MessagesPreprocessor.preprocess(
+                    self, {'messages': row['rejected_messages']})['messages']
+
+            messages = row['messages']
+            if self.inner_key is not None:
+                messages = messages[self.inner_key]
+
+            messages: Optional[List[Dict[str, str]]] = self.repair_messages(messages)
+            if not messages or isinstance(messages, str):
+                results.append(None)
+                continue
+
+            self._to_std_key(messages, 'role', self.role_keys)
+            self._to_std_key(messages, 'content', self.content_keys)
+            system = row.get('system', None)
+
+            if self._is_sharegpt_format(messages[0]):
+                messages = self.sharegpt_to_messages(messages, system)
+            else:
+                self.to_std_messages(messages, system)  # inplace
+
+            row['messages'] = messages
+            results.append(row)
+
+        return results

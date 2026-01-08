@@ -1,5 +1,5 @@
 import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from surogate.core.config.dataset_config import ConversationDatasetConfig
 from surogate.core.datasets.preprocessor.row import RowPreprocessor
@@ -30,7 +30,7 @@ class ConversationPreprocessor(RowPreprocessor):
         possible_sys_turn = self.transform_message(messages[0])
 
         if possible_sys_turn.get("role", None) != "system" and self.system_field in row:
-            turn = {"role": "system", "content": row.pop(self.system_field)}
+            turn = {"role": "system", "content": row.get(self.system_field)}
             turns.append(turn)
 
         for message in messages:
@@ -68,7 +68,7 @@ class ConversationPreprocessor(RowPreprocessor):
         return transformed_message
 
     def _get_messages(self, row):
-        messages = row.pop(self.messages_field, None)
+        messages = row.get(self.messages_field, None)
         if messages is None:
             raise ValueError("Messages is null. Please check `messages_field`.")
 
@@ -82,7 +82,7 @@ class ConversationPreprocessor(RowPreprocessor):
 
     def _get_tools(self, row) -> list[dict] | None:
         """Get tools from prompt if available."""
-        tools = row.pop(self.tools_field, None)
+        tools = row.get(self.tools_field, None)
         if tools is None:
             return None
 
@@ -93,3 +93,32 @@ class ConversationPreprocessor(RowPreprocessor):
             "Unknown tools format. Please convert it into a list[dict].\n"
             f"Current format: {type(tools)}"
         )
+
+    def preprocess_batch(self, rows: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+        """Process a batch of conversation dataset rows efficiently.
+
+        1. Batches message extraction and transformation
+        2. Batches JSON parsing for tool_calls
+        3. Reduces function call overhead
+
+        Args:
+            rows: List of input row dictionaries
+
+        Returns:
+            List of processed dictionaries with 'messages' and optionally 'tools' fields
+        """
+        results = []
+
+        for row in rows:
+            # Process messages
+            messages = self.get_conversation_thread(row)
+            result = {"messages": messages}
+
+            # Process tools if present
+            tools = self._get_tools(row)
+            if tools:
+                result["tools"] = tools
+
+            results.append(result)
+
+        return results

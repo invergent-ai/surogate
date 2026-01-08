@@ -207,6 +207,194 @@ class ChatTemplateProcessor:
             encoded['_extra_kwargs'] = chosen.extra_kwargs
 
         return batched[0] if len(batched) == 1 else batched
+
+    @torch.inference_mode()
+    def encode_batch(self,
+                     inputs_list: List[Union[Dict[str, Any], InferRequest]],
+                     return_template_inputs: bool = False,
+                     return_length: bool = False) -> List[Dict[str, Any]]:
+        """Encode a batch of inputs using batched tokenization for better performance.
+
+        This method processes multiple inputs simultaneously, which is significantly faster
+        than calling encode() repeatedly because:
+        1. Tokenizer batch operations are highly optimized (10-50x faster)
+        2. Reduces Python interpreter overhead
+        3. Better CPU cache utilization
+
+        Args:
+            inputs_list: List of input dictionaries or InferRequest objects
+            return_template_inputs: Whether to include template_inputs in output
+            return_length: Whether to include length in output
+
+        Returns:
+            List of encoded dictionaries, one per input
+        """
+        assert self._processor_inited, ('Please initialize the processor before calling the template.encode_batch method: '
+                                        'template.init_processor(processor).')
+
+        # Normalize inputs to ChatTemplateInputs
+        normalized_inputs = []
+        for inputs in inputs_list:
+            if isinstance(inputs, dict):
+                if not self.is_training:
+                    InferRequest.remove_response(inputs['messages'])
+                inputs = ChatTemplateInputs.from_dict(inputs)
+            elif isinstance(inputs, ChatTemplateInputs):
+                inputs = deepcopy(inputs)
+            assert isinstance(inputs, ChatTemplateInputs)
+            normalized_inputs.append(inputs)
+
+        # Process all inputs - collect context lists for batched tokenization
+        results = []
+        context_lists_batch = []
+        loss_scale_lists_batch = []
+        metadata_batch = []
+
+        for inputs in normalized_inputs:
+            chosen = inputs.chosen
+            # Prepare inputs (image loading, preprocessing, etc.)
+            self._preprocess_inputs(chosen)
+
+            # Get context list and loss scales (string concatenation phase)
+            if self.mode in {'vllm', 'lmdeploy', 'sglang'}:
+                encoded = ChatTemplateProcessor._encode(self, chosen)
+                keys = ['images', 'audios', 'videos']
+                if self.mode == 'vllm':
+                    keys.append('mm_processor_kwargs')
+                for key in keys:
+                    value = getattr(chosen, key)
+                    if value:
+                        encoded[key] = value
+                # For these modes, encode returns complete results
+                results.append((encoded, chosen))
+                context_lists_batch.append(None)
+                loss_scale_lists_batch.append(None)
+                metadata_batch.append(None)
+            else:
+                # Get context list (this does string operations but not tokenization yet)
+                chosen_copy = deepcopy(chosen)
+                chosen_copy.messages = deepcopy(chosen_copy.messages)
+                self._native_prepare_inputs(chosen_copy)
+
+                template_backend = self.template_backend
+                if (self.chat_template.template_type == 'dummy' and self.use_chat_template and not self.is_training):
+                    template_backend = 'jinja'
+
+                res_context_list, loss_scale_list, answer_len = (
+                    self._native_encode(chosen_copy) if template_backend == 'native' else self._jinja_encode(chosen_copy))
+
+                # Simplify context lists (merge strings, handle special tokens)
+                res_context_list, loss_scale_list = self._simplify_context_list(res_context_list, loss_scale_list, chosen_copy)
+
+                context_lists_batch.append(res_context_list)
+                loss_scale_lists_batch.append(loss_scale_list)
+                metadata_batch.append({
+                    'chosen': chosen,
+                    'answer_len': answer_len,
+                    'suffix_tokens': self._encode_context_list(self.chat_template.suffix)[0]
+                })
+                results.append(None)
+
+        # Batched tokenization: collect all strings that need tokenization
+        strings_to_tokenize = []
+        string_indices = []  # (result_idx, context_idx)
+
+        for result_idx, context_list in enumerate(context_lists_batch):
+            if context_list is None:
+                continue
+            for context_idx, context in enumerate(context_list):
+                if isinstance(context, str):
+                    strings_to_tokenize.append(context)
+                    string_indices.append((result_idx, context_idx))
+
+        # Perform batched tokenization on all strings at once
+        if strings_to_tokenize:
+            tokenized_batch = self._tokenize_batch(strings_to_tokenize)
+
+            # Distribute tokenized results back to context lists
+            for tokenized_ids, (result_idx, context_idx) in zip(tokenized_batch, string_indices):
+                context_lists_batch[result_idx][context_idx] = tokenized_ids
+
+        # Now encode each context list (this is fast now that tokenization is done)
+        final_results = []
+        for result_idx, (result, context_list, loss_scale_list, metadata) in enumerate(
+                zip(results, context_lists_batch, loss_scale_lists_batch, metadata_batch)):
+
+            if result is not None:
+                # Already encoded (vllm/lmdeploy/sglang mode)
+                encoded, chosen = result
+            else:
+                # Encode from tokenized context list
+                input_ids, labels, loss_scale = self._encode_context_list(context_list, loss_scale_list)
+                self._add_dynamic_eos(input_ids, labels, loss_scale, metadata['suffix_tokens'])
+
+                encoded = {
+                    'input_ids': input_ids,
+                    'labels': labels,
+                    'loss_scale': loss_scale
+                }
+                if encoded.get('labels') is not None:
+                    encoded['labels'][0] = -100
+                if encoded.get('loss_scale') is not None:
+                    encoded['loss_scale'][0] = 0
+                if not self.is_training:
+                    for k in list(encoded.keys()):
+                        if k.endswith('labels') or k.endswith('loss_scale'):
+                            encoded[k] = None
+
+                chosen = metadata['chosen']
+
+            # Apply truncation if needed
+            input_ids = encoded.get('input_ids')
+            labels = encoded.get('labels')
+            loss_scale_val = encoded.get('loss_scale')
+            length = self._get_length(input_ids, labels)
+
+            if self.max_length is not None and length > self.max_length:
+                if self.truncation_strategy in {'right', 'left'}:
+                    input_ids, labels, loss_scale_val = self._truncate(
+                        input_ids, labels, loss_scale_val, truncation_strategy=self.truncation_strategy)
+                    length = self._get_length(input_ids, labels)
+                elif self.truncation_strategy == 'raise':
+                    from surogate.core.datasets.preprocessor.row import MaxLengthError
+                    raise MaxLengthError(f'Current length of row({length}) is larger'
+                                         f' than the max_length({self.max_length}).')
+
+            encoded['length'] = length
+            encoded['input_ids'] = input_ids
+            encoded['labels'] = labels
+            encoded['loss_scale'] = loss_scale_val
+
+            # Post-process like in encode()
+            if chosen.channel is not None:
+                encoded['channel'] = chosen.channel
+
+            lengths = []
+            for key in list(encoded.keys()):
+                if encoded[key] is None:
+                    encoded.pop(key)
+                elif key.endswith('length'):
+                    value = encoded[key]
+                    if isinstance(value, int):
+                        lengths.append(value)
+                    elif isinstance(value, (tuple, list)):
+                        lengths += value
+
+            if return_length:
+                if not lengths:
+                    raise ValueError(f'lengths should not be empty. encoded: {encoded}')
+                encoded['length'] = lengths[0] if len(lengths) == 1 else lengths
+            else:
+                encoded.pop('length', None)
+
+            if return_template_inputs:
+                encoded['template_inputs'] = chosen
+
+            encoded['_extra_kwargs'] = chosen.extra_kwargs
+
+            final_results.append(encoded)
+
+        return final_results
  
 
     def _encode_truncated(self, inputs: StdChatTemplateInputs):
@@ -786,6 +974,36 @@ class ChatTemplateProcessor:
 
     def _tokenize(self, context, **kwargs):
         return self.tokenizer(context, return_attention_mask=False, add_special_tokens=False, **kwargs)['input_ids']
+
+    def _tokenize_batch(self, contexts: List[str], **kwargs) -> List[List[int]]:
+        """Tokenize a batch of strings efficiently using the tokenizer's batch processing.
+
+        This is significantly faster than calling _tokenize() in a loop because:
+        1. HuggingFace tokenizers use Rust implementations that parallelize across batch
+        2. Reduces Python<->Rust FFI overhead
+        3. Better memory locality and cache utilization
+
+        Args:
+            contexts: List of strings to tokenize
+            **kwargs: Additional arguments passed to tokenizer
+
+        Returns:
+            List of token ID lists, one per input string
+        """
+        if not contexts:
+            return []
+
+        # Use batch encoding for maximum performance
+        batch_result = self.tokenizer(
+            contexts,
+            return_attention_mask=False,
+            add_special_tokens=False,
+            padding=False,  # Don't pad - we handle variable lengths
+            truncation=False,  # Don't truncate - we handle this separately
+            **kwargs
+        )
+
+        return batch_result['input_ids']
 
     def pre_forward_hook(self, model: nn.Module, args, kwargs):
         old_kwargs = to_device(kwargs, model.device)

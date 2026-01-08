@@ -109,7 +109,7 @@ def get_model_and_tokenizer_from_local(
         HfConfigFactory.set_max_model_len(model_config, max_model_len)
 
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, use_fast=True)
 
     if model_info.quant_method == 'fp8':
         torch_dtype = 'auto'
@@ -241,8 +241,8 @@ def get_model_and_tokenizer_from_local(
         HfConfigFactory.set_max_model_len(model_config, max_model_len)
 
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, use_fast=True)
+ 
     model_kwargs['dtype'] = torch_dtype
 
     model = None

@@ -584,7 +584,7 @@ class TokenizeDatasets(SurogateCommand):
                 continue
             logger.info(f"Encoding {'train' if i == 0 else 'validation'} dataset...")
             preprocessor = EncodePreprocessor(template=template_processor)
-            batch_size = 100 if self.config.model_template.is_multimodal else 1000
+            batch_size = 100 if self.config.model_template.is_multimodal else 10000
             
             dataset = preprocessor(
                 dataset,

@@ -138,33 +138,75 @@ class RowPreprocessor:
         self._remove_prefix_keys(batched_row, '__@')
         rows = self.batched_to_rows(batched_row)
 
+        # Check if this preprocessor supports batched processing
+        use_batched = hasattr(self, 'preprocess_batch') and callable(getattr(self, 'preprocess_batch', None))
+
         new_rows = []
-        for row in rows:
+
+        if use_batched:
+            # Use batched preprocessing (much faster for tokenization)
             try:
-                row = self.preprocess(row)
-                # support [row1, row2, ...]
-                if row is None:
-                    row = []
-                if isinstance(row, dict):
-                    row = [row]
-                for r in row:
-                    self._check_objects(r)
-                    self._check_rejected_response(r)
-                    self._check_messages(r)
-                    self._cast_mm_data(r)
+                processed_rows = self.preprocess_batch(rows)
+
+                # Post-process each result
+                for row in processed_rows:
+                    try:
+                        # support [row1, row2, ...]
+                        if row is None:
+                            row = []
+                        if isinstance(row, dict):
+                            row = [row]
+                        for r in row:
+                            self._check_objects(r)
+                            self._check_rejected_response(r)
+                            self._check_messages(r)
+                            self._cast_mm_data(r)
+                        new_rows += row
+                    except Exception as e:
+                        if strict:
+                            logger.warning('To avoid errors, you can pass `strict=False`.')
+                            raise
+                        if isinstance(e, MaxLengthError) and ignore_max_length_error:
+                            pass
+                        elif self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
+                            import traceback
+                            logger.info(traceback.format_exc())
+                            logger.warning('👆👆👆There are errors in the dataset, the data will be deleted')
+                            self._traceback_counter += 1
             except Exception as e:
-                if strict:
-                    logger.warning('To avoid errors, you can pass `strict=False`.')
-                    raise
-                if isinstance(e, MaxLengthError) and ignore_max_length_error:
-                    pass
-                elif self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
-                    import traceback
-                    logger.info(traceback.format_exc())
-                    logger.warning('👆👆👆There are errors in the dataset, the data will be deleted')
-                    self._traceback_counter += 1
-                row = []
-            new_rows += row
+                # If batch processing fails entirely, fall back to row-by-row
+                logger.warning(f'Batched preprocessing failed ({e}), falling back to row-by-row processing')
+                use_batched = False
+
+        if not use_batched:
+            # Fall back to row-by-row preprocessing (original behavior)
+            for row in rows:
+                try:
+                    row = self.preprocess(row)
+                    # support [row1, row2, ...]
+                    if row is None:
+                        row = []
+                    if isinstance(row, dict):
+                        row = [row]
+                    for r in row:
+                        self._check_objects(r)
+                        self._check_rejected_response(r)
+                        self._check_messages(r)
+                        self._cast_mm_data(r)
+                except Exception as e:
+                    if strict:
+                        logger.warning('To avoid errors, you can pass `strict=False`.')
+                        raise
+                    if isinstance(e, MaxLengthError) and ignore_max_length_error:
+                        pass
+                    elif self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
+                        import traceback
+                        logger.info(traceback.format_exc())
+                        logger.warning('👆👆👆There are errors in the dataset, the data will be deleted')
+                        self._traceback_counter += 1
+                    row = []
+                new_rows += row
+
         res = self.rows_to_batched(new_rows)
         self._remove_prefix_keys(res, '__#')  # compat GRPO
         if len(res) == 0:
