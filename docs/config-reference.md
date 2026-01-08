@@ -17,10 +17,14 @@ This section provides a comprehensive reference for all configuration options av
 
 ## Model Settings
 
-| Option         | Type   | Default     | Description                                                                |
-| -------------- | ------ | ----------- | -------------------------------------------------------------------------- |
-| `model`        | string | required    | Path or HuggingFace model identifier (e.g., `"Qwen/Qwen3-0.6B"`).          |
-| `sequence_len` | int    | model's max | Maximum sequence length for training. Defaults to model's `max_model_len`. |
+| Option         | Type   | Default     | Description                                                                                                                                                                                                                                                                                 |
+| -------------- | ------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`        | string | required    | Path or HuggingFace model identifier (e.g., `"Qwen/Qwen3-0.6B"`).                                                                                                                                                                                                                           |
+| `model_type`   | string | auto-detect | Type of the model group. Automatically detected from model config if not specified.                                                                                                                                                                                                         |
+| `sequence_len` | int    | model's max | Maximum sequence length for training. Defaults to model's `max_model_len`.                                                                                                                                                                                                                  |
+| `max_model_len`| int    | auto-detect | Maximum model length for rope scaling. Automatically detected from model config if not specified.                                                                                                                                                                                           |
+| `rope_scaling` | string | `null`      | Type of RoPE scaling. Pass a string like `"linear"`, `"dynamic"`, or `"yarn"` along with `max_model_len` to automatically configure rope_scaling. Alternatively, pass a JSON string like `'{"factor": 2.0, "type": "yarn"}'` to directly override the rope_scaling in the model's config. |
+| `torch_dtype`  | string | auto-detect | PyTorch data type for model weights. Options: `"bfloat16"`, `"float16"`, `"float32"`. Automatically detected from model config if not specified.                                                                                                                                            |
 
 ## Recomputation Options
 
@@ -130,6 +134,18 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | `max_steps`                   | int  | `-1`    | Total number of training steps. `-1` derives from epochs and dataset size.                                                                               |
 | `eval_steps`                  | int  | `100`   | Run evaluation every N optimizer steps.                                                                                                                  |
 
+## Dataset Settings
+
+| Option                     | Type  | Default | Description                                                                                                                                                                                                                            |
+| -------------------------- | ----- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `datasets`                 | list  | `null`  | List of datasets for training. Each dataset should specify `path`, `type`, and other dataset-specific options.                                                                                                                         |
+| `validation_datasets`      | list  | `null`  | List of datasets for validation during training. If not provided, uses `validation_split_ratio` to create validation split from training data.                                                                                        |
+| `validation_split_ratio`   | float | `0.1`   | Ratio of training data to use for validation if no `validation_datasets` are provided. Value between 0.0 and 1.0.                                                                                                                      |
+| `train_seed`               | int   | `1234`  | Random seed for the training dataloader. Controls shuffling and sampling order.                                                                                                                                                        |
+| `eval_seed`                | int   | `1234`  | Random seed for the evaluation dataloader. Controls shuffling and sampling order.                                                                                                                                                      |
+| `dataloader_num_workers`   | int   | auto    | Number of subprocesses to use for data loading. `0` means data will be loaded in the main process. Defaults to optimal value based on CPU count.                                                                                      |
+| `sample_packing`           | bool  | `true`  | Whether to enable sample packing to fit multiple data samples into a single sequence. Packing reduces the number of samples in the dataset; adjust gradient accumulation steps and learning rate accordingly for packed datasets.      |
+
 ## Memory Optimization Settings
 
 | Option                     | Type | Default | Description                                                                                               |
@@ -164,9 +180,23 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 ## Chat Template Settings
 
-| Option              | Type | Default | Description                                |
-| ------------------- | ---- | ------- | ------------------------------------------ |
-| `use_chat_template` | bool | `true`  | Whether to use chat template for training. |
+Chat template settings control how conversations are formatted for training and inference.
+
+| Option                     | Type   | Default    | Description                                                                                                                                              |
+| -------------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `use_chat_template`        | bool   | `true`     | Whether to use chat template for training.                                                                                                               |
+| `template`                 | string | auto       | The chat template to use. Automatically detected from model if not specified. Available templates defined in CHAT_TEMPLATE_MAPPING.                      |
+| `system`                   | string | `null`     | Override the default system prompt in the template. Use `\n` for newlines.                                                                               |
+| `max_length`               | int    | `null`     | Maximum length for tokenized conversations. Defaults to `sequence_len` if not specified.                                                                 |
+| `truncation_strategy`      | string | `"delete"` | How to handle conversations exceeding max_length. Options: `"delete"` (skip sample), `"left"` (truncate from start), `"right"` (truncate from end), `"split"` (split into multiple samples). |
+| `padding_side`             | string | `"right"`  | Which side to pad sequences on. Options: `"left"`, `"right"`.                                                                                            |
+| `padding_free`             | bool   | `false`    | Enable padding-free training for more efficient packing.                                                                                                 |
+| `loss_scale`               | string | `"default"`| Loss scaling strategy. Options: `"default"`, or custom scaling configuration.                                                                             |
+| `sequence_parallel_size`   | int    | `1`        | Sequence parallelism size for distributed training across sequence dimension.                                                                            |
+| `response_prefix`          | string | `null`     | Prefix to add before model responses during inference. Use `\n` for newlines.                                                                            |
+| `max_pixels`               | int    | `null`     | Maximum number of pixels for vision models (multimodal only).                                                                                            |
+| `norm_bbox`                | string | `null`     | Bounding box normalization strategy for vision models. Options: `"norm1000"`, `"none"`, `null`.                                                          |
+| `agent_template`           | string | `null`     | Template for agent-style conversations (advanced usage).                                                                                                 |
 
 ## Logging & Reporting
 
@@ -196,7 +226,10 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 ```yaml
 # Model
 model: Qwen/Qwen3-0.6B
+model_type: qwen  # auto-detected if not specified
 sequence_len: 2048
+max_model_len: 2048
+torch_dtype: bfloat16  # auto-detected if not specified
 
 # Output
 output_dir: ./output
@@ -211,10 +244,28 @@ learning_rate: 2e-4
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
 
+# Dataset
+datasets:
+  - path: "mlabonne/FineTome-100k"
+    type: auto
+validation_split_ratio: 0.1
+train_seed: 1234
+eval_seed: 1234
+sample_packing: true
+dataloader_num_workers: 4
+
+# Chat Template
+use_chat_template: true
+template: qwen  # auto-detected if not specified
+truncation_strategy: delete
+padding_side: right
+
 # LoRA
 lora: true
 lora_rank: 16
 lora_alpha: 32
+lora_dropout: 0.05
+lora_dtype: fp32
 
 # Memory optimization
 recompute_block: true
@@ -223,9 +274,4 @@ recipe: bf16
 # Hardware
 gpus: 1
 use_cuda_graphs: true
-
-# Dataset
-datasets:
-  - path: "mlabonne/FineTome-100k"
-    type: auto
 ```

@@ -29,15 +29,6 @@ use_fused_rope: true
 2. Each CUDA block computes cos/sin values on-the-fly using `sincosf()`
 3. Results cached in shared memory and reused across all heads in the block
 
-
-### Memory savings
-
-For a 2K sequence length with 128 head dimension:
-- Standard: `2048 × 256 × 2 bytes = 1 MB` per model
-- Fused: 0 bytes (no allocation)
-
-The trade-off is a small compute overhead from `sincosf()` calls, but this is offset by reduced memory bandwidth from avoiding global memory reads of the precomputed tensor.
-
 ### When to use
 
 Fused RoPE is beneficial when:
