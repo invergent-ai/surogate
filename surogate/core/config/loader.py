@@ -2,6 +2,7 @@ import json
 import os
 import re
 from typing import Any, Type
+from urllib.request import urlopen
 import yaml
 from surogate.core.config.eval_config import EvalConfig
 from surogate.core.config.ptq_config import PTQConfig
@@ -15,12 +16,19 @@ logger = get_logger()
 SurogateConfig = SFTConfig | ServeConfig | PTQConfig | EvalConfig
 
 def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
-    with open(path, encoding="utf-8") as file:
-        cfg_dict = yaml.safe_load(file)
-        
-        # Expand environment variables
-        cfg_dict = _expand_env_vars(cfg_dict)
-        cfg: DictDefault = DictDefault(cfg_dict)
+    # Check if path is an HTTP(S) URL
+    if path.startswith(('http://', 'https://')):
+        logger.info(f"Fetching config from URL: {path}")
+        with urlopen(path) as response:
+            content = response.read().decode('utf-8')
+            cfg_dict = yaml.safe_load(content)
+    else:
+        with open(path, encoding="utf-8") as file:
+            cfg_dict = yaml.safe_load(file)
+
+    # Expand environment variables
+    cfg_dict = _expand_env_vars(cfg_dict)
+    cfg: DictDefault = DictDefault(cfg_dict)
     
     config = config_cls(cfg)
     cfg.config_path = path
