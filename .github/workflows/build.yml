@@ -14,7 +14,7 @@ jobs:
     name: Build wheel (${{ matrix.compiler.name }})
     runs-on: ubuntu-24.04
     container:
-      image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+      image: nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
     strategy:
       matrix:
         compiler:
