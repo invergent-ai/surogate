@@ -12,11 +12,19 @@ import subprocess
 import sys
 import tomlkit
 
-# Mapping of package names to their wheel filename patterns
-# Format: {package_name: (wheel_prefix, version)}
-TORCH_PACKAGES = {
-    'torch': ('torch', '2.9.1'),
-    'torchvision': ('torchvision', '0.24.1'),
+# Mapping of package names to their versions per CUDA tag
+# Format: {package_name: {cuda_tag: version}}
+TORCH_VERSIONS = {
+    'torch': {
+        'cu128': '2.9.1',
+        'cu129': '2.9.1',
+        'cu130': '2.9.1', 
+    },
+    'torchvision': {
+        'cu128': '0.24.1',
+        'cu129': '0.24.1',
+        'cu130': '0.24.1',
+    },
 }
 
 
@@ -24,11 +32,11 @@ def get_direct_url(package_name: str, version: str, index_url: str, cuda_tag: st
     """
     Generate a PEP 440 direct URL reference for a PyTorch package.
 
-    Example: torch @ https://download.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp312-cp312-linux_x86_64.whl
+    Example: torch @ https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl
     """
     # PyTorch wheel naming convention
     # Note: + is URL-encoded as %2B in the wheel filename
-    wheel_name = f"{package_name}-{version}%2B{cuda_tag}-cp312-cp312-linux_x86_64.whl"
+    wheel_name = f"{package_name}-{version}%2B{cuda_tag}-cp312-cp312-manylinux_2_28_x86_64.whl"
     return f"{package_name} @ {index_url}/{wheel_name}"
 
 
@@ -42,8 +50,12 @@ def update_dependencies(cuda_tag: str, torch_index_url: str):
         # Parse dependency name (handle various formats like "torch==2.9.1", "torch>=2.0")
         dep_name = dep.split('==')[0].split('>=')[0].split('<=')[0].split('[')[0].strip()
 
-        if dep_name in TORCH_PACKAGES:
-            _, version = TORCH_PACKAGES[dep_name]
+        if dep_name in TORCH_VERSIONS:
+            version = TORCH_VERSIONS[dep_name].get(cuda_tag)
+            if not version:
+                print(f"Warning: No version found for {dep_name} with {cuda_tag}, skipping")
+                new_deps.append(dep)
+                continue
             direct_url = get_direct_url(dep_name, version, torch_index_url, cuda_tag)
             new_deps.append(direct_url)
             print(f"Replaced {dep} with {direct_url}")
