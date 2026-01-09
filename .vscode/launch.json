@@ -9,7 +9,7 @@
             "type": "debugpy",
             "request": "launch",
             "module": "surogate.cli.main",
-            "args": ["tokenize", "--config", "${workspaceFolder}/examples/pt/qwen3.yaml"],
+            "args": ["tokenize", "${workspaceFolder}/examples/pt/qwen3.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"}
@@ -19,7 +19,7 @@
             "type": "debugpy",
             "request": "launch",
             "module": "surogate.cli.main",
-            "args": ["sft", "--config", "${workspaceFolder}/examples/sft/qwen3-lora-bf16.yaml"],
+            "args": ["sft", "${workspaceFolder}/examples/sft/qwen3-lora-bf16.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"}
@@ -29,7 +29,7 @@
             "type": "debugpy",
             "request": "launch",
             "module": "surogate.cli.main",
-            "args": ["pt", "--config", "${workspaceFolder}/examples/pt/qwen3-bf16.yaml"],
+            "args": ["pt", "${workspaceFolder}/examples/pt/qwen3-bf16.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"}

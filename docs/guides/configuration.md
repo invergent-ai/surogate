@@ -10,9 +10,9 @@ Surogate is driven by a YAML config file.
 Run via CLI:
 
 ```bash
-surogate sft --config path/to/config.yaml
+surogate sft path/to/config.yaml
 # or
-surogate pt --config path/to/config.yaml
+surogate pt path/to/config.yaml
 ```
 
 ## What to edit first

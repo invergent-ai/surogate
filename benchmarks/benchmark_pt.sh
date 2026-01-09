@@ -12,4 +12,4 @@ rm -rf ./output/benchmark_pt_${RECIPE} /tmp/benchmark_${RECIPE}.yaml
 cp examples/pt/qwen3-lora-${RECIPE}.yaml /tmp/benchmark_${RECIPE}.yaml
 sed -i "s|^model: .*|model: ${MODEL}|" /tmp/benchmark_${RECIPE}.yaml
 sed -i "s|^output_dir: .*|output_dir: ./output/benchmark_pt_${RECIPE}|" /tmp/benchmark_${RECIPE}.yaml
-surogate pt --config /tmp/benchmark_${RECIPE}.yaml
+surogate pt /tmp/benchmark_${RECIPE}.yaml

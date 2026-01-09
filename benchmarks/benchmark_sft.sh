@@ -8,8 +8,8 @@ if [ -z "$MODEL" ] || [ -z "$RECIPE" ]; then
     exit 1
 fi
 
-rm -rf ./output/benchmark_sft_${RECIPE} /tmp/benchmark_${RECIPE}.yaml
-cp examples/sft/qwen3-lora-${RECIPE}.yaml /tmp/benchmark_${RECIPE}.yaml
-sed -i "s|^model: .*|model: ${MODEL}|" /tmp/benchmark_${RECIPE}.yaml
-sed -i "s|^output_dir: .*|output_dir: ./output/benchmark_sft_${RECIPE}|" /tmp/benchmark_${RECIPE}.yaml
-surogate sft --config /tmp/benchmark_${RECIPE}.yaml
+rm -rf ./output/benchmark_sft_${RECIPE} /tmp/bench_${USER}_${RECIPE}.yaml
+cp examples/sft/qwen3-lora-${RECIPE}.yaml /tmp/bench_${USER}_${RECIPE}.yaml
+sed -i "s|^model: .*|model: ${MODEL}|" /tmp/bench_${USER}_${RECIPE}.yaml
+sed -i "s|^output_dir: .*|output_dir: ./output/benchmark_sft_${RECIPE}|" /tmp/bench_${USER}_${RECIPE}.yaml
+surogate sft /tmp/bench_${USER}_${RECIPE}.yaml

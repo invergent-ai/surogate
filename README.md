@@ -115,7 +115,7 @@ datasets:
 
 2) Run:
 ```bash
-surogate sft --config path/to/config.yaml
+surogate sft config.yaml
 ```
 
 3) Outputs:

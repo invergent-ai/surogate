@@ -111,7 +111,7 @@ You can also enable the `debug_timing_breakdown` flag to get a detailed timing b
 If you suspect your dataset is being labeled/masked incorrectly (for example, wrong tokens are ignored), run the tokenizer step with `--debug`:
 
 ```bash
-surogate tokenize --config <path/to/config.yaml> --debug
+surogate tokenize config.yaml --debug
 ```
 
 This prints tokens alongside their labels so you can confirm that the right spans are being ignored.

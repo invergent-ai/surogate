@@ -12,7 +12,7 @@ def prepare_command_parser(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
 
-    parser.add_argument('--config', type=str, required=True, help='Path to config file')
+    parser.add_argument('config', type=str, help='Path or HTTP(s) URL to config file')
     parser.add_argument('--debug', action='store_true', help='Print tokens along with their labels so you can confirm the correct items are being ignored.')
     parser.add_argument('--hub_token', type=str, help='Hugging Face token for private model access', default=None)
 

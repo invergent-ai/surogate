@@ -12,13 +12,13 @@ A reasonable default starting point:
 ## 2) Run
 
 ```bash
-surogate sft --config examples/sft/qwen3-lora-bf16.yaml
+surogate sft examples/sft/qwen3-lora-bf16.yaml
 ```
 
 If you use `uv` and want to guarantee you’re running inside the project environment:
 
 ```bash
-uv run surogate sft --config examples/sft/qwen3-lora-bf16.yaml
+uv run surogate sft examples/sft/qwen3-lora-bf16.yaml
 ```
 
 ## 3) Outputs

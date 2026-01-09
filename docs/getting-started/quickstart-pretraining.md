@@ -12,13 +12,13 @@ Start with:
 ## 2) Run
 
 ```bash
-surogate pt --config examples/pt/qwen3.yaml
+surogate pt examples/pt/qwen3.yaml
 ```
 
 Or, via `uv`:
 
 ```bash
-uv run surogate pt --config examples/pt/qwen3.yaml
+uv run surogate pt examples/pt/qwen3.yaml
 ```
 
 ## 3) Outputs
