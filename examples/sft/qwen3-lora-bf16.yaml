@@ -16,7 +16,6 @@ save_steps: 0
 learning_rate: 1e-4
 
 recipe: bf16
-optimizer: adamw_8bit
 
 lora: true
 lora_rank: 16

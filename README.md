@@ -43,7 +43,8 @@ Surogate is built for developers and enterprises that need fast experimentation 
   - [**🔥 FP8**](./csrc/src/recipes/fp8_hybrid/README.md): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
   - [**🔥 NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
 - **⚡ BnB/FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
-- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121 (WIP)
+- **👌 Optimizers**: AdamW 8bit, !! NorMuon !!
+- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - **🧪 Fast Experimentation**: Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
 - **🧠 Supported models**: Qwen2.5, Qwen3 Dense, LLama 3.2, more to come shortly
@@ -64,7 +65,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - `SM100`: B200, GB200
 - `SM103`: B300, GB300
 - `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
-- `SM121`: DGX Spark (in progress)
+- `SM121`: DGX Spark
   
 ---
 
@@ -76,10 +77,11 @@ curl -LsSf https://surogate.ai/install.sh | sh
 ```
 
 ### Option B: Build from source (dev / contributors)
+You need CUDA 12.8/12.9/13.x installed on your machine and NCCL development libraries libnccl-dev for your CUDA version
+
 ```bash
 # ...clone repo...
-make build
-# or: make wheel / make wheel-dev
+uv pip install -e .
 ```
 
 ---
@@ -103,6 +105,7 @@ lora: true
 lora_rank: 16
 # qlora_fp8: true  # optional, hardware-dependent
 # qlora_fp4: true  # Blackwell+
+# qlora_bnb: true  # Any GPU, lowest
 
 datasets:
   - path: "mlabonne/FineTome-100k"
@@ -115,7 +118,7 @@ surogate sft --config path/to/config.yaml
 ```
 
 3) Outputs:
-- checkpoints/logs/artifacts are written under `output_dir`
+- checkpoints, logs and artifacts are written under `output_dir`
 
 ---
 
