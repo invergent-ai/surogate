@@ -49,9 +49,7 @@ dependencies = [
     "adlfs>=2024.7.0,<2025.8.0",
     "ocifs==1.3.4",
     "densemax-lakefs-spec @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_spec-1.50.0-py3-none-any.whl",
-    "densemax-lakefs-sdk @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_sdk-1.50.0-py3-none-any.whl",
-    "torch==2.9.1",
-    "torchvision==0.24.1",
+    "densemax-lakefs-sdk @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_sdk-1.50.0-py3-none-any.whl"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
@@ -99,32 +97,5 @@ cache-keys = [
     { file = "CMakeLists.txt" },
     { file = "csrc/CMakeLists.txt" }
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu" },
-]
-torchvision = [
-    { index = "pytorch-cpu" },
-]
+.
 
