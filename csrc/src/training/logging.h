@@ -51,6 +51,7 @@ public:
 
     void log_sol_estimate(std::vector<std::pair<ETensorDType, long>> ops, int world_size);
     void set_callback(std::function<void(std::string_view)> cb);
+    void set_training_tokens(long total_tokens);
 
     void log_cmd(int argc, const char** argv);
     void log_options(const std::vector<std::pair<std::string_view, std::variant<bool, std::int64_t, float, std::string>>>& options);
@@ -104,9 +105,16 @@ private:
 
     // to estimate ETA
     int mRemainingTokens = -1;
+    int mTotalTokens = -1;
+    std::chrono::steady_clock::time_point mTrainingStartTime;
 
     // to estimate MFU
     long mExpectedTimePerToken = -1;
+
+    // for tracking trends
+    float mPreviousLoss = -1.0f;
+    float mNormMovingAverage = 0.0f;
+    int mNormSampleCount = 0;
 
     // arbitrary callback for log lines
     std::function<void(std::string_view)> mCallback;

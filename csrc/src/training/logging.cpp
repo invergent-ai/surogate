@@ -226,18 +226,64 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
     if(mVerbosity >= 0) {
         float iptr;
         float progress = 100.f * std::modf(epoch,  &iptr);
-        std::string tps_msg = format_tps(step_tokens, duration_ms);
-        std::string time_str = format_time(duration_ms);
-        std::string sol_msg = "";
 
-        // speed-of-light
+        // Tokens per second
+        long tps = (duration_ms > 0) ? (1000ll * step_tokens / duration_ms) : 0;
+
+        // Loss trend indicator
+        char trend = ' ';
+        if (mPreviousLoss > 0) {
+            if (loss < mPreviousLoss) {
+                trend = '\\';
+            } else if (loss > mPreviousLoss) {
+                trend = '/';
+            }
+        }
+        mPreviousLoss = loss;
+
+        // Update norm moving average
+        if (mNormSampleCount < 100) {
+            mNormMovingAverage = (mNormMovingAverage * mNormSampleCount + norm) / (mNormSampleCount + 1);
+            ++mNormSampleCount;
+        } else {
+            // Exponential moving average with alpha=0.1
+            mNormMovingAverage = 0.9f * mNormMovingAverage + 0.1f * norm;
+        }
+
+        // Check if norm exceeds threshold
+        char norm_flag = ' ';
+        if (mNormSampleCount >= 10 && mNormMovingAverage > 0 && norm > 5.0f * mNormMovingAverage) {
+            norm_flag = '!';
+        }
+
+        // Speed of light percentage
+        std::string sol_str = "";
         if (mExpectedTimePerToken > 0) {
             long peak = mExpectedTimePerToken * step_tokens / 1'000'000;
             double ratio = static_cast<double>(peak) / static_cast<double>(duration_ms);
-            sol_msg = fmt::format(" | sol {:.1f}%", ratio * 100.0);
+            sol_str = fmt::format(" | sol {:4.1f}", ratio * 100.0);
         }
 
-        printf("[T] step %5d [%5.1f%%] | time: %s | norm %10f | loss %10f | tps %s%s\n", step, progress, time_str.c_str(), norm, loss, tps_msg.c_str(), sol_msg.c_str());
+        // ETA calculation
+        std::string eta_str = "";
+        if (mRemainingTokens > 0 && mTotalTokens > 0) {
+            mRemainingTokens -= step_tokens;
+            auto elapsed = std::chrono::steady_clock::now() - mTrainingStartTime;
+            long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            long tokens_processed = mTotalTokens - mRemainingTokens;
+
+            if (tokens_processed > 0 && elapsed_ms > 0) {
+                double tokens_per_ms = static_cast<double>(tokens_processed) / elapsed_ms;
+                long eta_ms = static_cast<long>(mRemainingTokens / tokens_per_ms);
+
+                long eta_hours = eta_ms / (1000 * 60 * 60);
+                long eta_minutes = (eta_ms % (1000 * 60 * 60)) / (1000 * 60);
+                eta_str = fmt::format(" | eta {:02d}h{:02d}m", eta_hours, eta_minutes);
+            }
+        }
+
+        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s\n",
+               step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, sol_str.c_str(), eta_str.c_str());
         fflush(stdout);
     }
     log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}}})",
@@ -260,12 +306,14 @@ void TrainingRunLogger::log_eval(int step, float epoch, int eval_tokens, int dur
 {
     if(mRank != 0) return;
     if(mVerbosity >= -1) {
-        float iptr;
-        float progress = 100.f * std::modf(epoch,  &iptr);
         float train_avg = static_cast<float>(mTotalTrainingLoss / std::max(mTotalTrainingSteps, 1));
-        std::string tps_msg = format_tps(eval_tokens, duration_ms);
-        std::string time_str = format_time(duration_ms);
-        printf("\x1b[1m[V] step %5d [%5.1f%%] | time: %s | eval %10f | train %9f | tps %s\x1b[22m\n", step, progress, time_str.c_str(), loss, train_avg, tps_msg.c_str());
+        float gap = loss - train_avg;
+
+        // Tokens per second
+        long tps = (duration_ms > 0) ? (1000ll * eval_tokens / duration_ms) : 0;
+
+        printf("\x1b[1m>> eval                      loss %6.4f | gap %+7.4f | %5.1fk tps | %5d ms\x1b[22m\n",
+               loss, gap, tps / 1000.0f, duration_ms);
         fflush(stdout);
     }
     mTotalTrainingLoss = 0;
@@ -844,6 +892,17 @@ void TrainingRunLogger::log_abs_maxes(int step, const std::vector<std::pair<std:
  */
 void TrainingRunLogger::set_callback(std::function<void(std::string_view)> cb) {
     mCallback = std::move(cb);
+}
+
+/**
+ * @brief Set the total training tokens for ETA calculation.
+ *
+ * @param total_tokens Total number of tokens to process during training.
+ */
+void TrainingRunLogger::set_training_tokens(long total_tokens) {
+    mTotalTokens = total_tokens;
+    mRemainingTokens = total_tokens;
+    mTrainingStartTime = std::chrono::steady_clock::now();
 }
 
 /**
