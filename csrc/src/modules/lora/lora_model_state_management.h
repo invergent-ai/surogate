@@ -103,6 +103,19 @@ void ModularLoRAModel<Block>::allocate_run_state(const RuntimeOptions& options, 
     if (lora_enabled() && !mLoRAAdamW8BitState) {
         mLoRAAdamW8BitState = std::make_unique<LoRAAdamW8BitState>();
         mLoRAAdamW8BitState->initialized = false;
+
+        // Allocate quantization maps (256 entries each)
+        mLoRAAdamW8BitState->quantiles1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_quantiles1", {256});
+        mLoRAAdamW8BitState->quantiles2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_quantiles2", {256});
+
+        // Initialize quantization maps on host then copy to device
+        std::vector<float> h_quantiles1(256), h_quantiles2(256);
+        create_adamw8bit_quantiles1(h_quantiles1.data());
+        create_adamw8bit_quantiles2(h_quantiles2.data());
+        CUDA_CHECK(cudaMemcpy(mLoRAAdamW8BitState->quantiles1.Data, h_quantiles1.data(),
+                              256 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(mLoRAAdamW8BitState->quantiles2.Data, h_quantiles2.data(),
+                              256 * sizeof(float), cudaMemcpyHostToDevice));
     }
 }
 
