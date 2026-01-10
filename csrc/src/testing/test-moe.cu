@@ -10,6 +10,7 @@
 #include <numeric>
 
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 
 #include <thrust/device_vector.h>
 #include <thrust/copy.h>
@@ -765,4 +766,355 @@ TEST_CASE("moe full forward pass integration", "[moe][integration][fp32]") {
     float max_diff = max_abs_diff(h_output.data(), h_output_cpu.data(), num_tokens * hidden_size);
     INFO("Max difference in full forward pass: " << max_diff);
     REQUIRE(max_diff < 1e-3f);
+}
+
+// ============================================================================
+// Router Z-Loss Tests
+// ============================================================================
+
+// CPU reference for logsumexp
+static float logsumexp_cpu(const float* logits, int num_experts) {
+    float max_val = logits[0];
+    for (int e = 1; e < num_experts; ++e) {
+        max_val = std::max(max_val, logits[e]);
+    }
+    float sum = 0.0f;
+    for (int e = 0; e < num_experts; ++e) {
+        sum += std::exp(logits[e] - max_val);
+    }
+    return max_val + std::log(sum);
+}
+
+// CPU reference for z-loss
+static float z_loss_cpu(const float* router_logits, int num_tokens, int num_experts, float z_loss_coef) {
+    float z_loss = 0.0f;
+    for (int t = 0; t < num_tokens; ++t) {
+        float lse = logsumexp_cpu(router_logits + t * num_experts, num_experts);
+        z_loss += lse * lse;
+    }
+    return z_loss_coef * z_loss / num_tokens;
+}
+
+// CPU reference for z-loss backward
+static void z_loss_backward_cpu(float* d_logits, const float* router_logits,
+                                 int num_tokens, int num_experts, float z_loss_coef) {
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* logits = router_logits + t * num_experts;
+        float* d_l = d_logits + t * num_experts;
+
+        // Compute logsumexp
+        float lse = logsumexp_cpu(logits, num_experts);
+
+        // Compute softmax
+        float max_val = logits[0];
+        for (int e = 1; e < num_experts; ++e) {
+            max_val = std::max(max_val, logits[e]);
+        }
+        float sum = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            sum += std::exp(logits[e] - max_val);
+        }
+
+        // d_logits = coef * (2 * lse / num_tokens) * softmax
+        float scale = z_loss_coef * 2.0f * lse / num_tokens;
+        for (int e = 0; e < num_experts; ++e) {
+            float softmax_val = std::exp(logits[e] - max_val) / sum;
+            d_l[e] = scale * softmax_val;
+        }
+    }
+}
+
+TEST_CASE("moe_router_z_loss_forward FP32", "[moe][z_loss]") {
+    const int num_tokens = 32;
+    const int num_experts = 8;
+    const float z_loss_coef = 0.01f;
+
+    // Create random router logits
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits[i] = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;  // [-1, 1]
+    }
+
+    // CPU reference
+    float z_loss_cpu_val = z_loss_cpu(h_logits.data(), num_tokens, num_experts, z_loss_coef);
+
+    // GPU
+    thrust::device_vector<float> d_logits = to_device(h_logits);
+    thrust::device_vector<float> d_z_loss(1, 0.0f);
+
+    moe_router_z_loss_forward(
+        thrust::raw_pointer_cast(d_z_loss.data()),
+        thrust::raw_pointer_cast(d_logits.data()),
+        num_tokens, num_experts, z_loss_coef, 0
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float z_loss_gpu;
+    CUDA_CHECK(cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()),
+                          sizeof(float), cudaMemcpyDeviceToHost));
+
+    INFO("CPU z-loss: " << z_loss_cpu_val);
+    INFO("GPU z-loss: " << z_loss_gpu);
+    REQUIRE(std::abs(z_loss_gpu - z_loss_cpu_val) < 1e-5f);
+}
+
+TEST_CASE("moe_router_z_loss_forward BF16", "[moe][z_loss]") {
+    const int num_tokens = 64;
+    const int num_experts = 16;
+    const float z_loss_coef = 0.001f;
+
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits[i] = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;
+    }
+
+    // Convert to BF16
+    std::vector<nv_bfloat16> h_logits_bf16(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits_bf16[i] = __float2bfloat16(h_logits[i]);
+    }
+
+    // CPU reference (using FP32 logits for reference)
+    float z_loss_cpu_val = z_loss_cpu(h_logits.data(), num_tokens, num_experts, z_loss_coef);
+
+    // GPU with BF16
+    thrust::device_vector<nv_bfloat16> d_logits(h_logits_bf16.begin(), h_logits_bf16.end());
+    thrust::device_vector<float> d_z_loss(1, 0.0f);
+
+    moe_router_z_loss_forward(
+        thrust::raw_pointer_cast(d_z_loss.data()),
+        thrust::raw_pointer_cast(d_logits.data()),
+        num_tokens, num_experts, z_loss_coef, 0
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float z_loss_gpu;
+    CUDA_CHECK(cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()),
+                          sizeof(float), cudaMemcpyDeviceToHost));
+
+    INFO("CPU z-loss: " << z_loss_cpu_val);
+    INFO("GPU z-loss (BF16): " << z_loss_gpu);
+    // BF16 has lower precision, allow larger tolerance
+    REQUIRE(std::abs(z_loss_gpu - z_loss_cpu_val) < 1e-2f);
+}
+
+TEST_CASE("moe_router_z_loss_backward FP32", "[moe][z_loss]") {
+    const int num_tokens = 32;
+    const int num_experts = 8;
+    const float z_loss_coef = 0.01f;
+
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits[i] = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;
+    }
+
+    // CPU reference
+    std::vector<float> h_d_logits_cpu(num_tokens * num_experts);
+    z_loss_backward_cpu(h_d_logits_cpu.data(), h_logits.data(),
+                        num_tokens, num_experts, z_loss_coef);
+
+    // GPU
+    thrust::device_vector<float> d_logits = to_device(h_logits);
+    thrust::device_vector<float> d_d_logits(num_tokens * num_experts, 0.0f);
+
+    moe_router_z_loss_backward(
+        thrust::raw_pointer_cast(d_d_logits.data()),
+        thrust::raw_pointer_cast(d_logits.data()),
+        num_tokens, num_experts, z_loss_coef, 0
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_d_logits_gpu = from_device(d_d_logits);
+
+    float max_diff = max_abs_diff(h_d_logits_gpu.data(), h_d_logits_cpu.data(), num_tokens * num_experts);
+    INFO("Max gradient difference: " << max_diff);
+    REQUIRE(max_diff < 1e-5f);
+}
+
+TEST_CASE("moe_router_z_loss large logits", "[moe][z_loss]") {
+    // Test numerical stability with large logits
+    const int num_tokens = 16;
+    const int num_experts = 8;
+    const float z_loss_coef = 0.01f;
+
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        // Large range: [-50, 50] to test numerical stability
+        h_logits[i] = 100.0f * (static_cast<float>(rand()) / RAND_MAX) - 50.0f;
+    }
+
+    // CPU reference
+    float z_loss_cpu_val = z_loss_cpu(h_logits.data(), num_tokens, num_experts, z_loss_coef);
+
+    // GPU
+    thrust::device_vector<float> d_logits = to_device(h_logits);
+    thrust::device_vector<float> d_z_loss(1, 0.0f);
+
+    moe_router_z_loss_forward(
+        thrust::raw_pointer_cast(d_z_loss.data()),
+        thrust::raw_pointer_cast(d_logits.data()),
+        num_tokens, num_experts, z_loss_coef, 0
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float z_loss_gpu;
+    CUDA_CHECK(cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()),
+                          sizeof(float), cudaMemcpyDeviceToHost));
+
+    INFO("CPU z-loss (large logits): " << z_loss_cpu_val);
+    INFO("GPU z-loss (large logits): " << z_loss_gpu);
+    // Should be numerically stable - relative tolerance
+    float rel_diff = std::abs(z_loss_gpu - z_loss_cpu_val) / std::abs(z_loss_cpu_val);
+    REQUIRE(rel_diff < 1e-4f);
+}
+
+// ============================================================================
+// Grouped GEMM Tests
+// ============================================================================
+
+TEST_CASE("moe_grouped_gemm_gate_up FP32", "[moe][grouped_gemm]") {
+    const int num_experts = 4;
+    const int hidden_size = 64;     // C
+    const int intermediate_size = 128;  // D
+    const int total_tokens = 32;
+
+    // Create expert offsets (uniform distribution for simplicity)
+    std::vector<int> h_offsets(num_experts + 1);
+    h_offsets[0] = 0;
+    for (int e = 0; e < num_experts; ++e) {
+        h_offsets[e + 1] = h_offsets[e] + total_tokens / num_experts;
+    }
+    h_offsets[num_experts] = total_tokens;  // Ensure last offset is total
+
+    // Create random input (total_tokens, C)
+    std::vector<float> h_input(total_tokens * hidden_size);
+    for (auto& v : h_input) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+
+    // Create random weights (num_experts, 2*D, C)
+    std::vector<float> h_weights(num_experts * 2 * intermediate_size * hidden_size);
+    for (auto& v : h_weights) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+
+    // CPU reference: sequential per-expert matmul
+    std::vector<float> h_output_cpu(total_tokens * 2 * intermediate_size, 0.0f);
+    for (int e = 0; e < num_experts; ++e) {
+        int start = h_offsets[e];
+        int end = h_offsets[e + 1];
+        int tokens_e = end - start;
+        if (tokens_e == 0) continue;
+
+        const float* w = h_weights.data() + e * (2 * intermediate_size) * hidden_size;
+
+        // output[start:end] = input[start:end] @ weight^T
+        for (int t = 0; t < tokens_e; ++t) {
+            for (int d = 0; d < 2 * intermediate_size; ++d) {
+                float sum = 0.0f;
+                for (int c = 0; c < hidden_size; ++c) {
+                    sum += h_input[(start + t) * hidden_size + c] * w[d * hidden_size + c];
+                }
+                h_output_cpu[(start + t) * 2 * intermediate_size + d] = sum;
+            }
+        }
+    }
+
+    // GPU
+    thrust::device_vector<float> d_input = to_device(h_input);
+    thrust::device_vector<float> d_weights = to_device(h_weights);
+    thrust::device_vector<int> d_offsets = to_device(h_offsets);
+    thrust::device_vector<float> d_output(total_tokens * 2 * intermediate_size, 0.0f);
+
+    // Create cuBLAS handle
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
+
+    moe_grouped_gemm_gate_up(
+        thrust::raw_pointer_cast(d_output.data()),
+        thrust::raw_pointer_cast(d_input.data()),
+        thrust::raw_pointer_cast(d_weights.data()),
+        thrust::raw_pointer_cast(d_offsets.data()),
+        num_experts, hidden_size, intermediate_size,
+        cublas_handle, 0
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_output_gpu = from_device(d_output);
+
+    float max_diff = max_abs_diff(h_output_gpu.data(), h_output_cpu.data(),
+                                   total_tokens * 2 * intermediate_size);
+    INFO("Max difference in grouped gate_up GEMM: " << max_diff);
+    REQUIRE(max_diff < 1e-4f);
+
+    cublasDestroy(cublas_handle);
+}
+
+TEST_CASE("moe_grouped_gemm_down FP32", "[moe][grouped_gemm]") {
+    const int num_experts = 4;
+    const int hidden_size = 64;     // C
+    const int intermediate_size = 128;  // D
+    const int total_tokens = 32;
+
+    // Create expert offsets
+    std::vector<int> h_offsets(num_experts + 1);
+    h_offsets[0] = 0;
+    for (int e = 0; e < num_experts; ++e) {
+        h_offsets[e + 1] = h_offsets[e] + total_tokens / num_experts;
+    }
+    h_offsets[num_experts] = total_tokens;
+
+    // Create random input (total_tokens, D)
+    std::vector<float> h_input(total_tokens * intermediate_size);
+    for (auto& v : h_input) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+
+    // Create random weights (num_experts, C, D)
+    std::vector<float> h_weights(num_experts * hidden_size * intermediate_size);
+    for (auto& v : h_weights) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+
+    // CPU reference
+    std::vector<float> h_output_cpu(total_tokens * hidden_size, 0.0f);
+    for (int e = 0; e < num_experts; ++e) {
+        int start = h_offsets[e];
+        int end = h_offsets[e + 1];
+        int tokens_e = end - start;
+        if (tokens_e == 0) continue;
+
+        const float* w = h_weights.data() + e * hidden_size * intermediate_size;
+
+        // output[start:end] = input[start:end] @ weight^T
+        for (int t = 0; t < tokens_e; ++t) {
+            for (int c = 0; c < hidden_size; ++c) {
+                float sum = 0.0f;
+                for (int d = 0; d < intermediate_size; ++d) {
+                    sum += h_input[(start + t) * intermediate_size + d] * w[c * intermediate_size + d];
+                }
+                h_output_cpu[(start + t) * hidden_size + c] = sum;
+            }
+        }
+    }
+
+    // GPU
+    thrust::device_vector<float> d_input = to_device(h_input);
+    thrust::device_vector<float> d_weights = to_device(h_weights);
+    thrust::device_vector<int> d_offsets = to_device(h_offsets);
+    thrust::device_vector<float> d_output(total_tokens * hidden_size, 0.0f);
+
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
+
+    moe_grouped_gemm_down(
+        thrust::raw_pointer_cast(d_output.data()),
+        thrust::raw_pointer_cast(d_input.data()),
+        thrust::raw_pointer_cast(d_weights.data()),
+        thrust::raw_pointer_cast(d_offsets.data()),
+        num_experts, hidden_size, intermediate_size,
+        cublas_handle, 0
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_output_gpu = from_device(d_output);
+
+    float max_diff = max_abs_diff(h_output_gpu.data(), h_output_cpu.data(),
+                                   total_tokens * hidden_size);
+    INFO("Max difference in grouped down GEMM: " << max_diff);
+    REQUIRE(max_diff < 1e-4f);
+
+    cublasDestroy(cublas_handle);
 }

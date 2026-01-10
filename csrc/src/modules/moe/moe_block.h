@@ -7,6 +7,7 @@
 
 #include "expert.h"
 #include "router.h"
+#include "config/rope_config.h"
 #include "modules/module_base.h"
 #include "modules/primitives/attention.h"
 #include "modules/primitives/rmsnorm.h"
@@ -45,7 +46,7 @@ public:
         int num_kv_heads;
         int head_size;
         float rms_norm_eps = 1e-5f;
-        float rope_theta = 10000.0f;
+        RoPEConfig rope;  // Flexible RoPE configuration
         int max_seq_len = 2048;
         bool use_qkv_bias = false;
 
@@ -171,7 +172,7 @@ MoETransformerBlock<AttentionType, RouterType, NormType>::MoETransformerBlock(Co
         .hidden_size = config.hidden_size,
         .num_query_heads = config.num_query_heads,
         .num_kv_heads = config.num_kv_heads,
-        .rope_theta = config.rope_theta,
+        .rope = config.rope,
         .use_qkv_bias = config.use_qkv_bias
       })
     , mRouter({
@@ -209,28 +210,46 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::forward_impl(
     const int B = ctx.B;
     const int T = ctx.T;
     const int C = mConfig.hidden_size;
+    const long N = static_cast<long>(B) * T * C;
 
     // ========================================================================
     // Attention block: LN1 -> Attention -> Residual
     // ========================================================================
 
-    // Layer norm 1
-    Tensor ln1_out = mLN1.forward(ctx, w.ln1, input, acts.ln1);
+    // Layer norm 1 (standalone for first application)
+    Tensor ln1_out;
+    if constexpr (std::is_same_v<NormType, FusedResidualRMSNormModule>) {
+        RMSNormModule standalone_ln1({mConfig.hidden_size, mConfig.rms_norm_eps});
+        RMSNormModule::Activations standalone_acts;
+        RMSNormModule::Weights standalone_weights{w.ln1.weight};
+        ln1_out = standalone_ln1.forward(ctx, standalone_weights, input, standalone_acts);
+        acts.ln1.output.Value = ln1_out;
+        acts.ln1.rstd = standalone_acts.rstd;
+    } else {
+        ln1_out = mLN1.forward(ctx, w.ln1, input, acts.ln1);
+    }
 
     // Attention
     Tensor att_out = mAttention.forward(ctx, w.attention, ln1_out, acts.attention);
 
-    // First residual connection
+    // ========================================================================
+    // MoE block: LN2 (with fused residual) -> Router -> Experts -> Residual
+    // ========================================================================
+
+    // Pre-MoE LayerNorm with fused residual add:
     // residual_att = input + att_out
-    acts.residual_att = input;  // Placeholder - actual add needed
-    // vector_add(acts.residual_att, input, att_out, B * T * C, ctx.stream);
-
-    // ========================================================================
-    // MoE block: LN2 -> Router -> Experts -> Residual
-    // ========================================================================
-
-    // Layer norm 2
-    Tensor ln2_out = mLN2.forward(ctx, w.ln2, acts.residual_att, acts.ln2);
+    // ln2_out = RMSNorm(residual_att)
+    Tensor ln2_out;
+    if constexpr (std::is_same_v<NormType, FusedResidualRMSNormModule>) {
+        FusedResidualRMSNormModule ln2({mConfig.hidden_size, mConfig.rms_norm_eps});
+        ln2.forward_with_residual(ctx, w.ln2, att_out, input, acts.ln2);
+        acts.residual_att = acts.ln2.residual_out;
+        ln2_out = acts.ln2.output.Value;
+    } else {
+        // Manual residual add + norm (seed=0 for deterministic stochastic rounding)
+        vector_add_sr(acts.residual_att, input, att_out, 1.0f, N, /*seed=*/0, ctx.stream);
+        ln2_out = mLN2.forward(ctx, w.ln2, acts.residual_att, acts.ln2);
+    }
 
     // Router: compute routing decisions
     // Reshape ln2_out to (B*T, C) for routing
@@ -248,8 +267,8 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::forward_impl(
     if (mSharedExpert && w.shared_expert.has_value()) {
         Tensor shared_out = mSharedExpert->forward_all(ctx, *w.shared_expert, flat_input,
                                                         *acts.shared_expert);
-        // expert_out += shared_out
-        // vector_add(expert_out, expert_out, shared_out, B * T * C, ctx.stream);
+        // expert_out += shared_out (in-place add, seed=0 for deterministic)
+        vector_add_sr(expert_out, expert_out, shared_out, 1.0f, B * T * C, /*seed=*/0, ctx.stream);
     }
 
     // Reshape back to (B, T, C)
@@ -259,12 +278,10 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::forward_impl(
     acts.moe_output.Sizes[2] = C;
     acts.moe_output.Rank = 3;
 
-    // Second residual connection
-    // output = residual_att + moe_output
-    Tensor output = acts.residual_att;  // Placeholder
-    // vector_add(output, acts.residual_att, acts.moe_output, B * T * C, ctx.stream);
-
-    return output;
+    // Second residual connection: output = residual_att + moe_output
+    // This will be handled by the next block's fused LN1 (or done explicitly for last block)
+    // Return the MoE output - caller handles final residual
+    return acts.moe_output;
 }
 
 template<typename AttentionType, typename RouterType, typename NormType>
@@ -358,7 +375,8 @@ public:
     MoEBlockConfigBuilder& num_kv_heads(int heads) { mConfig.num_kv_heads = heads; return *this; }
     MoEBlockConfigBuilder& head_size(int size) { mConfig.head_size = size; return *this; }
     MoEBlockConfigBuilder& rms_norm_eps(float eps) { mConfig.rms_norm_eps = eps; return *this; }
-    MoEBlockConfigBuilder& rope_theta(float theta) { mConfig.rope_theta = theta; return *this; }
+    MoEBlockConfigBuilder& rope_config(const RoPEConfig& cfg) { mConfig.rope = cfg; return *this; }
+    MoEBlockConfigBuilder& rope_theta(float theta) { mConfig.rope.theta = theta; return *this; }  // Convenience
     MoEBlockConfigBuilder& max_seq_len(int len) { mConfig.max_seq_len = len; return *this; }
     MoEBlockConfigBuilder& use_qkv_bias(bool bias) { mConfig.use_qkv_bias = bias; return *this; }
 

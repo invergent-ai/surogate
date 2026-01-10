@@ -1530,7 +1530,7 @@ void ModularRunState<Block>::allocate_non_block_state() {
     if (!mConfig.use_fused_rope) {
         int max_seq_len = std::min((int)T, mConfig.pretrained_config.MaxPositionEmbeddings);  // Cap at seq length
         int head_size = mConfig.block_config.head_size;
-        float rope_theta = mConfig.block_config.rope_theta;
+        float rope_theta = mConfig.block_config.rope.theta;
 
         mNonBlockActivations.freq_cis = mAllocator->allocate(
             dtype, "freq_cis", kind, {(long)max_seq_len, (long)(2 * head_size)});

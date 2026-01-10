@@ -7,6 +7,7 @@
 
 #include <string_view>
 
+#include "config/rope_config.h"
 #include "utilities/dtype.h"
 
 // Configuration describing a pretrained decoder-only transformer model.
@@ -35,6 +36,7 @@ struct PretrainedConfig {
 
     int MaxPositionEmbeddings;
     float RopeTheta;
+    RoPEConfig Rope;  // Flexible RoPE configuration (GLM4 partial, Qwen2-VL M-RoPE, etc.)
     float RmsNormEps;
     bool TiedWordEmbeddings;
     bool UseQKVBias;

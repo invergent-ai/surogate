@@ -23,7 +23,8 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     block_config.num_kv_heads = config.NumKeyValHeads;
     block_config.head_size = config.head_size();
     block_config.rms_norm_eps = config.RmsNormEps;
-    block_config.rope_theta = config.RopeTheta;
+    block_config.rope = config.Rope;  // Use full RoPEConfig
+    block_config.rope.theta = config.RopeTheta;  // Backwards compat: sync theta
     block_config.max_seq_len = config.MaxPositionEmbeddings;
     block_config.use_qkv_bias = config.UseQKVBias;
     if constexpr (requires { block_config.use_qk_norm; }) {

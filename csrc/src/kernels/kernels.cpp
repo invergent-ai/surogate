@@ -286,6 +286,64 @@ void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, co
 }
 
 /**
+ * @brief Computes the forward pass for Rotary Positional Embeddings (RoPE) with partial rotation support.
+ *
+ * For partial RoPE (GLM4 style), only the first rotary_dim dimensions are rotated.
+ * Dimensions beyond rotary_dim are passed through unchanged.
+ *
+ * @param out The output tensor for the result of the RoPE transformation.
+ * @param in The input tensor containing the embedding data.
+ * @param freqs_cis Precomputed RoPE frequencies (cos and sin values interleaved), shape (T, rotary_dim).
+ * @param position_ids Optional position IDs for variable-length sequences (can be nullptr).
+ * @param abs_max_ptr Optional pointer to track the absolute maximum value.
+ * @param B Batch size.
+ * @param T Sequence length.
+ * @param Nq Number of query heads.
+ * @param Nkv Number of key/value heads.
+ * @param head_dim Full head dimension.
+ * @param rotary_dim Number of dimensions to rotate (must be <= head_dim and even).
+ * @param stream The CUDA stream to execute the kernel on.
+ */
+void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
+    if(out.DType == ETensorDType::FP32) {
+        rope_forward(out.get<float>(), in.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else if(out.DType == ETensorDType::BF16) {
+        rope_forward(out.get<nv_bfloat16>(), in.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else {
+        throw std::logic_error("rope_forward: unsupported dtype");
+    }
+}
+
+/**
+ * @brief Computes the backward pass for Rotary Positional Embeddings (RoPE) with partial rotation support.
+ *
+ * For partial RoPE (GLM4 style), only the first rotary_dim dimensions are rotated.
+ * Dimensions beyond rotary_dim are passed through unchanged.
+ *
+ * @param dinp The gradient of the input tensor to be computed.
+ * @param dout The incoming gradient tensor from the subsequent layer.
+ * @param freqs_cis Precomputed RoPE frequencies, shape (T, rotary_dim).
+ * @param position_ids Optional position IDs for variable-length sequences.
+ * @param abs_max_ptr Optional pointer for tracking absolute maximum value.
+ * @param B Batch size.
+ * @param T Sequence length.
+ * @param Nq Number of query heads.
+ * @param Nkv Number of key/value heads.
+ * @param head_dim Full head dimension.
+ * @param rotary_dim Number of dimensions to rotate (must be <= head_dim and even).
+ * @param stream The CUDA stream on which to execute the kernel.
+ */
+void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
+    if(dinp.DType == ETensorDType::FP32) {
+        rope_backward(dinp.get<float>(), dout.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else if(dinp.DType == ETensorDType::BF16) {
+        rope_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else {
+        throw std::logic_error("rope_backward: unsupported dtype");
+    }
+}
+
+/**
  * @brief Dispatches the fused RoPE forward pass (with on-the-fly cos/sin computation) based on tensor data type.
  *
  * This is an optimized version that computes cos/sin via sincosf() and caches them in shared memory,

@@ -281,6 +281,12 @@ public:
         // Batched gradients (for grouped GEMM)
         Tensor d_gate_up_proj;  ///< (num_experts, hidden_size, 2 * intermediate_size)
         Tensor d_down_proj;     ///< (num_experts, intermediate_size, hidden_size)
+
+        // Intermediate tensors for backward pass (must be pre-allocated)
+        Tensor d_expert_outputs;    ///< (total_tokens, hidden_size) gradient w.r.t. expert outputs
+        Tensor d_routing_weights;   ///< (B*T, top_k) gradient w.r.t. routing weights
+        Tensor d_permuted_input;    ///< (total_tokens, hidden_size) gradient w.r.t. permuted input
+        Tensor d_input;             ///< (B*T, hidden_size) gradient w.r.t. original input
     };
 
     explicit ExpertGroupModule(Config config);
@@ -415,39 +421,36 @@ inline Tensor ExpertGroupModule::backward_impl(
     const int total_tokens = BT * K;
 
     // Step 1: Backward through unpermute+combine
-    // d_expert_outputs[permuted_idx] += routing_weights[token, k] * grad_output[token]
-    // d_routing_weights[token, k] += dot(expert_outputs[permuted_idx], grad_output[token])
+    // Computes:
+    //   d_expert_outputs[permuted_idx] = routing_weights[token, k] * grad_output[token]
+    //   d_routing_weights[token, k] = dot(expert_outputs[permuted_idx], grad_output[token])
     //
-    // For now, use permute of grad_output (gradient flows through expert path only)
-    // Note: d_expert_outputs should be allocated by the caller
-    Tensor d_expert_outputs;
-    d_expert_outputs.DType = grad_output.DType;
-    // TODO: Allocate d_expert_outputs (total_tokens, C) from workspace
+    // Note: grads.d_expert_outputs and grads.d_routing_weights should be pre-allocated
 
-    // Permute gradient to expert-grouped order (inverse of combine)
     if (grad_output.DType == ETensorDType::BF16) {
-        moe_permute_tokens(
-            d_expert_outputs.get<nv_bfloat16>(),
+        moe_combine_backward(
+            grads.d_expert_outputs.get<nv_bfloat16>(),
+            grads.d_routing_weights.get<nv_bfloat16>(),
             grad_output.get<nv_bfloat16>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
+            acts.expert_outputs.get<nv_bfloat16>(),
+            routing.routing_weights.get<nv_bfloat16>(),
+            acts.scatter_indices.get<int>(),
+            BT, total_tokens, C, K, ctx.stream
         );
     } else {
-        moe_permute_tokens(
-            d_expert_outputs.get<float>(),
+        moe_combine_backward(
+            grads.d_expert_outputs.get<float>(),
+            grads.d_routing_weights.get<float>(),
             grad_output.get<float>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
+            acts.expert_outputs.get<float>(),
+            routing.routing_weights.get<float>(),
+            acts.scatter_indices.get<int>(),
+            BT, total_tokens, C, K, ctx.stream
         );
     }
 
-    // Scale by routing weights (element-wise on the hidden dimension)
-    // TODO: implement fused scale kernel
-
     // Step 2: Backward through each expert
-    Tensor d_permuted_input;
-    d_permuted_input.DType = grad_output.DType;
-    // TODO: Allocate d_permuted_input (total_tokens, C) from workspace
+    // Note: grads.d_permuted_input should be pre-allocated
     grads.expert_grads.resize(E);
     int offset = 0;
 
@@ -457,8 +460,8 @@ inline Tensor ExpertGroupModule::backward_impl(
 
         if (expert_tokens == 0) continue;
 
-        Tensor d_expert_output = slice(d_expert_outputs, 0, offset, offset + expert_tokens);
-        Tensor d_expert_input = slice(d_permuted_input, 0, offset, offset + expert_tokens);
+        Tensor d_expert_output = slice(grads.d_expert_outputs, 0, offset, offset + expert_tokens);
+        Tensor d_expert_input = slice(grads.d_permuted_input, 0, offset, offset + expert_tokens);
 
         mExperts[e].backward(ctx, w.experts[e], acts.expert_acts[e],
                              d_expert_output, grads.expert_grads[e], accumulate);
@@ -467,15 +470,26 @@ inline Tensor ExpertGroupModule::backward_impl(
     }
 
     // Step 3: Unpermute gradient back to token order
-    Tensor d_input;
-    d_input.DType = grad_output.DType;
-    // TODO: Allocate d_input (BT, C) from workspace
+    // Each original token receives gradients from K expert paths
+    // Note: grads.d_input should be pre-allocated
 
-    // Use unpermute_and_combine with uniform weights=1/K to sum gradients
-    // (each token receives gradient from K expert paths)
-    // TODO: implement proper gradient accumulation kernel
+    if (grads.d_permuted_input.DType == ETensorDType::BF16) {
+        moe_permute_backward(
+            grads.d_input.get<nv_bfloat16>(),
+            grads.d_permuted_input.get<nv_bfloat16>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    } else {
+        moe_permute_backward(
+            grads.d_input.get<float>(),
+            grads.d_permuted_input.get<float>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    }
 
-    return d_input;
+    return grads.d_input;
 }
 
 /**

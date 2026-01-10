@@ -5,6 +5,7 @@
 #ifndef SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H
 #define SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H
 
+#include "config/rope_config.h"
 #include "modules/module_base.h"
 #include "modules/primitives/attention.h"
 #include "modules/primitives/rmsnorm.h"
@@ -44,7 +45,7 @@ public:
         int num_query_heads;
         int num_kv_heads;
         int head_size;          // Usually hidden_size / num_query_heads
-        float rope_theta;
+        RoPEConfig rope;        // Flexible RoPE configuration
         int max_seq_len;        // Maximum sequence length for RoPE
         bool use_qkv_bias = false;
         bool use_qk_norm = false;
@@ -61,7 +62,7 @@ public:
                 .hidden_size = hidden_size,
                 .num_query_heads = num_query_heads,
                 .num_kv_heads = num_kv_heads,
-                .rope_theta = rope_theta,
+                .rope = rope,
                 .use_qkv_bias = use_qkv_bias,
                 .head_size = head_size
             };

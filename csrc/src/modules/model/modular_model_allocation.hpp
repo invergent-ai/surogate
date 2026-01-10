@@ -69,7 +69,8 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     rs_config.block_config.num_kv_heads = mConfig.NumKeyValHeads;
     rs_config.block_config.head_size = mConfig.head_size();
     rs_config.block_config.rms_norm_eps = mConfig.RmsNormEps;
-    rs_config.block_config.rope_theta = mConfig.RopeTheta;
+    rs_config.block_config.rope = mConfig.Rope;  // Use full RoPEConfig
+    rs_config.block_config.rope.theta = mConfig.RopeTheta;  // Backwards compat
     rs_config.block_config.max_seq_len = mConfig.MaxPositionEmbeddings;
     rs_config.block_config.use_qkv_bias = mConfig.UseQKVBias;
     if constexpr (requires { rs_config.block_config.use_qk_norm; }) {
