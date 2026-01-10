@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Literal
@@ -14,7 +14,30 @@ from surogate.utils.fs import to_abspath
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters
 
-logger = get_logger()
+@dataclass
+class DistributedConfig:
+    """
+    Configuration for multi-node distributed training via Ray.
+
+    When distributed training is enabled (num_nodes > 1), Ray handles cluster
+    management and node coordination, while NCCL handles GPU-to-GPU communication.
+
+    Args:
+        ray_address: Ray cluster address. Options:
+            - "auto": Connect to an existing Ray cluster
+            - "local": Start a local Ray instance
+            - "ray://host:port": Connect to a specific Ray head node
+        num_nodes: Total number of nodes to use for training.
+        gpus_per_node: Number of GPUs per node. If 0, uses config.gpus.
+        worker_output_dir: Base directory for worker-local tokenized data.
+            Each worker will create a subdirectory node-{rank}/ under this path.
+            If None, uses /tmp/surogate-{run_name}/ on each worker.
+            This path must be accessible by all worker nodes.
+    """
+    ray_address: str = "auto"
+    num_nodes: int = 1
+    gpus_per_node: int = 0  # 0 = use config.gpus
+    worker_output_dir: Optional[str] = None  # None = use /tmp/surogate-{run_name}/
 
 @dataclass
 class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
@@ -331,6 +354,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     aim_repo: Optional[str] = None
     aim_name: Optional[str] = None
 
+    # Multi-node distributed training config (optional)
+    distributed: Optional[DistributedConfig] = None
+
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
         self.run_name = cfg['run_name'] or self.generate_run_name()
@@ -426,11 +452,28 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.aim_repo = cfg.get('aim_repo', self.aim_repo)
         self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
 
+        # Parse distributed config
+        distributed_cfg = cfg.get('distributed', None)
+        if distributed_cfg:
+            if isinstance(distributed_cfg, dict):
+                self.distributed = DistributedConfig(
+                    ray_address=distributed_cfg.get('ray_address', 'auto'),
+                    num_nodes=distributed_cfg.get('num_nodes', 1),
+                    gpus_per_node=distributed_cfg.get('gpus_per_node', 0),
+                    worker_output_dir=distributed_cfg.get('worker_output_dir', None),
+                )
+            elif isinstance(distributed_cfg, DistributedConfig):
+                self.distributed = distributed_cfg
+        else:
+            self.distributed = None
+
     def __post_init__(self):
+        logger = get_logger()
+        
         ModelConfig.__post_init__(self)
         TrainDatasetConfig.__post_init__(self)
         ChatTemplateConfig.__post_init__(self)
-
+        
         self.prompt_template = self.model_template.chat_template
         if self.use_chat_template is None:
             self.use_chat_template = True
@@ -488,6 +531,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
 
     def ensure_directories(self):
+        # Skip directory creation if running inside a Ray worker
+        # Only the head node should create directories
+        from surogate.utils.dist import is_ray_worker
+        if is_ray_worker():
+            return
+
         # Convert output_dir to absolute path for consistent hash file location
         self.output_dir = str(Path(self.output_dir).resolve())
         _output_dir = Path(self.output_dir)

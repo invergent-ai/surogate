@@ -7,10 +7,6 @@ from surogate.core.model.chat_templates.processor import ChatTemplateProcessor, 
 from surogate.core.model.registry import ModelTemplate
 from surogate.core.model.utils import Processor
 from surogate.utils.dict import DictDefault
-from surogate.utils.logger import get_logger
-
-logger = get_logger()
-
 
 @dataclass
 class ChatTemplateConfig(ABC):

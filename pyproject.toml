@@ -37,7 +37,6 @@ dependencies = [
     "nanobind",
     "binpacking",
     "rich>=13.0.0",
-    "aim",
     "psutil",
     "matplotlib",
     "bitsandbytes>=0.49.0",
@@ -51,7 +50,8 @@ dependencies = [
     "densemax-lakefs-spec @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_spec-1.50.0-py3-none-any.whl",
     "densemax-lakefs-sdk @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_sdk-1.50.0-py3-none-any.whl",
     "torch==2.9.1",
-    "torchvision==0.24.1"
+    "torchvision==0.24.1",
+    "ray>=2.5.0",
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
@@ -88,7 +88,6 @@ cmake.build-type = "Release"
 
 [tool.scikit-build.cmake.define]
 PYTHON_BINDING = "ON"
-USE_MPI = "OFF"
 USE_CUFILE = "OFF"
 CMAKE_CUDA_ARCHITECTURES = {env="CUDAARCHS"}
 

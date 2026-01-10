@@ -33,11 +33,55 @@ EXTENSIONS_TO_DATASET_TYPES = {
 }
 
 
+def _shard_dataset_for_node(
+    dataset: Dataset,
+    node_rank: int,
+    num_nodes: int,
+) -> Dataset:
+    """
+    Deterministically shard a dataset for a specific node in distributed training.
+
+    Each node gets a contiguous 1/num_nodes portion of the dataset.
+    The last node takes any remainder samples.
+
+    Args:
+        dataset: The full dataset to shard.
+        node_rank: This node's rank (0-indexed).
+        num_nodes: Total number of nodes.
+
+    Returns:
+        A subset of the dataset for this node.
+    """
+    total_samples = len(dataset)
+
+    if total_samples < num_nodes:
+        logger.warning(
+            f"Dataset has fewer samples ({total_samples}) than nodes ({num_nodes}). "
+            f"Some nodes will have no data. Consider reducing num_nodes."
+        )
+        # Give one sample per node until we run out
+        if node_rank < total_samples:
+            return dataset.select([node_rank])
+        else:
+            # Return empty dataset for nodes beyond sample count
+            return dataset.select([])
+
+    samples_per_node = total_samples // num_nodes
+    start_idx = node_rank * samples_per_node
+    # Last node takes remainder
+    end_idx = total_samples if node_rank == num_nodes - 1 else start_idx + samples_per_node
+
+    logger.info(f"Node {node_rank}/{num_nodes}: Loading samples {start_idx}-{end_idx} ({end_idx - start_idx} samples)")
+    return dataset.select(range(start_idx, end_idx))
+
+
 def load_dataset_with_config(
         dataset_config: DatasetConfig,
         *,
         streaming=False,
         num_workers: int = 1,
+        node_rank: Optional[int] = None,
+        num_nodes: Optional[int] = None,
 ) -> Dataset | IterableDataset:
     load_dataset_kwargs = {
         "split": dataset_config.split if dataset_config.split else None,
@@ -46,33 +90,53 @@ def load_dataset_with_config(
         "num_proc": num_workers,
     }
 
+    dataset = None
+
     if Path(dataset_config.path).exists():
-        return _load_from_local_path(dataset_config, load_dataset_kwargs)
+        dataset = _load_from_local_path(dataset_config, load_dataset_kwargs)
+    else:
+        is_hub_dataset = _check_if_hub_dataset(dataset_config.path)
+        if is_hub_dataset:
+            dataset = _load_from_hub(dataset_config, load_dataset_kwargs)
+        else:
+            remote_fs, storage_options = _get_remote_filesystem(dataset_config.path)
+            is_cloud_dataset = False
+            if remote_fs:
+                try:
+                    is_cloud_dataset = remote_fs.exists(dataset_config.path)
+                except (FileNotFoundError, ConnectionError):
+                    pass
 
-    is_hub_dataset = _check_if_hub_dataset(dataset_config.path)
-    if is_hub_dataset:
-        return _load_from_hub(dataset_config, load_dataset_kwargs)
+            if is_cloud_dataset:
+                dataset = _load_from_cloud(
+                    dataset_config, remote_fs, storage_options, load_dataset_kwargs
+                )
+            elif dataset_config.path.startswith("https://"):
+                dataset = _load_from_url(dataset_config, load_dataset_kwargs)
 
-    remote_fs, storage_options = _get_remote_filesystem(dataset_config.path)
-    is_cloud_dataset = False
-    if remote_fs:
-        try:
-            is_cloud_dataset = remote_fs.exists(dataset_config.path)
-        except (FileNotFoundError, ConnectionError):
-            pass
-
-    if is_cloud_dataset:
-        return _load_from_cloud(
-            dataset_config, remote_fs, storage_options, load_dataset_kwargs
+    if dataset is None:
+        raise ValueError(
+            f"The dataset could not be loaded. This could be due to a misconfigured dataset path "
+            f"({dataset_config.path}). Try double-check your path / name. "
+            f"This is not caused by the dataset type."
         )
-    if dataset_config.path.startswith("https://"):
-        return _load_from_url(dataset_config, load_dataset_kwargs)
 
-    raise ValueError(
-        f"The dataset could not be loaded. This could be due to a misconfigured dataset path "
-        f"({dataset_config.path}). Try double-check your path / name. "
-        f"This is not caused by the dataset type."
-    )
+    # Apply node-based sharding for distributed training
+    if node_rank is not None and num_nodes is not None and num_nodes > 1:
+        if streaming:
+            logger.warning(
+                "Node-based sharding is not supported for streaming datasets. "
+                "Each node will see the full dataset."
+            )
+        elif isinstance(dataset, Dataset):
+            dataset = _shard_dataset_for_node(dataset, node_rank, num_nodes)
+        else:
+            logger.warning(
+                f"Node-based sharding is not supported for dataset type {type(dataset)}. "
+                f"Each node will see the full dataset."
+            )
+
+    return dataset
 
 
 def _check_if_hub_dataset(path: str) -> bool:

@@ -21,7 +21,14 @@ class SurogateSFT(TokenizeDatasets):
         super().__init__(config=config, args=args)
 
     def run(self):
-        # Tokenize datasets
+        # Check if distributed training is configured
+        # In distributed mode, each worker node tokenizes its own shard of the data
+        if self.config.distributed and self.config.distributed.num_nodes > 1:
+            logger.info("Distributed mode: each node will tokenize its own data shard")
+            logger.info(f"Starting training run '{self.config.run_name}'...")
+            return self._train_distributed()
+
+        # Single-node mode: tokenize datasets on the driver
         super().run()
 
         # Setup data loaders
@@ -36,7 +43,38 @@ class SurogateSFT(TokenizeDatasets):
             logger.warning(f"No eval files found matching '{self.config.output_dir}/eval.bin'")
 
         logger.info(f"Starting training run '{self.config.run_name}'...")
+
         return self.train_with_oom_recovery(train_files, eval_files)
+
+    def _train_distributed(self):
+        """Run multi-node distributed training via Ray.
+
+        Each worker node will tokenize its own 1/num_nodes shard of the dataset,
+        enabling parallel tokenization and reducing driver memory pressure.
+        """
+        from surogate.train.distributed import RayDistributedTrainer
+
+        dist_cfg = self.config.distributed
+        logger.info(f"Starting distributed training with {dist_cfg.num_nodes} nodes...")
+        logger.metric("Ray address", dist_cfg.ray_address)
+        logger.metric("Nodes", dist_cfg.num_nodes)
+        logger.metric("GPUs per node", dist_cfg.gpus_per_node or self.config.gpus)
+        logger.metric("Per-node tokenization", "enabled")
+
+        trainer = RayDistributedTrainer(
+            config=self.config,
+            train_files=[],  # Workers will tokenize their own data
+            eval_files=None,
+            ray_address=dist_cfg.ray_address,
+            num_nodes=dist_cfg.num_nodes,
+            gpus_per_node=dist_cfg.gpus_per_node or self.config.gpus,
+            tokenize_on_node=True,  # Each node tokenizes its own shard
+        )
+
+        try:
+            trainer.train()
+        finally:
+            trainer.shutdown()
     
     def train_with_oom_recovery(self, train_files, eval_files):
         original_batch_size = self.config.per_device_train_batch_size

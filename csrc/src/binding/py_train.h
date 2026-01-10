@@ -47,7 +47,18 @@ class NCCLCommunicator;
 class MultiGPUPyTrainer
 {
 public:
+    //! Single-node constructor (original)
     MultiGPUPyTrainer(int ngpus, PretrainedConfig config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config = std::nullopt, std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
+
+    //! Multi-node constructor (for Ray distributed training)
+    MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
+                      const void* nccl_id, const void* node_master_nccl_id,
+                      PretrainedConfig config, RuntimeOptions options,
+                      int batch_size, int seq_len, int grad_accum,
+                      bool memcpy_all_gather, bool memcpy_send_recv,
+                      std::optional<LoRAAdapterConfig> lora_config = std::nullopt,
+                      std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
+
     ~MultiGPUPyTrainer();
 
     void import_weights(std::string path);
@@ -64,6 +75,7 @@ public:
     std::vector<GPUUtilInfo> get_gpu_info();
 
     int world_size() const;
+    int local_world_size() const { return static_cast<int>(mContexts.size()); }
     int batch_size() const { return B; }
     int seq_length() const { return T; }
     const PretrainedConfig& config() const { return mConfig; }

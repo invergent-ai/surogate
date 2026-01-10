@@ -3,25 +3,20 @@
 
 BUILD_DIR ?= csrc/build
 BUILD_TYPE ?= Release
-CMAKE_FLAGS ?= "-DUSE_MPI=OFF"
 PARALLEL_JOBS ?= $(shell nproc)
 
-.PHONY: all build train export-checkpoint wheel configure clean clean-all test unit-tests help
+.PHONY: all build export-checkpoint wheel configure clean clean-all test unit-tests help
 
 # Default target
 all: build
 
 # Configure the build
 configure:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 
 # Build all targets
 build: configure
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS)
-
-# Build only the train executable
-train:
-	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target train
 
 # Build unit tests
 unit-tests: configure
@@ -67,7 +62,6 @@ help:
 	@echo "Targets:"
 	@echo "  all              - Build all targets (default)"
 	@echo "  build            - Build all targets"
-	@echo "  train            - Build only the train executable"
 	@echo "  unit-tests       - Build unit tests"
 	@echo "  wheel            - Build Python wheel using uv"
 	@echo "  wheel-dev        - Build Python wheel in development mode"
@@ -80,12 +74,9 @@ help:
 	@echo ""
 	@echo "Options (environment variables):"
 	@echo "  BUILD_TYPE=<type>    - CMake build type: Release, Debug, RelWithDebInfo (default: Release)"
-	@echo "  CMAKE_FLAGS=<flags>  - Additional CMake flags"
 	@echo "  PARALLEL_JOBS=<n>    - Number of parallel build jobs (default: nproc)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                                    # Build everything"
 	@echo "  make test                               # Build and run tests"
-	@echo "  make BUILD_TYPE=Debug train             # Build train in debug mode"
-	@echo "  make CMAKE_FLAGS='-DUSE_MPI=OFF' build  # Build without MPI"
 	@echo "  make clean-all rebuild                  # Full rebuild"

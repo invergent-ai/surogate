@@ -51,8 +51,65 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, PretrainedConfig config, Runtime
         throw std::runtime_error(fmt::format("Requested {} GPUs, only {} available", ngpus, gpus_available));
     }
     mContexts.resize(ngpus);
-    mThreads = NCCLCommunicator::launch_threads_communicators(
+    mThreads = NCCLCommunicator::launch_communicators(
        ngpus, memcpy_all_gather, memcpy_send_recv,
+       [&](NCCLCommunicator& comm) {
+           try {
+               this->main_loop(comm);
+           } catch (...) {
+               mHasCrashed = true;
+               throw;
+           }
+       });
+
+    while(!mIsRunning && !mHasCrashed) {
+        std::this_thread::yield();
+    }
+}
+
+/**
+ * @brief Construct a multi-GPU trainer for multi-node training (Ray).
+ *
+ * Creates NCCL communicators using externally-provided NCCL IDs for cross-node coordination.
+ * Used when training is orchestrated by Ray, where NCCL IDs are shared via Ray's object store.
+ *
+ * @param ngpus Number of local GPUs on this node.
+ * @param node_rank This node's rank (0 to num_nodes-1).
+ * @param num_nodes Total number of nodes in the cluster.
+ * @param nccl_id 128-byte NCCL unique ID for global communicator (shared across all nodes).
+ * @param node_master_nccl_id 128-byte NCCL unique ID for node master communicator.
+ * @param config Model architecture configuration.
+ * @param options Runtime/training options.
+ * @param batch_size Per-GPU micro-batch size.
+ * @param seq_len Sequence length.
+ * @param grad_accum Number of micro-steps before optimizer update.
+ * @param memcpy_all_gather Enable memcpy-based all-gather.
+ * @param memcpy_send_recv Enable memcpy-based send/recv.
+ * @param lora_config Optional LoRA configuration.
+ * @param qlora_config Optional QLoRA configuration.
+ */
+MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
+                                     const void* nccl_id, const void* node_master_nccl_id,
+                                     PretrainedConfig config, RuntimeOptions options,
+                                     int batch_size, int seq_len, int grad_accum,
+                                     bool memcpy_all_gather, bool memcpy_send_recv,
+                                     std::optional<LoRAAdapterConfig> lora_config,
+                                     std::optional<modules::QLoRAConfig> qlora_config) :
+    mConfig(config), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
+{
+    int gpus_available = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
+    if (ngpus == 0) {
+        ngpus = gpus_available;
+    }
+
+    if (ngpus > gpus_available) {
+        throw std::runtime_error(fmt::format("Requested {} GPUs, only {} available", ngpus, gpus_available));
+    }
+    mContexts.resize(ngpus);
+    mThreads = NCCLCommunicator::launch_communicators_multinode(
+       ngpus, node_rank, num_nodes, nccl_id, node_master_nccl_id,
+       memcpy_all_gather, memcpy_send_recv,
        [&](NCCLCommunicator& comm) {
            try {
                this->main_loop(comm);
@@ -417,7 +474,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext & ctx)> work,
  * @throws std::runtime_error If another worker reports a crash during startup waiting phase.
  */
 void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
-    sThreadContext& ctx = mContexts.at(comm.rank());
+    sThreadContext& ctx = mContexts.at(comm.local_rank());
 
     ctx.Communicator = &comm;
     ctx.GPUUtil = IGPUUtilTracker::create();
@@ -500,7 +557,9 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         }
     }
 
-    if (mIsReady.fetch_add(1) == comm.world_size() - 1) {
+    // Use local GPU count, not global world_size. Each node has its own trainer instance
+    // with its own mIsReady counter, so we sync when all LOCAL threads are ready.
+    if (mIsReady.fetch_add(1) == static_cast<int>(mContexts.size()) - 1) {
         mIsRunning = true;
     };
 

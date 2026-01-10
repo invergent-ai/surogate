@@ -12,9 +12,6 @@ from surogate.utils.jsonl import json_parse_to_dict
 from surogate.utils.logger import get_logger
 from surogate.utils.model import get_model_name
 
-logger = get_logger()
-
-
 @dataclass
 class ModelConfig(ABC):
     """
@@ -50,8 +47,9 @@ class ModelConfig(ABC):
 
 
     def _init_model_info(self) -> torch.dtype:
+        logger = get_logger()
         logger.debug("init model info and template...")
-        self.model_info, self.model_template, self.model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs())
+        self.model_info, self.model_template, self._model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs(), load_model=False)
         self.model_dir = self.model_info.model_dir
         self.model_type = self.model_info.model_type
 
@@ -61,6 +59,7 @@ class ModelConfig(ABC):
         return self.model_info.torch_dtype
 
     def _init_rope_scaling(self):
+        logger = get_logger()
         logger.debug("preparing rope_scaling...")
         if self.rope_scaling:
             rope_scaling: dict = json_parse_to_dict(self.rope_scaling, strict=False)

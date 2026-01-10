@@ -26,8 +26,8 @@ class SurogateTrainerWrapper():
     ):
         self.config = config
 
-        model_weights_path = get_model_weights_path(config.model.model_dir)
-
+        model_weights_path = get_model_weights_path(config.model_dir)
+        
         # Setup data loaders
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
         self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
@@ -46,7 +46,7 @@ class SurogateTrainerWrapper():
             if self.start_step >= 0:
                 self.trainer = _surogate.SurogateTrainer(
                     ngpu=config.gpus,
-                    config=_surogate.PretrainedConfig.from_pretrained(config.model.model_dir, to_surogate_dtype(config.torch_dtype)),
+                    config=_surogate.PretrainedConfig.from_pretrained(config.model_dir, to_surogate_dtype(config.torch_dtype)),
                     options=config.runtime_config,
                     batch_size=config.per_device_train_batch_size,
                     seq_len=config.sequence_len,
@@ -64,7 +64,7 @@ class SurogateTrainerWrapper():
         elif config.lora and config.lora_rank and config.lora_alpha and config.lora_target_modules:
             self.trainer = _surogate.SurogateTrainer(
                 ngpu=config.gpus,
-                config=_surogate.PretrainedConfig.from_pretrained(config.model.model_dir, to_surogate_dtype(config.torch_dtype)),
+                config=_surogate.PretrainedConfig.from_pretrained(config.model_dir, to_surogate_dtype(config.torch_dtype)),
                 options=config.runtime_config,
                 batch_size=config.per_device_train_batch_size,
                 seq_len=config.sequence_len,
@@ -89,7 +89,7 @@ class SurogateTrainerWrapper():
             self.trainer.init_weights()
         else:
             self.trainer = _surogate.SurogateTrainer.from_pretrained(
-                name=config.model.model_dir,
+                name=config.model_dir,
                 ngpu=config.gpus,
                 dtype=to_surogate_dtype(config.torch_dtype),
                 options=config.runtime_config,

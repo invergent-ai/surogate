@@ -6,10 +6,13 @@
 #include "comm.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <variant>
 #include <future>
+#include <thread>
+#include <barrier>
 
 #include <nccl.h>
 #include <fmt/core.h>
@@ -69,19 +72,21 @@ struct NCCLCommunicator::CommandBuffer
 /**
  * @brief Construct an NCCLCommunicator for a given rank and world size.
  *
- * Sets the CUDA device to @p rank, initializes the NCCL communicator using @p nccl_id,
- * and creates a dedicated comms stream and sync event on that device.
+ * Sets the CUDA device to the local device index, initializes the NCCL communicator
+ * using @p nccl_id, and creates a dedicated comms stream and sync event on that device.
  *
- * @param rank Local rank (also used as CUDA device index).
+ * @param rank Global rank in the NCCL communicator (0 to world-1).
  * @param world Total number of ranks in the communicator.
  * @param nccl_id Pointer to an ncclUniqueId shared across all ranks.
+ * @param local_device CUDA device index to use (defaults to rank for single-node).
  *
  * @throws std::runtime_error If NCCL initialization fails.
  */
-NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id) :
-    mRank(rank), mWorld(world), mNcclComm(nullptr), mCmdBuf(std::make_unique<CommandBuffer>())
+NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id, int local_device) :
+    mRank(rank), mWorld(world), mLocalRank(local_device >= 0 ? local_device : rank), mNcclComm(nullptr), mCmdBuf(std::make_unique<CommandBuffer>())
 {
-    CUDA_CHECK(cudaSetDevice(mRank));
+    // Use local_device for CUDA device selection (supports multi-node where device != global rank)
+    CUDA_CHECK(cudaSetDevice(mLocalRank));
     ncclCheck(ncclCommInitRank(&mNcclComm, mWorld, *reinterpret_cast<const ncclUniqueId*>(nccl_id), mRank));
 
     // must be created _after_ we set the device
@@ -503,462 +508,6 @@ void NCCLCommunicator::wait_on_comms(cudaStream_t compute_stream) {
     CUDA_CHECK(cudaStreamWaitEvent(compute_stream, mCommsSync, 0));
 }
 
-#if USE_MPI
-
-// macro conflict :(
-#undef HOST
-#include <mpi.h>
-
-/**
- * @brief Throws a std::runtime_error if an MPI call returned an error.
- *
- * @param status MPI status code returned by an MPI API call.
- * @param file Source file where the failing call was made.
- * @param line Source line where the failing call was made.
- *
- * @throws std::runtime_error Always thrown when @p status != MPI_SUCCESS.
- */
-void mpi_check(int status, const char *file, int line) {
-    if (status != MPI_SUCCESS) {
-        char mpi_error[4096];
-        int mpi_error_len = 0;
-        if(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) == MPI_SUCCESS) {
-            throw std::runtime_error(fmt::format("Failed to create MPI error string for error at {}:{} ({})", file, line, status));
-        }
-        throw std::runtime_error(fmt::format("MPI error at {}:{}: {}", file, line, mpi_error));
-    }
-}
-#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
-
-/**
- * @brief MPI-backed NCCL communicator variant (multi-process configuration).
- *
- * Uses MPI for barriers and host-side (all-)gathers needed by higher-level code.
- * NCCL grouping is started/ended around a transaction to batch NCCL operations.
- */
-class NCCLCommunicatorMPI : public NCCLCommunicator {
-public:
-    using NCCLCommunicator::NCCLCommunicator;
-
-    /**
-     * @brief Finalizes MPI if initialized and no exception is active.
-     *
-     * @note MPI_Finalize may hang if called during stack unwinding in some environments; guarded accordingly.
-     */
-    ~NCCLCommunicatorMPI() override;
-
-    /**
-     * @brief Global barrier across all MPI ranks in MPI_COMM_WORLD.
-     */
-    void barrier() override;
-
-    /**
-     * @brief No-op in multi-process mode (launch queue throttling not needed across processes).
-     */
-    void _launch_queue_throttle_sync() override {};
-
-    /**
-     * @brief Gather fixed-size byte blobs from all ranks onto rank 0.
-     *
-     * @param recv Host buffer on rank 0 (size must be world*size); ignored on other ranks.
-     * @param object Host pointer to this rank's byte blob of length @p size.
-     * @param size Number of bytes contributed per rank.
-     */
-    void gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) override;
-
-    /**
-     * @brief All-gather fixed-size byte blobs from all ranks onto all ranks.
-     *
-     * @param recv Host buffer receiving concatenated blobs (size must be world*size).
-     * @param object Host pointer to this rank's byte blob of length @p size.
-     * @param size Number of bytes contributed per rank.
-     */
-    void all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) override;
-
-    /**
-     * @brief Transaction hook: wait for readiness and start NCCL group.
-     *
-     * @param cmd Command buffer containing the readiness event to wait on.
-     */
-    void on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) override;
-
-    /**
-     * @brief Transaction hook: end NCCL group and record completion event.
-     *
-     * @param signal CUDA event to record on the comms stream when NCCL work for the transaction is enqueued.
-     */
-    void on_finish_transaction(cudaEvent_t signal) override;
-};
-
-
-/**
- * @brief Destructor joins MPI resources and finalizes MPI if no exception is active.
- */
-NCCLCommunicatorMPI::~NCCLCommunicatorMPI() {
-    int is_init = 0;
-    mpiCheck(MPI_Initialized(&is_init));
-    // I've observed that (at least in some circumstances), when
-    // an exception is active, MPI_Finalize just blocked forever...
-    if(is_init && std::uncaught_exceptions() == 0) {
-        mpiCheck(MPI_Finalize());
-    }
-}
-
-/**
- * @brief Global barrier across all MPI ranks in MPI_COMM_WORLD.
- */
-void NCCLCommunicatorMPI::barrier() {
-    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
-}
-
-/**
- * @brief Gather fixed-size byte blobs from all ranks onto rank 0.
- *
- * @param recv Host buffer on rank 0 (size must be world*size); ignored on other ranks.
- * @param object Host pointer to this rank's byte blob of length @p size.
- * @param size Number of bytes contributed per rank.
- */
-void NCCLCommunicatorMPI::gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) {
-    mpiCheck(MPI_Gather(object, size, MPI_BYTE, recv, size, MPI_BYTE, 0, MPI_COMM_WORLD));
-}
-
-/**
- * @brief All-gather fixed-size byte blobs from all ranks onto all ranks.
- *
- * @param recv Host buffer receiving concatenated blobs (size must be world*size).
- * @param object Host pointer to this rank's byte blob of length @p size.
- * @param size Number of bytes contributed per rank.
- */
-void NCCLCommunicatorMPI::all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) {
-    mpiCheck(MPI_Allgather(object, size, MPI_BYTE, recv, size, MPI_BYTE, MPI_COMM_WORLD));
-}
-
-/**
- * @brief Transaction hook: wait for readiness and start NCCL group.
- *
- * @param cmd Command buffer containing the readiness event to wait on.
- */
-void NCCLCommunicatorMPI::on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) {
-    CUDA_CHECK(cudaStreamWaitEvent(stream(), cmd.Ready));
-    ncclCheck(ncclGroupStart());
-}
-
-/**
- * @brief Transaction hook: end NCCL group and record completion event.
- *
- * @param signal CUDA event to record on the comms stream when NCCL work for the transaction is enqueued.
- */
-void NCCLCommunicatorMPI::on_finish_transaction(cudaEvent_t signal) {
-    ncclCheck(ncclGroupEnd());
-    CUDA_CHECK(cudaEventRecord(signal, stream()));
-}
-
-/**
- * @brief Construct an MPI-based NCCLCommunicator for the current MPI rank.
- *
- * Initializes MPI, obtains rank/world, broadcasts an ncclUniqueId from rank 0, and constructs the communicator.
- *
- * @return A communicator instance configured for MPI multi-process execution.
- */
-std::unique_ptr<NCCLCommunicator> NCCLCommunicator::make_mpi_communicator() {
-    mpiCheck(MPI_Init(nullptr, nullptr));
-    int rank, world;
-    mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
-    mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &world));
-
-    ncclUniqueId nccl_id;
-    if (rank == 0) {
-        ncclCheck(ncclGetUniqueId(&nccl_id));
-    }
-    mpiCheck(MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
-
-    return std::make_unique<NCCLCommunicatorMPI>(rank, world, &nccl_id);
-}
-
-#else
-std::unique_ptr<NCCLCommunicator> NCCLCommunicator::make_mpi_communicator() {
-    throw std::runtime_error("MPI communicator not available.");
-}
-
-
-#endif
-
-#if USE_THREADS
-
-#include <thread>
-#include <barrier>
-
-/**
- * @brief Thread-based NCCL communicator variant (multi-thread, single-process configuration).
- *
- * Provides barriers and host-side exchange using shared memory, and can optionally replace some NCCL ops
- * (all-gather and/or send/recv) with device-to-device memcpy coordinated via barriers.
- */
-class NCCLCommunicatorThreads : public NCCLCommunicator {
-public:
-    struct SharedState {
-        std::unique_ptr<std::barrier<>> Barrier;
-        std::vector<std::byte*> Buffer;     // one pointer per thread
-        std::vector<std::exception_ptr> Exceptions;
-        std::mutex Mutex;
-    };
-
-    /**
-     * @brief Construct a thread communicator for a given rank in a shared process.
-     *
-     * @param rank Thread/rank index (also used as CUDA device index).
-     * @param world Total number of ranks/threads.
-     * @param memcpy_allgather If true, all-gather may be implemented via host-coordinated D2D memcpy.
-     * @param memcpy_send_recv If true, point-to-point send/recv may be implemented via host-coordinated D2D memcpy.
-     * @param nccl_id Pointer to shared ncclUniqueId used for ncclCommInitRank.
-     * @param state Shared synchronization/exchange state shared by all ranks in the process.
-     */
-    NCCLCommunicatorThreads(int rank, int world, bool memcpy_allgather, bool memcpy_send_recv, const void* nccl_id, std::shared_ptr<SharedState> state);
-
-    /**
-     * @brief Drops out of the shared barrier on destruction (if present).
-     */
-    ~NCCLCommunicatorThreads() override;
-
-    /**
-     * @brief Barrier across all ranks/threads in the process.
-     */
-    void barrier() override;
-
-    /**
-     * @brief Throttle launch queue in multithreaded mode by synchronizing CPU threads.
-     */
-    void _launch_queue_throttle_sync() override;
-
-    /**
-     * @brief Gather fixed-size host byte blobs onto rank 0 using shared memory and barriers.
-     *
-     * @param recv Host buffer on rank 0 to receive all blobs (world*size).
-     * @param object Host pointer to this rank's blob of length @p size.
-     * @param size Number of bytes per rank.
-     */
-    void gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) override;
-
-    /**
-     * @brief All-gather fixed-size host byte blobs onto all ranks using shared memory and barriers.
-     *
-     * @param recv Host buffer to receive concatenated blobs (world*size).
-     * @param object Host pointer to this rank's blob of length @p size.
-     * @param size Number of bytes per rank.
-     */
-    void all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) override;
-
-    /**
-     * @brief All-gather weights either via NCCL or via D2D memcpy depending on configuration.
-     *
-     * @param src Device pointer to local shard (or full buffer if in-place).
-     * @param tgt Device pointer to full target buffer.
-     * @param size Total bytes in the full buffer (must be divisible by world size).
-     */
-    void gather_weight(const std::byte* src, std::byte* tgt, std::size_t size) override;
-
-    /**
-     * @brief Send bytes to @p peer using NCCL or deferred memcpy emulation.
-     *
-     * @param src Device pointer to send buffer.
-     * @param peer Destination rank.
-     * @param size Number of bytes.
-     */
-    void send(const std::byte* src, int peer, std::size_t size) override;
-
-    /**
-     * @brief Receive bytes from @p peer using NCCL or deferred memcpy emulation.
-     *
-     * @param tgt Device pointer to receive buffer.
-     * @param peer Source rank.
-     * @param size Number of bytes.
-     */
-    void recv(std::byte* tgt, int peer, std::size_t size) override;
-
-    /**
-     * @brief Transaction hook: decide whether this transaction uses NCCL and/or memcpy emulation.
-     *
-     * If memcpy emulation is used, waits on readiness events from all workers before proceeding.
-     * If NCCL is used, starts an NCCL group after waiting for readiness on this rank.
-     *
-     * @param cmd Command buffer containing queued commands and the readiness event.
-     */
-    void on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) override;
-
-    /**
-     * @brief Transaction hook: complete NCCL group and/or perform memcpy-based send/recv matching.
-     *
-     * For memcpy-emulated recv, assumes all workers enqueue the same number of receives and uses barriers
-     * and per-rank sync events to ensure correct ordering/visibility across devices.
-     *
-     * @param signal CUDA event recorded on the comms stream to signal completion/progress to peers.
-     *
-     * @throws std::runtime_error If a send/recv size mismatch is detected.
-     */
-    void on_finish_transaction(cudaEvent_t signal) override;
-
-private:
-    std::shared_ptr<SharedState> mShare;
-    bool mAllGatherUseMemcpy = false;
-    bool mSendRecvUseMemcpy = true;
-
-    // transaction status
-    bool mUseMemcpy;
-    bool mUseNCCL;
-
-    struct sSendParams {
-        const std::byte* Data;
-        std::size_t Size;
-        int Peer;
-        bool Matched = false;
-    };
-    std::vector<sSendParams> mSendParams;
-
-    struct sRecvParams {
-        std::byte* Data;
-        std::size_t Size;
-        int Peer;
-    };
-    std::vector<sRecvParams> mRecvParams;
-};
-
-/**
- * @brief Construct a thread communicator for a given rank in a shared process.
- *
- * @param rank Thread/rank index (also used as CUDA device index).
- * @param world Total number of ranks/threads.
- * @param memcpy_allgather If true, all-gather may be implemented via host-coordinated D2D memcpy.
- * @param memcpy_send_recv If true, point-to-point send/recv may be implemented via host-coordinated D2D memcpy.
- * @param nccl_id Pointer to shared ncclUniqueId used for ncclCommInitRank.
- * @param state Shared synchronization/exchange state shared by all ranks in the process.
- */
-NCCLCommunicatorThreads::NCCLCommunicatorThreads(int rank, int world, bool memcpy_allgather, bool memcpy_send_recv, const void* nccl_id, std::shared_ptr<SharedState> state):
-    NCCLCommunicator(rank, world, nccl_id), mShare(std::move(state)), mAllGatherUseMemcpy(memcpy_allgather), mSendRecvUseMemcpy(memcpy_send_recv) {
-}
-
-/**
- * @brief Drops out of the shared barrier on destruction (if present).
- */
-NCCLCommunicatorThreads::~NCCLCommunicatorThreads() {
-    if(mShare && mShare->Barrier) {
-        mShare->Barrier->arrive_and_drop();
-    }
-}
-
-class ThreadsPackImp : public CommunicatorThreadsPack {
-public:
-    ThreadsPackImp(std::vector<std::jthread> threads, std::shared_ptr<NCCLCommunicatorThreads::SharedState> state) :
-        mThreads(std::move(threads)), mState(std::move(state)){
-
-    }
-
-    ~ThreadsPackImp() override {
-        // Destructors are `noexcept` by default; never throw here or we'll `std::terminate`.
-        try {
-            join_impl();
-        } catch (...) {
-            // Swallow: `run_threads_communicators()` calls join() explicitly so exceptions
-            // are surfaced there. If multiple worker threads threw, joining may rethrow
-            // again during stack unwinding; ignore in destructor.
-        }
-    }
-
-    void join() override {
-        join_impl();
-    }
-
-    bool has_exception() const override {
-        std::lock_guard<std::mutex> lock(mState->Mutex);
-        for(int t = 0; t < mThreads.size(); ++t) {
-            if (auto error = mState->Exceptions[t]; error) {
-                return true;
-            }
-        }
-        return false;
-    }
-private:
-    void join_impl() {
-        // if any worker thread has already crashed, raise that exception in the main thread
-        check_exceptions();
-
-        for(auto& t: mThreads) {
-            if(t.joinable()) {
-                t.join();
-            }
-        }
-
-        // ok, now that everyone has terminated, check again for proper exit
-        check_exceptions();
-    }
-
-    void check_exceptions() {
-        std::lock_guard<std::mutex> lock(mState->Mutex);
-        for(int t = 0; t < mThreads.size(); ++t) {
-            if(auto error = mState->Exceptions[t]; error) {
-                fprintf(stderr, "Thread %d exited with uncaught exception\n", t);
-                fflush(stderr);
-                // reset the exception and rethrow it
-                mState->Exceptions[t] = nullptr;
-                std::rethrow_exception(error);
-            }
-        }
-    }
-
-    std::vector<std::jthread> mThreads;
-    std::shared_ptr<NCCLCommunicatorThreads::SharedState> mState;
-};
-
-/**
- * @brief Convenience helper that runs a communicator-per-GPU in threads and waits for completion.
- *
- * @param ngpus Number of GPU ranks/threads to launch.
- * @param memcpy_allgather Enable memcpy-based all-gather emulation in threaded mode.
- * @param memcpy_send_recv Enable memcpy-based send/recv emulation in threaded mode.
- * @param work Callable invoked once per rank with that rank's communicator.
- */
-void NCCLCommunicator::run_threads_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work) {
-    auto threads = launch_threads_communicators(ngpus, memcpy_allgather, memcpy_send_recv, std::move(work));
-    threads->join();
-}
-
-/**
- * @brief Launch a communicator-per-GPU in threads and return a joinable pack.
- *
- * @param ngpus Number of GPU ranks/threads to launch.
- * @param memcpy_allgather Enable memcpy-based all-gather emulation in threaded mode.
- * @param memcpy_send_recv Enable memcpy-based send/recv emulation in threaded mode.
- * @param work Callable invoked once per rank with that rank's communicator.
- *
- * @return A CommunicatorThreadsPack that can be joined and queried for exceptions.
- */
-std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_threads_communicators(
-            int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work)
-{
-    std::vector<std::jthread> threads;
-    ncclUniqueId nccl_id;
-    ncclCheck(ncclGetUniqueId(&nccl_id));
-    threads.reserve(ngpus);
-    auto bar = std::make_shared<NCCLCommunicatorThreads::SharedState>(std::make_unique<std::barrier<>>(ngpus), std::vector<std::byte*>(ngpus));
-    bar->Exceptions.resize(ngpus);
-    for(int i = 0; i < ngpus; ++i) {
-        threads.emplace_back([i, ngpus, nccl_id, memcpy_allgather, memcpy_send_recv, work, bar]() {
-            try {
-                if (!set_cpu_affinity()) {
-                    fprintf(stderr, "WARNING: Failed to set CPU affinity for rank %d\n", i);
-                }
-                NCCLCommunicatorThreads comm(i, ngpus, memcpy_allgather, memcpy_send_recv, &nccl_id, bar);
-                work(comm);
-                bar->Barrier->arrive_and_wait();
-            } catch(...) {
-                std::lock_guard<std::mutex> lock(bar->Mutex);
-                bar->Exceptions[i] = std::current_exception();
-            }
-        }
-        );
-    }
-    return std::make_unique<ThreadsPackImp>(std::move(threads), std::move(bar));
-}
-
 /**
  * @brief Schedule a destructive all-to-all rotation using explicit send/recv pairs.
  *
@@ -987,7 +536,306 @@ void NCCLCommunicator::schedule_destructive_all_to_all(const Tensor& tensor) {
     }
 }
 
-void NCCLCommunicatorThreads::send(const std::byte* src, int peer, std::size_t size) {
+// ============================================================================
+// Unified Threaded Communicator (with optional MPI for multi-node)
+// ============================================================================
+
+/**
+ * @brief Thread-based NCCL communicator variant supporting single-node and multi-node.
+ *
+ * Single-node: Uses std::barrier for CPU synchronization and shared memory for host data exchange.
+ * Multi-node: When MPI is available and multiple nodes detected, uses MPI for inter-node
+ * coordination while maintaining threaded intra-node communication.
+ *
+ * Can optionally replace some NCCL ops (all-gather and/or send/recv) with device-to-device
+ * memcpy coordinated via barriers.
+ */
+class NCCLCommunicatorImpl : public NCCLCommunicator {
+public:
+    struct SharedState {
+        std::unique_ptr<std::barrier<>> Barrier;
+        std::vector<std::byte*> Buffer;     // one pointer per thread
+        std::vector<std::exception_ptr> Exceptions;
+        std::mutex Mutex;
+        int NumNodes = 1;                   // number of nodes (1 = single node)
+        int NodeRank = 0;                   // this node's rank
+        int LocalGPUs = 0;                  // GPUs per node
+
+        // GPU staging buffers for host gather/all-gather in multi-node mode (Ray)
+        // Allocated once at init, reused for all operations
+        void* d_gather_send = nullptr;      // size = kMaxGatherObjectSize * LocalGPUs
+        void* d_gather_recv = nullptr;      // size = kMaxGatherObjectSize * world_size
+        static constexpr size_t kMaxGatherObjectSize = 4096;
+
+        // Device buffer for NCCL barrier (ncclAllReduce requires device memory)
+        char* d_barrier_buf = nullptr;      // 1 byte for barrier AllReduce
+
+        // Node master NCCL communicator for cross-node operations in Ray mode
+        ncclComm_t NodeMasterComm = nullptr;
+
+        ~SharedState() {
+            if (d_gather_send) cudaFree(d_gather_send);
+            if (d_gather_recv) cudaFree(d_gather_recv);
+            if (d_barrier_buf) cudaFree(d_barrier_buf);
+            if (NodeMasterComm) ncclCommDestroy(NodeMasterComm);
+        }
+    };
+
+    /**
+     * @brief Construct a communicator for a given local rank.
+     *
+     * @param local_rank Thread/rank index within this node (also used as CUDA device index).
+     * @param global_rank Global rank across all nodes.
+     * @param global_world Total number of GPUs across all nodes.
+     * @param memcpy_allgather If true, all-gather may be implemented via host-coordinated D2D memcpy.
+     * @param memcpy_send_recv If true, point-to-point send/recv may be implemented via host-coordinated D2D memcpy.
+     * @param nccl_id Pointer to shared ncclUniqueId used for ncclCommInitRank.
+     * @param state Shared synchronization/exchange state shared by all local ranks.
+     */
+    NCCLCommunicatorImpl(int local_rank, int global_rank, int global_world,
+                         bool memcpy_allgather, bool memcpy_send_recv,
+                         const void* nccl_id, std::shared_ptr<SharedState> state);
+
+    /**
+     * @brief Drops out of the shared barrier on destruction (if present).
+     */
+    ~NCCLCommunicatorImpl() override;
+
+    /**
+     * @brief Barrier across all ranks (local threads + inter-node MPI if multi-node).
+     */
+    void barrier() override;
+
+    /**
+     * @brief Throttle launch queue by synchronizing local CPU threads.
+     */
+    void _launch_queue_throttle_sync() override;
+
+    /**
+     * @brief Gather fixed-size host byte blobs onto global rank 0.
+     */
+    void gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) override;
+
+    /**
+     * @brief All-gather fixed-size host byte blobs onto all ranks.
+     */
+    void all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) override;
+
+    /**
+     * @brief All-gather weights either via NCCL or via D2D memcpy depending on configuration.
+     */
+    void gather_weight(const std::byte* src, std::byte* tgt, std::size_t size) override;
+
+    /**
+     * @brief Send bytes to @p peer using NCCL or deferred memcpy emulation.
+     */
+    void send(const std::byte* src, int peer, std::size_t size) override;
+
+    /**
+     * @brief Receive bytes from @p peer using NCCL or deferred memcpy emulation.
+     */
+    void recv(std::byte* tgt, int peer, std::size_t size) override;
+
+    /**
+     * @brief Transaction hook: decide whether this transaction uses NCCL and/or memcpy emulation.
+     */
+    void on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) override;
+
+    /**
+     * @brief Transaction hook: complete NCCL group and/or perform memcpy-based send/recv matching.
+     */
+    void on_finish_transaction(cudaEvent_t signal) override;
+
+    [[nodiscard]] int local_rank() const { return mLocalRank; }
+    [[nodiscard]] bool is_node_master() const { return mLocalRank == 0; }
+
+    void local_barrier() override;
+
+private:
+
+    std::shared_ptr<SharedState> mShare;
+    int mLocalRank;
+    bool mAllGatherUseMemcpy = false;
+    bool mSendRecvUseMemcpy = true;
+
+    // transaction status
+    bool mUseMemcpy;
+    bool mUseNCCL;
+
+    struct sSendParams {
+        const std::byte* Data;
+        std::size_t Size;
+        int Peer;
+        bool Matched = false;
+    };
+    std::vector<sSendParams> mSendParams;
+
+    struct sRecvParams {
+        std::byte* Data;
+        std::size_t Size;
+        int Peer;
+    };
+    std::vector<sRecvParams> mRecvParams;
+};
+
+NCCLCommunicatorImpl::NCCLCommunicatorImpl(
+    int local_rank, int global_rank, int global_world,
+    bool memcpy_allgather, bool memcpy_send_recv,
+    const void* nccl_id, std::shared_ptr<SharedState> state)
+    : NCCLCommunicator(global_rank, global_world, nccl_id, local_rank)  // Pass local_rank as device
+    , mShare(std::move(state))
+    , mLocalRank(local_rank)
+    , mAllGatherUseMemcpy(memcpy_allgather)
+    , mSendRecvUseMemcpy(memcpy_send_recv)
+{
+}
+
+NCCLCommunicatorImpl::~NCCLCommunicatorImpl() {
+    if(mShare && mShare->Barrier) {
+        mShare->Barrier->arrive_and_drop();
+    }
+}
+
+void NCCLCommunicatorImpl::local_barrier() {
+    mShare->Barrier->arrive_and_wait();
+}
+
+void NCCLCommunicatorImpl::barrier() {
+    // Two-level barrier for multi-node
+    local_barrier();
+
+    if (mShare->NumNodes > 1) {
+        // NCCL-based barrier: all-reduce a single byte on device memory
+        // Only local_rank 0 on each node participates in cross-node NCCL
+        if (is_node_master() && mShare->NodeMasterComm && mShare->d_barrier_buf) {
+            ncclCheck(ncclAllReduce(mShare->d_barrier_buf, mShare->d_barrier_buf, 1, ncclChar, ncclSum,
+                                    mShare->NodeMasterComm, stream()));
+            CUDA_CHECK(cudaStreamSynchronize(stream()));
+        }
+        local_barrier();  // Sync local threads after cross-node barrier
+    }
+}
+
+void NCCLCommunicatorImpl::_launch_queue_throttle_sync() {
+    // For multi-node training: synchronize local threads to prevent launch queue exhaustion
+    // For single-node training: skip barrier to avoid unnecessary CPU synchronization overhead
+    if (mShare->NumNodes > 1) {
+        local_barrier();
+    }
+}
+
+void NCCLCommunicatorImpl::gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) {
+    if (mShare->NumNodes > 1) {
+        // NCCL-based gather for multi-node
+        // Only node masters (local_rank == 0) participate in cross-node NCCL
+        int local_gpus = mShare->LocalGPUs;
+
+        if (size > NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize) {
+            throw std::runtime_error(fmt::format("gather_bytes_host: object size {} exceeds max {}",
+                                                 size, NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize));
+        }
+
+        // Step 1: Local gather via shared memory (same as single-node)
+        std::vector<std::byte> local_gather(local_gpus * size);
+        if (is_node_master()) {
+            mShare->Buffer[0] = local_gather.data();
+        }
+        local_barrier();
+        std::memcpy(mShare->Buffer[0] + mLocalRank * size, object, size);
+        local_barrier();
+
+        // Step 2: NCCL gather from node masters to global rank 0
+        if (is_node_master() && mShare->NodeMasterComm) {
+            // Copy local data to GPU staging buffer
+            CUDA_CHECK(cudaMemcpyAsync(mShare->d_gather_send, local_gather.data(),
+                                       local_gpus * size, cudaMemcpyHostToDevice, stream()));
+
+            // Use NCCL all-gather (no native gather, so gather = allgather + discard on non-root)
+            ncclCheck(ncclAllGather(mShare->d_gather_send, mShare->d_gather_recv,
+                                    local_gpus * size, ncclChar, mShare->NodeMasterComm, stream()));
+
+            // Copy result back to host (only rank 0 needs it)
+            if (rank() == 0) {
+                CUDA_CHECK(cudaMemcpyAsync(recv, mShare->d_gather_recv,
+                                           world_size() * size, cudaMemcpyDeviceToHost, stream()));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream()));
+        }
+        local_barrier();
+    } else {
+        // Single-node: simple shared memory gather
+        if (mLocalRank == 0) {
+            mShare->Buffer[0] = recv;
+        }
+        local_barrier();
+        std::memcpy(mShare->Buffer[0] + mLocalRank * size, object, size);
+        local_barrier();
+        if (mLocalRank == 0) {
+            mShare->Buffer[0] = nullptr;
+        }
+    }
+}
+
+void NCCLCommunicatorImpl::all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) {
+    if (mShare->NumNodes > 1) {
+        // NCCL-based all-gather for multi-node
+        int local_gpus = mShare->LocalGPUs;
+        int total_gpus = world_size();
+
+        if (size > NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize) {
+            throw std::runtime_error(fmt::format("all_gather_bytes_host: object size {} exceeds max {}",
+                                                 size, NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize));
+        }
+
+        // Step 1: Local all-gather via shared memory
+        local_barrier();
+        mShare->Buffer[mLocalRank] = const_cast<std::byte*>(object);
+        local_barrier();
+
+        std::vector<std::byte> local_data(local_gpus * size);
+        for (int i = 0; i < local_gpus; ++i) {
+            std::memcpy(local_data.data() + i * size, mShare->Buffer[i], size);
+        }
+        local_barrier();
+
+        // Step 2: NCCL all-gather from node masters
+        if (is_node_master() && mShare->NodeMasterComm) {
+            CUDA_CHECK(cudaMemcpyAsync(mShare->d_gather_send, local_data.data(),
+                                       local_gpus * size, cudaMemcpyHostToDevice, stream()));
+
+            ncclCheck(ncclAllGather(mShare->d_gather_send, mShare->d_gather_recv,
+                                    local_gpus * size, ncclChar, mShare->NodeMasterComm, stream()));
+
+            CUDA_CHECK(cudaMemcpyAsync(recv, mShare->d_gather_recv,
+                                       total_gpus * size, cudaMemcpyDeviceToHost, stream()));
+            CUDA_CHECK(cudaStreamSynchronize(stream()));
+        }
+        local_barrier();
+
+        // Step 3: Broadcast result to all local threads
+        if (is_node_master()) {
+            mShare->Buffer[0] = recv;
+        }
+        local_barrier();
+        if (!is_node_master()) {
+            std::memcpy(recv, mShare->Buffer[0], total_gpus * size);
+        }
+        local_barrier();
+        mShare->Buffer[mLocalRank] = nullptr;
+    } else {
+        // Single-node: simple shared memory all-gather
+        local_barrier();
+        mShare->Buffer[mLocalRank] = const_cast<std::byte*>(object);
+        local_barrier();
+        for (int i = 0; i < world_size(); ++i) {
+            std::memcpy(recv + i * size, mShare->Buffer[i], size);
+        }
+        local_barrier();
+        mShare->Buffer[mLocalRank] = nullptr;
+    }
+}
+
+void NCCLCommunicatorImpl::send(const std::byte* src, int peer, std::size_t size) {
     if (!mSendRecvUseMemcpy) {
         NCCLCommunicator::send(src, peer, size);
     } else {
@@ -995,7 +843,7 @@ void NCCLCommunicatorThreads::send(const std::byte* src, int peer, std::size_t s
     }
 }
 
-void NCCLCommunicatorThreads::recv(std::byte* tgt, int peer, std::size_t size) {
+void NCCLCommunicatorImpl::recv(std::byte* tgt, int peer, std::size_t size) {
     if (!mSendRecvUseMemcpy) {
         NCCLCommunicator::recv(tgt, peer, size);
     } else {
@@ -1003,8 +851,8 @@ void NCCLCommunicatorThreads::recv(std::byte* tgt, int peer, std::size_t size) {
     }
 }
 
-void NCCLCommunicatorThreads::gather_weight(const std::byte* src, std::byte* tgt, std::size_t size) {
-    if(mAllGatherUseMemcpy) {
+void NCCLCommunicatorImpl::gather_weight(const std::byte* src, std::byte* tgt, std::size_t size) {
+    if (mAllGatherUseMemcpy) {
         auto wgt_list = host_all_gather(src);
         std::size_t shard_size = size / world_size();
         for (int i = 0; i < world_size(); ++i) {
@@ -1017,26 +865,18 @@ void NCCLCommunicatorThreads::gather_weight(const std::byte* src, std::byte* tgt
     }
 }
 
-/**
- * @brief Transaction hook: decide whether this transaction uses NCCL and/or memcpy emulation.
- *
- * If memcpy emulation is used, waits on readiness events from all workers before proceeding.
- * If NCCL is used, starts an NCCL group after waiting for readiness on this rank.
- *
- * @param cmd Command buffer containing queued commands and the readiness event.
- */
-void NCCLCommunicatorThreads::on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) {
+void NCCLCommunicatorImpl::on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) {
     mUseMemcpy = false;
     mUseNCCL = false;
-    for (auto& cmd: cmd.Commands) {
-        if (std::holds_alternative<CommandBuffer::ScatterReduce>(cmd)) {
+    for (auto& c : cmd.Commands) {
+        if (std::holds_alternative<CommandBuffer::ScatterReduce>(c)) {
             mUseNCCL = true;
         }
-        if (std::holds_alternative<CommandBuffer::Gather>(cmd)) {
+        if (std::holds_alternative<CommandBuffer::Gather>(c)) {
             if (!mAllGatherUseMemcpy) mUseNCCL = true;
             if (mAllGatherUseMemcpy) mUseMemcpy = true;
         }
-        if (std::holds_alternative<CommandBuffer::Send>(cmd)) {
+        if (std::holds_alternative<CommandBuffer::Send>(c)) {
             if (!mSendRecvUseMemcpy) mUseNCCL = true;
             if (mSendRecvUseMemcpy) mUseMemcpy = true;
         }
@@ -1044,54 +884,44 @@ void NCCLCommunicatorThreads::on_execute_transaction(const NCCLCommunicator::Com
 
     assert(mUseNCCL || mUseMemcpy);
 
-    if(mUseMemcpy) {
+    if (mUseMemcpy) {
         // ensure every worker has set-up commands.Ready to the most recent version
-        barrier();
+        local_barrier();
         // get the ready event from all workers
         auto event_list = host_all_gather(cmd.Ready);
         // make sure to block the comms thread until the data is ready on every worker
-        for (auto event: event_list) {
+        for (auto event : event_list) {
             CUDA_CHECK(cudaStreamWaitEvent(stream(), event, 0));
         }
     }
 
-    if(mUseNCCL){
+    if (mUseNCCL) {
         CUDA_CHECK(cudaStreamWaitEvent(stream(), cmd.Ready, 0));
         ncclCheck(ncclGroupStart());
     }
 }
 
-/**
- * @brief Transaction hook: complete NCCL group and/or perform memcpy-based send/recv matching.
- *
- * For memcpy-emulated recv, assumes all workers enqueue the same number of receives and uses barriers
- * and per-rank sync events to ensure correct ordering/visibility across devices.
- *
- * @param signal CUDA event recorded on the comms stream to signal completion/progress to peers.
- *
- * @throws std::runtime_error If a send/recv size mismatch is detected.
- */
-void NCCLCommunicatorThreads::on_finish_transaction(cudaEvent_t signal) {
+void NCCLCommunicatorImpl::on_finish_transaction(cudaEvent_t signal) {
     if (!mRecvParams.empty()) {
         // get send-queues from peers
         std::vector<std::vector<sSendParams>*> send_params = host_all_gather(&mSendParams);
         std::vector<cudaEvent_t> sync_events = host_all_gather(signal);
         // ok, now iterate all recv's
-        for (auto& recv: mRecvParams) {
+        for (auto& recv_param : mRecvParams) {
             // find matching send
-            for (auto& send : *send_params.at(recv.Peer)) {
+            for (auto& send : *send_params.at(recv_param.Peer)) {
                 if (send.Peer != rank() || send.Matched) continue;
                 // copy data
-                if (recv.Size != send.Size) {
+                if (recv_param.Size != send.Size) {
                     throw std::runtime_error("Size mismatch in recv/send");
                 }
-                CUDA_CHECK(cudaMemcpyAsync(recv.Data, send.Data, recv.Size, cudaMemcpyDeviceToDevice, stream()));
+                CUDA_CHECK(cudaMemcpyAsync(recv_param.Data, send.Data, recv_param.Size, cudaMemcpyDeviceToDevice, stream()));
                 send.Matched = true;
                 break;
             }
 
             CUDA_CHECK(cudaEventRecord(signal, stream()));
-            barrier();      // assumes _all_ workers have the same number of receives!
+            local_barrier();  // assumes _all_ workers have the same number of receives!
             for (int j = 0; j < world_size(); ++j) {
                 if (j != rank()) {
                     CUDA_CHECK(cudaStreamWaitEvent(stream(), sync_events[j], 0));
@@ -1099,92 +929,299 @@ void NCCLCommunicatorThreads::on_finish_transaction(cudaEvent_t signal) {
             }
         }
 
-        barrier();
+        local_barrier();
         mRecvParams.clear();
         mSendParams.clear();
     }
-    if(mUseNCCL) {
+    if (mUseNCCL) {
         ncclCheck(ncclGroupEnd());
     }
 
     CUDA_CHECK(cudaEventRecord(signal, stream()));
 }
 
-/**
- * @brief Barrier across all ranks/threads in the process.
- */
-void NCCLCommunicatorThreads::barrier() {
-    mShare->Barrier->arrive_and_wait();
-}
+// ============================================================================
+// Thread Pack for managing worker threads
+// ============================================================================
 
-/**
- * @brief Throttle launch queue in multithreaded mode by synchronizing CPU threads.
- *
- * This prevents deadlocks that occur in multi-threaded (single-process) NCCL configurations
- * but not in multi-process configurations.
- *
- * Root Cause:
- * CUDA maintains a per-process launch queue for kernel submissions. In multi-threaded mode,
- * all GPU worker threads share this single queue. NCCL collective operations contain an
- * implicit global barrier - all ranks must reach the collective before any can proceed.
- *
- * Deadlock Scenario:
- * 1. GPU 0 (fast) enqueues its collective operation
- * 2. GPU 0 continues and fills the per-process launch queue with subsequent kernels
- * 3. GPU 1 (slow) tries to enqueue work needed to reach the collective, but queue is full
- * 4. GPU 0 is blocked on the collective barrier waiting for GPU 1
- * 5. GPU 1 cannot enqueue because GPU 0 filled the queue → deadlock
- *
- * Solution:
- * CPU-side thread synchronization (not GPU synchronization) ensures all threads reach the
- * collective submission point together before any thread can continue enqueueing work.
- * This prevents the launch queue from being exhausted by a single fast GPU.
- *
- * Note: Multi-process mode doesn't need this because each process has its own launch queue.
- */
-void NCCLCommunicatorThreads::_launch_queue_throttle_sync() {
-    this->barrier();
-}
+class CommunicatorThreadsPackImpl : public CommunicatorThreadsPack {
+public:
+    CommunicatorThreadsPackImpl(std::vector<std::jthread> threads,
+                                std::shared_ptr<NCCLCommunicatorImpl::SharedState> state)
+        : mThreads(std::move(threads)), mState(std::move(state)) {}
 
-/**
- * @brief Gather fixed-size host byte blobs onto rank 0 using shared memory and barriers.
- *
- * @param recv Host buffer on rank 0 to receive all blobs (world*size).
- * @param object Host pointer to this rank's blob of length @p size.
- * @param size Number of bytes per rank.
- */
-void NCCLCommunicatorThreads::gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) {
-    if(rank() == 0) {
-        mShare->Buffer[0] = recv;
+    ~CommunicatorThreadsPackImpl() override {
+        try {
+            join_impl();
+        } catch (...) {
+            // Swallow in destructor
+        }
     }
-    barrier();
-    std::memcpy(mShare->Buffer[0] + rank() * size, object, size);
-    barrier();
-    if(rank() == 0) {
-        mShare->Buffer[0] = nullptr;
+
+    void join() override {
+        join_impl();
     }
+
+    bool has_exception() const override {
+        std::lock_guard<std::mutex> lock(mState->Mutex);
+        for (size_t t = 0; t < mThreads.size(); ++t) {
+            if (mState->Exceptions[t]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    void join_impl() {
+        check_exceptions();
+        for (auto& t : mThreads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        check_exceptions();
+    }
+
+    void check_exceptions() {
+        std::lock_guard<std::mutex> lock(mState->Mutex);
+        for (size_t t = 0; t < mThreads.size(); ++t) {
+            if (auto error = mState->Exceptions[t]; error) {
+                fprintf(stderr, "Thread %zu exited with uncaught exception\n", t);
+                fflush(stderr);
+                mState->Exceptions[t] = nullptr;
+                std::rethrow_exception(error);
+            }
+        }
+    }
+
+    std::vector<std::jthread> mThreads;
+    std::shared_ptr<NCCLCommunicatorImpl::SharedState> mState;
+};
+
+// ============================================================================
+// Main Entry Points
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Helper to launch communicator threads for single-node training.
+ *
+ * @param ngpus Number of local GPUs.
+ * @param memcpy_allgather Enable memcpy-based all-gather emulation.
+ * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
+ * @param work Callable invoked once per GPU with that GPU's communicator.
+ * @return Thread pack for caller to manage.
+ */
+std::unique_ptr<CommunicatorThreadsPackImpl>
+launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
+                          std::function<void(NCCLCommunicator& comm)> work) {
+    // Detect available GPUs
+    int gpus_available = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
+    if (ngpus == 0) {
+        ngpus = gpus_available;
+    }
+    if (ngpus > gpus_available) {
+        throw std::runtime_error(fmt::format("Requested {} GPUs, but only {} available", ngpus, gpus_available));
+    }
+
+    // Generate NCCL unique ID
+    ncclUniqueId nccl_id;
+    ncclCheck(ncclGetUniqueId(&nccl_id));
+
+    // Create shared state for local threads
+    auto shared_state = std::make_shared<NCCLCommunicatorImpl::SharedState>();
+    shared_state->Barrier = std::make_unique<std::barrier<>>(ngpus);
+    shared_state->Buffer.resize(ngpus);
+    shared_state->Exceptions.resize(ngpus);
+    shared_state->NumNodes = 1;
+    shared_state->NodeRank = 0;
+    shared_state->LocalGPUs = ngpus;
+
+    // Launch worker threads
+    std::vector<std::jthread> threads;
+    threads.reserve(ngpus);
+
+    for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
+        threads.emplace_back([=, &work]() {
+            try {
+                if (!set_cpu_affinity()) {
+                    fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
+                }
+
+                NCCLCommunicatorImpl comm(local_rank, local_rank, ngpus,
+                                          memcpy_allgather, memcpy_send_recv,
+                                          &nccl_id, shared_state);
+                work(comm);
+                shared_state->Barrier->arrive_and_wait();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(shared_state->Mutex);
+                shared_state->Exceptions[local_rank] = std::current_exception();
+            }
+        });
+    }
+
+    return std::make_unique<CommunicatorThreadsPackImpl>(std::move(threads), shared_state);
+}
+
+} // anonymous namespace
+
+/**
+ * @brief Run distributed training with one thread per local GPU (blocking).
+ */
+void NCCLCommunicator::run_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
+                                          std::function<void(NCCLCommunicator& comm)> work) {
+    auto pack = launch_communicators_impl(ngpus, memcpy_allgather, memcpy_send_recv, std::move(work));
+    pack->join();
 }
 
 /**
- * @brief All-gather fixed-size host byte blobs onto all ranks using shared memory and barriers.
+ * @brief Launch communicator threads and return a joinable pack (non-blocking).
  *
- * @param recv Host buffer to receive concatenated blobs (world*size).
- * @param object Host pointer to this rank's blob of length @p size.
- * @param size Number of bytes per rank.
+ * For single-node operation. Use launch_communicators_multinode() for multi-node via Ray.
  */
-void NCCLCommunicatorThreads::all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) {
-    barrier();
-    mShare->Buffer[rank()] = const_cast<std::byte*>(object);
-    barrier();
-    for(int i = 0; i < world_size(); ++i) {
-        std::memcpy(recv + i * size,  mShare->Buffer[i], size);
-    }
-    barrier();
-    mShare->Buffer[rank()] = nullptr;
-}
-#else
-void NCCLCommunicator::launch_threads_communicators(int zero_level) {
-    throw std::runtime_error("threads communicator not available.");
+std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators(
+    int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
+    std::function<void(NCCLCommunicator& comm)> work) {
+
+    return launch_communicators_impl(ngpus, memcpy_allgather, memcpy_send_recv, std::move(work));
 }
 
-#endif
+/**
+ * @brief Generate a new NCCL unique ID.
+ */
+std::array<std::byte, 128> NCCLCommunicator::generate_nccl_id() {
+    ncclUniqueId id;
+    ncclCheck(ncclGetUniqueId(&id));
+    std::array<std::byte, 128> result;
+    static_assert(sizeof(ncclUniqueId) == 128, "ncclUniqueId size mismatch");
+    std::memcpy(result.data(), &id, 128);
+    return result;
+}
+
+/**
+ * @brief Launch communicator threads with externally-provided NCCL IDs (for Ray multi-node).
+ *
+ * Similar to launch_communicators_impl but:
+ * - Uses externally-provided nccl_id and node_master_nccl_id (coordinated via Ray)
+ * - Uses provided node_rank, num_nodes
+ * - Computes global_rank = node_rank * ngpus + local_rank
+ * - Computes global_world = num_nodes * ngpus
+ * - Initializes node master communicator and staging buffers for cross-node operations
+ */
+std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_multinode(
+    int ngpus,
+    int node_rank,
+    int num_nodes,
+    const void* nccl_id,
+    const void* node_master_nccl_id,
+    bool memcpy_allgather,
+    bool memcpy_send_recv,
+    std::function<void(NCCLCommunicator& comm)> work) {
+
+    // Detect available GPUs
+    int gpus_available = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
+    if (ngpus == 0) {
+        ngpus = gpus_available;
+    }
+    if (ngpus > gpus_available) {
+        throw std::runtime_error(fmt::format("Requested {} GPUs, but only {} available", ngpus, gpus_available));
+    }
+
+    // Validate parameters
+    if (node_rank < 0 || node_rank >= num_nodes) {
+        throw std::runtime_error(fmt::format("Invalid node_rank {} for num_nodes {}", node_rank, num_nodes));
+    }
+    if (num_nodes < 1) {
+        throw std::runtime_error(fmt::format("Invalid num_nodes {}", num_nodes));
+    }
+    if (nccl_id == nullptr) {
+        throw std::runtime_error("nccl_id cannot be null");
+    }
+    if (node_master_nccl_id == nullptr) {
+        throw std::runtime_error("node_master_nccl_id cannot be null");
+    }
+
+    int global_world = num_nodes * ngpus;
+
+    if (node_rank == 0) {
+        fprintf(stderr, "Ray multi-node training: %d nodes, %d GPUs per node, %d total GPUs\n",
+                num_nodes, ngpus, global_world);
+    }
+
+    // Create shared state for local threads
+    auto shared_state = std::make_shared<NCCLCommunicatorImpl::SharedState>();
+    shared_state->Barrier = std::make_unique<std::barrier<>>(ngpus);
+    shared_state->Buffer.resize(ngpus);
+    shared_state->Exceptions.resize(ngpus);
+    shared_state->NumNodes = num_nodes;
+    shared_state->NodeRank = node_rank;
+    shared_state->LocalGPUs = ngpus;
+
+    // Allocate staging buffers on device 0 for host gather/all-gather operations
+    CUDA_CHECK(cudaSetDevice(0));
+    size_t send_size = NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize * ngpus;
+    size_t recv_size = NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize * global_world;
+    CUDA_CHECK(cudaMalloc(&shared_state->d_gather_send, send_size));
+    CUDA_CHECK(cudaMalloc(&shared_state->d_gather_recv, recv_size));
+
+    // Allocate device buffer for NCCL barrier (ncclAllReduce requires device memory)
+    CUDA_CHECK(cudaMalloc(&shared_state->d_barrier_buf, sizeof(char)));
+    CUDA_CHECK(cudaMemset(shared_state->d_barrier_buf, 0, sizeof(char)));
+
+    // NOTE: NodeMasterComm is initialized inside the worker threads by local_rank=0
+    // because ncclCommInitRank is a collective operation that must be called
+    // simultaneously by all participating ranks (one per node). Moving this to the
+    // main thread would cause a deadlock since nodes may reach this point at different times.
+
+    // Launch worker threads
+    std::vector<std::jthread> threads;
+    threads.reserve(ngpus);
+
+    for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
+        int global_rank = node_rank * ngpus + local_rank;
+
+        threads.emplace_back([=, &work, nccl_id_copy = nccl_id, node_master_nccl_id_copy = node_master_nccl_id]() {
+            try {
+                if (!set_cpu_affinity()) {
+                    fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
+                }
+
+                NCCLCommunicatorImpl comm(local_rank, global_rank, global_world,
+                                          memcpy_allgather, memcpy_send_recv,
+                                          nccl_id_copy, shared_state);
+
+                // Initialize NodeMasterComm for cross-node operations IMMEDIATELY after the
+                // per-GPU communicator init. The ncclCommInitRank above is a collective operation
+                // that synchronizes all 8 GPUs across both nodes, so all local_rank=0 threads
+                // exit that call at approximately the same time. We leverage this synchronization
+                // to ensure the NodeMasterComm init (also a collective) is called simultaneously
+                // by both node masters without needing an explicit cross-node barrier.
+                //
+                // IMPORTANT: No local barrier before this! A local barrier would desynchronize
+                // the cross-node timing because nodes have different numbers of threads that
+                // might reach the barrier at different speeds.
+                if (local_rank == 0 && num_nodes > 1) {
+                    // Stay on device 0 (already set by NCCLCommunicatorImpl constructor for local_rank 0)
+                    ncclCheck(ncclCommInitRank(&shared_state->NodeMasterComm, num_nodes,
+                                               *reinterpret_cast<const ncclUniqueId*>(node_master_nccl_id_copy), node_rank));
+                }
+
+                // Now sync all local threads before proceeding to work
+                shared_state->Barrier->arrive_and_wait();
+
+                work(comm);
+
+                shared_state->Barrier->arrive_and_wait();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(shared_state->Mutex);
+                shared_state->Exceptions[local_rank] = std::current_exception();
+            }
+        });
+    }
+
+    return std::make_unique<CommunicatorThreadsPackImpl>(std::move(threads), shared_state);
+}

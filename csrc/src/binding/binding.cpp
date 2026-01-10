@@ -21,6 +21,7 @@
 #include "utilities/gpu_info.h"
 #include "utilities/safetensors.h"
 #include "utilities/sol.h"
+#include "utilities/comm.h"
 #include "config/lora_adapter_config.h"
 #include "recipes/recipe_factory.h"
 #include "modules/qlora/qlora_config.h"
@@ -797,26 +798,28 @@ NB_MODULE(_surogate, m) {
              "Save a checkpoint.\n\n"
              "Parameters:\n- path: Checkpoint directory.\n- step: Step number to save.")
         .def("step", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
-            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->world_size(), trainer->seq_length());
-            CHECK_SHAPE(targets, trainer->batch_size() * trainer->world_size(), trainer->seq_length());
+            // Use local_world_size (GPUs on this node) not global world_size
+            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
 
             trainer->step(inputs.data(), targets.data());
         }, nb::arg("inputs"), nb::arg("targets"),
              "Perform one training step (forward + backward).\n\n"
              "This call is asynchronous; the loss becomes available on the next `update()`.\n\n"
              "Parameters:\n"
-             "- inputs: int32 token ids shaped [batch_size * world_size, seq_length].\n"
-             "- targets: int32 token ids shaped [batch_size * world_size, seq_length].")
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].")
         .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
-            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->world_size(), trainer->seq_length());
-            CHECK_SHAPE(targets, trainer->batch_size() * trainer->world_size(), trainer->seq_length());
+            // Use local_world_size (GPUs on this node) not global world_size
+            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
 
             return trainer->validate(inputs.data(), targets.data());
         }, nb::arg("inputs"), nb::arg("targets"),
              "Compute validation loss for one batch (forward only).\n\n"
              "Parameters:\n"
-             "- inputs: int32 token ids shaped [batch_size * world_size, seq_length].\n"
-             "- targets: int32 token ids shaped [batch_size * world_size, seq_length].\n\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n\n"
              "Returns: loss (float).")
         .def("update_with_config", [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& config, int step){
             auto [loss, norm] = trainer->update_with_config(config, step);
@@ -892,19 +895,68 @@ NB_MODULE(_surogate, m) {
             "Get current memory allocator statistics.\n\n"
             "Parameters:\n- gpu_id: Which GPU to query.\n\n"
             "Returns: dict[str, dict] with per-segment counters; stack entries include {'stack': bytes}.")
+        .def_static("create_multinode", [](int ngpu, int node_rank, int num_nodes,
+                nb::bytes nccl_id, nb::bytes node_master_nccl_id,
+                PretrainedConfig config, RuntimeOptions options,
+                int batch_size, int seq_len, int grad_accum,
+                bool memcpy_all_gather, bool memcpy_send_recv,
+                std::optional<LoRAAdapterConfig> lora_config,
+                std::optional<modules::QLoRAConfig> qlora_config) {
+            if (nccl_id.size() != 128) {
+                throw std::runtime_error(fmt::format("nccl_id must be exactly 128 bytes, got {}", nccl_id.size()));
+            }
+            if (node_master_nccl_id.size() != 128) {
+                throw std::runtime_error(fmt::format("node_master_nccl_id must be exactly 128 bytes, got {}", node_master_nccl_id.size()));
+            }
+            options.ModelType = config.DType;
+            return new MultiGPUPyTrainer(ngpu, node_rank, num_nodes,
+                nccl_id.c_str(), node_master_nccl_id.c_str(),
+                config, options, batch_size, seq_len, grad_accum,
+                memcpy_all_gather, memcpy_send_recv, lora_config, qlora_config);
+        }, nb::arg("ngpu"), nb::arg("node_rank"), nb::arg("num_nodes"),
+           nb::arg("nccl_id"), nb::arg("node_master_nccl_id"),
+           nb::arg("config"), nb::arg("options"),
+           nb::arg("batch_size"), nb::arg("seq_len"), nb::arg("grad_accum"),
+           nb::arg("memcpy_all_gather") = true, nb::arg("memcpy_send_recv") = true,
+           nb::arg("lora_config") = std::nullopt, nb::arg("qlora_config") = std::nullopt,
+           "Create a trainer instance for multi-node distributed training.\n\n"
+           "Used with Ray for coordinating training across multiple machines.\n"
+           "NCCL IDs must be generated on the master node using generate_nccl_id()\n"
+           "and shared with all worker nodes before calling this method.\n\n"
+           "Parameters:\n"
+           "- ngpu: Number of local GPUs on this node.\n"
+           "- node_rank: This node's rank (0 to num_nodes-1).\n"
+           "- num_nodes: Total number of nodes in the cluster.\n"
+           "- nccl_id: 128-byte NCCL unique ID for global communicator.\n"
+           "- node_master_nccl_id: 128-byte NCCL unique ID for node master communicator.\n"
+           "- config: Model configuration.\n"
+           "- options: Runtime/training options.\n"
+           "- batch_size: Per-GPU batch size.\n"
+           "- seq_len: Sequence length.\n"
+           "- grad_accum: Gradient accumulation steps.\n"
+           "- memcpy_all_gather/memcpy_send_recv: Enable memcpy-based collectives.\n"
+           "- lora_config: Optional LoRA configuration.\n"
+           "- qlora_config: Optional QLoRA configuration.\n\n"
+           "Returns: SurogateTrainer")
         ;
 
     nb::class_<DataLoader>(m, "DataLoader",
         "Streaming token dataset loader.\n\n"
-        "Loads fixed-size chunks from a list of token files and fills preallocated arrays.")
-        .def("__init__", [](DataLoader *d, const std::vector<std::string>& file_list, int chunk_size, unsigned long seed = 42) {
-            new (d) DataLoader(file_list, chunk_size, 0, 1, seed);
-        }, nb::arg("file_list"), nb::arg("chunk_size"), nb::arg("seed") = 42,
+        "Loads fixed-size chunks from a list of token files and fills preallocated arrays.\n"
+        "Supports distributed sharding via rank/world_size for multi-node training.")
+        .def("__init__", [](DataLoader *d, const std::vector<std::string>& file_list, int chunk_size,
+                           int rank = 0, int world_size = 1, unsigned long seed = 42) {
+            new (d) DataLoader(file_list, chunk_size, rank, world_size, seed);
+        }, nb::arg("file_list"), nb::arg("chunk_size"), nb::arg("rank") = 0, nb::arg("world_size") = 1, nb::arg("seed") = 42,
            "Create a DataLoader.\n\n"
            "Parameters:\n"
            "- file_list: List of dataset file paths.\n"
            "- chunk_size: Chunk size in tokens.\n"
-           "- seed: RNG seed controlling shuffling/order.")
+           "- rank: Global rank of this worker (0 to world_size-1). Default: 0.\n"
+           "- world_size: Total number of workers. Default: 1.\n"
+           "- seed: RNG seed controlling shuffling/order.\n\n"
+           "For distributed training, each worker should use different rank with the same world_size.\n"
+           "Data is sharded via strided access: rank i reads chunks i, i+world_size, i+2*world_size, etc.")
         .def("load_batch", [](DataLoader* d, TokenArray inputs, TokenArray targets) {
             Tensor inp_t{ETensorDType::INT32, {static_cast<long>(inputs.shape(0)), static_cast<long>(inputs.shape(1))},
                         reinterpret_cast<std::byte*>(inputs.data()), nullptr, 2, inputs.device_id()};
@@ -946,6 +998,13 @@ NB_MODULE(_surogate, m) {
           "Use with care: this removes files from disk.");
     m.def("get_num_gpus", [](){ int count; CUDA_CHECK(cudaGetDeviceCount(&count)); return count; },
           "Return the number of CUDA devices visible to this process.");
+
+    m.def("generate_nccl_id", []() -> nb::bytes {
+        auto id = NCCLCommunicator::generate_nccl_id();
+        return nb::bytes(reinterpret_cast<const char*>(id.data()), 128);
+    }, "Generate a new NCCL unique ID (128 bytes) for multi-node coordination.\n\n"
+       "This ID must be shared across all nodes before launching distributed training.\n"
+       "Typically, the master node generates the ID and broadcasts it to all workers.");
 
     nb::enum_<TrainingRunLogger::EVerbosity>(m, "LogVerbosity",
         "Logger verbosity level.")
