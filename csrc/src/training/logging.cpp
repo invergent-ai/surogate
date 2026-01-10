@@ -453,12 +453,12 @@ void TrainingRunLogger::log_sol_estimate(std::vector<std::pair<ETensorDType, lon
     // used by get_peak_rate() and estimate_speed_of_light()
     double true_bf16_rate = 0.0;
     double true_fp8_rate = 0.0;
-    if (spec_bf16_peak > 0.0f) {
-        true_bf16_rate = measure_real_peak();
-    }
-    if (uses_fp8 && spec_fp8_peak > 0.0f) {
-        true_fp8_rate = measure_real_peak_fp8();
-    }
+    // if (spec_bf16_peak > 0.0f) {
+    //     true_bf16_rate = measure_real_peak();
+    // }
+    // if (uses_fp8 && spec_fp8_peak > 0.0f) {
+    //     true_fp8_rate = measure_real_peak_fp8();
+    // }
 
     // Now compute SOL estimate using measured values via get_peak_rate()
     const long estimate_ns = estimate_speed_of_light(gpu_name.c_str(), ops);
