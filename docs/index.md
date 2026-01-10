@@ -80,6 +80,7 @@ Run your first pretraining/fine-tuning:
 - [Memory](guides/memory.md)
 - [Offloading](guides/offloading.md)
 - [Multi-GPU](guides/multi-gpu.md)
+- [Multi-Node](guides/multi-node.md)
 - [Performance](guides/performance.md)
 - [Debugging](guides/debugging.md)
 

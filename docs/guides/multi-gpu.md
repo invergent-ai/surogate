@@ -2,6 +2,25 @@
 
 Surogate provides robust support for multi-GPU training, enabling efficient utilization of multiple GPUs to accelerate model training and handle larger models and datasets. The framework leverages data parallelism techniques with optimized communication patterns to distribute the workload across available GPUs.
 
+## Training Models That Don't Fit on a Single GPU
+
+Surogate's ZeRO implementation (stages 1-3) combined with CPU offloading enables training models that exceed single GPU memory capacity, **with important limitations**:
+
+**✅ What ZeRO Enables:**
+- Train models where the **base weights fit** on a single GPU, but **weights + optimizer states + gradients + activations** don't
+- Example: Training a 7B model (14 GB weights) that requires 66 GB total memory can work on 4x 24GB GPUs with ZeRO-3
+- Memory savings scale with number of GPUs: ZeRO-3 divides optimizer states, gradients, and weight storage by the number of GPUs
+
+**❌ What ZeRO Cannot Do:**
+- Train models where **base model weights alone** exceed single GPU memory
+- Example: A 70B model (140 GB in BF16) cannot be trained even with ZeRO-3 on 8x 80GB GPUs
+- **Reason**: During forward/backward passes, weights are reconstructed via all-gather operations, requiring each GPU to temporarily hold full weight tensors
+
+**💡 Extending Capacity with CPU Offloading:**
+Combine ZeRO with CPU offloading (`offload_optimizer`, `offload_master`, `offload_grads`, `offload_residual`) to train even larger models by using CPU RAM as overflow storage. This can extend capacity by 2-3x depending on your CPU RAM and PCIe bandwidth.
+
+**Note:** For models exceeding these limits (e.g., 70B+ parameter models), tensor parallelism would be required, which splits model weights across GPUs during computation rather than just for storage.
+
 ## Multi-Threading vs Multiprocessing
 
 Within a single node, there are two main approaches for handling multi-GPU support:
@@ -96,7 +115,7 @@ Example:
 zero_level: 2 # Shard optimizer states and gradients
 ```
 
-Higher ZeRO levels reduce per-GPU memory consumption but increase communication overhead. ZeRO-3 enables training models that don't fit on a single GPU.
+Higher ZeRO levels reduce per-GPU memory consumption but increase communication overhead. ZeRO-3 shards weights for storage, but full weights are reconstructed during forward/backward passes via all-gather operations (see limitations in the introduction above).
 
 ### `shard_weights`
 

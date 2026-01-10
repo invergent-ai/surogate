@@ -63,7 +63,9 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | `use_zero_copy`      | bool | `false` | Use ZeroCopy memory access instead of double-buffered cudaMemcpy for offloaded optimizer states. DMA is slower on consumer cards but faster on professional cards.                                                            |
 | `use_write_combined` | bool | `false` | Use write-combined memory for offloaded tensors. May improve PCIe throughput in some situations.                                                                                                                              |
 
-## Distributed Training (ZeRO) Options
+## Multi-GPU Training (ZeRO) Options
+
+These options apply to single-node multi-GPU training. For multi-node distributed training, see [Multi-Node Distributed Training](#multi-node-distributed-training).
 
 | Option                  | Type | Default | Description                                                                                                                                                                     |
 | ----------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -73,6 +75,26 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | `use_all_to_all_reduce` | bool | `false` | Use all-to-all-based reduce algorithm (combine with `memcpy_send_recv`).                                                                                                        |
 | `memcpy_all_gather`     | bool | `false` | Use memcpy for all-gather operations (threads backend only). Generally gets better bandwidth utilization on PCIe and does not consume SM resources.                             |
 | `memcpy_send_recv`      | bool | `false` | Use memcpy for send/receive operations (threads backend only).                                                                                                                  |
+
+## Multi-Node Distributed Training
+
+Configuration for training across multiple machines using Ray and NCCL. See the [Multi-Node Training Guide](guides/multi-node.md) for detailed setup instructions.
+
+| Option                        | Type   | Default  | Description                                                                                                                                                |
+| ----------------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `distributed.ray_address`     | string | `"auto"` | Ray cluster address. Options: `"auto"` (connect to existing cluster), `"local"` (start local instance), `"ray://host:port"` (connect to specific head).   |
+| `distributed.num_nodes`       | int    | `1`      | Total number of nodes to use for training. Set to `> 1` to enable multi-node training.                                                                     |
+| `distributed.gpus_per_node`   | int    | `0`      | Number of GPUs per node. If `0`, uses the value from `gpus` config parameter.                                                                              |
+| `distributed.worker_output_dir` | string | `null`   | Base directory for worker-local tokenized data. Each worker creates a `node-{rank}/` subdirectory. If `null`, uses `/tmp/surogate-{run_name}/` on each node. |
+
+**Example configuration:**
+```yaml
+distributed:
+  ray_address: "auto"
+  num_nodes: 2
+  gpus_per_node: 8
+  worker_output_dir: /shared/surogate-data
+```
 
 ## Hardware Settings
 

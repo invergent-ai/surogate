@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_UTILITIES_COMM_H
 #define SUROGATE_SRC_UTILITIES_COMM_H
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -37,11 +39,14 @@ public:
 
 class NCCLCommunicator {
 public:
-    NCCLCommunicator(int rank, int world, const void* nccl_id);
+    NCCLCommunicator(int rank, int world, const void* nccl_id, int local_device = -1);
     virtual ~NCCLCommunicator();
 
-    // Cpu-side barrier
+    // Cpu-side barrier (includes cross-node sync if multi-node)
     virtual void barrier() = 0;
+
+    // Local barrier (only syncs threads on this node)
+    virtual void local_barrier() = 0;
 
     void begin_transaction(cudaEvent_t ready);
     void begin_transaction(cudaStream_t wait_for_stream);
@@ -64,6 +69,7 @@ public:
 
     [[nodiscard]] int rank() const { return mRank; }
     [[nodiscard]] int world_size() const { return mWorld; }
+    [[nodiscard]] int local_rank() const { return mLocalRank; }
 
     [[nodiscard]] cudaStream_t stream() const { return mCommsStream; }
 
@@ -89,9 +95,69 @@ public:
         return result;
     }
 
-    static std::unique_ptr<NCCLCommunicator> make_mpi_communicator();
-    static void run_threads_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
-    static std::unique_ptr<CommunicatorThreadsPack> launch_threads_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+    /**
+     * @brief Run distributed training with one thread per local GPU (blocking).
+     *
+     * Single-node: Launches threads for each GPU, uses std::barrier for synchronization.
+     * Multi-node: When MPI environment is detected (OMPI_COMM_WORLD_SIZE), coordinates
+     * across nodes using MPI while maintaining threaded intra-node communication.
+     *
+     * @param ngpus Number of local GPUs to use (0 = auto-detect all available).
+     * @param memcpy_allgather Enable memcpy-based all-gather emulation.
+     * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
+     * @param work Callable invoked once per GPU with that GPU's communicator.
+     */
+    static void run_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+
+    /**
+     * @brief Launch communicator threads and return a joinable pack (non-blocking).
+     *
+     * Same as run_communicators but returns immediately with a joinable pack.
+     * Used by Python bindings to run training in background threads.
+     *
+     * @param ngpus Number of local GPUs to use (0 = auto-detect all available).
+     * @param memcpy_allgather Enable memcpy-based all-gather emulation.
+     * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
+     * @param work Callable invoked once per GPU with that GPU's communicator.
+     * @return Joinable pack that can be used to wait for completion.
+     */
+    static std::unique_ptr<CommunicatorThreadsPack> launch_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+
+    /**
+     * @brief Launch communicator threads with externally-provided NCCL IDs (for Ray multi-node).
+     *
+     * Used for multi-node training where NCCL IDs are coordinated externally (e.g., via Ray).
+     * Creates two NCCL communicators:
+     * 1. Global communicator spanning all GPUs across all nodes (for gradient sync)
+     * 2. Node master communicator spanning only local_rank=0 on each node (for host gather/barrier)
+     *
+     * @param ngpus Number of local GPUs on this node.
+     * @param node_rank This node's rank (0 to num_nodes-1).
+     * @param num_nodes Total number of nodes.
+     * @param nccl_id Shared NCCL unique ID for global communicator (128 bytes, same on all nodes).
+     * @param node_master_nccl_id Shared NCCL unique ID for node master communicator (128 bytes, same on all nodes).
+     * @param memcpy_allgather Enable memcpy-based all-gather emulation.
+     * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
+     * @param work Callable invoked once per GPU with that GPU's communicator.
+     * @return Joinable pack that can be used to wait for completion.
+     */
+    static std::unique_ptr<CommunicatorThreadsPack> launch_communicators_multinode(
+        int ngpus,
+        int node_rank,
+        int num_nodes,
+        const void* nccl_id,
+        const void* node_master_nccl_id,
+        bool memcpy_allgather,
+        bool memcpy_send_recv,
+        std::function<void(NCCLCommunicator& comm)> work
+    );
+
+    /**
+     * @brief Generate a new NCCL unique ID.
+     * @return 128-byte unique ID that must be shared across all nodes.
+     */
+    static std::array<std::byte, 128> generate_nccl_id();
+
 protected:
     void terminate_nccl();
 
@@ -114,6 +180,7 @@ private:
     ncclComm_t mNcclComm;
     int mRank;
     int mWorld;
+    int mLocalRank;  // Local device index (same as rank for single-node, device index for multi-node)
 
     cudaEvent_t mCommsSync;
     cudaStream_t mCommsStream;

@@ -59,7 +59,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # with a fallback implementation
 option(USE_CUFILE "Enable cuFile support for optimized file I/O" ON)
 option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
-option(USE_MPI "Enable MPI backend for multi-GPU support" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
 
 FetchContent_Declare(
@@ -172,19 +171,10 @@ target_include_directories(nvidia::nccl INTERFACE "${NCCL_INCLUDE_DIRS}")
 
 set(MULTI_GPU_DEPS "")
 set(MULTI_GPU_DEFS "")
-if (USE_MPI)
-    find_package(MPI REQUIRED)
-    list(APPEND MULTI_GPU_DEPS MPI::MPI_CXX)
-    list(APPEND MULTI_GPU_DEFS USE_MPI=1)
-endif ()
 
-find_package(Threads)
-if (Threads_FOUND)
-    list(APPEND MULTI_GPU_DEPS Threads::Threads)
-    list(APPEND MULTI_GPU_DEFS USE_THREADS=1)
-else ()
-    message(STATUS "Threads not found, disabling")
-endif ()
+# Threads are always required for the unified multi-GPU communicator
+find_package(Threads REQUIRED)
+list(APPEND MULTI_GPU_DEPS Threads::Threads)
 
 find_path(CUDNN_INCLUDE_DIR cudnn.h
         HINTS $ENV{CUDNN_INCLUDE_PATH} ${CUDA_TOOLKIT_ROOT_DIR}
@@ -285,11 +275,8 @@ target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
 target_include_directories(surogate-common PUBLIC src ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
 target_compile_options(surogate-common PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo> $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 
-add_executable(train src/train.cpp)
-target_link_libraries(train PRIVATE surogate-common CLI11::CLI11 fmt::fmt-header-only)
-
 if (NOT SKBUILD)
-    install(TARGETS surogate-common train
+    install(TARGETS surogate-common
             LIBRARY DESTINATION lib
             RUNTIME DESTINATION bin
     )

@@ -38,7 +38,7 @@ bool gpu_available() {
     if (!checked) {
         checked = true;
         try {
-            NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator&) { available = true; });
+            NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator&) { available = true; });
         } catch (...) {
             available = false;
         }
@@ -127,7 +127,7 @@ std::vector<TensorShard> collect_tensors(ITensorContainer& container) {
 TEST_CASE("Modular dense model: 1 step forward/backward/update runs", "[modular][dense][smoke][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -165,7 +165,7 @@ TEST_CASE("Modular dense model: 1 step forward/backward/update runs", "[modular]
 TEST_CASE("Modular: Qwen3-style head_dim + qk_norm forward/backward/update runs", "[modular][qwen3][qk-norm][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -211,7 +211,7 @@ TEST_CASE("Modular: Qwen3-style head_dim + qk_norm forward/backward/update runs"
 TEST_CASE("Modular cuda-graphs: 1 step forward/backward/update runs", "[modular][cuda-graphs][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -255,7 +255,7 @@ TEST_CASE("Modular dense model: FP8 matmul forward/backward/update runs", "[modu
     if (!gpu_available()) SKIP("CUDA not available");
     if (!fp8_supported()) SKIP("FP8 tensor cores not available on this GPU");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -292,7 +292,7 @@ TEST_CASE("Modular dense model: FP8 matmul forward/backward/update runs", "[modu
 TEST_CASE("Modular: offload-residual forward/backward/update runs", "[modular][offload][residual][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 64;
 
@@ -326,7 +326,7 @@ TEST_CASE("Modular: offload-residual forward/backward/update runs", "[modular][o
 TEST_CASE("Modular: attn-bwd-chunks=2 runs", "[modular][attention][chunks][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -360,7 +360,7 @@ TEST_CASE("Modular: attn-bwd-chunks=2 runs", "[modular][attention][chunks][gpu]"
 TEST_CASE("Modular: attn-bwd-chunks requires divisible batch", "[modular][attention][chunks][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int T = 64;
 
         PretrainedConfig cfg = create_test_config(/*num_layers=*/2, /*vocab_size=*/128);
@@ -376,7 +376,7 @@ TEST_CASE("Modular: attn-bwd-chunks requires divisible batch", "[modular][attent
 TEST_CASE("Modular: offload-optimizer allocates optimizer state on host", "[modular][offload][optimizer][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 32;
 
@@ -415,7 +415,7 @@ TEST_CASE("Modular: offload-optimizer allocates optimizer state on host", "[modu
 TEST_CASE("Modular: offload-master stores master weights on host (requires --use-zero-copy)", "[modular][offload][weights][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(/*num_layers=*/1, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.OffloadMaster = true;
@@ -435,7 +435,7 @@ TEST_CASE("Modular: offload-master stores master weights on host (requires --use
 TEST_CASE("Modular: recompute flags + chunked head/attn backward run", "[modular][recompute][chunks][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -470,7 +470,7 @@ TEST_CASE("Modular: recompute flags + chunked head/attn backward run", "[modular
 TEST_CASE("Modular: offload optimizer states + recompute-block training step runs", "[modular][offload][recompute][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 64;
 
@@ -505,7 +505,7 @@ TEST_CASE("Modular ZeRO-2: all-to-all reducer + offload-gradients runs (2 GPUs)"
     if (!gpu_available()) SKIP("CUDA not available");
     if (get_cuda_device_count() < 2) SKIP("Need at least 2 GPUs for all-to-all test");
 
-    NCCLCommunicator::run_threads_communicators(2, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(2, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 32;
         constexpr int GradAccum = 2;
@@ -551,7 +551,7 @@ TEST_CASE("Modular ZeRO-2: all-to-all reducer + offload-gradients runs (2 GPUs)"
 TEST_CASE("Modular recompute-block shares large activations across layers", "[modular][recompute][memory][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(/*num_layers=*/3, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = true;
@@ -581,7 +581,7 @@ TEST_CASE("Modular recompute-block shares large activations across layers", "[mo
 TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[modular][lora][recompute][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 2;
         constexpr int T = 64;
 
@@ -639,7 +639,7 @@ TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[modula
 TEST_CASE("Modular leaf recompute flags affect activation sharing", "[modular][recompute][leaf][memory][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(/*num_layers=*/3, /*vocab_size=*/128);
         auto allocator = std::make_shared<TensorAllocator>();
 
@@ -691,7 +691,7 @@ TEST_CASE("Modular leaf recompute flags affect activation sharing", "[modular][r
 TEST_CASE("Modular LoRA: base weights stay fixed, adapter weights update", "[modular][lora][smoke][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 64;
 
@@ -816,7 +816,7 @@ TEST_CASE("Modular ZeRO-3 (shard weights) forward runs on 2 GPUs", "[modular][ze
     if (!gpu_available()) SKIP("CUDA not available");
     if (get_cuda_device_count() < 2) SKIP("Need at least 2 GPUs");
 
-    NCCLCommunicator::run_threads_communicators(2, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(2, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 32;
         PretrainedConfig cfg = create_test_config(/*num_layers=*/2, /*vocab_size=*/128);
@@ -842,7 +842,7 @@ TEST_CASE("Modular ZeRO-2 (shard gradients) forward/backward/update runs on 2 GP
     if (!gpu_available()) SKIP("CUDA not available");
     if (get_cuda_device_count() < 2) SKIP("Need at least 2 GPUs");
 
-    NCCLCommunicator::run_threads_communicators(2, false, false, [](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(2, false, false, [](NCCLCommunicator& comm) {
         constexpr int B = 1;
         constexpr int T = 32;
         PretrainedConfig cfg = create_test_config(/*num_layers=*/2, /*vocab_size=*/128);
@@ -927,7 +927,7 @@ TEST_CASE("Recompute-block: loss matches non-recompute on first forward", "[modu
     float loss_with_recompute = 0.0f;
 
     // Run without recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = false;
@@ -954,7 +954,7 @@ TEST_CASE("Recompute-block: loss matches non-recompute on first forward", "[modu
     });
 
     // Run with recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = true;
@@ -1003,7 +1003,7 @@ TEST_CASE("Recompute-block: gradients match non-recompute after backward", "[mod
     float norm_with_recompute = 0.0f;
 
     // Run without recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = false;
@@ -1033,7 +1033,7 @@ TEST_CASE("Recompute-block: gradients match non-recompute after backward", "[mod
     });
 
     // Run with recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = true;
@@ -1090,7 +1090,7 @@ TEST_CASE("Recompute-block: multi-step training divergence check", "[modular][re
     std::vector<float> losses_with_recompute(num_steps);
 
     // Run without recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = false;
@@ -1122,7 +1122,7 @@ TEST_CASE("Recompute-block: multi-step training divergence check", "[modular][re
     });
 
     // Run with recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = true;
@@ -1188,7 +1188,7 @@ TEST_CASE("Recompute-block: weights evolve identically over training", "[modular
     float final_loss_with_recompute = 0.0f;
 
     // Run without recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = false;
@@ -1219,7 +1219,7 @@ TEST_CASE("Recompute-block: weights evolve identically over training", "[modular
     });
 
     // Run with recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = true;
@@ -1273,7 +1273,7 @@ TEST_CASE("Recompute-block: activation values match recomputed values", "[modula
     constexpr int T = 64;
     constexpr int num_layers = 3;
 
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
 
         // First, run forward WITHOUT recompute and capture activations
@@ -1384,7 +1384,7 @@ TEST_CASE("Recompute-block: longer training shows divergence pattern", "[modular
     std::vector<float> norms_with_recompute(num_steps);
 
     // Run without recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/256);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = false;
@@ -1416,7 +1416,7 @@ TEST_CASE("Recompute-block: longer training shows divergence pattern", "[modular
     });
 
     // Run with recompute-block
-    NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+    NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/256);
         RuntimeOptions opts = create_test_options();
         opts.RecomputeBlock = true;

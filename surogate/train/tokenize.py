@@ -492,7 +492,7 @@ class TokenizeDatasets(SurogateCommand):
         template_processor = self.config.get_template_processor(self.config.tokenizer)
         template_processor.set_mode('train')
         if template_processor.use_model:
-            template_processor.model = self.config.model
+            template_processor.model = self.config._model
         
         if self.config.model_template.is_multimodal and (
                 self.config.padding_free or self.config.sample_packing) and not template_processor.support_padding_free:
@@ -506,10 +506,20 @@ class TokenizeDatasets(SurogateCommand):
         train_seed = np.random.RandomState(self.config.train_seed)
         eval_seed = np.random.RandomState(self.config.eval_seed)
         has_validation_datasets = len(self.config.validation_datasets) > 0
-        
+
+        # Get node sharding info for distributed training (set by distributed.py)
+        node_rank = getattr(self.config, '_node_rank', None)
+        num_nodes = getattr(self.config, '_num_nodes', None)
+
         with disable_datasets_caching():
             for ds_config in self.config.datasets:
-                dataset = load_dataset_with_config(ds_config, num_workers=self.config.dataloader_num_workers)
+                # Shard training data across nodes for distributed training
+                dataset = load_dataset_with_config(
+                    ds_config,
+                    num_workers=self.config.dataloader_num_workers,
+                    node_rank=node_rank,
+                    num_nodes=num_nodes,
+                )
 
                 dataset = pre_process(dataset, ds_config, num_proc=self.config.dataloader_num_workers)
                 train_dataset, val_dataset = post_process(
@@ -523,6 +533,8 @@ class TokenizeDatasets(SurogateCommand):
                     val_datasets.append(val_dataset)
 
             for ds_config in self.config.validation_datasets:
+                # Validation datasets are NOT sharded - all nodes get full eval data
+                # for consistent evaluation metrics across nodes
                 dataset = load_dataset_with_config(ds_config, num_workers=self.config.dataloader_num_workers)
                 dataset = pre_process(dataset, ds_config, num_proc=self.config.dataloader_num_workers)
                 _, val_dataset = post_process(

@@ -1455,10 +1455,18 @@ public:
         if (!lora_enabled()) return;
         namespace fs = std::filesystem;
         fs::path dir(directory);
-        fs::create_directories(dir);
 
+        // Only global rank 0 creates the directory to avoid NFS race conditions
+        // when multiple nodes try to create the same directory simultaneously
+        if (comm.rank() == 0) {
+            fs::create_directories(dir);
+        }
+
+        // Full barrier to ensure directory exists before any rank proceeds
+        comm.barrier();
+        
         mLoRAWeights->export_to_file((dir / "adapter_model.safetensors").string(), comm);
-
+        
         if (comm.rank() == 0) {
             nlohmann::json adapter_config;
             adapter_config["base_model_name_or_path"] = base_model_path;
@@ -1476,7 +1484,7 @@ public:
             config_file << adapter_config.dump(2);
         }
 
-        comm.barrier();
+        // Note: No barrier needed here - export_to_file already synchronizes all ranks
     }
 
     void import_adapter(const std::string& file_name, NCCLCommunicator& comm) {
