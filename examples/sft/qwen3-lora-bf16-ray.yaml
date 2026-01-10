@@ -3,6 +3,11 @@ output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
 
+distributed:
+  ray_address: "auto"      # or "ray://192.168.1.100:6379"
+  num_nodes: 2
+  gpus_per_node: 4
+ 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
 
