@@ -51,7 +51,7 @@
 
 // Model configuration and factory
 #include "model_config.h"
-#include "modular_model.h"
+#include "model/modular_model.h"
 #include "model_factory.h"
 
 // LoRA adapter support

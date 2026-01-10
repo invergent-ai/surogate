@@ -26,7 +26,7 @@
 #include "lora_config.h"
 #include "lora_weights.h"
 #include "modules/forward_hooks.h"
-#include "modules/modular_model.h"
+#include "modules/model/modular_model.h"
 #include "modules/optimizers/normuon.h"
 #include "modules/qlora/qlora_config.h"
 #include "modules/qlora/fp8_weight_provider.h"

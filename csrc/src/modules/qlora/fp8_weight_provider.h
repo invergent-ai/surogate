@@ -12,7 +12,14 @@
 #include "fp8_weights.h"
 #include "block_quantized_tensor.h"
 #include "modules/composite/transformer_block.h"
-#include "modules/weight_manager.h"  // For FP8WeightCache type
+#include "modules/weights/weight_manager_types.h"
+#include "modules/weights/weight_manager.h"
+#include "modules/weights/weight_manager_helpers.h"
+#include "modules/weights/weight_manager_allocation.h"
+#include "modules/weights/weight_manager_gather.h"
+#include "modules/weights/weight_manager_optimizer.h"
+#include "modules/weights/weight_manager_io.h"
+#include "modules/weights/weight_manager_quantization.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 

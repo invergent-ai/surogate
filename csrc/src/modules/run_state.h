@@ -230,7 +230,7 @@ public:
      * @brief Simplified per-layer activation gradients (for simplified backward path)
      *
      * Mirrors the legacy LLamaRunState per-layer gradient buffers closely enough
-     * for the modular "simplified" backward implementation in modular_model.h.
+     * for the modular "simplified" backward implementation in model/modular_model.h.
      */
     struct SimplifiedLayerGradients {
         Tensor d_res_ffn;   ///< (B, T, C) gradient w.r.t. (residual_att + mlp_down)

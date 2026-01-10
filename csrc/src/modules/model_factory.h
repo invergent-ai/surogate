@@ -10,7 +10,7 @@
 #include <stdexcept>
 
 #include "model_config.h"
-#include "modular_model.h"
+#include "model/modular_model.h"
 #include "composite/transformer_block.h"
 #include "moe/moe_block.h"
 

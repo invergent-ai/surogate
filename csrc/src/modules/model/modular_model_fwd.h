@@ -22,7 +22,15 @@
 #include "../module_concept.h"
 #include "../optimizer_state.h"
 #include "../run_state.h"
-#include "../weight_manager.h"
+
+#include "../weights/weight_manager_types.h"
+#include "../weights/weight_manager.h"
+#include "../weights/weight_manager_helpers.h"
+#include "../weights/weight_manager_allocation.h"
+#include "../weights/weight_manager_gather.h"
+#include "../weights/weight_manager_optimizer.h"
+#include "../weights/weight_manager_io.h"
+#include "../weights/weight_manager_quantization.h"
 
 #include "recipes/recipe.h"
 #include "recipes/bf16/bf16_recipe.h"

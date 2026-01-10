@@ -298,8 +298,8 @@ ModularGradientManager<Block>::ModularGradientManager(
     } else {
         // LoRA mode: only allocate d_final_norm (small: hidden_size elements)
         // d_embeddings and d_lm_head are NOT needed because:
-        // - encoder_backward is skipped when lora_only=true (modular_model.h:1564-1580)
-        // - lm_head backward is skipped when lora_only=true (modular_model.h:2743-2750)
+        // - encoder_backward is skipped when lora_only=true
+        // - lm_head backward is skipped when lora_only=true
         // This saves ~762 MiB for a 4B model (vocab_size * hidden_size * 2 bytes)
         long C = config.hidden_size;
         mFullNonBlock.d_final_norm = mAllocator->allocate(config.grad_dtype, "d_final_norm", EAllocationType::ON_DEVICE, {C});
