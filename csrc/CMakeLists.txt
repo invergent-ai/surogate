@@ -220,6 +220,11 @@ target_sources(surogate-common PRIVATE
     src/modules/qlora/fp4_weights.cpp
     src/modules/qlora/bnb_weights.cpp
 
+    src/modules/lora/lora_weights_manager.cpp
+    src/modules/lora/lora_grads_manager.cpp
+    src/modules/lora/lora_optimizer_state.cpp
+    src/modules/lora/lora_utils.cpp
+
     # Recipe system
     src/recipes/recipe.cpp
     src/recipes/recipe_factory.cpp
