@@ -16,9 +16,9 @@
 #ifndef SUROGATE_SRC_MODELS_QWEN3_QWEN3_MODEL_H
 #define SUROGATE_SRC_MODELS_QWEN3_QWEN3_MODEL_H
 
+#include "models/qwen3/config.h"
 #include "models/qwen3/transformer_block.h"
 #include "modules/model/modular_model.h"
-#include "config/pretrained_config.h"
 
 namespace modules {
 

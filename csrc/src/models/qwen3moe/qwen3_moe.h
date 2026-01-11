@@ -11,6 +11,7 @@
 
 #include "config/pretrained_config.h"
 #include "models/registry.h"
+#include "models/qwen3moe/weight_mapping.h"
 
 namespace models {
 
@@ -26,6 +27,9 @@ public:
     static std::unique_ptr<PretrainedConfig> load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype);
     static void save_to_hf_config_json(const PretrainedConfig& config, nlohmann::json& config_json);
     static std::unique_ptr<PretrainedConfig> create_from_preset_name(std::string_view name, ETensorDType dtype);
+    static std::unique_ptr<modules::BaseWeightMapping> create_weight_mapping() {
+        return std::make_unique<modules::Qwen3MoEWeightMapping>();
+    }
 
     static ArchitectureOps ops() {
         return {
@@ -34,6 +38,7 @@ public:
             .load_from_hf_config_json = &Qwen3MoEArchitecture::load_from_hf_config_json,
             .save_to_hf_config_json = &Qwen3MoEArchitecture::save_to_hf_config_json,
             .create_from_preset_name = &Qwen3MoEArchitecture::create_from_preset_name,
+            .create_weight_mapping = &Qwen3MoEArchitecture::create_weight_mapping,
         };
     }
 };

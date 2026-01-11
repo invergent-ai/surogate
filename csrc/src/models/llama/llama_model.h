@@ -14,9 +14,9 @@
 #ifndef SUROGATE_SRC_MODELS_LLAMA_LLAMA_MODEL_H
 #define SUROGATE_SRC_MODELS_LLAMA_LLAMA_MODEL_H
 
+#include "models/llama/config.h"
 #include "models/llama/transformer_block.h"
 #include "modules/model/modular_model.h"
-#include "config/pretrained_config.h"
 
 namespace modules {
 

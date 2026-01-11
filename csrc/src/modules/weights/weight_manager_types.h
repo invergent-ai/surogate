@@ -13,6 +13,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include "config/pretrained_config.h"
 #include "recipes/nvfp4/nvfp4_recipe.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor.h"
@@ -123,6 +124,9 @@ struct ModularWeightManagerConfig {
     int vocab_size;
     int hidden_size;
     bool tied_embeddings;
+
+    // Architecture ID for weight mapping lookup
+    PretrainedConfig::ArchitectureId architecture_id = PretrainedConfig::LLAMA;
 
     // QLoRA: skip block weight allocation (weights provided externally via set_weight_provider)
     bool skip_block_allocation = false;

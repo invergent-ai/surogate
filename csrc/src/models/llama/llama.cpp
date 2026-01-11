@@ -3,6 +3,7 @@
 //
 
 #include "models/llama/llama.h"
+#include "models/llama/config.h"
 
 #include <nlohmann/json.hpp>
 

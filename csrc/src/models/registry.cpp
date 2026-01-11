@@ -104,5 +104,13 @@ std::vector<std::string_view> all_preset_names() {
     };
 }
 
+std::unique_ptr<modules::BaseWeightMapping> create_weight_mapping(PretrainedConfig::ArchitectureId id) {
+    const auto& ops = architecture_from_id(id);
+    auto mapping = ops.create_weight_mapping();
+    mapping->register_patterns();
+    mapping->register_export_patterns();
+    return mapping;
+}
+
 } // namespace models
 

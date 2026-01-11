@@ -29,6 +29,125 @@ using namespace modules;
 using namespace testing_utils;
 using Catch::Approx;
 
+/**
+ * @brief Qwen3 MoE 15B-A2B configuration
+ *
+ * Qwen3 MoE architecture with:
+ * - 128 experts with top-8 routing (2B active parameters per token)
+ * - norm_topk_prob: normalize routing weights after top-k selection
+ * - QK normalization in attention (requires use_qk_norm=true)
+ * - All layers are MoE (decoder_sparse_step=1, no mlp_only_layers)
+ */
+inline ModelConfig qwen3_moe_15b_a2b(ETensorDType dtype = ETensorDType::BF16) {
+    MoEConfig moe;
+    moe.num_experts = 128;
+    moe.top_k = 8;
+    moe.use_shared_expert = false;
+    moe.router_aux_loss_coef = 0.001f;
+    moe.capacity_factor = 1.25f;
+    moe.decoder_sparse_step = 1;      // All layers are MoE
+    moe.mlp_only_layers = {};         // No dense-only layers
+    moe.norm_topk_prob = false;       // Qwen3 default (don't normalize after top-k)
+    moe.moe_intermediate_size = 768;  // Per-expert intermediate size
+
+    return ModelConfigBuilder()
+        .architecture(ArchitectureType::MoE)
+        .activation(ActivationType::SwiGLU)
+        .hidden_size(2048)
+        .intermediate_size(6144)       // Dense MLP intermediate (not used in MoE layers)
+        .vocab_size(151936)
+        .num_layers(24)
+        .num_query_heads(32)
+        .num_kv_heads(4)
+        .max_position_embeddings(32768)
+        .rope_theta(10000.0f)
+        .rms_norm_eps(1e-6f)
+        .tied_embeddings(false)
+        .use_qkv_bias(false)
+        .qk_norm(true)                 // Qwen3 uses QK normalization
+        .moe(moe)
+        .dtype(dtype)
+        .build();
+}
+
+/**
+ * @brief Qwen3 MoE 30B-A3B configuration
+ *
+ * Larger Qwen3 MoE model with 128 experts.
+ */
+inline ModelConfig qwen3_moe_30b_a3b(ETensorDType dtype = ETensorDType::BF16) {
+    MoEConfig moe;
+    moe.num_experts = 128;
+    moe.top_k = 8;
+    moe.use_shared_expert = false;
+    moe.router_aux_loss_coef = 0.001f;
+    moe.capacity_factor = 1.25f;
+    moe.decoder_sparse_step = 1;
+    moe.mlp_only_layers = {};
+    moe.norm_topk_prob = false;
+    moe.moe_intermediate_size = 1024;
+
+    return ModelConfigBuilder()
+        .architecture(ArchitectureType::MoE)
+        .activation(ActivationType::SwiGLU)
+        .hidden_size(2560)
+        .intermediate_size(8192)
+        .vocab_size(151936)
+        .num_layers(32)
+        .num_query_heads(32)
+        .num_kv_heads(4)
+        .max_position_embeddings(32768)
+        .rope_theta(10000.0f)
+        .rms_norm_eps(1e-6f)
+        .tied_embeddings(false)
+        .use_qkv_bias(false)
+        .qk_norm(true)
+        .moe(moe)
+        .dtype(dtype)
+        .build();
+}
+
+/**
+ * @brief Test configuration for hybrid model validation
+ *
+ * Small model for testing heterogeneous layer support.
+ */
+inline ModelConfig hybrid_test(ETensorDType dtype = ETensorDType::BF16) {
+    MoEConfig moe;
+    moe.num_experts = 4;
+    moe.top_k = 2;
+    moe.use_shared_expert = false;
+    moe.router_aux_loss_coef = 0.01f;
+    moe.capacity_factor = 1.25f;
+
+    ModelConfig config = ModelConfigBuilder()
+        .architecture(ArchitectureType::Hybrid)
+        .activation(ActivationType::SwiGLU)
+        .hidden_size(256)
+        .intermediate_size(512)
+        .vocab_size(1024)
+        .num_layers(4)
+        .num_query_heads(4)
+        .num_kv_heads(2)
+        .max_position_embeddings(512)
+        .rope_theta(10000.0f)
+        .rms_norm_eps(1e-5f)
+        .tied_embeddings(true)
+        .use_qkv_bias(false)
+        .moe(moe)
+        .dtype(dtype)
+        .build();
+
+    // Layer 0: Dense
+    // Layer 1: MoE
+    // Layer 2: Dense
+    // Layer 3: MoE
+    config.layer_overrides.push_back(LayerOverride::moe(1, 4, 2));
+    config.layer_overrides.push_back(LayerOverride::moe(3, 4, 2));
+
+    return config;
+}
+
 // ============================================================================
 // LayerOverride Tests
 // ============================================================================
@@ -145,7 +264,7 @@ TEST_CASE("ModelConfig block type queries", "[heterogeneous][config]") {
 
 TEST_CASE("Hybrid model presets", "[heterogeneous][presets]") {
     SECTION("hybrid_test preset configuration") {
-        auto config = presets::hybrid_test();
+        auto config = hybrid_test();
 
         REQUIRE(config.architecture == ArchitectureType::Hybrid);
         REQUIRE(config.NumLayers == 4);
@@ -261,7 +380,7 @@ TEST_CASE("Qwen3 MoE layer pattern with decoder_sparse_step", "[heterogeneous][q
 
 TEST_CASE("Qwen3 MoE preset configurations", "[heterogeneous][qwen3][presets]") {
     SECTION("qwen3_moe_15b_a2b preset") {
-        auto config = presets::qwen3_moe_15b_a2b();
+        auto config = qwen3_moe_15b_a2b();
 
         REQUIRE(config.architecture == ArchitectureType::MoE);
         REQUIRE(config.NumLayers == 24);
@@ -286,7 +405,7 @@ TEST_CASE("Qwen3 MoE preset configurations", "[heterogeneous][qwen3][presets]") 
     }
 
     SECTION("qwen3_moe_30b_a3b preset") {
-        auto config = presets::qwen3_moe_30b_a3b();
+        auto config = qwen3_moe_30b_a3b();
 
         REQUIRE(config.architecture == ArchitectureType::MoE);
         REQUIRE(config.NumLayers == 32);
@@ -379,7 +498,7 @@ TEST_CASE("ModelFactory hybrid model creation", "[heterogeneous][factory]") {
     }
 
     SECTION("Factory creates hybrid model with valid config") {
-        auto config = presets::hybrid_test();
+        auto config = hybrid_test();
         ModelOptions options;
 
         // This should not throw
@@ -394,7 +513,7 @@ TEST_CASE("ModelFactory hybrid model creation", "[heterogeneous][factory]") {
 // ============================================================================
 
 TEST_CASE("Heterogeneous model block pattern", "[heterogeneous][cuda]") {
-    auto config = presets::hybrid_test();
+    auto config = hybrid_test();
     ModelOptions options;
     options.model_dtype = ETensorDType::BF16;
     options.matmul_dtype = ETensorDType::BF16;

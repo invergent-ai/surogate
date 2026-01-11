@@ -12,6 +12,10 @@
 
 #include "config/pretrained_config.h"
 
+namespace modules {
+class BaseWeightMapping;
+}
+
 namespace models {
 
 /**
@@ -33,6 +37,9 @@ struct ArchitectureOps {
 
     // Optional: create a pretrained config from a from-scratch preset name
     std::unique_ptr<PretrainedConfig> (*create_from_preset_name)(std::string_view name, ETensorDType dtype);
+
+    // Create weight mapping for this architecture (for HuggingFace import/export)
+    std::unique_ptr<modules::BaseWeightMapping> (*create_weight_mapping)();
 };
 
 const ArchitectureOps& architecture_from_hf_name(std::string_view hf_architecture_name);
@@ -54,6 +61,9 @@ bool is_supported_architecture_id(PretrainedConfig::ArchitectureId id);
 
 // Get all registered preset names across all architectures
 std::vector<std::string_view> all_preset_names();
+
+// Create weight mapping for an architecture by ID
+std::unique_ptr<modules::BaseWeightMapping> create_weight_mapping(PretrainedConfig::ArchitectureId id);
 
 } // namespace models
 

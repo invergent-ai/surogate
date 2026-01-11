@@ -16,9 +16,9 @@
 #ifndef SUROGATE_SRC_MODELS_QWEN3MOE_QWEN3_MOE_MODEL_H
 #define SUROGATE_SRC_MODELS_QWEN3MOE_QWEN3_MOE_MODEL_H
 
+#include "models/qwen3moe/config.h"
 #include "models/qwen3moe/qwen3_moe_block.h"
 #include "modules/model/modular_model.h"
-#include "config/pretrained_config.h"
 
 namespace modules {
 

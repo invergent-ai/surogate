@@ -62,6 +62,7 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     wm_config.vocab_size = config.VocabSize;
     wm_config.hidden_size = config.HiddenSize;
     wm_config.tied_embeddings = config.TiedWordEmbeddings;
+    wm_config.architecture_id = config.Architecture;
     wm_config.skip_block_allocation = options.skip_block_allocation;
     wm_config.enable_fp8_forward = options.enable_fp8_forward;
     wm_config.enable_fp4_forward = options.enable_fp4_forward;

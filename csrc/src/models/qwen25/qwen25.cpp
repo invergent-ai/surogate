@@ -3,6 +3,7 @@
 //
 
 #include "models/qwen25/qwen25.h"
+#include "models/qwen25/config.h"
 
 #include <nlohmann/json.hpp>
 

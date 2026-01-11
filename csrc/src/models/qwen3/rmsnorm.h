@@ -9,7 +9,7 @@
 #ifndef SUROGATE_SRC_MODELS_QWEN3_RMSNORM_H
 #define SUROGATE_SRC_MODELS_QWEN3_RMSNORM_H
 
-#include "models/qwen2/rmsnorm.h"
+#include "models/qwen25/rmsnorm.h"
 
 namespace modules {
 

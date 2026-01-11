@@ -7,8 +7,8 @@
 #define SUROGATE_SRC_MODELS_QWEN2_TRANSFORMER_BLOCK_H
 
 #include "modules/composite/transformer_block.h"
-#include "models/qwen2/attention.h"
-#include "models/qwen2/rmsnorm.h"
+#include "models/qwen25/attention.h"
+#include "models/qwen25/rmsnorm.h"
 
 namespace modules {
 

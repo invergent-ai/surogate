@@ -20,10 +20,6 @@
 #include "modules/model_factory.h"
 #include "modules/composite/transformer_block.h"
 #include "modules/moe/moe_block.h"
-#include "models/llama/transformer_block.h"
-#include "models/qwen2/transformer_block.h"
-#include "models/qwen3/transformer_block.h"
-#include "models/qwen3moe/qwen3_moe_block.h"
 #include "modules/lora/lora_model.h"
 
 /**

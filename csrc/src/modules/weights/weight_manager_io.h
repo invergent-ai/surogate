@@ -1,6 +1,17 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
+// Weight Manager I/O - Import/export weights from/to HuggingFace format
+//
+// This file provides the implementation of weight import/export for the
+// ModularWeightManager. It handles:
+// 1. Direct tensor mapping (fused QKV, fused gate+up)
+// 2. Split tensor fusion from HuggingFace format (Q, K, V -> QKV)
+// 3. Sharded weight loading for distributed training
+// 4. Model-specific patterns via the weight mapping registry
+//
+// The registry-based system in weight_mapping.h provides an extensible approach
+// for adding new model architectures through inheritance.
 
 #ifndef LLMQ_SRC_MODULES_WEIGHTS_WEIGHT_MANAGER_IO_H
 #define LLMQ_SRC_MODULES_WEIGHTS_WEIGHT_MANAGER_IO_H
@@ -14,7 +25,10 @@
 #include <vector>
 
 #include "kernels/kernels.h"
+#include "models/llama/config.h"
+#include "models/registry.h"
 #include "modules/weights/weight_manager_helpers.h"
+#include "modules/weights/weight_mapping.h"
 #include "utilities/comm.h"
 #include "utilities/philox.h"
 #include "utilities/safetensors.h"
@@ -209,6 +223,13 @@ namespace {
 
         src.read_raw(dst_slice, slice_begin - src_begin, elements, allow_cast);
     }
+
+    /**
+     * @brief Load full tensor (range {0,0} means entire tensor)
+     */
+    inline void load_full(const TensorShard& dst, const SafeTensorEntry& src, bool allow_cast) {
+        load_intersect(dst, src, 0, static_cast<std::ptrdiff_t>(dst.global_nelem()), allow_cast);
+    }
 }
 
 template<typename Block>
@@ -216,12 +237,11 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
     SafeTensorsReader reader{filename};
 
     const auto& cfg = mConfig.block_config;
-    long C = cfg.hidden_size;
-    long D = cfg.intermediate_size;
-    long HS = cfg.head_size;
-    long HQ = cfg.num_query_heads;
-    long HKV = cfg.num_kv_heads;
-
+    const long C = cfg.hidden_size;
+    const long D = cfg.intermediate_size;
+    const long HS = cfg.head_size;
+    const long HQ = cfg.num_query_heads;
+    const long HKV = cfg.num_kv_heads;
     const long q_rows = HS * HQ;
     const long kv_rows = HS * HKV;
     const long fused_rows = q_rows + 2 * kv_rows;
@@ -237,104 +257,218 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
     auto& dst_nonblock = load_sharded ? mMasterNonBlock : mWorkNonBlock;
     auto& dst_blocks = load_sharded ? mMasterBlocks : mWorkBlocks;
 
-    auto dst = [&](Tensor& t, const std::vector<long>& global_shape) -> TensorShard {
+    // Helper to create TensorShard with appropriate sharding
+    auto make_shard = [&](Tensor& t, const std::vector<long>& global_shape) -> TensorShard {
         if (load_num == 1) return TensorShard(t);
         return TensorShard(t, load_idx, load_num, global_shape);
     };
 
-    // Build name -> destination mapping for direct matches.
-    std::unordered_map<std::string, TensorShard> named_tensors;
-    named_tensors.emplace("model.embed_tokens.weight", dst(dst_nonblock.embeddings, {mConfig.vocab_size, mConfig.hidden_size}));
-    named_tensors.emplace("model.norm.weight", dst(dst_nonblock.final_norm_weight, {mConfig.hidden_size}));
-    named_tensors.emplace("lm_head.weight", dst(dst_nonblock.lm_head, {mConfig.vocab_size, mConfig.hidden_size}));
+    // ========================================================================
+    // Tensor Resolution: Map TensorTarget enum to actual TensorShard
+    // ========================================================================
 
-    for (int i = 0; i < mConfig.num_layers; ++i) {
-        auto& block = dst_blocks.at(i);
-        std::string prefix = "model.layers." + std::to_string(i);
-
-        named_tensors.emplace(prefix + ".input_layernorm.weight", dst(block.ln1.weight, {C}));
-        named_tensors.emplace(prefix + ".post_attention_layernorm.weight", dst(block.ln2.weight, {C}));
-        named_tensors.emplace(prefix + ".self_attn.qkv.weight", dst(block.attention.qkv_weight, {fused_rows, C}));
-        if (block.attention.qkv_bias.has_value()) {
-            named_tensors.emplace(prefix + ".self_attn.qkv.bias", dst(block.attention.qkv_bias.value(), {fused_rows}));
+    // Resolve non-block tensors
+    auto resolve_nonblock = [&](TensorTarget target) -> std::optional<TensorShard> {
+        switch (target) {
+            case TensorTarget::Embeddings:
+                return make_shard(dst_nonblock.embeddings, {mConfig.vocab_size, mConfig.hidden_size});
+            case TensorTarget::FinalNorm:
+                return make_shard(dst_nonblock.final_norm_weight, {mConfig.hidden_size});
+            case TensorTarget::LMHead:
+                return make_shard(dst_nonblock.lm_head, {mConfig.vocab_size, mConfig.hidden_size});
+            default:
+                return std::nullopt;
         }
-        named_tensors.emplace(prefix + ".self_attn.o_proj.weight", dst(block.attention.out_weight, {C, q_rows}));
-        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
-            if (block.attention.q_norm_weight.has_value()) {
-                named_tensors.emplace(prefix + ".self_attn.q_norm.weight", dst(block.attention.q_norm_weight.value(), {HS}));
+    };
+
+    // Resolve block tensors (dense blocks)
+    auto resolve_block = [&](TensorTarget target, int layer_idx) -> std::optional<TensorShard> {
+        if (layer_idx < 0 || layer_idx >= mConfig.num_layers) return std::nullopt;
+        auto& block = dst_blocks.at(layer_idx);
+
+        switch (target) {
+            case TensorTarget::LN1Weight:
+                return make_shard(block.ln1.weight, {C});
+            case TensorTarget::LN2Weight:
+                return make_shard(block.ln2.weight, {C});
+            case TensorTarget::QKVWeight:
+                return make_shard(block.attention.qkv_weight, {fused_rows, C});
+            case TensorTarget::QKVBias:
+                if (block.attention.qkv_bias.has_value()) {
+                    return make_shard(block.attention.qkv_bias.value(), {fused_rows});
+                }
+                return std::nullopt;
+            case TensorTarget::OutWeight:
+                return make_shard(block.attention.out_weight, {C, q_rows});
+            case TensorTarget::QNormWeight:
+                if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+                    if (block.attention.q_norm_weight.has_value()) {
+                        return make_shard(block.attention.q_norm_weight.value(), {HS});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::KNormWeight:
+                if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+                    if (block.attention.k_norm_weight.has_value()) {
+                        return make_shard(block.attention.k_norm_weight.value(), {HS});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MLPUpWeight:
+                if constexpr (has_mlp_weights<BlockWeights>::value) {
+                    return make_shard(block.mlp_up_weight, {2 * D, C});
+                }
+                return std::nullopt;
+            case TensorTarget::MLPDownWeight:
+                if constexpr (has_mlp_weights<BlockWeights>::value) {
+                    return make_shard(block.mlp_down_weight, {C, D});
+                }
+                return std::nullopt;
+
+            // MoE targets
+            case TensorTarget::RouterGate:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    return make_shard(block.router.gate, {cfg.num_experts, C});
+                }
+                return std::nullopt;
+            case TensorTarget::ExpertsGateUp:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.experts.use_batched) {
+                        return make_shard(block.experts.gate_up_proj, {cfg.num_experts, 2 * D, C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::ExpertsDown:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.experts.use_batched) {
+                        return make_shard(block.experts.down_proj, {cfg.num_experts, C, D});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::SharedExpertGate:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.shared_expert.has_value()) {
+                        int shared_D = cfg.shared_expert_intermediate > 0 ?
+                                       cfg.shared_expert_intermediate : static_cast<int>(D);
+                        return make_shard(block.shared_expert->gate_proj, {shared_D, C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::SharedExpertUp:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.shared_expert.has_value()) {
+                        int shared_D = cfg.shared_expert_intermediate > 0 ?
+                                       cfg.shared_expert_intermediate : static_cast<int>(D);
+                        return make_shard(block.shared_expert->up_proj, {shared_D, C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::SharedExpertDown:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.shared_expert.has_value()) {
+                        int shared_D = cfg.shared_expert_intermediate > 0 ?
+                                       cfg.shared_expert_intermediate : static_cast<int>(D);
+                        return make_shard(block.shared_expert->down_proj, {C, shared_D});
+                    }
+                }
+                return std::nullopt;
+
+            default:
+                return std::nullopt;
+        }
+    };
+
+    // Resolve per-expert tensors (non-batched MoE)
+    auto resolve_expert = [&](TensorTarget target, int layer_idx, int expert_idx) -> std::optional<TensorShard> {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            if (layer_idx < 0 || layer_idx >= mConfig.num_layers) return std::nullopt;
+            auto& block = dst_blocks.at(layer_idx);
+
+            if (block.experts.use_batched) return std::nullopt;  // Use batched loading instead
+            if (expert_idx < 0 || expert_idx >= static_cast<int>(block.experts.experts.size())) {
+                return std::nullopt;
             }
-            if (block.attention.k_norm_weight.has_value()) {
-                named_tensors.emplace(prefix + ".self_attn.k_norm.weight", dst(block.attention.k_norm_weight.value(), {HS}));
-            }
-        }
 
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            named_tensors.emplace(prefix + ".mlp.up.weight", dst(block.mlp_up_weight, {2 * D, C}));
-            named_tensors.emplace(prefix + ".mlp.down_proj.weight", dst(block.mlp_down_weight, {C, D}));
+            auto& expert = block.experts.experts[expert_idx];
+            switch (target) {
+                case TensorTarget::ExpertGate:
+                    return make_shard(expert.gate_proj, {D, C});
+                case TensorTarget::ExpertUp:
+                    return make_shard(expert.up_proj, {D, C});
+                case TensorTarget::ExpertDown:
+                    return make_shard(expert.down_proj, {C, D});
+                default:
+                    return std::nullopt;
+            }
+        } else {
+            return std::nullopt;
         }
-    }
+    };
+
+    // ========================================================================
+    // Create weight mapping registry for this model type
+    // ========================================================================
+
+    // Create a temporary PretrainedConfig-like object for range computation
+    // We use a LlamaConfig as a proxy since the range functions only need
+    // NumQueryHeads, NumKeyValHeads, HiddenSize, IntermediateSize
+    LlamaConfig proxy_cfg;
+    proxy_cfg.NumQueryHeads = static_cast<int>(HQ);
+    proxy_cfg.NumKeyValHeads = static_cast<int>(HKV);
+    proxy_cfg.HiddenSize = static_cast<int>(C);
+    proxy_cfg.IntermediateSize = static_cast<int>(D);
+    proxy_cfg.HeadDim = static_cast<int>(HS);
+
+    // Get weight mapping from the registry using architecture ID
+    auto mapping = models::create_weight_mapping(mConfig.architecture_id);
+
+    // ========================================================================
+    // Process each tensor using the registry
+    // ========================================================================
 
     for (const auto& entry : reader.entries()) {
         const std::string& name = entry.name();
 
-        if (auto found = named_tensors.find(name); found != named_tensors.end()) {
-            load_intersect(found->second, entry, 0, (std::ptrdiff_t)found->second.global_nelem(), allow_cast);
+        // Match against registered patterns
+        PatternMatch match = mapping->match(name, proxy_cfg, C);
+
+        if (!match) {
+            // No pattern matched - skip silently (could be optimizer state, etc.)
             continue;
         }
 
-        // Handle split Q/K/V and gate/up projections from HuggingFace format
-        if (name.starts_with("model.layers.")) {
-            std::size_t chars = 0;
-            auto layer_idx = std::stoi(name.c_str() + 13, &chars);
-            std::string suffix = name.substr(13 + chars);
-            auto& block = mMasterBlocks.at(layer_idx);
+        // Resolve the target tensor
+        std::optional<TensorShard> dst_opt;
 
-            TensorShard qkv_w = TensorShard(block.attention.qkv_weight, mConfig.shard_idx, mConfig.num_shards,
-                                            std::vector<long>{fused_rows, C});
-            std::optional<TensorShard> qkv_b{};
-            if (block.attention.qkv_bias.has_value()) {
-                qkv_b = TensorShard(block.attention.qkv_bias.value(), mConfig.shard_idx, mConfig.num_shards,
-                                    std::vector<long>{fused_rows});
-            }
-            TensorShard mlp_up{};
-            if constexpr (has_mlp_weights<BlockWeights>::value) {
-                mlp_up = TensorShard(block.mlp_up_weight, mConfig.shard_idx, mConfig.num_shards,
-                                     std::vector<long>{2 * D, C});
-            }
-
-            // Global split positions in fused tensors (in elements).
-            const std::ptrdiff_t q_begin = 0;
-            const std::ptrdiff_t k_begin = q_rows * C;
-            const std::ptrdiff_t v_begin = (q_rows + kv_rows) * C;
-            const std::ptrdiff_t q_end = q_rows * C;
-            const std::ptrdiff_t k_end = (q_rows + kv_rows) * C;
-            const std::ptrdiff_t v_end = fused_rows * C;
-
-            if (suffix == ".self_attn.q_proj.weight") {
-                load_intersect(qkv_w, entry, q_begin, q_end, allow_cast);
-            } else if (suffix == ".self_attn.k_proj.weight") {
-                load_intersect(qkv_w, entry, k_begin, k_end, allow_cast);
-            } else if (suffix == ".self_attn.v_proj.weight") {
-                load_intersect(qkv_w, entry, v_begin, v_end, allow_cast);
-            } else if (suffix == ".self_attn.q_proj.bias") {
-                if (qkv_b.has_value()) load_intersect(qkv_b.value(), entry, 0, q_rows, allow_cast);
-            } else if (suffix == ".self_attn.k_proj.bias") {
-                if (qkv_b.has_value()) load_intersect(qkv_b.value(), entry, q_rows, q_rows + kv_rows, allow_cast);
-            } else if (suffix == ".self_attn.v_proj.bias") {
-                if (qkv_b.has_value()) load_intersect(qkv_b.value(), entry, q_rows + kv_rows, fused_rows, allow_cast);
-            } else if (suffix == ".mlp.up_proj.weight") {
-                if constexpr (has_mlp_weights<BlockWeights>::value) {
-                    load_intersect(mlp_up, entry, 0, D * C, allow_cast);
-                }
-            } else if (suffix == ".mlp.gate_proj.weight") {
-                if constexpr (has_mlp_weights<BlockWeights>::value) {
-                    load_intersect(mlp_up, entry, D * C, 2 * D * C, allow_cast);
-                }
-            } else {
-                // For other / MoE tensors, skip.
-            }
+        if (match.expert_idx >= 0) {
+            // Per-expert tensor
+            dst_opt = resolve_expert(match.pattern->target, match.layer_idx, match.expert_idx);
+        } else if (match.layer_idx >= 0) {
+            // Per-layer tensor
+            dst_opt = resolve_block(match.pattern->target, match.layer_idx);
         } else {
-            throw std::runtime_error("Unexpected tensor name: " + name);
+            // Non-block tensor
+            dst_opt = resolve_nonblock(match.pattern->target);
+        }
+
+        if (!dst_opt.has_value()) {
+            // Target not available (optional tensor or type mismatch)
+            if (!match.pattern->optional) {
+                // Non-optional tensor should exist - this might indicate a problem
+                // but we'll skip silently for robustness
+            }
+            continue;
+        }
+
+        const TensorShard& dst = dst_opt.value();
+
+        // Load the tensor, applying range for fusion if needed
+        if (match.range.is_full_tensor()) {
+            // Direct load - full tensor
+            load_full(dst, entry, allow_cast);
+        } else {
+            // Fusion load - load into a slice of the destination
+            load_intersect(dst, entry, match.range.begin, match.range.end, allow_cast);
         }
     }
 
@@ -368,113 +502,233 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
         comm.barrier();
     }
 
+    [[maybe_unused]] const auto& cfg = mConfig.block_config;
+    const long D = cfg.intermediate_size;
+    const long HS = cfg.head_size;
+    const long HQ = cfg.num_query_heads;
+    const long HKV = cfg.num_kv_heads;
+    const long q_rows = HS * HQ;
+    const long kv_rows = HS * HKV;
+
+    // ========================================================================
+    // Create weight mapping registry for export
+    // ========================================================================
+
+    // Get weight mapping from the registry using architecture ID
+    auto mapping = models::create_weight_mapping(mConfig.architecture_id);
+
+    // ========================================================================
+    // Helper to compute row slices from marker values
+    // Markers: -1=Q, -2=K, -3=V, -4=up, -5=gate
+    // ========================================================================
+
+    auto compute_slice = [&](long marker) -> std::pair<long, long> {
+        switch (marker) {
+            case -1: return {0, q_rows};                          // Q
+            case -2: return {q_rows, q_rows + kv_rows};           // K
+            case -3: return {q_rows + kv_rows, q_rows + 2 * kv_rows}; // V
+            case -4: return {0, D};                                // up
+            case -5: return {D, 2 * D};                           // gate
+            default: return {0, 0};                               // full tensor
+        }
+    };
+
+    // ========================================================================
+    // Helper to resolve tensor from target
+    // ========================================================================
+
+    auto resolve_nonblock = [&](TensorTarget target) -> std::optional<Tensor> {
+        switch (target) {
+            case TensorTarget::Embeddings:
+                return mWorkNonBlock.embeddings;
+            case TensorTarget::FinalNorm:
+                return mWorkNonBlock.final_norm_weight;
+            case TensorTarget::LMHead:
+                if (!mConfig.tied_embeddings) return mWorkNonBlock.lm_head;
+                return std::nullopt;
+            default:
+                return std::nullopt;
+        }
+    };
+
+    auto resolve_block = [&](TensorTarget target, int layer_idx, long marker) -> std::optional<Tensor> {
+        if (layer_idx < 0 || layer_idx >= mConfig.num_layers) return std::nullopt;
+        const auto& block = mWorkBlocks[layer_idx];
+
+        auto [row_begin, row_end] = compute_slice(marker);
+
+        switch (target) {
+            case TensorTarget::LN1Weight:
+                return block.ln1.weight;
+            case TensorTarget::LN2Weight:
+                return block.ln2.weight;
+            case TensorTarget::QKVWeight:
+                if (row_begin != row_end) {
+                    return slice(block.attention.qkv_weight, 0, row_begin, row_end);
+                }
+                return block.attention.qkv_weight;
+            case TensorTarget::QKVBias:
+                if (block.attention.qkv_bias.has_value()) {
+                    if (row_begin != row_end) {
+                        return slice(block.attention.qkv_bias.value(), 0, row_begin, row_end);
+                    }
+                    return block.attention.qkv_bias.value();
+                }
+                return std::nullopt;
+            case TensorTarget::OutWeight:
+                return block.attention.out_weight;
+            case TensorTarget::QNormWeight:
+                if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+                    if (block.attention.q_norm_weight.has_value()) {
+                        return block.attention.q_norm_weight.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::KNormWeight:
+                if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+                    if (block.attention.k_norm_weight.has_value()) {
+                        return block.attention.k_norm_weight.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MLPUpWeight:
+                if constexpr (has_mlp_weights<BlockWeights>::value) {
+                    if (row_begin != row_end) {
+                        return slice(block.mlp_up_weight, 0, row_begin, row_end);
+                    }
+                    return block.mlp_up_weight;
+                }
+                return std::nullopt;
+            case TensorTarget::MLPDownWeight:
+                if constexpr (has_mlp_weights<BlockWeights>::value) {
+                    return block.mlp_down_weight;
+                }
+                return std::nullopt;
+
+            // MoE targets
+            case TensorTarget::RouterGate:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    return block.router.gate;
+                }
+                return std::nullopt;
+            case TensorTarget::ExpertsGateUp:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.experts.use_batched) {
+                        return block.experts.gate_up_proj;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::ExpertsDown:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.experts.use_batched) {
+                        return block.experts.down_proj;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::SharedExpertGate:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.shared_expert.has_value()) {
+                        return block.shared_expert->gate_proj;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::SharedExpertUp:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.shared_expert.has_value()) {
+                        return block.shared_expert->up_proj;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::SharedExpertDown:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (block.shared_expert.has_value()) {
+                        return block.shared_expert->down_proj;
+                    }
+                }
+                return std::nullopt;
+
+            default:
+                return std::nullopt;
+        }
+    };
+
+    // ========================================================================
+    // Collect tensors for export
+    // ========================================================================
+
     SafeTensorWriter writer{filename};
 
-    // Register non-split tensors.
-    writer.register_tensor("model.embed_tokens.weight", TensorShard(mWorkNonBlock.embeddings));
-    writer.register_tensor("model.norm.weight", TensorShard(mWorkNonBlock.final_norm_weight));
-    if (!mConfig.tied_embeddings) {
-        writer.register_tensor("lm_head.weight", TensorShard(mWorkNonBlock.lm_head));
+    // Register non-block tensors
+    for (const auto& pattern : mapping->export_nonblock_patterns()) {
+        auto tensor_opt = resolve_nonblock(pattern.source);
+        if (tensor_opt.has_value()) {
+            writer.register_tensor(pattern.hf_name_template, TensorShard(tensor_opt.value()));
+        }
     }
 
-    const auto& cfg = mConfig.block_config;
-    long C = cfg.hidden_size;
-    long D = cfg.intermediate_size;
-    long HS = cfg.head_size;
-    long HQ = cfg.num_query_heads;
-    long HKV = cfg.num_kv_heads;
-
-    // Register block tensors in HuggingFace format.
-    for (int i = 0; i < mConfig.num_layers; ++i) {
-        const auto& block = mWorkBlocks[i];
-        std::string prefix = "model.layers." + std::to_string(i);
-
-        const long q_rows = HS * HQ;
-        const long kv_rows = HS * HKV;
-        const long fused_rows = q_rows + 2 * kv_rows;
-
-        writer.register_tensor(prefix + ".input_layernorm.weight", TensorShard(block.ln1.weight));
-        writer.register_tensor(prefix + ".post_attention_layernorm.weight", TensorShard(block.ln2.weight));
-        writer.register_tensor(prefix + ".self_attn.o_proj.weight", TensorShard(block.attention.out_weight));
-        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
-            if (block.attention.q_norm_weight.has_value()) {
-                writer.register_tensor(prefix + ".self_attn.q_norm.weight", TensorShard(block.attention.q_norm_weight.value()));
-            }
-            if (block.attention.k_norm_weight.has_value()) {
-                writer.register_tensor(prefix + ".self_attn.k_norm.weight", TensorShard(block.attention.k_norm_weight.value()));
+    // Register per-layer tensors
+    for (int layer_idx = 0; layer_idx < mConfig.num_layers; ++layer_idx) {
+        for (const auto& pattern : mapping->export_layer_patterns()) {
+            auto tensor_opt = resolve_block(pattern.source, layer_idx, pattern.row_begin);
+            if (tensor_opt.has_value()) {
+                std::string name = pattern.expand_name(layer_idx);
+                writer.register_tensor(name, TensorShard(tensor_opt.value()));
             }
         }
 
-        // Split QKV from fused tensor.
-        writer.register_tensor(prefix + ".self_attn.q_proj.weight",
-                               TensorShard(slice(block.attention.qkv_weight, 0, 0, q_rows)));
-        writer.register_tensor(prefix + ".self_attn.k_proj.weight",
-                               TensorShard(slice(block.attention.qkv_weight, 0, q_rows, q_rows + kv_rows)));
-        writer.register_tensor(prefix + ".self_attn.v_proj.weight",
-                               TensorShard(slice(block.attention.qkv_weight, 0, q_rows + kv_rows, fused_rows)));
-
-        if (block.attention.qkv_bias.has_value()) {
-            const auto& bias = block.attention.qkv_bias.value();
-            writer.register_tensor(prefix + ".self_attn.q_proj.bias", TensorShard(slice(bias, 0, 0, q_rows)));
-            writer.register_tensor(prefix + ".self_attn.k_proj.bias", TensorShard(slice(bias, 0, q_rows, q_rows + kv_rows)));
-            writer.register_tensor(prefix + ".self_attn.v_proj.bias", TensorShard(slice(bias, 0, q_rows + kv_rows, fused_rows)));
-        }
-
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            writer.register_tensor(prefix + ".mlp.up_proj.weight", TensorShard(slice(block.mlp_up_weight, 0, 0, D)));
-            writer.register_tensor(prefix + ".mlp.gate_proj.weight", TensorShard(slice(block.mlp_up_weight, 0, D, 2 * D)));
-            writer.register_tensor(prefix + ".mlp.down_proj.weight", TensorShard(block.mlp_down_weight));
+        // Handle per-expert patterns for non-batched MoE
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            const auto& block = mWorkBlocks[layer_idx];
+            if (!block.experts.use_batched) {
+                std::string prefix = "model.layers." + std::to_string(layer_idx);
+                for (int e = 0; e < static_cast<int>(block.experts.experts.size()); ++e) {
+                    std::string exp_prefix = prefix + ".mlp.experts." + std::to_string(e);
+                    const auto& expert = block.experts.experts[e];
+                    writer.register_tensor(exp_prefix + ".gate_proj.weight", TensorShard(expert.gate_proj));
+                    writer.register_tensor(exp_prefix + ".up_proj.weight", TensorShard(expert.up_proj));
+                    writer.register_tensor(exp_prefix + ".down_proj.weight", TensorShard(expert.down_proj));
+                }
+            }
         }
     }
 
     writer.prepare_metadata(&comm);
 
+    // ========================================================================
+    // Write tensors
+    // ========================================================================
+
     // Write non-block tensors
-    writer.write_tensor("model.embed_tokens.weight", TensorShard(mWorkNonBlock.embeddings), &comm);
-    writer.write_tensor("model.norm.weight", TensorShard(mWorkNonBlock.final_norm_weight), &comm);
-    if (!mConfig.tied_embeddings) {
-        writer.write_tensor("lm_head.weight", TensorShard(mWorkNonBlock.lm_head), &comm);
+    for (const auto& pattern : mapping->export_nonblock_patterns()) {
+        auto tensor_opt = resolve_nonblock(pattern.source);
+        if (tensor_opt.has_value()) {
+            writer.write_tensor(pattern.hf_name_template, TensorShard(tensor_opt.value()), &comm);
+        }
     }
 
-    // Write block tensors
-    for (int i = 0; i < mConfig.num_layers; ++i) {
-        const auto& block = mWorkBlocks[i];
-        std::string prefix = "model.layers." + std::to_string(i);
-
-        const long q_rows = HS * HQ;
-        const long kv_rows = HS * HKV;
-        const long fused_rows = q_rows + 2 * kv_rows;
-
-        writer.write_tensor(prefix + ".input_layernorm.weight", TensorShard(block.ln1.weight), &comm);
-        writer.write_tensor(prefix + ".post_attention_layernorm.weight", TensorShard(block.ln2.weight), &comm);
-        writer.write_tensor(prefix + ".self_attn.o_proj.weight", TensorShard(block.attention.out_weight), &comm);
-        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
-            if (block.attention.q_norm_weight.has_value()) {
-                writer.write_tensor(prefix + ".self_attn.q_norm.weight", TensorShard(block.attention.q_norm_weight.value()), &comm);
-            }
-            if (block.attention.k_norm_weight.has_value()) {
-                writer.write_tensor(prefix + ".self_attn.k_norm.weight", TensorShard(block.attention.k_norm_weight.value()), &comm);
+    // Write per-layer tensors
+    for (int layer_idx = 0; layer_idx < mConfig.num_layers; ++layer_idx) {
+        for (const auto& pattern : mapping->export_layer_patterns()) {
+            auto tensor_opt = resolve_block(pattern.source, layer_idx, pattern.row_begin);
+            if (tensor_opt.has_value()) {
+                std::string name = pattern.expand_name(layer_idx);
+                writer.write_tensor(name, TensorShard(tensor_opt.value()), &comm);
             }
         }
 
-        writer.write_tensor(prefix + ".self_attn.q_proj.weight",
-                            TensorShard(slice(block.attention.qkv_weight, 0, 0, q_rows)), &comm);
-        writer.write_tensor(prefix + ".self_attn.k_proj.weight",
-                            TensorShard(slice(block.attention.qkv_weight, 0, q_rows, q_rows + kv_rows)), &comm);
-        writer.write_tensor(prefix + ".self_attn.v_proj.weight",
-                            TensorShard(slice(block.attention.qkv_weight, 0, q_rows + kv_rows, fused_rows)), &comm);
-
-        if (block.attention.qkv_bias.has_value()) {
-            const auto& bias = block.attention.qkv_bias.value();
-            writer.write_tensor(prefix + ".self_attn.q_proj.bias", TensorShard(slice(bias, 0, 0, q_rows)), &comm);
-            writer.write_tensor(prefix + ".self_attn.k_proj.bias", TensorShard(slice(bias, 0, q_rows, q_rows + kv_rows)), &comm);
-            writer.write_tensor(prefix + ".self_attn.v_proj.bias", TensorShard(slice(bias, 0, q_rows + kv_rows, fused_rows)), &comm);
-        }
-
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            writer.write_tensor(prefix + ".mlp.up_proj.weight", TensorShard(slice(block.mlp_up_weight, 0, 0, D)), &comm);
-            writer.write_tensor(prefix + ".mlp.gate_proj.weight", TensorShard(slice(block.mlp_up_weight, 0, D, 2 * D)), &comm);
-            writer.write_tensor(prefix + ".mlp.down_proj.weight", TensorShard(block.mlp_down_weight), &comm);
+        // Handle per-expert patterns for non-batched MoE
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            const auto& block = mWorkBlocks[layer_idx];
+            if (!block.experts.use_batched) {
+                std::string prefix = "model.layers." + std::to_string(layer_idx);
+                for (int e = 0; e < static_cast<int>(block.experts.experts.size()); ++e) {
+                    std::string exp_prefix = prefix + ".mlp.experts." + std::to_string(e);
+                    const auto& expert = block.experts.experts[e];
+                    writer.write_tensor(exp_prefix + ".gate_proj.weight", TensorShard(expert.gate_proj), &comm);
+                    writer.write_tensor(exp_prefix + ".up_proj.weight", TensorShard(expert.up_proj), &comm);
+                    writer.write_tensor(exp_prefix + ".down_proj.weight", TensorShard(expert.down_proj), &comm);
+                }
+            }
         }
     }
 

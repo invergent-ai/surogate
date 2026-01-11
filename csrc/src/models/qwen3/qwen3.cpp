@@ -3,6 +3,7 @@
 //
 
 #include "models/qwen3/qwen3.h"
+#include "models/qwen3/config.h"
 
 #include <nlohmann/json.hpp>
 

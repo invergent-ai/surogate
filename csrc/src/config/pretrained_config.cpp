@@ -67,8 +67,3 @@ std::unique_ptr<PretrainedConfig> create_pretrained_config_from_name(std::string
     throw std::runtime_error(fmt::format("unknown model name {}", name));
 }
 
-// Legacy compatibility function - returns a copy
-PretrainedConfig create_pretrained_config_from_name_legacy(std::string_view name, ETensorDType dtype) {
-    auto cfg = create_pretrained_config_from_name(name, dtype);
-    return *cfg;  // Return a copy of the config
-}

@@ -11,6 +11,8 @@
 
 #include "config/pretrained_config.h"
 #include "fp8_scaling_config.h"
+#include "models/qwen25/config.h"
+#include "models/qwen3moe/config.h"
 #include "training/runtime_options.h"
 #include "utilities/dtype.h"
 
