@@ -6,6 +6,7 @@
 #ifndef SUROGATE_SRC_BINDING_PY_TRAIN_H
 #define SUROGATE_SRC_BINDING_PY_TRAIN_H
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <thread>
@@ -48,12 +49,12 @@ class MultiGPUPyTrainer
 {
 public:
     //! Single-node constructor (original)
-    MultiGPUPyTrainer(int ngpus, PretrainedConfig config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config = std::nullopt, std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
+    MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config = std::nullopt, std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
 
     //! Multi-node constructor (for Ray distributed training)
     MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
                       const void* nccl_id, const void* node_master_nccl_id,
-                      PretrainedConfig config, RuntimeOptions options,
+                      const PretrainedConfig& config, RuntimeOptions options,
                       int batch_size, int seq_len, int grad_accum,
                       bool memcpy_all_gather, bool memcpy_send_recv,
                       std::optional<LoRAAdapterConfig> lora_config = std::nullopt,
@@ -78,7 +79,7 @@ public:
     int local_world_size() const { return static_cast<int>(mContexts.size()); }
     int batch_size() const { return B; }
     int seq_length() const { return T; }
-    const PretrainedConfig& config() const { return mConfig; }
+    const PretrainedConfig& config() const { return *mConfig; }
     const RuntimeOptions& options() const { return mOptions; }
     bool is_qlora() const { return mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized(); }
 
@@ -88,7 +89,7 @@ public:
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
 
 private:
-    PretrainedConfig mConfig;
+    std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
     RuntimeOptions mOptions;
     std::optional<LoRAAdapterConfig> mLoRAConfig;
     std::optional<modules::QLoRAConfig> mQLoRAConfig;

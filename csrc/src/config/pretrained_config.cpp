@@ -12,7 +12,7 @@
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 
-PretrainedConfig load_pretrained_config(const char* file_name, ETensorDType dtype) {
+std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, ETensorDType dtype) {
     std::ifstream file(file_name);
     if (!file.is_open()) {
         throw std::runtime_error(fmt::format("could not open config file {}", file_name));
@@ -26,6 +26,12 @@ PretrainedConfig load_pretrained_config(const char* file_name, ETensorDType dtyp
     }
     const auto& ops = models::architecture_from_hf_name(archs.front());
     return ops.load_from_hf_config_json(config_json, dtype);
+}
+
+// Legacy compatibility function - returns a copy
+PretrainedConfig load_pretrained_config_legacy(const char* file_name, ETensorDType dtype) {
+    auto cfg = load_pretrained_config(file_name, dtype);
+    return *cfg;  // Return a copy of the config
 }
 
 [[nodiscard]] std::string_view PretrainedConfig::model_name() const {
@@ -56,7 +62,13 @@ void save_pretrained_config(const PretrainedConfig& config, const char* file_nam
     file << config_json.dump(4);
 }
 
-PretrainedConfig create_pretrained_config_from_name(std::string_view name, ETensorDType dtype) {
-    if (auto cfg = models::create_from_preset_name(name, dtype); cfg.has_value()) return cfg.value();
+std::unique_ptr<PretrainedConfig> create_pretrained_config_from_name(std::string_view name, ETensorDType dtype) {
+    if (auto cfg = models::create_from_preset_name(name, dtype)) return cfg;
     throw std::runtime_error(fmt::format("unknown model name {}", name));
+}
+
+// Legacy compatibility function - returns a copy
+PretrainedConfig create_pretrained_config_from_name_legacy(std::string_view name, ETensorDType dtype) {
+    auto cfg = create_pretrained_config_from_name(name, dtype);
+    return *cfg;  // Return a copy of the config
 }

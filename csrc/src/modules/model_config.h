@@ -142,16 +142,54 @@ struct ModelConfig : public PretrainedConfig {
     bool use_sliding_window = false;     ///< Sliding window attention (Mistral)
     int sliding_window_size = 4096;      ///< Size of sliding window
 
+    // MoE convenience fields (copied from moe_config for direct access)
+    // These are populated by from_pretrained_config when moe_config is set
+    int NumExperts = 0;              ///< Number of experts (0 = dense model)
+    int NumExpertsPerTok = 0;        ///< Top-K experts per token
+    int MoeIntermediateSize = 0;     ///< Per-expert intermediate size
+
     // Extended RoPE configuration
     float rope_scaling_factor = 1.0f;    ///< RoPE scaling for longer contexts
     std::string rope_type = "default";   ///< RoPE type: "default", "linear", "dynamic", "yarn"
 
     /**
      * @brief Construct from existing PretrainedConfig
+     *
+     * Handles the config inheritance hierarchy, extracting MoE-specific
+     * fields from Qwen3MoEConfig if applicable.
      */
     static ModelConfig from_pretrained_config(const PretrainedConfig& base) {
         ModelConfig config;
-        static_cast<PretrainedConfig&>(config) = base;
+
+        // Copy base fields
+        config.Architecture = base.Architecture;
+        config.BosTokenId = base.BosTokenId;
+        config.EosTokenId = base.EosTokenId;
+        config.PadTokenId = base.PadTokenId;
+        config.HiddenSize = base.HiddenSize;
+        config.IntermediateSize = base.IntermediateSize;
+        config.VocabSize = base.VocabSize;
+        config.NumQueryHeads = base.NumQueryHeads;
+        config.NumKeyValHeads = base.NumKeyValHeads;
+        config.NumLayers = base.NumLayers;
+        config.HeadDim = base.HeadDim;
+        config.MaxPositionEmbeddings = base.MaxPositionEmbeddings;
+        config.RopeTheta = base.RopeTheta;
+        config.Rope = base.Rope;
+        config.RmsNormEps = base.RmsNormEps;
+        config.TiedWordEmbeddings = base.TiedWordEmbeddings;
+        config.UseQKVBias = base.UseQKVBias;
+        config.UseQKNorm = base.UseQKNorm;
+        config.DType = base.DType;
+
+        // Copy QK norm setting
+        config.use_qk_norm = base.has_qk_norm();
+
+        // Check for sliding window (Qwen2Config and derived)
+        if (const auto* qwen2 = dynamic_cast<const Qwen2Config*>(&base)) {
+            config.use_sliding_window = qwen2->SlidingWindow > 0;
+            config.sliding_window_size = qwen2->SlidingWindow;
+        }
 
         // Infer attention type from head counts
         if (config.NumKeyValHeads == 1) {
@@ -162,20 +200,35 @@ struct ModelConfig : public PretrainedConfig {
             config.attention_type = AttentionType::MHA;
         }
 
-        // Infer architecture type from MoE configuration
-        if (config.NumExperts > 0) {
-            config.architecture = ArchitectureType::MoE;
+        // Check for MoE configuration (Qwen3MoEConfig)
+        fprintf(stderr, "[ModelConfig] base.Architecture=%d, base.is_moe()=%d\n",
+                static_cast<int>(base.Architecture), base.is_moe());
+        if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&base)) {
+            fprintf(stderr, "[ModelConfig] dynamic_cast to Qwen3MoEConfig succeeded! NumExperts=%d\n",
+                    moe_cfg->NumExperts);
+            if (moe_cfg->NumExperts > 0) {
+                config.architecture = ArchitectureType::MoE;
 
-            // Set up MoE config from PretrainedConfig fields
-            MoEConfig moe;
-            moe.num_experts = config.NumExperts;
-            moe.top_k = config.NumExpertsPerTok;
-            moe.moe_intermediate_size = config.MoeIntermediateSize;
-            moe.decoder_sparse_step = config.DecoderSparseStep;
-            moe.mlp_only_layers = config.MlpOnlyLayers;
-            moe.norm_topk_prob = config.NormTopkProb;
-            moe.router_aux_loss_coef = config.RouterAuxLossCoef;
-            config.moe_config = moe;
+                // Set up MoE config from Qwen3MoEConfig fields
+                MoEConfig moe;
+                moe.num_experts = moe_cfg->NumExperts;
+                moe.top_k = moe_cfg->NumExpertsPerTok;
+                moe.moe_intermediate_size = moe_cfg->MoeIntermediateSize;
+                moe.decoder_sparse_step = moe_cfg->DecoderSparseStep;
+                moe.mlp_only_layers = moe_cfg->MlpOnlyLayers;
+                moe.norm_topk_prob = moe_cfg->NormTopkProb;
+                moe.router_aux_loss_coef = moe_cfg->RouterAuxLossCoef;
+                config.moe_config = moe;
+
+                // Also populate convenience fields for direct access
+                config.NumExperts = moe_cfg->NumExperts;
+                config.NumExpertsPerTok = moe_cfg->NumExpertsPerTok;
+                config.MoeIntermediateSize = moe_cfg->MoeIntermediateSize;
+                fprintf(stderr, "[ModelConfig] MoE config set: experts=%d, top_k=%d, moe_intermediate=%d\n",
+                        config.NumExperts, config.NumExpertsPerTok, config.MoeIntermediateSize);
+            }
+        } else {
+            fprintf(stderr, "[ModelConfig] dynamic_cast to Qwen3MoEConfig FAILED\n");
         }
 
         return config;

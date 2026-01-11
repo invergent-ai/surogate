@@ -39,8 +39,8 @@
  *
  * @throws std::runtime_error If requested GPUs exceed available device count.
  */
-MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, PretrainedConfig config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) :
-    mConfig(config), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
+MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) :
+    mConfig(config.clone()), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
 {
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
@@ -91,12 +91,12 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, PretrainedConfig config, Runtime
  */
 MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
                                      const void* nccl_id, const void* node_master_nccl_id,
-                                     PretrainedConfig config, RuntimeOptions options,
+                                     const PretrainedConfig& config, RuntimeOptions options,
                                      int batch_size, int seq_len, int grad_accum,
                                      bool memcpy_all_gather, bool memcpy_send_recv,
                                      std::optional<LoRAAdapterConfig> lora_config,
                                      std::optional<modules::QLoRAConfig> qlora_config) :
-    mConfig(config), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
+    mConfig(config.clone()), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
 {
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
@@ -168,9 +168,9 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
                 MemoryBreakdownContext breakdown_ctx;
                 breakdown_ctx.enabled = true;
                 breakdown_ctx.allocator = rs.Allocator.get();
-                breakdown_ctx.hidden_size = mConfig.HiddenSize;
-                breakdown_ctx.intermediate_size = mConfig.IntermediateSize;
-                breakdown_ctx.num_layers = mConfig.NumLayers;
+                breakdown_ctx.hidden_size = mConfig->HiddenSize;
+                breakdown_ctx.intermediate_size = mConfig->IntermediateSize;
+                breakdown_ctx.num_layers = mConfig->NumLayers;
                 breakdown_ctx.batch_size = B;
                 breakdown_ctx.seq_length = T;
 
@@ -497,7 +497,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
 
     auto allocator = std::make_shared<TensorAllocator>();
 
-    modules::ModelConfig mod_config = modules::ModelConfig::from_pretrained_config(mConfig);
+    modules::ModelConfig mod_config = modules::ModelConfig::from_pretrained_config(*mConfig);
     modules::ModelOptions mod_options = modules::ModelOptions::from_runtime_options(mOptions);
 
     // QLoRA: skip block weight allocation since weights are provided by QLoRA weight provider

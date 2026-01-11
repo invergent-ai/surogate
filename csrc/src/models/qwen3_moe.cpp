@@ -10,7 +10,7 @@
 
 namespace models {
 
-static PretrainedConfig create_qwen3_moe_config(
+static std::unique_ptr<Qwen3MoEConfig> create_qwen3_moe_config(
     int head_dim, int hidden_size, int intermediate_size, int moe_intermediate_size,
     int max_position_embeddings, int num_attention_heads, int num_hidden_layers,
     int num_key_value_heads, int num_experts, int num_experts_per_tok,
@@ -19,85 +19,85 @@ static PretrainedConfig create_qwen3_moe_config(
     float rms_norm_eps, float rope_theta, bool tie_word_embeddings, int vocab_size,
     ETensorDType dtype
 ) {
-    PretrainedConfig config = {
-        .Architecture = PretrainedConfig::QWEN3_MOE,
-        .BosTokenId = 151643,
-        .EosTokenId = 151645,
-        .PadTokenId = 151643,
-        .HiddenSize = hidden_size,
-        .IntermediateSize = intermediate_size,
-        .VocabSize = vocab_size,
-        .NumQueryHeads = num_attention_heads,
-        .NumKeyValHeads = num_key_value_heads,
-        .NumLayers = num_hidden_layers,
-        .HeadDim = head_dim,
-        .MaxPositionEmbeddings = max_position_embeddings,
-        .RopeTheta = rope_theta,
-        .RmsNormEps = rms_norm_eps,
-        .TiedWordEmbeddings = tie_word_embeddings,
-        .UseQKVBias = false,
-        .UseQKNorm = true,
-        .DType = dtype
-    };
+    auto config = std::make_unique<Qwen3MoEConfig>();
+    config->BosTokenId = 151643;
+    config->EosTokenId = 151645;
+    config->PadTokenId = 151643;
+    config->HiddenSize = hidden_size;
+    config->IntermediateSize = intermediate_size;
+    config->VocabSize = vocab_size;
+    config->NumQueryHeads = num_attention_heads;
+    config->NumKeyValHeads = num_key_value_heads;
+    config->NumLayers = num_hidden_layers;
+    config->HeadDim = head_dim;
+    config->MaxPositionEmbeddings = max_position_embeddings;
+    config->RopeTheta = rope_theta;
+    config->RmsNormEps = rms_norm_eps;
+    config->TiedWordEmbeddings = tie_word_embeddings;
+    config->UseQKVBias = false;
+    config->UseQKNorm = true;  // Qwen3 uses QK norm
+    config->DType = dtype;
 
-    // MoE-specific fields stored in extended config
-    config.NumExperts = num_experts;
-    config.NumExpertsPerTok = num_experts_per_tok;
-    config.MoeIntermediateSize = moe_intermediate_size;
-    config.DecoderSparseStep = decoder_sparse_step;
-    config.MlpOnlyLayers = mlp_only_layers;
-    config.NormTopkProb = norm_topk_prob;
-    config.RouterAuxLossCoef = router_aux_loss_coef;
+    // MoE-specific fields (in Qwen3MoEConfig)
+    config->NumExperts = num_experts;
+    config->NumExpertsPerTok = num_experts_per_tok;
+    config->MoeIntermediateSize = moe_intermediate_size;
+    config->DecoderSparseStep = decoder_sparse_step;
+    config->MlpOnlyLayers = mlp_only_layers;
+    config->NormTopkProb = norm_topk_prob;
+    config->RouterAuxLossCoef = router_aux_loss_coef;
 
     return config;
 }
 
-PretrainedConfig Qwen3MoEArchitecture::load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype) {
-    PretrainedConfig result;
-    result.Architecture = PretrainedConfig::QWEN3_MOE;
-    result.DType = dtype;
+std::unique_ptr<PretrainedConfig> Qwen3MoEArchitecture::load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype) {
+    auto result = std::make_unique<Qwen3MoEConfig>();
+    result->DType = dtype;
 
-    result.BosTokenId = config_json.at("bos_token_id").get<int>();
-    result.EosTokenId = config_json.at("eos_token_id").get<int>();
-    result.PadTokenId = config_json.value("pad_token_id", result.BosTokenId);
+    result->BosTokenId = config_json.at("bos_token_id").get<int>();
+    result->EosTokenId = config_json.at("eos_token_id").get<int>();
+    result->PadTokenId = config_json.value("pad_token_id", result->BosTokenId);
 
-    result.HiddenSize = config_json.at("hidden_size").get<int>();
-    result.IntermediateSize = config_json.at("intermediate_size").get<int>();
-    result.VocabSize = config_json.at("vocab_size").get<int>();
-    result.NumQueryHeads = config_json.at("num_attention_heads").get<int>();
-    result.NumKeyValHeads = config_json.at("num_key_value_heads").get<int>();
-    result.NumLayers = config_json.at("num_hidden_layers").get<int>();
+    result->HiddenSize = config_json.at("hidden_size").get<int>();
+    result->IntermediateSize = config_json.at("intermediate_size").get<int>();
+    result->VocabSize = config_json.at("vocab_size").get<int>();
+    result->NumQueryHeads = config_json.at("num_attention_heads").get<int>();
+    result->NumKeyValHeads = config_json.at("num_key_value_heads").get<int>();
+    result->NumLayers = config_json.at("num_hidden_layers").get<int>();
 
     // Qwen3 MoE uses explicit head_dim
-    result.HeadDim = config_json.at("head_dim").get<int>();
+    result->HeadDim = config_json.at("head_dim").get<int>();
 
-    result.MaxPositionEmbeddings = config_json.at("max_position_embeddings").get<int>();
-    result.RopeTheta = config_json.at("rope_theta").get<float>();
-    result.TiedWordEmbeddings = config_json.at("tie_word_embeddings").get<bool>();
-    result.RmsNormEps = config_json.value("rms_norm_eps", 1e-6f);
+    result->MaxPositionEmbeddings = config_json.at("max_position_embeddings").get<int>();
+    result->RopeTheta = config_json.at("rope_theta").get<float>();
+    result->TiedWordEmbeddings = config_json.at("tie_word_embeddings").get<bool>();
+    result->RmsNormEps = config_json.value("rms_norm_eps", 1e-6f);
 
     // Qwen3 MoE uses no attention bias by default
-    result.UseQKVBias = config_json.value("attention_bias", false);
+    result->UseQKVBias = config_json.value("attention_bias", false);
     // Qwen3 MoE uses QK normalization
-    result.UseQKNorm = true;
+    result->UseQKNorm = true;
 
-    // MoE-specific configuration
-    result.NumExperts = config_json.at("num_experts").get<int>();
-    result.NumExpertsPerTok = config_json.at("num_experts_per_tok").get<int>();
-    result.MoeIntermediateSize = config_json.value("moe_intermediate_size", result.IntermediateSize);
-    result.DecoderSparseStep = config_json.value("decoder_sparse_step", 1);
-    result.NormTopkProb = config_json.value("norm_topk_prob", false);
-    result.RouterAuxLossCoef = config_json.value("router_aux_loss_coef", 0.001f);
+    // MoE-specific configuration (in Qwen3MoEConfig)
+    result->NumExperts = config_json.at("num_experts").get<int>();
+    result->NumExpertsPerTok = config_json.at("num_experts_per_tok").get<int>();
+    result->MoeIntermediateSize = config_json.value("moe_intermediate_size", result->IntermediateSize);
+    result->DecoderSparseStep = config_json.value("decoder_sparse_step", 1);
+    result->NormTopkProb = config_json.value("norm_topk_prob", false);
+    result->RouterAuxLossCoef = config_json.value("router_aux_loss_coef", 0.001f);
 
     // Parse mlp_only_layers array if present
     if (config_json.contains("mlp_only_layers") && config_json["mlp_only_layers"].is_array()) {
-        result.MlpOnlyLayers = config_json["mlp_only_layers"].get<std::vector<int>>();
+        result->MlpOnlyLayers = config_json["mlp_only_layers"].get<std::vector<int>>();
     }
 
     return result;
 }
 
 void Qwen3MoEArchitecture::save_to_hf_config_json(const PretrainedConfig& config, nlohmann::json& config_json) {
+    // Cast to Qwen3MoEConfig to access MoE-specific fields
+    const auto* moe_config = dynamic_cast<const Qwen3MoEConfig*>(&config);
+
     config_json["architectures"] = {std::string(kHfArchitectureName)};
     config_json["model_type"] = "qwen3_moe";
     config_json["bos_token_id"] = config.BosTokenId;
@@ -117,20 +117,22 @@ void Qwen3MoEArchitecture::save_to_hf_config_json(const PretrainedConfig& config
     config_json["attention_bias"] = false;
     config_json["torch_dtype"] = dtype_to_torch_str(config.DType);
 
-    // MoE-specific fields
-    config_json["num_experts"] = config.NumExperts;
-    config_json["num_experts_per_tok"] = config.NumExpertsPerTok;
-    config_json["moe_intermediate_size"] = config.MoeIntermediateSize;
-    config_json["decoder_sparse_step"] = config.DecoderSparseStep;
-    config_json["norm_topk_prob"] = config.NormTopkProb;
-    config_json["router_aux_loss_coef"] = config.RouterAuxLossCoef;
+    // MoE-specific fields (from Qwen3MoEConfig)
+    if (moe_config) {
+        config_json["num_experts"] = moe_config->NumExperts;
+        config_json["num_experts_per_tok"] = moe_config->NumExpertsPerTok;
+        config_json["moe_intermediate_size"] = moe_config->MoeIntermediateSize;
+        config_json["decoder_sparse_step"] = moe_config->DecoderSparseStep;
+        config_json["norm_topk_prob"] = moe_config->NormTopkProb;
+        config_json["router_aux_loss_coef"] = moe_config->RouterAuxLossCoef;
 
-    if (!config.MlpOnlyLayers.empty()) {
-        config_json["mlp_only_layers"] = config.MlpOnlyLayers;
+        if (!moe_config->MlpOnlyLayers.empty()) {
+            config_json["mlp_only_layers"] = moe_config->MlpOnlyLayers;
+        }
     }
 }
 
-std::optional<PretrainedConfig> Qwen3MoEArchitecture::create_from_preset_name(std::string_view name, ETensorDType dtype) {
+std::unique_ptr<PretrainedConfig> Qwen3MoEArchitecture::create_from_preset_name(std::string_view name, ETensorDType dtype) {
     // Qwen3-MoE-30B-A3B: 128 experts, 8 active per token
     // Total params: ~30B, Active params: ~3B per token
     if (iequals(name, "Qwen3-MoE-30B-A3B") || iequals(name, "qwen3_moe_30b_a3b")) {
@@ -157,7 +159,7 @@ std::optional<PretrainedConfig> Qwen3MoEArchitecture::create_from_preset_name(st
         );
     }
 
-    return std::nullopt;
+    return nullptr;
 }
 
 } // namespace models

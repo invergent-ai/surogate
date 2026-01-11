@@ -40,12 +40,12 @@ const ArchitectureOps& architecture_from_id(PretrainedConfig::ArchitectureId id)
     throw std::logic_error("unknown ArchitectureId");
 }
 
-std::optional<PretrainedConfig> create_from_preset_name(std::string_view name, ETensorDType dtype) {
+std::unique_ptr<PretrainedConfig> create_from_preset_name(std::string_view name, ETensorDType dtype) {
     for (const auto& ops : registry()) {
         if (!ops.create_from_preset_name) continue;
-        if (auto cfg = ops.create_from_preset_name(name, dtype); cfg.has_value()) return cfg;
+        if (auto cfg = ops.create_from_preset_name(name, dtype)) return cfg;
     }
-    return std::nullopt;
+    return nullptr;
 }
 
 std::vector<std::string_view> supported_hf_architectures() {

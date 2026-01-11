@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <optional>
+#include <memory>
 #include <string_view>
 
 #include <nlohmann/json_fwd.hpp>
@@ -14,15 +14,20 @@
 
 namespace models {
 
+/**
+ * @brief Architecture handler for Qwen3 dense models.
+ *
+ * Returns Qwen3Config instances from load operations.
+ */
 class Qwen3Architecture {
 public:
     static constexpr std::string_view kHfArchitectureName = "Qwen3ForCausalLM";
 
-    static PretrainedConfig load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype);
+    static std::unique_ptr<PretrainedConfig> load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype);
     static void save_to_hf_config_json(const PretrainedConfig& config, nlohmann::json& config_json);
-    static std::optional<PretrainedConfig> create_from_preset_name(std::string_view name, ETensorDType dtype);
+    static std::unique_ptr<PretrainedConfig> create_from_preset_name(std::string_view name, ETensorDType dtype);
 
-    static constexpr ArchitectureOps ops() {
+    static ArchitectureOps ops() {
         return {
             .hf_architecture_name = kHfArchitectureName,
             .id = PretrainedConfig::QWEN3,

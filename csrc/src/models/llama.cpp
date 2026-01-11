@@ -12,77 +12,74 @@
 
 namespace models {
 
-static PretrainedConfig create_llama2_config(int hidden_size, int intermediate_size, int heads, int depth, ETensorDType dtype) {
-    return {
-        .Architecture = PretrainedConfig::LLAMA,
-        .BosTokenId = 1,
-        .EosTokenId = 2,
-        .PadTokenId = 0,
-        .HiddenSize = hidden_size,
-        .IntermediateSize = intermediate_size,
-        .VocabSize = 32000,
-        .NumQueryHeads = heads,
-        .NumKeyValHeads = heads,
-        .NumLayers = depth,
-        .HeadDim = 0,
-        .MaxPositionEmbeddings = 4096,
-        .RopeTheta = 10000.f,
-        .RmsNormEps = 1e-05f,
-        .TiedWordEmbeddings = false,
-        .UseQKVBias = false,
-        .UseQKNorm = false,
-        .DType = dtype
-    };
+static std::unique_ptr<LlamaConfig> create_llama2_config(int hidden_size, int intermediate_size, int heads, int depth, ETensorDType dtype) {
+    auto config = std::make_unique<LlamaConfig>();
+    config->BosTokenId = 1;
+    config->EosTokenId = 2;
+    config->PadTokenId = 0;
+    config->HiddenSize = hidden_size;
+    config->IntermediateSize = intermediate_size;
+    config->VocabSize = 32000;
+    config->NumQueryHeads = heads;
+    config->NumKeyValHeads = heads;
+    config->NumLayers = depth;
+    config->HeadDim = 0;
+    config->MaxPositionEmbeddings = 4096;
+    config->RopeTheta = 10000.f;
+    config->RmsNormEps = 1e-05f;
+    config->TiedWordEmbeddings = false;
+    config->UseQKVBias = false;
+    config->UseQKNorm = false;
+    config->DType = dtype;
+    return config;
 }
 
-static PretrainedConfig create_llama3_config(int hidden_size, int intermediate_size, int q_heads, int kv_heads, int depth,
-                                             ETensorDType dtype) {
-    return {
-        .Architecture = PretrainedConfig::LLAMA,
-        .BosTokenId = 128000,
-        .EosTokenId = 128001,
-        .PadTokenId = 128255,
-        .HiddenSize = hidden_size,
-        .IntermediateSize = intermediate_size,
-        .VocabSize = 128256,
-        .NumQueryHeads = q_heads,
-        .NumKeyValHeads = kv_heads,
-        .NumLayers = depth,
-        .HeadDim = 0,
-        .MaxPositionEmbeddings = 4096,
-        .RopeTheta = 500000.f,
-        .RmsNormEps = 1e-05f,
-        .TiedWordEmbeddings = false,
-        .UseQKVBias = false,
-        .UseQKNorm = false,
-        .DType = dtype
-    };
+static std::unique_ptr<LlamaConfig> create_llama3_config(int hidden_size, int intermediate_size, int q_heads, int kv_heads, int depth,
+                                                          ETensorDType dtype) {
+    auto config = std::make_unique<LlamaConfig>();
+    config->BosTokenId = 128000;
+    config->EosTokenId = 128001;
+    config->PadTokenId = 128255;
+    config->HiddenSize = hidden_size;
+    config->IntermediateSize = intermediate_size;
+    config->VocabSize = 128256;
+    config->NumQueryHeads = q_heads;
+    config->NumKeyValHeads = kv_heads;
+    config->NumLayers = depth;
+    config->HeadDim = 0;
+    config->MaxPositionEmbeddings = 4096;
+    config->RopeTheta = 500000.f;
+    config->RmsNormEps = 1e-05f;
+    config->TiedWordEmbeddings = false;
+    config->UseQKVBias = false;
+    config->UseQKNorm = false;
+    config->DType = dtype;
+    return config;
 }
 
-PretrainedConfig LlamaArchitecture::load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype) {
-    PretrainedConfig result;
-    result.Architecture = PretrainedConfig::LLAMA;
-    result.DType = dtype;
+std::unique_ptr<PretrainedConfig> LlamaArchitecture::load_from_hf_config_json(const nlohmann::json& config_json, ETensorDType dtype) {
+    auto result = std::make_unique<LlamaConfig>();
+    result->DType = dtype;
 
-    result.BosTokenId = config_json.at("bos_token_id").get<int>();
-    result.EosTokenId = config_json.at("eos_token_id").get<int>();
-    result.PadTokenId = config_json.value("pad_token_id", 0);
+    result->BosTokenId = config_json.at("bos_token_id").get<int>();
+    result->EosTokenId = config_json.at("eos_token_id").get<int>();
+    result->PadTokenId = config_json.value("pad_token_id", 0);
 
-    result.HiddenSize = config_json.at("hidden_size").get<int>();
-    result.IntermediateSize = config_json.at("intermediate_size").get<int>();
-    result.VocabSize = config_json.at("vocab_size").get<int>();
-    result.NumQueryHeads = config_json.at("num_attention_heads").get<int>();
-    result.NumKeyValHeads = config_json.at("num_key_value_heads").get<int>();
-    result.NumLayers = config_json.at("num_hidden_layers").get<int>();
-    result.HeadDim = config_json.value("head_dim", 0);
+    result->HiddenSize = config_json.at("hidden_size").get<int>();
+    result->IntermediateSize = config_json.at("intermediate_size").get<int>();
+    result->VocabSize = config_json.at("vocab_size").get<int>();
+    result->NumQueryHeads = config_json.at("num_attention_heads").get<int>();
+    result->NumKeyValHeads = config_json.at("num_key_value_heads").get<int>();
+    result->NumLayers = config_json.at("num_hidden_layers").get<int>();
+    result->HeadDim = config_json.value("head_dim", 0);
 
-    result.MaxPositionEmbeddings = config_json.at("max_position_embeddings").get<int>();
-    result.RopeTheta = config_json.value("rope_theta", 10000.0f);
-    result.TiedWordEmbeddings = config_json.value("tie_word_embeddings", false);
-    result.RmsNormEps = config_json.value("rms_norm_eps", 1e-05f);
+    result->MaxPositionEmbeddings = config_json.at("max_position_embeddings").get<int>();
+    result->RopeTheta = config_json.value("rope_theta", 10000.0f);
+    result->TiedWordEmbeddings = config_json.value("tie_word_embeddings", false);
+    result->RmsNormEps = config_json.value("rms_norm_eps", 1e-05f);
 
-    result.UseQKVBias = config_json.value("attention_bias", false);
-    result.UseQKNorm = false;
+    result->UseQKVBias = config_json.value("attention_bias", false);
+    result->UseQKNorm = false;
 
     return result;
 }
@@ -108,7 +105,7 @@ void LlamaArchitecture::save_to_hf_config_json(const PretrainedConfig& config, n
     config_json["torch_dtype"] = dtype_to_torch_str(config.DType);
 }
 
-std::optional<PretrainedConfig> LlamaArchitecture::create_from_preset_name(std::string_view name, ETensorDType dtype) {
+std::unique_ptr<PretrainedConfig> LlamaArchitecture::create_from_preset_name(std::string_view name, ETensorDType dtype) {
     if (iequals(name, "llama-2-7b")) {
         return create_llama2_config(4096, 11008, 32, 32, dtype);
     }
@@ -118,7 +115,7 @@ std::optional<PretrainedConfig> LlamaArchitecture::create_from_preset_name(std::
     if (iequals(name, "llama-3-8b")) {
         return create_llama3_config(4096, 14336, 32, 8, 32, dtype);
     }
-    return std::nullopt;
+    return nullptr;
 }
 
 } // namespace models
