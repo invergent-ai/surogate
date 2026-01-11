@@ -1262,11 +1262,13 @@ void moe_router_z_loss_backward(nv_bfloat16* d_logits, const nv_bfloat16* router
 void moe_grouped_gemm_gate_up(float* output, const float* input, const float* weights,
                               const int* expert_offsets, int num_experts,
                               int hidden_size, int intermediate_size,
-                              cublasHandle_t cublas_handle, cudaStream_t stream);
+                              cublasHandle_t cublas_handle, cudaStream_t stream,
+                              const int* host_offsets = nullptr);
 void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                               const int* expert_offsets, int num_experts,
                               int hidden_size, int intermediate_size,
-                              cublasHandle_t cublas_handle, cudaStream_t stream);
+                              cublasHandle_t cublas_handle, cudaStream_t stream,
+                              const int* host_offsets = nullptr);
 
 /// @brief Grouped GEMM for MoE down projection across all experts.
 /// Runs all expert GEMMs in parallel instead of sequentially.
@@ -1282,10 +1284,56 @@ void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, con
 void moe_grouped_gemm_down(float* output, const float* input, const float* weights,
                            const int* expert_offsets, int num_experts,
                            int hidden_size, int intermediate_size,
-                           cublasHandle_t cublas_handle, cudaStream_t stream);
+                           cublasHandle_t cublas_handle, cudaStream_t stream,
+                           const int* host_offsets = nullptr);
 void moe_grouped_gemm_down(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                            const int* expert_offsets, int num_experts,
                            int hidden_size, int intermediate_size,
-                           cublasHandle_t cublas_handle, cudaStream_t stream);
+                           cublasHandle_t cublas_handle, cudaStream_t stream,
+                           const int* host_offsets = nullptr);
+
+/// @brief Grouped GEMM backward through down projection for all MoE experts.
+/// Computes d_swiglu = d_output @ down_proj (no transpose on weight).
+/// @param d_input Output gradient w.r.t. SwiGLU output (total_tokens, D).
+/// @param d_output Input gradient from downstream (total_tokens, C).
+/// @param weights Down projection weights in batched layout (num_experts, C, D).
+/// @param expert_offsets Cumulative token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param hidden_size Hidden dimension (C).
+/// @param intermediate_size Expert intermediate dimension (D).
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+void moe_grouped_gemm_down_backward(float* d_input, const float* d_output, const float* weights,
+                                     const int* expert_offsets, int num_experts,
+                                     int hidden_size, int intermediate_size,
+                                     cublasHandle_t cublas_handle, cudaStream_t stream,
+                                     const int* host_offsets = nullptr);
+void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_output, const nv_bfloat16* weights,
+                                     const int* expert_offsets, int num_experts,
+                                     int hidden_size, int intermediate_size,
+                                     cublasHandle_t cublas_handle, cudaStream_t stream,
+                                     const int* host_offsets = nullptr);
+
+/// @brief Grouped GEMM backward through gate+up projection for all MoE experts.
+/// Computes d_input = d_gate_up @ gate_up_proj (no transpose on weight).
+/// @param d_input Output gradient w.r.t. original input (total_tokens, C).
+/// @param d_gate_up Input gradient from SwiGLU backward (total_tokens, 2*D).
+/// @param weights Gate+up projection weights in batched layout (num_experts, 2*D, C).
+/// @param expert_offsets Cumulative token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param hidden_size Hidden dimension (C).
+/// @param intermediate_size Expert intermediate dimension (D, d_gate_up is 2*D).
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+void moe_grouped_gemm_gate_up_backward(float* d_input, const float* d_gate_up, const float* weights,
+                                        const int* expert_offsets, int num_experts,
+                                        int hidden_size, int intermediate_size,
+                                        cublasHandle_t cublas_handle, cudaStream_t stream,
+                                        const int* host_offsets = nullptr);
+void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_gate_up, const nv_bfloat16* weights,
+                                        const int* expert_offsets, int num_experts,
+                                        int hidden_size, int intermediate_size,
+                                        cublasHandle_t cublas_handle, cudaStream_t stream,
+                                        const int* host_offsets = nullptr);
 
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

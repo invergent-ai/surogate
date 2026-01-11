@@ -900,7 +900,7 @@ void moe_router_z_loss_backward(
 // ============================================================================
 // Grouped GEMM for MoE Expert Computation
 // ============================================================================
-// Uses cuBLAS batched GEMM to run all experts in parallel instead of sequentially.
+// Uses cuBLAS grouped batched GEMM to run all experts in parallel.
 // This reduces kernel launch overhead from O(num_experts) to O(1).
 //
 // The expert weights are stored in a batched layout:
@@ -919,95 +919,164 @@ constexpr cudaDataType_t cublas_dtype() {
     else static_assert(!sizeof(T), "Unsupported type for cuBLAS");
 }
 
+// Kernel to build pointer arrays on device (avoids host-device sync)
+template<typename T>
+__global__ void build_gemm_pointers_gate_up_kernel(
+    const T** A_ptrs,           // output: input pointers
+    const T** B_ptrs,           // output: weight pointers
+    T** C_ptrs,                 // output: output pointers
+    int* lda_arr,
+    int* ldb_arr,
+    int* ldc_arr,
+    int* m_arr,
+    int* n_arr,
+    int* k_arr,
+    const T* input,
+    const T* weights,
+    T* output,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,            // C
+    int intermediate_size       // D
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_experts) return;
+
+    int start = expert_offsets[e];
+    int end = expert_offsets[e + 1];
+    int tokens_e = end - start;
+
+    // Input: (tokens_e, C) at offset start * C
+    A_ptrs[e] = input + start * hidden_size;
+    // Weight: (2*D, C) for expert e
+    B_ptrs[e] = weights + e * (2 * intermediate_size) * hidden_size;
+    // Output: (tokens_e, 2*D) at offset start * 2*D
+    C_ptrs[e] = output + start * (2 * intermediate_size);
+
+    // Row-major: output(tokens, 2*D) = input(tokens, C) @ weight^T(C, 2*D)
+    // In column-major (treating row-major as col-major):
+    // - input becomes (C, tokens) col-major
+    // - weight becomes (C, 2*D) col-major
+    // - output becomes (2*D, tokens) col-major
+    //
+    // So: output(2*D, tokens) = weight^T(2*D, C) @ input(C, tokens)
+    // cuBLAS: C = op(A) @ op(B)
+    // A = weight with CUBLAS_OP_T: op(A) = (2*D, C)
+    // B = input with CUBLAS_OP_N: op(B) = (C, tokens)
+    // M = 2*D, N = tokens, K = C
+
+    m_arr[e] = 2 * intermediate_size;  // M = 2*D
+    n_arr[e] = tokens_e;               // N = tokens
+    k_arr[e] = hidden_size;            // K = C
+    lda_arr[e] = hidden_size;          // lda = C (leading dim of weight in col-major)
+    ldb_arr[e] = hidden_size;          // ldb = C (leading dim of input in col-major)
+    ldc_arr[e] = 2 * intermediate_size; // ldc = 2*D (leading dim of output in col-major)
+}
+
+template<typename T>
+__global__ void build_gemm_pointers_down_kernel(
+    const T** A_ptrs,
+    const T** B_ptrs,
+    T** C_ptrs,
+    int* lda_arr,
+    int* ldb_arr,
+    int* ldc_arr,
+    int* m_arr,
+    int* n_arr,
+    int* k_arr,
+    const T* input,
+    const T* weights,
+    T* output,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,            // C
+    int intermediate_size       // D
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_experts) return;
+
+    int start = expert_offsets[e];
+    int end = expert_offsets[e + 1];
+    int tokens_e = end - start;
+
+    // Input: (tokens_e, D) at offset start * D
+    A_ptrs[e] = input + start * intermediate_size;
+    // Weight: (C, D) for expert e
+    B_ptrs[e] = weights + e * hidden_size * intermediate_size;
+    // Output: (tokens_e, C) at offset start * C
+    C_ptrs[e] = output + start * hidden_size;
+
+    // Row-major: output(tokens, C) = input(tokens, D) @ weight^T(D, C)
+    // Col-major: output(C, tokens) = weight^T(C, D) @ input(D, tokens)
+    // A = weight with CUBLAS_OP_T: op(A) = (C, D)
+    // B = input with CUBLAS_OP_N: op(B) = (D, tokens)
+    // M = C, N = tokens, K = D
+
+    m_arr[e] = hidden_size;       // M = C
+    n_arr[e] = tokens_e;          // N = tokens
+    k_arr[e] = intermediate_size; // K = D
+    lda_arr[e] = intermediate_size; // lda = D
+    ldb_arr[e] = intermediate_size; // ldb = D
+    ldc_arr[e] = hidden_size;       // ldc = C
+}
+
 template<typename T>
 void moe_grouped_gemm_gate_up_impl(
     T* output,                        // (total_tokens, 2*D) - gate+up output
     const T* input,                   // (total_tokens, C) - permuted tokens
     const T* weights,                 // (num_experts, 2*D, C) - batched weights
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert
+    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
     int hidden_size,                  // C
     int intermediate_size,            // D (output is 2*D for gate+up)
     cublasHandle_t cublas_handle,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
 ) {
-    // Copy offsets to host for batched setup
-    std::vector<int> h_offsets(num_experts + 1);
-    CUDA_CHECK(cudaMemcpyAsync(h_offsets.data(), expert_offsets,
-                               (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Get host-side offsets - either use cached or copy from device
+    std::vector<int> local_offsets;
+    const int* h_offsets;
 
-    // Build pointer arrays for batched GEMM
-    // GEMM: output[e] = input[e] @ weights[e]^T
-    // Where input[e] is (tokens_e, C), weights[e] is (2*D, C), output[e] is (tokens_e, 2*D)
-    // cuBLAS: C = alpha * op(A) * op(B) + beta * C
-    // We want: output = input @ weights^T, which is (M, N) = (M, K) @ (K, N)
-    // With M = tokens_e, K = C, N = 2*D
-    // cuBLAS column-major: C(M,N) = A(M,K) @ B(K,N) => need B^T for row-major weights
+    if (host_offsets) {
+        // Use pre-cached host offsets (no sync needed)
+        h_offsets = host_offsets;
+    } else {
+        // Copy from device (requires sync - slower path)
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
 
-    std::vector<const T*> h_A_ptrs(num_experts);
-    std::vector<const T*> h_B_ptrs(num_experts);
-    std::vector<T*> h_C_ptrs(num_experts);
-    std::vector<int> h_m(num_experts);
-    std::vector<int> h_n(num_experts);
-    std::vector<int> h_k(num_experts);
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
 
-    int batch_count = 0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const int out_dim = 2 * intermediate_size;
+
+    // Submit all GEMMs - cuBLAS batches them internally when on same stream
     for (int e = 0; e < num_experts; ++e) {
         int tokens_e = h_offsets[e + 1] - h_offsets[e];
         if (tokens_e == 0) continue;
 
-        // Input: (tokens_e, C) at offset h_offsets[e] * C
-        h_A_ptrs[batch_count] = input + h_offsets[e] * hidden_size;
-        // Weight: (2*D, C) for expert e
-        h_B_ptrs[batch_count] = weights + e * (2 * intermediate_size) * hidden_size;
-        // Output: (tokens_e, 2*D) at offset h_offsets[e] * 2*D
-        h_C_ptrs[batch_count] = output + h_offsets[e] * (2 * intermediate_size);
+        const T* input_e = input + h_offsets[e] * hidden_size;
+        const T* weight_e = weights + e * out_dim * hidden_size;
+        T* output_e = output + h_offsets[e] * out_dim;
 
-        h_m[batch_count] = tokens_e;
-        h_n[batch_count] = 2 * intermediate_size;
-        h_k[batch_count] = hidden_size;
-        batch_count++;
-    }
-
-    if (batch_count == 0) return;
-
-    // For variable-size batched GEMM, we need to use cublasGemmBatchedEx
-    // or loop with individual GEMMs. cuBLAS batched requires same M,N,K.
-    // Since expert token counts vary, we fall back to individual GEMMs
-    // but with all calls submitted to the same stream (parallel execution via stream overlap).
-
-    // Alternative: Use cublasGemmGroupedBatchedEx (CUDA 12.0+) for true grouped GEMM
-    // For now, use individual GEMMs which still benefit from stream-level parallelism
-
-    float alpha = 1.0f;
-    float beta = 0.0f;
-
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
-
-    for (int b = 0; b < batch_count; ++b) {
-        // GEMM: C = A @ B^T in row-major = B @ A^T in column-major
-        // cuBLAS is column-major, so for row-major C(M,N) = A(M,K) @ B^T(K,N):
-        // We compute in column-major: C^T(N,M) = B(N,K) @ A^T(K,M)
-        // This is equivalent to: cublasGemm(N, M, K, B, A, C) with no transpose
-        // But we want weights^T @ input^T in column-major which gives (output^T)
-        // Actually simpler: for row-major, use CUBLAS_OP_T on both and swap A/B
-
-        cublasGemmEx(
+        CUBLAS_CHECK(cublasGemmEx(
             cublas_handle,
-            CUBLAS_OP_T,  // op(A) = A^T, because weights is (2*D, C), we want (C, 2*D)
-            CUBLAS_OP_N,  // op(B) = B, input is (tokens, C)
-            h_n[b],       // M = 2*D (rows of C)
-            h_m[b],       // N = tokens (cols of C)
-            h_k[b],       // K = C
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            out_dim, tokens_e, hidden_size,
             &alpha,
-            h_B_ptrs[b], cublas_dtype<T>(), h_k[b],  // A = weight, lda = C (before transpose)
-            h_A_ptrs[b], cublas_dtype<T>(), h_k[b],  // B = input, ldb = C
+            weight_e, cublas_dtype<T>(), hidden_size,
+            input_e, cublas_dtype<T>(), hidden_size,
             &beta,
-            h_C_ptrs[b], cublas_dtype<T>(), h_n[b],  // C = output, ldc = 2*D
+            output_e, cublas_dtype<T>(), out_dim,
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
-        );
+        ));
     }
 }
 
@@ -1016,124 +1085,416 @@ void moe_grouped_gemm_down_impl(
     T* output,                        // (total_tokens, C) - down proj output
     const T* input,                   // (total_tokens, D) - SwiGLU output
     const T* weights,                 // (num_experts, C, D) - batched weights
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert
+    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
     int hidden_size,                  // C
     int intermediate_size,            // D
     cublasHandle_t cublas_handle,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
 ) {
-    std::vector<int> h_offsets(num_experts + 1);
-    CUDA_CHECK(cudaMemcpyAsync(h_offsets.data(), expert_offsets,
-                               (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Get host-side offsets - either use cached or copy from device
+    std::vector<int> local_offsets;
+    const int* h_offsets;
 
-    std::vector<const T*> h_A_ptrs(num_experts);
-    std::vector<const T*> h_B_ptrs(num_experts);
-    std::vector<T*> h_C_ptrs(num_experts);
-    std::vector<int> h_tokens(num_experts);
+    if (host_offsets) {
+        h_offsets = host_offsets;
+    } else {
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
 
-    int batch_count = 0;
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
     for (int e = 0; e < num_experts; ++e) {
         int tokens_e = h_offsets[e + 1] - h_offsets[e];
         if (tokens_e == 0) continue;
 
-        h_A_ptrs[batch_count] = input + h_offsets[e] * intermediate_size;
-        h_B_ptrs[batch_count] = weights + e * hidden_size * intermediate_size;
-        h_C_ptrs[batch_count] = output + h_offsets[e] * hidden_size;
-        h_tokens[batch_count] = tokens_e;
-        batch_count++;
+        const T* input_e = input + h_offsets[e] * intermediate_size;
+        const T* weight_e = weights + e * hidden_size * intermediate_size;
+        T* output_e = output + h_offsets[e] * hidden_size;
+
+        CUBLAS_CHECK(cublasGemmEx(
+            cublas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            hidden_size, tokens_e, intermediate_size,
+            &alpha,
+            weight_e, cublas_dtype<T>(), intermediate_size,
+            input_e, cublas_dtype<T>(), intermediate_size,
+            &beta,
+            output_e, cublas_dtype<T>(), hidden_size,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT
+        ));
     }
+}
 
-    if (batch_count == 0) return;
+void moe_grouped_gemm_gate_up(
+    nv_bfloat16* output,
+    const nv_bfloat16* input,
+    const nv_bfloat16* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int intermediate_size,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets
+) {
+    moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
+                                   num_experts, hidden_size, intermediate_size,
+                                   cublas_handle, stream, host_offsets);
+}
 
-    float alpha = 1.0f;
-    float beta = 0.0f;
+void moe_grouped_gemm_gate_up(
+    float* output,
+    const float* input,
+    const float* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int intermediate_size,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets
+) {
+    moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
+                                   num_experts, hidden_size, intermediate_size,
+                                   cublas_handle, stream, host_offsets);
+}
+
+void moe_grouped_gemm_down(
+    nv_bfloat16* output,
+    const nv_bfloat16* input,
+    const nv_bfloat16* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int intermediate_size,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets
+) {
+    moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
+                                num_experts, hidden_size, intermediate_size,
+                                cublas_handle, stream, host_offsets);
+}
+
+void moe_grouped_gemm_down(
+    float* output,
+    const float* input,
+    const float* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int intermediate_size,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets
+) {
+    moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
+                                num_experts, hidden_size, intermediate_size,
+                                cublas_handle, stream, host_offsets);
+}
+
+// ============================================================================
+// Grouped GEMM Backward for MoE Expert Computation
+// ============================================================================
+// These compute the backward pass through expert projections:
+// - down_backward: d_swiglu = d_output @ down_proj (no transpose on weight)
+// - gate_up_backward: d_input = d_gate_up @ gate_up_proj (no transpose on weight)
+
+// Kernel to build pointer arrays for down backward on device
+template<typename T>
+__global__ void build_gemm_pointers_down_backward_kernel(
+    const T** A_ptrs,           // output: d_output pointers
+    const T** B_ptrs,           // output: weight pointers
+    T** C_ptrs,                 // output: d_input pointers
+    int* lda_arr,
+    int* ldb_arr,
+    int* ldc_arr,
+    int* m_arr,
+    int* n_arr,
+    int* k_arr,
+    const T* d_output,
+    const T* weights,
+    T* d_input,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,            // C
+    int intermediate_size       // D
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_experts) return;
+
+    int start = expert_offsets[e];
+    int end = expert_offsets[e + 1];
+    int tokens_e = end - start;
+
+    // d_output: (tokens_e, C) at offset start * C
+    A_ptrs[e] = d_output + start * hidden_size;
+    // Weight: (C, D) for expert e
+    B_ptrs[e] = weights + e * hidden_size * intermediate_size;
+    // d_input: (tokens_e, D) at offset start * D
+    C_ptrs[e] = d_input + start * intermediate_size;
+
+    // For backward: d_input = d_output @ W (no transpose on W)
+    // Row-major: d_input[t][d] = sum_c d_output[t][c] * W[c][d]
+    //
+    // In column-major:
+    // - d_output is (C, tokens) col-major
+    // - W is (D, C) col-major (because row-major (C, D))
+    // - d_input is (D, tokens) col-major
+    //
+    // So: d_input(D, tokens) = W(D, C) @ d_output(C, tokens)
+    // With CUBLAS_OP_N on both: M = D, N = tokens, K = C
+
+    m_arr[e] = intermediate_size;   // M = D
+    n_arr[e] = tokens_e;            // N = tokens
+    k_arr[e] = hidden_size;         // K = C
+    lda_arr[e] = intermediate_size; // lda = D (leading dim of W in col-major)
+    ldb_arr[e] = hidden_size;       // ldb = C (leading dim of d_output in col-major)
+    ldc_arr[e] = intermediate_size; // ldc = D (leading dim of d_input in col-major)
+}
+
+// Kernel to build pointer arrays for gate_up backward on device
+template<typename T>
+__global__ void build_gemm_pointers_gate_up_backward_kernel(
+    const T** A_ptrs,           // output: d_gate_up pointers
+    const T** B_ptrs,           // output: weight pointers
+    T** C_ptrs,                 // output: d_input pointers
+    int* lda_arr,
+    int* ldb_arr,
+    int* ldc_arr,
+    int* m_arr,
+    int* n_arr,
+    int* k_arr,
+    const T* d_gate_up,
+    const T* weights,
+    T* d_input,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,            // C
+    int intermediate_size       // D
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_experts) return;
+
+    int start = expert_offsets[e];
+    int end = expert_offsets[e + 1];
+    int tokens_e = end - start;
+
+    // d_gate_up: (tokens_e, 2*D) at offset start * 2*D
+    A_ptrs[e] = d_gate_up + start * (2 * intermediate_size);
+    // Weight: (2*D, C) for expert e
+    B_ptrs[e] = weights + e * (2 * intermediate_size) * hidden_size;
+    // d_input: (tokens_e, C) at offset start * C
+    C_ptrs[e] = d_input + start * hidden_size;
+
+    // For backward: d_input = d_gate_up @ W (no transpose on W)
+    // Row-major: d_input[t][c] = sum_d d_gate_up[t][d] * W[d][c]
+    //
+    // In column-major:
+    // - d_gate_up is (2*D, tokens) col-major
+    // - W is (C, 2*D) col-major (because row-major (2*D, C))
+    // - d_input is (C, tokens) col-major
+    //
+    // So: d_input(C, tokens) = W(C, 2*D) @ d_gate_up(2*D, tokens)
+    // With CUBLAS_OP_N on both: M = C, N = tokens, K = 2*D
+
+    m_arr[e] = hidden_size;           // M = C
+    n_arr[e] = tokens_e;              // N = tokens
+    k_arr[e] = 2 * intermediate_size; // K = 2*D
+    lda_arr[e] = hidden_size;         // lda = C (leading dim of W in col-major)
+    ldb_arr[e] = 2 * intermediate_size; // ldb = 2*D (leading dim of d_gate_up in col-major)
+    ldc_arr[e] = hidden_size;         // ldc = C (leading dim of d_input in col-major)
+}
+
+template<typename T>
+void moe_grouped_gemm_down_backward_impl(
+    T* d_input,                       // (total_tokens, D) - gradient w.r.t. SwiGLU output
+    const T* d_output,                // (total_tokens, C) - gradient from downstream
+    const T* weights,                 // (num_experts, C, D) - down_proj weights
+    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    int num_experts,
+    int hidden_size,                  // C
+    int intermediate_size,            // D
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
+) {
+    std::vector<int> local_offsets;
+    const int* h_offsets;
+
+    if (host_offsets) {
+        h_offsets = host_offsets;
+    } else {
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
 
     CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
 
-    for (int b = 0; b < batch_count; ++b) {
-        // output(tokens, C) = input(tokens, D) @ weight^T(D, C)
-        cublasGemmEx(
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    for (int e = 0; e < num_experts; ++e) {
+        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+        if (tokens_e == 0) continue;
+
+        const T* d_output_e = d_output + h_offsets[e] * hidden_size;
+        const T* weight_e = weights + e * hidden_size * intermediate_size;
+        T* d_input_e = d_input + h_offsets[e] * intermediate_size;
+
+        CUBLAS_CHECK(cublasGemmEx(
             cublas_handle,
-            CUBLAS_OP_T,  // op(A) = A^T
-            CUBLAS_OP_N,  // op(B) = B
-            hidden_size,  // M = C
-            h_tokens[b],  // N = tokens
-            intermediate_size,  // K = D
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            intermediate_size, tokens_e, hidden_size,
             &alpha,
-            h_B_ptrs[b], cublas_dtype<T>(), intermediate_size,
-            h_A_ptrs[b], cublas_dtype<T>(), intermediate_size,
+            weight_e, cublas_dtype<T>(), intermediate_size,
+            d_output_e, cublas_dtype<T>(), hidden_size,
             &beta,
-            h_C_ptrs[b], cublas_dtype<T>(), hidden_size,
+            d_input_e, cublas_dtype<T>(), intermediate_size,
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
-        );
+        ));
     }
 }
 
-void moe_grouped_gemm_gate_up(
-    nv_bfloat16* output,
-    const nv_bfloat16* input,
+template<typename T>
+void moe_grouped_gemm_gate_up_backward_impl(
+    T* d_input,                       // (total_tokens, C) - gradient w.r.t. input
+    const T* d_gate_up,               // (total_tokens, 2*D) - gradient from SwiGLU backward
+    const T* weights,                 // (num_experts, 2*D, C) - gate_up_proj weights
+    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    int num_experts,
+    int hidden_size,                  // C
+    int intermediate_size,            // D (d_gate_up is 2*D)
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
+) {
+    std::vector<int> local_offsets;
+    const int* h_offsets;
+
+    if (host_offsets) {
+        h_offsets = host_offsets;
+    } else {
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
+
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const int gate_up_dim = 2 * intermediate_size;
+
+    for (int e = 0; e < num_experts; ++e) {
+        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+        if (tokens_e == 0) continue;
+
+        const T* d_gate_up_e = d_gate_up + h_offsets[e] * gate_up_dim;
+        const T* weight_e = weights + e * gate_up_dim * hidden_size;
+        T* d_input_e = d_input + h_offsets[e] * hidden_size;
+
+        CUBLAS_CHECK(cublasGemmEx(
+            cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            hidden_size, tokens_e, gate_up_dim,
+            &alpha,
+            weight_e, cublas_dtype<T>(), hidden_size,
+            d_gate_up_e, cublas_dtype<T>(), gate_up_dim,
+            &beta,
+            d_input_e, cublas_dtype<T>(), hidden_size,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT
+        ));
+    }
+}
+
+// Host wrappers for grouped GEMM backward
+void moe_grouped_gemm_down_backward(
+    nv_bfloat16* d_input,
+    const nv_bfloat16* d_output,
     const nv_bfloat16* weights,
     const int* expert_offsets,
     int num_experts,
     int hidden_size,
     int intermediate_size,
     cublasHandle_t cublas_handle,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* host_offsets
 ) {
-    moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
-                                   num_experts, hidden_size, intermediate_size,
-                                   cublas_handle, stream);
+    moe_grouped_gemm_down_backward_impl(d_input, d_output, weights, expert_offsets,
+                                         num_experts, hidden_size, intermediate_size,
+                                         cublas_handle, stream, host_offsets);
 }
 
-void moe_grouped_gemm_gate_up(
-    float* output,
-    const float* input,
+void moe_grouped_gemm_down_backward(
+    float* d_input,
+    const float* d_output,
     const float* weights,
     const int* expert_offsets,
     int num_experts,
     int hidden_size,
     int intermediate_size,
     cublasHandle_t cublas_handle,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* host_offsets
 ) {
-    moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
-                                   num_experts, hidden_size, intermediate_size,
-                                   cublas_handle, stream);
+    moe_grouped_gemm_down_backward_impl(d_input, d_output, weights, expert_offsets,
+                                         num_experts, hidden_size, intermediate_size,
+                                         cublas_handle, stream, host_offsets);
 }
 
-void moe_grouped_gemm_down(
-    nv_bfloat16* output,
-    const nv_bfloat16* input,
+void moe_grouped_gemm_gate_up_backward(
+    nv_bfloat16* d_input,
+    const nv_bfloat16* d_gate_up,
     const nv_bfloat16* weights,
     const int* expert_offsets,
     int num_experts,
     int hidden_size,
     int intermediate_size,
     cublasHandle_t cublas_handle,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* host_offsets
 ) {
-    moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
-                                num_experts, hidden_size, intermediate_size,
-                                cublas_handle, stream);
+    moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
+                                            num_experts, hidden_size, intermediate_size,
+                                            cublas_handle, stream, host_offsets);
 }
 
-void moe_grouped_gemm_down(
-    float* output,
-    const float* input,
+void moe_grouped_gemm_gate_up_backward(
+    float* d_input,
+    const float* d_gate_up,
     const float* weights,
     const int* expert_offsets,
     int num_experts,
     int hidden_size,
     int intermediate_size,
     cublasHandle_t cublas_handle,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* host_offsets
 ) {
-    moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
-                                num_experts, hidden_size, intermediate_size,
-                                cublas_handle, stream);
+    moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
+                                            num_experts, hidden_size, intermediate_size,
+                                            cublas_handle, stream, host_offsets);
 }
 
 // ============================================================================

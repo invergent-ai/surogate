@@ -898,55 +898,52 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
 
             fill_zero(expert_outputs, stream);
 
-            // Copy expert_offsets to host for sequential expert dispatch
-            std::vector<int> h_expert_offsets(num_experts + 1);
-            CUDA_CHECK(cudaMemcpyAsync(h_expert_offsets.data(), expert_offsets.get<int>(),
-                                       (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Recompute expert forward pass using grouped GEMM
+            // Use cached host offsets if available
+            const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
-            // Recompute expert forward pass to get activations
-            for (int e = 0; e < num_experts; ++e) {
-                int start = h_expert_offsets[e];
-                int end = h_expert_offsets[e + 1];
-                int expert_tokens = end - start;
-                if (expert_tokens == 0) continue;
-
-                // Slice tensors for this expert's tokens
-                Tensor exp_inp = slice(permuted_input, 0, start, end);
-                Tensor exp_gate_up = slice(expert_gate_up, 0, start, end);
-                Tensor exp_swiglu = slice(expert_swiglu, 0, start, end);
-                Tensor exp_out = slice(expert_outputs, 0, start, end);
-
-                // Get this expert's weights
-                Tensor exp_gate_up_w = slice(weights.experts.gate_up_proj, 0, e, e + 1);
-                exp_gate_up_w.Sizes[0] = 2 * expert_D;
-                exp_gate_up_w.Sizes[1] = C;
-                exp_gate_up_w.Rank = 2;
-
-                Tensor exp_down_w = slice(weights.experts.down_proj, 0, e, e + 1);
-                exp_down_w.Sizes[0] = C;
-                exp_down_w.Sizes[1] = expert_D;
-                exp_down_w.Rank = 2;
-
-                // Gate+Up projection
-                matmul(
-                    exp_gate_up, exp_gate_up_w, exp_inp, std::nullopt,
-                    nullptr, nullptr,
-                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                    2 * expert_D, expert_tokens, C, EMMTranspose::TN, false,
-                    stream
+            // Gate+Up projection for all experts
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_grouped_gemm_gate_up(
+                    expert_gate_up.template get<nv_bfloat16>(),
+                    permuted_input.template get<nv_bfloat16>(),
+                    weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
                 );
+            } else {
+                moe_grouped_gemm_gate_up(
+                    expert_gate_up.template get<float>(),
+                    permuted_input.template get<float>(),
+                    weights.experts.gate_up_proj.template get<float>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
+                );
+            }
 
-                // SwiGLU activation
-                swiglu_forward(exp_swiglu, exp_gate_up, nullptr, 1, expert_tokens, expert_D, stream);
+            // SwiGLU activation on all tokens
+            swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
 
-                // Down projection
-                matmul(
-                    exp_out, exp_down_w, exp_swiglu, std::nullopt,
-                    nullptr, nullptr,
-                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                    C, expert_tokens, expert_D, EMMTranspose::TN, false,
-                    stream
+            // Down projection for all experts
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_grouped_gemm_down(
+                    expert_outputs.template get<nv_bfloat16>(),
+                    expert_swiglu.template get<nv_bfloat16>(),
+                    weights.experts.down_proj.template get<nv_bfloat16>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
+                );
+            } else {
+                moe_grouped_gemm_down(
+                    expert_outputs.template get<float>(),
+                    expert_swiglu.template get<float>(),
+                    weights.experts.down_proj.template get<float>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
                 );
             }
         }
@@ -1014,59 +1011,56 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
 
     if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward);
 
-    // Backward through each expert
+    // Backward through each expert using grouped GEMM
     with_ctx("moe_expert_backward", [&]() {
         if constexpr (has_moe_weights<BlockWeights>::value) {
-            std::vector<int> h_expert_offsets(num_experts + 1);
-            CUDA_CHECK(cudaMemcpyAsync(h_expert_offsets.data(), expert_offsets.get<int>(),
-                                       (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Use cached host offsets if available
+            const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
-            for (int e = 0; e < num_experts; ++e) {
-                int start = h_expert_offsets[e];
-                int end = h_expert_offsets[e + 1];
-                int expert_tokens = end - start;
-                if (expert_tokens == 0) continue;
-
-                // Slice tensors for this expert
-                Tensor exp_inp = slice(permuted_input, 0, start, end);
-                Tensor exp_gate_up = slice(expert_gate_up, 0, start, end);
-                Tensor exp_swiglu = slice(expert_swiglu, 0, start, end);
-                Tensor d_exp_out = slice(d_expert_outputs, 0, start, end);
-                Tensor d_exp_swiglu = slice(d_expert_swiglu, 0, start, end);
-                Tensor d_exp_gate_up = slice(d_expert_gate_up, 0, start, end);
-                Tensor d_exp_inp = slice(d_permuted_input, 0, start, end);
-
-                // Get this expert's weights
-                Tensor exp_gate_up_w = slice(weights.experts.gate_up_proj, 0, e, e + 1);
-                exp_gate_up_w.Sizes[0] = 2 * expert_D;
-                exp_gate_up_w.Sizes[1] = C;
-                exp_gate_up_w.Rank = 2;
-
-                Tensor exp_down_w = slice(weights.experts.down_proj, 0, e, e + 1);
-                exp_down_w.Sizes[0] = C;
-                exp_down_w.Sizes[1] = expert_D;
-                exp_down_w.Rank = 2;
-
-                // Backward through down projection: d_exp_swiglu = d_exp_out @ exp_down_w
-                matmul(
-                    d_exp_swiglu, exp_down_w, d_exp_out, std::nullopt,
-                    nullptr, nullptr,
-                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                    expert_D, expert_tokens, C, EMMTranspose::NN, false,
-                    stream
+            // Backward through down projection for all experts
+            // d_expert_swiglu = d_expert_outputs @ down_proj (no transpose)
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_grouped_gemm_down_backward(
+                    d_expert_swiglu.template get<nv_bfloat16>(),
+                    d_expert_outputs.template get<nv_bfloat16>(),
+                    weights.experts.down_proj.template get<nv_bfloat16>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
                 );
+            } else {
+                moe_grouped_gemm_down_backward(
+                    d_expert_swiglu.template get<float>(),
+                    d_expert_outputs.template get<float>(),
+                    weights.experts.down_proj.template get<float>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
+                );
+            }
 
-                // Backward through SwiGLU: d_exp_gate_up from d_exp_swiglu and exp_gate_up
-                swiglu_backward(d_exp_gate_up, d_exp_swiglu, exp_gate_up, nullptr, 1, expert_tokens, expert_D, stream);
+            // Backward through SwiGLU activation for all tokens
+            swiglu_backward(d_expert_gate_up, d_expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
 
-                // Backward through gate+up projection: d_exp_inp = d_exp_gate_up @ exp_gate_up_w
-                matmul(
-                    d_exp_inp, exp_gate_up_w, d_exp_gate_up, std::nullopt,
-                    nullptr, nullptr,
-                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                    C, expert_tokens, 2 * expert_D, EMMTranspose::NN, false,
-                    stream
+            // Backward through gate+up projection for all experts
+            // d_permuted_input = d_expert_gate_up @ gate_up_proj (no transpose)
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_grouped_gemm_gate_up_backward(
+                    d_permuted_input.template get<nv_bfloat16>(),
+                    d_expert_gate_up.template get<nv_bfloat16>(),
+                    weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
+                );
+            } else {
+                moe_grouped_gemm_gate_up_backward(
+                    d_permuted_input.template get<float>(),
+                    d_expert_gate_up.template get<float>(),
+                    weights.experts.gate_up_proj.template get<float>(),
+                    expert_offsets.template get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
                 );
             }
         }

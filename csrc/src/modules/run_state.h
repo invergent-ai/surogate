@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <fmt/format.h>
 
 #include "fp8_scaling_config.h"
@@ -491,6 +492,15 @@ public:
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
     cudaEvent_t opt_embeddings_done() const { return mOptEmbeddingsDone; }
     cudaEvent_t layer_update_done(int layer_idx) const { return mLayerUpdateDone[layer_idx]; }
+
+    // cuBLAS handle for grouped GEMM operations (MoE experts)
+    // Public member for direct access (matches pattern of IRunState::MainStream)
+    cublasHandle_t CublasHandle = nullptr;
+
+    // MoE expert offsets cached on host to avoid repeated D2H sync in grouped GEMM
+    // Set once per forward pass after moe_compute_expert_offsets, reused for all GEMMs
+    std::vector<int> MoeHostExpertOffsets;
+    bool MoeHostOffsetsValid = false;  // Set to false at start of each forward pass
 
     // CUDA graphs (exec instances live in the run state so they persist across steps).
     cudaGraphExec_t& forward_block_graph(int layer_idx) { return mForwardBlockGraphs.at((std::size_t)layer_idx); }
@@ -1833,6 +1843,9 @@ void ModularRunState<Block>::create_cuda_resources() {
     CUDA_CHECK(cudaEventCreate(&mSideStreamEvent));
     CUDA_CHECK(cudaEventCreate(&mOptEmbeddingsDone));
 
+    // Create cuBLAS handle for grouped GEMM operations (MoE experts)
+    CUBLAS_CHECK(cublasCreate(&CublasHandle));
+
     mLayerUpdateDone.resize(mConfig.num_layers);
     for (int i = 0; i < mConfig.num_layers; ++i) {
         CUDA_CHECK(cudaEventCreate(&mLayerUpdateDone[i]));
@@ -1880,6 +1893,12 @@ void ModularRunState<Block>::release_cuda_resources() noexcept {
     if (mOptEmbeddingsDone) {
         cudaEventDestroy(mOptEmbeddingsDone);
         mOptEmbeddingsDone = nullptr;
+    }
+
+    // Destroy cuBLAS handle
+    if (CublasHandle) {
+        cublasDestroy(CublasHandle);
+        CublasHandle = nullptr;
     }
 
     for (auto& event : mLayerUpdateDone) {

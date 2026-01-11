@@ -465,25 +465,20 @@ inline Tensor ExpertGroupModule::forward_impl(
     }
 
     // Step 2: Run experts on permuted tokens
-    // For now, use sequential per-expert execution
-    // TODO: Implement grouped GEMM for batched execution
+    // Note: Grouped GEMM is used in modular_model_forward.hpp for the main training path.
+    // This fallback uses sequential per-expert execution for the ModuleContext-based API.
     acts.expert_acts.resize(E);
     int offset = 0;
 
     for (int e = 0; e < E; ++e) {
-        // Get token count for this expert from routing.token_counts
         const int* h_count_ptr = routing.token_counts.get<int>();
-        int expert_tokens = h_count_ptr[e];  // Note: need to async copy this
+        int expert_tokens = h_count_ptr[e];
 
         if (expert_tokens == 0) continue;
 
-        // Slice of permuted input for this expert
         Tensor expert_input = slice(acts.permuted_input, 0, offset, offset + expert_tokens);
-
-        // Slice for expert output
         Tensor expert_output = slice(acts.expert_outputs, 0, offset, offset + expert_tokens);
 
-        // Run expert forward
         mExperts[e].forward(ctx, w.experts[e], expert_input, acts.expert_acts[e]);
 
         offset += expert_tokens;
@@ -625,7 +620,8 @@ inline Tensor ExpertGroupModule::backward_impl(
     }
 
     // Step 2: Backward through each expert
-    // Note: grads.d_permuted_input should be pre-allocated
+    // Note: Grouped GEMM backward is used in modular_model_block_ops.hpp for the main training path.
+    // This fallback uses sequential per-expert backward for the ModuleContext-based API.
     grads.expert_grads.resize(E);
     int offset = 0;
 
