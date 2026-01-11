@@ -304,6 +304,9 @@ void ModularLoRAModel<Block>::calculate_lora_gradient_norm(NCCLCommunicator& com
     auto& rs = mBaseModel->get_run_state();
     cudaStream_t stream = rs.MainStream;
 
+    // Ensure backward has completed before reading LoRA gradients.
+    CUDA_CHECK(cudaStreamWaitEvent(stream, rs.BackwardDone));
+
     Tensor& buf = mLoRARunState->norm_buffer;
     fill_zero(buf, stream);
 
@@ -334,7 +337,7 @@ void ModularLoRAModel<Block>::calculate_lora_gradient_norm(NCCLCommunicator& com
     }
 
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);
-    
+
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
