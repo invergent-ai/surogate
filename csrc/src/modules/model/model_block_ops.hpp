@@ -45,7 +45,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
     const bool in_skip_range = (layer_idx < skip_first) || (layer_idx >= mConfig.NumLayers - skip_last);
     const bool allow_fp4_layer = !in_skip_range;
 
-    // Match legacy recompute dependency rules (LLamaModel::_recompute_block).
+    // recompute dependency rules
     const bool recompute_ln1 = mOptions.recompute_rmsnorm || mOptions.recompute_attention || mOptions.recompute_block;
     const bool recompute_ln2 = mOptions.recompute_rmsnorm || mOptions.recompute_ffn || mOptions.recompute_block;
     const bool recompute_qkv = mOptions.recompute_qkv || mOptions.recompute_attention || mOptions.recompute_block;
@@ -143,7 +143,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             abs_max(q.att.abs_max(), a.att, (long)a.att.nelem(), rs.DeviceProp, stream);
         }
 
-        // Match legacy: only recompute att_out when recomputing the whole block (needed to rebuild residual_att/LN2).
+        // only recompute att_out when recomputing the whole block (needed to rebuild residual_att/LN2).
         if (mOptions.recompute_block) {
             // Note: During recomputation we DON'T use delayed scaling quantizer indices
             Tensor* inp_quant = rs.has_fp8_forward() ? &rs.fp8_forward_quants().att : nullptr;
@@ -349,7 +349,7 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
         Tensor saved_d_mlp_up{};
         if (stack_large_bwd_temps) {
             if (da.d_swiglu.Data == nullptr) rs.temp_acquire(da.d_swiglu);
-            // Reuse the (recomputed) mlp_up buffer in-place for d_mlp_up (matches legacy).
+            // Reuse the (recomputed) mlp_up buffer in-place for d_mlp_up.
             saved_d_mlp_up = da.d_mlp_up;
             da.d_mlp_up = a.mlp_up;
         }

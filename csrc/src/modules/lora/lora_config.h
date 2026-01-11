@@ -134,10 +134,6 @@ struct ModularLoRAConfig {
 
     /// Convert to the user-facing LoRA adapter config (CLI/python).
     [[nodiscard]] LoRAAdapterConfig to_adapter_config() const;
-
-    // Backwards-compatible names.
-    static ModularLoRAConfig from_legacy(const LoRAConfig& legacy) { return from_adapter_config(legacy); }
-    [[nodiscard]] LoRAConfig to_legacy() const { return to_adapter_config(); }
 };
 
 /**

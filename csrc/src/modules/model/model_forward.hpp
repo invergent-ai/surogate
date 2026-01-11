@@ -102,7 +102,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
         auto& acts = rs.simplified_acts(l);
         auto& q = rs.simplified_quant_acts(l);
 
-        // Get the residual buffer for this layer (like legacy DeviceResiduals)
+        // Get the residual buffer for this layer
         // For layer 0: residual is the encoded input
         // For layer L>0: residual is get_residual(l-1) which gets populated by the LN1 fused op
         Tensor& residual = l == 0 ? rs.non_block_activations().encoded :
@@ -214,7 +214,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
             }
 
             // 4) Attention (FlashAttention via cuDNN)
-            // Match legacy behavior: use the shared CuBLAS workspace for cuDNN forward.
+            // use the shared CuBLAS workspace for cuDNN forward.
             attention_forward_cudnn(acts.att, acts.lse, qkv_for_attn, rs.CuBlasWorkspace,
                                     rs.CudnnHandle, B, T, Hq, Hkv, Hs, main_stream);
 

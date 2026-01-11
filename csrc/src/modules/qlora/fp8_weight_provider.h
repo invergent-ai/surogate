@@ -123,7 +123,7 @@ public:
     }
 
     /**
-     * @brief Legacy alias for new_step() - invalidates cache by starting new step
+     * @brief alias for new_step() - invalidates cache by starting new step
      */
     void invalidate_cache() {
         new_step();
@@ -247,7 +247,7 @@ public:
     }
 
     /**
-     * @brief Get the block weights (legacy interface)
+     * @brief Get the block weights (interface)
      */
     [[nodiscard]] BlockWeights& fp8_weight_cache() {
         return mFP8Block;
@@ -398,7 +398,7 @@ void FP8WeightProvider<Block>::allocate_dequant_buffers() {
 
     // Allocate dequantization buffers - single layer, reused across all layers
     // When use_native_fp8() is true, these will be FP8 with per-tensor scales
-    // When false, these will be BF16 (legacy path)
+    // When false, these will be BF16
     mDequantQKV = mAllocator->allocate(dequant_dtype, "dequant_qkv",
                                         EAllocationType::ON_DEVICE,
                                         {(long)qkv_out, (long)hidden});
@@ -580,7 +580,7 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
                 block_size, mDeviceProps, stream);
 
         } else {
-            // **BF16 LEGACY PATH**: Dequantize to BF16
+            // **BF16 PATH**: Dequantize to BF16
             dequantize_per_block(
                 mDequantQKV.get<nv_bfloat16>(),
                 qblock.qkv_proj.data.get<__nv_fp8_e4m3>(),

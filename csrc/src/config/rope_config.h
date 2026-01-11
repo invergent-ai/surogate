@@ -20,10 +20,10 @@
  * Example configurations:
  * @code
  * // Standard LLaMA-style RoPE
- * RoPEConfig llama_rope{.mode = RoPEConfig::Mode::FULL, .theta = 10000.0f};
+ * RoPEConfig full_rope{.mode = RoPEConfig::Mode::FULL, .theta = 10000.0f};
  *
  * // GLM4 partial RoPE (half dimensions rotated)
- * RoPEConfig glm4_rope{.mode = RoPEConfig::Mode::PARTIAL, .partial_factor = 0.5f, .theta = 10000.0f};
+ * RoPEConfig partial_rope{.mode = RoPEConfig::Mode::PARTIAL, .partial_factor = 0.5f, .theta = 10000.0f};
  *
  * // Qwen2-VL multimodal RoPE
  * RoPEConfig mrope{.mode = RoPEConfig::Mode::MULTIMODAL, .mrope_section = {16, 24, 24}, .theta = 10000.0f};

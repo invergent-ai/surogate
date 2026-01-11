@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Modular model smoke / integration tests (no legacy LLamaModel dependency).
+// Modular model smoke / integration tests.
 
 #include <catch2/catch_test_macros.hpp>
 

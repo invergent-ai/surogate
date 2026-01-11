@@ -232,7 +232,7 @@ public:
      * @brief Set the training recipe for matmul dispatch
      *
      * The recipe controls quantization format and matmul implementation.
-     * If not set, the model uses legacy conditional dispatch based on options.
+     * If not set, the model uses conditional dispatch based on options.
      */
     void set_recipe(std::shared_ptr<recipes::Recipe> recipe) { mRecipe = std::move(recipe); }
 
@@ -397,15 +397,15 @@ private:
 // Implementation split across focused headers
 // ============================================================================
 
-#include "modular_model_lifecycle.hpp"
-#include "modular_model_forward.hpp"
-#include "modular_model_backward.hpp"
-#include "modular_model_optimizer_adamw.hpp"
-#include "modular_model_optimizer_normuon.hpp"
-#include "modular_model_block_ops.hpp"
-#include "modular_model_accessors.hpp"
-#include "modular_model_allocation.hpp"
-#include "modular_model_graph.hpp"
+#include "model_lifecycle.hpp"
+#include "model_forward.hpp"
+#include "model_backward.hpp"
+#include "model_optimizer_adamw.hpp"
+#include "model_optimizer_normuon.hpp"
+#include "model_block_ops.hpp"
+#include "model_accessors.hpp"
+#include "model_allocation.hpp"
+#include "model_graph.hpp"
 
 } // namespace modules
 

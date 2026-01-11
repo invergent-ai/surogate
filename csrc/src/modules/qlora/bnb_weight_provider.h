@@ -112,7 +112,7 @@ public:
     }
 
     /**
-     * @brief Legacy alias for new_step() - invalidates cache by starting new step
+     * @brief alias for new_step() - invalidates cache by starting new step
      */
     void invalidate_cache() {
         new_step();

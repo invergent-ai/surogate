@@ -78,16 +78,6 @@ public:
         return create(mod_config, mod_options, rank, world, alloc);
     }
 
-    // Backwards-compatible name.
-    static std::unique_ptr<IModel> create_from_llama_config(
-        const PretrainedConfig& config,
-        const RuntimeOptions& options,
-        int rank,
-        int world,
-        const std::shared_ptr<TensorAllocator>& alloc = nullptr) {
-        return create_from_pretrained_config(config, options, rank, world, alloc);
-    }
-
 private:
     /**
      * @brief Create a dense transformer model

@@ -68,8 +68,7 @@ namespace detail {
 /**
  * @brief Execute a callable either directly or under a CUDA graph capture/replay.
  *
- * Mirrors the legacy training path behavior: capture the callable on @p stream, then
- * instantiate/update a cached cudaGraphExec and launch it.
+ * Capture the callable on @p stream, then instantiate/update a cached cudaGraphExec and launch it.
  *
  * Note: If @p function depends on host-side decisions (e.g., optional hooks), the
  * caller must disable graphs in those cases to keep the graph topology stable.

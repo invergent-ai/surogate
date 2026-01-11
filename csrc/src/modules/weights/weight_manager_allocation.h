@@ -462,7 +462,7 @@ void ModularWeightManager<Block>::allocate_block_weights(
         return static_cast<Tensor>(shard_t);
     };
 
-    // Legacy parity: norm weights + biases stay in model dtype; matmul weights may be FP8.
+    // norm weights + biases stay in model dtype; matmul weights may be FP8.
     block.ln1.weight = alloc(other_dtype, "ln1_w", {C});
 
     // Attention weights

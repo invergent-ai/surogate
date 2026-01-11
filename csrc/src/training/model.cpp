@@ -23,7 +23,7 @@ float IModel::get_accuracy() const {
 }
 
 void IModel::update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
-    // Default implementation: dispatch to legacy AdamW update
+    // Default implementation: dispatch to AdamW update
     // Derived classes can override to support NorMuon and other optimizers
     update(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
            step, config.adamw_epsilon, config.weight_decay, config.grad_clip);

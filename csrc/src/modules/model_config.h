@@ -181,9 +181,6 @@ struct ModelConfig : public PretrainedConfig {
         return config;
     }
 
-    // Backwards-compatible name.
-    static ModelConfig from_llama_config(const PretrainedConfig& base) { return from_pretrained_config(base); }
-
     /**
      * @brief Check if a specific layer uses MoE
      *

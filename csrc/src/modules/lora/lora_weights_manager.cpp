@@ -153,7 +153,7 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
                           int in_features,
                           unsigned long long subsequence) {
         if (!layer.has_value()) return;
-        // Match legacy init: std consistent with kaiming_uniform_(a=sqrt(5)) => bound = 1/sqrt(fan_in)
+        // std consistent with kaiming_uniform_(a=sqrt(5)) => bound = 1/sqrt(fan_in)
         float std_a = 1.0f / std::sqrt(3.0f * static_cast<float>(in_features));
         fill_normal(layer->A, layer->A.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
         fill_zero(layer->B, nullptr);

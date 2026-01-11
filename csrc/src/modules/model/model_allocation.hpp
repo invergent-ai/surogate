@@ -109,7 +109,7 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     typename ModularGradientManager<Block>::Config gm_config;
     gm_config.num_layers = mConfig.NumLayers;
     gm_config.block_config = rs_config.block_config;
-    // Weight gradients are stored in model dtype (legacy parity). The CLI flag --gradient-dtype
+    // Weight gradients are stored in model dtype. The CLI flag --gradient-dtype
     // refers to activation-gradient quantization for FP8 matmuls, not parameter gradients.
     gm_config.grad_dtype = options.model_dtype.value_or(mConfig.DType);
     gm_config.shard_idx = comm.rank();
