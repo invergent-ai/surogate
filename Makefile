@@ -19,14 +19,15 @@ build: configure
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS)
 
 # Build unit tests
-unit-tests: configure
+unit-tests:
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target unit-tests
 
 # Build Python wheel
 wheel:
 	uv build --wheel
 
-wheel-dev: build
+wheel-dev: configure
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target _surogate
 	cp -f $(BUILD_DIR)/_surogate*.so surogate/
 	cp -f $(BUILD_DIR)/_surogate*.so .venv/lib/python3.12/site-packages/surogate/
