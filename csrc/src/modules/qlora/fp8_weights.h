@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "block_quantized_tensor.h"
+#include "moe_weights.h"
 #include "qlora_config.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
@@ -100,6 +101,30 @@ public:
     [[nodiscard]] bool is_quantized() const { return mConfig.qlora_config.is_quantized(); }
 
     /**
+     * @brief Check if this is an MoE model
+     */
+    [[nodiscard]] bool is_moe() const { return mConfig.qlora_config.is_moe(); }
+
+    /**
+     * @brief Get number of experts (0 for dense models)
+     */
+    [[nodiscard]] int num_experts() const { return mConfig.qlora_config.num_experts; }
+
+    /**
+     * @brief Get MoE block weights (for MoE models)
+     * @throws std::runtime_error if not an MoE model
+     */
+    [[nodiscard]] const MoEBlockWeights<QLoRABlockWeights, BlockQuantizedWeight>&
+        get_moe_block(int layer_idx) const {
+        return mMoEBlocks[layer_idx];
+    }
+
+    [[nodiscard]] MoEBlockWeights<QLoRABlockWeights, BlockQuantizedWeight>&
+        get_moe_block(int layer_idx) {
+        return mMoEBlocks[layer_idx];
+    }
+
+    /**
      * @brief Get total memory usage for quantized weights in bytes
      */
     [[nodiscard]] std::size_t quantized_weights_bytes() const;
@@ -114,8 +139,12 @@ private:
     TensorAllocator* mAllocator;
     const cudaDeviceProp* mDeviceProps;
 
-    // Quantized base model weights (FP8 + per-block scales)
+    // Quantized base model weights for dense models (FP8 + per-block scales)
     std::vector<QLoRABlockWeights> mQuantizedBlocks;
+
+    // Quantized base model weights for MoE models
+    using FP8MoEBlockWeights = MoEBlockWeights<QLoRABlockWeights, BlockQuantizedWeight>;
+    std::vector<FP8MoEBlockWeights> mMoEBlocks;
 
     // Embedding weights (not quantized)
     QLoRAEmbeddingWeights mEmbeddings;
@@ -136,6 +165,15 @@ private:
     void load_and_quantize_block(int layer_idx, SafeTensorsReader& reader,
                                  cudaStream_t stream);
     void load_embeddings(SafeTensorsReader& reader, cudaStream_t stream);
+
+    // MoE-specific allocation and loading helpers
+    void allocate_moe_block(int layer_idx);
+    void load_and_quantize_moe_block(int layer_idx, SafeTensorsReader& reader,
+                                      cudaStream_t stream);
+
+    // Generic allocation helper for quantized weights
+    void allocate_fp8_weight(BlockQuantizedWeight& weight, int M, int K,
+                             const std::string& name_prefix);
 };
 
 } // namespace modules

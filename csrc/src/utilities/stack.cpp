@@ -37,6 +37,15 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
     std::size_t aligned_amount = div_ceil(amount, alignment) * alignment;
     std::byte* new_top = mTop + aligned_amount;
     if(new_top > mBackingMemory + mCapacity) {
+        std::size_t used = mTop - mBackingMemory;
+        fprintf(stderr, "[Stack OOM] Failed to allocate '%s': requested=%zu MB, used=%zu MB, capacity=%zu MB\n",
+                name, aligned_amount / (1024*1024), used / (1024*1024), mCapacity / (1024*1024));
+        // Print recent allocations
+        fprintf(stderr, "[Stack OOM] Recent allocations:\n");
+        size_t start = mAlloc.size() > 10 ? mAlloc.size() - 10 : 0;
+        for (size_t i = start; i < mAlloc.size(); ++i) {
+            fprintf(stderr, "  - %s: %zu MB\n", mAlloc[i].Name, mAlloc[i].Amount / (1024*1024));
+        }
         throw std::bad_alloc();
     }
 

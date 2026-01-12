@@ -16,6 +16,7 @@
 struct cudaDeviceProp;
 typedef struct cudnnContext* cudnnHandle_t;
 typedef struct cublasLtContext* cublasLtHandle_t;
+typedef struct cublasContext* cublasHandle_t;
 
 struct Tensor;
 enum class ETensorDType: int;
@@ -165,12 +166,22 @@ void backward_bias(Tensor& dbias, const Tensor& dout, const float* scale_a, cons
 
 void precompute_freqs_cis(float *freqs_cis, int dim, int end, float theta);
 void precompute_freqs_cis(nv_bfloat16 *freqs_cis, int dim, int end, float theta);
+// Full RoPE (rotary_dim == head_dim)
 void rope_forward(float* out, const float* in, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_forward(nv_bfloat16* out, const nv_bfloat16* in, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_backward(float* dinp, const float* dout, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
+
+// Partial RoPE (rotary_dim < head_dim, for GLM4 style partial_rotary_factor)
+// Only dimensions [0, rotary_dim) are rotated; [rotary_dim, head_dim) pass through unchanged
+void rope_forward(float* out, const float* in, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+void rope_forward(nv_bfloat16* out, const nv_bfloat16* in, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+void rope_backward(float* dinp, const float* dout, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+void rope_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
 
 void rope_forward_quant(__nv_fp8_e4m3* out, float* scale_ptr, const nv_bfloat16* inp, const nv_bfloat16* freqs_cis, const int* position_ids, const float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_forward_quant(Tensor& out, float* scale_ptr, const Tensor& inp, const Tensor& freqs_cis, const int* position_ids, const float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
@@ -196,6 +207,60 @@ void swiglu_forward_quant(Tensor& out, float* scale_ptr, const Tensor& inp, cons
 void swiglu_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16* inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
 void swiglu_backward(float* dinp, const float* dout, const float* inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
 void swiglu_backward(Tensor& dinp, const Tensor& dout, const Tensor& inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
+
+// ============================================================================
+// Fast LoRA SiLU kernels for MoE expert optimization
+// ============================================================================
+
+/// @brief Compute h = silu(e) * g from separate gate and up outputs.
+/// Unlike swiglu_forward which takes concatenated [up, gate], this takes separate tensors.
+/// @param h Output tensor (N, D).
+/// @param e Gate projection output (N, D).
+/// @param g Up projection output (N, D).
+/// @param N Number of tokens.
+/// @param D Intermediate dimension.
+/// @param stream CUDA stream.
+void silu_mul_forward(nv_bfloat16* h, const nv_bfloat16* e, const nv_bfloat16* g, int N, int D, cudaStream_t stream);
+void silu_mul_forward(float* h, const float* e, const float* g, int N, int D, cudaStream_t stream);
+void silu_mul_forward(Tensor& h, const Tensor& e, const Tensor& g, int N, int D, cudaStream_t stream);
+
+/// @brief In-place backward through SiLU multiplication for fast LoRA.
+/// Computes de, dg from dh and overwrites e->de, g->dg IN-PLACE.
+/// Optionally outputs reconstructed h for down LoRA gradient computation.
+/// @param e Gate output (N, D) - modified in-place to de.
+/// @param g Up output (N, D) - modified in-place to dg.
+/// @param dh Upstream gradient (N, D).
+/// @param h_out Optional output for reconstructed h (can be nullptr).
+/// @param N Number of tokens.
+/// @param D Intermediate dimension.
+/// @param stream CUDA stream.
+void silu_mul_backward_inplace(nv_bfloat16* e, nv_bfloat16* g, const nv_bfloat16* dh, nv_bfloat16* h_out, int N, int D, cudaStream_t stream);
+void silu_mul_backward_inplace(float* e, float* g, const float* dh, float* h_out, int N, int D, cudaStream_t stream);
+void silu_mul_backward_inplace(Tensor& e, Tensor& g, const Tensor& dh, Tensor* h_out, int N, int D, cudaStream_t stream);
+
+/// @brief Split (N, 2D) gate_up tensor into separate (N, D) up and gate tensors.
+/// Layout: gate_up = [up | gate], up is columns [0,D), gate is columns [D,2D).
+/// @param gate_up Input tensor (N, 2D).
+/// @param up Output up projection (N, D).
+/// @param gate Output gate projection (N, D).
+/// @param N Number of tokens.
+/// @param D Intermediate dimension.
+/// @param stream CUDA stream.
+void split_gate_up(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gate, int N, int D, cudaStream_t stream);
+void split_gate_up(const float* gate_up, float* up, float* gate, int N, int D, cudaStream_t stream);
+void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate, int N, int D, cudaStream_t stream);
+
+/// @brief Concatenate (N, D) dg and de tensors into (N, 2D) d_gate_up.
+/// Layout: d_gate_up = [dg | de], dg is columns [0,D), de is columns [D,2D).
+/// @param dg Gradient w.r.t. up output (N, D).
+/// @param de Gradient w.r.t. gate output (N, D).
+/// @param d_gate_up Output tensor (N, 2D).
+/// @param N Number of tokens.
+/// @param D Intermediate dimension.
+/// @param stream CUDA stream.
+void concat_d_gate_up(const nv_bfloat16* dg, const nv_bfloat16* de, nv_bfloat16* d_gate_up, int N, int D, cudaStream_t stream);
+void concat_d_gate_up(const float* dg, const float* de, float* d_gate_up, int N, int D, cudaStream_t stream);
+void concat_d_gate_up(const Tensor& dg, const Tensor& de, Tensor& d_gate_up, int N, int D, cudaStream_t stream);
 
 void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Nq, HS)
                              float* stats, // output for backward pass: (B, Hq, T)
@@ -1038,5 +1103,343 @@ void dequantize_bnb_nf4_double(nv_bfloat16* out, const unsigned char* in,
 /// Returns pointer to the 16-element NF4 lookup table for debugging.
 /// @return Pointer to static array of 16 floats.
 const float* get_nf4_codebook();
+
+// ============================================================================
+// Mixture of Experts (MoE) Kernels
+// ============================================================================
+// Routing, expert selection, and token dispatch operations for MoE layers.
+
+/// @brief Row-wise softmax for MoE routing logits.
+/// @param out Output routing probabilities (num_tokens, num_experts).
+/// @param inp Input routing logits (num_tokens, num_experts).
+/// @param num_tokens Number of tokens (batch_size * seq_len).
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_softmax_forward(float* out, const float* inp, int num_tokens, int num_experts, cudaStream_t stream);
+void moe_softmax_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_tokens, int num_experts, cudaStream_t stream);
+
+/// @brief Element-wise sigmoid for DeepSeek-style MoE routing.
+/// @param out Output routing scores (num_elements).
+/// @param inp Input routing logits (num_elements).
+/// @param num_elements Total number of elements.
+/// @param stream CUDA stream.
+void moe_sigmoid_forward(float* out, const float* inp, int num_elements, cudaStream_t stream);
+void moe_sigmoid_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_elements, cudaStream_t stream);
+
+/// @brief Top-K expert selection per token.
+/// @param expert_indices Output expert indices (num_tokens, top_k).
+/// @param routing_weights Output routing weights (num_tokens, top_k).
+/// @param scores Input routing scores (num_tokens, num_experts).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param top_k Number of experts per token.
+/// @param normalize_weights Whether to normalize weights to sum to 1.
+/// @param stream CUDA stream.
+void moe_topk_forward(int* expert_indices, float* routing_weights, const float* scores,
+                      int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+void moe_topk_forward(int* expert_indices, nv_bfloat16* routing_weights, const nv_bfloat16* scores,
+                      int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+
+/// @brief Compute histogram of tokens assigned to each expert.
+/// @param expert_counts Output counts per expert (num_experts).
+/// @param expert_indices Input expert indices (num_tokens, top_k).
+/// @param num_tokens Number of tokens.
+/// @param top_k Number of experts per token.
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_compute_expert_counts(int* expert_counts, const int* expert_indices,
+                               int num_tokens, int top_k, int num_experts, cudaStream_t stream);
+
+/// @brief Compute expert offsets from counts (exclusive prefix sum).
+/// expert_offsets[i] = sum(expert_counts[0:i])
+/// expert_offsets[num_experts] = total_tokens (num_tokens * top_k)
+/// @param expert_offsets Output offsets (num_experts + 1).
+/// @param expert_counts Input counts per expert (num_experts).
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_compute_expert_offsets(int* expert_offsets, const int* expert_counts,
+                                int num_experts, cudaStream_t stream);
+
+/// @brief Build gather/scatter indices for token permutation.
+/// gather_indices[permuted_pos] = original token assignment index
+/// scatter_indices[assignment_idx] = permuted position
+/// @param gather_indices Output gather indices (total_tokens).
+/// @param scatter_indices Output scatter indices (total_tokens).
+/// @param expert_indices Expert assignments (num_tokens, top_k).
+/// @param expert_offsets Expert offsets from compute_expert_offsets (num_experts + 1).
+/// @param expert_positions Temporary storage for atomic counters (num_experts). Zeroed by caller.
+/// @param num_tokens Number of original tokens.
+/// @param top_k Number of experts per token.
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_build_indices(int* gather_indices, int* scatter_indices,
+                       const int* expert_indices, const int* expert_offsets,
+                       int* expert_positions, int num_tokens, int top_k,
+                       int num_experts, cudaStream_t stream);
+
+/// @brief Permute tokens from natural order to expert-grouped order.
+/// @param out Output permuted hidden states (total_tokens, hidden_size).
+/// @param inp Input hidden states (num_tokens, hidden_size).
+/// @param gather_indices Gather indices from compute_gather_indices (total_tokens).
+/// @param total_tokens Total token-expert assignments (num_tokens * top_k).
+/// @param num_tokens Number of original tokens.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_permute_tokens(float* out, const float* inp, const int* gather_indices,
+                        int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+void moe_permute_tokens(nv_bfloat16* out, const nv_bfloat16* inp, const int* gather_indices,
+                        int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Unpermute and weight-combine expert outputs back to token order.
+/// @param out Output combined hidden states (num_tokens, hidden_size).
+/// @param expert_out Expert outputs in permuted order (total_tokens, hidden_size).
+/// @param routing_weights Routing weights (num_tokens, top_k).
+/// @param scatter_indices Scatter indices (inverse of gather_indices).
+/// @param num_tokens Number of original tokens.
+/// @param total_tokens Total token-expert assignments.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_unpermute_and_combine(float* out, const float* expert_out, const float* routing_weights,
+                               const int* scatter_indices, int num_tokens, int total_tokens,
+                               int hidden_size, int top_k, cudaStream_t stream);
+void moe_unpermute_and_combine(nv_bfloat16* out, const nv_bfloat16* expert_out, const nv_bfloat16* routing_weights,
+                               const int* scatter_indices, int num_tokens, int total_tokens,
+                               int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Compute auxiliary load-balancing loss for MoE training.
+/// aux_loss = coef * num_experts * sum_e(fraction_e * prob_e)
+/// @param aux_loss Output scalar loss value (device pointer).
+/// @param routing_probs Routing probabilities post-softmax (num_tokens, num_experts).
+/// @param expert_indices Expert indices (num_tokens, top_k).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param top_k Number of experts per token.
+/// @param aux_loss_coef Loss coefficient (typically 0.01).
+/// @param stream CUDA stream.
+void moe_compute_aux_loss(float* aux_loss, const float* routing_probs, const int* expert_indices,
+                          int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
+void moe_compute_aux_loss(float* aux_loss, const nv_bfloat16* routing_probs, const int* expert_indices,
+                          int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
+
+// MoE Backward Kernels
+
+/// @brief Backward pass for softmax routing.
+/// d_logits = softmax_probs * (d_probs - sum_j(d_probs_j * softmax_probs_j))
+/// @param d_logits Output gradient w.r.t. logits (num_tokens, num_experts).
+/// @param d_probs Input gradient w.r.t. softmax output (num_tokens, num_experts).
+/// @param softmax_probs Saved softmax probabilities from forward (num_tokens, num_experts).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_softmax_backward(float* d_logits, const float* d_probs, const float* softmax_probs,
+                          int num_tokens, int num_experts, cudaStream_t stream);
+void moe_softmax_backward(nv_bfloat16* d_logits, const nv_bfloat16* d_probs, const nv_bfloat16* softmax_probs,
+                          int num_tokens, int num_experts, cudaStream_t stream);
+
+/// @brief Backward pass for unpermute+combine operation.
+/// Computes gradients for expert outputs and optionally routing weights.
+/// @param d_expert_out Output gradient for expert outputs (total_tokens, hidden_size).
+/// @param d_routing_weights Optional output gradient for routing weights (num_tokens, top_k). Can be NULL.
+/// @param d_output Input gradient from downstream (num_tokens, hidden_size).
+/// @param expert_out Expert outputs from forward pass (for weight gradient computation).
+/// @param routing_weights Routing weights from forward pass.
+/// @param scatter_indices Scatter indices from forward pass.
+/// @param num_tokens Number of original tokens.
+/// @param total_tokens Total token-expert assignments.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_combine_backward(float* d_expert_out, float* d_routing_weights,
+                          const float* d_output, const float* expert_out, const float* routing_weights,
+                          const int* scatter_indices, int num_tokens, int total_tokens,
+                          int hidden_size, int top_k, cudaStream_t stream);
+void moe_combine_backward(nv_bfloat16* d_expert_out, nv_bfloat16* d_routing_weights,
+                          const nv_bfloat16* d_output, const nv_bfloat16* expert_out, const nv_bfloat16* routing_weights,
+                          const int* scatter_indices, int num_tokens, int total_tokens,
+                          int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Backward pass for token permutation.
+/// Gathers gradients from permuted order back to token order.
+/// @param d_input Output gradient in token order (num_tokens, hidden_size).
+/// @param d_permuted Input gradient in permuted order (total_tokens, hidden_size).
+/// @param gather_indices Gather indices from forward pass.
+/// @param total_tokens Total token-expert assignments.
+/// @param num_tokens Number of original tokens.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_permute_backward(float* d_input, const float* d_permuted, const int* gather_indices,
+                          int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+void moe_permute_backward(nv_bfloat16* d_input, const nv_bfloat16* d_permuted, const int* gather_indices,
+                          int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Compute router z-loss for MoE training regularization.
+/// z_loss = coef * (1/num_tokens) * sum_t(logsumexp(logits_t))^2
+/// Encourages smaller router logits to prevent instability.
+/// @param z_loss Output scalar loss value (device pointer, accumulated via atomicAdd).
+/// @param router_logits Pre-softmax router logits (num_tokens, num_experts).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param z_loss_coef Loss coefficient (typically 0.001-0.01).
+/// @param stream CUDA stream.
+void moe_router_z_loss_forward(float* z_loss, const float* router_logits,
+                               int num_tokens, int num_experts, float z_loss_coef, cudaStream_t stream);
+void moe_router_z_loss_forward(float* z_loss, const nv_bfloat16* router_logits,
+                               int num_tokens, int num_experts, float z_loss_coef, cudaStream_t stream);
+
+/// @brief Backward pass for router z-loss.
+/// d_logits = coef * (2 * logsumexp / num_tokens) * softmax(logits)
+/// @param d_logits Output gradient w.r.t. router logits (num_tokens, num_experts).
+/// @param router_logits Pre-softmax router logits from forward pass.
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param z_loss_coef Loss coefficient (same as forward).
+/// @param stream CUDA stream.
+void moe_router_z_loss_backward(float* d_logits, const float* router_logits,
+                                int num_tokens, int num_experts, float z_loss_coef, cudaStream_t stream);
+void moe_router_z_loss_backward(nv_bfloat16* d_logits, const nv_bfloat16* router_logits,
+                                int num_tokens, int num_experts, float z_loss_coef, cudaStream_t stream);
+
+/// @brief Generic Grouped GEMM for MoE across all experts.
+/// @param output Output tensor (total_tokens, M).
+/// @param input Input tensor in permuted order (total_tokens, K).
+/// @param weights Batched expert weights (num_experts, M, K).
+/// @param expert_offsets Token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param M Output dimension.
+/// @param K Input dimension.
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+/// @param host_offsets Optional: pre-cached host offsets.
+void moe_grouped_gemm(float* output, const float* input, const float* weights,
+                      const int* expert_offsets, int num_experts,
+                      int M, int K,
+                      cublasHandle_t cublas_handle, cudaStream_t stream,
+                      const int* host_offsets = nullptr,
+                      float alpha = 1.0f, float beta = 0.0f,
+                      EMMTranspose mode = EMMTranspose::TN);
+void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
+                      const int* expert_offsets, int num_experts,
+                      int M, int K,
+                      cublasHandle_t cublas_handle, cudaStream_t stream,
+                      const int* host_offsets = nullptr,
+                      float alpha = 1.0f, float beta = 0.0f,
+                      EMMTranspose mode = EMMTranspose::TN);
+
+/// @brief Computes weight gradients across all experts: dW = grad_output^T @ input
+/// @param d_weight Output gradient tensor (num_experts, M, N).
+/// @param grad_output Input gradient from downstream (total_tokens, M).
+/// @param input Input activations (total_tokens, N).
+/// @param expert_offsets Token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param M Output rows of dW.
+/// @param N Output cols of dW.
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+/// @param host_offsets Optional: pre-cached host offsets.
+/// @param alpha Scaling factor.
+/// @param beta Accumulation factor.
+void moe_grouped_gemm_weight_grad(float* d_weight, const float* grad_output, const float* input,
+                                  const int* expert_offsets, int num_experts,
+                                  int M, int N,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  float alpha = 1.0f, float beta = 0.0f);
+void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad_output, const nv_bfloat16* input,
+                                  const int* expert_offsets, int num_experts,
+                                  int M, int N,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  float alpha = 1.0f, float beta = 0.0f);
+
+/// @brief Grouped GEMM for MoE gate+up projection across all experts.
+/// Runs all expert GEMMs in parallel instead of sequentially.
+/// @param output Output tensor (total_tokens, 2*intermediate_size).
+/// @param input Input tensor in permuted order (total_tokens, hidden_size).
+/// @param weights Batched expert weights (num_experts, 2*intermediate_size, hidden_size).
+/// @param expert_offsets Token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param hidden_size Input hidden dimension (C).
+/// @param intermediate_size Expert intermediate dimension (D, output is 2*D).
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+void moe_grouped_gemm_gate_up(float* output, const float* input, const float* weights,
+                              const int* expert_offsets, int num_experts,
+                              int hidden_size, int intermediate_size,
+                              cublasHandle_t cublas_handle, cudaStream_t stream,
+                              const int* host_offsets = nullptr);
+void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
+                              const int* expert_offsets, int num_experts,
+                              int hidden_size, int intermediate_size,
+                              cublasHandle_t cublas_handle, cudaStream_t stream,
+                              const int* host_offsets = nullptr);
+
+/// @brief Grouped GEMM for MoE down projection across all experts.
+/// Runs all expert GEMMs in parallel instead of sequentially.
+/// @param output Output tensor (total_tokens, hidden_size).
+/// @param input Input tensor (SwiGLU output) in permuted order (total_tokens, intermediate_size).
+/// @param weights Batched expert weights (num_experts, hidden_size, intermediate_size).
+/// @param expert_offsets Token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param hidden_size Output hidden dimension (C).
+/// @param intermediate_size Expert intermediate dimension (D).
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+void moe_grouped_gemm_down(float* output, const float* input, const float* weights,
+                           const int* expert_offsets, int num_experts,
+                           int hidden_size, int intermediate_size,
+                           cublasHandle_t cublas_handle, cudaStream_t stream,
+                           const int* host_offsets = nullptr);
+void moe_grouped_gemm_down(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
+                           const int* expert_offsets, int num_experts,
+                           int hidden_size, int intermediate_size,
+                           cublasHandle_t cublas_handle, cudaStream_t stream,
+                           const int* host_offsets = nullptr);
+
+/// @brief Grouped GEMM backward through down projection for all MoE experts.
+/// Computes d_swiglu = d_output @ down_proj (no transpose on weight).
+/// @param d_input Output gradient w.r.t. SwiGLU output (total_tokens, D).
+/// @param d_output Input gradient from downstream (total_tokens, C).
+/// @param weights Down projection weights in batched layout (num_experts, C, D).
+/// @param expert_offsets Cumulative token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param hidden_size Hidden dimension (C).
+/// @param intermediate_size Expert intermediate dimension (D).
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+void moe_grouped_gemm_down_backward(float* d_input, const float* d_output, const float* weights,
+                                     const int* expert_offsets, int num_experts,
+                                     int hidden_size, int intermediate_size,
+                                     cublasHandle_t cublas_handle, cudaStream_t stream,
+                                     const int* host_offsets = nullptr);
+void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_output, const nv_bfloat16* weights,
+                                     const int* expert_offsets, int num_experts,
+                                     int hidden_size, int intermediate_size,
+                                     cublasHandle_t cublas_handle, cudaStream_t stream,
+                                     const int* host_offsets = nullptr);
+
+/// @brief Grouped GEMM backward through gate+up projection for all MoE experts.
+/// Computes d_input = d_gate_up @ gate_up_proj (no transpose on weight).
+/// @param d_input Output gradient w.r.t. original input (total_tokens, C).
+/// @param d_gate_up Input gradient from SwiGLU backward (total_tokens, 2*D).
+/// @param weights Gate+up projection weights in batched layout (num_experts, 2*D, C).
+/// @param expert_offsets Cumulative token offsets per expert (num_experts + 1).
+/// @param num_experts Number of experts.
+/// @param hidden_size Hidden dimension (C).
+/// @param intermediate_size Expert intermediate dimension (D, d_gate_up is 2*D).
+/// @param cublas_handle cuBLAS handle.
+/// @param stream CUDA stream.
+void moe_grouped_gemm_gate_up_backward(float* d_input, const float* d_gate_up, const float* weights,
+                                        const int* expert_offsets, int num_experts,
+                                        int hidden_size, int intermediate_size,
+                                        cublasHandle_t cublas_handle, cudaStream_t stream,
+                                        const int* host_offsets = nullptr);
+void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_gate_up, const nv_bfloat16* weights,
+                                        const int* expert_offsets, int num_experts,
+                                        int hidden_size, int intermediate_size,
+                                        cublasHandle_t cublas_handle, cudaStream_t stream,
+                                        const int* host_offsets = nullptr);
 
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

@@ -259,11 +259,6 @@ inline Tensor LMHeadModule::forward_impl(ModuleContext& ctx, Weights& w, Tensor&
 inline float LMHeadModule::forward_with_loss(ModuleContext& ctx, Weights& w, Tensor& input,
                                               Tensor& targets, Tensor& losses, Tensor* valid_count,
                                               bool compute_grad) {
-    const int BT = ctx.B * ctx.T;
-    const int C = mConfig.hidden_size;
-    const int V = mConfig.vocab_size;
-    const int P = mConfig.num_chunks;
-
     // For chunked processing (memory efficiency)
     // Note: This is a simplified version. Full implementation would
     // iterate over chunks with fused_classifier.

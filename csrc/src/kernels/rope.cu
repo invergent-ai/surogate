@@ -66,11 +66,14 @@ void precompute_freqs_cis(nv_bfloat16 *freqs_cis, int dim, int end, float theta)
 }
 
 /**
- * @brief CUDA kernel for RoPE forward and backward passes.
+ * @brief CUDA kernel for RoPE forward and backward passes with partial RoPE support.
  *
  * Applies rotary position embedding to Q and K heads. V heads are passed
  * through unchanged (just copied if out != inp). Uses complex multiplication
  * interpretation: treats pairs of dimensions as (real, imag) and rotates.
+ *
+ * For partial RoPE (GLM4 style), only dimensions [0, rotary_dim) are rotated.
+ * Dimensions [rotary_dim, head_dim) are passed through unchanged.
  *
  * Forward: (x, y) -> (x*cos - y*sin, x*sin + y*cos)
  * Backward: same but with negated sin (inverse rotation)
@@ -79,18 +82,19 @@ void precompute_freqs_cis(nv_bfloat16 *freqs_cis, int dim, int end, float theta)
  * @tparam floatX Data type (float or nv_bfloat16).
  * @param[out] out Output tensor of shape (B, T, Nq+Nk+Nv, head_dim).
  * @param[in] inp Input tensor of shape (B, T, Nq+Nk+Nv, head_dim).
- * @param[in] freqs_cis Precomputed frequency table of shape (T, head_dim).
+ * @param[in] freqs_cis Precomputed frequency table of shape (T, rotary_dim).
  * @param[in,out] abs_max_ptr Optional global absolute maximum tracker.
  * @param B Batch size.
  * @param T Sequence length.
  * @param Nq Number of query heads.
  * @param Nkv Number of key/value heads (for GQA).
- * @param head_dim Head dimension.
+ * @param head_dim Full head dimension.
+ * @param rotary_dim Number of dimensions to apply RoPE to (must be <= head_dim, even).
  * @param bw Compile-time backward flag.
  */
 template<bool Backward, typename floatX>
 __global__ void rope_kernel(floatX *out, const floatX *inp, const floatX *freqs_cis, const int* position_ids, float* abs_max_ptr,
-                            int B, int T, int Nq, int Nkv, int head_dim, std::bool_constant<Backward> bw = {}) {
+                            int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, std::bool_constant<Backward> bw = {}) {
     using x64 = GenericVector<floatX, 8/sizeof(floatX)>;
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
     __shared__ float block_abs_max;
@@ -137,31 +141,73 @@ __global__ void rope_kernel(floatX *out, const floatX *inp, const floatX *freqs_
         int b = idx / (T * N * head_dim_half);
         int t = (idx / (N * head_dim_half)) % T;
         int d = idx % head_dim_half;
-        
+
         int t_pos = position_ids ? position_ids[b*T + t] : t;
-        
+
         int idx_bt = b * (T * N * head_dim) + t * (N * head_dim);
         int idx_bth = idx_bt + qkv * (Nq * head_dim) + h * head_dim;
         int idxi = idx_bth + d; // index in the input
 
-        x128 freqs_vec = x128::load_ldg(freqs_cis + t_pos * head_dim + 2 * d);
+        int rotary_dim_half = rotary_dim / 2;
         x64 v_real = x64::load(inp + idxi);
         x64 v_imag = x64::load(inp + idxi + head_dim_half);
         x64 o_real;
         x64 o_imag;
-        for(int k = 0; k < x64::size; k++) {
-            float cos = (float)freqs_vec[2*k];
-            float sin = (float)freqs_vec[2*k+1];
-            if constexpr (Backward) {
-                sin = -sin;
+
+        // Check if this dimension block is within rotary_dim (partial RoPE support)
+        if (d + x64::size <= rotary_dim_half) {
+            // All dimensions in this vector are within rotary range - apply rotation
+            x128 freqs_vec = x128::load_ldg(freqs_cis + t_pos * rotary_dim + 2 * d);
+            for(int k = 0; k < x64::size; k++) {
+                float cos = (float)freqs_vec[2*k];
+                float sin = (float)freqs_vec[2*k+1];
+                if constexpr (Backward) {
+                    sin = -sin;
+                }
+                float real = (float)v_real[k];
+                float imag = (float)v_imag[k];
+                o_real[k] = real * cos - imag * sin;
+                o_imag[k] = real * sin + imag * cos;
+                if (abs_max_ptr) {
+                    thread_abs_max = fmaxf(thread_abs_max, fabsf(o_real[k]));
+                    thread_abs_max = fmaxf(thread_abs_max, fabsf(o_imag[k]));
+                }
             }
-            float real = (float)v_real[k];
-            float imag = (float)v_imag[k];
-            o_real[k] = real * cos - imag * sin;
-            o_imag[k] = real * sin + imag * cos;
-            if (abs_max_ptr) {
-                thread_abs_max = fmaxf(thread_abs_max, fabsf(o_real[k]));
-                thread_abs_max = fmaxf(thread_abs_max, fabsf(o_imag[k]));
+        } else if (d >= rotary_dim_half) {
+            // All dimensions in this vector are beyond rotary range - pass through
+            for(int k = 0; k < x64::size; k++) {
+                o_real[k] = v_real[k];
+                o_imag[k] = v_imag[k];
+                if (abs_max_ptr) {
+                    thread_abs_max = fmaxf(thread_abs_max, fabsf((float)v_real[k]));
+                    thread_abs_max = fmaxf(thread_abs_max, fabsf((float)v_imag[k]));
+                }
+            }
+        } else {
+            // Mixed: some dimensions rotated, some passed through
+            // This happens at the boundary of rotary_dim
+            for(int k = 0; k < x64::size; k++) {
+                int dk = d + k;
+                if (dk < rotary_dim_half) {
+                    // Within rotary range - apply rotation
+                    float cos = (float)freqs_cis[t_pos * rotary_dim + 2 * dk];
+                    float sin = (float)freqs_cis[t_pos * rotary_dim + 2 * dk + 1];
+                    if constexpr (Backward) {
+                        sin = -sin;
+                    }
+                    float real = (float)v_real[k];
+                    float imag = (float)v_imag[k];
+                    o_real[k] = real * cos - imag * sin;
+                    o_imag[k] = real * sin + imag * cos;
+                } else {
+                    // Beyond rotary range - pass through
+                    o_real[k] = v_real[k];
+                    o_imag[k] = v_imag[k];
+                }
+                if (abs_max_ptr) {
+                    thread_abs_max = fmaxf(thread_abs_max, fabsf((float)o_real[k]));
+                    thread_abs_max = fmaxf(thread_abs_max, fabsf((float)o_imag[k]));
+                }
             }
         }
         o_real.store(out + idxi);
@@ -172,7 +218,7 @@ __global__ void rope_kernel(floatX *out, const floatX *inp, const floatX *freqs_
 }
 
 /**
- * @brief Template launcher for RoPE kernel.
+ * @brief Template launcher for RoPE kernel with partial RoPE support.
  *
  * Configures and launches rope_kernel with 128 threads per block.
  * Supports both forward and backward passes via template parameter.
@@ -181,48 +227,78 @@ __global__ void rope_kernel(floatX *out, const floatX *inp, const floatX *freqs_
  * @tparam floatX Data type (float or nv_bfloat16).
  * @param[out] out Output tensor (can be same as in for in-place).
  * @param[in] in Input tensor of shape (B, T, Nq+Nk+Nv, head_dim).
- * @param[in] freqs_cis Precomputed frequency table.
+ * @param[in] freqs_cis Precomputed frequency table of shape (T, rotary_dim).
  * @param[in,out] abs_max_ptr Optional absolute maximum tracker.
  * @param B Batch size.
  * @param T Sequence length.
  * @param Nq Number of query heads.
  * @param Nkv Number of key/value heads.
- * @param head_dim Head dimension.
+ * @param head_dim Full head dimension.
+ * @param rotary_dim Number of dimensions to rotate (for partial RoPE, <= head_dim).
  * @param stream CUDA stream.
  * @param bw Compile-time backward flag.
  */
 template<bool Backward, class floatX>
-void rope_imp(floatX* out, const floatX* in, const floatX *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream, std::bool_constant<Backward> bw = {}) {
+void rope_imp(floatX* out, const floatX* in, const floatX *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream, std::bool_constant<Backward> bw = {}) {
     if (abs_max_ptr)
         CUDA_CHECK(cudaMemsetAsync(abs_max_ptr, 0, sizeof(float), stream));
 
     const int block_size = 128;
     using x64 = GenericVector<floatX, 8/sizeof(floatX)>;
     assert(head_dim % (2*x64::size) == 0);
+    assert(rotary_dim % 2 == 0 && rotary_dim <= head_dim);
     int total_threads = (B * T * (Nq + 2*Nkv) * head_dim / 2) / x64::size;
     int num_blocks = div_ceil(total_threads, block_size);
-    rope_kernel<<<num_blocks, block_size, 0, stream>>>(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, bw);
+    rope_kernel<<<num_blocks, block_size, 0, stream>>>(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, bw);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/// @brief RoPE forward pass for FP32 tensors.
+// ============================================================================
+// Public API: Full RoPE (rotary_dim == head_dim, backwards compatible)
+// ============================================================================
+
+/// @brief RoPE forward pass for FP32 tensors (full RoPE).
 void rope_forward(float* out, const float* in, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
-    rope_imp(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream, std::bool_constant<false>());
+    rope_imp(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, head_dim, stream, std::bool_constant<false>());
 }
 
-/// @brief RoPE forward pass for BF16 tensors.
+/// @brief RoPE forward pass for BF16 tensors (full RoPE).
 void rope_forward(nv_bfloat16* out, const nv_bfloat16* in, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream)  {
-    rope_imp(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream, std::bool_constant<false>());
+    rope_imp(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, head_dim, stream, std::bool_constant<false>());
 }
 
-/// @brief RoPE backward pass for FP32 tensors (applies inverse rotation).
+/// @brief RoPE backward pass for FP32 tensors (full RoPE, applies inverse rotation).
 void rope_backward(float* dinp, const float* dout, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
-    rope_imp(dinp, dout, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream, std::bool_constant<true>());
+    rope_imp(dinp, dout, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, head_dim, stream, std::bool_constant<true>());
 }
 
-/// @brief RoPE backward pass for BF16 tensors (applies inverse rotation).
+/// @brief RoPE backward pass for BF16 tensors (full RoPE, applies inverse rotation).
 void rope_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream)  {
-    rope_imp(dinp, dout, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream, std::bool_constant<true>());
+    rope_imp(dinp, dout, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, head_dim, stream, std::bool_constant<true>());
+}
+
+// ============================================================================
+// Public API: Partial RoPE (rotary_dim < head_dim, for GLM4 etc.)
+// ============================================================================
+
+/// @brief RoPE forward pass for FP32 tensors with partial rotation (GLM4 style).
+void rope_forward(float* out, const float* in, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
+    rope_imp(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream, std::bool_constant<false>());
+}
+
+/// @brief RoPE forward pass for BF16 tensors with partial rotation (GLM4 style).
+void rope_forward(nv_bfloat16* out, const nv_bfloat16* in, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream)  {
+    rope_imp(out, in, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream, std::bool_constant<false>());
+}
+
+/// @brief RoPE backward pass for FP32 tensors with partial rotation (GLM4 style).
+void rope_backward(float* dinp, const float* dout, const float *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
+    rope_imp(dinp, dout, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream, std::bool_constant<true>());
+}
+
+/// @brief RoPE backward pass for BF16 tensors with partial rotation (GLM4 style).
+void rope_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream)  {
+    rope_imp(dinp, dout, freqs_cis, position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream, std::bool_constant<true>());
 }
 
 // ============================================================================

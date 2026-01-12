@@ -47,7 +47,11 @@ BnBWeightsManager::BnBWeightsManager(const Config& config, TensorAllocator& allo
     // Pre-size the vector but don't allocate GPU memory yet.
     // Each layer's storage will be allocated lazily in load_and_quantize_block()
     // to reduce peak memory during initialization.
-    mQuantizedBlocks.resize(mConfig.num_layers);
+    if (config.qlora_config.is_moe()) {
+        mMoEBlocks.resize(mConfig.num_layers);
+    } else {
+        mQuantizedBlocks.resize(mConfig.num_layers);
+    }
 }
 
 void BnBWeightsManager::allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int M, int K,
@@ -138,9 +142,37 @@ void BnBWeightsManager::allocate_single_block(int layer_idx) {
 void BnBWeightsManager::import_and_quantize(const std::string& file_name,
                                             NCCLCommunicator& comm,
                                             cudaStream_t stream) {
+    // Debug: Check CUDA memory and print allocation breakdown before any allocations
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[BnB] BEFORE import - CUDA memory: "
+                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
+                  << free_mem / 1024 / 1024 << " MB free\n";
+        std::cerr << "[BnB] Pre-import allocation breakdown:\n";
+        mAllocator->print_stats();
+    }
+
     std::cerr << "[BnB] importing and quantizing weights from " << file_name << "\n";
     std::cerr << "[BnB] block_size=" << mScaleConfig.block_size
               << ", double_quant=" << (mScaleConfig.double_quant ? "true" : "false") << "\n";
+
+    if (is_moe()) {
+        const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                              mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+        std::cerr << "[BnB] MoE model detected: " << mConfig.qlora_config.num_experts << " experts, "
+                  << "top_k=" << mConfig.qlora_config.num_experts_per_tok
+                  << ", moe_intermediate_size=" << mConfig.qlora_config.moe_intermediate_size
+                  << ", using moe_inter=" << moe_inter
+                  << ", hidden=" << mConfig.hidden_size << "\n";
+        // Calculate expected NF4 memory for experts
+        long expert_gate_up_bytes = (2L * moe_inter * mConfig.hidden_size) / 2;  // NF4 packed
+        long expert_down_bytes = (long(mConfig.hidden_size) * moe_inter) / 2;
+        long per_layer_bytes = mConfig.qlora_config.num_experts * (expert_gate_up_bytes + expert_down_bytes);
+        long total_expert_bytes = per_layer_bytes * mConfig.num_layers;
+        std::cerr << "[BnB] Expected expert NF4 memory: " << (total_expert_bytes / 1024 / 1024) << " MB ("
+                  << (per_layer_bytes / 1024 / 1024) << " MB/layer)\n";
+    }
 
     SafeTensorsReader reader(file_name);
 
@@ -153,12 +185,18 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
     const int head_size = mConfig.head_size;
     const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
 
+    // For MoE models, use moe_intermediate_size for expert projections
+    const int moe_inter = is_moe() ?
+        (mConfig.qlora_config.moe_intermediate_size > 0 ?
+         mConfig.qlora_config.moe_intermediate_size : intermediate) : intermediate;
+
     std::size_t max_weight_elems = std::max({
         static_cast<std::size_t>(qkv_out) * hidden,
         static_cast<std::size_t>(hidden) * num_q_heads * head_size,
-        static_cast<std::size_t>(2 * intermediate) * hidden,
-        static_cast<std::size_t>(hidden) * intermediate,
-        static_cast<std::size_t>(mConfig.vocab_size) * hidden  // Embedding
+        static_cast<std::size_t>(2 * intermediate) * hidden,  // Dense MLP (if any)
+        static_cast<std::size_t>(2 * moe_inter) * hidden,     // Expert gate+up
+        static_cast<std::size_t>(hidden) * moe_inter,         // Expert down
+        static_cast<std::size_t>(mConfig.vocab_size) * hidden // Embedding
     });
 
     // Allocate temporary load buffer directly (not through allocator) so we can free it after use
@@ -191,8 +229,16 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
     load_embeddings(reader, stream);
 
     // Load and quantize each transformer block
-    for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-        load_and_quantize_block(layer, reader, stream);
+    if (is_moe()) {
+        // MoE path: load experts + router
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            load_and_quantize_moe_block(layer, reader, stream);
+        }
+    } else {
+        // Dense path
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            load_and_quantize_block(layer, reader, stream);
+        }
     }
 
     // Sync before freeing load buffer
@@ -478,8 +524,14 @@ void BnBWeightsManager::apply_double_quantization(BnBBlockQuantizedWeight& weigh
 
 std::size_t BnBWeightsManager::quantized_weights_bytes() const {
     std::size_t total = 0;
-    for (const auto& block : mQuantizedBlocks) {
-        total += block.bytes();
+    if (is_moe()) {
+        for (const auto& block : mMoEBlocks) {
+            total += block.bytes();
+        }
+    } else {
+        for (const auto& block : mQuantizedBlocks) {
+            total += block.bytes();
+        }
     }
     total += mEmbeddings.bytes();
     return total;
@@ -488,18 +540,248 @@ std::size_t BnBWeightsManager::quantized_weights_bytes() const {
 float BnBWeightsManager::memory_savings_ratio() const {
     // Calculate what BF16 storage would have been
     std::size_t bf16_bytes = 0;
-    for (const auto& block : mQuantizedBlocks) {
-        bf16_bytes += static_cast<std::size_t>(block.qkv_proj.M) * block.qkv_proj.K * 2;
-        bf16_bytes += static_cast<std::size_t>(block.out_proj.M) * block.out_proj.K * 2;
-        bf16_bytes += static_cast<std::size_t>(block.gate_up_proj.M) * block.gate_up_proj.K * 2;
-        bf16_bytes += static_cast<std::size_t>(block.down_proj.M) * block.down_proj.K * 2;
-        bf16_bytes += block.ln1_weight.bytes();
-        bf16_bytes += block.ln2_weight.bytes();
+
+    if (is_moe()) {
+        for (const auto& block : mMoEBlocks) {
+            bf16_bytes += static_cast<std::size_t>(block.qkv_proj.M) * block.qkv_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.out_proj.M) * block.out_proj.K * 2;
+            bf16_bytes += block.ln1_weight.bytes();
+            bf16_bytes += block.ln2_weight.bytes();
+            bf16_bytes += block.router_gate.bytes();
+            for (const auto& expert : block.experts) {
+                bf16_bytes += static_cast<std::size_t>(expert.gate_up_proj.M) * expert.gate_up_proj.K * 2;
+                bf16_bytes += static_cast<std::size_t>(expert.down_proj.M) * expert.down_proj.K * 2;
+            }
+        }
+    } else {
+        for (const auto& block : mQuantizedBlocks) {
+            bf16_bytes += static_cast<std::size_t>(block.qkv_proj.M) * block.qkv_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.out_proj.M) * block.out_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.gate_up_proj.M) * block.gate_up_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.down_proj.M) * block.down_proj.K * 2;
+            bf16_bytes += block.ln1_weight.bytes();
+            bf16_bytes += block.ln2_weight.bytes();
+        }
     }
     bf16_bytes += mEmbeddings.bytes();
 
     std::size_t actual_bytes = quantized_weights_bytes();
     return 1.0f - static_cast<float>(actual_bytes) / static_cast<float>(bf16_bytes);
+}
+
+void BnBWeightsManager::allocate_moe_block(int layer_idx) {
+    auto ctx = mAllocator->with_context("BnB_MoE_Weights");
+
+    // Debug: print CUDA memory info at start of each layer
+    if (layer_idx % 10 == 0) {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[BnB] Layer " << layer_idx << " - CUDA memory: "
+                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
+                  << free_mem / 1024 / 1024 << " MB free, "
+                  << total_mem / 1024 / 1024 << " MB total\n";
+    }
+
+    const int hidden = mConfig.hidden_size;
+    const int num_q_heads = mConfig.num_query_heads;
+    const int num_kv_heads = mConfig.num_kv_heads;
+    const int head_size = mConfig.head_size;
+    const int n_experts = mConfig.qlora_config.num_experts;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+    auto& block = mMoEBlocks[layer_idx];
+
+    // QKV projection (same as dense)
+    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+    allocate_bnb_weight(block.qkv_proj, qkv_out, hidden, "qkv");
+
+    // Output projection (same as dense)
+    allocate_bnb_weight(block.out_proj, hidden, num_q_heads * head_size, "out");
+
+    // Layer norm weights (BF16, not quantized)
+    block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
+                                            EAllocationType::ON_DEVICE, {(long)hidden});
+    block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
+                                            EAllocationType::ON_DEVICE, {(long)hidden});
+
+    // QK-norm weights (for Qwen3)
+    if (mConfig.use_qk_norm) {
+        block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
+                                                   EAllocationType::ON_DEVICE, {(long)head_size});
+        block.k_norm_weight = mAllocator->allocate(ETensorDType::BF16, "k_norm",
+                                                   EAllocationType::ON_DEVICE, {(long)head_size});
+    }
+
+    // Router gate (BF16, not quantized - small tensor)
+    // NOTE: Allocated as (hidden_size, num_experts) for matmul with TN transpose
+    block.router_gate = mAllocator->allocate(ETensorDType::BF16, "router_gate",
+                                              EAllocationType::ON_DEVICE,
+                                              {(long)hidden, (long)n_experts});
+
+    // Allocate expert weights
+    block.experts.resize(n_experts);
+    for (int e = 0; e < n_experts; ++e) {
+        auto& expert = block.experts[e];
+        std::string prefix = fmt::format("expert_{}", e);
+        allocate_bnb_weight(expert.gate_up_proj, 2 * moe_inter, hidden, prefix + "_gate_up");
+        allocate_bnb_weight(expert.down_proj, hidden, moe_inter, prefix + "_down");
+    }
+}
+
+void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsReader& reader,
+                                                     cudaStream_t stream) {
+    // Lazily allocate this layer's NF4 storage
+    allocate_moe_block(layer_idx);
+
+    auto& block = mMoEBlocks[layer_idx];
+    const int hidden = mConfig.hidden_size;
+    const int num_q_heads = mConfig.num_query_heads;
+    const int num_kv_heads = mConfig.num_kv_heads;
+    const int head_size = mConfig.head_size;
+    const int n_experts = mConfig.qlora_config.num_experts;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+    const std::string prefix = fmt::format("model.layers.{}", layer_idx);
+
+    // Helper to load and quantize a weight
+    auto load_and_quantize = [&](const std::string& name, BnBBlockQuantizedWeight& dest, int M, int K) {
+        mLoadBuffer.Sizes[0] = M;
+        mLoadBuffer.Sizes[1] = K;
+        mLoadBuffer.Rank = 2;
+
+        if (const auto* entry = find_entry_opt(reader, name)) {
+            entry->read_tensor(mLoadBuffer, /*allow_cast=*/true);
+            quantize_and_store(dest, mLoadBuffer, M, K, stream);
+        } else {
+            std::cerr << "[BnB WARN] layer " << layer_idx << " weight not found: " << name << "\n";
+        }
+    };
+
+    // Load Q, K, V projections (handle both fused and separate)
+    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+    const std::string qkv_name = prefix + ".self_attn.qkv_proj.weight";
+    if (find_entry_opt(reader, qkv_name)) {
+        load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
+    } else {
+        // Separate Q, K, V - load into parts of mLoadBuffer and then quantize
+        const int q_out = num_q_heads * head_size;
+        const int kv_out = num_kv_heads * head_size;
+
+        mLoadBuffer.Sizes[0] = qkv_out;
+        mLoadBuffer.Sizes[1] = hidden;
+        mLoadBuffer.Rank = 2;
+
+        // Load Q into the first part
+        Tensor q_view = mLoadBuffer;
+        q_view.Sizes[0] = q_out;
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_proj.weight")) {
+            entry->read_tensor(q_view, true);
+        }
+
+        // Load K into the middle part
+        Tensor k_view = mLoadBuffer;
+        k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
+        k_view.Sizes[0] = kv_out;
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_proj.weight")) {
+            entry->read_tensor(k_view, true);
+        }
+
+        // Load V into the last part
+        Tensor v_view = mLoadBuffer;
+        v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
+        v_view.Sizes[0] = kv_out;
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.v_proj.weight")) {
+            entry->read_tensor(v_view, true);
+        }
+
+        mLoadBuffer.Sizes[0] = qkv_out;
+        quantize_and_store(block.qkv_proj, mLoadBuffer, qkv_out, hidden, stream);
+    }
+
+    // Output projection
+    load_and_quantize(prefix + ".self_attn.o_proj.weight",
+                      block.out_proj, hidden, num_q_heads * head_size);
+
+    // Layer norms
+    if (const auto* entry = find_entry_opt(reader, prefix + ".input_layernorm.weight")) {
+        entry->read_tensor(block.ln1_weight, true);
+    }
+    if (const auto* entry = find_entry_opt(reader, prefix + ".post_attention_layernorm.weight")) {
+        entry->read_tensor(block.ln2_weight, true);
+    }
+
+    // QK-norm weights (for Qwen3)
+    if (mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_norm.weight")) {
+            entry->read_tensor(block.q_norm_weight.value(), true);
+        }
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_norm.weight")) {
+            entry->read_tensor(block.k_norm_weight.value(), true);
+        }
+    }
+
+    // Router gate (BF16, not quantized)
+    // Model stores as (num_experts, hidden), we need (hidden, num_experts) for TN matmul
+    if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate.weight")) {
+        // Load into temporary buffer with correct shape
+        mLoadBuffer.Sizes[0] = n_experts;
+        mLoadBuffer.Sizes[1] = hidden;
+        mLoadBuffer.Rank = 2;
+        entry->read_tensor(mLoadBuffer, true);
+
+        // Transpose: (n_experts, hidden) -> (hidden, n_experts)
+        transpose(block.router_gate.get<nv_bfloat16>(),
+                  mLoadBuffer.get<nv_bfloat16>(),
+                  n_experts, hidden, stream);
+    } else {
+        std::cerr << "[BnB WARN] layer " << layer_idx << " router gate not found: "
+                  << prefix << ".mlp.gate.weight - this will cause NaN!\n";
+    }
+
+    // Load and quantize each expert
+    for (int e = 0; e < n_experts; ++e) {
+        auto& expert = block.experts[e];
+        const std::string exp_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+
+        // Expert gate+up projection (handle both fused and separate)
+        const std::string gate_up_name = exp_prefix + ".gate_up_proj.weight";
+        if (find_entry_opt(reader, gate_up_name)) {
+            load_and_quantize(gate_up_name, expert.gate_up_proj, 2 * moe_inter, hidden);
+        } else {
+            // Separate gate and up - fuse them
+            mLoadBuffer.Sizes[0] = 2 * moe_inter;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+
+            // Load up into first part (Qwen3 uses [up; gate] layout)
+            Tensor up_view = mLoadBuffer;
+            up_view.Sizes[0] = moe_inter;
+            if (const auto* entry = find_entry_opt(reader, exp_prefix + ".up_proj.weight")) {
+                entry->read_tensor(up_view, true);
+            } else if (e == 0 && layer_idx == 0) {
+                std::cerr << "[BnB WARN] expert 0 up_proj not found: " << exp_prefix << ".up_proj.weight\n";
+            }
+
+            // Load gate into second part
+            Tensor gate_view = mLoadBuffer;
+            gate_view.Data = mLoadBuffer.Data + moe_inter * hidden * sizeof(nv_bfloat16);
+            gate_view.Sizes[0] = moe_inter;
+            if (const auto* entry = find_entry_opt(reader, exp_prefix + ".gate_proj.weight")) {
+                entry->read_tensor(gate_view, true);
+            } else if (e == 0 && layer_idx == 0) {
+                std::cerr << "[BnB WARN] expert 0 gate_proj not found: " << exp_prefix << ".gate_proj.weight\n";
+            }
+
+            mLoadBuffer.Sizes[0] = 2 * moe_inter;
+            quantize_and_store(expert.gate_up_proj, mLoadBuffer, 2 * moe_inter, hidden, stream);
+        }
+
+        // Expert down projection
+        load_and_quantize(exp_prefix + ".down_proj.weight",
+                          expert.down_proj, hidden, moe_inter);
+    }
 }
 
 } // namespace modules

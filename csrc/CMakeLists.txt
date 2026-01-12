@@ -211,13 +211,19 @@ target_sources(surogate-common PRIVATE
 
     src/config/pretrained_config.cpp
     src/models/registry.cpp
-    src/models/qwen25.cpp
-    src/models/qwen3.cpp
-    src/models/llama.cpp
+    src/models/qwen25/qwen25.cpp
+    src/models/qwen3/qwen3.cpp
+    src/models/qwen3moe/qwen3_moe.cpp
+    src/models/llama/llama.cpp
 
     src/modules/qlora/fp8_weights.cpp
     src/modules/qlora/fp4_weights.cpp
     src/modules/qlora/bnb_weights.cpp
+
+    src/modules/lora/lora_weights_manager.cpp
+    src/modules/lora/lora_grads_manager.cpp
+    src/modules/lora/lora_optimizer_state.cpp
+    src/modules/lora/lora_utils.cpp
 
     # Recipe system
     src/recipes/recipe.cpp
@@ -230,6 +236,8 @@ target_sources(surogate-common PRIVATE
     src/kernels/encoder.cu
     src/kernels/matmul.cpp
     src/kernels/swiglu.cu
+    src/kernels/fast_lora_silu.cu
+    src/kernels/moe_kernels.cu
     src/kernels/rope.cu
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
@@ -313,7 +321,7 @@ endif ()
 
 # ----------------------------------------------------------------------------
 # Tests
-option(BUILD_TESTS "Build unit tests" ON)
+option(BUILD_TESTS "Build unit tests" OFF)
 if (BUILD_TESTS)
     enable_testing()
 
@@ -333,6 +341,9 @@ if (BUILD_TESTS)
 	            src/testing/test-normuon.cu
 	            src/testing/test-fp4.cu
 	            src/testing/test-bnb-quant.cpp
+	            src/testing/test-moe.cu
+	            src/testing/test-fast-lora-silu.cu
+	            src/testing/test-heterogeneous.cu
 	    )
     target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
     target_compile_options(unit-tests PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)

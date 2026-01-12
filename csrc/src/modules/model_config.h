@@ -11,6 +11,8 @@
 
 #include "config/pretrained_config.h"
 #include "fp8_scaling_config.h"
+#include "models/qwen25/config.h"
+#include "models/qwen3moe/config.h"
 #include "training/runtime_options.h"
 #include "utilities/dtype.h"
 
@@ -64,16 +66,57 @@ struct MoEConfig {
     float router_aux_loss_coef = 0.01f;  ///< Load balancing auxiliary loss coefficient
     bool router_jitter = false;     ///< Add noise during routing for training stability
     float capacity_factor = 1.25f;  ///< Expert capacity factor for load balancing
+
+    // Qwen3 MoE-style layer configuration
+    int decoder_sparse_step = 1;    ///< MoE layer frequency: MoE every N layers (1 = all MoE)
+    std::vector<int> mlp_only_layers; ///< Explicit list of layer indices using dense MLP instead of MoE
+    bool norm_topk_prob = false;    ///< Normalize top-k routing weights to sum to 1 (Qwen3 style)
+    int moe_intermediate_size = 0;  ///< Per-expert intermediate size (0 = use IntermediateSize)
+};
+
+/**
+ * @brief Block types for heterogeneous architectures
+ */
+enum class BlockType {
+    Dense,       ///< Standard dense transformer block
+    MoE,         ///< Mixture of Experts block
+    Conv,        ///< Convolutional block (for LFM2)
+    SwitchMoE    ///< Switch Transformer style (top-1 routing)
 };
 
 /**
  * @brief Per-layer configuration override for hybrid architectures
  */
 struct LayerOverride {
-    int layer_idx;                  ///< Which layer this override applies to
-    bool is_moe = false;            ///< Whether this layer uses MoE
-    std::optional<int> num_experts; ///< Override number of experts for this layer
-    std::optional<int> intermediate_size;  ///< Override intermediate size
+    int layer_idx;                          ///< Which layer this override applies to
+    BlockType block_type = BlockType::Dense; ///< Block type for this layer
+    bool is_moe = false;                    ///< Whether this layer uses MoE (deprecated, use block_type)
+    std::optional<int> num_experts;         ///< Override number of experts for this layer
+    std::optional<int> intermediate_size;   ///< Override intermediate size
+    std::optional<int> top_k;               ///< Override top-k for MoE layers
+
+    // Convenience constructors
+    static LayerOverride dense(int idx) {
+        return LayerOverride{idx, BlockType::Dense, false};
+    }
+
+    static LayerOverride moe(int idx, int experts = 8, int k = 2) {
+        LayerOverride override{idx, BlockType::MoE, true};
+        override.num_experts = experts;
+        override.top_k = k;
+        return override;
+    }
+
+    static LayerOverride switch_moe(int idx, int experts = 128) {
+        LayerOverride override{idx, BlockType::SwitchMoE, true};
+        override.num_experts = experts;
+        override.top_k = 1;
+        return override;
+    }
+
+    static LayerOverride conv(int idx) {
+        return LayerOverride{idx, BlockType::Conv, false};
+    }
 };
 
 /**
@@ -101,16 +144,54 @@ struct ModelConfig : public PretrainedConfig {
     bool use_sliding_window = false;     ///< Sliding window attention (Mistral)
     int sliding_window_size = 4096;      ///< Size of sliding window
 
+    // MoE convenience fields (copied from moe_config for direct access)
+    // These are populated by from_pretrained_config when moe_config is set
+    int NumExperts = 0;              ///< Number of experts (0 = dense model)
+    int NumExpertsPerTok = 0;        ///< Top-K experts per token
+    int MoeIntermediateSize = 0;     ///< Per-expert intermediate size
+
     // Extended RoPE configuration
     float rope_scaling_factor = 1.0f;    ///< RoPE scaling for longer contexts
     std::string rope_type = "default";   ///< RoPE type: "default", "linear", "dynamic", "yarn"
 
     /**
      * @brief Construct from existing PretrainedConfig
+     *
+     * Handles the config inheritance hierarchy, extracting MoE-specific
+     * fields from Qwen3MoEConfig if applicable.
      */
     static ModelConfig from_pretrained_config(const PretrainedConfig& base) {
         ModelConfig config;
-        static_cast<PretrainedConfig&>(config) = base;
+
+        // Copy base fields
+        config.Architecture = base.Architecture;
+        config.BosTokenId = base.BosTokenId;
+        config.EosTokenId = base.EosTokenId;
+        config.PadTokenId = base.PadTokenId;
+        config.HiddenSize = base.HiddenSize;
+        config.IntermediateSize = base.IntermediateSize;
+        config.VocabSize = base.VocabSize;
+        config.NumQueryHeads = base.NumQueryHeads;
+        config.NumKeyValHeads = base.NumKeyValHeads;
+        config.NumLayers = base.NumLayers;
+        config.HeadDim = base.HeadDim;
+        config.MaxPositionEmbeddings = base.MaxPositionEmbeddings;
+        config.RopeTheta = base.RopeTheta;
+        config.Rope = base.Rope;
+        config.RmsNormEps = base.RmsNormEps;
+        config.TiedWordEmbeddings = base.TiedWordEmbeddings;
+        config.UseQKVBias = base.UseQKVBias;
+        config.UseQKNorm = base.UseQKNorm;
+        config.DType = base.DType;
+
+        // Copy QK norm setting
+        config.use_qk_norm = base.has_qk_norm();
+
+        // Check for sliding window (Qwen2Config and derived)
+        if (const auto* qwen2 = dynamic_cast<const Qwen2Config*>(&base)) {
+            config.use_sliding_window = qwen2->SlidingWindow > 0;
+            config.sliding_window_size = qwen2->SlidingWindow;
+        }
 
         // Infer attention type from head counts
         if (config.NumKeyValHeads == 1) {
@@ -121,29 +202,110 @@ struct ModelConfig : public PretrainedConfig {
             config.attention_type = AttentionType::MHA;
         }
 
+        // Check for MoE configuration (Qwen3MoEConfig)
+        if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&base)) {
+            if (moe_cfg->NumExperts > 0) {
+                config.architecture = ArchitectureType::MoE;
+
+                // Set up MoE config from Qwen3MoEConfig fields
+                MoEConfig moe;
+                moe.num_experts = moe_cfg->NumExperts;
+                moe.top_k = moe_cfg->NumExpertsPerTok;
+                moe.moe_intermediate_size = moe_cfg->MoeIntermediateSize;
+                moe.decoder_sparse_step = moe_cfg->DecoderSparseStep;
+                moe.mlp_only_layers = moe_cfg->MlpOnlyLayers;
+                moe.norm_topk_prob = moe_cfg->NormTopkProb;
+                moe.router_aux_loss_coef = moe_cfg->RouterAuxLossCoef;
+                config.moe_config = moe;
+
+                // Also populate convenience fields for direct access
+                config.NumExperts = moe_cfg->NumExperts;
+                config.NumExpertsPerTok = moe_cfg->NumExpertsPerTok;
+                config.MoeIntermediateSize = moe_cfg->MoeIntermediateSize;
+            }
+        }
+
         return config;
     }
 
-    // Backwards-compatible name.
-    static ModelConfig from_llama_config(const PretrainedConfig& base) { return from_pretrained_config(base); }
-
     /**
      * @brief Check if a specific layer uses MoE
+     *
+     * For MoE/Hybrid architectures, this follows the Qwen3 MoE pattern:
+     * 1. If layer is in mlp_only_layers, it's NOT MoE (dense MLP)
+     * 2. Otherwise, if (layer_idx + 1) % decoder_sparse_step == 0, it's MoE
+     * 3. Layer overrides take precedence over the above rules
      */
     [[nodiscard]] bool is_layer_moe(int layer_idx) const {
         if (architecture == ArchitectureType::Dense) {
             return false;
         }
+
+        // Check explicit layer overrides first (highest priority)
+        for (const auto& override : layer_overrides) {
+            if (override.layer_idx == layer_idx) {
+                return override.block_type == BlockType::MoE ||
+                       override.block_type == BlockType::SwitchMoE ||
+                       override.is_moe;  // Backwards compatibility
+            }
+        }
+
+        // For MoE/Hybrid architectures, use Qwen3-style pattern
+        if (architecture == ArchitectureType::MoE || architecture == ArchitectureType::Hybrid) {
+            if (moe_config.has_value()) {
+                const auto& moe = moe_config.value();
+
+                // Check if this layer is explicitly marked as dense (mlp_only_layers)
+                for (int dense_layer : moe.mlp_only_layers) {
+                    if (dense_layer == layer_idx) {
+                        return false;
+                    }
+                }
+
+                // Check decoder_sparse_step pattern: MoE if (layer_idx + 1) % step == 0
+                // With step=1, all layers are MoE (default behavior)
+                // With step=2, layers 1,3,5,... are MoE (every other layer starting from 1)
+                if (moe.num_experts > 0) {
+                    return (layer_idx + 1) % moe.decoder_sparse_step == 0;
+                }
+            }
+        }
+
+        // Default: MoE architecture means all layers are MoE, Hybrid means dense
+        return architecture == ArchitectureType::MoE;
+    }
+
+    /**
+     * @brief Get the block type for a specific layer
+     */
+    [[nodiscard]] BlockType get_block_type(int layer_idx) const {
+        if (architecture == ArchitectureType::Dense) {
+            return BlockType::Dense;
+        }
         if (architecture == ArchitectureType::MoE) {
-            return true;
+            return BlockType::MoE;
         }
         // Hybrid: check overrides
         for (const auto& override : layer_overrides) {
             if (override.layer_idx == layer_idx) {
-                return override.is_moe;
+                return override.block_type;
             }
         }
-        return false;  // Default to dense for hybrid
+        return BlockType::Dense;  // Default to dense for hybrid
+    }
+
+    /**
+     * @brief Get top-k for routing in a specific layer
+     */
+    [[nodiscard]] int get_top_k(int layer_idx) const {
+        // Check for layer override
+        for (const auto& override : layer_overrides) {
+            if (override.layer_idx == layer_idx && override.top_k.has_value()) {
+                return override.top_k.value();
+            }
+        }
+        // Default from MoE config
+        return moe_config.has_value() ? moe_config->top_k : 2;
     }
 
     /**

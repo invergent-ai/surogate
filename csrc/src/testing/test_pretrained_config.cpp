@@ -43,15 +43,16 @@ TEST_CASE("load_pretrained_config: Qwen2ForCausalLM parses", "[config][qwen2]") 
     auto path = write_temp_json(j, "surogate_test_qwen2_config.json");
 
     auto cfg = load_pretrained_config(path.c_str(), ETensorDType::BF16);
-    REQUIRE(cfg.Architecture == PretrainedConfig::QWEN2);
-    REQUIRE(cfg.HiddenSize == 896);
-    REQUIRE(cfg.NumQueryHeads == 14);
-    REQUIRE(cfg.NumKeyValHeads == 2);
-    REQUIRE(cfg.HeadDim == 0);
-    REQUIRE(cfg.UseQKNorm == false);
-    REQUIRE(cfg.UseQKVBias == true);
-    REQUIRE(cfg.PadTokenId == cfg.BosTokenId);
-    REQUIRE(cfg.head_size() == 896 / 14);
+    REQUIRE(cfg != nullptr);
+    REQUIRE(cfg->Architecture == PretrainedConfig::QWEN2);
+    REQUIRE(cfg->HiddenSize == 896);
+    REQUIRE(cfg->NumQueryHeads == 14);
+    REQUIRE(cfg->NumKeyValHeads == 2);
+    REQUIRE(cfg->HeadDim == 0);
+    REQUIRE(cfg->UseQKNorm == false);
+    REQUIRE(cfg->UseQKVBias == true);
+    REQUIRE(cfg->PadTokenId == cfg->BosTokenId);
+    REQUIRE(cfg->head_size() == 896 / 14);
 }
 
 TEST_CASE("load_pretrained_config: Qwen3ForCausalLM parses head_dim + qk_norm", "[config][qwen3]") {
@@ -75,21 +76,23 @@ TEST_CASE("load_pretrained_config: Qwen3ForCausalLM parses head_dim + qk_norm", 
     auto path = write_temp_json(j, "surogate_test_qwen3_config.json");
 
     auto cfg = load_pretrained_config(path.c_str(), ETensorDType::BF16);
-    REQUIRE(cfg.Architecture == PretrainedConfig::QWEN3);
-    REQUIRE(cfg.HiddenSize == 1024);
-    REQUIRE(cfg.NumQueryHeads == 16);
-    REQUIRE(cfg.HeadDim == 128);
-    REQUIRE(cfg.head_size() == 128);
-    REQUIRE(cfg.attn_out_channels() == 16 * 128);
-    REQUIRE(cfg.UseQKNorm == true);
-    REQUIRE(cfg.UseQKVBias == false);
-    REQUIRE(cfg.PadTokenId == cfg.BosTokenId);
+    REQUIRE(cfg != nullptr);
+    REQUIRE(cfg->Architecture == PretrainedConfig::QWEN3);
+    REQUIRE(cfg->HiddenSize == 1024);
+    REQUIRE(cfg->NumQueryHeads == 16);
+    REQUIRE(cfg->HeadDim == 128);
+    REQUIRE(cfg->head_size() == 128);
+    REQUIRE(cfg->attn_out_channels() == 16 * 128);
+    REQUIRE(cfg->UseQKNorm == true);
+    REQUIRE(cfg->UseQKVBias == false);
+    REQUIRE(cfg->PadTokenId == cfg->BosTokenId);
 }
 
 TEST_CASE("create_pretrained_config_from_name: Qwen2.5 preset still works", "[config][preset]") {
     auto cfg = create_pretrained_config_from_name("Qwen2.5-0.5B", ETensorDType::BF16);
-    REQUIRE(cfg.Architecture == PretrainedConfig::QWEN2);
-    REQUIRE(cfg.HiddenSize == 896);
-    REQUIRE(cfg.NumLayers == 24);
+    REQUIRE(cfg != nullptr);
+    REQUIRE(cfg->Architecture == PretrainedConfig::QWEN2);
+    REQUIRE(cfg->HiddenSize == 896);
+    REQUIRE(cfg->NumLayers == 24);
 }
 

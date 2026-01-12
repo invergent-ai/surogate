@@ -12,6 +12,7 @@ from surogate.train.reporter import training_logger_context
 from surogate.train.training_plot import generate_training_plot
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
+from surogate.utils.system_info import get_system_info, print_system_diagnostics
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
@@ -37,8 +38,8 @@ class SurogateTrainerWrapper():
                                                 seed=config.eval_seed) if eval_files else None
 
         # Calculate steps
-        self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
-
+        self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size    
+            
         # Create trainer
         self.start_step = 0
         if config.resume_from_checkpoint:

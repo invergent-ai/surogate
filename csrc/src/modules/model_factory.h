@@ -10,12 +10,26 @@
 #include <stdexcept>
 
 #include "model_config.h"
-#include "modular_model.h"
+#include "model/modular_model.h"
+#include "model/heterogeneous_model.h"
 #include "composite/transformer_block.h"
 #include "moe/moe_block.h"
 
+// Model class headers for inheritance-based dispatch
+#include "models/llama/llama_model.h"
+#include "models/qwen25/qwen25_model.h"
+#include "models/qwen3/qwen3_model.h"
+#include "models/qwen3moe/qwen3_moe_model.h"
+#include "models/llama/transformer_block.h"
+#include "models/qwen25/transformer_block.h"
+#include "models/qwen3/transformer_block.h"
+#include "models/qwen3moe/qwen3_moe_block.h"
+
 #include "training/model.h"
 #include "utilities/allocator.h"
+#include "lora/lora_model.h"
+#include "lora/lora_config.h"
+#include "qlora/qlora_config.h"
 
 namespace modules {
 
@@ -64,6 +78,25 @@ public:
         }
     }
 
+    /**
+     * @brief Create a model from PretrainedConfig using inheritance-based dispatch
+     *
+     * Dispatches to the correct model class based on the config's architecture ID:
+     * - QWEN3_MOE -> Qwen3MoEModel or Qwen3HybridModel
+     * - QWEN3     -> Qwen3Model
+     * - QWEN2     -> Qwen2Model
+     * - LLAMA     -> LlamaModel
+     *
+     * This follows the Transformers-like inheritance pattern where config type
+     * determines model class, enabling model-specific behaviors.
+     *
+     * @param config PretrainedConfig (or derived) instance
+     * @param options Runtime options
+     * @param rank Process rank for sharding
+     * @param world World size
+     * @param alloc Optional tensor allocator
+     * @return Unique pointer to model (as IModel)
+     */
     static std::unique_ptr<IModel> create_from_pretrained_config(
         const PretrainedConfig& config,
         const RuntimeOptions& options,
@@ -74,22 +107,154 @@ public:
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
         ModelOptions mod_options = ModelOptions::from_runtime_options(options);
 
-        return create(mod_config, mod_options, rank, world, alloc);
+        // Dispatch based on config architecture ID (most specific first)
+        switch (config.Architecture) {
+            case PretrainedConfig::QWEN3_MOE: {
+                // Qwen3 MoE - use dynamic_cast for additional config fields
+                if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&config)) {
+                    return create_qwen3_moe_model(*moe_cfg, mod_options, rank, world, alloc);
+                }
+                // Fallback if dynamic_cast fails but Architecture says MoE
+                return create_moe_model(mod_config, mod_options, rank, world, alloc);
+            }
+
+            case PretrainedConfig::QWEN3:
+                return std::make_unique<Qwen3Model>(mod_config, mod_options, rank, world, alloc);
+
+            case PretrainedConfig::QWEN2:
+                return std::make_unique<Qwen2Model>(mod_config, mod_options, rank, world, alloc);
+
+            case PretrainedConfig::LLAMA:
+            default:
+                return std::make_unique<LlamaModel>(mod_config, mod_options, rank, world, alloc);
+        }
     }
 
-    // Backwards-compatible name.
-    static std::unique_ptr<IModel> create_from_llama_config(
+    /**
+     * @brief Create a LoRA-wrapped model from PretrainedConfig
+     *
+     * Dispatches to the correct model + LoRA wrapper based on the config's architecture ID.
+     * This centralizes the type-dispatching logic that would otherwise be duplicated
+     * across callers (py_train.cpp, etc.).
+     *
+     * @param config PretrainedConfig (or derived) instance
+     * @param lora_config LoRA configuration (rank, alpha, targets, etc.)
+     * @param options Runtime options
+     * @param comm NCCL communicator for distributed setup
+     * @param alloc Tensor allocator
+     * @param qlora_config Optional QLoRA configuration for quantized base weights
+     * @return Unique pointer to LoRA-wrapped model (as IModel)
+     */
+    static std::unique_ptr<IModel> create_lora_from_pretrained_config(
         const PretrainedConfig& config,
+        const ModularLoRAConfig& lora_config,
         const RuntimeOptions& options,
-        int rank,
-        int world,
-        const std::shared_ptr<TensorAllocator>& alloc = nullptr) {
-        return create_from_pretrained_config(config, options, rank, world, alloc);
+        NCCLCommunicator& comm,
+        const std::shared_ptr<TensorAllocator>& alloc,
+        const QLoRAConfig& qlora_config = QLoRAConfig{}) {
+
+        ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
+        ModelOptions mod_options = ModelOptions::from_runtime_options(options);
+
+        // QLoRA: skip block weight allocation since weights are provided by QLoRA weight provider
+        if (qlora_config.is_quantized()) {
+            mod_options.skip_block_allocation = true;
+        }
+
+        // Dispatch based on config architecture ID (most specific first)
+        switch (config.Architecture) {
+            case PretrainedConfig::QWEN3_MOE: {
+                // Qwen3 MoE
+                using Block = Qwen3MoEBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::QWEN3: {
+                // Qwen3 dense
+                using Block = Qwen3TransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::QWEN2: {
+                // Qwen2 dense
+                using Block = Qwen2TransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::LLAMA:
+            default: {
+                // LLaMA dense
+                using Block = LlamaTransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+        }
+    }
+
+    /**
+     * @brief Try to cast a model to a LoRA model and invoke a callback
+     *
+     * Helper for operations that need access to the typed ModularLoRAModel
+     * (e.g., export_adapter, get_lora_gradients). Returns true if cast succeeded.
+     *
+     * @tparam Callback Callable taking ModularLoRAModel<Block>*
+     * @param model The IModel to try casting
+     * @param callback The callback to invoke if cast succeeds
+     * @return true if any cast succeeded and callback was invoked
+     */
+    template<typename Callback>
+    static bool try_lora_model(IModel* model, Callback&& callback) {
+        // Try dense block types (most specific first)
+        if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen3TransformerBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen2TransformerBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<LlamaTransformerBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<DenseTransformerBlock<>>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        // Try MoE block types
+        if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen3MoEBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<StandardMoEBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        return false;
     }
 
 private:
     /**
      * @brief Create a dense transformer model
+     *
+     * Dispatches to the correct model class based on ModelConfig's architecture
+     * hint or uses inheritance-based selection when available.
+     *
+     * Model hierarchy for dense architectures:
+     * - LlamaModel (default, uses LlamaTransformerBlock)
+     * - Qwen2Model (uses Qwen2TransformerBlock with sliding window support)
+     * - Qwen3Model (uses Qwen3TransformerBlock with QK normalization)
      */
     static std::unique_ptr<IModel> create_dense_model(
         const ModelConfig& config,
@@ -98,22 +263,45 @@ private:
         int world,
         const std::shared_ptr<TensorAllocator>& alloc) {
 
-        // Select block type based on activation and norm types
-        // For now, default to DenseTransformerBlock with standard components
+        // Dispatch based on config hints
+        // The config may have been converted from a PretrainedConfig, so we check
+        // for model-specific features to select the correct block type.
 
-        using DefaultBlock = DenseTransformerBlock<>;
+        // Check for Qwen3-specific features (QK normalization)
+        if (config.use_qk_norm) {
+            return std::make_unique<Qwen3Model>(config, options, rank, world, alloc);
+        }
 
-        return std::make_unique<ModularTransformerModel<DefaultBlock>>(
-            config, options, rank, world, alloc);
+        // Check for Qwen2-specific features (sliding window)
+        if (config.use_sliding_window && config.sliding_window_size > 0) {
+            return std::make_unique<Qwen2Model>(config, options, rank, world, alloc);
+        }
+
+        // Check for QKV bias (common in Qwen2, but also can be in others)
+        // This is a weaker signal, so we use LlamaModel which handles bias correctly
+        if (config.UseQKVBias) {
+            // Qwen2 typically has bias, but if no sliding window, it might be
+            // a variant - use Qwen2 block anyway for proper bias handling
+            return std::make_unique<Qwen2Model>(config, options, rank, world, alloc);
+        }
+
+        // Default to LlamaModel
+        return std::make_unique<LlamaModel>(config, options, rank, world, alloc);
     }
 
     /**
      * @brief Create a Mixture-of-Experts model
      *
      * Supports various MoE configurations:
+     * - Qwen3 MoE (Qwen3MoEModel with Qwen3RouterModule)
      * - Standard top-k routing (Mixtral-style)
      * - Switch routing (top-1)
      * - With or without shared expert (Nemotron/DeepSeek style)
+     *
+     * Model hierarchy for MoE architectures:
+     * - Qwen3MoEModel (uses Qwen3MoEBlock with Qwen3Router)
+     * - StandardMoEBlock (generic MoE with TopKRouter)
+     * - SwitchTransformerBlock (top-1 routing)
      */
     static std::unique_ptr<IModel> create_moe_model(
         const ModelConfig& config,
@@ -127,6 +315,11 @@ private:
         }
 
         const auto& moe_cfg = config.moe_config.value();
+
+        // Check for Qwen3-specific features (QK norm) to use Qwen3MoEModel
+        if (config.use_qk_norm) {
+            return std::make_unique<Qwen3MoEModel>(config, options, rank, world, alloc);
+        }
 
         // Select router type based on top_k
         if (moe_cfg.top_k == 1) {
@@ -144,6 +337,14 @@ private:
 
     /**
      * @brief Create a hybrid (mixed dense/MoE) model
+     *
+     * Uses HeterogeneousTransformerModel with std::variant to support
+     * different block types per layer while preserving type safety.
+     *
+     * Supports:
+     * - Dense + MoE hybrid (DeepSeek, Nemotron style)
+     * - Dense + SwitchMoE hybrid
+     * - Future: Dense + Conv hybrid (LFM2)
      */
     static std::unique_ptr<IModel> create_hybrid_model(
         const ModelConfig& config,
@@ -152,11 +353,34 @@ private:
         int world,
         const std::shared_ptr<TensorAllocator>& alloc) {
 
-        // TODO: Implement hybrid model with per-layer block selection
-        throw std::runtime_error("Hybrid models not yet implemented");
+        // Validate that we have layer overrides
+        if (config.layer_overrides.empty()) {
+            throw std::invalid_argument(
+                "Hybrid architecture requires layer_overrides to specify per-layer block types");
+        }
 
-        // Future implementation would require runtime polymorphism
-        // or code generation for specific layer patterns
+        // Check what block types are needed
+        bool has_switch_moe = false;
+        for (const auto& override : config.layer_overrides) {
+            if (override.block_type == BlockType::SwitchMoE) {
+                has_switch_moe = true;
+                break;
+            }
+        }
+
+        // For now, we support Dense + MoE and Dense + SwitchMoE
+        // More combinations can be added by extending the template instantiation
+        if (has_switch_moe) {
+            // Dense + SwitchMoE variant
+            using HybridModel = HeterogeneousTransformerModel<
+                DenseTransformerBlock<>,
+                SwitchTransformerBlock
+            >;
+            return std::make_unique<HybridModel>(config, options, rank, world, alloc);
+        } else {
+            // Default: Dense + MoE variant
+            return std::make_unique<DefaultHeterogeneousModel>(config, options, rank, world, alloc);
+        }
     }
 };
 
@@ -358,310 +582,6 @@ private:
 // ============================================================================
 // Predefined model configurations
 // ============================================================================
-
-namespace presets {
-
-/**
- * @brief LLaMA 7B configuration
- */
-inline ModelConfig llama_7b(ETensorDType dtype = ETensorDType::BF16) {
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::Dense)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(4096)
-        .intermediate_size(11008)
-        .vocab_size(32000)
-        .num_layers(32)
-        .num_query_heads(32)
-        .num_kv_heads(32)
-        .max_position_embeddings(2048)
-        .rope_theta(10000.0f)
-        .rms_norm_eps(1e-5f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief LLaMA 13B configuration
- */
-inline ModelConfig llama_13b(ETensorDType dtype = ETensorDType::BF16) {
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::Dense)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(5120)
-        .intermediate_size(13824)
-        .vocab_size(32000)
-        .num_layers(40)
-        .num_query_heads(40)
-        .num_kv_heads(40)
-        .max_position_embeddings(2048)
-        .rope_theta(10000.0f)
-        .rms_norm_eps(1e-5f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Qwen2 0.5B configuration
- */
-inline ModelConfig qwen2_0_5b(ETensorDType dtype = ETensorDType::BF16) {
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::Dense)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(896)
-        .intermediate_size(4864)
-        .vocab_size(151936)
-        .num_layers(24)
-        .num_query_heads(14)
-        .num_kv_heads(2)
-        .max_position_embeddings(32768)
-        .rope_theta(1000000.0f)
-        .rms_norm_eps(1e-6f)
-        .tied_embeddings(true)
-        .use_qkv_bias(true)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Qwen2 1.5B configuration
- */
-inline ModelConfig qwen2_1_5b(ETensorDType dtype = ETensorDType::BF16) {
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::Dense)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(1536)
-        .intermediate_size(8960)
-        .vocab_size(151936)
-        .num_layers(28)
-        .num_query_heads(12)
-        .num_kv_heads(2)
-        .max_position_embeddings(32768)
-        .rope_theta(1000000.0f)
-        .rms_norm_eps(1e-6f)
-        .tied_embeddings(true)
-        .use_qkv_bias(true)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Qwen2 7B configuration
- */
-inline ModelConfig qwen2_7b(ETensorDType dtype = ETensorDType::BF16) {
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::Dense)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(3584)
-        .intermediate_size(18944)
-        .vocab_size(152064)
-        .num_layers(28)
-        .num_query_heads(28)
-        .num_kv_heads(4)
-        .max_position_embeddings(131072)
-        .rope_theta(1000000.0f)
-        .rms_norm_eps(1e-6f)
-        .tied_embeddings(false)
-        .use_qkv_bias(true)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Mistral 7B configuration
- */
-inline ModelConfig mistral_7b(ETensorDType dtype = ETensorDType::BF16) {
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::Dense)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(4096)
-        .intermediate_size(14336)
-        .vocab_size(32000)
-        .num_layers(32)
-        .num_query_heads(32)
-        .num_kv_heads(8)
-        .max_position_embeddings(32768)
-        .rope_theta(10000.0f)
-        .rms_norm_eps(1e-5f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .sliding_window(4096)
-        .dtype(dtype)
-        .build();
-}
-
-// ============================================================================
-// MoE model presets
-// ============================================================================
-
-/**
- * @brief Mixtral 8x7B configuration
- *
- * 8 experts with top-2 routing per token.
- * Each expert is a standard MLP with SwiGLU activation.
- */
-inline ModelConfig mixtral_8x7b(ETensorDType dtype = ETensorDType::BF16) {
-    MoEConfig moe;
-    moe.num_experts = 8;
-    moe.top_k = 2;
-    moe.use_shared_expert = false;
-    moe.router_aux_loss_coef = 0.01f;
-    moe.capacity_factor = 1.25f;
-
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::MoE)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(4096)
-        .intermediate_size(14336)  // Per-expert intermediate size
-        .vocab_size(32000)
-        .num_layers(32)
-        .num_query_heads(32)
-        .num_kv_heads(8)
-        .max_position_embeddings(32768)
-        .rope_theta(1000000.0f)
-        .rms_norm_eps(1e-5f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .sliding_window(4096)
-        .moe(moe)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Mixtral 8x22B configuration
- */
-inline ModelConfig mixtral_8x22b(ETensorDType dtype = ETensorDType::BF16) {
-    MoEConfig moe;
-    moe.num_experts = 8;
-    moe.top_k = 2;
-    moe.use_shared_expert = false;
-    moe.router_aux_loss_coef = 0.01f;
-    moe.capacity_factor = 1.25f;
-
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::MoE)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(6144)
-        .intermediate_size(16384)
-        .vocab_size(32768)
-        .num_layers(56)
-        .num_query_heads(48)
-        .num_kv_heads(8)
-        .max_position_embeddings(65536)
-        .rope_theta(1000000.0f)
-        .rms_norm_eps(1e-5f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .sliding_window(4096)
-        .moe(moe)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Qwen2 MoE configuration (A14B style)
- *
- * 60 experts with top-6 routing, plus a shared expert.
- */
-inline ModelConfig qwen2_moe_a14b(ETensorDType dtype = ETensorDType::BF16) {
-    MoEConfig moe;
-    moe.num_experts = 60;
-    moe.top_k = 6;
-    moe.use_shared_expert = true;
-    moe.shared_expert_size = 5632;  // Shared expert size
-    moe.router_aux_loss_coef = 0.001f;
-    moe.capacity_factor = 1.5f;
-
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::MoE)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(3584)
-        .intermediate_size(2560)  // Per-expert (smaller due to many experts)
-        .vocab_size(151936)
-        .num_layers(28)
-        .num_query_heads(28)
-        .num_kv_heads(4)
-        .max_position_embeddings(32768)
-        .rope_theta(1000000.0f)
-        .rms_norm_eps(1e-6f)
-        .tied_embeddings(false)
-        .use_qkv_bias(true)
-        .moe(moe)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief DeepSeek MoE V2 Lite configuration
- *
- * DeepSeek-style with shared expert and fine-grained experts.
- */
-inline ModelConfig deepseek_moe_16b(ETensorDType dtype = ETensorDType::BF16) {
-    MoEConfig moe;
-    moe.num_experts = 64;
-    moe.top_k = 6;
-    moe.use_shared_expert = true;
-    moe.shared_expert_size = 11008;  // 2x regular expert size
-    moe.router_aux_loss_coef = 0.001f;
-    moe.capacity_factor = 1.25f;
-
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::MoE)
-        .activation(ActivationType::SwiGLU)
-        .hidden_size(4096)
-        .intermediate_size(1408)  // Small per-expert size (fine-grained)
-        .vocab_size(102400)
-        .num_layers(28)
-        .num_query_heads(32)
-        .num_kv_heads(32)
-        .max_position_embeddings(4096)
-        .rope_theta(10000.0f)
-        .rms_norm_eps(1e-6f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .moe(moe)
-        .dtype(dtype)
-        .build();
-}
-
-/**
- * @brief Switch Transformer base configuration
- *
- * Single expert per token (top-1 routing) for maximum efficiency.
- */
-inline ModelConfig switch_base(ETensorDType dtype = ETensorDType::BF16) {
-    MoEConfig moe;
-    moe.num_experts = 128;
-    moe.top_k = 1;  // Switch routing
-    moe.use_shared_expert = false;
-    moe.router_aux_loss_coef = 0.01f;
-    moe.capacity_factor = 1.25f;
-
-    return ModelConfigBuilder()
-        .architecture(ArchitectureType::MoE)
-        .activation(ActivationType::GeLU)  // Original Switch uses GeLU
-        .hidden_size(768)
-        .intermediate_size(2048)
-        .vocab_size(32128)
-        .num_layers(12)
-        .num_query_heads(12)
-        .num_kv_heads(12)
-        .max_position_embeddings(512)
-        .rope_theta(10000.0f)
-        .rms_norm_eps(1e-6f)
-        .tied_embeddings(false)
-        .use_qkv_bias(false)
-        .moe(moe)
-        .dtype(dtype)
-        .build();
-}
-
-} // namespace presets
 
 } // namespace modules
 

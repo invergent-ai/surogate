@@ -179,10 +179,10 @@ public:
      * @brief Whether this recipe handles forward matmul dispatch
      *
      * When true, the model should use recipe->forward_matmul() for all projections
-     * instead of the legacy conditional logic. This allows recipes to fully control
+     * instead of the conditional logic. This allows recipes to fully control
      * the matmul path.
      *
-     * Default: false (use legacy code path for backward compatibility)
+     * Default: false (use code path for backward compatibility)
      */
     [[nodiscard]] virtual bool handles_forward_matmul() const { return false; }
 

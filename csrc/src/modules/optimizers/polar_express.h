@@ -118,32 +118,6 @@ void apply_scale(
 );
 
 /**
- * @brief Compute matrix product C = A @ B
- *
- * General batched matrix multiplication for Polar Express.
- * Supports non-square matrices.
- *
- * @param A Input matrix (batch, M, K)
- * @param B Input matrix (batch, K, N)
- * @param C Output matrix (batch, M, N)
- * @param batch Batch size
- * @param M Rows of A and C
- * @param K Cols of A, rows of B
- * @param N Cols of B and C
- * @param stream CUDA stream
- */
-void batched_matmul(
-    const nv_bfloat16* A,
-    const nv_bfloat16* B,
-    nv_bfloat16* C,
-    int batch,
-    int M,
-    int K,
-    int N,
-    cudaStream_t stream
-);
-
-/**
  * @brief Add scaled matrix: C = alpha * A + C
  *
  * @param A Input matrix

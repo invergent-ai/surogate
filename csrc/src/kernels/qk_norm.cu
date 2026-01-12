@@ -579,6 +579,8 @@ void qkv_head_rmsnorm_forward(Tensor& qkv, Tensor& rstd, const Tensor& weight,
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected weight shape");
     }
     if (rstd.Rank != 3 || rstd.Sizes[0] != B || rstd.Sizes[1] != T || rstd.Sizes[2] != num_heads) {
+        fprintf(stderr, "[qk_norm] rstd shape mismatch: rstd.Sizes=[%ld,%ld,%ld], expected=[%d,%d,%d]\n",
+                rstd.Sizes[0], rstd.Sizes[1], rstd.Sizes[2], B, T, num_heads);
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected rstd shape");
     }
 

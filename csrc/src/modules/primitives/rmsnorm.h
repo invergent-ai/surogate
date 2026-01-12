@@ -100,7 +100,6 @@ private:
 };
 
 inline Tensor RMSNormModule::forward_impl(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts) {
-    const int BT = ctx.B * ctx.T;
     const int C = mConfig.hidden_size;
 
     // Save input for backward

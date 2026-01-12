@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 #include "dtype.h"
 #include "utils.h"
@@ -37,6 +38,27 @@ struct Tensor {
             sz *= Sizes[i];
         }
         return sz;
+    }
+
+    [[nodiscard]] bool is_null() const { return Data == nullptr; }
+    [[nodiscard]] bool has_value() const { return Data != nullptr; }
+
+    static Tensor empty(ETensorDType dtype, const std::vector<long>& shape) {
+        if (shape.size() > MAX_TENSOR_DIM) throw std::runtime_error("Tensor rank too large");
+        Tensor t;
+        t.DType = dtype;
+        t.Rank = (int)shape.size();
+        for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[i];
+        for (int i = t.Rank; i < MAX_TENSOR_DIM; ++i) t.Sizes[i] = 1;
+        t.Data = nullptr;
+        t.Device = -1;
+        return t;
+    }
+
+    static Tensor empty_like(const Tensor& other) {
+        Tensor t = other;
+        t.Data = nullptr;
+        return t;
     }
 
     //! this is a debugging function, copying the requested element from the GPU to the CPU
@@ -86,6 +108,12 @@ struct Tensor {
     }
 
     float* scale() {
+        if(Stats == nullptr)
+            return nullptr;
+        return Stats + 1;
+    }
+
+    const float* scale() const {
         if(Stats == nullptr)
             return nullptr;
         return Stats + 1;

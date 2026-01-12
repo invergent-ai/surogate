@@ -41,7 +41,11 @@ FP4WeightsManager::FP4WeightsManager(const Config& config, TensorAllocator& allo
     }
 
     // Allocate FP4 weight storage
-    allocate_fp4_blocks();
+    if (is_moe()) {
+        allocate_moe_blocks();
+    } else {
+        allocate_fp4_blocks();
+    }
 }
 
 FP4WeightsManager::~FP4WeightsManager() {
@@ -173,6 +177,11 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
                                              cudaStream_t stream) {
     std::cerr << "[FP4-QLoRA] importing and quantizing weights from " << file_name << "\n";
 
+    if (is_moe()) {
+        std::cerr << "[FP4-QLoRA] MoE mode: " << num_experts() << " experts per layer, "
+                  << mConfig.qlora_config.num_experts_per_tok << " active per token\n";
+    }
+
     SafeTensorsReader reader(file_name);
 
     // Allocate temporary load buffer for BF16 weights
@@ -183,12 +192,19 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
     const int head_size = mConfig.head_size;
     const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
 
+    // For MoE models, use the per-expert intermediate size
+    const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
+        ? mConfig.qlora_config.moe_intermediate_size
+        : intermediate;
+
     std::size_t max_weight_elems = std::max({
         static_cast<std::size_t>(qkv_out) * hidden,
         static_cast<std::size_t>(hidden) * num_q_heads * head_size,
         static_cast<std::size_t>(2 * intermediate) * hidden,
         static_cast<std::size_t>(hidden) * intermediate,
-        static_cast<std::size_t>(mConfig.vocab_size) * hidden
+        static_cast<std::size_t>(mConfig.vocab_size) * hidden,
+        // For MoE: expert gate_up projection
+        static_cast<std::size_t>(2 * moe_intermediate) * hidden
     });
 
     // Allocate temporary load buffer directly
@@ -209,7 +225,11 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
 
     // Load and quantize each transformer block
     for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-        load_and_quantize_block(layer, reader, stream);
+        if (is_moe()) {
+            load_and_quantize_moe_block(layer, reader, stream);
+        } else {
+            load_and_quantize_block(layer, reader, stream);
+        }
     }
 
     // Sync before freeing load buffer
@@ -449,8 +469,14 @@ void FP4WeightsManager::quantize_fp4_and_store(FP4BlockQuantizedWeight& dest, co
 
 std::size_t FP4WeightsManager::quantized_weights_bytes() const {
     std::size_t total = 0;
-    for (const auto& block : mFP4Blocks) {
-        total += block.bytes();
+    if (is_moe()) {
+        for (const auto& block : mMoEBlocks) {
+            total += block.bytes();
+        }
+    } else {
+        for (const auto& block : mFP4Blocks) {
+            total += block.bytes();
+        }
     }
     total += mEmbeddings.bytes();
     return total;
@@ -459,18 +485,275 @@ std::size_t FP4WeightsManager::quantized_weights_bytes() const {
 float FP4WeightsManager::memory_savings_ratio() const {
     // Calculate what BF16 storage would have been
     std::size_t bf16_bytes = 0;
-    for (const auto& block : mFP4Blocks) {
-        bf16_bytes += static_cast<std::size_t>(block.qkv_proj.M) * block.qkv_proj.K * 2;
-        bf16_bytes += static_cast<std::size_t>(block.out_proj.M) * block.out_proj.K * 2;
-        bf16_bytes += static_cast<std::size_t>(block.gate_up_proj.M) * block.gate_up_proj.K * 2;
-        bf16_bytes += static_cast<std::size_t>(block.down_proj.M) * block.down_proj.K * 2;
-        bf16_bytes += block.ln1_weight.bytes();
-        bf16_bytes += block.ln2_weight.bytes();
+
+    if (is_moe()) {
+        for (const auto& block : mMoEBlocks) {
+            bf16_bytes += static_cast<std::size_t>(block.qkv_proj.M) * block.qkv_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.out_proj.M) * block.out_proj.K * 2;
+            bf16_bytes += block.ln1_weight.bytes();
+            bf16_bytes += block.ln2_weight.bytes();
+            bf16_bytes += block.router_gate.bytes();
+            for (const auto& expert : block.experts) {
+                bf16_bytes += static_cast<std::size_t>(expert.gate_up_proj.M) * expert.gate_up_proj.K * 2;
+                bf16_bytes += static_cast<std::size_t>(expert.down_proj.M) * expert.down_proj.K * 2;
+            }
+        }
+    } else {
+        for (const auto& block : mFP4Blocks) {
+            bf16_bytes += static_cast<std::size_t>(block.qkv_proj.M) * block.qkv_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.out_proj.M) * block.out_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.gate_up_proj.M) * block.gate_up_proj.K * 2;
+            bf16_bytes += static_cast<std::size_t>(block.down_proj.M) * block.down_proj.K * 2;
+            bf16_bytes += block.ln1_weight.bytes();
+            bf16_bytes += block.ln2_weight.bytes();
+        }
     }
     bf16_bytes += mEmbeddings.bytes();
 
     std::size_t actual_bytes = quantized_weights_bytes();
     return 1.0f - static_cast<float>(actual_bytes) / static_cast<float>(bf16_bytes);
+}
+
+// ============================================================================
+// MoE-specific helpers
+// ============================================================================
+
+void FP4WeightsManager::allocate_fp4_weight(FP4BlockQuantizedWeight& weight, int M, int K,
+                                             const std::string& name_prefix) {
+    weight.M = M;
+    weight.K = K;
+
+    // FP4 packed data: M * K / 2 bytes
+    std::size_t packed_bytes = FP4BlockScaleConfig::packed_data_bytes(M, K);
+    weight.data = mAllocator->allocate(ETensorDType::BYTE, (name_prefix + "_fp4").c_str(),
+                                       EAllocationType::ON_DEVICE, {(long)packed_bytes});
+
+    // FP8 block scales with F8_128x4 alignment
+    auto [scale_rows, scale_cols] = FP4BlockScaleConfig::scale_dims(M, K);
+    weight.block_scales_rowwise = mAllocator->allocate(ETensorDType::FP8_E4M3, (name_prefix + "_scales").c_str(),
+                                                        EAllocationType::ON_DEVICE,
+                                                        {(long)scale_rows, (long)scale_cols});
+
+    // Global amax
+    weight.global_amax_rowwise = allocate_global_amax();
+}
+
+void FP4WeightsManager::allocate_moe_blocks() {
+    auto ctx = mAllocator->with_context("FP4_MoE_Weights");
+
+    const int num_layers = mConfig.num_layers;
+    const int hidden = mConfig.hidden_size;
+    const int num_q_heads = mConfig.num_query_heads;
+    const int num_kv_heads = mConfig.num_kv_heads;
+    const int head_size = mConfig.head_size;
+    const int n_experts = num_experts();
+    const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
+        ? mConfig.qlora_config.moe_intermediate_size
+        : mConfig.intermediate_size;
+
+    mMoEBlocks.resize(num_layers);
+
+    for (int layer = 0; layer < num_layers; ++layer) {
+        auto& block = mMoEBlocks[layer];
+
+        // QKV projection
+        const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+        allocate_fp4_weight(block.qkv_proj, qkv_out, hidden,
+                            fmt::format("l{}_qkv", layer));
+
+        // Output projection
+        allocate_fp4_weight(block.out_proj, hidden, num_q_heads * head_size,
+                            fmt::format("l{}_out", layer));
+
+        // Layer norm weights (BF16, not quantized)
+        block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
+                                                 EAllocationType::ON_DEVICE, {(long)hidden});
+        block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
+                                                 EAllocationType::ON_DEVICE, {(long)hidden});
+
+        // QK-norm weights (for models like Qwen3)
+        if (mConfig.use_qk_norm) {
+            block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
+                                                        EAllocationType::ON_DEVICE, {(long)head_size});
+            block.k_norm_weight = mAllocator->allocate(ETensorDType::BF16, "k_norm",
+                                                        EAllocationType::ON_DEVICE, {(long)head_size});
+        }
+
+        // Router gate (BF16, not quantized - small tensor)
+        // NOTE: Allocated as (hidden_size, num_experts) for matmul with TN transpose
+        block.router_gate = mAllocator->allocate(ETensorDType::BF16, "router_gate",
+                                                  EAllocationType::ON_DEVICE,
+                                                  {(long)hidden, (long)n_experts});
+
+        // Expert weights
+        block.experts.resize(n_experts);
+        for (int e = 0; e < n_experts; ++e) {
+            auto& expert = block.experts[e];
+
+            // Gate+Up projection
+            allocate_fp4_weight(expert.gate_up_proj, 2 * moe_intermediate, hidden,
+                                fmt::format("l{}_e{}_gate_up", layer, e));
+
+            // Down projection
+            allocate_fp4_weight(expert.down_proj, hidden, moe_intermediate,
+                                fmt::format("l{}_e{}_down", layer, e));
+        }
+    }
+
+    std::cerr << "[FP4-QLoRA] allocated " << num_layers << " MoE blocks with "
+              << n_experts << " experts each\n";
+}
+
+void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsReader& reader,
+                                                     cudaStream_t stream) {
+    auto& block = mMoEBlocks[layer_idx];
+    const int hidden = mConfig.hidden_size;
+    const int num_q_heads = mConfig.num_query_heads;
+    const int num_kv_heads = mConfig.num_kv_heads;
+    const int head_size = mConfig.head_size;
+    const int n_experts = num_experts();
+    const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
+        ? mConfig.qlora_config.moe_intermediate_size
+        : mConfig.intermediate_size;
+
+    const std::string prefix = fmt::format("model.layers.{}", layer_idx);
+
+    // Helper to load and quantize a weight
+    auto load_and_quantize = [&](const std::string& name, FP4BlockQuantizedWeight& dest, int M, int K) {
+        mLoadBuffer.Sizes[0] = M;
+        mLoadBuffer.Sizes[1] = K;
+        mLoadBuffer.Rank = 2;
+
+        if (const auto* entry = find_entry_opt(reader, name)) {
+            entry->read_tensor(mLoadBuffer, /*allow_cast=*/true);
+            quantize_fp4_and_store(dest, mLoadBuffer, M, K, stream);
+        } else {
+            std::cerr << "[FP4-QLoRA WARN] layer " << layer_idx << " weight not found: " << name << "\n";
+        }
+    };
+
+    // =========================================================================
+    // Attention weights (same as dense)
+    // =========================================================================
+    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+    const std::string qkv_name = prefix + ".self_attn.qkv_proj.weight";
+    if (find_entry_opt(reader, qkv_name)) {
+        load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
+    } else {
+        // Separate Q, K, V
+        const int q_out = num_q_heads * head_size;
+        const int kv_out = num_kv_heads * head_size;
+
+        mLoadBuffer.Sizes[0] = qkv_out;
+        mLoadBuffer.Sizes[1] = hidden;
+        mLoadBuffer.Rank = 2;
+
+        Tensor q_view = mLoadBuffer;
+        q_view.Sizes[0] = q_out;
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_proj.weight")) {
+            entry->read_tensor(q_view, true);
+        }
+
+        Tensor k_view = mLoadBuffer;
+        k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
+        k_view.Sizes[0] = kv_out;
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_proj.weight")) {
+            entry->read_tensor(k_view, true);
+        }
+
+        Tensor v_view = mLoadBuffer;
+        v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
+        v_view.Sizes[0] = kv_out;
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.v_proj.weight")) {
+            entry->read_tensor(v_view, true);
+        }
+
+        mLoadBuffer.Sizes[0] = qkv_out;
+        quantize_fp4_and_store(block.qkv_proj, mLoadBuffer, qkv_out, hidden, stream);
+    }
+
+    // Output projection
+    load_and_quantize(prefix + ".self_attn.o_proj.weight",
+                      block.out_proj, hidden, num_q_heads * head_size);
+
+    // Layer norms
+    if (const auto* entry = find_entry_opt(reader, prefix + ".input_layernorm.weight")) {
+        entry->read_tensor(block.ln1_weight, true);
+    }
+    if (const auto* entry = find_entry_opt(reader, prefix + ".post_attention_layernorm.weight")) {
+        entry->read_tensor(block.ln2_weight, true);
+    }
+
+    // QK-norm weights
+    if (mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_norm.weight")) {
+            entry->read_tensor(block.q_norm_weight.value(), true);
+        }
+        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_norm.weight")) {
+            entry->read_tensor(block.k_norm_weight.value(), true);
+        }
+    }
+
+    // =========================================================================
+    // Router gate (BF16, not quantized)
+    // =========================================================================
+    // Model stores as (num_experts, hidden), we need (hidden, num_experts) for TN matmul
+    if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate.weight")) {
+        // Load into temporary buffer with correct shape
+        mLoadBuffer.Sizes[0] = n_experts;
+        mLoadBuffer.Sizes[1] = hidden;
+        mLoadBuffer.Rank = 2;
+        entry->read_tensor(mLoadBuffer, true);
+
+        // Transpose: (n_experts, hidden) -> (hidden, n_experts)
+        transpose(block.router_gate.get<nv_bfloat16>(),
+                  mLoadBuffer.get<nv_bfloat16>(),
+                  n_experts, hidden, stream);
+    } else {
+        std::cerr << "[FP4-QLoRA WARN] layer " << layer_idx << " router gate not found: "
+                  << prefix << ".mlp.gate.weight - this will cause NaN!\n";
+    }
+
+    // =========================================================================
+    // Expert weights
+    // =========================================================================
+    for (int e = 0; e < n_experts; ++e) {
+        auto& expert = block.experts[e];
+        const std::string exp_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+
+        // Gate+Up projection (may be fused or separate)
+        const std::string gate_up_name = exp_prefix + ".gate_up_proj.weight";
+        if (find_entry_opt(reader, gate_up_name)) {
+            load_and_quantize(gate_up_name, expert.gate_up_proj, 2 * moe_intermediate, hidden);
+        } else {
+            // Separate gate and up - fuse them
+            mLoadBuffer.Sizes[0] = 2 * moe_intermediate;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+
+            // Up in first half
+            Tensor up_view = mLoadBuffer;
+            up_view.Sizes[0] = moe_intermediate;
+            if (const auto* entry = find_entry_opt(reader, exp_prefix + ".up_proj.weight")) {
+                entry->read_tensor(up_view, true);
+            }
+
+            // Gate in second half
+            Tensor gate_view = mLoadBuffer;
+            gate_view.Data = mLoadBuffer.Data + moe_intermediate * hidden * sizeof(nv_bfloat16);
+            gate_view.Sizes[0] = moe_intermediate;
+            if (const auto* entry = find_entry_opt(reader, exp_prefix + ".gate_proj.weight")) {
+                entry->read_tensor(gate_view, true);
+            }
+
+            mLoadBuffer.Sizes[0] = 2 * moe_intermediate;
+            quantize_fp4_and_store(expert.gate_up_proj, mLoadBuffer, 2 * moe_intermediate, hidden, stream);
+        }
+
+        // Down projection
+        load_and_quantize(exp_prefix + ".down_proj.weight",
+                          expert.down_proj, hidden, moe_intermediate);
+    }
 }
 
 } // namespace modules

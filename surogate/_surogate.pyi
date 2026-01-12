@@ -832,6 +832,11 @@ class QLoRAConfig:
         Whether quantization is active (enabled and strategy != None).
         """
     @property
+    def is_moe(self) -> bool:
+        """
+        Whether this is an MoE model (num_experts > 0).
+        """
+    @property
     def strategy(self) -> str:
         """
         Quantization strategy as a string.
@@ -840,6 +845,36 @@ class QLoRAConfig:
     def strategy(self, arg: str) -> None:
         """
         Quantization strategy as a string.
+        """
+    @property
+    def num_experts(self) -> int:
+        """
+        Number of experts for MoE models (0 = dense model, >0 = MoE model).
+        """
+    @num_experts.setter
+    def num_experts(self, arg: int) -> None:
+        """
+        Number of experts for MoE models (0 = dense model, >0 = MoE model).
+        """
+    @property
+    def num_experts_per_tok(self) -> int:
+        """
+        Number of experts selected per token (top-k routing).
+        """
+    @num_experts_per_tok.setter
+    def num_experts_per_tok(self, arg: int) -> None:
+        """
+        Number of experts selected per token (top-k routing).
+        """
+    @property
+    def moe_intermediate_size(self) -> int:
+        """
+        Per-expert MLP intermediate size (0 = use regular intermediate_size).
+        """
+    @moe_intermediate_size.setter
+    def moe_intermediate_size(self, arg: int) -> None:
+        """
+        Per-expert MLP intermediate size (0 = use regular intermediate_size).
         """
 class QLoRAQuantStrategy(enum.Enum):
     """

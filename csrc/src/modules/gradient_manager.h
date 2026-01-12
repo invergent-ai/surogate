@@ -15,8 +15,7 @@
 #include "utilities/allocator.h"
 #include "utilities/tensor.h"
 #include "utilities/philox.h"
-
-class NCCLCommunicator;
+#include "utilities/comm.h"
 
 namespace modules {
 
@@ -298,8 +297,8 @@ ModularGradientManager<Block>::ModularGradientManager(
     } else {
         // LoRA mode: only allocate d_final_norm (small: hidden_size elements)
         // d_embeddings and d_lm_head are NOT needed because:
-        // - encoder_backward is skipped when lora_only=true (modular_model.h:1564-1580)
-        // - lm_head backward is skipped when lora_only=true (modular_model.h:2743-2750)
+        // - encoder_backward is skipped when lora_only=true
+        // - lm_head backward is skipped when lora_only=true
         // This saves ~762 MiB for a 4B model (vocab_size * hidden_size * 2 bytes)
         long C = config.hidden_size;
         mFullNonBlock.d_final_norm = mAllocator->allocate(config.grad_dtype, "d_final_norm", EAllocationType::ON_DEVICE, {C});
@@ -897,6 +896,13 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
     if constexpr (requires { grads.ln2_grads.d_weight; }) {
         grads.ln2_grads.d_weight = mAllocator->allocate(dtype, "d_ln2_w", kind, {C});
     }
+    // MoE blocks use grads.ln1/ln2.d_weight instead of grads.ln1_grads/ln2_grads.d_weight
+    if constexpr (requires { grads.ln1.d_weight; }) {
+        grads.ln1.d_weight = mAllocator->allocate(dtype, "d_ln1_w", kind, {C});
+    }
+    if constexpr (requires { grads.ln2.d_weight; }) {
+        grads.ln2.d_weight = mAllocator->allocate(dtype, "d_ln2_w", kind, {C});
+    }
 
     if constexpr (requires { grads.attention_grads.d_qkv_weight; }) {
         grads.attention_grads.d_qkv_weight = mAllocator->allocate(dtype, "d_qkv_w", kind, {qkv_channels, C});
@@ -953,6 +959,13 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
     }
     if constexpr (requires { grads.ln2_grads.d_weight; }) {
         grads.ln2_grads.d_weight = alloc_shard_1d("d_ln2_w_shard", C);
+    }
+    // MoE blocks use grads.ln1/ln2.d_weight instead of grads.ln1_grads/ln2_grads.d_weight
+    if constexpr (requires { grads.ln1.d_weight; }) {
+        grads.ln1.d_weight = alloc_shard_1d("d_ln1_w_shard", C);
+    }
+    if constexpr (requires { grads.ln2.d_weight; }) {
+        grads.ln2.d_weight = alloc_shard_1d("d_ln2_w_shard", C);
     }
 
     if constexpr (requires { grads.attention_grads.d_qkv_weight; }) {

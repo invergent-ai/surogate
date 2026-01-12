@@ -190,24 +190,23 @@ NB_MODULE(_surogate, m) {
                 throw std::runtime_error("At this point, only qwen2 architecture is supported.");
             }
 
-            new (t) PretrainedConfig{
-                .Architecture = architecture,
-                .BosTokenId = bos_token_id.value(),
-                .EosTokenId = eos_token_id.value(),
-                .PadTokenId = bos_token_id.value(),
-                .HiddenSize = hidden_size,
-                .IntermediateSize = intermediate_size,
-                .VocabSize = vocab_size.value(),
-                .NumQueryHeads = num_attention_heads,
-                .NumKeyValHeads = num_key_value_heads,
-                .NumLayers = num_hidden_layers,
-                .MaxPositionEmbeddings = max_position_embeddings.value(),
-                .RopeTheta = rope_theta.value(),
-                .RmsNormEps = rms_norm_eps,
-                .TiedWordEmbeddings = tie_word_embeddings,
-                .UseQKVBias = use_qkv_bias.value(),
-                .DType = dtype_from_str(dtype)
-            };
+            new (t) PretrainedConfig();
+            t->Architecture = architecture;
+            t->BosTokenId = bos_token_id.value();
+            t->EosTokenId = eos_token_id.value();
+            t->PadTokenId = bos_token_id.value();
+            t->HiddenSize = hidden_size;
+            t->IntermediateSize = intermediate_size;
+            t->VocabSize = vocab_size.value();
+            t->NumQueryHeads = num_attention_heads;
+            t->NumKeyValHeads = num_key_value_heads;
+            t->NumLayers = num_hidden_layers;
+            t->MaxPositionEmbeddings = max_position_embeddings.value();
+            t->RopeTheta = rope_theta.value();
+            t->RmsNormEps = rms_norm_eps;
+            t->TiedWordEmbeddings = tie_word_embeddings;
+            t->UseQKVBias = use_qkv_bias.value();
+            t->DType = dtype_from_str(dtype);
         }, nb::kw_only(),
              nb::arg("architecture"),
              nb::arg("bos_token_id") = nb::none(),
@@ -259,23 +258,28 @@ NB_MODULE(_surogate, m) {
         .def_prop_ro("head_size", &PretrainedConfig::head_size, "Attention head size (= hidden_size / num_attention_heads).")
         .def_prop_ro("qkv_channels", &PretrainedConfig::qkv_channels, "Total QKV channel count used internally.")
         .def_prop_ro("model_name", &PretrainedConfig::model_name, "Canonical model name derived from the configuration.")
-        .def_static("from_pretrained", [](const std::string& name, const std::string& dtype_str)
+        .def_static("from_pretrained", [](const std::string& name, const std::string& dtype_str) -> PretrainedConfig*
         {
             std::string hf_path = get_hf_model_files(name);
             if (hf_path.empty()) {
                 throw std::runtime_error("Could not find model files for " + name);
             }
             std::string config_path = hf_path + "/config.json";
-            return new PretrainedConfig(load_pretrained_config(config_path.c_str(), dtype_from_str(dtype_str)));
+            auto cfg = load_pretrained_config(config_path.c_str(), dtype_from_str(dtype_str));
+            return cfg.release();  // Transfer ownership of polymorphic object
         }, nb::arg("name"), nb::arg("dtype"),
            "Load a config.json from a HuggingFace model directory.\n\n"
            "Parameters:\n"
            "- name: HuggingFace model name or local cache key.\n"
            "- dtype: Override dtype for the loaded configuration.\n\n"
            "Returns: PretrainedConfig")
-        .def_static("from_name", [](const std::string& name, const std::string& dtype_str)
+        .def_static("from_name", [](const std::string& name, const std::string& dtype_str) -> PretrainedConfig*
         {
-            return new PretrainedConfig(create_pretrained_config_from_name(name, dtype_from_str(dtype_str)));
+            auto cfg = create_pretrained_config_from_name(name, dtype_from_str(dtype_str));
+            if (!cfg) {
+                throw std::runtime_error("Unknown model name: " + name);
+            }
+            return cfg.release();  // Transfer ownership of polymorphic object
         }, nb::arg("name"), nb::arg("dtype"),
            "Create a configuration from a known model name.\n\n"
            "Parameters:\n"
@@ -624,6 +628,14 @@ NB_MODULE(_surogate, m) {
                 "Enable double quantization for BnB (quantize absmax values to INT8).")
         .def_rw("bnb_double_quant_group_size", &modules::QLoRAConfig::bnb_double_quant_group_size,
                 "Group size for double quantization (number of absmax values per group).")
+        .def_rw("num_experts", &modules::QLoRAConfig::num_experts,
+                "Number of experts for MoE models (0 = dense model, >0 = MoE model).")
+        .def_rw("num_experts_per_tok", &modules::QLoRAConfig::num_experts_per_tok,
+                "Number of experts selected per token (top-k routing).")
+        .def_rw("moe_intermediate_size", &modules::QLoRAConfig::moe_intermediate_size,
+                "Per-expert MLP intermediate size (0 = use regular intermediate_size).")
+        .def_prop_ro("is_moe", &modules::QLoRAConfig::is_moe,
+                     "Whether this is an MoE model (num_experts > 0).")
         .def("__repr__", [](const modules::QLoRAConfig& cfg) {
             if (cfg.is_bnb()) {
                 return fmt::format("QLoRAConfig(enabled={}, strategy='{}', block_size={}, bnb_double_quant={}, adapter_dtype='{}')",
@@ -733,7 +745,7 @@ NB_MODULE(_surogate, m) {
         "Multi-GPU trainer wrapper.\n\n"
         "Provides training/evaluation steps and checkpoint/weight import/export.\n"
         "Some operations may run asynchronously (see method docs).")
-        .def("__init__", [](MultiGPUPyTrainer *t, int ngpu, PretrainedConfig config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) {
+        .def("__init__", [](MultiGPUPyTrainer *t, int ngpu, const PretrainedConfig& config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) {
             options.ModelType = config.DType;
             new (t) MultiGPUPyTrainer(ngpu, config, options, batch_size, seq_len, grad_accum, memcpy_all_gather, memcpy_send_recv, lora_config, qlora_config);
         }, nb::arg("ngpu"), nb::arg("config"), nb::arg("options"), nb::arg("batch_size"), nb::arg("seq_len"), nb::arg("grad_accum"),
@@ -771,7 +783,8 @@ NB_MODULE(_surogate, m) {
             if (!std::filesystem::exists(model_path)) {
                 model_path = hf_path + "/model.safetensors.index.json";
             }
-            PretrainedConfig config = load_pretrained_config(config_path.c_str(), dtype_from_str(dtype));
+            auto config_ptr = load_pretrained_config(config_path.c_str(), dtype_from_str(dtype));
+            const PretrainedConfig& config = *config_ptr;
             options.ModelType = config.DType;
             auto trainer = new MultiGPUPyTrainer(ngpu, config, options, batch_size, seq_len, grad_accum, memcpy_all_gather, memcpy_send_recv, lora_config, qlora_config);
             trainer->import_weights(model_path);

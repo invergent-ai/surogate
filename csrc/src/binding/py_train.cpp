@@ -19,6 +19,7 @@
 #include "modules/model_config.h"
 #include "modules/model_factory.h"
 #include "modules/composite/transformer_block.h"
+#include "modules/moe/moe_block.h"
 #include "modules/lora/lora_model.h"
 
 /**
@@ -38,8 +39,8 @@
  *
  * @throws std::runtime_error If requested GPUs exceed available device count.
  */
-MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, PretrainedConfig config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) :
-    mConfig(config), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
+MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) :
+    mConfig(config.clone()), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
 {
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
@@ -90,12 +91,12 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, PretrainedConfig config, Runtime
  */
 MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
                                      const void* nccl_id, const void* node_master_nccl_id,
-                                     PretrainedConfig config, RuntimeOptions options,
+                                     const PretrainedConfig& config, RuntimeOptions options,
                                      int batch_size, int seq_len, int grad_accum,
                                      bool memcpy_all_gather, bool memcpy_send_recv,
                                      std::optional<LoRAAdapterConfig> lora_config,
                                      std::optional<modules::QLoRAConfig> qlora_config) :
-    mConfig(config), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
+    mConfig(config.clone()), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
 {
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
@@ -167,20 +168,19 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
                 MemoryBreakdownContext breakdown_ctx;
                 breakdown_ctx.enabled = true;
                 breakdown_ctx.allocator = rs.Allocator.get();
-                breakdown_ctx.hidden_size = mConfig.HiddenSize;
-                breakdown_ctx.intermediate_size = mConfig.IntermediateSize;
-                breakdown_ctx.num_layers = mConfig.NumLayers;
+                breakdown_ctx.hidden_size = mConfig->HiddenSize;
+                breakdown_ctx.intermediate_size = mConfig->IntermediateSize;
+                breakdown_ctx.num_layers = mConfig->NumLayers;
                 breakdown_ctx.batch_size = B;
                 breakdown_ctx.seq_length = T;
 
                 // Get QLoRA stats if applicable
-                using DenseBlock = modules::DenseTransformerBlock<>;
-                if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get())) {
+                modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
                     if (lora_model->qlora_enabled()) {
                         breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
                         breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
                     }
-                }
+                });
 
                 // Use a temporary logger to print the breakdown
                 TrainingRunLogger logger("", 0, TrainingRunLogger::VERBOSE);
@@ -225,10 +225,13 @@ void MultiGPUPyTrainer::export_model(std::string path) {
  */
 void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_path) {
     run_work([path, base_model_path](sThreadContext& ctx) {
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get());
-        if (!lora_model) throw std::runtime_error("export_adapter: Model is not a modular LoRA model.");
-        lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
+        bool found = modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
+            lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
+        });
+
+        if (!found) {
+            throw std::runtime_error("export_adapter: Model is not a modular LoRA model");
+        }
     });
 }
 
@@ -308,7 +311,12 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         Tensor position_ids = ctx.Model->get_position_ids_buffer();
         Tensor targets = ctx.Model->get_target_buffer();
         ctx.Model->forward(inputs, position_ids, *ctx.Communicator, micro_idx);
-        ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
+        try {
+            ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[DEBUG] Exception in backward: %s\n", e.what());
+            throw;
+        }
     });
     ++mTrainMicroStep;
 }
@@ -481,23 +489,8 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
 
     auto allocator = std::make_shared<TensorAllocator>();
 
-    modules::ModelConfig mod_config = modules::ModelConfig::from_llama_config(mConfig);
-    modules::ModelOptions mod_options = modules::ModelOptions::from_runtime_options(mOptions);
-
-    // QLoRA: skip block weight allocation since weights are provided by QLoRA weight provider
-    if (mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized()) {
-        mod_options.skip_block_allocation = true;
-    }
-
-    std::unique_ptr<IModel> model_storage = modules::ModelFactory::create(
-        mod_config, mod_options, comm.rank(), comm.world_size(), allocator);
-
     if (mLoRAConfig.has_value()) {
-        if (mod_config.architecture != modules::ArchitectureType::Dense) {
-            throw std::runtime_error("MultiGPUPyTrainer: LoRA requires dense architecture");
-        }
-
-        // Convert LoRAAdapterConfig -> modular LoRA config.
+        // Convert LoRAAdapterConfig -> modular LoRA config
         modules::ModularLoRAConfig mod_lora;
         mod_lora.rank = mLoRAConfig->Rank;
         mod_lora.alpha = mLoRAConfig->Alpha;
@@ -520,24 +513,19 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             }
         }
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
-        auto* dense_ptr = dynamic_cast<DenseModel*>(model_storage.get());
-        if (!dense_ptr) {
-            throw std::runtime_error("MultiGPUPyTrainer: modular factory returned non-dense model under dense config");
-        }
-
         // Build QLoRA config if provided
         modules::QLoRAConfig qlora_config;
         if (mQLoRAConfig.has_value()) {
             qlora_config = mQLoRAConfig.value();
         }
 
-        std::unique_ptr<DenseModel> dense_base(static_cast<DenseModel*>(model_storage.release()));
-        ctx.Model = std::make_unique<modules::ModularLoRAModel<DenseBlock>>(
-            std::move(dense_base), mod_lora, mOptions, comm, allocator, qlora_config);
+        // Use factory to create LoRA model with proper architecture dispatch
+        ctx.Model = modules::ModelFactory::create_lora_from_pretrained_config(
+            *mConfig, mod_lora, mOptions, comm, allocator, qlora_config);
     } else {
-        ctx.Model = std::move(model_storage);
+        // Use factory to create base model with proper architecture dispatch
+        ctx.Model = modules::ModelFactory::create_from_pretrained_config(
+            *mConfig, mOptions, comm.rank(), comm.world_size(), allocator);
     }
 
     ctx.Model->allocate_run_state(mOptions, comm, B, T, /*allocate_optimizer=*/true);
@@ -690,13 +678,7 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_gradients(int
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;
     run_work([&result](sThreadContext& ctx) {
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get());
-        if (!lora_model) throw std::runtime_error("get_lora_gradients: model is not a modular LoRA model");
-
-        const auto& config = lora_model->base_model().config();
-        CUDA_CHECK(cudaDeviceSynchronize());
-
+        // Helper to add LoRA layer gradients
         auto add_layer = [&](const std::string& module_prefix,
                              const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
             if (!layer.has_value()) return;
@@ -704,22 +686,44 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
         };
 
-        for (int l = 0; l < config.NumLayers; ++l) {
-            bool unused_accumulate = false;
-            auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-            std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
+        bool found = modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
+            const auto& config = lora_model->base_model().config();
+            const bool is_moe = lora_model->is_moe_model();
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-            add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-            add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-            add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-            add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            for (int l = 0; l < config.NumLayers; ++l) {
+                bool unused_accumulate = false;
+                auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
+                std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
 
-            add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-            add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-            add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                // Attention LoRA (same for dense and MoE)
+                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+
+                if (is_moe) {
+                    // MoE models use per-expert LoRA
+                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                        auto& expert = block.moe.experts[e];
+                        std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        add_layer(expert_prefix + ".gate_proj", expert.gate);
+                        add_layer(expert_prefix + ".up_proj", expert.up);
+                        add_layer(expert_prefix + ".down_proj", expert.down);
+                    }
+                } else {
+                    // Dense models use single MLP LoRA
+                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                }
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+        });
+
+        if (!found) {
+            throw std::runtime_error("get_lora_gradients: model is not a modular LoRA model");
         }
-
-        CUDA_CHECK(cudaDeviceSynchronize());
     }, gpu_id);
     return result;
 }

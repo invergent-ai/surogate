@@ -22,7 +22,7 @@ namespace modules {
  * - weight: (out_features, in_features) - transposed for TN matmul
  * - bias: (out_features,) optional
  *
- * The module wraps the forward_qmm/backward_qmm patterns from llama_model.cpp,
+ * The module wraps the forward_qmm/backward_qmm patterns,
  * providing a clean interface while maintaining the same performance characteristics.
  */
 class LinearModule : public ModuleBase<LinearModule> {
@@ -260,7 +260,7 @@ inline Tensor LinearModule::backward_impl(ModuleContext& ctx, Weights& w, Activa
 
         Tensor& inp_q = acts.input_cached.for_matmul();
 
-        // Note: FP8 backward may need weight transpose - see backward_qmm in llama_model.cpp
+        // Note: FP8 backward may need weight transpose - see backward_qmm
         // This is a simplified version; full implementation would handle temp buffers
         matmul(grad_input, w.weight, d_out.Quant.value_or(d_out.Value), std::nullopt,
                w.weight.scale(), d_out.Quant ? d_out.Quant->scale() : nullptr,

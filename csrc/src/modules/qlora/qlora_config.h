@@ -125,6 +125,24 @@ struct QLoRAConfig {
     /// Group size for double quantization (number of absmax values per group)
     int bnb_double_quant_group_size = 256;
 
+    // =========================================================================
+    // MoE (Mixture of Experts) configuration
+    // =========================================================================
+
+    /// Number of experts (0 = dense model, >0 = MoE model)
+    int num_experts = 0;
+
+    /// Number of experts selected per token (top-k routing)
+    int num_experts_per_tok = 8;
+
+    /// Per-expert MLP intermediate size (0 = use regular intermediate_size)
+    int moe_intermediate_size = 0;
+
+    /**
+     * @brief Check if this is an MoE model
+     */
+    [[nodiscard]] bool is_moe() const { return num_experts > 0; }
+
     /**
      * @brief Check if quantization is active
      */
@@ -224,88 +242,6 @@ struct QLoRAConfig {
     static QLoRAConfig none() {
         return QLoRAConfig{};
     }
-};
-
-/**
- * @brief Builder for QLoRA configuration
- */
-class QLoRAConfigBuilder {
-public:
-    QLoRAConfigBuilder() = default;
-
-    QLoRAConfigBuilder& enable(bool v = true) {
-        mConfig.enabled = v;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& strategy(QLoRAQuantStrategy s) {
-        mConfig.strategy = s;
-        if (s != QLoRAQuantStrategy::None) {
-            mConfig.enabled = true;
-        }
-        return *this;
-    }
-
-    QLoRAConfigBuilder& fp8() {
-        mConfig.strategy = QLoRAQuantStrategy::FP8;
-        mConfig.base_dtype = ETensorDType::FP8_E4M3;
-        mConfig.scale_config.block_size = 128;
-        mConfig.enabled = true;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& nvfp4() {
-        mConfig.strategy = QLoRAQuantStrategy::NVFP4;
-        mConfig.base_dtype = ETensorDType::FP4_E2M1;
-        mConfig.scale_config.block_size = 16;  // FP4 uses 16-element blocks
-        mConfig.enabled = true;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& bnb(int block_size = 64) {
-        mConfig.strategy = QLoRAQuantStrategy::BitsAndBytes;
-        mConfig.base_dtype = ETensorDType::INT8;  // Packed 4-bit NF4
-        mConfig.scale_config.block_size = block_size;
-        mConfig.enabled = true;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& bnb_double_quant(bool enable = true) {
-        mConfig.bnb_double_quant = enable;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& bnb_double_quant_group_size(int size) {
-        mConfig.bnb_double_quant_group_size = size;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& block_size(int size) {
-        mConfig.scale_config.block_size = size;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& base_dtype(ETensorDType dt) {
-        mConfig.base_dtype = dt;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& adapter_dtype(ETensorDType dt) {
-        mConfig.adapter_dtype = dt;
-        return *this;
-    }
-
-    QLoRAConfigBuilder& four_over_six(bool enable,
-                                       recipes::FourOverSixErrorMetric metric = recipes::FourOverSixErrorMetric::MSE) {
-        mConfig.enable_four_over_six = enable;
-        mConfig.four_over_six_metric = metric;
-        return *this;
-    }
-
-    [[nodiscard]] QLoRAConfig build() const { return mConfig; }
-
-private:
-    QLoRAConfig mConfig;
 };
 
 /**

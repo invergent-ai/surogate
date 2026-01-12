@@ -331,6 +331,7 @@ void NCCLCommunicator::schedule_all_gather(const TensorShard& src, Tensor& tgt) 
     }
 
     if (src.DType != tgt.DType) {
+        fprintf(stderr, "[DEBUG] all_gather dtype mismatch: src.DType=%d tgt.DType=%d\n", (int)src.DType, (int)tgt.DType);
         throw std::runtime_error("gather: Mismatched dtypes");
     }
 
@@ -394,7 +395,7 @@ void NCCLCommunicator::all_reduce_sum_int(int* values, int n, cudaStream_t strea
  * @throws std::runtime_error if tensor dtype is not supported.
  */
 void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
-    if (mWorld == 1) return;  // No-op for single GPU
+    if (mWorld == 1) return; // No-op for single GPU
 
     ncclDataType_t nccl_dtype;
     switch (tensor.DType) {
@@ -408,6 +409,7 @@ void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
             nccl_dtype = ncclFloat16;
             break;
         default:
+            fprintf(stderr, "[DEBUG] all_reduce_avg ERROR: unsupported dtype %d\n", (int)tensor.DType);
             throw std::runtime_error(fmt::format(
                 "NCCLCommunicator::all_reduce_avg: unsupported tensor dtype {}",
                 dtype_to_str(tensor.DType)));
@@ -415,7 +417,7 @@ void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
 
     ncclCheck(ncclAllReduce(tensor.Data, tensor.Data, tensor.nelem(), nccl_dtype, ncclAvg, mNcclComm, stream));
 }
-
+ 
 /**
  * @brief Reduce-scatter FP32 gradients across ranks using average.
  *

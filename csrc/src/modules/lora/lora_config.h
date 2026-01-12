@@ -48,6 +48,9 @@ struct ModularLoRAConfig {
     /// Data type for LoRA weights
     ETensorDType dtype = ETensorDType::BF16;
 
+    /// Whether this is a Mixture-of-Experts LoRA (one LoRA per expert)
+    bool is_moe = false;
+
     /// Initialize A with Kaiming uniform, B with zeros (following PEFT)
     bool init_a_kaiming = true;
 
@@ -134,10 +137,6 @@ struct ModularLoRAConfig {
 
     /// Convert to the user-facing LoRA adapter config (CLI/python).
     [[nodiscard]] LoRAAdapterConfig to_adapter_config() const;
-
-    // Backwards-compatible names.
-    static ModularLoRAConfig from_legacy(const LoRAConfig& legacy) { return from_adapter_config(legacy); }
-    [[nodiscard]] LoRAConfig to_legacy() const { return to_adapter_config(); }
 };
 
 /**

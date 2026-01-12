@@ -225,23 +225,6 @@ void ba_plus_cAA(
 }
 
 // ----------------------------------------------------------------------------
-// General Batched MatMul: C = A @ B (legacy)
-
-void batched_matmul(
-    const nv_bfloat16* A,
-    const nv_bfloat16* B,
-    nv_bfloat16* C,
-    int batch,
-    int M,
-    int K,
-    int N,
-    cudaStream_t stream
-) {
-    // Legacy function kept for API compatibility
-    // The actual implementation is done inline in polar_express with cuBLAS
-}
-
-// ----------------------------------------------------------------------------
 // AXPY: C = alpha * A + C
 
 __global__ void kAxpyMatrix(

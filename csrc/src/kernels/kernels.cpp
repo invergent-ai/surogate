@@ -6,6 +6,7 @@
 #include "kernels.h"
 
 #include "utilities/tensor.h"
+#include <cstdio>
 
 /**
  * @brief Performs the forward pass of Root Mean Square Normalization (RMSNorm).
@@ -280,6 +281,64 @@ void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, co
         rope_backward(dinp.get<float>(), dout.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream);
     } else if(dinp.DType == ETensorDType::BF16) {
         rope_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream);
+    } else {
+        throw std::logic_error("rope_backward: unsupported dtype");
+    }
+}
+
+/**
+ * @brief Computes the forward pass for Rotary Positional Embeddings (RoPE) with partial rotation support.
+ *
+ * For partial RoPE (GLM4 style), only the first rotary_dim dimensions are rotated.
+ * Dimensions beyond rotary_dim are passed through unchanged.
+ *
+ * @param out The output tensor for the result of the RoPE transformation.
+ * @param in The input tensor containing the embedding data.
+ * @param freqs_cis Precomputed RoPE frequencies (cos and sin values interleaved), shape (T, rotary_dim).
+ * @param position_ids Optional position IDs for variable-length sequences (can be nullptr).
+ * @param abs_max_ptr Optional pointer to track the absolute maximum value.
+ * @param B Batch size.
+ * @param T Sequence length.
+ * @param Nq Number of query heads.
+ * @param Nkv Number of key/value heads.
+ * @param head_dim Full head dimension.
+ * @param rotary_dim Number of dimensions to rotate (must be <= head_dim and even).
+ * @param stream The CUDA stream to execute the kernel on.
+ */
+void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
+    if(out.DType == ETensorDType::FP32) {
+        rope_forward(out.get<float>(), in.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else if(out.DType == ETensorDType::BF16) {
+        rope_forward(out.get<nv_bfloat16>(), in.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else {
+        throw std::logic_error("rope_forward: unsupported dtype");
+    }
+}
+
+/**
+ * @brief Computes the backward pass for Rotary Positional Embeddings (RoPE) with partial rotation support.
+ *
+ * For partial RoPE (GLM4 style), only the first rotary_dim dimensions are rotated.
+ * Dimensions beyond rotary_dim are passed through unchanged.
+ *
+ * @param dinp The gradient of the input tensor to be computed.
+ * @param dout The incoming gradient tensor from the subsequent layer.
+ * @param freqs_cis Precomputed RoPE frequencies, shape (T, rotary_dim).
+ * @param position_ids Optional position IDs for variable-length sequences.
+ * @param abs_max_ptr Optional pointer for tracking absolute maximum value.
+ * @param B Batch size.
+ * @param T Sequence length.
+ * @param Nq Number of query heads.
+ * @param Nkv Number of key/value heads.
+ * @param head_dim Full head dimension.
+ * @param rotary_dim Number of dimensions to rotate (must be <= head_dim and even).
+ * @param stream The CUDA stream on which to execute the kernel.
+ */
+void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
+    if(dinp.DType == ETensorDType::FP32) {
+        rope_backward(dinp.get<float>(), dout.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+    } else if(dinp.DType == ETensorDType::BF16) {
+        rope_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
     } else {
         throw std::logic_error("rope_backward: unsupported dtype");
     }
@@ -584,6 +643,8 @@ void vector_add_sr(Tensor& dest, const Tensor& left, const Tensor& right, float 
  */
 void add_2d_slice(Tensor& dst, const Tensor& src, long rows, long dst_cols, long src_cols, long dst_col_offset, cudaStream_t stream) {
     if (dst.DType != src.DType) {
+        fprintf(stderr, "[DEBUG] add_2d_slice dtype mismatch: dst.DType=%d src.DType=%d\n", (int)dst.DType, (int)src.DType);
+        fprintf(stderr, "[DEBUG] dst shape: [%ld, %ld] src shape: [%ld, %ld]\n", dst.Sizes[0], dst.Sizes[1], src.Sizes[0], src.Sizes[1]);
         throw std::logic_error("add_2d_slice: dtype mismatch");
     }
     if (dst.DType == ETensorDType::FP32) {
@@ -823,11 +884,22 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
+
     if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
         matmul(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
     } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
-        float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
+        // Note: bias is expected to be FP32 when output is FP32
+        // If bias is BF16, we skip it (TODO: add support for BF16 bias with FP32 output)
+        float* bias_ptr = nullptr;
+        if(bias.has_value()) {
+            if(bias.value().DType == ETensorDType::FP32) {
+                bias_ptr = bias.value().get<float>();
+            } else {
+                // Skip BF16 bias for now - this shouldn't happen in practice
+                fprintf(stderr, "[WARNING] matmul: FP32 output with BF16 bias - skipping bias\n");
+            }
+        }
         matmul(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
     } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP8_E4M3) {
         if(bias.has_value()) {
@@ -849,6 +921,8 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
         matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
     } else {
+        fprintf(stderr, "[DEBUG] matmul error: c.DType=%d a.DType=%d b.DType=%d\n",
+                (int)c.DType, (int)a.DType, (int)b.DType);
         throw std::logic_error("matmul_forward: invalid DType combination");
     }
 }

@@ -30,6 +30,7 @@ enum class BackwardHookPoint {
     AfterMLPDownBackward,   ///< After MLP down projection backward
     BeforeMLPUpBackward,    ///< Before MLP up projection backward
     AfterMLPUpBackward,     ///< After MLP up projection backward
+    MoEExpertGroupManual,    ///< Manual expert group backward (fused)
 
     // Layer-level
     BeforeLayerBackward,    ///< Before any backward computation for this layer
@@ -49,6 +50,7 @@ constexpr const char* hook_point_name(BackwardHookPoint point) {
         case BackwardHookPoint::AfterMLPDownBackward: return "AfterMLPDownBackward";
         case BackwardHookPoint::BeforeMLPUpBackward: return "BeforeMLPUpBackward";
         case BackwardHookPoint::AfterMLPUpBackward: return "AfterMLPUpBackward";
+        case BackwardHookPoint::MoEExpertGroupManual: return "MoEExpertGroupManual";
         case BackwardHookPoint::BeforeLayerBackward: return "BeforeLayerBackward";
         case BackwardHookPoint::AfterLayerBackward: return "AfterLayerBackward";
         default: return "Unknown";
@@ -68,9 +70,10 @@ constexpr const char* hook_point_name(BackwardHookPoint point) {
  */
 using BackwardHook = std::function<void(
     int layer_idx,
-    BackwardHookPoint point,
     bool accumulate,
-    cudaStream_t stream
+    cudaStream_t stream,
+    BackwardHookPoint point,
+    void* context
 )>;
 
 /**
@@ -93,7 +96,7 @@ using BackwardHook = std::function<void(
  *     });
  *
  * // During backward pass in the model
- * hooks.invoke(layer_idx, BackwardHookPoint::AfterQKVBackward, accumulate, stream);
+ * hooks.invoke(layer_idx, BackwardHookPoint::AfterQKVBackward, accumulate, stream, nullptr);
  * @endcode
  */
 class BackwardHookRegistry {
@@ -158,12 +161,13 @@ public:
      * @param point The hook point being invoked
      * @param accumulate Whether to accumulate gradients
      * @param stream CUDA stream for GPU work
+     * @param context Optional caller-provided context (passed to hook)
      */
-    void invoke(int layer_idx, BackwardHookPoint point, bool accumulate, cudaStream_t stream) const {
+    void invoke(int layer_idx, BackwardHookPoint point, bool accumulate, cudaStream_t stream, void* context = nullptr) const {
         auto it = mHooks.find(point);
         if (it != mHooks.end()) {
             for (const auto& entry : it->second) {
-                entry.hook(layer_idx, point, accumulate, stream);
+                entry.hook(layer_idx, accumulate, stream, point, context);
             }
         }
     }

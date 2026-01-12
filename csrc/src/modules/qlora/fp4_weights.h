@@ -11,6 +11,7 @@
 
 #include "fp4_block_quantized_tensor.h"
 #include "block_quantized_tensor.h"  // For QLoRAEmbeddingWeights
+#include "moe_weights.h"
 #include "qlora_config.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
@@ -90,6 +91,29 @@ public:
     [[nodiscard]] bool is_fp4() const { return mConfig.qlora_config.is_fp4(); }
 
     /**
+     * @brief Check if this is an MoE model
+     */
+    [[nodiscard]] bool is_moe() const { return mConfig.qlora_config.is_moe(); }
+
+    /**
+     * @brief Get number of experts (0 for dense models)
+     */
+    [[nodiscard]] int num_experts() const { return mConfig.qlora_config.num_experts; }
+
+    /**
+     * @brief Get MoE block weights (for MoE models)
+     */
+    [[nodiscard]] const MoEBlockWeights<FP4BlockWeights, FP4BlockQuantizedWeight>&
+        get_moe_block(int layer_idx) const {
+        return mMoEBlocks[layer_idx];
+    }
+
+    [[nodiscard]] MoEBlockWeights<FP4BlockWeights, FP4BlockQuantizedWeight>&
+        get_moe_block(int layer_idx) {
+        return mMoEBlocks[layer_idx];
+    }
+
+    /**
      * @brief Get total memory usage for quantized weights in bytes
      */
     [[nodiscard]] std::size_t quantized_weights_bytes() const;
@@ -104,8 +128,12 @@ private:
     TensorAllocator* mAllocator;
     const cudaDeviceProp* mDeviceProps;
 
-    // FP4 quantized base model weights
+    // FP4 quantized base model weights for dense models
     std::vector<FP4BlockWeights> mFP4Blocks;
+
+    // FP4 quantized base model weights for MoE models
+    using FP4MoEBlockWeights = MoEBlockWeights<FP4BlockWeights, FP4BlockQuantizedWeight>;
+    std::vector<FP4MoEBlockWeights> mMoEBlocks;
 
     // Embedding weights (not quantized)
     QLoRAEmbeddingWeights mEmbeddings;
@@ -129,6 +157,15 @@ private:
     void load_and_quantize_block(int layer_idx, SafeTensorsReader& reader,
                                  cudaStream_t stream);
     void load_embeddings(SafeTensorsReader& reader, cudaStream_t stream);
+
+    // MoE-specific allocation and loading helpers
+    void allocate_moe_blocks();
+    void load_and_quantize_moe_block(int layer_idx, SafeTensorsReader& reader,
+                                      cudaStream_t stream);
+
+    // Generic allocation helper for FP4 quantized weights
+    void allocate_fp4_weight(FP4BlockQuantizedWeight& weight, int M, int K,
+                             const std::string& name_prefix);
 };
 
 } // namespace modules

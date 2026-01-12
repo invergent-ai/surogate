@@ -5,6 +5,7 @@
 #ifndef SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H
 #define SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H
 
+#include "config/rope_config.h"
 #include "modules/module_base.h"
 #include "modules/primitives/attention.h"
 #include "modules/primitives/rmsnorm.h"
@@ -44,7 +45,7 @@ public:
         int num_query_heads;
         int num_kv_heads;
         int head_size;          // Usually hidden_size / num_query_heads
-        float rope_theta;
+        RoPEConfig rope;        // Flexible RoPE configuration
         int max_seq_len;        // Maximum sequence length for RoPE
         bool use_qkv_bias = false;
         bool use_qk_norm = false;
@@ -57,14 +58,16 @@ public:
 
         // Derived configs for sub-modules
         [[nodiscard]] typename AttentionType::Config attention_config() const {
-            return {
-                .hidden_size = hidden_size,
-                .num_query_heads = num_query_heads,
-                .num_kv_heads = num_kv_heads,
-                .rope_theta = rope_theta,
-                .use_qkv_bias = use_qkv_bias,
-                .head_size = head_size
-            };
+            typename AttentionType::Config cfg;
+            cfg.hidden_size = hidden_size;
+            cfg.num_query_heads = num_query_heads;
+            cfg.num_kv_heads = num_kv_heads;
+            cfg.rope = rope;
+            cfg.use_qkv_bias = use_qkv_bias;
+            cfg.use_qk_norm = use_qk_norm;
+            cfg.qk_norm_eps = rms_norm_eps;  // Use same epsilon as layer norm
+            cfg.head_size = head_size;
+            return cfg;
         }
 
         [[nodiscard]] typename NormType::Config norm_config() const {
@@ -192,8 +195,6 @@ template<typename Att, typename Act, typename Norm>
 Tensor DenseTransformerBlock<Att, Act, Norm>::forward_impl(
     ModuleContext& ctx, Weights& w, Tensor& residual, Activations& acts) {
 
-    const int B = ctx.B;
-    const int T = ctx.T;
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
 
@@ -214,7 +215,7 @@ Tensor DenseTransformerBlock<Att, Act, Norm>::forward_impl(
         acts.ln1_acts.output.Value = ln1_output;
         acts.ln1_acts.rstd = standalone_acts.rstd;
     } else {
-        Norm norm_module{};
+        Norm norm_module(typename Norm::Config{mConfig.hidden_size, mConfig.rms_norm_eps});
         ln1_output = norm_module.forward(ctx, w.ln1, residual, acts.ln1_acts);
     }
 
@@ -322,8 +323,6 @@ Tensor DenseTransformerBlock<Att, Act, Norm>::backward_impl(
     ModuleContext& ctx, Weights& w, Activations& acts,
     Tensor& grad_residual, Gradients& grads, bool accumulate) {
 
-    const int B = ctx.B;
-    const int T = ctx.T;
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
 

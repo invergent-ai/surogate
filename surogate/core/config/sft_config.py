@@ -656,6 +656,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 double_quant=self.qlora_bnb_double_quant
             )
 
+        # Populate MoE fields from model config for QLoRA quantization
+        if self.qlora_config is not None and self.model_info.is_moe_model:
+            from surogate.core.model.hf_config import HfConfigFactory
+            config = self.model_info.config
+            num_experts = HfConfigFactory.get_config_attr(config, 'num_experts') or 0
+            num_experts_per_tok = HfConfigFactory.get_config_attr(config, 'num_experts_per_tok') or 8
+            moe_intermediate_size = HfConfigFactory.get_config_attr(config, 'moe_intermediate_size') or 0
+            if num_experts > 0:
+                self.qlora_config.num_experts = num_experts
+                self.qlora_config.num_experts_per_tok = num_experts_per_tok
+                self.qlora_config.moe_intermediate_size = moe_intermediate_size
+
     def generate_run_name(self):
         return generate_unique_name(category='science')
 

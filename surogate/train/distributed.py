@@ -296,7 +296,7 @@ class NodeTrainer:
                     seed=self._config.eval_seed
                 )
         else:
-            # Legacy mode: strided access across shared pre-tokenized files
+            # strided access across shared pre-tokenized files
             self._train_loader = _surogate.DataLoader(
                 self._train_files,
                 self.chunk_size,

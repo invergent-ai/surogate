@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bnb_block_quantized_tensor.h"
+#include "moe_weights.h"
 #include "qlora_config.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
@@ -106,6 +107,30 @@ public:
     [[nodiscard]] bool is_quantized() const { return mConfig.qlora_config.is_quantized(); }
 
     /**
+     * @brief Check if this is an MoE model
+     */
+    [[nodiscard]] bool is_moe() const { return mConfig.qlora_config.is_moe(); }
+
+    /**
+     * @brief Get number of experts (0 for dense models)
+     */
+    [[nodiscard]] int num_experts() const { return mConfig.qlora_config.num_experts; }
+
+    /**
+     * @brief Get MoE block weights (for MoE models)
+     * @throws std::runtime_error if not an MoE model
+     */
+    [[nodiscard]] const MoEBlockWeights<BnBBlockWeights, BnBBlockQuantizedWeight>&
+        get_moe_block(int layer_idx) const {
+        return mMoEBlocks[layer_idx];
+    }
+
+    [[nodiscard]] MoEBlockWeights<BnBBlockWeights, BnBBlockQuantizedWeight>&
+        get_moe_block(int layer_idx) {
+        return mMoEBlocks[layer_idx];
+    }
+
+    /**
      * @brief Get total memory usage for quantized weights in bytes
      */
     [[nodiscard]] std::size_t quantized_weights_bytes() const;
@@ -123,8 +148,12 @@ private:
     // BnB scale configuration (derived from qlora_config)
     BnBBlockScaleConfig mScaleConfig;
 
-    // Quantized base model weights (NF4 + per-block absmax)
+    // Quantized base model weights for dense models (NF4 + per-block absmax)
     std::vector<BnBBlockWeights> mQuantizedBlocks;
+
+    // Quantized base model weights for MoE models
+    using BnBMoEBlockWeights = MoEBlockWeights<BnBBlockWeights, BnBBlockQuantizedWeight>;
+    std::vector<BnBMoEBlockWeights> mMoEBlocks;
 
     // Embedding weights (not quantized)
     BnBEmbeddingWeights mEmbeddings;
@@ -150,6 +179,11 @@ private:
     void load_and_quantize_block(int layer_idx, SafeTensorsReader& reader,
                                  cudaStream_t stream);
     void load_embeddings(SafeTensorsReader& reader, cudaStream_t stream);
+
+    // MoE-specific allocation and loading helpers
+    void allocate_moe_block(int layer_idx);
+    void load_and_quantize_moe_block(int layer_idx, SafeTensorsReader& reader,
+                                      cudaStream_t stream);
 };
 
 } // namespace modules
