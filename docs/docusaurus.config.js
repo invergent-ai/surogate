@@ -65,8 +65,8 @@ module.exports = {
             ],
         },
         algolia: {
-          appId: '8EXJ6NKCKV',
-          apiKey: '7f951ba32bf4dfde8f61f505b1eae949',
+          appId: 'K46M9C3QXR',
+          apiKey: 'dd2966a169733d65efa82dadebb316e9',
           indexName: 'surogate',
         },
         footer: {
@@ -147,7 +147,7 @@ module.exports = {
         {
             tagName: 'meta',
             attributes: { name: 'twitter:image', content: 'https://docs.surogate.ai/img/social-card.jpg' }
-        },
+        }
     ],
     presets: [
         [
