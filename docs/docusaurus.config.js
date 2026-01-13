@@ -67,7 +67,7 @@ module.exports = {
         algolia: {
           appId: 'K46M9C3QXR',
           apiKey: 'dd2966a169733d65efa82dadebb316e9',
-          indexName: 'surogate',
+          indexName: 'docs_surogate_ai_k46m9c3qxr_pages',
         },
         footer: {
             style: 'dark',
