@@ -112,7 +112,7 @@ void BnBWeightsManager::allocate_single_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_Weights");
 
     // Show progress bar
-    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing");
+    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing layers");
 
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
@@ -248,8 +248,6 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
     cudaStream_t stream_0, stream_1;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_0, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_1, cudaStreamNonBlocking));
-
-    std::cerr << "[BnB] using double-buffered I/O for parallel quantization\n";
 
     if (is_moe()) {
         // MoE path: load experts + router with double-buffering
@@ -647,7 +645,7 @@ void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_MoE_Weights");
 
     // Show progress bar
-    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing");
+    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing layers");
 
     const int hidden = mConfig.hidden_size;
     const int num_q_heads = mConfig.num_query_heads;
@@ -660,10 +658,6 @@ void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     // Determine allocation type for expert weights
     // When offload_experts is enabled, store experts in pinned CPU memory
     const EAllocationType exp_alloc = expert_alloc_type();
-
-    if (layer_idx == 0 && mConfig.offload_experts) {
-        std::cerr << "[BnB] Expert offloading ENABLED - allocating expert NF4 weights in pinned CPU memory\n";
-    }
 
     auto& block = mMoEBlocks[layer_idx];
 

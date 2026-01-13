@@ -32,6 +32,7 @@
 #include "utilities/comm.h"
 #include "utilities/philox.h"
 #include "utilities/safetensors.h"
+#include "utilities/utils.h"
 
 namespace modules {
 
@@ -395,10 +396,49 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
             if (layer_idx < 0 || layer_idx >= mConfig.num_layers) return std::nullopt;
             auto& block = dst_blocks.at(layer_idx);
 
-            if (block.experts.use_batched) return std::nullopt;  // Use batched loading instead
-            if (expert_idx < 0 || expert_idx >= static_cast<int>(block.experts.experts.size())) {
+            // HF Qwen3-MoE checkpoints store experts as separate gate_proj/up_proj/down_proj tensors.
+            // Internally we use a batched expert layout for grouped GEMM. When use_batched is enabled,
+            // map per-expert tensors into the corresponding slice of the batched weights:
+            //   - experts.gate_up_proj stores [up; gate] (rows 0..D-1 = up, rows D..2D-1 = gate)
+            //   - experts.down_proj stores per-expert down weights (C, D)
+            if (block.experts.use_batched) {
+                const int E = cfg.num_experts;
+                if (expert_idx < 0 || expert_idx >= E) return std::nullopt;
+
+                // When loading sharded master weights, only materialize experts that belong to this shard.
+                const int load_experts_per_shard = (load_num > 1) ? div_exact(E, load_num) : E;
+                const int shard_begin = (load_num > 1) ? (load_idx * load_experts_per_shard) : 0;
+                const int shard_end = shard_begin + load_experts_per_shard;
+                if (expert_idx < shard_begin || expert_idx >= shard_end) return std::nullopt;
+                const int local_expert = expert_idx - shard_begin;
+
+                const std::size_t elem_size = get_dtype_size(block.experts.gate_up_proj.DType);
+                if (target == TensorTarget::ExpertUp || target == TensorTarget::ExpertGate) {
+                    // Slice into (E_local, 2*D, C) -> (D, C)
+                    const long row_offset = (target == TensorTarget::ExpertUp) ? 0 : D;
+                    Tensor slice = block.experts.gate_up_proj;
+                    slice.Rank = 2;
+                    slice.Sizes[0] = D;
+                    slice.Sizes[1] = C;
+                    const std::size_t base_elems = (static_cast<std::size_t>(local_expert) * static_cast<std::size_t>(2 * D) + static_cast<std::size_t>(row_offset)) * static_cast<std::size_t>(C);
+                    slice.Data = block.experts.gate_up_proj.Data + base_elems * elem_size;
+                    return TensorShard(slice);
+                }
+                if (target == TensorTarget::ExpertDown) {
+                    // Slice into (E_local, C, D) -> (C, D)
+                    Tensor slice = block.experts.down_proj;
+                    slice.Rank = 2;
+                    slice.Sizes[0] = C;
+                    slice.Sizes[1] = D;
+                    const std::size_t base_elems = static_cast<std::size_t>(local_expert) * static_cast<std::size_t>(C) * static_cast<std::size_t>(D);
+                    slice.Data = block.experts.down_proj.Data + base_elems * elem_size;
+                    return TensorShard(slice);
+                }
                 return std::nullopt;
             }
+
+            // Non-batched expert layout: direct per-expert tensors.
+            if (expert_idx < 0 || expert_idx >= static_cast<int>(block.experts.experts.size())) return std::nullopt;
 
             auto& expert = block.experts.experts[expert_idx];
             switch (target) {

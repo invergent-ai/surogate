@@ -24,6 +24,7 @@
 #include <cublas_v2.h>
 
 #include "kernels/kernels.h"
+#include "modules/lora/lora_config.h"
 #include "modules/model_factory.h"
 #include "modules/moe/moe_block.h"
 #include "modules/qlora/bnb_weights.h"
@@ -298,6 +299,154 @@ TempFile write_minimal_qwen3_moe_safetensors(const MinimalMoESafetensorsConfig& 
 
     writer.finalize(nullptr);
 
+    return tmp;
+}
+
+// Writes a 2-layer Qwen3 MoE checkpoint (BF16) to exercise QLoRA+MoE paths where
+// selective expert dequantization must be re-applied in backward for each layer.
+TempFile write_minimal_qwen3_moe_safetensors_2layers(const MinimalMoESafetensorsConfig& cfg,
+                                                     const std::vector<nv_bfloat16>& router_gate_l0,
+                                                     const std::vector<nv_bfloat16>& router_gate_l1) {
+    const int hidden = cfg.hidden_size;
+    const int num_experts = cfg.num_experts;
+    const int moe_inter = cfg.moe_intermediate_size;
+    const int qkv_out = (cfg.num_query_heads + 2 * cfg.num_kv_heads) * cfg.head_size;
+
+    REQUIRE(static_cast<int>(router_gate_l0.size()) == num_experts * hidden);
+    REQUIRE(static_cast<int>(router_gate_l1.size()) == num_experts * hidden);
+
+    std::mt19937 gen(123);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+    auto fill_bf16 = [&](int elems, float value) {
+        std::vector<nv_bfloat16> v(static_cast<std::size_t>(elems));
+        for (int i = 0; i < elems; ++i) v[static_cast<std::size_t>(i)] = __float2bfloat16(value);
+        return v;
+    };
+    auto fill_rand_bf16 = [&](int elems) {
+        std::vector<nv_bfloat16> v(static_cast<std::size_t>(elems));
+        for (int i = 0; i < elems; ++i) v[static_cast<std::size_t>(i)] = __float2bfloat16(dist(gen));
+        return v;
+    };
+
+    // Non-block: embeddings + final norm.
+    DeviceBuffer<nv_bfloat16> d_embed(static_cast<std::size_t>(cfg.vocab_size) * hidden);
+    DeviceBuffer<nv_bfloat16> d_norm(hidden);
+
+    // Build embeddings: random, but make token id 1 a deterministic "all ones" vector so routing is stable.
+    auto h_embed = fill_rand_bf16(static_cast<int>(d_embed.size()));
+    for (int c = 0; c < hidden; ++c) {
+        h_embed[static_cast<std::size_t>(1) * hidden + c] = __float2bfloat16(1.0f);
+    }
+    CUDA_CHECK(cudaMemcpy(d_embed.data(), h_embed.data(),
+                          d_embed.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    auto h_norm = fill_bf16(hidden, 1.0f);
+    CUDA_CHECK(cudaMemcpy(d_norm.data(), h_norm.data(),
+                          hidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+
+    // Shared attention weights across both layers (kept zeroed).
+    DeviceBuffer<nv_bfloat16> d_qkv(static_cast<std::size_t>(qkv_out) * hidden);
+    DeviceBuffer<nv_bfloat16> d_o(static_cast<std::size_t>(hidden) * (cfg.num_query_heads * cfg.head_size));
+    DeviceBuffer<nv_bfloat16> d_expert_gate_up(static_cast<std::size_t>(2 * moe_inter) * hidden);
+    DeviceBuffer<nv_bfloat16> d_expert_down(static_cast<std::size_t>(hidden) * moe_inter);
+    CUDA_CHECK(cudaMemcpy(d_qkv.data(), fill_bf16(static_cast<int>(d_qkv.size()), 0.0f).data(),
+                          d_qkv.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_o.data(), fill_bf16(static_cast<int>(d_o.size()), 0.0f).data(),
+                          d_o.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    // NOTE: keep experts non-zero so LoRA gradients don't vanish through SwiGLU at exactly 0.
+    // Small positive weights preserve deterministic routing (inputs remain mostly positive).
+    constexpr float kExpertInit = 0.05f;
+    CUDA_CHECK(cudaMemcpy(d_expert_gate_up.data(), fill_bf16(static_cast<int>(d_expert_gate_up.size()), kExpertInit).data(),
+                          d_expert_gate_up.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_expert_down.data(), fill_bf16(static_cast<int>(d_expert_down.size()), kExpertInit).data(),
+                          d_expert_down.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+
+    // Layernorm weights: ones.
+    DeviceBuffer<nv_bfloat16> d_ln1(hidden);
+    DeviceBuffer<nv_bfloat16> d_ln2(hidden);
+    auto h_ln = fill_bf16(hidden, 1.0f);
+    CUDA_CHECK(cudaMemcpy(d_ln1.data(), h_ln.data(), hidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ln2.data(), h_ln.data(), hidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+
+    // Router gates per layer (BF16).
+    DeviceBuffer<nv_bfloat16> d_router_gate0(static_cast<std::size_t>(num_experts) * hidden);
+    DeviceBuffer<nv_bfloat16> d_router_gate1(static_cast<std::size_t>(num_experts) * hidden);
+    CUDA_CHECK(cudaMemcpy(d_router_gate0.data(), router_gate_l0.data(),
+                          router_gate_l0.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_router_gate1.data(), router_gate_l1.data(),
+                          router_gate_l1.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+
+    const std::string path = make_temp_path("surogate_test_moe_2layers");
+    TempFile tmp(path);
+    SafeTensorWriter writer(path);
+
+    auto reg = [&](const std::string& name, const Tensor& t) {
+        writer.register_tensor(name, TensorShard(t));
+    };
+    auto write = [&](const std::string& name, const Tensor& t) {
+        writer.write_tensor(name, TensorShard(t), nullptr);
+    };
+
+    // Register tensors.
+    reg("model.embed_tokens.weight",
+        make_tensor(ETensorDType::BF16, {cfg.vocab_size, hidden}, reinterpret_cast<std::byte*>(d_embed.data())));
+    reg("model.norm.weight",
+        make_tensor(ETensorDType::BF16, {hidden}, reinterpret_cast<std::byte*>(d_norm.data())));
+
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string lp = "model.layers." + std::to_string(layer);
+        reg(lp + ".self_attn.qkv_proj.weight",
+            make_tensor(ETensorDType::BF16, {qkv_out, hidden}, reinterpret_cast<std::byte*>(d_qkv.data())));
+        reg(lp + ".self_attn.o_proj.weight",
+            make_tensor(ETensorDType::BF16, {hidden, cfg.num_query_heads * cfg.head_size}, reinterpret_cast<std::byte*>(d_o.data())));
+        reg(lp + ".input_layernorm.weight",
+            make_tensor(ETensorDType::BF16, {hidden}, reinterpret_cast<std::byte*>(d_ln1.data())));
+        reg(lp + ".post_attention_layernorm.weight",
+            make_tensor(ETensorDType::BF16, {hidden}, reinterpret_cast<std::byte*>(d_ln2.data())));
+        reg(lp + ".mlp.gate.weight",
+            make_tensor(ETensorDType::BF16, {num_experts, hidden},
+                        reinterpret_cast<std::byte*>((layer == 0) ? d_router_gate0.data() : d_router_gate1.data())));
+
+        for (int e = 0; e < num_experts; ++e) {
+            const std::string ep = lp + ".mlp.experts." + std::to_string(e);
+            reg(ep + ".gate_up_proj.weight",
+                make_tensor(ETensorDType::BF16, {2 * moe_inter, hidden}, reinterpret_cast<std::byte*>(d_expert_gate_up.data())));
+            reg(ep + ".down_proj.weight",
+                make_tensor(ETensorDType::BF16, {hidden, moe_inter}, reinterpret_cast<std::byte*>(d_expert_down.data())));
+        }
+    }
+
+    writer.prepare_metadata(nullptr);
+
+    // Write tensors.
+    write("model.embed_tokens.weight",
+          make_tensor(ETensorDType::BF16, {cfg.vocab_size, hidden}, reinterpret_cast<std::byte*>(d_embed.data())));
+    write("model.norm.weight",
+          make_tensor(ETensorDType::BF16, {hidden}, reinterpret_cast<std::byte*>(d_norm.data())));
+
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string lp = "model.layers." + std::to_string(layer);
+        write(lp + ".self_attn.qkv_proj.weight",
+              make_tensor(ETensorDType::BF16, {qkv_out, hidden}, reinterpret_cast<std::byte*>(d_qkv.data())));
+        write(lp + ".self_attn.o_proj.weight",
+              make_tensor(ETensorDType::BF16, {hidden, cfg.num_query_heads * cfg.head_size}, reinterpret_cast<std::byte*>(d_o.data())));
+        write(lp + ".input_layernorm.weight",
+              make_tensor(ETensorDType::BF16, {hidden}, reinterpret_cast<std::byte*>(d_ln1.data())));
+        write(lp + ".post_attention_layernorm.weight",
+              make_tensor(ETensorDType::BF16, {hidden}, reinterpret_cast<std::byte*>(d_ln2.data())));
+        write(lp + ".mlp.gate.weight",
+              make_tensor(ETensorDType::BF16, {num_experts, hidden},
+                          reinterpret_cast<std::byte*>((layer == 0) ? d_router_gate0.data() : d_router_gate1.data())));
+
+        for (int e = 0; e < num_experts; ++e) {
+            const std::string ep = lp + ".mlp.experts." + std::to_string(e);
+            write(ep + ".gate_up_proj.weight",
+                  make_tensor(ETensorDType::BF16, {2 * moe_inter, hidden}, reinterpret_cast<std::byte*>(d_expert_gate_up.data())));
+            write(ep + ".down_proj.weight",
+                  make_tensor(ETensorDType::BF16, {hidden, moe_inter}, reinterpret_cast<std::byte*>(d_expert_down.data())));
+        }
+    }
+
+    writer.finalize(nullptr);
     return tmp;
 }
 
@@ -905,6 +1054,178 @@ TEST_CASE("ModularWeightManager allocates MoE router/expert weights in model dty
     });
 }
 
+TEST_CASE("ModularWeightManager imports per-expert MoE weights into batched expert tensors", "[moe][weights][import]") {
+    if (!cuda_available()) SKIP("CUDA not available");
+
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        const int hidden = 8;
+        const int D = 4;
+        const int num_experts = 2;
+        const int top_k = 1;
+
+        // Build a minimal MoE block config and weight manager.
+        modules::MoEBlockConfigBuilder builder;
+        builder.hidden_size(hidden)
+            .num_query_heads(1)
+            .num_kv_heads(1)
+            .head_size(8)
+            .num_experts(num_experts)
+            .top_k(top_k)
+            .intermediate_size(D);
+
+        modules::ModularWeightManager<modules::StandardMoEBlock>::Config cfg{
+            .num_layers = 1,
+            .block_config = builder.build(),
+            .master_dtype = ETensorDType::BF16,
+            .model_dtype = ETensorDType::BF16,
+            .matmul_dtype = ETensorDType::BF16,
+            .shard_idx = 0,
+            .num_shards = 1,
+            .shard_weights = false,
+            .offload_master = false,
+            .offload_quants = false,
+            .use_zero_copy = false,
+            .offload_alloc = EAllocationType::PINNED,
+            .persistent_quants = false,
+            .init_projections_to_zero = false,
+            .vocab_size = 32,
+            .hidden_size = hidden,
+            .tied_embeddings = false,
+            .architecture_id = PretrainedConfig::QWEN3_MOE,
+            .skip_block_allocation = false,
+            .enable_fp8_forward = false,
+            .enable_fp4_forward = false,
+            .enable_four_over_six = false,
+            .four_over_six_metric = recipes::FourOverSixErrorMetric::MSE,
+        };
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        modules::ModularWeightManager<modules::StandardMoEBlock> wm(cfg, *allocator);
+
+        auto fill_const = [](int elems, float value) {
+            std::vector<nv_bfloat16> v(static_cast<std::size_t>(elems));
+            for (int i = 0; i < elems; ++i) v[static_cast<std::size_t>(i)] = __float2bfloat16(value);
+            return v;
+        };
+
+        // Create a small safetensors file using HF per-expert naming (gate_proj/up_proj/down_proj).
+        const std::string path = make_temp_path("surogate_test_moe_per_expert_import");
+        TempFile tmp(path);
+        SafeTensorWriter writer(path);
+
+        // Router gate (num_experts, hidden)
+        DeviceBuffer<nv_bfloat16> d_router(static_cast<std::size_t>(num_experts) * hidden);
+        auto h_router = fill_const(num_experts * hidden, 0.01f);
+        CUDA_CHECK(cudaMemcpy(d_router.data(), h_router.data(),
+                              h_router.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+
+        writer.register_tensor("model.layers.0.mlp.gate.weight",
+                               TensorShard(make_tensor(ETensorDType::BF16, {num_experts, hidden},
+                                                       reinterpret_cast<std::byte*>(d_router.data()))));
+
+        // Experts: gate/up weights are (D, hidden), down weights are (hidden, D).
+        std::array<DeviceBuffer<nv_bfloat16>, 6> d_expert{};
+        for (auto& b : d_expert) b = DeviceBuffer<nv_bfloat16>(static_cast<std::size_t>(D) * hidden);
+        std::array<DeviceBuffer<nv_bfloat16>, 2> d_down{
+            DeviceBuffer<nv_bfloat16>(static_cast<std::size_t>(hidden) * D),
+            DeviceBuffer<nv_bfloat16>(static_cast<std::size_t>(hidden) * D)
+        };
+
+        for (int e = 0; e < num_experts; ++e) {
+            // Distinct constants per expert/proj so we can verify placement.
+            const float gate_v = 10.0f + static_cast<float>(e);
+            const float up_v = 20.0f + static_cast<float>(e);
+            const float down_v = 30.0f + static_cast<float>(e);
+
+            auto h_gate = fill_const(D * hidden, gate_v);
+            auto h_up = fill_const(D * hidden, up_v);
+            auto h_down = fill_const(hidden * D, down_v);
+
+            CUDA_CHECK(cudaMemcpy(d_expert[static_cast<std::size_t>(e) * 2 + 0].data(), h_gate.data(),
+                                  h_gate.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_expert[static_cast<std::size_t>(e) * 2 + 1].data(), h_up.data(),
+                                  h_up.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_down[static_cast<std::size_t>(e)].data(), h_down.data(),
+                                  h_down.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+
+            const std::string prefix = "model.layers.0.mlp.experts." + std::to_string(e);
+            writer.register_tensor(prefix + ".gate_proj.weight",
+                                   TensorShard(make_tensor(ETensorDType::BF16, {D, hidden},
+                                                           reinterpret_cast<std::byte*>(d_expert[static_cast<std::size_t>(e) * 2 + 0].data()))));
+            writer.register_tensor(prefix + ".up_proj.weight",
+                                   TensorShard(make_tensor(ETensorDType::BF16, {D, hidden},
+                                                           reinterpret_cast<std::byte*>(d_expert[static_cast<std::size_t>(e) * 2 + 1].data()))));
+            writer.register_tensor(prefix + ".down_proj.weight",
+                                   TensorShard(make_tensor(ETensorDType::BF16, {hidden, D},
+                                                           reinterpret_cast<std::byte*>(d_down[static_cast<std::size_t>(e)].data()))));
+        }
+
+        writer.prepare_metadata(nullptr);
+        writer.write_tensor("model.layers.0.mlp.gate.weight",
+                            TensorShard(make_tensor(ETensorDType::BF16, {num_experts, hidden},
+                                                    reinterpret_cast<std::byte*>(d_router.data()))),
+                            nullptr);
+        for (int e = 0; e < num_experts; ++e) {
+            const std::string prefix = "model.layers.0.mlp.experts." + std::to_string(e);
+            writer.write_tensor(prefix + ".gate_proj.weight",
+                                TensorShard(make_tensor(ETensorDType::BF16, {D, hidden},
+                                                        reinterpret_cast<std::byte*>(d_expert[static_cast<std::size_t>(e) * 2 + 0].data()))),
+                                nullptr);
+            writer.write_tensor(prefix + ".up_proj.weight",
+                                TensorShard(make_tensor(ETensorDType::BF16, {D, hidden},
+                                                        reinterpret_cast<std::byte*>(d_expert[static_cast<std::size_t>(e) * 2 + 1].data()))),
+                                nullptr);
+            writer.write_tensor(prefix + ".down_proj.weight",
+                                TensorShard(make_tensor(ETensorDType::BF16, {hidden, D},
+                                                        reinterpret_cast<std::byte*>(d_down[static_cast<std::size_t>(e)].data()))),
+                                nullptr);
+        }
+        writer.finalize(nullptr);
+
+        // Import into batched expert weights.
+        REQUIRE_NOTHROW(wm.import_from_file(tmp.path, /*allow_cast=*/true, comm));
+
+        auto& w = wm.get_block(0, /*stream=*/0);
+        REQUIRE(w.experts.use_batched);
+        REQUIRE(w.experts.gate_up_proj.Rank == 3);
+        REQUIRE(w.experts.gate_up_proj.Sizes[0] == num_experts);
+        REQUIRE(w.experts.gate_up_proj.Sizes[1] == 2 * D);
+        REQUIRE(w.experts.gate_up_proj.Sizes[2] == hidden);
+
+        // Verify placement: [up; gate] in gate_up_proj.
+        std::vector<nv_bfloat16> h_gate_up(static_cast<std::size_t>(num_experts) * 2 * D * hidden);
+        CUDA_CHECK(cudaMemcpy(h_gate_up.data(), w.experts.gate_up_proj.get<nv_bfloat16>(),
+                              h_gate_up.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+        auto at = [&](int e, int row, int col) -> float {
+            const std::size_t idx = (static_cast<std::size_t>(e) * 2 * D + static_cast<std::size_t>(row)) * hidden + static_cast<std::size_t>(col);
+            return __bfloat162float(h_gate_up[idx]);
+        };
+
+        for (int e = 0; e < num_experts; ++e) {
+            const float expected_up = 20.0f + static_cast<float>(e);
+            const float expected_gate = 10.0f + static_cast<float>(e);
+            REQUIRE(at(e, /*row=*/0, /*col=*/0) == Catch::Approx(expected_up));
+            REQUIRE(at(e, /*row=*/D - 1, /*col=*/hidden - 1) == Catch::Approx(expected_up));
+            REQUIRE(at(e, /*row=*/D, /*col=*/0) == Catch::Approx(expected_gate));
+            REQUIRE(at(e, /*row=*/2 * D - 1, /*col=*/hidden - 1) == Catch::Approx(expected_gate));
+        }
+
+        // Verify down_proj placement.
+        std::vector<nv_bfloat16> h_down(static_cast<std::size_t>(num_experts) * hidden * D);
+        CUDA_CHECK(cudaMemcpy(h_down.data(), w.experts.down_proj.get<nv_bfloat16>(),
+                              h_down.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+        auto down_at = [&](int e, int row, int col) -> float {
+            const std::size_t idx = (static_cast<std::size_t>(e) * hidden + static_cast<std::size_t>(row)) * D + static_cast<std::size_t>(col);
+            return __bfloat162float(h_down[idx]);
+        };
+        for (int e = 0; e < num_experts; ++e) {
+            const float expected_down = 30.0f + static_cast<float>(e);
+            REQUIRE(down_at(e, /*row=*/0, /*col=*/0) == Catch::Approx(expected_down));
+            REQUIRE(down_at(e, /*row=*/hidden - 1, /*col=*/D - 1) == Catch::Approx(expected_down));
+        }
+    });
+}
+
 TEST_CASE("moe_topk_backward matches CPU reference (fp32)", "[moe][topk][backward]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
@@ -1091,5 +1412,257 @@ TEST_CASE("Modular MoE model: 1 step forward/backward/update runs (full finetune
             }
         }
         REQUIRE(changed);
+    });
+}
+
+TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora][smoke]") {
+    if (!cuda_available()) SKIP("CUDA not available");
+
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        constexpr int B = 2;
+        constexpr int T = 32;
+
+        Qwen3MoEConfig cfg;
+        cfg.HiddenSize = 64;
+        cfg.IntermediateSize = 128;
+        cfg.MoeIntermediateSize = 32;
+        cfg.NumQueryHeads = 4;
+        cfg.NumKeyValHeads = 2;
+        cfg.HeadDim = 16; // Hq*Hd == Hidden
+        cfg.NumLayers = 2;
+        cfg.VocabSize = 256;
+        cfg.MaxPositionEmbeddings = 128;
+        cfg.RopeTheta = 10000.0f;
+        cfg.RmsNormEps = 1e-6f;
+        cfg.TiedWordEmbeddings = false;
+        cfg.UseQKVBias = false;
+        cfg.UseQKNorm = true;
+        cfg.BosTokenId = 0;
+        cfg.EosTokenId = 1;
+        cfg.PadTokenId = 2;
+        cfg.DType = ETensorDType::BF16;
+
+        cfg.NumExperts = 4;
+        cfg.NumExpertsPerTok = 2;
+        cfg.DecoderSparseStep = 1;
+        cfg.MlpOnlyLayers = {};
+        cfg.NormTopkProb = true;
+        cfg.RouterAuxLossCoef = 0.001f;
+
+        RuntimeOptions opts;
+        opts.UseCudaGraphs = false;
+        opts.RecomputeBlock = false;
+        opts.ModelType = ETensorDType::BF16;
+        opts.MatmulType = ETensorDType::BF16;
+        opts.MasterDType = ETensorDType::BF16;
+
+        modules::LoRAConfigBuilder lora_builder;
+        modules::ModularLoRAConfig lora_cfg = lora_builder.rank(4)
+                                                  .alpha(8.0f)
+                                                  .dtype(ETensorDType::BF16)
+                                                  .clear_targets()
+                                                  .attention()
+                                                  .mlp()  // MoE MLP targets use grouped per-expert LoRA
+                                                  .build();
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        auto model = modules::ModelFactory::create_lora_from_pretrained_config(cfg, lora_cfg, opts, comm, allocator);
+        model->allocate_run_state(opts, comm, B, T, /*allocate_optimizer=*/true);
+        model->init_weights(comm);
+
+        // Capture a small checksum of one grouped MoE LoRA tensor to ensure the optimizer actually updates it.
+        float grouped_gate_b_abs_before = 0.0f;
+        bool found_grouped_gate_b = false;
+        model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
+            if (name.find(".mlp.experts.grouped.gate_proj.lora_B.weight") == std::string::npos) return;
+            if (t.DType != ETensorDType::BF16) return;
+            // First few elements should start at 0 and become non-zero after one update.
+            std::array<nv_bfloat16, 8> h{};
+            CUDA_CHECK(cudaMemcpy(h.data(), t.get<nv_bfloat16>(), h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            for (const auto& v : h) {
+                grouped_gate_b_abs_before += std::abs(__bfloat162float(v));
+            }
+            found_grouped_gate_b = true;
+        });
+        REQUIRE(found_grouped_gate_b);
+
+        auto& inputs = model->get_input_buffer();
+        auto& targets = model->get_target_buffer();
+        auto& pos_ids = model->get_position_ids_buffer();
+
+        std::fill(inputs.get<std::int32_t>(), inputs.get<std::int32_t>() + B * T, 1);
+        std::fill(targets.get<std::int32_t>(), targets.get<std::int32_t>() + B * T, 2);
+        for (int b = 0; b < B; ++b) {
+            for (int t = 0; t < T; ++t) {
+                pos_ids.get<std::int32_t>()[b * T + t] = t;
+            }
+        }
+
+        // Two micro-steps to exercise grad accumulation + MoE scatter-add paths.
+        for (int micro = 0; micro < 2; ++micro) {
+            REQUIRE_NOTHROW(model->forward(inputs, pos_ids, comm, micro));
+            REQUIRE_NOTHROW(model->backward(inputs, targets, comm, /*grad_accum_steps=*/2, micro));
+        }
+
+        REQUIRE_NOTHROW(model->update(comm, /*lr=*/1e-2f, /*beta1=*/0.9f, /*beta2=*/0.999f, /*t=*/1,
+                                      /*epsilon=*/1e-8f, /*weight_decay=*/0.0f, /*grad_clip=*/0.0f));
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        float loss = model->get_loss();
+        float norm = model->get_norm();
+        REQUIRE(std::isfinite(loss));
+        REQUIRE(std::isfinite(norm));
+        REQUIRE(norm > 0.0f);
+        REQUIRE(norm < 1e4f);
+
+        float grouped_gate_b_abs_after = 0.0f;
+        model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
+            if (name.find(".mlp.experts.grouped.gate_proj.lora_B.weight") == std::string::npos) return;
+            if (t.DType != ETensorDType::BF16) return;
+            std::array<nv_bfloat16, 8> h{};
+            CUDA_CHECK(cudaMemcpy(h.data(), t.get<nv_bfloat16>(), h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            for (const auto& v : h) {
+                grouped_gate_b_abs_after += std::abs(__bfloat162float(v));
+            }
+        });
+        REQUIRE(grouped_gate_b_abs_after > grouped_gate_b_abs_before);
+    });
+}
+
+TEST_CASE("Modular MoE model: QLoRA(BnB) selective expert dequant works in backward across layers", "[moe][qlora][bnb][lora][regression]") {
+    if (!cuda_available()) SKIP("CUDA not available");
+
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        constexpr int B = 1;
+        constexpr int T = 16;
+
+        // Tiny 2-layer MoE checkpoint with deterministic, disjoint routing per layer:
+        // - layer0 routes to experts {0,1}
+        // - layer1 routes to experts {2,3}
+        MinimalMoESafetensorsConfig wcfg{};
+        wcfg.vocab_size = 64;
+        wcfg.hidden_size = 16;
+        wcfg.intermediate_size = 16;
+        wcfg.moe_intermediate_size = 8;
+        wcfg.num_query_heads = 2;
+        wcfg.num_kv_heads = 1;
+        wcfg.head_size = 8;
+        wcfg.num_experts = 4;
+
+        std::vector<nv_bfloat16> gate0(static_cast<std::size_t>(wcfg.num_experts) * wcfg.hidden_size);
+        std::vector<nv_bfloat16> gate1(static_cast<std::size_t>(wcfg.num_experts) * wcfg.hidden_size);
+        for (int e = 0; e < wcfg.num_experts; ++e) {
+            float s0 = (e < 2) ? 1.0f : -1.0f;
+            float s1 = (e < 2) ? -1.0f : 1.0f;
+            for (int c = 0; c < wcfg.hidden_size; ++c) {
+                gate0[static_cast<std::size_t>(e) * wcfg.hidden_size + c] = __float2bfloat16(s0);
+                gate1[static_cast<std::size_t>(e) * wcfg.hidden_size + c] = __float2bfloat16(s1);
+            }
+        }
+        TempFile tmp = write_minimal_qwen3_moe_safetensors_2layers(wcfg, gate0, gate1);
+
+        Qwen3MoEConfig cfg;
+        cfg.HiddenSize = wcfg.hidden_size;
+        cfg.IntermediateSize = wcfg.intermediate_size;
+        cfg.MoeIntermediateSize = wcfg.moe_intermediate_size;
+        cfg.NumQueryHeads = wcfg.num_query_heads;
+        cfg.NumKeyValHeads = wcfg.num_kv_heads;
+        cfg.HeadDim = wcfg.head_size;
+        cfg.NumLayers = 2;
+        cfg.VocabSize = wcfg.vocab_size;
+        cfg.MaxPositionEmbeddings = 128;
+        cfg.RopeTheta = 10000.0f;
+        cfg.RmsNormEps = 1e-6f;
+        cfg.TiedWordEmbeddings = true;
+        cfg.UseQKVBias = false;
+        cfg.UseQKNorm = false;
+        cfg.BosTokenId = 0;
+        cfg.EosTokenId = 1;
+        cfg.PadTokenId = 2;
+        cfg.DType = ETensorDType::BF16;
+
+        cfg.NumExperts = wcfg.num_experts;
+        cfg.NumExpertsPerTok = 2;
+        cfg.DecoderSparseStep = 1;
+        cfg.MlpOnlyLayers = {};
+        cfg.NormTopkProb = true;
+        cfg.RouterAuxLossCoef = 0.0f;
+
+        RuntimeOptions opts;
+        opts.UseCudaGraphs = false;
+        opts.RecomputeBlock = false;
+        opts.ModelType = ETensorDType::BF16;
+        opts.MatmulType = ETensorDType::BF16;
+        opts.MasterDType = ETensorDType::BF16;
+        opts.SelectiveExpertDequant = true;
+        opts.OffloadExperts = false;
+
+        modules::LoRAConfigBuilder lora_builder;
+        modules::ModularLoRAConfig lora_cfg = lora_builder.rank(2)
+                                                  .alpha(4.0f)
+                                                  .dtype(ETensorDType::BF16)
+                                                  .clear_targets()
+                                                  .mlp()  // MoE MLP targets use grouped per-expert LoRA
+                                                  .build();
+
+        modules::QLoRAConfig qcfg = modules::QLoRAConfig::bnb(/*block_size=*/64, /*double_quant=*/true);
+        qcfg.num_experts = wcfg.num_experts;
+        qcfg.num_experts_per_tok = 2;
+        qcfg.moe_intermediate_size = wcfg.moe_intermediate_size;
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        auto model = modules::ModelFactory::create_lora_from_pretrained_config(cfg, lora_cfg, opts, comm, allocator, qcfg);
+
+        REQUIRE_NOTHROW(model->import_weights(tmp.path, /*allow_cast=*/true, comm));
+        model->allocate_run_state(opts, comm, B, T, /*allocate_optimizer=*/true);
+
+        auto get_grouped_gate_b_abs = [&](int layer) {
+            const std::string needle = "base_model.model.model.layers." + std::to_string(layer) + ".mlp.experts.grouped.gate_proj.lora_B.weight";
+            float abs_sum = 0.0f;
+            bool found = false;
+            model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
+                if (name != needle) return;
+                REQUIRE(t.DType == ETensorDType::BF16);
+                std::array<nv_bfloat16, 8> h{};
+                CUDA_CHECK(cudaMemcpy(h.data(), t.get<nv_bfloat16>(), h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                for (const auto& v : h) abs_sum += std::abs(__bfloat162float(v));
+                found = true;
+            });
+            REQUIRE(found);
+            return abs_sum;
+        };
+
+        const float before_l0 = get_grouped_gate_b_abs(/*layer=*/0);
+        const float before_l1 = get_grouped_gate_b_abs(/*layer=*/1);
+        REQUIRE(before_l0 == 0.0f);
+        REQUIRE(before_l1 == 0.0f);
+
+        auto& inputs = model->get_input_buffer();
+        auto& targets = model->get_target_buffer();
+        auto& pos_ids = model->get_position_ids_buffer();
+
+        std::fill(inputs.get<std::int32_t>(), inputs.get<std::int32_t>() + B * T, 1);
+        std::fill(targets.get<std::int32_t>(), targets.get<std::int32_t>() + B * T, 2);
+        for (int t = 0; t < T; ++t) {
+            pos_ids.get<std::int32_t>()[t] = t;
+        }
+
+        REQUIRE_NOTHROW(model->forward(inputs, pos_ids, comm, /*micro_step=*/0));
+        REQUIRE_NOTHROW(model->backward(inputs, targets, comm, /*grad_accum_steps=*/1, /*micro_step=*/0));
+        REQUIRE_NOTHROW(model->update(comm, /*lr=*/1e-2f, /*beta1=*/0.9f, /*beta2=*/0.999f, /*t=*/1,
+                                      /*epsilon=*/1e-8f, /*weight_decay=*/0.0f, /*grad_clip=*/0.0f));
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        REQUIRE(std::isfinite(model->get_loss()));
+        REQUIRE(std::isfinite(model->get_norm()));
+        REQUIRE(model->get_norm() > 0.0f);
+        REQUIRE(model->get_norm() < 1e4f);
+
+        const float after_l0 = get_grouped_gate_b_abs(/*layer=*/0);
+        const float after_l1 = get_grouped_gate_b_abs(/*layer=*/1);
+        REQUIRE(after_l0 > 0.0f);
+        REQUIRE(after_l1 > 0.0f);
     });
 }

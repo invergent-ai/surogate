@@ -6,6 +6,9 @@
 #define SUROGATE_SRC_MODULES_LORA_LORA_MODEL_OPTIMIZER_H
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <vector>
 
@@ -188,6 +191,18 @@ void ModularLoRAModel<Block>::update_normuon(NCCLCommunicator& comm, const optim
             if (lora_w.mlp.gate.has_value()) { add_param(lora_w.mlp.gate->A); add_param(lora_w.mlp.gate->B); }
             if (lora_w.mlp.up.has_value()) { add_param(lora_w.mlp.up->A); add_param(lora_w.mlp.up->B); }
             if (lora_w.mlp.down.has_value()) { add_param(lora_w.mlp.down->A); add_param(lora_w.mlp.down->B); }
+
+            if (lora_w.moe.use_grouped) {
+                if (lora_w.moe.grouped.gate.has_value()) { add_param(lora_w.moe.grouped.gate->A); add_param(lora_w.moe.grouped.gate->B); }
+                if (lora_w.moe.grouped.up.has_value()) { add_param(lora_w.moe.grouped.up->A); add_param(lora_w.moe.grouped.up->B); }
+                if (lora_w.moe.grouped.down.has_value()) { add_param(lora_w.moe.grouped.down->A); add_param(lora_w.moe.grouped.down->B); }
+            } else {
+                for (auto& expert : lora_w.moe.experts) {
+                    if (expert.gate.has_value()) { add_param(expert.gate->A); add_param(expert.gate->B); }
+                    if (expert.up.has_value()) { add_param(expert.up->A); add_param(expert.up->B); }
+                    if (expert.down.has_value()) { add_param(expert.down->A); add_param(expert.down->B); }
+                }
+            }
         }
 
         state.num_blocks = (state.state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -293,6 +308,29 @@ void ModularLoRAModel<Block>::update_normuon(NCCLCommunicator& comm, const optim
         if (lora_w.mlp.gate.has_value()) { update_param(lora_w.mlp.gate->A, lora_g.mlp.gate->A); update_param(lora_w.mlp.gate->B, lora_g.mlp.gate->B); }
         if (lora_w.mlp.up.has_value()) { update_param(lora_w.mlp.up->A, lora_g.mlp.up->A); update_param(lora_w.mlp.up->B, lora_g.mlp.up->B); }
         if (lora_w.mlp.down.has_value()) { update_param(lora_w.mlp.down->A, lora_g.mlp.down->A); update_param(lora_w.mlp.down->B, lora_g.mlp.down->B); }
+
+        if (lora_w.moe.use_grouped) {
+            if (lora_w.moe.grouped.gate.has_value() && lora_g.moe.grouped.gate.has_value()) {
+                update_param(lora_w.moe.grouped.gate->A, lora_g.moe.grouped.gate->A);
+                update_param(lora_w.moe.grouped.gate->B, lora_g.moe.grouped.gate->B);
+            }
+            if (lora_w.moe.grouped.up.has_value() && lora_g.moe.grouped.up.has_value()) {
+                update_param(lora_w.moe.grouped.up->A, lora_g.moe.grouped.up->A);
+                update_param(lora_w.moe.grouped.up->B, lora_g.moe.grouped.up->B);
+            }
+            if (lora_w.moe.grouped.down.has_value() && lora_g.moe.grouped.down.has_value()) {
+                update_param(lora_w.moe.grouped.down->A, lora_g.moe.grouped.down->A);
+                update_param(lora_w.moe.grouped.down->B, lora_g.moe.grouped.down->B);
+            }
+        } else {
+            for (std::size_t e = 0; e < lora_w.moe.experts.size() && e < lora_g.moe.experts.size(); ++e) {
+                auto& w_exp = lora_w.moe.experts[e];
+                auto& g_exp = lora_g.moe.experts[e];
+                if (w_exp.gate.has_value() && g_exp.gate.has_value()) { update_param(w_exp.gate->A, g_exp.gate->A); update_param(w_exp.gate->B, g_exp.gate->B); }
+                if (w_exp.up.has_value() && g_exp.up.has_value()) { update_param(w_exp.up->A, g_exp.up->A); update_param(w_exp.up->B, g_exp.up->B); }
+                if (w_exp.down.has_value() && g_exp.down.has_value()) { update_param(w_exp.down->A, g_exp.down->A); update_param(w_exp.down->B, g_exp.down->B); }
+            }
+        }
     }
 
     CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, main_stream));
@@ -329,10 +367,16 @@ void ModularLoRAModel<Block>::calculate_lora_gradient_norm(NCCLCommunicator& com
         if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A); norm_squared(g.mlp.up->B); }
         if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A); norm_squared(g.mlp.down->B); }
 
-        for (const auto& expert : g.moe.experts) {
-            if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
-            if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
-            if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
+        if (g.moe.use_grouped) {
+            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A); norm_squared(g.moe.grouped.gate->B); }
+            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A); norm_squared(g.moe.grouped.up->B); }
+            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A); norm_squared(g.moe.grouped.down->B); }
+        } else {
+            for (const auto& expert : g.moe.experts) {
+                if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
+                if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
+                if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
+            }
         }
     }
 
@@ -341,6 +385,33 @@ void ModularLoRAModel<Block>::calculate_lora_gradient_norm(NCCLCommunicator& com
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
+
+    // Optional debug print to diagnose extreme gradient norms without tracing the full code path.
+    // Enabled via: SUROGATE_DEBUG_LORA_NORM=1
+    static std::atomic<long> s_norm_calls{0};
+    const long norm_call_idx = s_norm_calls.fetch_add(1, std::memory_order_relaxed);
+    const bool debug_norm = std::getenv("SUROGATE_DEBUG_LORA_NORM") != nullptr;
+    if (debug_norm && comm.rank() == 0 && norm_call_idx < 8) {
+        int valid_tokens = 0;
+        float norm_sq = 0.0f;
+        CUDA_CHECK(cudaMemcpy(&valid_tokens, rs.ValidTokenCount.Data, sizeof(valid_tokens), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&norm_sq, buf.template get<float>(), sizeof(norm_sq), cudaMemcpyDeviceToHost));
+        float raw_norm = std::sqrt(std::max(0.0f, norm_sq));
+        float token_scale = (valid_tokens > 0 && total_tokens > 0.0f) ? (total_tokens / static_cast<float>(valid_tokens)) : 0.0f;
+        float scaled_norm = raw_norm * token_scale;
+        std::cerr << "[LoRA NORM DEBUG] call=" << norm_call_idx
+                  << " B=" << rs.B << " T=" << rs.T
+                  << " grad_accum=" << rs.GradAccumSteps
+                  << " world=" << comm.world_size()
+                  << " valid=" << valid_tokens
+                  << " total=" << total_tokens
+                  << " token_scale=" << token_scale
+                  << " raw_norm=" << raw_norm
+                  << " scaled_norm=" << scaled_norm
+                  << " grad_clip=" << grad_clip
+                  << "\n";
+    }
+
     global_norm_sqrt(buf.template get<float>(), rs.NormHost, grad_clip,
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
@@ -376,6 +447,18 @@ void ModularLoRAModel<Block>::initialize_multi_tensor_state(NCCLCommunicator& co
         if (lora_w.mlp.gate.has_value()) { collect_tensor(lora_w.mlp.gate->A); collect_tensor(lora_w.mlp.gate->B); }
         if (lora_w.mlp.up.has_value()) { collect_tensor(lora_w.mlp.up->A); collect_tensor(lora_w.mlp.up->B); }
         if (lora_w.mlp.down.has_value()) { collect_tensor(lora_w.mlp.down->A); collect_tensor(lora_w.mlp.down->B); }
+
+        if (lora_w.moe.use_grouped) {
+            if (lora_w.moe.grouped.gate.has_value()) { collect_tensor(lora_w.moe.grouped.gate->A); collect_tensor(lora_w.moe.grouped.gate->B); }
+            if (lora_w.moe.grouped.up.has_value()) { collect_tensor(lora_w.moe.grouped.up->A); collect_tensor(lora_w.moe.grouped.up->B); }
+            if (lora_w.moe.grouped.down.has_value()) { collect_tensor(lora_w.moe.grouped.down->A); collect_tensor(lora_w.moe.grouped.down->B); }
+        } else {
+            for (auto& expert : lora_w.moe.experts) {
+                if (expert.gate.has_value()) { collect_tensor(expert.gate->A); collect_tensor(expert.gate->B); }
+                if (expert.up.has_value()) { collect_tensor(expert.up->A); collect_tensor(expert.up->B); }
+                if (expert.down.has_value()) { collect_tensor(expert.down->A); collect_tensor(expert.down->B); }
+            }
+        }
     }
 
     state.num_tensors = (int)h_param_ptrs.size();
@@ -418,6 +501,12 @@ void ModularLoRAModel<Block>::update_grad_pointers(NCCLCommunicator& comm, cudaS
         if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
     };
 
+    auto collect_grouped_grad = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& grad_opt) {
+        if (!grad_opt.has_value()) return;
+        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
+        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
+    };
+
     for (int l = 0; l < L; ++l) {
         auto& lora_g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
         collect_grad(lora_g.attention.q);
@@ -427,6 +516,18 @@ void ModularLoRAModel<Block>::update_grad_pointers(NCCLCommunicator& comm, cudaS
         collect_grad(lora_g.mlp.gate);
         collect_grad(lora_g.mlp.up);
         collect_grad(lora_g.mlp.down);
+
+        if (lora_g.moe.use_grouped) {
+            collect_grouped_grad(lora_g.moe.grouped.gate);
+            collect_grouped_grad(lora_g.moe.grouped.up);
+            collect_grouped_grad(lora_g.moe.grouped.down);
+        } else {
+            for (auto& expert : lora_g.moe.experts) {
+                collect_grad(expert.gate);
+                collect_grad(expert.up);
+                collect_grad(expert.down);
+            }
+        }
     }
 
     CUDA_CHECK(cudaMemcpyAsync(state.grad_ptrs.Data, h_grad_ptrs.data(), h_grad_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));

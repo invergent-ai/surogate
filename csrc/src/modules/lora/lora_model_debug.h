@@ -63,10 +63,16 @@ std::vector<float> ModularLoRAModel<Block>::debug_get_grad_norms_by_layer(NCCLCo
         if (g.mlp.up.has_value()) { add(g.mlp.up->A); add(g.mlp.up->B); }
         if (g.mlp.down.has_value()) { add(g.mlp.down->A); add(g.mlp.down->B); }
 
-        for (const auto& expert : g.moe.experts) {
-            if (expert.gate.has_value()) { add(expert.gate->A); add(expert.gate->B); }
-            if (expert.up.has_value()) { add(expert.up->A); add(expert.up->B); }
-            if (expert.down.has_value()) { add(expert.down->A); add(expert.down->B); }
+        if (g.moe.use_grouped) {
+            if (g.moe.grouped.gate.has_value()) { add(g.moe.grouped.gate->A); add(g.moe.grouped.gate->B); }
+            if (g.moe.grouped.up.has_value()) { add(g.moe.grouped.up->A); add(g.moe.grouped.up->B); }
+            if (g.moe.grouped.down.has_value()) { add(g.moe.grouped.down->A); add(g.moe.grouped.down->B); }
+        } else {
+            for (const auto& expert : g.moe.experts) {
+                if (expert.gate.has_value()) { add(expert.gate->A); add(expert.gate->B); }
+                if (expert.up.has_value()) { add(expert.up->A); add(expert.up->B); }
+                if (expert.down.has_value()) { add(expert.down->A); add(expert.down->B); }
+            }
         }
 
         deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem(), stream);
@@ -127,12 +133,18 @@ std::vector<std::pair<std::string, float>> ModularLoRAModel<Block>::debug_get_gr
     if (g.mlp.up.has_value()) out.emplace_back("up_proj", module_norm(g.mlp.up->A, g.mlp.up->B));
     if (g.mlp.down.has_value()) out.emplace_back("down_proj", module_norm(g.mlp.down->A, g.mlp.down->B));
 
-    for (int e = 0; e < (int)g.moe.experts.size(); ++e) {
-        const auto& expert = g.moe.experts[e];
-        std::string prefix = "expert" + std::to_string(e) + ".";
-        if (expert.gate.has_value()) out.emplace_back(prefix + "gate_proj", module_norm(expert.gate->A, expert.gate->B));
-        if (expert.up.has_value()) out.emplace_back(prefix + "up_proj", module_norm(expert.up->A, expert.up->B));
-        if (expert.down.has_value()) out.emplace_back(prefix + "down_proj", module_norm(expert.down->A, expert.down->B));
+    if (g.moe.use_grouped) {
+        if (g.moe.grouped.gate.has_value()) out.emplace_back("moe.grouped.gate_proj", module_norm(g.moe.grouped.gate->A, g.moe.grouped.gate->B));
+        if (g.moe.grouped.up.has_value()) out.emplace_back("moe.grouped.up_proj", module_norm(g.moe.grouped.up->A, g.moe.grouped.up->B));
+        if (g.moe.grouped.down.has_value()) out.emplace_back("moe.grouped.down_proj", module_norm(g.moe.grouped.down->A, g.moe.grouped.down->B));
+    } else {
+        for (int e = 0; e < (int)g.moe.experts.size(); ++e) {
+            const auto& expert = g.moe.experts[e];
+            std::string prefix = "expert" + std::to_string(e) + ".";
+            if (expert.gate.has_value()) out.emplace_back(prefix + "gate_proj", module_norm(expert.gate->A, expert.gate->B));
+            if (expert.up.has_value()) out.emplace_back(prefix + "up_proj", module_norm(expert.up->A, expert.up->B));
+            if (expert.down.has_value()) out.emplace_back(prefix + "down_proj", module_norm(expert.down->A, expert.down->B));
+        }
     }
 
     return out;

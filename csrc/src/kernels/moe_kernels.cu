@@ -756,43 +756,36 @@ void moe_compute_expert_counts(
     );
 }
 
+// Compute exclusive prefix sum of expert_counts into expert_offsets (length num_experts + 1).
+// num_experts is small (typically <= 128), so a single-thread kernel is sufficient and avoids
+// alignment/temporary-storage pitfalls of generic scan implementations.
+__global__ void moe_compute_expert_offsets_kernel(
+    int* __restrict__ expert_offsets,
+    const int* __restrict__ expert_counts,
+    int num_experts
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int sum = 0;
+    expert_offsets[0] = 0;
+    for (int e = 0; e < num_experts; ++e) {
+        sum += expert_counts[e];
+        expert_offsets[e + 1] = sum;
+    }
+}
+
 void moe_compute_expert_offsets(
     int* expert_offsets,
     const int* expert_counts,
     int num_experts,
     cudaStream_t stream
 ) {
-    // Compute exclusive prefix sum of expert_counts
-    // expert_offsets[i] = sum(expert_counts[0:i])
-    // expert_offsets[num_experts] = total_tokens
-
-    // Use CUB InclusiveSum to get expert_offsets[1..num_experts] directly
-    // This gives us expert_offsets[i] = sum(expert_counts[0..i-1]) for i=1..num_experts
-    // We need to shift the result and set expert_offsets[0] = 0
-
-    void* d_temp_storage = nullptr;
-    size_t temp_storage_bytes = 0;
-
-    // First call to determine temp storage size
-    cub::DeviceScan::InclusiveSum(
-        d_temp_storage, temp_storage_bytes,
-        expert_counts, expert_offsets + 1, num_experts, stream
-    );
-
-    // Allocate temporary storage
-    cudaMallocAsync(&d_temp_storage, temp_storage_bytes, stream);
-
-    // Run inclusive prefix sum into expert_offsets[1..num_experts]
-    // This gives us: expert_offsets[i+1] = sum(expert_counts[0..i])
-    cub::DeviceScan::InclusiveSum(
-        d_temp_storage, temp_storage_bytes,
-        expert_counts, expert_offsets + 1, num_experts, stream
-    );
-
-    // Set expert_offsets[0] = 0
-    cudaMemsetAsync(expert_offsets, 0, sizeof(int), stream);
-
-    cudaFreeAsync(d_temp_storage, stream);
+    // Compute exclusive prefix sum of expert_counts.
+    // We intentionally use a tiny single-thread kernel here:
+    // - num_experts is small (typically <= 128)
+    // - avoids CUB alignment pitfalls (expert_offsets + 1 may be misaligned)
+    // - avoids per-call cudaMallocAsync/cudaFreeAsync overhead
+    moe_compute_expert_offsets_kernel<<<1, 1, 0, stream>>>(expert_offsets, expert_counts, num_experts);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void moe_build_indices(

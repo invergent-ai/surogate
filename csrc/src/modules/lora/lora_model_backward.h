@@ -40,18 +40,38 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
                     auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                     lora_accum = lora_accum || accumulate;
 
-                    // Selective expert dequantization: use the cached selection info from forward
-                    // The BnB weight provider caches the selection info used in dequantize_selected_experts
-                    // We use the same selection in backward to match the compact buffer layout
+                    auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
+                    // Selective expert dequantization (QLoRA MoE):
+                    // In forward, we dequantize only router-selected experts into compact buffers.
+                    // Backward must dequantize the same selection for the current layer; otherwise
+                    // grouped GEMMs will skip tokens for experts not present in the compact buffers,
+                    // leaving gradients uninitialized and causing extreme/unstable norms.
+                    SelectiveExpertInfo selection_info;
                     const SelectiveExpertInfo* selection_info_ptr = nullptr;
                     if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant()) {
-                        const auto& cached_selection = mBnBWeightProvider->get_current_selection();
-                        if (cached_selection.enabled) {
-                            selection_info_ptr = &cached_selection;
+                        if (moe_ctx->host_offsets) {
+                            // Fast path: build selection from host-side expert offsets (no D2H sync).
+                            selection_info.reset();
+                            selection_info.num_total = moe_ctx->num_experts;
+                            selection_info.expert_to_compact.assign(moe_ctx->num_experts, -1);
+                            for (int e = 0; e < moe_ctx->num_experts; ++e) {
+                                int tokens_e = moe_ctx->host_offsets[e + 1] - moe_ctx->host_offsets[e];
+                                if (tokens_e <= 0) continue;
+                                selection_info.expert_to_compact[e] = static_cast<int>(selection_info.active_experts.size());
+                                selection_info.active_experts.push_back(e);
+                            }
+                            selection_info.num_active = static_cast<int>(selection_info.active_experts.size());
+                            selection_info.enabled = selection_info.num_active > 0;
+                        } else if (moe_ctx->expert_indices) {
+                            // Slow fallback: copy (BT, top_k) expert indices to host and dedupe.
+                            selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
+                        }
+
+                        if (selection_info.enabled) {
+                            mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
+                            selection_info_ptr = &selection_info;
                         }
                     }
-
-                    auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
                     const auto& cfg = mBaseModel->config();
                     const int C = (int)cfg.HiddenSize;
                     const int D = (int)cfg.IntermediateSize;
@@ -62,6 +82,124 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
                     using WeightsType = std::remove_reference_t<decltype(base_weights)>;
                     if constexpr (has_experts<WeightsType>::value) {
                         if (base_weights.experts.use_batched && lora_grads.moe.use_grouped) {
+                            // Recompute (gate, up) activations for THIS layer into the shared LoRA buffers.
+                            //
+                            // grouped_fast_expert_lora_backward mutates (total_gate, total_up) in-place via
+                            // silu_mul_backward_inplace(). These buffers are shared across layers, so we must
+                            // reconstruct them per layer; otherwise earlier layers would see stale values
+                            // (often from the last processed layer), leading to incorrect gradients and
+                            // extreme/unstable global norms.
+                            //
+                            // Base expert_gate_up for this layer is available in moe_ctx->expert_gate_up.
+                            // We split it, then add the current LoRA contributions for gate/up exactly as in forward.
+                            if (moe_ctx->expert_gate_up) {
+                                const int total_tokens = moe_ctx->total_tokens;
+                                split_gate_up(*moe_ctx->expert_gate_up,
+                                              mLoRARunState->moe_lora_up,
+                                              mLoRARunState->moe_lora_gate,
+                                              total_tokens, moe_D, stream);
+
+                                const bool use_selective = selection_info_ptr && selection_info_ptr->enabled;
+                                const int* active_indices = use_selective ? selection_info_ptr->active_experts.data() : nullptr;
+                                const int gemm_num_experts = use_selective ? selection_info_ptr->num_active : moe_ctx->num_experts;
+
+                                auto add_grouped_lora = [&](const std::optional<LoRAGroupedLayerWeights<Tensor>>& lora_layer,
+                                                           Tensor& out) {
+                                    if (!lora_layer.has_value() || !lora_layer->has_value()) return;
+
+                                    if (moe_ctx->permuted_input->DType != lora_layer->A.DType ||
+                                        moe_ctx->permuted_input->DType != lora_layer->B.DType ||
+                                        moe_ctx->permuted_input->DType != out.DType ||
+                                        moe_ctx->permuted_input->DType != mLoRARunState->moe_lora_intermediate1.DType) {
+                                        throw std::runtime_error("MoE LoRA backward: dtype mismatch while reconstructing gate/up. "
+                                                                 "Set lora_dtype='bf16' to match activation dtype.");
+                                    }
+
+                                    // lora_intermediate1: (tokens, rank) = x @ A^T
+                                    if (moe_ctx->permuted_input->DType == ETensorDType::BF16) {
+                                        moe_grouped_gemm(
+                                            mLoRARunState->moe_lora_intermediate1.get<nv_bfloat16>(),
+                                            moe_ctx->permuted_input->get<nv_bfloat16>(),
+                                            lora_layer->A.get<nv_bfloat16>(),
+                                            moe_ctx->expert_offsets->get<int>(),
+                                            moe_ctx->num_experts,
+                                            /*M=*/rank,
+                                            /*K=*/C,
+                                            mBaseModel->run_state().CublasHandle,
+                                            stream,
+                                            moe_ctx->host_offsets,
+                                            /*alpha=*/1.0f,
+                                            /*beta=*/0.0f,
+                                            EMMTranspose::TN,
+                                            active_indices,
+                                            /*weight_is_compact=*/false,
+                                            gemm_num_experts
+                                        );
+
+                                        // out += scaling * (lora_intermediate1 @ B^T)
+                                        moe_grouped_gemm(
+                                            out.get<nv_bfloat16>(),
+                                            mLoRARunState->moe_lora_intermediate1.get<nv_bfloat16>(),
+                                            lora_layer->B.get<nv_bfloat16>(),
+                                            moe_ctx->expert_offsets->get<int>(),
+                                            moe_ctx->num_experts,
+                                            /*M=*/moe_D,
+                                            /*K=*/rank,
+                                            mBaseModel->run_state().CublasHandle,
+                                            stream,
+                                            moe_ctx->host_offsets,
+                                            /*alpha=*/mLoRAConfig.scaling(),
+                                            /*beta=*/1.0f,
+                                            EMMTranspose::TN,
+                                            active_indices,
+                                            /*weight_is_compact=*/false,
+                                            gemm_num_experts
+                                        );
+                                    } else {
+                                        moe_grouped_gemm(
+                                            mLoRARunState->moe_lora_intermediate1.get<float>(),
+                                            moe_ctx->permuted_input->get<float>(),
+                                            lora_layer->A.get<float>(),
+                                            moe_ctx->expert_offsets->get<int>(),
+                                            moe_ctx->num_experts,
+                                            /*M=*/rank,
+                                            /*K=*/C,
+                                            mBaseModel->run_state().CublasHandle,
+                                            stream,
+                                            moe_ctx->host_offsets,
+                                            /*alpha=*/1.0f,
+                                            /*beta=*/0.0f,
+                                            EMMTranspose::TN,
+                                            active_indices,
+                                            /*weight_is_compact=*/false,
+                                            gemm_num_experts
+                                        );
+
+                                        moe_grouped_gemm(
+                                            out.get<float>(),
+                                            mLoRARunState->moe_lora_intermediate1.get<float>(),
+                                            lora_layer->B.get<float>(),
+                                            moe_ctx->expert_offsets->get<int>(),
+                                            moe_ctx->num_experts,
+                                            /*M=*/moe_D,
+                                            /*K=*/rank,
+                                            mBaseModel->run_state().CublasHandle,
+                                            stream,
+                                            moe_ctx->host_offsets,
+                                            /*alpha=*/mLoRAConfig.scaling(),
+                                            /*beta=*/1.0f,
+                                            EMMTranspose::TN,
+                                            active_indices,
+                                            /*weight_is_compact=*/false,
+                                            gemm_num_experts
+                                        );
+                                    }
+                                };
+
+                                add_grouped_lora(lora_block.moe.grouped.gate, mLoRARunState->moe_lora_gate);
+                                add_grouped_lora(lora_block.moe.grouped.up, mLoRARunState->moe_lora_up);
+                            }
+
                             detail::grouped_fast_expert_lora_backward(
                                 lora_grads.moe.grouped,
                                 const_cast<Tensor&>(*moe_ctx->d_permuted_input),

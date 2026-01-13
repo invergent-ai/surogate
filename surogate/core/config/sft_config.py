@@ -655,6 +655,16 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     def create_qlora_config(self):
         self.qlora_config = None
+
+        # QLoRA is only supported together with LoRA adapters in Surogate:
+        # base weights remain frozen and only LoRA params are trained.
+        if (self.qlora_fp4 or self.qlora_fp8 or self.qlora_bnb) and not self.lora:
+            raise ValueError(
+                "QLoRA options (qlora_bnb/qlora_fp8/qlora_fp4) require `lora: true` "
+                "(base weights are frozen; only LoRA adapters are trained). "
+                "Either enable LoRA or disable QLoRA."
+            )
+
         if self.qlora_fp4:
             self.qlora_config = _surogate.QLoRAConfig.nvfp4()
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six

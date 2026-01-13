@@ -870,6 +870,21 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         }
     });
 
+    // Cache expert offsets on host (per layer) to avoid repeated D2H sync in grouped GEMM calls.
+    // IMPORTANT: rs.MoeHostExpertOffsets is a single reusable buffer; in multi-layer backward it must be
+    // refreshed for each layer, otherwise grouped GEMMs will use stale offsets from another layer and
+    // produce incorrect/uninitialized gradients (often manifesting as extreme norm spikes).
+    with_ctx("moe_cache_host_offsets", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            rs.MoeHostExpertOffsets.resize(num_experts + 1);
+            CUDA_CHECK(cudaMemcpyAsync(rs.MoeHostExpertOffsets.data(), expert_offsets.get<int>(),
+                                       (num_experts + 1) * sizeof(int),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            rs.MoeHostOffsetsValid = true;
+        }
+    });
+
     // Allocate expert backward temporaries
     Tensor permuted_input{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
     Tensor expert_gate_up{a.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
@@ -1229,6 +1244,10 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Backward through permutation: scatter d_permuted_input back to d_ln2
     with_ctx("moe_permute_backward", [&]() {
         if constexpr (has_moe_weights<BlockWeights>::value) {
+            // moe_permute_backward uses atomicAdd into d_ln2, so we must start from a zero buffer.
+            // Dense blocks overwrite d_ln2 via matmul backward, but MoE uses scatter-add for top-k.
+            fill_zero(da.d_ln2, stream);
+
             if (da.d_ln2.DType == ETensorDType::BF16) {
                 Tensor d_ln2_flat = da.d_ln2;
                 d_ln2_flat.Sizes[0] = BT;

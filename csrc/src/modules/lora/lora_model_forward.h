@@ -54,10 +54,26 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                     // Selective expert dequantization: only dequantize router-selected experts
                     // This saves ~1.1GB of dequant buffer memory for 128-expert MoE models
                     SelectiveExpertInfo selection_info;
-                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant() && moe_ctx->expert_indices) {
-                        selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
-                        mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
-                        moe_ctx->selection_info = &selection_info;
+                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant()) {
+                        if (moe_ctx->host_offsets) {
+                            selection_info.reset();
+                            selection_info.num_total = moe_ctx->num_experts;
+                            selection_info.expert_to_compact.assign(moe_ctx->num_experts, -1);
+                            for (int e = 0; e < moe_ctx->num_experts; ++e) {
+                                int tokens_e = moe_ctx->host_offsets[e + 1] - moe_ctx->host_offsets[e];
+                                if (tokens_e <= 0) continue;
+                                selection_info.expert_to_compact[e] = static_cast<int>(selection_info.active_experts.size());
+                                selection_info.active_experts.push_back(e);
+                            }
+                            selection_info.num_active = static_cast<int>(selection_info.active_experts.size());
+                            selection_info.enabled = selection_info.num_active > 0;
+                        } else if (moe_ctx->expert_indices) {
+                            selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
+                        }
+
+                        if (selection_info.enabled) {
+                            mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
+                        }
                     }
 
                     auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
@@ -189,10 +205,26 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
 
                     // Selective expert dequantization: only dequantize router-selected experts
                     SelectiveExpertInfo selection_info;
-                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant() && moe_ctx->expert_indices) {
-                        selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
-                        mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
-                        moe_ctx->selection_info = &selection_info;
+                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant()) {
+                        if (moe_ctx->host_offsets) {
+                            selection_info.reset();
+                            selection_info.num_total = moe_ctx->num_experts;
+                            selection_info.expert_to_compact.assign(moe_ctx->num_experts, -1);
+                            for (int e = 0; e < moe_ctx->num_experts; ++e) {
+                                int tokens_e = moe_ctx->host_offsets[e + 1] - moe_ctx->host_offsets[e];
+                                if (tokens_e <= 0) continue;
+                                selection_info.expert_to_compact[e] = static_cast<int>(selection_info.active_experts.size());
+                                selection_info.active_experts.push_back(e);
+                            }
+                            selection_info.num_active = static_cast<int>(selection_info.active_experts.size());
+                            selection_info.enabled = selection_info.num_active > 0;
+                        } else if (moe_ctx->expert_indices) {
+                            selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
+                        }
+
+                        if (selection_info.enabled) {
+                            mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
+                        }
                     }
 
                     auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
