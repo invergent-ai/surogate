@@ -24,12 +24,15 @@
 #include <cublas_v2.h>
 
 #include "kernels/kernels.h"
+#include "modules/model_factory.h"
 #include "modules/moe/moe_block.h"
 #include "modules/qlora/bnb_weights.h"
 #include "modules/qlora/fp4_weights.h"
 #include "modules/qlora/fp8_weights.h"
 #include "modules/qlora/qlora_config.h"
 #include "modules/weights/weight_manager.h"
+#include "models/qwen3moe/config.h"
+#include "training/runtime_options.h"
 #include "utilities/allocator.h"
 #include "utilities/safetensors.h"
 #include "utilities/utils.h"
@@ -899,5 +902,194 @@ TEST_CASE("ModularWeightManager allocates MoE router/expert weights in model dty
 
         // Avoid unused parameter warning.
         (void)comm;
+    });
+}
+
+TEST_CASE("moe_topk_backward matches CPU reference (fp32)", "[moe][topk][backward]") {
+    if (!cuda_available()) SKIP("CUDA not available");
+
+    CudaStream stream;
+
+    const int BT = 11;
+    const int E = 9;
+    const int K = 4;
+
+    std::mt19937 gen(123);
+    std::uniform_real_distribution<float> dist_prob(0.001f, 1.0f);
+    std::uniform_real_distribution<float> dist_grad(-0.25f, 0.25f);
+
+    std::vector<float> h_probs(static_cast<std::size_t>(BT) * E);
+    for (int t = 0; t < BT; ++t) {
+        float sum = 0.0f;
+        for (int e = 0; e < E; ++e) {
+            float v = dist_prob(gen);
+            h_probs[static_cast<std::size_t>(t) * E + e] = v;
+            sum += v;
+        }
+        for (int e = 0; e < E; ++e) {
+            h_probs[static_cast<std::size_t>(t) * E + e] /= sum;
+        }
+    }
+
+    DeviceBuffer<float> d_probs(h_probs.size());
+    DeviceBuffer<int> d_expert_indices(static_cast<std::size_t>(BT) * K);
+    DeviceBuffer<float> d_routing_w(static_cast<std::size_t>(BT) * K);
+    DeviceBuffer<float> d_d_routing_w(static_cast<std::size_t>(BT) * K);
+    DeviceBuffer<float> d_d_probs(static_cast<std::size_t>(BT) * E);
+
+    CUDA_CHECK(cudaMemcpyAsync(d_probs.data(), h_probs.data(), h_probs.size() * sizeof(float),
+                               cudaMemcpyHostToDevice, stream.stream));
+
+    for (bool normalize : {false, true}) {
+        moe_topk_forward(d_expert_indices.data(), d_routing_w.data(), d_probs.data(),
+                         BT, E, K, normalize, stream.stream);
+
+        std::vector<float> h_d_routing_w(static_cast<std::size_t>(BT) * K);
+        for (auto& v : h_d_routing_w) v = dist_grad(gen);
+        CUDA_CHECK(cudaMemcpyAsync(d_d_routing_w.data(), h_d_routing_w.data(), h_d_routing_w.size() * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream.stream));
+        CUDA_CHECK(cudaMemsetAsync(d_d_probs.data(), 0, d_d_probs.size() * sizeof(float), stream.stream));
+
+        moe_topk_backward(d_d_probs.data(), d_d_routing_w.data(), d_probs.data(), d_expert_indices.data(),
+                          BT, E, K, normalize, stream.stream);
+
+        CUDA_CHECK(cudaStreamSynchronize(stream.stream));
+
+        auto h_expert_indices = copy_device_to_host(d_expert_indices.data(), static_cast<std::size_t>(BT) * K);
+        auto h_d_probs = copy_device_to_host(d_d_probs.data(), static_cast<std::size_t>(BT) * E);
+
+        // CPU reference
+        std::vector<float> ref(static_cast<std::size_t>(BT) * E, 0.0f);
+        for (int t = 0; t < BT; ++t) {
+            float S = 0.0f;
+            float dot = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const int idx = h_expert_indices[static_cast<std::size_t>(t) * K + k];
+                const float p = h_probs[static_cast<std::size_t>(t) * E + idx];
+                const float g = h_d_routing_w[static_cast<std::size_t>(t) * K + k];
+                S += p;
+                dot += g * p;
+            }
+
+            for (int k = 0; k < K; ++k) {
+                const int idx = h_expert_indices[static_cast<std::size_t>(t) * K + k];
+                const float p = h_probs[static_cast<std::size_t>(t) * E + idx];
+                const float g = h_d_routing_w[static_cast<std::size_t>(t) * K + k];
+                if (!normalize) {
+                    ref[static_cast<std::size_t>(t) * E + idx] += g;
+                } else {
+                    ref[static_cast<std::size_t>(t) * E + idx] += (g * S - dot) / (S * S);
+                }
+            }
+        }
+
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            REQUIRE(h_d_probs[i] == Catch::Approx(ref[i]).margin(1e-5f));
+        }
+    }
+}
+
+TEST_CASE("Modular MoE model: 1 step forward/backward/update runs (full finetune)", "[moe][modular][smoke]") {
+    if (!cuda_available()) SKIP("CUDA not available");
+
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        constexpr int B = 2;
+        constexpr int T = 32;
+
+        Qwen3MoEConfig cfg;
+        cfg.HiddenSize = 32;
+        cfg.IntermediateSize = 64;   // dense MLP (unused for pure MoE layers)
+        cfg.MoeIntermediateSize = 16;
+        cfg.NumQueryHeads = 4;
+        cfg.NumKeyValHeads = 2;
+        cfg.HeadDim = 16;            // != HiddenSize / NumQueryHeads
+        cfg.NumLayers = 2;
+        cfg.VocabSize = 128;
+        cfg.MaxPositionEmbeddings = 128;
+        cfg.RopeTheta = 10000.0f;
+        cfg.RmsNormEps = 1e-6f;
+        cfg.TiedWordEmbeddings = false;
+        cfg.UseQKVBias = false;
+        cfg.UseQKNorm = true;
+        cfg.BosTokenId = 0;
+        cfg.EosTokenId = 1;
+        cfg.PadTokenId = 2;
+        cfg.DType = ETensorDType::BF16;
+
+        cfg.NumExperts = 4;
+        cfg.NumExpertsPerTok = 2;
+        cfg.DecoderSparseStep = 1;       // all layers MoE
+        cfg.MlpOnlyLayers = {};
+        cfg.NormTopkProb = true;
+        cfg.RouterAuxLossCoef = 0.001f;
+
+        RuntimeOptions opts;
+        opts.UseCudaGraphs = false;
+        opts.RecomputeBlock = false;
+        opts.ModelType = ETensorDType::BF16;
+        opts.MatmulType = ETensorDType::BF16;
+        opts.MasterDType = ETensorDType::BF16;
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
+        model->allocate_run_state(opts, comm, B, T, /*allocate_optimizer=*/true);
+        model->init_weights(comm);
+
+        TensorShard gate_before;
+        bool found_gate = false;
+        model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
+            if (name == "model.layers.0.mlp.router.gate.weight") {
+                gate_before = t;
+                found_gate = true;
+            }
+        });
+        REQUIRE(found_gate);
+        REQUIRE(gate_before.DType == ETensorDType::BF16);
+        REQUIRE(gate_before.Data != nullptr);
+        auto h_gate_before = copy_device_to_host(reinterpret_cast<const nv_bfloat16*>(gate_before.Data), 64);
+
+        // Fill inputs/targets/position IDs in pinned host buffers provided by the model.
+        auto& inputs = model->get_input_buffer();
+        auto& targets = model->get_target_buffer();
+        auto& pos_ids = model->get_position_ids_buffer();
+
+        std::fill(inputs.get<std::int32_t>(), inputs.get<std::int32_t>() + B * T, 1);
+        std::fill(targets.get<std::int32_t>(), targets.get<std::int32_t>() + B * T, 2);
+        for (int b = 0; b < B; ++b) {
+            for (int t = 0; t < T; ++t) {
+                pos_ids.get<std::int32_t>()[b * T + t] = t;
+            }
+        }
+
+        REQUIRE_NOTHROW(model->forward(inputs, pos_ids, comm, /*micro_step=*/0));
+        REQUIRE_NOTHROW(model->backward(inputs, targets, comm, /*grad_accum_steps=*/1, /*micro_step=*/0));
+        REQUIRE_NOTHROW(model->update(comm, /*lr=*/1e-2f, /*beta1=*/0.9f, /*beta2=*/0.999f, /*t=*/1,
+                                      /*epsilon=*/1e-8f, /*weight_decay=*/0.0f, /*grad_clip=*/0.0f));
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        REQUIRE(std::isfinite(model->get_loss()));
+        REQUIRE(std::isfinite(model->get_norm()));
+        REQUIRE(model->get_norm() > 0.0f);
+
+        TensorShard gate_after;
+        bool found_gate_after = false;
+        model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
+            if (name == "model.layers.0.mlp.router.gate.weight") {
+                gate_after = t;
+                found_gate_after = true;
+            }
+        });
+        REQUIRE(found_gate_after);
+        auto h_gate_after = copy_device_to_host(reinterpret_cast<const nv_bfloat16*>(gate_after.Data), 64);
+
+        bool changed = false;
+        for (std::size_t i = 0; i < h_gate_before.size(); ++i) {
+            if (bf16_bits(h_gate_before[i]) != bf16_bits(h_gate_after[i])) {
+                changed = true;
+                break;
+            }
+        }
+        REQUIRE(changed);
     });
 }

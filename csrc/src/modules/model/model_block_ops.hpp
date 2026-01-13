@@ -736,6 +736,12 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     const int qkv_channels = (int)mConfig.qkv_channels();
     const int BT = B * T;
 
+    // Determine if this layer should use FP4/FP8 quantization (skip ranges match dense path).
+    const int skip_first = std::max(0, mOptions.skip_quant_first_layers);
+    const int skip_last = std::max(0, mOptions.skip_quant_last_layers);
+    const bool in_skip_range = (layer_idx < skip_first) || (layer_idx >= mConfig.NumLayers - skip_last);
+    const bool allow_fp4_layer = !in_skip_range;
+
     // MoE config
     assert(mConfig.moe_config.has_value() && "MoE config must be set for MoE blocks");
     const auto& moe_cfg = *mConfig.moe_config;
@@ -748,6 +754,8 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Use the simplified activation/gradient buffers
     auto& a = rs.simplified_acts(layer_idx);
     auto& da = rs.simplified_grads(layer_idx);
+    auto& qa = rs.simplified_quant_acts(layer_idx);
+    auto& qg = rs.simplified_quant_grads();
 
     // LoRA-only mode: skip computing base weight gradients (only compute dinp for gradient flow)
     const bool lora_only = rs.is_lora_only_mode();
@@ -882,17 +890,50 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Recompute forward pass for expert activations (needed for backward)
     with_ctx("moe_expert_recompute", [&]() {
         if constexpr (has_moe_weights<BlockWeights>::value) {
-            // ... (permutation logic) ...
-            // Recompute expert forward pass using grouped GEMM
-            // ...
-            // Gate+Up projection ...
-            // SwiGLU activation on tokens
+            // Permute tokens to expert-grouped order
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_permute_tokens(
+                    permuted_input.get<nv_bfloat16>(),
+                    flat_ln2.get<nv_bfloat16>(),
+                    gather_indices.get<int>(),
+                    total_expert_tokens, BT, C, top_k, stream
+                );
+            } else {
+                moe_permute_tokens(
+                    permuted_input.get<float>(),
+                    flat_ln2.get<float>(),
+                    gather_indices.get<int>(),
+                    total_expert_tokens, BT, C, top_k, stream
+                );
+            }
+
+            // Gate+Up projection across all experts
+            const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_grouped_gemm_gate_up(
+                    expert_gate_up.get<nv_bfloat16>(),
+                    permuted_input.get<nv_bfloat16>(),
+                    weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                    expert_offsets.get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
+                );
+            } else {
+                moe_grouped_gemm_gate_up(
+                    expert_gate_up.get<float>(),
+                    permuted_input.get<float>(),
+                    weights.experts.gate_up_proj.template get<float>(),
+                    expert_offsets.get<int>(),
+                    num_experts, C, expert_D,
+                    rs.CublasHandle, stream, host_offsets
+                );
+            }
+
+            // SwiGLU activation on tokens + down projection
             {
                 Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(expert_swiglu);
                 swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
-
-                const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
                 // Down projection for all experts
                 if (a.ln2.DType == ETensorDType::BF16) {
@@ -920,6 +961,9 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     });
 
     // Backward through combine (unpermute + weight)
+    // Keep routing weight gradients in FP32 for router backward (routing is computed in FP32).
+    Tensor d_routing_weights_fp32{ETensorDType::FP32, {BT, top_k}, nullptr, nullptr, 2, dev};
+    rs.temp_acquire(d_routing_weights_fp32);
     with_ctx("moe_combine_backward", [&]() {
         if constexpr (has_moe_weights<BlockWeights>::value) {
             // d_res_ffn is the gradient from the residual connection
@@ -952,13 +996,18 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
                     BT, total_expert_tokens, C, top_k, stream
                 );
 
+                // Convert d_routing_weights to FP32 for router backward
+                convert_dtype(
+                    d_routing_weights_fp32.get<float>(),
+                    d_routing_weights.get<nv_bfloat16>(),
+                    BT * top_k,
+                    stream
+                );
+
                 rs.temp_free(routing_weights_bf16);
                 rs.temp_free(d_routing_weights);
             } else {
                 // For FP32
-                Tensor d_routing_weights{ETensorDType::FP32, {BT, top_k}, nullptr, nullptr, 2, dev};
-                rs.temp_acquire(d_routing_weights);
-
                 Tensor d_res_ffn_fp32 = da.d_res_ffn;
                 d_res_ffn_fp32.Sizes[0] = BT;
                 d_res_ffn_fp32.Sizes[1] = C;
@@ -966,15 +1015,13 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
 
                 moe_combine_backward(
                     d_expert_outputs.get<float>(),
-                    d_routing_weights.get<float>(),
+                    d_routing_weights_fp32.get<float>(),
                     d_res_ffn_fp32.get<float>(),
                     expert_outputs.get<float>(),
                     routing_weights_fp32.get<float>(),
                     scatter_indices.get<int>(),
                     BT, total_expert_tokens, C, top_k, stream
                 );
-
-                rs.temp_free(d_routing_weights);
             }
         }
     });
@@ -1006,6 +1053,53 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
             if constexpr (has_moe_weights<BlockWeights>::value) {
                 // Use cached host offsets if available
                 const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
+
+                // Expert down_proj weight gradients require the SwiGLU activations.
+                // Keep this out of the main backward path in LoRA-only mode.
+                if (!lora_only) {
+                    if constexpr (requires { grads.experts.d_down_proj; }) {
+                        if (grads.experts.d_down_proj.Data && grads.experts.d_down_proj.nelem() > 0) {
+                            Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                            rs.temp_acquire(expert_swiglu);
+                            swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
+
+                            const float beta = accumulate ? 1.0f : 0.0f;
+                            if (a.ln2.DType == ETensorDType::BF16) {
+                                moe_grouped_gemm_weight_grad(
+                                    grads.experts.d_down_proj.template get<nv_bfloat16>(),
+                                    d_expert_outputs.get<nv_bfloat16>(),
+                                    expert_swiglu.get<nv_bfloat16>(),
+                                    expert_offsets.get<int>(),
+                                    num_experts,
+                                    /*M=*/C,
+                                    /*N=*/expert_D,
+                                    rs.CublasHandle,
+                                    stream,
+                                    host_offsets,
+                                    /*alpha=*/1.0f,
+                                    beta
+                                );
+                            } else {
+                                moe_grouped_gemm_weight_grad(
+                                    grads.experts.d_down_proj.template get<float>(),
+                                    d_expert_outputs.get<float>(),
+                                    expert_swiglu.get<float>(),
+                                    expert_offsets.get<int>(),
+                                    num_experts,
+                                    /*M=*/C,
+                                    /*N=*/expert_D,
+                                    rs.CublasHandle,
+                                    stream,
+                                    host_offsets,
+                                    /*alpha=*/1.0f,
+                                    beta
+                                );
+                            }
+
+                            rs.temp_free(expert_swiglu);
+                        }
+                    }
+                }
 
                 Tensor d_expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(d_expert_swiglu);
@@ -1061,9 +1155,49 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
                 // So: first = d_up (expert_up), second = d_gate (expert_gate)
                 concat_d_gate_up(expert_up, expert_gate, d_expert_gate_up, total_expert_tokens, expert_D, stream);
 
-                rs.temp_free(expert_up);
                 rs.temp_free(expert_gate);
+                rs.temp_free(expert_up);
                 rs.temp_free(d_expert_swiglu);
+
+                // Expert gate_up_proj weight gradient (before computing d_permuted_input).
+                if (!lora_only) {
+                    if constexpr (requires { grads.experts.d_gate_up_proj; }) {
+                        if (grads.experts.d_gate_up_proj.Data && grads.experts.d_gate_up_proj.nelem() > 0) {
+                            const float beta = accumulate ? 1.0f : 0.0f;
+                            if (a.ln2.DType == ETensorDType::BF16) {
+                                moe_grouped_gemm_weight_grad(
+                                    grads.experts.d_gate_up_proj.template get<nv_bfloat16>(),
+                                    d_expert_gate_up.get<nv_bfloat16>(),
+                                    permuted_input.get<nv_bfloat16>(),
+                                    expert_offsets.get<int>(),
+                                    num_experts,
+                                    /*M=*/2 * expert_D,
+                                    /*N=*/C,
+                                    rs.CublasHandle,
+                                    stream,
+                                    host_offsets,
+                                    /*alpha=*/1.0f,
+                                    beta
+                                );
+                            } else {
+                                moe_grouped_gemm_weight_grad(
+                                    grads.experts.d_gate_up_proj.template get<float>(),
+                                    d_expert_gate_up.get<float>(),
+                                    permuted_input.get<float>(),
+                                    expert_offsets.get<int>(),
+                                    num_experts,
+                                    /*M=*/2 * expert_D,
+                                    /*N=*/C,
+                                    rs.CublasHandle,
+                                    stream,
+                                    host_offsets,
+                                    /*alpha=*/1.0f,
+                                    beta
+                                );
+                            }
+                        }
+                    }
+                }
 
                 // Backward through gate+up projection for all experts
                 // d_permuted_input = d_expert_gate_up @ gate_up_proj (no transpose)
@@ -1123,7 +1257,95 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         }
     });
 
+    // Router backward: propagate gradients through top-k normalization and softmax back into LN2,
+    // and (if training base weights) compute router gate weight gradients.
+    with_ctx("moe_router_backward", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            // d_probs is sparse (only selected experts have non-zero entries), but represented as a dense (BT, E) buffer.
+            Tensor d_probs{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
+            Tensor d_logits{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
+            rs.temp_acquire(d_probs);
+            rs.temp_acquire(d_logits);
+
+            fill_zero(d_probs, stream);
+
+            // Top-k backward (treat indices as constants): d_probs from d_routing_weights.
+            moe_topk_backward(
+                d_probs.get<float>(),
+                d_routing_weights_fp32.get<float>(),
+                router_probs.get<float>(),
+                expert_indices.get<int>(),
+                BT, num_experts, top_k,
+                /*normalize_weights=*/true,
+                stream
+            );
+
+            // Softmax backward: d_logits from d_probs.
+            moe_softmax_backward(
+                d_logits.get<float>(),
+                d_probs.get<float>(),
+                router_probs.get<float>(),
+                BT, num_experts,
+                stream
+            );
+
+            // Convert d_logits to BF16 for matmuls against BF16 weights/activations.
+            Tensor d_logits_bf16{ETensorDType::BF16, {BT, num_experts}, nullptr, nullptr, 2, dev};
+            rs.temp_acquire(d_logits_bf16);
+            convert_dtype(
+                d_logits_bf16.get<nv_bfloat16>(),
+                d_logits.get<float>(),
+                BT * num_experts,
+                stream
+            );
+
+            // d_ln2 += d_logits @ router.gate
+            // In column-major view: d_ln2^T(C, BT) = router.gate^T(C, E) @ d_logits^T(E, BT)
+            Tensor d_ln2_flat = da.d_ln2;
+            d_ln2_flat.Sizes[0] = BT;
+            d_ln2_flat.Sizes[1] = C;
+            d_ln2_flat.Rank = 2;
+            matmul(
+                d_ln2_flat,
+                weights.router.gate,
+                d_logits_bf16,
+                std::nullopt,
+                nullptr, nullptr,
+                rs.CublasLtHandle, rs.CuBlasWorkspace,
+                C, BT, num_experts,
+                EMMTranspose::NN,
+                /*accumulate=*/true,
+                stream
+            );
+
+            // d_router_gate (weight grad): dW = d_logits^T @ ln2  (E, C)
+            if (!lora_only) {
+                if constexpr (requires { grads.router.d_gate; }) {
+                    if (grads.router.d_gate.Data && grads.router.d_gate.nelem() > 0) {
+                        matmul(
+                            grads.router.d_gate,
+                            flat_ln2,
+                            d_logits_bf16,
+                            std::nullopt,
+                            nullptr, nullptr,
+                            rs.CublasLtHandle, rs.CuBlasWorkspace,
+                            C, num_experts, BT,
+                            EMMTranspose::NT,
+                            /*accumulate=*/accumulate,
+                            stream
+                        );
+                    }
+                }
+            }
+
+            rs.temp_free(d_logits_bf16);
+            rs.temp_free(d_logits);
+            rs.temp_free(d_probs);
+        }
+    });
+
     // Free expert temporaries
+    rs.temp_free(d_routing_weights_fp32);
     rs.temp_free(d_permuted_input);
     rs.temp_free(d_expert_gate_up);
     rs.temp_free(d_expert_outputs);
@@ -1158,15 +1380,49 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward, nullptr);
 
     // Output projection backward
-    with_ctx("att_out", [&]() {
-        // d_att = d_res_att @ out_weight
-        matmul(
-            da.d_att, weights.attention.out_weight, da.d_res_att, std::nullopt,
-            nullptr, nullptr,
-            rs.CublasLtHandle, rs.CuBlasWorkspace,
-            Hq * Hs, B * T, C, EMMTranspose::NN, false,
-            stream
-        );
+    with_ctx("att_out:qmm", [&]() {
+        Tensor* d_out_weight = nullptr;
+        if (!lora_only) {
+            if constexpr (requires { grads.attention_grads.d_out_weight; }) {
+                d_out_weight = &grads.attention_grads.d_out_weight;
+            } else if constexpr (requires { grads.attention.d_out_weight; }) {
+                d_out_weight = &grads.attention.d_out_weight;
+            }
+        }
+
+        modules::MatmulContext ctx;
+        ctx.dinp = &da.d_att;
+        ctx.dweight = d_out_weight;
+        ctx.dbias = nullptr;
+        ctx.dout = &da.d_res_att;
+        ctx.inp = &a.att;
+        ctx.weight = &weights.attention.out_weight;
+        ctx.inp_quant = &qa.att;
+        ctx.dout_quant = &qg.d_res_att;
+        ctx.bias_buffer = nullptr;
+        ctx.B = (int)B;
+        ctx.T = (int)T;
+        ctx.C_in = (int)(Hq * Hs);
+        ctx.C_out = (int)C;
+        ctx.run_state = &rs;
+        ctx.stream = stream;
+        ctx.layer_idx = layer_idx;
+        ctx.op = modules::MatmulOp::AttnOut;
+        ctx.accumulate = accumulate;
+        ctx.skip_weight_grad = lora_only;
+        ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+        ctx.allow_fp4 = allow_fp4_layer;
+        ctx.allow_fp8 = allow_fp4_layer;
+
+        // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+        if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+            auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+            ctx.cached_fp4_data = &fp4_t.o_weight.data;
+            ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
+            ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 1;
+        }
+
+        mRecipe->backward_matmul(ctx);
     });
 
     if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward, nullptr);
@@ -1180,41 +1436,230 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         rs.temp_acquire(rs.scratch().cudnn_workspace);
         const Tensor& qkv_for_attn = (a.qkv_rope.Data != nullptr) ? a.qkv_rope : a.qkv;
 
-        attention_backward_cudnn(
-            da.d_qkv,
-            a.lse,
-            a.att,
-            da.d_att,
-            qkv_for_attn,
-            rs.scratch().cudnn_workspace,
-            rs.CudnnHandle,
-            B, T, Hq, Hkv, Hs,
-            stream
-        );
+        const int chunks = mOptions.attention_bwd_chunks;
+        if (chunks < 1) {
+            throw std::runtime_error("attention_bwd_chunks must be >= 1");
+        }
+        if (chunks > 1 && B % chunks != 0) {
+            throw std::runtime_error(fmt::format(
+                "attn_bwd_chunks ({}) must evenly divide per_device_train_batch_size ({}). "
+                "Either increase batch size to a multiple of {} or reduce attn_bwd_chunks.",
+                chunks, B, chunks));
+        }
+
+        if (chunks == 1) {
+            attention_backward_cudnn(
+                da.d_qkv,
+                a.lse,
+                a.att,
+                da.d_att,
+                qkv_for_attn,
+                rs.scratch().cudnn_workspace,
+                rs.CudnnHandle,
+                B, T, Hq, Hkv, Hs,
+                stream
+            );
+        } else {
+            const long chunk_batch_size = div_exact(static_cast<long>(B), static_cast<long>(chunks));
+            for (int i = 0; i < chunks; ++i) {
+                Tensor d_qkv = shard_view(da.d_qkv, i, chunks);
+                Tensor lse = shard_view(a.lse, i, chunks);
+                Tensor att = shard_view(a.att, i, chunks);
+                Tensor d_att = shard_view(da.d_att, i, chunks);
+                Tensor qkv = shard_view(qkv_for_attn, i, chunks);
+                attention_backward_cudnn(
+                    d_qkv,
+                    lse,
+                    att,
+                    d_att,
+                    qkv,
+                    rs.scratch().cudnn_workspace,
+                    rs.CudnnHandle,
+                    chunk_batch_size, T, Hq, Hkv, Hs,
+                    stream
+                );
+            }
+        }
         rs.temp_free(rs.scratch().cudnn_workspace);
     });
 
-    // RoPE backward (if needed)
-    if (a.qkv_rope.Data != nullptr) {
-        with_ctx("rope_backward", [&]() {
-            const int head_size = (int)mConfig.head_size();
-            // TODO: Implement RoPE backward for MoE
-            // For now, just copy d_qkv_rope to d_qkv (assumes RoPE is invertible)
-        });
+    // RoPE backward: produces d_qkv in pre-RoPE space.
+    with_ctx("rope_backward", [&]() {
+        if (mOptions.use_fused_rope) {
+            rope_fused_backward(
+                da.d_qkv, da.d_qkv,
+                rs.PositionIDs.template get<int>(),
+                rs.has_grad_quants() ? qg.d_qkv.abs_max() : nullptr,
+                mConfig.RopeTheta, B, T, Hq, Hkv, Hs,
+                stream
+            );
+        } else {
+            rope_backward(
+                da.d_qkv, da.d_qkv,
+                rs.non_block_activations().freq_cis,
+                rs.PositionIDs.template get<int>(),
+                rs.has_grad_quants() ? qg.d_qkv.abs_max() : nullptr,
+                B, T, Hq, Hkv, Hs,
+                stream
+            );
+        }
+    });
+
+    // Optional Q/K head RMSNorm backward (Qwen3-style).
+    using BwdAttentionWeightsType = std::decay_t<decltype(weights.attention)>;
+    if constexpr (has_qk_norm_weights<BwdAttentionWeightsType>::value) {
+        if (weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value()) {
+            with_ctx("qk_norm_backward", [&]() {
+                // If we didn't keep pre-RoPE QKV, convert activations back to pre-RoPE space.
+                if (a.qkv_rope.Data == nullptr) {
+                    if (mOptions.use_fused_rope) {
+                        rope_fused_backward(
+                            a.qkv, a.qkv,
+                            rs.PositionIDs.template get<int>(),
+                            nullptr,
+                            mConfig.RopeTheta, B, T, Hq, Hkv, Hs,
+                            stream
+                        );
+                    } else {
+                        rope_backward(
+                            a.qkv, a.qkv,
+                            rs.non_block_activations().freq_cis,
+                            rs.PositionIDs.template get<int>(),
+                            nullptr,
+                            B, T, Hq, Hkv, Hs,
+                            stream
+                        );
+                    }
+                }
+
+                const int q_rows = Hq * Hs;
+
+                // Weight gradients must use dy (post-attention backward, pre-qk_norm_backward_dx).
+                // Skip in LoRA-only mode since QK-norm weights are frozen.
+                if (!lora_only) {
+                    if constexpr (requires { grads.attention_grads.d_q_norm_weight; grads.attention_grads.d_k_norm_weight; }) {
+                        if (grads.attention_grads.d_q_norm_weight.has_value()) {
+                            qkv_head_rmsnorm_backward_dweight(
+                                grads.attention_grads.d_q_norm_weight.value(),
+                                da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(),
+                                B, T, qkv_channels,
+                                /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+                                /*accumulate=*/accumulate,
+                                stream
+                            );
+                        }
+                        if (grads.attention_grads.d_k_norm_weight.has_value()) {
+                            qkv_head_rmsnorm_backward_dweight(
+                                grads.attention_grads.d_k_norm_weight.value(),
+                                da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(),
+                                B, T, qkv_channels,
+                                /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+                                /*accumulate=*/accumulate,
+                                stream
+                            );
+                        }
+                    } else if constexpr (requires { grads.attention.d_q_norm_weight; grads.attention.d_k_norm_weight; }) {
+                        if (grads.attention.d_q_norm_weight.has_value()) {
+                            qkv_head_rmsnorm_backward_dweight(
+                                grads.attention.d_q_norm_weight.value(),
+                                da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(),
+                                B, T, qkv_channels,
+                                /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+                                /*accumulate=*/accumulate,
+                                stream
+                            );
+                        }
+                        if (grads.attention.d_k_norm_weight.has_value()) {
+                            qkv_head_rmsnorm_backward_dweight(
+                                grads.attention.d_k_norm_weight.value(),
+                                da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(),
+                                B, T, qkv_channels,
+                                /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+                                /*accumulate=*/accumulate,
+                                stream
+                            );
+                        }
+                    }
+                }
+
+                // Transform dy -> dx in-place.
+                qkv_head_rmsnorm_backward_dx(
+                    da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(), a.q_rstd,
+                    B, T, qkv_channels,
+                    /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+                    stream
+                );
+                qkv_head_rmsnorm_backward_dx(
+                    da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(), a.k_rstd,
+                    B, T, qkv_channels,
+                    /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+                    stream
+                );
+            });
+        }
     }
 
     // QKV projection backward
     if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeQKVBackward, nullptr);
 
-    with_ctx("qkv", [&]() {
-        // d_ln1 = d_qkv @ qkv_weight
-        matmul(
-            da.d_ln1, weights.attention.qkv_weight, da.d_qkv, std::nullopt,
-            nullptr, nullptr,
-            rs.CublasLtHandle, rs.CuBlasWorkspace,
-            C, B * T, qkv_channels, EMMTranspose::NN, false,
-            stream
-        );
+    with_ctx("qkv:qmm", [&]() {
+        Tensor* d_qkv_weight = nullptr;
+        Tensor* d_qkv_bias = nullptr;
+        std::optional<Tensor> dbias_tmp = std::nullopt;
+
+        if (!lora_only) {
+            if constexpr (requires { grads.attention_grads.d_qkv_weight; }) {
+                d_qkv_weight = &grads.attention_grads.d_qkv_weight;
+                if constexpr (requires { grads.attention_grads.d_qkv_bias; }) {
+                    if (weights.attention.qkv_bias.has_value() && grads.attention_grads.d_qkv_bias.has_value()) {
+                        dbias_tmp = grads.attention_grads.d_qkv_bias.value();
+                        d_qkv_bias = &dbias_tmp.value();
+                    }
+                }
+            } else if constexpr (requires { grads.attention.d_qkv_weight; }) {
+                d_qkv_weight = &grads.attention.d_qkv_weight;
+                if constexpr (requires { grads.attention.d_qkv_bias; }) {
+                    if (weights.attention.qkv_bias.has_value() && grads.attention.d_qkv_bias.has_value()) {
+                        dbias_tmp = grads.attention.d_qkv_bias.value();
+                        d_qkv_bias = &dbias_tmp.value();
+                    }
+                }
+            }
+        }
+
+        modules::MatmulContext ctx;
+        ctx.dinp = &da.d_ln1;
+        ctx.dweight = d_qkv_weight;
+        ctx.dbias = d_qkv_bias;
+        ctx.dout = &da.d_qkv;
+        ctx.inp = &a.ln1;
+        ctx.weight = &weights.attention.qkv_weight;
+        ctx.inp_quant = &qa.ln1;
+        ctx.dout_quant = &qg.d_qkv;
+        ctx.bias_buffer = &rs.scratch().matmul_bias_scratch;
+        ctx.B = (int)B;
+        ctx.T = (int)T;
+        ctx.C_in = (int)C;
+        ctx.C_out = (int)qkv_channels;
+        ctx.run_state = &rs;
+        ctx.stream = stream;
+        ctx.layer_idx = layer_idx;
+        ctx.op = modules::MatmulOp::QKV;
+        ctx.accumulate = accumulate;
+        ctx.skip_weight_grad = lora_only;
+        ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+        ctx.allow_fp4 = allow_fp4_layer;
+        ctx.allow_fp8 = allow_fp4_layer;
+
+        // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+        if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+            auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+            ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
+            ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;
+            ctx.cached_fp4_amax = mWeights->fp4_weight_amax_transposed().template get<float>() + 0;
+        }
+
+        mRecipe->backward_matmul(ctx);
     });
 
     if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward, nullptr);
@@ -1390,6 +1835,8 @@ void ModularTransformerModel<Block>::calculate_gradient_norm_impl(NCCLCommunicat
         auto& g = mGrads->get_block_shard(i, stream);
         if constexpr (requires { g.ln1_grads.d_weight; }) norm_squared(TensorShard(g.ln1_grads.d_weight));
         if constexpr (requires { g.ln2_grads.d_weight; }) norm_squared(TensorShard(g.ln2_grads.d_weight));
+        if constexpr (requires { g.ln1.d_weight; }) norm_squared(TensorShard(g.ln1.d_weight));
+        if constexpr (requires { g.ln2.d_weight; }) norm_squared(TensorShard(g.ln2.d_weight));
 
         if constexpr (requires { g.attention_grads.d_qkv_weight; }) norm_squared(TensorShard(g.attention_grads.d_qkv_weight));
         if constexpr (requires { g.attention_grads.d_qkv_bias; }) {
@@ -1409,8 +1856,30 @@ void ModularTransformerModel<Block>::calculate_gradient_norm_impl(NCCLCommunicat
             }
         }
 
+        if constexpr (requires { g.attention.d_qkv_weight; }) norm_squared(TensorShard(g.attention.d_qkv_weight));
+        if constexpr (requires { g.attention.d_qkv_bias; }) {
+            if (g.attention.d_qkv_bias.has_value()) {
+                norm_squared(TensorShard(g.attention.d_qkv_bias.value()));
+            }
+        }
+        if constexpr (requires { g.attention.d_out_weight; }) norm_squared(TensorShard(g.attention.d_out_weight));
+        if constexpr (requires { g.attention.d_q_norm_weight; }) {
+            if (g.attention.d_q_norm_weight.has_value()) {
+                norm_squared(TensorShard(g.attention.d_q_norm_weight.value()));
+            }
+        }
+        if constexpr (requires { g.attention.d_k_norm_weight; }) {
+            if (g.attention.d_k_norm_weight.has_value()) {
+                norm_squared(TensorShard(g.attention.d_k_norm_weight.value()));
+            }
+        }
+
         if constexpr (requires { g.d_mlp_up_weight; }) norm_squared(TensorShard(g.d_mlp_up_weight));
         if constexpr (requires { g.d_mlp_down_weight; }) norm_squared(TensorShard(g.d_mlp_down_weight));
+
+        if constexpr (requires { g.router.d_gate; }) norm_squared(TensorShard(g.router.d_gate));
+        if constexpr (requires { g.experts.d_gate_up_proj; }) norm_squared(TensorShard(g.experts.d_gate_up_proj));
+        if constexpr (requires { g.experts.d_down_proj; }) norm_squared(TensorShard(g.experts.d_down_proj));
     }
 
     // Reduce partial sums to a single scalar on-device.
@@ -1429,4 +1898,3 @@ void ModularTransformerModel<Block>::calculate_gradient_norm_impl(NCCLCommunicat
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
 }
-

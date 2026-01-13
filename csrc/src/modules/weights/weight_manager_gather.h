@@ -85,10 +85,20 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
         if (src.attention.qkv_bias.has_value() && dst.attention.qkv_bias.has_value()) {
             dst.attention.qkv_bias->Stats = src.attention.qkv_bias->Stats;
         }
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            dst.mlp_up_weight.Stats = src.mlp_up_weight.Stats;
-            dst.mlp_down_weight.Stats = src.mlp_down_weight.Stats;
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            dst.mlp_up_weight.Stats = src.mlp_up_weight.Stats;
+	            dst.mlp_down_weight.Stats = src.mlp_down_weight.Stats;
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            dst.router.gate.Stats = src.router.gate.Stats;
+	            if (src.router.bias.has_value() && dst.router.bias.has_value()) {
+	                dst.router.bias->Stats = src.router.bias->Stats;
+	            }
+	            if (src.experts.use_batched && dst.experts.use_batched) {
+	                dst.experts.gate_up_proj.Stats = src.experts.gate_up_proj.Stats;
+	                dst.experts.down_proj.Stats = src.experts.down_proj.Stats;
+	            }
+	        }
 
         // Convert/copy local shard into the correct slice of the destination, then all-gather.
         auto shard_dst = [&](Tensor& full) -> Tensor {
@@ -111,10 +121,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
         }
         convert_into(src.ln2.weight, shard_dst(dst.ln2.weight));
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            convert_into(src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
-            convert_into(src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            convert_into(src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
+	            convert_into(src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            convert_into(src.router.gate, shard_dst(dst.router.gate));
+	            if (src.router.bias.has_value() && dst.router.bias.has_value()) {
+	                convert_into(src.router.bias.value(), shard_dst(dst.router.bias.value()));
+	            }
+	            if (src.experts.use_batched && dst.experts.use_batched) {
+	                convert_into(src.experts.gate_up_proj, shard_dst(dst.experts.gate_up_proj));
+	                convert_into(src.experts.down_proj, shard_dst(dst.experts.down_proj));
+	            }
+	            if (src.shared_expert.has_value() && dst.shared_expert.has_value()) {
+	                convert_into(src.shared_expert->gate_proj, shard_dst(dst.shared_expert->gate_proj));
+	                convert_into(src.shared_expert->up_proj, shard_dst(dst.shared_expert->up_proj));
+	                convert_into(src.shared_expert->down_proj, shard_dst(dst.shared_expert->down_proj));
+	            }
+	        }
 
         if (mConfig.num_shards == 1) {
             CUDA_CHECK(cudaEventRecord(status.done_event, fetch_stream));
@@ -138,10 +163,23 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
         }
         gather_full(dst.ln2.weight);
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            gather_full(dst.mlp_up_weight);
-            gather_full(dst.mlp_down_weight);
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            gather_full(dst.mlp_up_weight);
+	            gather_full(dst.mlp_down_weight);
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            gather_full(dst.router.gate);
+	            if (dst.router.bias.has_value()) gather_full(dst.router.bias.value());
+	            if (dst.experts.use_batched) {
+	                gather_full(dst.experts.gate_up_proj);
+	                gather_full(dst.experts.down_proj);
+	            }
+	            if (dst.shared_expert.has_value()) {
+	                gather_full(dst.shared_expert->gate_proj);
+	                gather_full(dst.shared_expert->up_proj);
+	                gather_full(dst.shared_expert->down_proj);
+	            }
+	        }
 
         comm.execute_transaction(status.done_event);
         return;
@@ -173,10 +211,20 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
     if (master_src.attention.qkv_bias.has_value() && dst.attention.qkv_bias.has_value()) {
         dst.attention.qkv_bias->Stats = master_src.attention.qkv_bias->Stats;
     }
-    if constexpr (has_mlp_weights<BlockWeights>::value) {
-        dst.mlp_up_weight.Stats = master_src.mlp_up_weight.Stats;
-        dst.mlp_down_weight.Stats = master_src.mlp_down_weight.Stats;
-    }
+	    if constexpr (has_mlp_weights<BlockWeights>::value) {
+	        dst.mlp_up_weight.Stats = master_src.mlp_up_weight.Stats;
+	        dst.mlp_down_weight.Stats = master_src.mlp_down_weight.Stats;
+	    }
+	    if constexpr (has_moe_weights<BlockWeights>::value) {
+	        dst.router.gate.Stats = master_src.router.gate.Stats;
+	        if (master_src.router.bias.has_value() && dst.router.bias.has_value()) {
+	            dst.router.bias->Stats = master_src.router.bias->Stats;
+	        }
+	        if (master_src.experts.use_batched && dst.experts.use_batched) {
+	            dst.experts.gate_up_proj.Stats = master_src.experts.gate_up_proj.Stats;
+	            dst.experts.down_proj.Stats = master_src.experts.down_proj.Stats;
+	        }
+	    }
 
     auto shard_dst = [&](Tensor& full) -> Tensor {
         return static_cast<Tensor>(shard_view(full, mConfig.shard_idx, mConfig.num_shards));
@@ -204,10 +252,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
         }
         convert_into(master_src.ln2.weight, quant_dst.ln2.weight);
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            convert_into(master_src.mlp_up_weight, quant_dst.mlp_up_weight);
-            convert_into(master_src.mlp_down_weight, quant_dst.mlp_down_weight);
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            convert_into(master_src.mlp_up_weight, quant_dst.mlp_up_weight);
+	            convert_into(master_src.mlp_down_weight, quant_dst.mlp_down_weight);
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            convert_into(master_src.router.gate, quant_dst.router.gate);
+	            if (master_src.router.bias.has_value() && quant_dst.router.bias.has_value()) {
+	                convert_into(master_src.router.bias.value(), quant_dst.router.bias.value());
+	            }
+	            if (master_src.experts.use_batched && quant_dst.experts.use_batched) {
+	                convert_into(master_src.experts.gate_up_proj, quant_dst.experts.gate_up_proj);
+	                convert_into(master_src.experts.down_proj, quant_dst.experts.down_proj);
+	            }
+	            if (master_src.shared_expert.has_value() && quant_dst.shared_expert.has_value()) {
+	                convert_into(master_src.shared_expert->gate_proj, quant_dst.shared_expert->gate_proj);
+	                convert_into(master_src.shared_expert->up_proj, quant_dst.shared_expert->up_proj);
+	                convert_into(master_src.shared_expert->down_proj, quant_dst.shared_expert->down_proj);
+	            }
+	        }
         mQuantBlockVersion[layer_idx] = mVersion;
     };
 
@@ -225,7 +288,7 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
         auto& quant_host = mQuantBlocks.at(layer_idx);
         auto& quant_device = mQuantBuffer[qbuf_idx];
 
-        if (quants_stale) {
+	        if (quants_stale) {
             // Quantize from master to device staging buffer
             convert_into(master_src.ln1.weight, quant_device.ln1.weight);
             convert_into(master_src.attention.qkv_weight, quant_device.attention.qkv_weight);
@@ -234,10 +297,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
             convert_into(master_src.attention.out_weight, quant_device.attention.out_weight);
             convert_into(master_src.ln2.weight, quant_device.ln2.weight);
-            if constexpr (has_mlp_weights<BlockWeights>::value) {
-                convert_into(master_src.mlp_up_weight, quant_device.mlp_up_weight);
-                convert_into(master_src.mlp_down_weight, quant_device.mlp_down_weight);
-            }
+	            if constexpr (has_mlp_weights<BlockWeights>::value) {
+	                convert_into(master_src.mlp_up_weight, quant_device.mlp_up_weight);
+	                convert_into(master_src.mlp_down_weight, quant_device.mlp_down_weight);
+	            }
+	            if constexpr (has_moe_weights<BlockWeights>::value) {
+	                convert_into(master_src.router.gate, quant_device.router.gate);
+	                if (master_src.router.bias.has_value() && quant_device.router.bias.has_value()) {
+	                    convert_into(master_src.router.bias.value(), quant_device.router.bias.value());
+	                }
+	                if (master_src.experts.use_batched && quant_device.experts.use_batched) {
+	                    convert_into(master_src.experts.gate_up_proj, quant_device.experts.gate_up_proj);
+	                    convert_into(master_src.experts.down_proj, quant_device.experts.down_proj);
+	                }
+	                if (master_src.shared_expert.has_value() && quant_device.shared_expert.has_value()) {
+	                    convert_into(master_src.shared_expert->gate_proj, quant_device.shared_expert->gate_proj);
+	                    convert_into(master_src.shared_expert->up_proj, quant_device.shared_expert->up_proj);
+	                    convert_into(master_src.shared_expert->down_proj, quant_device.shared_expert->down_proj);
+	                }
+	            }
 
             // Copy from device staging to host storage (persist for future steps)
             auto copy_d2h = [fetch_stream](const Tensor& src, Tensor& dst_t) {
@@ -250,11 +328,26 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
                 copy_d2h(quant_device.attention.qkv_bias.value(), quant_host.attention.qkv_bias.value());
             }
             copy_d2h(quant_device.attention.out_weight, quant_host.attention.out_weight);
-            copy_d2h(quant_device.ln2.weight, quant_host.ln2.weight);
-            if constexpr (has_mlp_weights<BlockWeights>::value) {
-                copy_d2h(quant_device.mlp_up_weight, quant_host.mlp_up_weight);
-                copy_d2h(quant_device.mlp_down_weight, quant_host.mlp_down_weight);
-            }
+	            copy_d2h(quant_device.ln2.weight, quant_host.ln2.weight);
+	            if constexpr (has_mlp_weights<BlockWeights>::value) {
+	                copy_d2h(quant_device.mlp_up_weight, quant_host.mlp_up_weight);
+	                copy_d2h(quant_device.mlp_down_weight, quant_host.mlp_down_weight);
+	            }
+	            if constexpr (has_moe_weights<BlockWeights>::value) {
+	                copy_d2h(quant_device.router.gate, quant_host.router.gate);
+	                if (quant_device.router.bias.has_value() && quant_host.router.bias.has_value()) {
+	                    copy_d2h(quant_device.router.bias.value(), quant_host.router.bias.value());
+	                }
+	                if (quant_device.experts.use_batched && quant_host.experts.use_batched) {
+	                    copy_d2h(quant_device.experts.gate_up_proj, quant_host.experts.gate_up_proj);
+	                    copy_d2h(quant_device.experts.down_proj, quant_host.experts.down_proj);
+	                }
+	                if (quant_device.shared_expert.has_value() && quant_host.shared_expert.has_value()) {
+	                    copy_d2h(quant_device.shared_expert->gate_proj, quant_host.shared_expert->gate_proj);
+	                    copy_d2h(quant_device.shared_expert->up_proj, quant_host.shared_expert->up_proj);
+	                    copy_d2h(quant_device.shared_expert->down_proj, quant_host.shared_expert->down_proj);
+	                }
+	            }
             mQuantBlockVersion[layer_idx] = mVersion;
         } else {
             // Quants are fresh: copy from host to device staging buffer
@@ -269,10 +362,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
             copy_h2d(quant_host.attention.out_weight, quant_device.attention.out_weight);
             copy_h2d(quant_host.ln2.weight, quant_device.ln2.weight);
-            if constexpr (has_mlp_weights<BlockWeights>::value) {
-                copy_h2d(quant_host.mlp_up_weight, quant_device.mlp_up_weight);
-                copy_h2d(quant_host.mlp_down_weight, quant_device.mlp_down_weight);
-            }
+	            if constexpr (has_mlp_weights<BlockWeights>::value) {
+	                copy_h2d(quant_host.mlp_up_weight, quant_device.mlp_up_weight);
+	                copy_h2d(quant_host.mlp_down_weight, quant_device.mlp_down_weight);
+	            }
+	            if constexpr (has_moe_weights<BlockWeights>::value) {
+	                copy_h2d(quant_host.router.gate, quant_device.router.gate);
+	                if (quant_host.router.bias.has_value() && quant_device.router.bias.has_value()) {
+	                    copy_h2d(quant_host.router.bias.value(), quant_device.router.bias.value());
+	                }
+	                if (quant_host.experts.use_batched && quant_device.experts.use_batched) {
+	                    copy_h2d(quant_host.experts.gate_up_proj, quant_device.experts.gate_up_proj);
+	                    copy_h2d(quant_host.experts.down_proj, quant_device.experts.down_proj);
+	                }
+	                if (quant_host.shared_expert.has_value() && quant_device.shared_expert.has_value()) {
+	                    copy_h2d(quant_host.shared_expert->gate_proj, quant_device.shared_expert->gate_proj);
+	                    copy_h2d(quant_host.shared_expert->up_proj, quant_device.shared_expert->up_proj);
+	                    copy_h2d(quant_host.shared_expert->down_proj, quant_device.shared_expert->down_proj);
+	                }
+	            }
         }
 
         // Copy from device staging to prefetch buffer (device-to-device, same dtype - no conversion needed)
@@ -291,10 +399,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
         }
         convert_into(quant_device.ln2.weight, shard_dst(dst.ln2.weight));
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            convert_into(quant_device.mlp_up_weight, shard_dst(dst.mlp_up_weight));
-            convert_into(quant_device.mlp_down_weight, shard_dst(dst.mlp_down_weight));
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            convert_into(quant_device.mlp_up_weight, shard_dst(dst.mlp_up_weight));
+	            convert_into(quant_device.mlp_down_weight, shard_dst(dst.mlp_down_weight));
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            convert_into(quant_device.router.gate, shard_dst(dst.router.gate));
+	            if (quant_device.router.bias.has_value() && dst.router.bias.has_value()) {
+	                convert_into(quant_device.router.bias.value(), shard_dst(dst.router.bias.value()));
+	            }
+	            if (quant_device.experts.use_batched && dst.experts.use_batched) {
+	                convert_into(quant_device.experts.gate_up_proj, shard_dst(dst.experts.gate_up_proj));
+	                convert_into(quant_device.experts.down_proj, shard_dst(dst.experts.down_proj));
+	            }
+	            if (quant_device.shared_expert.has_value() && dst.shared_expert.has_value()) {
+	                convert_into(quant_device.shared_expert->gate_proj, shard_dst(dst.shared_expert->gate_proj));
+	                convert_into(quant_device.shared_expert->up_proj, shard_dst(dst.shared_expert->up_proj));
+	                convert_into(quant_device.shared_expert->down_proj, shard_dst(dst.shared_expert->down_proj));
+	            }
+	        }
 
         CUDA_CHECK(cudaEventRecord(mQuantStatus[qbuf_idx].done_event, fetch_stream));
     } else if (use_persistent_quants) {
@@ -320,10 +443,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
         }
         convert_into(quant_src.ln2.weight, shard_dst(dst.ln2.weight));
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            convert_into(quant_src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
-            convert_into(quant_src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            convert_into(quant_src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
+	            convert_into(quant_src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            convert_into(quant_src.router.gate, shard_dst(dst.router.gate));
+	            if (quant_src.router.bias.has_value() && dst.router.bias.has_value()) {
+	                convert_into(quant_src.router.bias.value(), shard_dst(dst.router.bias.value()));
+	            }
+	            if (quant_src.experts.use_batched && dst.experts.use_batched) {
+	                convert_into(quant_src.experts.gate_up_proj, shard_dst(dst.experts.gate_up_proj));
+	                convert_into(quant_src.experts.down_proj, shard_dst(dst.experts.down_proj));
+	            }
+	            if (quant_src.shared_expert.has_value() && dst.shared_expert.has_value()) {
+	                convert_into(quant_src.shared_expert->gate_proj, shard_dst(dst.shared_expert->gate_proj));
+	                convert_into(quant_src.shared_expert->up_proj, shard_dst(dst.shared_expert->up_proj));
+	                convert_into(quant_src.shared_expert->down_proj, shard_dst(dst.shared_expert->down_proj));
+	            }
+	        }
     } else {
         // No persistent quants: convert from master weights (with potential quantization).
         convert_into(master_src.ln1.weight, shard_dst(dst.ln1.weight));
@@ -341,10 +479,25 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
         }
         convert_into(master_src.ln2.weight, shard_dst(dst.ln2.weight));
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            convert_into(master_src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
-            convert_into(master_src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
-        }
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            convert_into(master_src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
+	            convert_into(master_src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            convert_into(master_src.router.gate, shard_dst(dst.router.gate));
+	            if (master_src.router.bias.has_value() && dst.router.bias.has_value()) {
+	                convert_into(master_src.router.bias.value(), shard_dst(dst.router.bias.value()));
+	            }
+	            if (master_src.experts.use_batched && dst.experts.use_batched) {
+	                convert_into(master_src.experts.gate_up_proj, shard_dst(dst.experts.gate_up_proj));
+	                convert_into(master_src.experts.down_proj, shard_dst(dst.experts.down_proj));
+	            }
+	            if (master_src.shared_expert.has_value() && dst.shared_expert.has_value()) {
+	                convert_into(master_src.shared_expert->gate_proj, shard_dst(dst.shared_expert->gate_proj));
+	                convert_into(master_src.shared_expert->up_proj, shard_dst(dst.shared_expert->up_proj));
+	                convert_into(master_src.shared_expert->down_proj, shard_dst(dst.shared_expert->down_proj));
+	            }
+	        }
     }
 
     comm.begin_transaction(fetch_stream);
@@ -363,10 +516,23 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
         if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
     }
     gather_full(dst.ln2.weight);
-    if constexpr (has_mlp_weights<BlockWeights>::value) {
-        gather_full(dst.mlp_up_weight);
-        gather_full(dst.mlp_down_weight);
-    }
+	    if constexpr (has_mlp_weights<BlockWeights>::value) {
+	        gather_full(dst.mlp_up_weight);
+	        gather_full(dst.mlp_down_weight);
+	    }
+	    if constexpr (has_moe_weights<BlockWeights>::value) {
+	        gather_full(dst.router.gate);
+	        if (dst.router.bias.has_value()) gather_full(dst.router.bias.value());
+	        if (dst.experts.use_batched) {
+	            gather_full(dst.experts.gate_up_proj);
+	            gather_full(dst.experts.down_proj);
+	        }
+	        if (dst.shared_expert.has_value()) {
+	            gather_full(dst.shared_expert->gate_proj);
+	            gather_full(dst.shared_expert->up_proj);
+	            gather_full(dst.shared_expert->down_proj);
+	        }
+	    }
     comm.execute_transaction(status.done_event);
 }
 

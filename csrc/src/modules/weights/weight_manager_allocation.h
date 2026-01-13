@@ -81,14 +81,14 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
             allocate_block_weights(mMasterBlocks[i], config.master_dtype, config.master_dtype, config.offload_master, sharded_master);
         }
         allocate_non_block_weights(mMasterNonBlock, config.master_dtype, config.offload_master, sharded_master);
-    } else {
-        // Master weights are sharded views into the work weights.
-        mMasterBlocks.resize(config.num_layers);
-        for (int i = 0; i < config.num_layers; ++i) {
-            auto shard = [&](const Tensor& t) -> Tensor {
-                if (!sharded_master) return t;
-                return static_cast<Tensor>(shard_view(t, config.shard_idx, config.num_shards));
-            };
+	    } else {
+	        // Master weights are sharded views into the work weights.
+	        mMasterBlocks.resize(config.num_layers);
+	        for (int i = 0; i < config.num_layers; ++i) {
+	            auto shard = [&](const Tensor& t) -> Tensor {
+	                if (!sharded_master) return t;
+	                return static_cast<Tensor>(shard_view(t, config.shard_idx, config.num_shards));
+	            };
 
             auto& src = mWorkBlocks[i];
             auto& dst = mMasterBlocks[i];
@@ -98,13 +98,30 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
             if (src.attention.qkv_bias.has_value()) {
                 dst.attention.qkv_bias = shard(src.attention.qkv_bias.value());
             }
-            dst.attention.out_weight = shard(src.attention.out_weight);
-            dst.ln2.weight = shard(src.ln2.weight);
-            if constexpr (has_mlp_weights<BlockWeights>::value) {
-                dst.mlp_up_weight = shard(src.mlp_up_weight);
-                dst.mlp_down_weight = shard(src.mlp_down_weight);
-            }
-        }
+	            dst.attention.out_weight = shard(src.attention.out_weight);
+	            dst.ln2.weight = shard(src.ln2.weight);
+	            if constexpr (has_mlp_weights<BlockWeights>::value) {
+	                dst.mlp_up_weight = shard(src.mlp_up_weight);
+	                dst.mlp_down_weight = shard(src.mlp_down_weight);
+	            }
+	            if constexpr (has_moe_weights<BlockWeights>::value) {
+	                dst.router.gate = shard(src.router.gate);
+	                if (src.router.bias.has_value()) {
+	                    dst.router.bias = shard(src.router.bias.value());
+	                }
+	                if (src.experts.use_batched) {
+	                    dst.experts.use_batched = true;
+	                    dst.experts.gate_up_proj = shard(src.experts.gate_up_proj);
+	                    dst.experts.down_proj = shard(src.experts.down_proj);
+	                }
+	                if (src.shared_expert.has_value()) {
+	                    dst.shared_expert.emplace();
+	                    dst.shared_expert->gate_proj = shard(src.shared_expert->gate_proj);
+	                    dst.shared_expert->up_proj = shard(src.shared_expert->up_proj);
+	                    dst.shared_expert->down_proj = shard(src.shared_expert->down_proj);
+	                }
+	            }
+	        }
 
         auto shard_nb = [&](const Tensor& t) -> Tensor {
             if (!sharded_master) return t;

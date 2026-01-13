@@ -20,3 +20,4 @@ study/**
 unit-test-sol.json
 uv.lock
 .aim/
+.cache/**

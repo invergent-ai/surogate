@@ -285,6 +285,27 @@ ModularGradientManager<Block>::ModularGradientManager(
                     }
                 }
 
+                if constexpr (requires { full.attention.d_q_norm_weight; shard.attention.d_q_norm_weight; }) {
+                    if (full.attention.d_q_norm_weight.has_value()) {
+                        shard.attention.d_q_norm_weight = shard_tensor(full.attention.d_q_norm_weight.value());
+                    }
+                }
+                if constexpr (requires { full.attention.d_k_norm_weight; shard.attention.d_k_norm_weight; }) {
+                    if (full.attention.d_k_norm_weight.has_value()) {
+                        shard.attention.d_k_norm_weight = shard_tensor(full.attention.d_k_norm_weight.value());
+                    }
+                }
+
+                if constexpr (requires { full.router.d_gate; shard.router.d_gate; }) {
+                    shard.router.d_gate = shard_tensor(full.router.d_gate);
+                }
+                if constexpr (requires { full.experts.d_gate_up_proj; shard.experts.d_gate_up_proj; }) {
+                    shard.experts.d_gate_up_proj = shard_tensor(full.experts.d_gate_up_proj);
+                }
+                if constexpr (requires { full.experts.d_down_proj; shard.experts.d_down_proj; }) {
+                    shard.experts.d_down_proj = shard_tensor(full.experts.d_down_proj);
+                }
+
                 if constexpr (requires { full.d_mlp_up_weight; shard.d_mlp_up_weight; }) shard.d_mlp_up_weight = shard_tensor(full.d_mlp_up_weight);
                 if constexpr (requires { full.d_mlp_down_weight; shard.d_mlp_down_weight; }) shard.d_mlp_down_weight = shard_tensor(full.d_mlp_down_weight);
             }
@@ -386,6 +407,8 @@ template<typename Block>
         for (auto& block : mFullGradients) {
             if constexpr (requires { block.ln1_grads.d_weight; }) fill_zero(block.ln1_grads.d_weight, stream);
             if constexpr (requires { block.ln2_grads.d_weight; }) fill_zero(block.ln2_grads.d_weight, stream);
+            if constexpr (requires { block.ln1.d_weight; }) fill_zero(block.ln1.d_weight, stream);
+            if constexpr (requires { block.ln2.d_weight; }) fill_zero(block.ln2.d_weight, stream);
 
             if constexpr (requires { block.attention_grads.d_qkv_weight; }) fill_zero(block.attention_grads.d_qkv_weight, stream);
             if constexpr (requires { block.attention_grads.d_out_weight; }) fill_zero(block.attention_grads.d_out_weight, stream);
@@ -405,8 +428,30 @@ template<typename Block>
                 }
             }
 
+            if constexpr (requires { block.attention.d_qkv_weight; }) fill_zero(block.attention.d_qkv_weight, stream);
+            if constexpr (requires { block.attention.d_out_weight; }) fill_zero(block.attention.d_out_weight, stream);
+            if constexpr (requires { block.attention.d_qkv_bias; }) {
+                if (block.attention.d_qkv_bias.has_value()) {
+                    fill_zero(block.attention.d_qkv_bias.value(), stream);
+                }
+            }
+            if constexpr (requires { block.attention.d_q_norm_weight; }) {
+                if (block.attention.d_q_norm_weight.has_value()) {
+                    fill_zero(block.attention.d_q_norm_weight.value(), stream);
+                }
+            }
+            if constexpr (requires { block.attention.d_k_norm_weight; }) {
+                if (block.attention.d_k_norm_weight.has_value()) {
+                    fill_zero(block.attention.d_k_norm_weight.value(), stream);
+                }
+            }
+
             if constexpr (requires { block.d_mlp_up_weight; }) fill_zero(block.d_mlp_up_weight, stream);
             if constexpr (requires { block.d_mlp_down_weight; }) fill_zero(block.d_mlp_down_weight, stream);
+
+            if constexpr (requires { block.router.d_gate; }) fill_zero(block.router.d_gate, stream);
+            if constexpr (requires { block.experts.d_gate_up_proj; }) fill_zero(block.experts.d_gate_up_proj, stream);
+            if constexpr (requires { block.experts.d_down_proj; }) fill_zero(block.experts.d_down_proj, stream);
         }
     } else {
         // ZeRO-2: reset buffer bookkeeping; shard buffers are overwritten on the first micro-step.
@@ -642,9 +687,23 @@ void ModularGradientManager<Block>::scatter_reduce_block(BlockGradients& grads, 
             maybe_schedule(grads.attention_grads.d_k_norm_weight.value());
         }
     }
+    if constexpr (requires { grads.attention.d_q_norm_weight; }) {
+        if (grads.attention.d_q_norm_weight.has_value()) {
+            maybe_schedule(grads.attention.d_q_norm_weight.value());
+        }
+    }
+    if constexpr (requires { grads.attention.d_k_norm_weight; }) {
+        if (grads.attention.d_k_norm_weight.has_value()) {
+            maybe_schedule(grads.attention.d_k_norm_weight.value());
+        }
+    }
 
     if constexpr (requires { grads.d_mlp_up_weight; }) maybe_schedule(grads.d_mlp_up_weight);
     if constexpr (requires { grads.d_mlp_down_weight; }) maybe_schedule(grads.d_mlp_down_weight);
+
+    if constexpr (requires { grads.router.d_gate; }) maybe_schedule(grads.router.d_gate);
+    if constexpr (requires { grads.experts.d_gate_up_proj; }) maybe_schedule(grads.experts.d_gate_up_proj);
+    if constexpr (requires { grads.experts.d_down_proj; }) maybe_schedule(grads.experts.d_down_proj);
 
     comm.execute_transaction(signal);
 }
@@ -685,9 +744,23 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
             acc_local(shard.attention_grads.d_k_norm_weight.value(), grads.attention_grads.d_k_norm_weight.value(), rng_2[3]);
         }
     }
+    if constexpr (requires { shard.attention.d_q_norm_weight; grads.attention.d_q_norm_weight; }) {
+        if (shard.attention.d_q_norm_weight.has_value() && grads.attention.d_q_norm_weight.has_value()) {
+            acc_local(shard.attention.d_q_norm_weight.value(), grads.attention.d_q_norm_weight.value(), rng_2[2] ^ 0x3c6ef372u);
+        }
+    }
+    if constexpr (requires { shard.attention.d_k_norm_weight; grads.attention.d_k_norm_weight; }) {
+        if (shard.attention.d_k_norm_weight.has_value() && grads.attention.d_k_norm_weight.has_value()) {
+            acc_local(shard.attention.d_k_norm_weight.value(), grads.attention.d_k_norm_weight.value(), rng_2[3] ^ 0xbb67ae85u);
+        }
+    }
 
     if constexpr (requires { shard.d_mlp_up_weight; grads.d_mlp_up_weight; }) acc_local(shard.d_mlp_up_weight, grads.d_mlp_up_weight, rng_2[0]);
     if constexpr (requires { shard.d_mlp_down_weight; grads.d_mlp_down_weight; }) acc_local(shard.d_mlp_down_weight, grads.d_mlp_down_weight, rng_2[1]);
+
+    if constexpr (requires { shard.router.d_gate; grads.router.d_gate; }) acc_local(shard.router.d_gate, grads.router.d_gate, rng_2[0] ^ 0xa54ff53au);
+    if constexpr (requires { shard.experts.d_gate_up_proj; grads.experts.d_gate_up_proj; }) acc_local(shard.experts.d_gate_up_proj, grads.experts.d_gate_up_proj, rng_2[1] ^ 0x510e527fu);
+    if constexpr (requires { shard.experts.d_down_proj; grads.experts.d_down_proj; }) acc_local(shard.experts.d_down_proj, grads.experts.d_down_proj, rng_2[2] ^ 0x9b05688cu);
 
     if constexpr (requires { shard.attention_grads.d_qkv_bias; grads.attention_grads.d_qkv_bias; }) {
         if (shard.attention_grads.d_qkv_bias.has_value() && grads.attention_grads.d_qkv_bias.has_value()) {
@@ -720,6 +793,26 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
     if constexpr (requires { grads.attention.d_qkv_weight; }) maybe_schedule(grads.attention.d_qkv_weight);
     if constexpr (requires { grads.attention_grads.d_out_weight; }) maybe_schedule(grads.attention_grads.d_out_weight);
     if constexpr (requires { grads.attention.d_out_weight; }) maybe_schedule(grads.attention.d_out_weight);
+    if constexpr (requires { grads.attention_grads.d_q_norm_weight; }) {
+        if (grads.attention_grads.d_q_norm_weight.has_value()) {
+            maybe_schedule(grads.attention_grads.d_q_norm_weight.value());
+        }
+    }
+    if constexpr (requires { grads.attention_grads.d_k_norm_weight; }) {
+        if (grads.attention_grads.d_k_norm_weight.has_value()) {
+            maybe_schedule(grads.attention_grads.d_k_norm_weight.value());
+        }
+    }
+    if constexpr (requires { grads.attention.d_q_norm_weight; }) {
+        if (grads.attention.d_q_norm_weight.has_value()) {
+            maybe_schedule(grads.attention.d_q_norm_weight.value());
+        }
+    }
+    if constexpr (requires { grads.attention.d_k_norm_weight; }) {
+        if (grads.attention.d_k_norm_weight.has_value()) {
+            maybe_schedule(grads.attention.d_k_norm_weight.value());
+        }
+    }
 
     if constexpr (requires { grads.attention_grads.d_qkv_bias; }) {
         if (grads.attention_grads.d_qkv_bias.has_value()) {
@@ -734,6 +827,10 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
 
     if constexpr (requires { grads.d_mlp_up_weight; }) maybe_schedule(grads.d_mlp_up_weight);
     if constexpr (requires { grads.d_mlp_down_weight; }) maybe_schedule(grads.d_mlp_down_weight);
+
+    if constexpr (requires { grads.router.d_gate; }) maybe_schedule(grads.router.d_gate);
+    if constexpr (requires { grads.experts.d_gate_up_proj; }) maybe_schedule(grads.experts.d_gate_up_proj);
+    if constexpr (requires { grads.experts.d_down_proj; }) maybe_schedule(grads.experts.d_down_proj);
 
     comm.execute_transaction(signal);
 }
@@ -811,12 +908,32 @@ void ModularGradientManager<Block>::sr_accumulate_layer(int layer_idx, BlockGrad
             sr_accumulate_tensor(shard.attention_grads.d_k_norm_weight.value(), full.attention_grads.d_k_norm_weight.value(), stream, rng_2[3] ^ 0x9e3779b9u);
         }
     }
+    if constexpr (requires { shard.attention.d_q_norm_weight; full.attention.d_q_norm_weight; }) {
+        if (shard.attention.d_q_norm_weight.has_value() && full.attention.d_q_norm_weight.has_value()) {
+            sr_accumulate_tensor(shard.attention.d_q_norm_weight.value(), full.attention.d_q_norm_weight.value(), stream, rng_2[3] ^ 0x3c6ef372u);
+        }
+    }
+    if constexpr (requires { shard.attention.d_k_norm_weight; full.attention.d_k_norm_weight; }) {
+        if (shard.attention.d_k_norm_weight.has_value() && full.attention.d_k_norm_weight.has_value()) {
+            sr_accumulate_tensor(shard.attention.d_k_norm_weight.value(), full.attention.d_k_norm_weight.value(), stream, rng_2[3] ^ 0xbb67ae85u);
+        }
+    }
 
     if constexpr (requires { shard.d_mlp_up_weight; full.d_mlp_up_weight; }) {
         sr_accumulate_tensor(shard.d_mlp_up_weight, full.d_mlp_up_weight, stream, rng_1[2]);
     }
     if constexpr (requires { shard.d_mlp_down_weight; full.d_mlp_down_weight; }) {
         sr_accumulate_tensor(shard.d_mlp_down_weight, full.d_mlp_down_weight, stream, rng_1[3]);
+    }
+
+    if constexpr (requires { shard.router.d_gate; full.router.d_gate; }) {
+        sr_accumulate_tensor(shard.router.d_gate, full.router.d_gate, stream, rng_2[0] ^ 0xa54ff53au);
+    }
+    if constexpr (requires { shard.experts.d_gate_up_proj; full.experts.d_gate_up_proj; }) {
+        sr_accumulate_tensor(shard.experts.d_gate_up_proj, full.experts.d_gate_up_proj, stream, rng_2[1] ^ 0x510e527fu);
+    }
+    if constexpr (requires { shard.experts.d_down_proj; full.experts.d_down_proj; }) {
+        sr_accumulate_tensor(shard.experts.d_down_proj, full.experts.d_down_proj, stream, rng_2[2] ^ 0x9b05688cu);
     }
 }
 
@@ -864,6 +981,20 @@ void ModularGradientManager<Block>::sr_accumulate_layer_all_to_all(
             reduce(shard.attention_grads.d_k_norm_weight.value(), full.attention_grads.d_k_norm_weight.value(), rng_2[3] ^ 0x9e3779b9u);
         }
     }
+    if constexpr (requires { shard.attention.d_q_norm_weight; full.attention.d_q_norm_weight; }) {
+        if (shard.attention.d_q_norm_weight.has_value() && full.attention.d_q_norm_weight.has_value()) {
+            reduce(shard.attention.d_q_norm_weight.value(), full.attention.d_q_norm_weight.value(), rng_2[3] ^ 0x3c6ef372u);
+        }
+    }
+    if constexpr (requires { shard.attention.d_k_norm_weight; full.attention.d_k_norm_weight; }) {
+        if (shard.attention.d_k_norm_weight.has_value() && full.attention.d_k_norm_weight.has_value()) {
+            reduce(shard.attention.d_k_norm_weight.value(), full.attention.d_k_norm_weight.value(), rng_2[3] ^ 0xbb67ae85u);
+        }
+    }
+
+    if constexpr (requires { shard.router.d_gate; full.router.d_gate; }) reduce(shard.router.d_gate, full.router.d_gate, rng_2[0] ^ 0xa54ff53au);
+    if constexpr (requires { shard.experts.d_gate_up_proj; full.experts.d_gate_up_proj; }) reduce(shard.experts.d_gate_up_proj, full.experts.d_gate_up_proj, rng_2[1] ^ 0x510e527fu);
+    if constexpr (requires { shard.experts.d_down_proj; full.experts.d_down_proj; }) reduce(shard.experts.d_down_proj, full.experts.d_down_proj, rng_2[2] ^ 0x9b05688cu);
 
     if constexpr (requires { shard.attention_grads.d_qkv_bias; full.attention_grads.d_qkv_bias; }) {
         if (shard.attention_grads.d_qkv_bias.has_value() && full.attention_grads.d_qkv_bias.has_value()) {
@@ -924,11 +1055,44 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
         }
     }
 
+    if constexpr (requires { grads.attention.d_qkv_weight; }) {
+        grads.attention.d_qkv_weight = mAllocator->allocate(dtype, "d_qkv_w", kind, {qkv_channels, C});
+        if constexpr (requires { grads.attention.d_qkv_bias; }) {
+            if (cfg.use_qkv_bias) {
+                grads.attention.d_qkv_bias = mAllocator->allocate(dtype, "d_qkv_b", kind, {qkv_channels});
+            }
+        }
+        if constexpr (requires { grads.attention.d_out_weight; }) {
+            grads.attention.d_out_weight = mAllocator->allocate(dtype, "d_att_out_w", kind, {C, q_rows});
+        }
+        if constexpr (requires { grads.attention.d_q_norm_weight; grads.attention.d_k_norm_weight; }) {
+            if constexpr (requires { cfg.use_qk_norm; }) {
+                if (cfg.use_qk_norm) {
+                    grads.attention.d_q_norm_weight = mAllocator->allocate(dtype, "d_q_norm_w", kind, {HS});
+                    grads.attention.d_k_norm_weight = mAllocator->allocate(dtype, "d_k_norm_w", kind, {HS});
+                }
+            }
+        }
+    }
+
     if constexpr (requires { grads.d_mlp_up_weight; }) {
         grads.d_mlp_up_weight = mAllocator->allocate(dtype, "d_mlp_up_w", kind, {2 * D, C});
     }
     if constexpr (requires { grads.d_mlp_down_weight; }) {
         grads.d_mlp_down_weight = mAllocator->allocate(dtype, "d_mlp_down_w", kind, {C, D});
+    }
+
+    // MoE-specific gradients can be extremely large; avoid allocating them in LoRA-only mode where base weights are frozen.
+    if (!mConfig.skip_allocation) {
+        if constexpr (requires { grads.router.d_gate; }) {
+            grads.router.d_gate = mAllocator->allocate(dtype, "d_router_gate_w", kind, {cfg.num_experts, C});
+        }
+        if constexpr (requires { grads.experts.d_gate_up_proj; }) {
+            grads.experts.d_gate_up_proj = mAllocator->allocate(dtype, "d_experts_gate_up_w", kind, {cfg.num_experts, 2 * D, C});
+        }
+        if constexpr (requires { grads.experts.d_down_proj; }) {
+            grads.experts.d_down_proj = mAllocator->allocate(dtype, "d_experts_down_w", kind, {cfg.num_experts, C, D});
+        }
     }
 }
 
@@ -951,6 +1115,10 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
     };
     auto alloc_shard_2d = [&](const char* name, long rows, long cols) -> Tensor {
         TensorShard shard = mAllocator->allocate_shard(dtype, mConfig.shard_idx, mConfig.num_shards, name, {rows, cols}, kind);
+        return static_cast<Tensor>(shard);
+    };
+    auto alloc_shard_3d = [&](const char* name, long dim0, long dim1, long dim2) -> Tensor {
+        TensorShard shard = mAllocator->allocate_shard(dtype, mConfig.shard_idx, mConfig.num_shards, name, {dim0, dim1, dim2}, kind);
         return static_cast<Tensor>(shard);
     };
 
@@ -988,11 +1156,42 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
         }
     }
 
+    if constexpr (requires { grads.attention.d_qkv_weight; }) {
+        grads.attention.d_qkv_weight = alloc_shard_2d("d_qkv_w_shard", qkv_channels, C);
+        if constexpr (requires { grads.attention.d_qkv_bias; }) {
+            if (cfg.use_qkv_bias) {
+                grads.attention.d_qkv_bias = alloc_shard_1d("d_qkv_b_shard", qkv_channels);
+            }
+        }
+        if constexpr (requires { grads.attention.d_out_weight; }) {
+            grads.attention.d_out_weight = alloc_shard_2d("d_att_out_w_shard", C, q_rows);
+        }
+        if constexpr (requires { grads.attention.d_q_norm_weight; grads.attention.d_k_norm_weight; }) {
+            if constexpr (requires { cfg.use_qk_norm; }) {
+                if (cfg.use_qk_norm) {
+                    grads.attention.d_q_norm_weight = alloc_shard_1d("d_q_norm_w_shard", HS);
+                    grads.attention.d_k_norm_weight = alloc_shard_1d("d_k_norm_w_shard", HS);
+                }
+            }
+        }
+    }
+
     if constexpr (requires { grads.d_mlp_up_weight; }) {
         grads.d_mlp_up_weight = alloc_shard_2d("d_mlp_up_w_shard", 2 * D, C);
     }
     if constexpr (requires { grads.d_mlp_down_weight; }) {
         grads.d_mlp_down_weight = alloc_shard_2d("d_mlp_down_w_shard", C, D);
+    }
+
+    // MoE-specific gradients
+    if constexpr (requires { grads.router.d_gate; }) {
+        grads.router.d_gate = alloc_shard_2d("d_router_gate_w_shard", cfg.num_experts, C);
+    }
+    if constexpr (requires { grads.experts.d_gate_up_proj; }) {
+        grads.experts.d_gate_up_proj = alloc_shard_3d("d_experts_gate_up_w_shard", cfg.num_experts, 2 * D, C);
+    }
+    if constexpr (requires { grads.experts.d_down_proj; }) {
+        grads.experts.d_down_proj = alloc_shard_3d("d_experts_down_w_shard", cfg.num_experts, C, D);
     }
 }
 

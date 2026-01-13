@@ -18,11 +18,13 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     // Create transformer blocks
     BlockConfig block_config;
     block_config.hidden_size = config.HiddenSize;
-    // For MoE models, use MoeIntermediateSize for the per-expert intermediate dimension
-    // IntermediateSize is the dense MLP size (used for shared experts or mlp_only_layers)
-    block_config.intermediate_size = (config.NumExperts > 0 && config.MoeIntermediateSize > 0)
-                                     ? config.MoeIntermediateSize
-                                     : config.IntermediateSize;
+    // For MoE models, use moe_intermediate_size for the per-expert intermediate dimension.
+    // IntermediateSize is the dense MLP size (used for shared experts or mlp_only_layers).
+    if (config.moe_config.has_value() && config.moe_config->moe_intermediate_size > 0) {
+        block_config.intermediate_size = config.moe_config->moe_intermediate_size;
+    } else {
+        block_config.intermediate_size = config.IntermediateSize;
+    }
     block_config.num_query_heads = config.NumQueryHeads;
     block_config.num_kv_heads = config.NumKeyValHeads;
     block_config.head_size = config.head_size();
@@ -33,6 +35,27 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     block_config.use_qkv_bias = config.UseQKVBias;
     if constexpr (requires { block_config.use_qk_norm; }) {
         block_config.use_qk_norm = config.UseQKNorm;
+    }
+    if (config.moe_config.has_value()) {
+        const auto& moe = config.moe_config.value();
+        if constexpr (requires { block_config.num_experts; }) {
+            block_config.num_experts = moe.num_experts;
+        }
+        if constexpr (requires { block_config.top_k; }) {
+            block_config.top_k = moe.top_k;
+        }
+        if constexpr (requires { block_config.aux_loss_coef; }) {
+            block_config.aux_loss_coef = moe.router_aux_loss_coef;
+        }
+        if constexpr (requires { block_config.capacity_factor; }) {
+            block_config.capacity_factor = moe.capacity_factor;
+        }
+        if constexpr (requires { block_config.use_shared_expert; }) {
+            block_config.use_shared_expert = moe.use_shared_expert;
+        }
+        if constexpr (requires { block_config.shared_expert_intermediate; }) {
+            block_config.shared_expert_intermediate = moe.shared_expert_size;
+        }
     }
 
     mBlocks.reserve(config.NumLayers);
@@ -110,4 +133,3 @@ ModuleContext ModularTransformerModel<Block>::create_context(int B, int T) {
                            mOptions.matmul_dtype.value() != mOptions.model_dtype.value_or(mConfig.DType);
     return ctx;
 }
-

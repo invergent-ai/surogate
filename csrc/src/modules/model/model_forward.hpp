@@ -645,8 +645,8 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     // h = silu(gate) * up
                     silu_mul_forward(expert_swiglu, expert_gate, expert_up, total_expert_tokens, expert_D, main_stream);
 
-                    rs.temp_free(expert_up);
                     rs.temp_free(expert_gate);
+                    rs.temp_free(expert_up);
 
                     // Grouped GEMM for down projection across all experts
                     if (acts.ln2.DType == ETensorDType::BF16) {

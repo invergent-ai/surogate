@@ -205,6 +205,83 @@ __global__ void moe_topk_forward_kernel(
 }
 
 // ============================================================================
+// Top-K Backward Kernel
+// ============================================================================
+// Backward through top-k selection (treating indices as constants).
+//
+// Forward (when normalize_weights=true):
+//   p = softmax_probs[token, :]
+//   p_k = p[idx_k]
+//   S = sum_k p_k
+//   w_k = p_k / S
+//
+// Given d_w_k, compute sparse gradients for the selected probs:
+//   d_p_k = (d_w_k * S - sum_j d_w_j * p_j) / (S * S)
+// Non-selected experts receive zero gradient.
+//
+// For normalize_weights=false, w_k = p_k and d_p_k = d_w_k.
+__global__ void moe_topk_backward_kernel(
+    float* __restrict__ d_probs,              // (num_tokens, num_experts)
+    const float* __restrict__ d_routing_w,    // (num_tokens, top_k)
+    const float* __restrict__ probs,          // (num_tokens, num_experts)
+    const int* __restrict__ expert_indices,   // (num_tokens, top_k)
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    bool normalize_weights
+) {
+    constexpr int MAX_K = 8;
+    int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token_idx >= num_tokens) return;
+    if (top_k <= 0 || top_k > MAX_K) return;
+
+    float* d_row = d_probs + token_idx * num_experts;
+    const float* p_row = probs + token_idx * num_experts;
+    const float* d_w_row = d_routing_w + token_idx * top_k;
+    const int* idx_row = expert_indices + token_idx * top_k;
+
+    if (!normalize_weights) {
+        #pragma unroll
+        for (int k = 0; k < MAX_K; ++k) {
+            if (k >= top_k) break;
+            int e = idx_row[k];
+            if (e >= 0 && e < num_experts) {
+                d_row[e] = d_w_row[k];
+            }
+        }
+        return;
+    }
+
+    float p_k[MAX_K];
+    float sum_p = 0.0f;
+    float dot = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < MAX_K; ++k) {
+        if (k >= top_k) break;
+        int e = idx_row[k];
+        float p = (e >= 0 && e < num_experts) ? p_row[e] : 0.0f;
+        p_k[k] = p;
+        sum_p += p;
+        dot += d_w_row[k] * p;
+    }
+
+    // S should be > 0 (sum of selected probs), but clamp for safety.
+    sum_p = fmaxf(sum_p, 1e-20f);
+    float inv_s2 = 1.0f / (sum_p * sum_p);
+
+    #pragma unroll
+    for (int k = 0; k < MAX_K; ++k) {
+        if (k >= top_k) break;
+        int e = idx_row[k];
+        if (e >= 0 && e < num_experts) {
+            float d_p = (d_w_row[k] * sum_p - dot) * inv_s2;
+            d_row[e] = d_p;
+        }
+    }
+}
+
+// ============================================================================
 // Token Permutation / Dispatch Kernels
 // ============================================================================
 // Reorders tokens from natural order to expert-grouped order for efficient GEMM.
@@ -637,6 +714,25 @@ void moe_topk_forward(
     int grid_size = (num_tokens + block_size - 1) / block_size;
     moe_topk_forward_kernel<float, 8><<<grid_size, block_size, 0, stream>>>(
         expert_indices, routing_weights, scores,
+        num_tokens, num_experts, top_k, normalize_weights
+    );
+}
+
+void moe_topk_backward(
+    float* d_probs,
+    const float* d_routing_weights,
+    const float* probs,
+    const int* expert_indices,
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = (num_tokens + block_size - 1) / block_size;
+    moe_topk_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_probs, d_routing_weights, probs, expert_indices,
         num_tokens, num_experts, top_k, normalize_weights
     );
 }

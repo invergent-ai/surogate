@@ -24,6 +24,7 @@ warmup_steps: 20
 lora: true
 lora_rank: 16
 lora_alpha: 32
+lora_dtype: bf16
 
 lora_target_modules:
   - q_proj
@@ -37,6 +38,7 @@ lora_target_modules:
 qlora_bnb: true
 qlora_bnb_block_size: 64
 qlora_bnb_double_quant: true
+qlora_offload_experts: true
 debug_memory_breakdown: true
 offload_residual: true
 offload_optimizer: true

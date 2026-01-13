@@ -142,11 +142,26 @@ void ModularWeightManager<Block>::fetch_master_block(int layer_idx, cudaStream_t
             copy_h2d(src.attention.k_norm_weight.value(), dst.attention.k_norm_weight.value());
         }
     }
-    copy_h2d(src.ln2.weight, dst.ln2.weight);
-    if constexpr (has_mlp_weights<BlockWeights>::value) {
-        copy_h2d(src.mlp_up_weight, dst.mlp_up_weight);
-        copy_h2d(src.mlp_down_weight, dst.mlp_down_weight);
-    }
+	    copy_h2d(src.ln2.weight, dst.ln2.weight);
+	    if constexpr (has_mlp_weights<BlockWeights>::value) {
+	        copy_h2d(src.mlp_up_weight, dst.mlp_up_weight);
+	        copy_h2d(src.mlp_down_weight, dst.mlp_down_weight);
+	    }
+	    if constexpr (has_moe_weights<BlockWeights>::value) {
+	        copy_h2d(src.router.gate, dst.router.gate);
+	        if (src.router.bias.has_value() && dst.router.bias.has_value()) {
+	            copy_h2d(src.router.bias.value(), dst.router.bias.value());
+	        }
+	        if (src.experts.use_batched && dst.experts.use_batched) {
+	            copy_h2d(src.experts.gate_up_proj, dst.experts.gate_up_proj);
+	            copy_h2d(src.experts.down_proj, dst.experts.down_proj);
+	        }
+	        if (src.shared_expert.has_value() && dst.shared_expert.has_value()) {
+	            copy_h2d(src.shared_expert->gate_proj, dst.shared_expert->gate_proj);
+	            copy_h2d(src.shared_expert->up_proj, dst.shared_expert->up_proj);
+	            copy_h2d(src.shared_expert->down_proj, dst.shared_expert->down_proj);
+	        }
+	    }
 
     CUDA_CHECK(cudaEventRecord(status.done_event, fetch_stream));
 }
@@ -201,11 +216,26 @@ void ModularWeightManager<Block>::release_master_block(int layer_idx, cudaStream
             copy_d2h(src.attention.k_norm_weight.value(), dst.attention.k_norm_weight.value());
         }
     }
-    copy_d2h(src.ln2.weight, dst.ln2.weight);
-    if constexpr (has_mlp_weights<BlockWeights>::value) {
-        copy_d2h(src.mlp_up_weight, dst.mlp_up_weight);
-        copy_d2h(src.mlp_down_weight, dst.mlp_down_weight);
-    }
+	    copy_d2h(src.ln2.weight, dst.ln2.weight);
+	    if constexpr (has_mlp_weights<BlockWeights>::value) {
+	        copy_d2h(src.mlp_up_weight, dst.mlp_up_weight);
+	        copy_d2h(src.mlp_down_weight, dst.mlp_down_weight);
+	    }
+	    if constexpr (has_moe_weights<BlockWeights>::value) {
+	        copy_d2h(src.router.gate, dst.router.gate);
+	        if (src.router.bias.has_value() && dst.router.bias.has_value()) {
+	            copy_d2h(src.router.bias.value(), dst.router.bias.value());
+	        }
+	        if (src.experts.use_batched && dst.experts.use_batched) {
+	            copy_d2h(src.experts.gate_up_proj, dst.experts.gate_up_proj);
+	            copy_d2h(src.experts.down_proj, dst.experts.down_proj);
+	        }
+	        if (src.shared_expert.has_value() && dst.shared_expert.has_value()) {
+	            copy_d2h(src.shared_expert->gate_proj, dst.shared_expert->gate_proj);
+	            copy_d2h(src.shared_expert->up_proj, dst.shared_expert->up_proj);
+	            copy_d2h(src.shared_expert->down_proj, dst.shared_expert->down_proj);
+	        }
+	    }
 
     CUDA_CHECK(cudaEventRecord(st.done_event, put_stream));
     st.is_ready = true;
@@ -265,13 +295,26 @@ void ModularWeightManager<Block>::synchronize_absmax(NCCLCommunicator& comm) {
         if (b.attention.qkv_bias.has_value()) {
             compute(b.attention.qkv_bias.value());
         }
-        compute(b.attention.out_weight);
-        if constexpr (has_mlp_weights<BlockWeights>::value) {
-            compute(b.mlp_up_weight);
-            compute(b.mlp_down_weight);
-        }
-        comm.wait_on_comms(stream);
-    }
+	        compute(b.attention.out_weight);
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            compute(b.mlp_up_weight);
+	            compute(b.mlp_down_weight);
+	        }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            compute(b.router.gate);
+	            if (b.router.bias.has_value()) compute(b.router.bias.value());
+	            if (b.experts.use_batched) {
+	                compute(b.experts.gate_up_proj);
+	                compute(b.experts.down_proj);
+	            }
+	            if (b.shared_expert.has_value()) {
+	                compute(b.shared_expert->gate_proj);
+	                compute(b.shared_expert->up_proj);
+	                compute(b.shared_expert->down_proj);
+	            }
+	        }
+	        comm.wait_on_comms(stream);
+	    }
 
     comm.barrier();
 }

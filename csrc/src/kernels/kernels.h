@@ -1140,6 +1140,14 @@ void moe_topk_forward(int* expert_indices, float* routing_weights, const float* 
 void moe_topk_forward(int* expert_indices, nv_bfloat16* routing_weights, const nv_bfloat16* scores,
                       int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
 
+/// @brief Backward through top-k selection (with optional post-selection normalization).
+/// Given gradients wrt the selected weights (num_tokens, top_k), scatter them back to a dense
+/// gradient wrt the full probability matrix (num_tokens, num_experts).
+/// When @p normalize_weights is true, assumes forward did: w_k = p_k / sum_j p_j over selected experts.
+/// Inputs/outputs are FP32 because routing is computed in FP32 in the modular model path.
+void moe_topk_backward(float* d_probs, const float* d_routing_weights, const float* probs, const int* expert_indices,
+                       int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+
 /// @brief Compute histogram of tokens assigned to each expert.
 /// @param expert_counts Output counts per expert (num_experts).
 /// @param expert_indices Input expert indices (num_tokens, top_k).

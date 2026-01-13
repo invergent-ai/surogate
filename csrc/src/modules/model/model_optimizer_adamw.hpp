@@ -107,6 +107,14 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                 add_tensor(bw.mlp_up_weight.nelem());
                 add_tensor(bw.mlp_down_weight.nelem());
             }
+
+            if constexpr (has_moe_weights<typename Block::Weights>::value) {
+                add_tensor(bw.router.gate.nelem());
+                if (bw.experts.use_batched) {
+                    add_tensor(bw.experts.gate_up_proj.nelem());
+                    add_tensor(bw.experts.down_proj.nelem());
+                }
+            }
             
             mWeights->release_master_block(i, main_stream, rs.side_stream());
         }
@@ -274,6 +282,14 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                                             0.f);
                         }
                     }
+                    if constexpr (requires { bg.attention.d_q_norm_weight; }) {
+                        if (bg.attention.d_q_norm_weight.has_value()) {
+                            run_8bit_update("attn.q_norm_weight",
+                                            bw.attention.q_norm_weight.value(),
+                                            bg.attention.d_q_norm_weight.value(),
+                                            0.f);
+                        }
+                    }
                 }
                 if (bw.attention.k_norm_weight.has_value()) {
                     if constexpr (requires { bg.attention_grads.d_k_norm_weight; }) {
@@ -281,6 +297,14 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                             run_8bit_update("attn.k_norm_weight",
                                             bw.attention.k_norm_weight.value(),
                                             bg.attention_grads.d_k_norm_weight.value(),
+                                            0.f);
+                        }
+                    }
+                    if constexpr (requires { bg.attention.d_k_norm_weight; }) {
+                        if (bg.attention.d_k_norm_weight.has_value()) {
+                            run_8bit_update("attn.k_norm_weight",
+                                            bw.attention.k_norm_weight.value(),
+                                            bg.attention.d_k_norm_weight.value(),
                                             0.f);
                         }
                     }
@@ -292,6 +316,14 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
         if constexpr (has_mlp_weights<typename Block::Weights>::value) {
             run_8bit_update("mlp_up_weight", bw.mlp_up_weight, bg.d_mlp_up_weight, weight_decay);
             run_8bit_update("mlp_down_weight", bw.mlp_down_weight, bg.d_mlp_down_weight, weight_decay);
+        }
+
+        if constexpr (has_moe_weights<typename Block::Weights>::value) {
+            run_8bit_update("router.gate", bw.router.gate, bg.router.d_gate, weight_decay);
+            if (bw.experts.use_batched) {
+                run_8bit_update("experts.gate_up_proj", bw.experts.gate_up_proj, bg.experts.d_gate_up_proj, weight_decay);
+                run_8bit_update("experts.down_proj", bw.experts.down_proj, bg.experts.d_down_proj, weight_decay);
+            }
         }
 
         mWeights->release_master_block(i, main_stream, rs.side_stream());
@@ -314,4 +346,3 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
     mWeights->end_optimizer(rs.Stack);
     CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, main_stream));
 }
-

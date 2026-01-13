@@ -342,6 +342,7 @@ if (BUILD_TESTS)
 	            src/testing/test-fp4.cu
 	            src/testing/test-bnb-quant.cpp
 	            src/testing/test-moe.cu
+	            src/testing/test_moe.cpp
 	            src/testing/test-fast-lora-silu.cu
 	            src/testing/test-heterogeneous.cu
 	    )
