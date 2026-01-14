@@ -109,16 +109,16 @@ class SurogateTrainerWrapper():
             logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
 
         # Apply warmup_ratio if warmup_steps is 0
-        warmup_steps = config.warmup_steps
-        if warmup_steps == 0 and config.warmup_ratio > 0:
-            warmup_steps = int(self.max_steps * config.warmup_ratio)
-            logger.info(f"Derived {warmup_steps} warmup steps from warmup_ratio={config.warmup_ratio}")
+        self.warmup_steps = config.warmup_steps
+        if self.warmup_steps == 0 and config.warmup_ratio > 0:
+            self.warmup_steps = int(self.max_steps * config.warmup_ratio)
+            logger.info(f"Derived {self.warmup_steps} warmup steps from warmup_ratio={config.warmup_ratio}")
 
         # Setup learning rate schedule
         self.lr_schedule = LRSchedule(
             base_lr=config.learning_rate,
             max_steps=self.max_steps,
-            warmup_steps=warmup_steps,
+            warmup_steps=self.warmup_steps,
             cooldown_steps=config.cooldown_steps,
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type
@@ -146,7 +146,7 @@ class SurogateTrainerWrapper():
             logger.info(f"Steps per epoch: {self.steps_per_epoch}")
             logger.info(f"Max steps: {self.max_steps}")
             logger.info(
-                f"LR schedule: {self.config.lr_scheduler_type} (warmup={warmup_steps}, cooldown={self.config.cooldown_steps})")
+                f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.warmup_steps}, cooldown={self.config.cooldown_steps})")
 
             # Print LoRA info if enabled
             if self.config.lora and self.config.lora_config:

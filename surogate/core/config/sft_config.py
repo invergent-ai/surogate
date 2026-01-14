@@ -142,8 +142,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4
         use_fused_rope (Optional[bool], defaults to False):
             Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth)
-        fp8_amax_history (Optional[int], defaults to 1024):
-            FP8 delayed scaling amax history length (default: 1024, for fp8-hybrid recipe)
+        fp8_amax_history (Optional[int], defaults to 16):
+            FP8 delayed scaling amax history length (default: 16, for fp8-hybrid recipe)
         fp4_backend (Optional[Literal['cutlass', 'cudnn']], defaults to 'cutlass'):
             FP4 matmul backend: cutlass (default) or cudnn (for nvfp4 recipe)
         skip_quant_first_layers (Optional[int], defaults to 0):
@@ -300,7 +300,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     master_dtype: Optional[str] = None
     recipe: Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4']] = 'bf16'
     use_fused_rope: Optional[bool] = False
-    fp8_amax_history: Optional[int] = 1024
+    fp8_amax_history: Optional[int] = 16
     fp4_backend: Optional[Literal['cutlass', 'cudnn']] = 'cutlass'
     skip_quant_first_layers: Optional[int] = 0
     skip_quant_last_layers: Optional[int] = 0

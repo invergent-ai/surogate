@@ -23,11 +23,11 @@ class LRSchedule:
         if step < self.warmup_steps:
             return self.base_lr * step / self.warmup_steps
         
-        # Cooldown phase: 1-sqrt schedule to zero
+        # Cooldown phase: 1-sqrt schedule from base_lr to final_lr
         if self.cooldown_steps > 0 and step >= (self.max_steps - self.cooldown_steps):
             cooldown_step = step - (self.max_steps - self.cooldown_steps)
             progress = cooldown_step / self.cooldown_steps
-            return self.final_lr * (1.0 - math.sqrt(progress))
+            return self.final_lr + (self.base_lr - self.final_lr) * (1.0 - math.sqrt(progress))
         
         # Main phase
         if self.main_steps <= 0:

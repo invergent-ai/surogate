@@ -3,17 +3,15 @@ from unsloth import FastLanguageModel
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 
-from unsloth.chat_templates import standardize_sharegpt
-
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name="Qwen/Qwen3-0.6B",
     max_seq_length=2048,  # Context length - can be longer, but uses more memory
-    load_in_4bit=True,  # 4bit uses much less memory
+    load_in_4bit=False,  # 4bit uses much less memory
     load_in_fp8=False,  # A bit more accurate, uses 2x memory
     full_finetuning=False,  # We have full finetuning now!
     float8_kv_cache=False,
     fast_inference=False,
-    use_exact_model_name=False
+    use_exact_model_name=True
     # token = "hf_...",      # use one if using gated models
 )
 
@@ -30,14 +28,20 @@ model = FastLanguageModel.get_peft_model(
     loftq_config=None,  # And LoftQ
 )
 
-dataset = load_dataset("mlabonne/FineTome-100k", split="train").select(range(10000))
-dataset = standardize_sharegpt(dataset)
+dataset = load_dataset("OpenLLM-Ro/ro_gsm8k", split="train")
 
 
 def format_prompts(examples):
-    convos = examples["conversations"]
-    texts = [tokenizer.apply_chat_template(convo, tokenize=False) for convo in convos]
-    return {"text": texts, }
+    texts = []
+    for question, answer in zip(examples["question"], examples["answer"]):
+        messages = [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+        text = tokenizer.apply_chat_template(messages, tokenize=False)
+        texts.append(text)
+        
+    return {"text": texts}
 
 
 dataset = dataset.map(format_prompts, batched=True)
@@ -51,8 +55,8 @@ trainer = SFTTrainer(
         dataset_text_field="text",
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,  # Use GA to mimic batch size!
-        warmup_steps=5,
-        num_train_epochs = 1, # Set this for 1 full training run.
+        warmup_steps=20,
+        num_train_epochs = 2, # Set this for 1 full training run.
         # max_steps=30,
         learning_rate=2e-4,  # Reduce to 2e-5 for long training runs
         logging_steps=1,
@@ -66,3 +70,4 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()
+model.save_pretrained("./output_unsloth_bf16")
