@@ -21,7 +21,13 @@ Simply running the script is not enough; the model requires a lightweight fine-t
 1. Dataset Size: Use a budget of approximately 150,000 supervised fine-tuning (SFT) samples
 2. Training Duration: The sources suggest training for one epoch (roughly 1,056 updates)
 3. Hardware & Time: This can be achieved on a single consumer-grade GPU (such as an NVIDIA RTX PRO 6000) in approximately 1.5 to 8 hours
-    
+
+IMPORTANT: Upcycled MoE training requires careful hyperparameter tuning:
+- Use LOWER learning rate than dense models (1e-5 recommended, vs 2e-4 for dense)
+- This script sets router_aux_loss_coef=0.01 (10x higher than pretrained MoE defaults)
+- Monitor gradient norms - should stay below 0.4 during training
+- Watch for router collapse: sudden loss increases after initial decrease indicate instability
+
 python upcycle_script.py \
     --model_id "Qwen/Qwen3-0.6B-Instruct" \
     --num_experts 8 \
@@ -237,6 +243,10 @@ def convert_qwen3_dense_to_hf_moe(model: nn.Module, num_experts: int, top_k: int
     base_cfg_dict["num_experts"] = int(num_experts)
     base_cfg_dict["num_experts_per_tok"] = int(top_k)
     base_cfg_dict["norm_topk_prob"] = True
+
+    # Set higher router auxiliary loss for upcycled models (0.01 instead of default 0.001)
+    # Upcycled models need stronger load balancing to prevent router collapse during fine-tuning
+    base_cfg_dict["router_aux_loss_coef"] = 0.01
 
     # Qwen3 config validation: if layer_types exists, it must match depth.
     n_layers = int(base_cfg_dict.get("num_hidden_layers"))
@@ -622,8 +632,21 @@ def main():
             top_k=args.top_k,
             dus_pct=args.dus_pct,
         )
-    
-    print("Next step: Lightweight fine-tuning with ~150k samples.")
+
+    print("\n" + "="*80)
+    print("✓ Upcycling complete!")
+    print("="*80)
+    print("\nNext step: Lightweight fine-tuning with ~150k samples.")
+    print("\nCRITICAL: Upcycled MoE models require special training hyperparameters:")
+    print("  • Learning rate: 1e-5 (MUCH LOWER than dense models)")
+    print("  • Router aux loss: 0.01 (already set in config.json)")
+    print("  • Gradient clipping: max_grad_norm=0.5")
+    print("  • Warmup ratio: 0.15-0.2 (longer than dense models)")
+    print("\nMonitor training for router collapse:")
+    print("  ✓ Healthy: gradient norm < 0.4, steady loss decrease")
+    print("  ✗ Failing: gradient norm > 0.8, loss suddenly increases")
+    print("\nSee docs/getting-started/quickstart-sft.md for detailed guidance.")
+    print("="*80)
     
     
 if __name__ == "__main__":
