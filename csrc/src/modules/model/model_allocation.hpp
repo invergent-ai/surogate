@@ -69,10 +69,6 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
                                                ? mConfig.MoeIntermediateSize
                                                : mConfig.IntermediateSize;
 
-    // Debug: print intermediate size being used
-    fprintf(stderr, "[RunState] NumExperts=%d, MoeIntermediateSize=%d, IntermediateSize=%d -> using intermediate_size=%d\n",
-            mConfig.NumExperts, mConfig.MoeIntermediateSize, mConfig.IntermediateSize,
-            rs_config.block_config.intermediate_size);
     rs_config.block_config.num_query_heads = mConfig.NumQueryHeads;
     rs_config.block_config.num_kv_heads = mConfig.NumKeyValHeads;
     rs_config.block_config.head_size = mConfig.head_size();

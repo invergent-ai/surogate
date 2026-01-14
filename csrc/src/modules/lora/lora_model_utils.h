@@ -79,10 +79,8 @@ inline void apply_lora_contribution(
     packed_delta.Sizes[1] = out_features;
     for (int i = 2; i < MAX_TENSOR_DIM; ++i) packed_delta.Sizes[i] = 1;
 
-    fprintf(stderr, "[DEBUG] Calling matmul: packed_delta.DType=%d, output.DType=%d\n", (int)packed_delta.DType, (int)output.DType);
     matmul(packed_delta, lora.B, intermediate, std::nullopt, nullptr, nullptr,
            handle, workspace, out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/false, stream);
-    fprintf(stderr, "[DEBUG] After matmul: packed_delta.DType=%d, output.DType=%d\n", (int)packed_delta.DType, (int)output.DType);
     add_2d_slice(output, packed_delta, BT, total_out_features, out_features, output_offset, stream);
 }
 

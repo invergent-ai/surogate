@@ -776,11 +776,17 @@ class RayDistributedTrainer:
             max_steps = steps_per_epoch * config.num_epochs
             logger.info(f"Calculated {steps_per_epoch} steps per epoch from {num_tokens} tokens")
 
+        # Apply warmup_ratio if warmup_steps is 0
+        warmup_steps = config.warmup_steps
+        if warmup_steps == 0 and config.warmup_ratio > 0:
+            warmup_steps = int(max_steps * config.warmup_ratio)
+            logger.info(f"Derived {warmup_steps} warmup steps from warmup_ratio={config.warmup_ratio}")
+
         # Learning rate schedule
         lr_schedule = LRSchedule(
             base_lr=config.learning_rate,
             max_steps=max_steps,
-            warmup_steps=config.warmup_steps,
+            warmup_steps=warmup_steps,
             cooldown_steps=config.cooldown_steps,
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type
