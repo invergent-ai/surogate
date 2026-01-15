@@ -20,7 +20,7 @@ bool cuda_available() {
 
 } // namespace
 
-TEST_CASE("global_norm_sqrt: grad_clip=0 disables clipping (scale=1)", "[grad-clip][gpu]") {
+TEST_CASE("global_norm_sqrt: grad_clip=0 disables clipping (scale=1)", "[kernels][grad-clip][gpu]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -50,7 +50,7 @@ TEST_CASE("global_norm_sqrt: grad_clip=0 disables clipping (scale=1)", "[grad-cl
     CUDA_CHECK(cudaFree(device_buf));
 }
 
-TEST_CASE("global_norm_sqrt: clipping scale uses grad_clip / norm", "[grad-clip][gpu]") {
+TEST_CASE("global_norm_sqrt: clipping scale uses grad_clip / norm", "[kernels][grad-clip][gpu]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -107,7 +107,7 @@ TEST_CASE("global_norm_sqrt: clipping scale uses grad_clip / norm", "[grad-clip]
     CUDA_CHECK(cudaFree(device_buf));
 }
 
-TEST_CASE("global_norm_sqrt: token scaling uses total_tokens / valid_tokens", "[grad-clip][gpu]") {
+TEST_CASE("global_norm_sqrt: token scaling uses total_tokens / valid_tokens", "[kernels][grad-clip][gpu]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -146,7 +146,7 @@ TEST_CASE("global_norm_sqrt: token scaling uses total_tokens / valid_tokens", "[
     CUDA_CHECK(cudaFree(device_buf));
 }
 
-TEST_CASE("global_norm_sqrt: clipping with token scaling returns combined multiplier", "[grad-clip][gpu]") {
+TEST_CASE("global_norm_sqrt: clipping with token scaling returns combined multiplier", "[kernels][grad-clip][gpu]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }

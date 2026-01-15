@@ -24,7 +24,7 @@ std::filesystem::path write_temp_json(const nlohmann::json& j, const std::string
 
 } // namespace
 
-TEST_CASE("load_pretrained_config: Qwen2ForCausalLM parses", "[config][qwen2]") {
+TEST_CASE("load_pretrained_config: Qwen2ForCausalLM parses", "[models][config][qwen2]") {
     nlohmann::json j;
     j["architectures"] = {"Qwen2ForCausalLM"};
     j["bos_token_id"] = 151643;
@@ -55,7 +55,7 @@ TEST_CASE("load_pretrained_config: Qwen2ForCausalLM parses", "[config][qwen2]") 
     REQUIRE(cfg->head_size() == 896 / 14);
 }
 
-TEST_CASE("load_pretrained_config: Qwen3ForCausalLM parses head_dim + qk_norm", "[config][qwen3]") {
+TEST_CASE("load_pretrained_config: Qwen3ForCausalLM parses head_dim + qk_norm", "[models][config][qwen3]") {
     nlohmann::json j;
     j["architectures"] = {"Qwen3ForCausalLM"};
     j["bos_token_id"] = 151643;
@@ -88,7 +88,7 @@ TEST_CASE("load_pretrained_config: Qwen3ForCausalLM parses head_dim + qk_norm", 
     REQUIRE(cfg->PadTokenId == cfg->BosTokenId);
 }
 
-TEST_CASE("create_pretrained_config_from_name: Qwen2.5 preset still works", "[config][preset]") {
+TEST_CASE("create_pretrained_config_from_name: Qwen2.5 preset still works", "[models][config][preset]") {
     auto cfg = create_pretrained_config_from_name("Qwen2.5-0.5B", ETensorDType::BF16);
     REQUIRE(cfg != nullptr);
     REQUIRE(cfg->Architecture == PretrainedConfig::QWEN2);

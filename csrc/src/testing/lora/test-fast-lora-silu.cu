@@ -21,8 +21,8 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 using Catch::Approx;
@@ -144,7 +144,7 @@ static float max_rel_error(const std::vector<float>& a, const std::vector<float>
 // Test Cases
 // ============================================================================
 
-TEST_CASE("silu_mul_forward correctness", "[fast_lora][silu]") {
+TEST_CASE("silu_mul_forward correctness", "[lora][fast_lora][silu]") {
     const int N = 1024;  // tokens
     const int D = 768;   // intermediate dim (Qwen3 MoE)
 
@@ -193,7 +193,7 @@ TEST_CASE("silu_mul_forward correctness", "[fast_lora][silu]") {
     REQUIRE(max_err < 0.01f);  // 1% tolerance for BF16
 }
 
-TEST_CASE("silu_mul_backward_inplace correctness", "[fast_lora][silu]") {
+TEST_CASE("silu_mul_backward_inplace correctness", "[lora][fast_lora][silu]") {
     const int N = 1024;
     const int D = 768;
 
@@ -265,7 +265,7 @@ TEST_CASE("silu_mul_backward_inplace correctness", "[fast_lora][silu]") {
     REQUIRE(h_err < 0.01f);
 }
 
-TEST_CASE("split_gate_up correctness", "[fast_lora][split]") {
+TEST_CASE("split_gate_up correctness", "[lora][fast_lora][split]") {
     const int N = 512;
     const int D = 768;
 
@@ -316,7 +316,7 @@ TEST_CASE("split_gate_up correctness", "[fast_lora][split]") {
     REQUIRE(gate_err == 0.0f);
 }
 
-TEST_CASE("concat_d_gate_up correctness", "[fast_lora][concat]") {
+TEST_CASE("concat_d_gate_up correctness", "[lora][fast_lora][concat]") {
     const int N = 512;
     const int D = 768;
 
@@ -364,7 +364,7 @@ TEST_CASE("concat_d_gate_up correctness", "[fast_lora][concat]") {
     REQUIRE(err == 0.0f);
 }
 
-TEST_CASE("split then concat roundtrip", "[fast_lora][roundtrip]") {
+TEST_CASE("split then concat roundtrip", "[lora][fast_lora][roundtrip]") {
     const int N = 256;
     const int D = 768;
 
@@ -414,7 +414,7 @@ TEST_CASE("split then concat roundtrip", "[fast_lora][roundtrip]") {
     REQUIRE(err == 0.0f);
 }
 
-TEST_CASE("silu_mul_backward_inplace gradient check", "[fast_lora][gradient]") {
+TEST_CASE("silu_mul_backward_inplace gradient check", "[lora][fast_lora][gradient]") {
     // Numerical gradient check to verify backward is correct
     const int N = 32;
     const int D = 64;

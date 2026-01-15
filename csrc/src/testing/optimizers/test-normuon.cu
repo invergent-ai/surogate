@@ -24,8 +24,8 @@
 #include "modules/optimizers/polar_express.h"
 #include "modules/optimizers/normuon.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 using namespace optimizers;
@@ -286,7 +286,7 @@ float relative_error(const std::vector<float>& actual, const std::vector<float>&
 // Tests
 // ============================================================================
 
-TEST_CASE("Polar Express produces orthogonal output", "[normuon][polar_express]") {
+TEST_CASE("Polar Express produces orthogonal output", "[optimizers][normuon]") {
     std::mt19937 gen(42);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -387,7 +387,7 @@ TEST_CASE("Polar Express produces orthogonal output", "[normuon][polar_express]"
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("XXT kernel correctness", "[normuon][polar_express][xxt]") {
+TEST_CASE("XXT kernel correctness", "[optimizers][normuon]") {
     std::mt19937 gen(123);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -426,7 +426,7 @@ TEST_CASE("XXT kernel correctness", "[normuon][polar_express][xxt]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("Spectral scale computation", "[normuon][polar_express][norm]") {
+TEST_CASE("Spectral scale computation", "[optimizers][normuon]") {
     std::mt19937 gen(456);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -461,7 +461,7 @@ TEST_CASE("Spectral scale computation", "[normuon][polar_express][norm]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("Cautious weight decay update", "[normuon][update]") {
+TEST_CASE("Cautious weight decay update", "[optimizers][normuon]") {
     std::mt19937 gen(789);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -509,7 +509,7 @@ TEST_CASE("Cautious weight decay update", "[normuon][update]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("NorMuon momentum update 8-bit", "[normuon][momentum]") {
+TEST_CASE("NorMuon momentum update 8-bit", "[optimizers][normuon]") {
     std::mt19937 gen(101112);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -582,7 +582,7 @@ TEST_CASE("NorMuon momentum update 8-bit", "[normuon][momentum]") {
 // Benchmarks
 // ============================================================================
 
-TEST_CASE("Polar Express benchmark", "[normuon][benchmark][!benchmark]") {
+TEST_CASE("Polar Express benchmark", "[optimizers][normuon][benchmark][!benchmark]") {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 

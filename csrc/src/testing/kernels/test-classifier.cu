@@ -21,8 +21,8 @@
 #include <catch2/catch_approx.hpp>
 
 #include "kernels/kernels.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 #include "utilities/utils.h"
 
 using namespace testing_utils;
@@ -67,7 +67,7 @@ static void classifier_cpu(float* losses, float* dlogits,
 
 } // namespace
 
-TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[classifier][fp32]") {
+TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[kernels][classifier][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
@@ -133,7 +133,7 @@ TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[classifier][fp
     REQUIRE(h_valid_token_count == h_valid_token_count_ref);
 }
 
-TEST_CASE("fused classifier bf16 forward/backward matches CPU (tolerant)", "[classifier][bf16]") {
+TEST_CASE("fused classifier bf16 forward/backward matches CPU (tolerant)", "[kernels][classifier][bf16]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;

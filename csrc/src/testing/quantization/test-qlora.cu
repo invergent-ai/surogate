@@ -19,7 +19,7 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
-#include "test_utils.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -52,7 +52,7 @@ float compute_mae(const std::vector<float>& a, const std::vector<float>& b) {
 } // anonymous namespace
 
 
-TEST_CASE("per-block quantization roundtrip", "[qlora][quant]") {
+TEST_CASE("per-block quantization roundtrip", "[quantization][qlora]") {
     // Test parameters
     const int M = 256;
     const int K = 256;
@@ -111,7 +111,7 @@ TEST_CASE("per-block quantization roundtrip", "[qlora][quant]") {
 }
 
 
-TEST_CASE("per-block quantization handles large values", "[qlora][quant]") {
+TEST_CASE("per-block quantization handles large values", "[quantization][qlora]") {
     // Test with values that require scaling
     const int M = 128;
     const int K = 128;
@@ -168,7 +168,7 @@ TEST_CASE("per-block quantization handles large values", "[qlora][quant]") {
 }
 
 
-TEST_CASE("per-block quantization with multiple blocks", "[qlora][quant]") {
+TEST_CASE("per-block quantization with multiple blocks", "[quantization][qlora]") {
     // Test with multiple blocks
     const int M = 512;
     const int K = 512;
@@ -238,7 +238,7 @@ TEST_CASE("per-block quantization with multiple blocks", "[qlora][quant]") {
 }
 
 
-TEST_CASE("per-block quantization with non-aligned dimensions", "[qlora][quant]") {
+TEST_CASE("per-block quantization with non-aligned dimensions", "[quantization][qlora]") {
     // Test with dimensions not evenly divisible by block size
     const int M = 300;  // Not divisible by 128
     const int K = 400;  // Not divisible by 128
@@ -288,7 +288,7 @@ TEST_CASE("per-block quantization with non-aligned dimensions", "[qlora][quant]"
 }
 
 
-TEST_CASE("per-block quantization different block sizes", "[qlora][quant]") {
+TEST_CASE("per-block quantization different block sizes", "[quantization][qlora]") {
     const int M = 256;
     const int K = 256;
 
@@ -341,7 +341,7 @@ TEST_CASE("per-block quantization different block sizes", "[qlora][quant]") {
 }
 
 
-TEST_CASE("per-block quantization preserves zero", "[qlora][quant]") {
+TEST_CASE("per-block quantization preserves zero", "[quantization][qlora]") {
     // Test that zeros are preserved
     const int M = 128;
     const int K = 128;

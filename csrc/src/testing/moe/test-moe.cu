@@ -21,8 +21,8 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -244,7 +244,7 @@ static float max_abs_diff(const float* a, const float* b, size_t n) {
 // Test Cases
 // ============================================================================
 
-TEST_CASE("moe_softmax_forward fp32 matches CPU", "[moe][softmax][fp32]") {
+TEST_CASE("moe_softmax_forward fp32 matches CPU", "[moe][softmax]") {
     const int num_tokens = 64;
     const int num_experts = 8;
     const size_t n = num_tokens * num_experts;
@@ -283,7 +283,7 @@ TEST_CASE("moe_softmax_forward fp32 matches CPU", "[moe][softmax][fp32]") {
     }
 }
 
-TEST_CASE("moe_softmax_forward bf16 matches CPU", "[moe][softmax][bf16]") {
+TEST_CASE("moe_softmax_forward bf16 matches CPU", "[moe][softmax]") {
     const int num_tokens = 64;
     const int num_experts = 8;
     const size_t n = num_tokens * num_experts;
@@ -319,7 +319,7 @@ TEST_CASE("moe_softmax_forward bf16 matches CPU", "[moe][softmax][bf16]") {
     }
 }
 
-TEST_CASE("moe_sigmoid_forward fp32 matches CPU", "[moe][sigmoid][fp32]") {
+TEST_CASE("moe_sigmoid_forward fp32 matches CPU", "[moe][sigmoid]") {
     const int num_elements = 512;
 
     // Generate input data
@@ -347,7 +347,7 @@ TEST_CASE("moe_sigmoid_forward fp32 matches CPU", "[moe][sigmoid][fp32]") {
     }
 }
 
-TEST_CASE("moe_topk_forward fp32 matches CPU", "[moe][topk][fp32]") {
+TEST_CASE("moe_topk_forward fp32 matches CPU", "[moe][topk]") {
     const int num_tokens = 32;
     const int num_experts = 8;
     const int top_k = 2;
@@ -453,7 +453,7 @@ TEST_CASE("moe_compute_expert_counts matches CPU", "[moe][counts]") {
     REQUIRE(total_gpu == num_tokens * top_k);
 }
 
-TEST_CASE("moe_permute_tokens fp32 matches CPU", "[moe][permute][fp32]") {
+TEST_CASE("moe_permute_tokens fp32 matches CPU", "[moe][permute]") {
     const int num_tokens = 32;
     const int num_experts = 4;
     const int top_k = 2;
@@ -506,7 +506,7 @@ TEST_CASE("moe_permute_tokens fp32 matches CPU", "[moe][permute][fp32]") {
     REQUIRE(max_diff < 1e-5f);
 }
 
-TEST_CASE("moe_unpermute_and_combine fp32 matches CPU", "[moe][combine][fp32]") {
+TEST_CASE("moe_unpermute_and_combine fp32 matches CPU", "[moe][combine]") {
     const int num_tokens = 32;
     const int num_experts = 4;
     const int top_k = 2;
@@ -575,7 +575,7 @@ TEST_CASE("moe_unpermute_and_combine fp32 matches CPU", "[moe][combine][fp32]") 
     REQUIRE(max_diff < 1e-4f);
 }
 
-TEST_CASE("moe_compute_aux_loss fp32 matches CPU", "[moe][auxloss][fp32]") {
+TEST_CASE("moe_compute_aux_loss fp32 matches CPU", "[moe][auxloss]") {
     const int num_tokens = 64;
     const int num_experts = 8;
     const int top_k = 2;
@@ -626,7 +626,7 @@ TEST_CASE("moe_compute_aux_loss fp32 matches CPU", "[moe][auxloss][fp32]") {
     REQUIRE(h_loss[0] == Catch::Approx(cpu_loss).margin(1e-4f));
 }
 
-TEST_CASE("moe_softmax_backward fp32 matches CPU", "[moe][softmax][backward][fp32]") {
+TEST_CASE("moe_softmax_backward fp32 matches CPU", "[moe][softmax]") {
     const int num_tokens = 64;
     const int num_experts = 8;
     const size_t n = num_tokens * num_experts;
@@ -665,7 +665,7 @@ TEST_CASE("moe_softmax_backward fp32 matches CPU", "[moe][softmax][backward][fp3
     REQUIRE(max_diff < 1e-5f);
 }
 
-TEST_CASE("moe full forward pass integration", "[moe][integration][fp32]") {
+TEST_CASE("moe full forward pass integration", "[moe][integration]") {
     // Test the full MoE forward pass: input -> router -> permute -> (expert placeholder) -> combine -> output
     const int num_tokens = 32;
     const int num_experts = 4;

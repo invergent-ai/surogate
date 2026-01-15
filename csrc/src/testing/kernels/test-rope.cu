@@ -16,8 +16,8 @@
 #include <catch2/catch_approx.hpp>
 
 #include "kernels/kernels.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -85,7 +85,7 @@ static void rope_backward_cpu(float* dinp, const float* dout, const float* freqs
 
 } // namespace
 
-TEST_CASE("rope forward/backward fp32 matches CPU", "[rope][fp32]") {
+TEST_CASE("rope forward/backward fp32 matches CPU", "[kernels][rope][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
@@ -186,7 +186,7 @@ TEST_CASE("rope forward/backward fp32 matches CPU", "[rope][fp32]") {
     REQUIRE(h_absmax_bwd == Catch::Approx(expected_absmax_bwd).margin(1e-6f));
 }
 
-TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[rope][bf16]") {
+TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[kernels][rope][bf16]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
@@ -308,7 +308,7 @@ TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[rope][bf16]
 }
 
 // New tests to ensure abs-max path participates for values and to catch sync/early-return bugs
-TEST_CASE("rope absmax (fp32)", "[rope][fp32][absmax]") {
+TEST_CASE("rope absmax (fp32)", "[kernels][rope][fp32][absmax]") {
     using namespace testing_config;
     // Craft sizes to force blocks to span Q/K and V regions in the same block
     // Small problem so a single block likely processes mixed heads
@@ -370,7 +370,7 @@ TEST_CASE("rope absmax (fp32)", "[rope][fp32][absmax]") {
 // Tests for fused RoPE kernel (TransformerEngine-style optimization)
 // ============================================================================
 
-TEST_CASE("rope_fused forward/backward fp32 matches baseline", "[rope][fused][fp32]") {
+TEST_CASE("rope_fused forward/backward fp32 matches baseline", "[kernels][rope][fused][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
@@ -448,7 +448,7 @@ TEST_CASE("rope_fused forward/backward fp32 matches baseline", "[rope][fused][fp
     }
 }
 
-TEST_CASE("rope_fused forward/backward bf16 matches baseline", "[rope][fused][bf16]") {
+TEST_CASE("rope_fused forward/backward bf16 matches baseline", "[kernels][rope][fused][bf16]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
@@ -540,7 +540,7 @@ TEST_CASE("rope_fused forward/backward bf16 matches baseline", "[rope][fused][bf
     }
 }
 
-TEST_CASE("rope_fused absmax (fp32)", "[rope][fused][fp32][absmax]") {
+TEST_CASE("rope_fused absmax (fp32)", "[kernels][rope][fused][fp32][absmax]") {
     const int B = 1, T = 64, Nq = 2, Nkv = 2, HD = 32;
     const int N = Nq + 2 * Nkv;
     const float theta = 10000.0f;
@@ -566,7 +566,7 @@ TEST_CASE("rope_fused absmax (fp32)", "[rope][fused][fp32][absmax]") {
     REQUIRE(absmax == Catch::Approx(10.0f).margin(1e-5f));
 }
 
-TEST_CASE("rope_fused in-place operation (fp32)", "[rope][fused][fp32][inplace]") {
+TEST_CASE("rope_fused in-place operation (fp32)", "[kernels][rope][fused][fp32][inplace]") {
     const int B = 2, T = 32, Nq = 4, Nkv = 4, HD = 64;
     const int N = Nq + 2 * Nkv;
     const float theta = 10000.0f;

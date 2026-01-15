@@ -22,8 +22,8 @@
 #include "modules/model/heterogeneous_model.h"
 #include "utilities/allocator.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace modules;
 using namespace testing_utils;
@@ -152,7 +152,7 @@ inline ModelConfig hybrid_test(ETensorDType dtype = ETensorDType::BF16) {
 // LayerOverride Tests
 // ============================================================================
 
-TEST_CASE("LayerOverride convenience constructors", "[heterogeneous][config]") {
+TEST_CASE("LayerOverride convenience constructors", "[models][heterogeneous][config]") {
     SECTION("Dense layer override") {
         auto override = LayerOverride::dense(5);
         REQUIRE(override.layer_idx == 5);
@@ -190,7 +190,7 @@ TEST_CASE("LayerOverride convenience constructors", "[heterogeneous][config]") {
 // ModelConfig Block Type Tests
 // ============================================================================
 
-TEST_CASE("ModelConfig block type queries", "[heterogeneous][config]") {
+TEST_CASE("ModelConfig block type queries", "[models][heterogeneous][config]") {
     SECTION("Dense architecture always returns Dense block type") {
         ModelConfig config;
         config.architecture = ArchitectureType::Dense;
@@ -262,7 +262,7 @@ TEST_CASE("ModelConfig block type queries", "[heterogeneous][config]") {
 // Hybrid Model Preset Tests
 // ============================================================================
 
-TEST_CASE("Hybrid model presets", "[heterogeneous][presets]") {
+TEST_CASE("Hybrid model presets", "[models][heterogeneous][presets]") {
     SECTION("hybrid_test preset configuration") {
         auto config = hybrid_test();
 
@@ -287,7 +287,7 @@ TEST_CASE("Hybrid model presets", "[heterogeneous][presets]") {
 // Qwen3 MoE-style Configuration Tests
 // ============================================================================
 
-TEST_CASE("Qwen3 MoE layer pattern with decoder_sparse_step", "[heterogeneous][qwen3][config]") {
+TEST_CASE("Qwen3 MoE layer pattern with decoder_sparse_step", "[models][heterogeneous][qwen3][config]") {
     SECTION("decoder_sparse_step=1 makes all layers MoE") {
         MoEConfig moe_cfg;
         moe_cfg.num_experts = 128;
@@ -378,7 +378,7 @@ TEST_CASE("Qwen3 MoE layer pattern with decoder_sparse_step", "[heterogeneous][q
     }
 }
 
-TEST_CASE("Qwen3 MoE preset configurations", "[heterogeneous][qwen3][presets]") {
+TEST_CASE("Qwen3 MoE preset configurations", "[models][heterogeneous][qwen3][presets]") {
     SECTION("qwen3_moe_15b_a2b preset") {
         auto config = qwen3_moe_15b_a2b();
 
@@ -420,7 +420,7 @@ TEST_CASE("Qwen3 MoE preset configurations", "[heterogeneous][qwen3][presets]") 
     }
 }
 
-TEST_CASE("MoEConfig norm_topk_prob configuration", "[heterogeneous][qwen3][router]") {
+TEST_CASE("MoEConfig norm_topk_prob configuration", "[models][heterogeneous][qwen3][router]") {
     SECTION("Default norm_topk_prob is false") {
         MoEConfig moe;
         REQUIRE(moe.norm_topk_prob == false);
@@ -442,7 +442,7 @@ TEST_CASE("MoEConfig norm_topk_prob configuration", "[heterogeneous][qwen3][rout
 // HeterogeneousBlock Tests
 // ============================================================================
 
-TEST_CASE("HeterogeneousBlock type identification", "[heterogeneous][block]") {
+TEST_CASE("HeterogeneousBlock type identification", "[models][heterogeneous][block]") {
     SECTION("Dense block identification") {
         DefaultDenseBlock::Config cfg;
         cfg.hidden_size = 256;
@@ -482,7 +482,7 @@ TEST_CASE("HeterogeneousBlock type identification", "[heterogeneous][block]") {
 // Model Factory Tests
 // ============================================================================
 
-TEST_CASE("ModelFactory hybrid model creation", "[heterogeneous][factory]") {
+TEST_CASE("ModelFactory hybrid model creation", "[models][heterogeneous][factory]") {
     SECTION("Factory rejects empty layer_overrides for Hybrid") {
         ModelConfig config;
         config.architecture = ArchitectureType::Hybrid;
@@ -512,7 +512,7 @@ TEST_CASE("ModelFactory hybrid model creation", "[heterogeneous][factory]") {
 // Integration Tests (require CUDA device)
 // ============================================================================
 
-TEST_CASE("Heterogeneous model block pattern", "[heterogeneous][cuda]") {
+TEST_CASE("Heterogeneous model block pattern", "[models][heterogeneous][cuda]") {
     auto config = hybrid_test();
     ModelOptions options;
     options.model_dtype = ETensorDType::BF16;

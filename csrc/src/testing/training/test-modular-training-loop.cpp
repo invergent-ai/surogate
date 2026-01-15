@@ -129,7 +129,7 @@ std::vector<TensorShard> collect_tensors(ITensorContainer& container) {
 
 } // namespace
 
-TEST_CASE("Modular dense model: 1 step forward/backward/update runs", "[modular][dense][smoke][gpu]") {
+TEST_CASE("Modular dense model: 1 step forward/backward/update runs", "[training][modular][dense][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -167,7 +167,7 @@ TEST_CASE("Modular dense model: 1 step forward/backward/update runs", "[modular]
     });
 }
 
-TEST_CASE("Modular: Qwen3-style head_dim + qk_norm forward/backward/update runs", "[modular][qwen3][qk-norm][gpu]") {
+TEST_CASE("Modular: Qwen3-style head_dim + qk_norm forward/backward/update runs", "[training][modular][qk-norm][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -213,7 +213,7 @@ TEST_CASE("Modular: Qwen3-style head_dim + qk_norm forward/backward/update runs"
     });
 }
 
-TEST_CASE("Modular cuda-graphs: 1 step forward/backward/update runs", "[modular][cuda-graphs][gpu]") {
+TEST_CASE("Modular cuda-graphs: 1 step forward/backward/update runs", "[training][modular][cuda-graphs][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -256,7 +256,7 @@ TEST_CASE("Modular cuda-graphs: 1 step forward/backward/update runs", "[modular]
     });
 }
 
-TEST_CASE("Modular dense model: FP8 matmul forward/backward/update runs", "[modular][fp8][gpu]") {
+TEST_CASE("Modular dense model: FP8 matmul forward/backward/update runs", "[training][modular][fp8][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
     if (!fp8_supported()) SKIP("FP8 tensor cores not available on this GPU");
 
@@ -294,7 +294,7 @@ TEST_CASE("Modular dense model: FP8 matmul forward/backward/update runs", "[modu
     });
 }
 
-TEST_CASE("Modular: offload-residual forward/backward/update runs", "[modular][offload][residual][gpu]") {
+TEST_CASE("Modular: offload-residual forward/backward/update runs", "[training][modular][offload][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -328,7 +328,7 @@ TEST_CASE("Modular: offload-residual forward/backward/update runs", "[modular][o
     });
 }
 
-TEST_CASE("Modular: attn-bwd-chunks=2 runs", "[modular][attention][chunks][gpu]") {
+TEST_CASE("Modular: attn-bwd-chunks=2 runs", "[training][modular][attention][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -362,7 +362,7 @@ TEST_CASE("Modular: attn-bwd-chunks=2 runs", "[modular][attention][chunks][gpu]"
     });
 }
 
-TEST_CASE("Modular: attn-bwd-chunks requires divisible batch", "[modular][attention][chunks][gpu]") {
+TEST_CASE("Modular: attn-bwd-chunks requires divisible batch", "[training][modular][attention][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -378,7 +378,7 @@ TEST_CASE("Modular: attn-bwd-chunks requires divisible batch", "[modular][attent
     });
 }
 
-TEST_CASE("Modular: offload-optimizer allocates optimizer state on host", "[modular][offload][optimizer][gpu]") {
+TEST_CASE("Modular: offload-optimizer allocates optimizer state on host", "[training][modular][offload][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -417,7 +417,7 @@ TEST_CASE("Modular: offload-optimizer allocates optimizer state on host", "[modu
     });
 }
 
-TEST_CASE("Modular: offload-master stores master weights on host (requires --use-zero-copy)", "[modular][offload][weights][gpu]") {
+TEST_CASE("Modular: offload-master stores master weights on host (requires --use-zero-copy)", "[training][modular][offload][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -437,7 +437,7 @@ TEST_CASE("Modular: offload-master stores master weights on host (requires --use
     });
 }
 
-TEST_CASE("Modular: recompute flags + chunked head/attn backward run", "[modular][recompute][chunks][gpu]") {
+TEST_CASE("Modular: recompute flags + chunked head/attn backward run", "[training][modular][recompute][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -472,7 +472,7 @@ TEST_CASE("Modular: recompute flags + chunked head/attn backward run", "[modular
     });
 }
 
-TEST_CASE("Modular: offload optimizer states + recompute-block training step runs", "[modular][offload][recompute][gpu]") {
+TEST_CASE("Modular: offload optimizer states + recompute-block training step runs", "[training][modular][offload][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -506,7 +506,7 @@ TEST_CASE("Modular: offload optimizer states + recompute-block training step run
     });
 }
 
-TEST_CASE("Modular ZeRO-2: all-to-all reducer + offload-gradients runs (2 GPUs)", "[modular][zero2][alltoall][offload][multi-gpu]") {
+TEST_CASE("Modular ZeRO-2: all-to-all reducer + offload-gradients runs (2 GPUs)", "[training][modular][zero2][multi-gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
     if (get_cuda_device_count() < 2) SKIP("Need at least 2 GPUs for all-to-all test");
 
@@ -553,7 +553,7 @@ TEST_CASE("Modular ZeRO-2: all-to-all reducer + offload-gradients runs (2 GPUs)"
     });
 }
 
-TEST_CASE("Modular recompute-block shares large activations across layers", "[modular][recompute][memory][gpu]") {
+TEST_CASE("Modular recompute-block shares large activations across layers", "[training][modular][recompute][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -583,7 +583,7 @@ TEST_CASE("Modular recompute-block shares large activations across layers", "[mo
     });
 }
 
-TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[modular][lora][recompute][gpu]") {
+TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[training][modular][lora][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -641,7 +641,7 @@ TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[modula
 // Note: Tests for configurable optimizer state dtypes (BF16, FP8) have been removed.
 // The adamw8bit optimizer uses 8-bit quantized states internally.
 
-TEST_CASE("Modular leaf recompute flags affect activation sharing", "[modular][recompute][leaf][memory][gpu]") {
+TEST_CASE("Modular leaf recompute flags affect activation sharing", "[training][modular][recompute][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -693,7 +693,7 @@ TEST_CASE("Modular leaf recompute flags affect activation sharing", "[modular][r
     });
 }
 
-TEST_CASE("Modular LoRA: base weights stay fixed, adapter weights update", "[modular][lora][smoke][gpu]") {
+TEST_CASE("Modular LoRA: base weights stay fixed, adapter weights update", "[training][modular][lora][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -818,7 +818,7 @@ TEST_CASE("Modular LoRA: base weights stay fixed, adapter weights update", "[mod
     });
 }
 
-TEST_CASE("Modular ZeRO-3 (shard weights) forward runs on 2 GPUs", "[modular][zero3][multi-gpu]") {
+TEST_CASE("Modular ZeRO-3 (shard weights) forward runs on 2 GPUs", "[training][modular][zero3][multi-gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
     if (get_cuda_device_count() < 2) SKIP("Need at least 2 GPUs");
 
@@ -844,7 +844,7 @@ TEST_CASE("Modular ZeRO-3 (shard weights) forward runs on 2 GPUs", "[modular][ze
     });
 }
 
-TEST_CASE("Modular ZeRO-2 (shard gradients) forward/backward/update runs on 2 GPUs", "[modular][zero2][multi-gpu]") {
+TEST_CASE("Modular ZeRO-2 (shard gradients) forward/backward/update runs on 2 GPUs", "[training][modular][zero2][multi-gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
     if (get_cuda_device_count() < 2) SKIP("Need at least 2 GPUs");
 
@@ -921,7 +921,7 @@ float max_rel_diff(const std::vector<float>& a, const std::vector<float>& b, flo
 
 } // namespace
 
-TEST_CASE("Recompute-block: loss matches non-recompute on first forward", "[modular][recompute][accuracy][gpu]") {
+TEST_CASE("Recompute-block: loss matches non-recompute on first forward", "[training][modular][recompute][gpu]") {
     // Test that the forward pass produces identical loss with and without recompute-block
     if (!gpu_available()) SKIP("CUDA not available");
 
@@ -997,7 +997,7 @@ TEST_CASE("Recompute-block: loss matches non-recompute on first forward", "[modu
     REQUIRE(std::abs(loss_no_recompute - loss_with_recompute) < 1e-5f);
 }
 
-TEST_CASE("Recompute-block: gradients match non-recompute after backward", "[modular][recompute][accuracy][gradients][gpu]") {
+TEST_CASE("Recompute-block: gradients match non-recompute after backward", "[training][modular][recompute][gpu]") {
     // Test that backward pass produces identical gradient norms
     if (!gpu_available()) SKIP("CUDA not available");
 
@@ -1082,7 +1082,7 @@ TEST_CASE("Recompute-block: gradients match non-recompute after backward", "[mod
     REQUIRE(norm_rel_diff < 1e-4f);
 }
 
-TEST_CASE("Recompute-block: multi-step training divergence check", "[modular][recompute][accuracy][divergence][gpu]") {
+TEST_CASE("Recompute-block: multi-step training divergence check", "[training][modular][recompute][gpu]") {
     // Test that training for multiple steps doesn't diverge between the two modes
     if (!gpu_available()) SKIP("CUDA not available");
 
@@ -1180,7 +1180,7 @@ TEST_CASE("Recompute-block: multi-step training divergence check", "[modular][re
     REQUIRE(max_rel_loss_diff < 0.01f);  // 1% tolerance - stricter than 2%
 }
 
-TEST_CASE("Recompute-block: weights evolve identically over training", "[modular][recompute][accuracy][weights][gpu]") {
+TEST_CASE("Recompute-block: weights evolve identically over training", "[training][modular][recompute][gpu]") {
     // Test that weight updates result in similar final loss after training
     if (!gpu_available()) SKIP("CUDA not available");
 
@@ -1270,7 +1270,7 @@ TEST_CASE("Recompute-block: weights evolve identically over training", "[modular
     REQUIRE(loss_rel_diff < 0.01f);
 }
 
-TEST_CASE("Recompute-block: activation values match recomputed values", "[modular][recompute][accuracy][activations][gpu]") {
+TEST_CASE("Recompute-block: activation values match recomputed values", "[training][modular][recompute][gpu]") {
     // This test verifies that stored activations (no recompute) match freshly recomputed ones
     // by manually triggering recomputation and comparing
     if (!gpu_available()) SKIP("CUDA not available");
@@ -1374,7 +1374,7 @@ TEST_CASE("Recompute-block: activation values match recomputed values", "[modula
     });
 }
 
-TEST_CASE("Recompute-block: longer training shows divergence pattern", "[modular][recompute][accuracy][long][gpu]") {
+TEST_CASE("Recompute-block: longer training shows divergence pattern", "[training][modular][recompute][gpu]") {
     // Run longer training to see if differences accumulate
     if (!gpu_available()) SKIP("CUDA not available");
 

@@ -20,7 +20,7 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
-#include "test_utils.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -164,7 +164,7 @@ float compute_mae(const std::vector<float>& a, const std::vector<float>& b) {
 } // anonymous namespace
 
 
-TEST_CASE("FP4 E2M1 quantization levels", "[fp4][quant]") {
+TEST_CASE("FP4 E2M1 quantization levels", "[quantization][fp4]") {
     // Verify FP4 E2M1 quantization produces correct discrete levels
     std::vector<float> test_values = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f,
                                        2.0f, 2.5f, 3.0f, 3.5f, 4.0f, 5.0f, 6.0f, 7.0f};
@@ -192,7 +192,7 @@ TEST_CASE("FP4 E2M1 quantization levels", "[fp4][quant]") {
 }
 
 
-TEST_CASE("FP4 block quantization roundtrip", "[fp4][quant]") {
+TEST_CASE("FP4 block quantization roundtrip", "[quantization][fp4]") {
     // Test parameters - must be multiples of 16 for FP4
     const int M = 128;
     const int K = 128;
@@ -283,7 +283,7 @@ TEST_CASE("FP4 block quantization roundtrip", "[fp4][quant]") {
 }
 
 
-TEST_CASE("Hadamard transform basic properties", "[fp4][hadamard]") {
+TEST_CASE("Hadamard transform basic properties", "[quantization][fp4]") {
     // Test that Hadamard transform preserves energy (orthogonality)
     const int M = 64;
     const int K = 64;  // Must be multiple of 16
@@ -329,7 +329,7 @@ TEST_CASE("Hadamard transform basic properties", "[fp4][hadamard]") {
 }
 
 
-TEST_CASE("Hadamard transform forward-inverse roundtrip", "[fp4][hadamard]") {
+TEST_CASE("Hadamard transform forward-inverse roundtrip", "[quantization][fp4]") {
     const int M = 32;
     const int K = 32;
 
@@ -377,7 +377,7 @@ TEST_CASE("Hadamard transform forward-inverse roundtrip", "[fp4][hadamard]") {
 }
 
 
-TEST_CASE("Hadamard transform CPU-GPU consistency", "[fp4][hadamard]") {
+TEST_CASE("Hadamard transform CPU-GPU consistency", "[quantization][fp4]") {
     const int M = 16;
     const int K = 32;
 
@@ -424,7 +424,7 @@ TEST_CASE("Hadamard transform CPU-GPU consistency", "[fp4][hadamard]") {
 }
 
 
-TEST_CASE("FP4 scale shape computation", "[fp4][utils]") {
+TEST_CASE("FP4 scale shape computation", "[quantization][fp4][utils]") {
     // Test that fp4_scale_shape returns correct dimensions
     {
         auto [rows, cols] = fp4_scale_shape(128, 128);
@@ -445,7 +445,7 @@ TEST_CASE("FP4 scale shape computation", "[fp4][utils]") {
     }
 }
 
-TEST_CASE("FP4 cuDNN matmul matches BF16 reference (within tolerance)", "[fp4][matmul]") {
+TEST_CASE("FP4 cuDNN matmul matches BF16 reference (within tolerance)", "[quantization][fp4]") {
     if (!device_supports_fp4()) {
         SKIP("FP4 matmul requires Blackwell GPU (SM100+)");
     }
@@ -574,7 +574,7 @@ TEST_CASE("FP4 cuDNN matmul matches BF16 reference (within tolerance)", "[fp4][m
     REQUIRE(rel_l2 < 0.35);
 }
 
-TEST_CASE("FP4 dW matmul path (dout^T @ inp) is numerically reasonable", "[fp4][backward]") {
+TEST_CASE("FP4 dW matmul path (dout^T @ inp) is numerically reasonable", "[quantization][fp4]") {
     if (!device_supports_fp4()) {
         SKIP("FP4 matmul requires Blackwell GPU (SM100+)");
     }

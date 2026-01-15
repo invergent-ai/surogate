@@ -56,7 +56,7 @@ int get_cuda_device_count() {
 // Basic NCCL Availability Tests
 // =============================================================================
 
-TEST_CASE("CUDA device availability", "[nccl][cuda][basic]") {
+TEST_CASE("CUDA device availability", "[distributed][nccl][cuda][basic]") {
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
     
@@ -70,7 +70,7 @@ TEST_CASE("CUDA device availability", "[nccl][cuda][basic]") {
     REQUIRE(device_count > 0);
 }
 
-TEST_CASE("NCCL communicator can be created with single GPU", "[nccl][basic]") {
+TEST_CASE("NCCL communicator can be created with single GPU", "[distributed][nccl][basic]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -91,7 +91,7 @@ TEST_CASE("NCCL communicator can be created with single GPU", "[nccl][basic]") {
     REQUIRE(communicator_created == true);
 }
 
-TEST_CASE("NCCL communicator properties with single GPU", "[nccl][basic]") {
+TEST_CASE("NCCL communicator properties with single GPU", "[distributed][nccl][basic]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -107,7 +107,7 @@ TEST_CASE("NCCL communicator properties with single GPU", "[nccl][basic]") {
 // Multi-GPU NCCL Tests (if multiple GPUs available)
 // =============================================================================
 
-TEST_CASE("NCCL communicator with multiple GPUs", "[nccl][multi-gpu]") {
+TEST_CASE("NCCL communicator with multiple GPUs", "[distributed][nccl][multi-gpu]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -138,7 +138,7 @@ TEST_CASE("NCCL communicator with multiple GPUs", "[nccl][multi-gpu]") {
     }
 }
 
-TEST_CASE("NCCL barrier synchronization", "[nccl][sync]") {
+TEST_CASE("NCCL barrier synchronization", "[distributed][nccl][sync]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -164,7 +164,7 @@ TEST_CASE("NCCL barrier synchronization", "[nccl][sync]") {
 // Host Gather Tests
 // =============================================================================
 
-TEST_CASE("NCCL host_gather with single GPU", "[nccl][gather]") {
+TEST_CASE("NCCL host_gather with single GPU", "[distributed][nccl][gather]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -181,7 +181,7 @@ TEST_CASE("NCCL host_gather with single GPU", "[nccl][gather]") {
     });
 }
 
-TEST_CASE("NCCL host_gather with multiple GPUs", "[nccl][gather][multi-gpu]") {
+TEST_CASE("NCCL host_gather with multiple GPUs", "[distributed][nccl][gather][multi-gpu]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -207,7 +207,7 @@ TEST_CASE("NCCL host_gather with multiple GPUs", "[nccl][gather][multi-gpu]") {
     });
 }
 
-TEST_CASE("NCCL host_all_gather with single GPU", "[nccl][allgather]") {
+TEST_CASE("NCCL host_all_gather with single GPU", "[distributed][nccl][allgather]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -221,7 +221,7 @@ TEST_CASE("NCCL host_all_gather with single GPU", "[nccl][allgather]") {
     });
 }
 
-TEST_CASE("NCCL host_all_gather with multiple GPUs", "[nccl][allgather][multi-gpu]") {
+TEST_CASE("NCCL host_all_gather with multiple GPUs", "[distributed][nccl][allgather][multi-gpu]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -250,7 +250,7 @@ TEST_CASE("NCCL host_all_gather with multiple GPUs", "[nccl][allgather][multi-gp
 // Host Gather with Struct Tests
 // =============================================================================
 
-TEST_CASE("NCCL host_gather with struct", "[nccl][gather][struct]") {
+TEST_CASE("NCCL host_gather with struct", "[distributed][nccl][gather][struct]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -278,7 +278,7 @@ TEST_CASE("NCCL host_gather with struct", "[nccl][gather][struct]") {
 // Error Handling Tests
 // =============================================================================
 
-TEST_CASE("NCCL handles zero GPUs gracefully", "[nccl][error]") {
+TEST_CASE("NCCL handles zero GPUs gracefully", "[distributed][nccl][error]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -303,7 +303,7 @@ TEST_CASE("NCCL handles zero GPUs gracefully", "[nccl][error]") {
 // Stress Tests
 // =============================================================================
 
-TEST_CASE("NCCL multiple sequential communicator creations", "[nccl][stress]") {
+TEST_CASE("NCCL multiple sequential communicator creations", "[distributed][nccl][stress]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -317,7 +317,7 @@ TEST_CASE("NCCL multiple sequential communicator creations", "[nccl][stress]") {
     }
 }
 
-TEST_CASE("NCCL with memcpy_allgather option", "[nccl][options]") {
+TEST_CASE("NCCL with memcpy_allgather option", "[distributed][nccl][options]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -329,7 +329,7 @@ TEST_CASE("NCCL with memcpy_allgather option", "[nccl][options]") {
     });
 }
 
-TEST_CASE("NCCL with memcpy_send_recv option", "[nccl][options]") {
+TEST_CASE("NCCL with memcpy_send_recv option", "[distributed][nccl][options]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -341,7 +341,7 @@ TEST_CASE("NCCL with memcpy_send_recv option", "[nccl][options]") {
     });
 }
 
-TEST_CASE("NCCL with both memcpy options", "[nccl][options]") {
+TEST_CASE("NCCL with both memcpy options", "[distributed][nccl][options]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -357,7 +357,7 @@ TEST_CASE("NCCL with both memcpy options", "[nccl][options]") {
 // NCCL ID Generation Tests
 // =============================================================================
 
-TEST_CASE("generate_nccl_id returns 128 bytes", "[nccl][id]") {
+TEST_CASE("generate_nccl_id returns 128 bytes", "[distributed][nccl][id]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -366,7 +366,7 @@ TEST_CASE("generate_nccl_id returns 128 bytes", "[nccl][id]") {
     REQUIRE(id.size() == 128);
 }
 
-TEST_CASE("generate_nccl_id returns unique IDs", "[nccl][id]") {
+TEST_CASE("generate_nccl_id returns unique IDs", "[distributed][nccl][id]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -377,7 +377,7 @@ TEST_CASE("generate_nccl_id returns unique IDs", "[nccl][id]") {
     REQUIRE(id1 != id2);
 }
 
-TEST_CASE("generate_nccl_id produces valid IDs for multiple calls", "[nccl][id]") {
+TEST_CASE("generate_nccl_id produces valid IDs for multiple calls", "[distributed][nccl][id]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -399,7 +399,7 @@ TEST_CASE("generate_nccl_id produces valid IDs for multiple calls", "[nccl][id]"
 // Multi-node Communicator Tests (simulated single-node)
 // =============================================================================
 
-TEST_CASE("launch_communicators_multinode with single node", "[nccl][multinode][.]") {
+TEST_CASE("launch_communicators_multinode with single node", "[distributed][nccl][multinode][.]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -428,7 +428,7 @@ TEST_CASE("launch_communicators_multinode with single node", "[nccl][multinode][
     REQUIRE(executed == true);
 }
 
-TEST_CASE("launch_communicators_multinode with multiple local GPUs", "[nccl][multinode][multi-gpu][.]") {
+TEST_CASE("launch_communicators_multinode with multiple local GPUs", "[distributed][nccl][multinode][multi-gpu][.]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -472,7 +472,7 @@ TEST_CASE("launch_communicators_multinode with multiple local GPUs", "[nccl][mul
     }
 }
 
-TEST_CASE("launch_communicators_multinode barrier works", "[nccl][multinode][sync][.]") {
+TEST_CASE("launch_communicators_multinode barrier works", "[distributed][nccl][multinode][sync][.]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -502,7 +502,7 @@ TEST_CASE("launch_communicators_multinode barrier works", "[nccl][multinode][syn
     pack->join();
 }
 
-TEST_CASE("launch_communicators_multinode host_gather works", "[nccl][multinode][gather][.]") {
+TEST_CASE("launch_communicators_multinode host_gather works", "[distributed][nccl][multinode][gather][.]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -537,7 +537,7 @@ TEST_CASE("launch_communicators_multinode host_gather works", "[nccl][multinode]
     pack->join();
 }
 
-TEST_CASE("launch_communicators_multinode host_all_gather works", "[nccl][multinode][allgather][.]") {
+TEST_CASE("launch_communicators_multinode host_all_gather works", "[distributed][nccl][multinode][allgather][.]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
@@ -575,7 +575,7 @@ TEST_CASE("launch_communicators_multinode host_all_gather works", "[nccl][multin
 // Multi-node Error Handling Tests
 // =============================================================================
 
-TEST_CASE("launch_communicators_multinode validates node_rank", "[nccl][multinode][error][.]") {
+TEST_CASE("launch_communicators_multinode validates node_rank", "[distributed][nccl][multinode][error][.]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -595,7 +595,7 @@ TEST_CASE("launch_communicators_multinode validates node_rank", "[nccl][multinod
     );
 }
 
-TEST_CASE("launch_communicators_multinode validates num_nodes", "[nccl][multinode][error][.]") {
+TEST_CASE("launch_communicators_multinode validates num_nodes", "[distributed][nccl][multinode][error][.]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -615,7 +615,7 @@ TEST_CASE("launch_communicators_multinode validates num_nodes", "[nccl][multinod
     );
 }
 
-TEST_CASE("launch_communicators_multinode validates nccl_id not null", "[nccl][multinode][error][.]") {
+TEST_CASE("launch_communicators_multinode validates nccl_id not null", "[distributed][nccl][multinode][error][.]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -634,7 +634,7 @@ TEST_CASE("launch_communicators_multinode validates nccl_id not null", "[nccl][m
     );
 }
 
-TEST_CASE("launch_communicators_multinode validates node_master_nccl_id not null", "[nccl][multinode][error][.]") {
+TEST_CASE("launch_communicators_multinode validates node_master_nccl_id not null", "[distributed][nccl][multinode][error][.]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }

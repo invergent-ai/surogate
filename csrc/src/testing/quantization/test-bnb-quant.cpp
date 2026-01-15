@@ -77,7 +77,7 @@ void unpack_nf4(unsigned char packed, unsigned char& hi, unsigned char& lo) {
 
 } // anonymous namespace
 
-TEST_CASE("BnB NF4 quantization basic roundtrip", "[bnb][nf4][quant]") {
+TEST_CASE("BnB NF4 quantization basic roundtrip", "[quantization][bnb]") {
     const int M = 64;
     const int K = 128;
     const int block_size = 64;
@@ -156,7 +156,7 @@ TEST_CASE("BnB NF4 quantization basic roundtrip", "[bnb][nf4][quant]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("BnB NF4 absmax computation", "[bnb][nf4][absmax]") {
+TEST_CASE("BnB NF4 absmax computation", "[quantization][bnb]") {
     const int block_size = 64;
     const int num_blocks = 4;
     const int num_elements = block_size * num_blocks;
@@ -227,7 +227,7 @@ TEST_CASE("BnB NF4 absmax computation", "[bnb][nf4][absmax]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("BnB NF4 double quantization roundtrip", "[bnb][nf4][double_quant]") {
+TEST_CASE("BnB NF4 double quantization roundtrip", "[quantization][bnb]") {
     const int M = 128;
     const int K = 256;
     const int block_size = 64;
@@ -317,7 +317,7 @@ TEST_CASE("BnB NF4 double quantization roundtrip", "[bnb][nf4][double_quant]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("BnB NF4 codebook values match expected", "[bnb][nf4][codebook]") {
+TEST_CASE("BnB NF4 codebook values match expected", "[quantization][bnb]") {
     // Get the codebook from the kernel
     const float* kernel_codebook = get_nf4_codebook();
 
@@ -329,7 +329,7 @@ TEST_CASE("BnB NF4 codebook values match expected", "[bnb][nf4][codebook]") {
     }
 }
 
-TEST_CASE("BnB NF4 handles different block sizes", "[bnb][nf4][blocksize]") {
+TEST_CASE("BnB NF4 handles different block sizes", "[quantization][bnb]") {
     const int M = 256;
     const int K = 256;
     const int num_elements = M * K;
@@ -399,7 +399,7 @@ TEST_CASE("BnB NF4 handles different block sizes", "[bnb][nf4][blocksize]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("BnB NF4 preserves zeros", "[bnb][nf4][zeros]") {
+TEST_CASE("BnB NF4 preserves zeros", "[quantization][bnb]") {
     const int block_size = 64;
     const int num_elements = block_size * 2;
     const int packed_size = (num_elements + 1) / 2;
@@ -462,7 +462,7 @@ TEST_CASE("BnB NF4 preserves zeros", "[bnb][nf4][zeros]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("BnB QLoRAConfig factory method", "[bnb][config]") {
+TEST_CASE("BnB QLoRAConfig factory method", "[quantization][bnb]") {
     // Test the QLoRAConfig::bnb() factory method
     auto cfg = modules::QLoRAConfig::bnb(64, true);
 
@@ -485,7 +485,7 @@ TEST_CASE("BnB QLoRAConfig factory method", "[bnb][config]") {
     REQUIRE(cfg2.bnb_double_quant == false);
 }
 
-TEST_CASE("BnB NF4 quantization performance", "[bnb][nf4][benchmark]") {
+TEST_CASE("BnB NF4 quantization performance", "[quantization][bnb]") {
     // Test different matrix sizes typical for LLM weight matrices
     struct TestCase {
         int M;
@@ -573,7 +573,7 @@ TEST_CASE("BnB NF4 quantization performance", "[bnb][nf4][benchmark]") {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-TEST_CASE("BnB NF4 dequantization performance", "[bnb][nf4][benchmark]") {
+TEST_CASE("BnB NF4 dequantization performance", "[quantization][bnb]") {
     // Test different matrix sizes typical for LLM weight matrices
     struct TestCase {
         int M;

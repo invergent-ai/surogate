@@ -12,8 +12,8 @@
 
 #include "kernels/kernels.h"
 #include "utilities/tensor.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -25,7 +25,7 @@ Tensor tensor_from_device_ptr(ETensorDType dt, std::byte* ptr, const std::vector
 
 } // namespace
 
-TEST_CASE("qk_norm+rope fused forward matches baseline (fp32)", "[qk_norm][rope][fp32]") {
+TEST_CASE("qk_norm+rope fused forward matches baseline (fp32)", "[kernels][qk_norm][rope][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
@@ -100,7 +100,7 @@ TEST_CASE("qk_norm+rope fused forward matches baseline (fp32)", "[qk_norm][rope]
     }
 }
 
-TEST_CASE("qk_norm+rope fused backward matches baseline (fp32)", "[qk_norm][rope][backward][fp32]") {
+TEST_CASE("qk_norm+rope fused backward matches baseline (fp32)", "[kernels][qk_norm][rope][backward][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;

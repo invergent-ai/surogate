@@ -18,8 +18,8 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -80,7 +80,7 @@ static float max_abs(const float* data, size_t n) {
 
 } // namespace
 
-TEST_CASE("swiglu forward/backward fp32 matches CPU", "[swiglu][fp32]") {
+TEST_CASE("swiglu forward/backward fp32 matches CPU", "[kernels][swiglu][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T; // ensure B*T*C divisible by kernel block requirements
@@ -155,7 +155,7 @@ TEST_CASE("swiglu forward/backward fp32 matches CPU", "[swiglu][fp32]") {
     REQUIRE(h_absmax == Catch::Approx(cpu_absmax_bwd).margin(1e-6f));
 }
 
-TEST_CASE("swiglu forward/backward bfloat16 matches CPU (emulated)", "[swiglu][bf16]") {
+TEST_CASE("swiglu forward/backward bfloat16 matches CPU (emulated)", "[kernels][swiglu][bf16]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T; // ensure divisibility
@@ -240,7 +240,7 @@ TEST_CASE("swiglu forward/backward bfloat16 matches CPU (emulated)", "[swiglu][b
     REQUIRE(h_absmax == Catch::Approx(cpu_absmax_bwd).margin(5e-3f));
 }
 
-TEST_CASE("swiglu_forward_quant is bit-perfect to swiglu_forward + quant_with_absmax", "[swiglu][quant][fp8]") {
+TEST_CASE("swiglu_forward_quant is bit-perfect to swiglu_forward + quant_with_absmax", "[kernels][swiglu][quant][fp8]") {
     // This test verifies that directly computing SwiGLU in bf16 and writing fp8 (swiglu_forward_quant)
     // is bit-identical to: bf16 swiglu_forward -> take absmax -> quantize_with_abs_max to fp8.
     const auto& cfg = testing_config::get_test_config();

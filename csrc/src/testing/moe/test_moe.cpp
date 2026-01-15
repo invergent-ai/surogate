@@ -501,7 +501,7 @@ void build_indices_cpu(std::vector<int>& gather_indices, std::vector<int>& scatt
 
 } // namespace
 
-TEST_CASE("moe_remap_expert_indices maps global->compact indices", "[moe][selective][remap]") {
+TEST_CASE("moe_remap_expert_indices maps global->compact indices", "[moe][selective]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     CudaStream stream;
@@ -550,7 +550,7 @@ TEST_CASE("moe_remap_expert_indices maps global->compact indices", "[moe][select
     }
 }
 
-TEST_CASE("moe_grouped_gemm_gate_up supports compact expert weights", "[moe][grouped_gemm][compact]") {
+TEST_CASE("moe_grouped_gemm_gate_up supports compact expert weights", "[moe][grouped_gemm]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     CudaStream stream;
@@ -631,7 +631,7 @@ TEST_CASE("moe_grouped_gemm_gate_up supports compact expert weights", "[moe][gro
     }
 }
 
-TEST_CASE("moe_grouped_gemm_down supports compact expert weights", "[moe][grouped_gemm][compact]") {
+TEST_CASE("moe_grouped_gemm_down supports compact expert weights", "[moe][grouped_gemm]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     CudaStream stream;
@@ -710,7 +710,7 @@ TEST_CASE("moe_grouped_gemm_down supports compact expert weights", "[moe][groupe
     }
 }
 
-TEST_CASE("moe_combine_backward matches CPU reference", "[moe][combine][backward]") {
+TEST_CASE("moe_combine_backward matches CPU reference", "[moe][combine]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     CudaStream stream;
@@ -805,7 +805,7 @@ TEST_CASE("moe_combine_backward matches CPU reference", "[moe][combine][backward
     }
 }
 
-TEST_CASE("moe_permute_backward matches CPU reference", "[moe][permute][backward]") {
+TEST_CASE("moe_permute_backward matches CPU reference", "[moe][permute]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     CudaStream stream;
@@ -981,7 +981,7 @@ TEST_CASE("BnB/FP8/FP4 MoE router gate loads without transpose", "[moe][qlora][r
     });
 }
 
-TEST_CASE("ModularWeightManager allocates MoE router/expert weights in model dtype", "[moe][weights][allocation]") {
+TEST_CASE("ModularWeightManager allocates MoE router/expert weights in model dtype", "[moe][weights]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -1054,7 +1054,7 @@ TEST_CASE("ModularWeightManager allocates MoE router/expert weights in model dty
     });
 }
 
-TEST_CASE("ModularWeightManager imports per-expert MoE weights into batched expert tensors", "[moe][weights][import]") {
+TEST_CASE("ModularWeightManager imports per-expert MoE weights into batched expert tensors", "[moe][weights]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -1226,7 +1226,7 @@ TEST_CASE("ModularWeightManager imports per-expert MoE weights into batched expe
     });
 }
 
-TEST_CASE("moe_topk_backward matches CPU reference (fp32)", "[moe][topk][backward]") {
+TEST_CASE("moe_topk_backward matches CPU reference (fp32)", "[moe][topk]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     CudaStream stream;
@@ -1310,7 +1310,7 @@ TEST_CASE("moe_topk_backward matches CPU reference (fp32)", "[moe][topk][backwar
     }
 }
 
-TEST_CASE("Modular MoE model: 1 step forward/backward/update runs (full finetune)", "[moe][modular][smoke]") {
+TEST_CASE("Modular MoE model: 1 step forward/backward/update runs (full finetune)", "[moe][modular]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -1415,7 +1415,7 @@ TEST_CASE("Modular MoE model: 1 step forward/backward/update runs (full finetune
     });
 }
 
-TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora][smoke]") {
+TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -1470,11 +1470,14 @@ TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora][
         model->allocate_run_state(opts, comm, B, T, /*allocate_optimizer=*/true);
         model->init_weights(comm);
 
-        // Capture a small checksum of one grouped MoE LoRA tensor to ensure the optimizer actually updates it.
+        // Capture a small checksum of grouped MoE LoRA tensors (exported as per-expert slices)
+        // to ensure the optimizer actually updates them.
         float grouped_gate_b_abs_before = 0.0f;
-        bool found_grouped_gate_b = false;
+        int found_count = 0;
         model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
-            if (name.find(".mlp.experts.grouped.gate_proj.lora_B.weight") == std::string::npos) return;
+            // PEFT-compatible format: .mlp.experts.{e}.gate_proj.lora_B.weight
+            if (name.find(".mlp.experts.") == std::string::npos) return;
+            if (name.find(".gate_proj.lora_B.weight") == std::string::npos) return;
             if (t.DType != ETensorDType::BF16) return;
             // First few elements should start at 0 and become non-zero after one update.
             std::array<nv_bfloat16, 8> h{};
@@ -1482,9 +1485,9 @@ TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora][
             for (const auto& v : h) {
                 grouped_gate_b_abs_before += std::abs(__bfloat162float(v));
             }
-            found_grouped_gate_b = true;
+            found_count++;
         });
-        REQUIRE(found_grouped_gate_b);
+        REQUIRE(found_count == cfg.NumExperts * cfg.NumLayers);
 
         auto& inputs = model->get_input_buffer();
         auto& targets = model->get_target_buffer();
@@ -1518,7 +1521,9 @@ TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora][
 
         float grouped_gate_b_abs_after = 0.0f;
         model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
-            if (name.find(".mlp.experts.grouped.gate_proj.lora_B.weight") == std::string::npos) return;
+            // PEFT-compatible format: .mlp.experts.{e}.gate_proj.lora_B.weight
+            if (name.find(".mlp.experts.") == std::string::npos) return;
+            if (name.find(".gate_proj.lora_B.weight") == std::string::npos) return;
             if (t.DType != ETensorDType::BF16) return;
             std::array<nv_bfloat16, 8> h{};
             CUDA_CHECK(cudaMemcpy(h.data(), t.get<nv_bfloat16>(), h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1530,7 +1535,7 @@ TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora][
     });
 }
 
-TEST_CASE("Modular MoE model: QLoRA(BnB) selective expert dequant works in backward across layers", "[moe][qlora][bnb][lora][regression]") {
+TEST_CASE("Modular MoE model: QLoRA(BnB) selective expert dequant works in backward across layers", "[moe][qlora][bnb]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
@@ -1618,18 +1623,25 @@ TEST_CASE("Modular MoE model: QLoRA(BnB) selective expert dequant works in backw
         model->allocate_run_state(opts, comm, B, T, /*allocate_optimizer=*/true);
 
         auto get_grouped_gate_b_abs = [&](int layer) {
-            const std::string needle = "base_model.model.model.layers." + std::to_string(layer) + ".mlp.experts.grouped.gate_proj.lora_B.weight";
+            // With PEFT-compatible export, grouped weights are exported as per-expert slices
+            // We sum over all experts in the layer to get total gradient update
             float abs_sum = 0.0f;
-            bool found = false;
-            model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
-                if (name != needle) return;
-                REQUIRE(t.DType == ETensorDType::BF16);
-                std::array<nv_bfloat16, 8> h{};
-                CUDA_CHECK(cudaMemcpy(h.data(), t.get<nv_bfloat16>(), h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                for (const auto& v : h) abs_sum += std::abs(__bfloat162float(v));
-                found = true;
-            });
-            REQUIRE(found);
+            int found_count = 0;
+            const int num_experts = wcfg.num_experts;
+
+            for (int e = 0; e < num_experts; ++e) {
+                const std::string needle = "base_model.model.model.layers." + std::to_string(layer) +
+                                          ".mlp.experts." + std::to_string(e) + ".gate_proj.lora_B.weight";
+                model->weights().iterate_tensors([&](std::string name, const TensorShard& t) {
+                    if (name != needle) return;
+                    REQUIRE(t.DType == ETensorDType::BF16);
+                    std::array<nv_bfloat16, 8> h{};
+                    CUDA_CHECK(cudaMemcpy(h.data(), t.get<nv_bfloat16>(), h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                    for (const auto& v : h) abs_sum += std::abs(__bfloat162float(v));
+                    found_count++;
+                });
+            }
+            REQUIRE(found_count == num_experts);
             return abs_sum;
         };
 

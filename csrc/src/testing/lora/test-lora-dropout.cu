@@ -20,8 +20,8 @@
 #include "kernels/kernels.h"
 #include "utilities/tensor.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 

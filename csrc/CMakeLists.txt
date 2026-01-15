@@ -378,34 +378,80 @@ endif ()
 
 # ----------------------------------------------------------------------------
 # Tests
-option(BUILD_TESTS "Build unit tests" OFF)
-if (BUILD_TESTS)
+option(BUILD_TESTS "Build all tests (unit + integration)" OFF)
+option(BUILD_TESTS_UNIT "Build unit tests (kernels, modules, components)" ON)
+option(BUILD_TESTS_INTEGRATION "Build integration tests (training loops, distributed)" OFF)
+
+if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
     enable_testing()
 
-	    add_executable(unit-tests
-	            src/testing/test_main.cpp
-	            src/testing/test-swiglu.cu
-	            src/testing/test-rope.cu
-	            src/testing/test-nccl.cpp
-	            src/testing/test-grad-clip.cu
-	            src/testing/test-classifier.cu
-	            src/testing/test-modular-training-loop.cpp
-	            src/testing/test_pretrained_config.cpp
-	            src/testing/test-sol.cpp
-	            src/testing/test-qk-norm-rope.cu
-	            src/testing/test-qlora.cu
-	            src/testing/test-adamw.cu
-	            src/testing/test-normuon.cu
-	            src/testing/test-fp4.cu
-	            src/testing/test-bnb-quant.cpp
-	            src/testing/test-moe.cu
-	            src/testing/test_moe.cpp
-	            src/testing/test-fast-lora-silu.cu
-	            src/testing/test-lora-dropout.cu
-	            src/testing/test-heterogeneous.cu
-	    )
-    target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
-    target_compile_options(unit-tests PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    # Unit tests: Kernels, quantization, optimizers, LoRA, MoE, models
+    if (BUILD_TESTS OR BUILD_TESTS_UNIT)
+        add_executable(unit-tests
+            src/testing/utilities/test_main.cpp
 
-    add_test(NAME unit-tests COMMAND unit-tests)
-endif ()
+            # Kernels
+            src/testing/kernels/test-swiglu.cu
+            src/testing/kernels/test-rope.cu
+            src/testing/kernels/test-qk-norm-rope.cu
+            src/testing/kernels/test-classifier.cu
+            src/testing/kernels/test-grad-clip.cu
+
+            # Quantization
+            src/testing/quantization/test-qlora.cu
+            src/testing/quantization/test-fp4.cu
+            src/testing/quantization/test-bnb-quant.cpp
+
+            # Optimizers
+            src/testing/optimizers/test-adamw.cu
+            src/testing/optimizers/test-normuon.cu
+
+            # LoRA
+            src/testing/lora/test-lora-dropout.cu
+            src/testing/lora/test-fast-lora-silu.cu
+
+            # MoE
+            src/testing/moe/test-moe.cu
+            src/testing/moe/test_moe.cpp
+
+            # Models
+            src/testing/models/test-heterogeneous.cu
+            src/testing/models/test_pretrained_config.cpp
+
+            # Utilities
+            src/testing/utilities/test-sol.cpp
+        )
+        target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
+        target_compile_options(unit-tests PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+        )
+        add_test(NAME unit-tests COMMAND unit-tests)
+    endif()
+
+    # Integration tests: Full training loops, multi-GPU communication
+    if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
+        add_executable(integration-tests
+            src/testing/utilities/test_main.cpp
+
+            # Training
+            src/testing/training/test-modular-training-loop.cpp
+
+            # Distributed
+            src/testing/distributed/test-nccl.cpp
+        )
+        target_link_libraries(integration-tests PRIVATE
+            surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only
+        )
+        target_compile_options(integration-tests PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+        )
+        add_test(NAME integration-tests COMMAND integration-tests)
+    endif()
+
+    # Convenience target for all tests
+    if (BUILD_TESTS)
+        add_custom_target(all-tests DEPENDS unit-tests integration-tests)
+    endif()
+endif()

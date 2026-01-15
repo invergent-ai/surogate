@@ -23,8 +23,8 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
-#include "test_config.h"
-#include "test_utils.h"
+#include "../utilities/test_config.h"
+#include "../utilities/test_utils.h"
 
 using namespace testing_utils;
 
@@ -144,7 +144,7 @@ private:
 // CORRECTNESS TESTS
 // ============================================================================
 
-TEST_CASE("AdamW 8-bit initialization", "[adamw8bit][init]") {
+TEST_CASE("AdamW 8-bit initialization", "[optimizers][adamw8bit]") {
     const size_t n = 4096 * 16;  // 64K parameters
     const size_t num_blocks = (n + 2047) / 2048;
 
@@ -189,7 +189,7 @@ TEST_CASE("AdamW 8-bit initialization", "[adamw8bit][init]") {
     }
 }
 
-TEST_CASE("AdamW 8-bit quantization maps", "[adamw8bit][quantiles]") {
+TEST_CASE("AdamW 8-bit quantization maps", "[optimizers][adamw8bit]") {
     std::vector<float> h_quantiles1(256);
     std::vector<float> h_quantiles2(256);
 
@@ -223,7 +223,7 @@ TEST_CASE("AdamW 8-bit quantization maps", "[adamw8bit][quantiles]") {
     REQUIRE(h_quantiles2[0] == Catch::Approx(0.0f).margin(0.01f));   // First should be 0 or near 0
 }
 
-TEST_CASE("AdamW 8-bit FP32 correctness", "[adamw8bit][fp32][correctness]") {
+TEST_CASE("AdamW 8-bit FP32 correctness", "[optimizers][adamw8bit]") {
     const size_t n = 4096 * 16;  // 64K parameters
     const size_t num_blocks = (n + 2047) / 2048;
     const int num_steps = 10;
@@ -297,7 +297,7 @@ TEST_CASE("AdamW 8-bit FP32 correctness", "[adamw8bit][fp32][correctness]") {
     REQUIRE(rel_err < 0.05f);
 }
 
-TEST_CASE("AdamW 8-bit BF16 correctness", "[adamw8bit][bf16][correctness]") {
+TEST_CASE("AdamW 8-bit BF16 correctness", "[optimizers][adamw8bit]") {
     const size_t n = 4096 * 16;
     const size_t num_blocks = (n + 2047) / 2048;
     const int num_steps = 10;
@@ -375,7 +375,7 @@ TEST_CASE("AdamW 8-bit BF16 correctness", "[adamw8bit][bf16][correctness]") {
 // BENCHMARKS
 // ============================================================================
 
-TEST_CASE("AdamW 8-bit benchmark - FP32 params", "[adamw8bit][benchmark][fp32]") {
+TEST_CASE("AdamW 8-bit benchmark - FP32 params", "[optimizers][adamw8bit][benchmark]") {
     const size_t n = 50 * 1024 * 1024;  // 50M parameters
     const size_t num_blocks = (n + 2047) / 2048;
     const int warmup_iters = 5;
@@ -474,7 +474,7 @@ TEST_CASE("AdamW 8-bit benchmark - FP32 params", "[adamw8bit][benchmark][fp32]")
     REQUIRE(avg_ms > 0);
 }
 
-TEST_CASE("AdamW 8-bit benchmark - BF16 params", "[adamw8bit][benchmark][bf16]") {
+TEST_CASE("AdamW 8-bit benchmark - BF16 params", "[optimizers][adamw8bit][benchmark]") {
     const size_t n = 50 * 1024 * 1024;  // 50M parameters
     const size_t num_blocks = (n + 2047) / 2048;
     const int warmup_iters = 5;
