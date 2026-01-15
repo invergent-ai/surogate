@@ -23,6 +23,7 @@ enum class ForwardHookPoint {
     AfterMLPUpProjection,    ///< After MLP up matmul, before SwiGLU
     AfterMLPDownProjection,  ///< After MLP down matmul
     MoEExpertGroupManual,    ///< Manual expert group execution (fused)
+    AfterRouterProjection,   ///< After router logits matmul, before softmax (for router LoRA)
 };
 
 constexpr const char* hook_point_name(ForwardHookPoint point) {
@@ -32,6 +33,7 @@ constexpr const char* hook_point_name(ForwardHookPoint point) {
         case ForwardHookPoint::AfterMLPUpProjection: return "AfterMLPUpProjection";
         case ForwardHookPoint::AfterMLPDownProjection: return "AfterMLPDownProjection";
         case ForwardHookPoint::MoEExpertGroupManual: return "MoEExpertGroupManual";
+        case ForwardHookPoint::AfterRouterProjection: return "AfterRouterProjection";
         default: return "Unknown";
     }
 }

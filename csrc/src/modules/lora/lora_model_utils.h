@@ -85,6 +85,191 @@ inline void apply_lora_contribution(
 }
 
 /**
+ * @brief Apply LoRA contribution to FP32 output (e.g., router logits)
+ *
+ * Similar to apply_lora_contribution but the output is always FP32.
+ * This is used for router LoRA where logits are computed in FP32 for numerical stability.
+ * The LoRA computation is done in the work dtype (BF16) and then we use FP32 matmul
+ * accumulation since router outputs are small (BT x num_experts, typically <128 experts).
+ */
+inline void apply_lora_contribution_fp32(
+    Tensor& output,
+    int output_offset,
+    const Tensor& input,
+    const LoRALayerWeights<Tensor>& lora,
+    Tensor& intermediate,
+    Tensor& slice_buffer,
+    float scaling,
+    int BT,
+    int in_features,
+    int out_features,
+    int rank,
+    cublasLtHandle_t handle,
+    Tensor& workspace,
+    cudaStream_t stream) {
+
+    if (!lora.has_value()) return;
+    if (out_features <= 0 || BT <= 0) return;
+
+    // intermediate = input @ A^T  (BT x rank)
+    // Compute in work dtype (typically BF16)
+    matmul(intermediate, lora.A, input, std::nullopt, nullptr, nullptr,
+           handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+    // Scale intermediate so the final B projection includes the LoRA scaling
+    if (scaling != 1.0f) {
+        vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
+    }
+
+    // For router logits (small number of outputs), we compute the delta in BF16,
+    // convert to FP32, then accumulate. This is cleaner than mixed-precision matmul.
+    // Use slice_buffer as temporary for the BF16 delta
+    Tensor lora_delta = slice_buffer;
+    lora_delta.DType = lora.B.DType;  // Work dtype (typically BF16)
+    lora_delta.Rank = 2;
+    lora_delta.Sizes[0] = BT;
+    lora_delta.Sizes[1] = out_features;
+    for (int i = 2; i < MAX_TENSOR_DIM; ++i) lora_delta.Sizes[i] = 1;
+
+    matmul(lora_delta, lora.B, intermediate, std::nullopt, nullptr, nullptr,
+           handle, workspace, out_features, BT, rank, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+    const long total_out_features = output.Sizes[output.Rank - 1];
+    if (output_offset < 0 || output_offset + out_features > total_out_features) {
+        throw std::logic_error("apply_lora_contribution_fp32: output_offset out of bounds");
+    }
+
+    // Simple case: full output (no offset) - use fused BF16->FP32 accumulate
+    // We convert the BF16 delta to FP32 in-place using the output buffer end as temp,
+    // then add to output. For small router outputs, this overhead is minimal.
+    if (output_offset == 0 && out_features == total_out_features) {
+        // Accumulate BF16 delta into FP32 output element-wise
+        // output[i] += bf16_to_float(lora_delta[i])
+        fused_bf16_accum_to_fp32(output.get<float>(), lora_delta.get<nv_bfloat16>(),
+                                  BT * out_features, stream);
+        return;
+    }
+
+    // With offset: accumulate strided
+    float* output_ptr = output.get<float>() + output_offset;
+    fused_bf16_accum_to_fp32_strided(output_ptr, lora_delta.get<nv_bfloat16>(),
+                                      BT, out_features, (int)total_out_features, stream);
+}
+
+/**
+ * @brief Backward pass for router LoRA (weight gradients only, no input gradient)
+ *
+ * Computes gradients for router LoRA weights without propagating gradients to input.
+ * This is used for router LoRA where the input gradient is computed separately by the
+ * base model (d_ln2 is computed in the MoE backward pass independently).
+ *
+ * The forward pass computes: logits += scaling * (input @ A^T @ B^T)
+ * The backward computes:
+ *   intermediate = input @ A^T  (BT x rank)
+ *   dB = intermediate^T @ d_logits   (rank x E)
+ *   dA = (B @ d_logits^T)^T @ input  (rank x C) -> transposed storage: (C x rank)?
+ *
+ * Note: d_logits is in FP32, input is in BF16, LoRA weights are in BF16.
+ * We use dtype conversion for mixed-precision matmuls.
+ *
+ * @param dA Gradient w.r.t lora_A (rank, in_features)
+ * @param dB Gradient w.r.t lora_B (out_features, rank)
+ * @param d_logits Gradient w.r.t output logits (BT, out_features) - FP32
+ * @param input Input to router (BT, in_features) - BF16
+ * @param A lora_A weights (rank, in_features) - BF16
+ * @param B lora_B weights (out_features, rank) - BF16
+ * @param scaling LoRA scaling factor
+ * @param intermediate Scratch buffer (BT, rank)
+ * @param intermediate2 Scratch buffer (BT, out_features) for FP32->BF16 conversion
+ * @param slice_buffer Additional scratch buffer
+ * @param BT Batch * sequence length
+ * @param in_features Hidden size (C)
+ * @param out_features Number of experts (E)
+ * @param rank LoRA rank
+ * @param accumulate Whether to accumulate gradients
+ * @param handle cuBLAS handle
+ * @param workspace cuBLAS workspace
+ * @param stream CUDA stream
+ */
+inline void backward_lora_router(
+    Tensor& dA,
+    Tensor& dB,
+    const Tensor& d_logits,   // FP32
+    const Tensor& input,      // BF16
+    const Tensor& A,
+    const Tensor& B,
+    float scaling,
+    Tensor& intermediate,
+    Tensor& intermediate2,
+    Tensor& slice_buffer,
+    int BT,
+    int in_features,
+    int out_features,
+    int rank,
+    bool accumulate,
+    cublasLtHandle_t handle,
+    Tensor& workspace,
+    cudaStream_t stream) {
+
+    if (!A.Data || !B.Data) return;
+    if (BT <= 0 || out_features <= 0) return;
+
+    // Convert d_logits from FP32 to BF16 for matmul (router outputs are small, so this is OK)
+    // Use slice_buffer as temp for the BF16 version of d_logits
+    Tensor d_logits_bf16 = slice_buffer;
+    d_logits_bf16.DType = ETensorDType::BF16;
+    d_logits_bf16.Rank = 2;
+    d_logits_bf16.Sizes[0] = BT;
+    d_logits_bf16.Sizes[1] = out_features;
+    for (int i = 2; i < MAX_TENSOR_DIM; ++i) d_logits_bf16.Sizes[i] = 1;
+
+    convert_dtype(d_logits_bf16.get<nv_bfloat16>(), d_logits.get<float>(),
+                  BT * out_features, stream);
+
+    // intermediate = input @ A^T  (BT x rank)
+    matmul(intermediate, A, input, std::nullopt, nullptr, nullptr,
+           handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+    // Apply scaling to intermediate
+    if (scaling != 1.0f) {
+        vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
+    }
+
+    // dB = intermediate^T @ d_logits_bf16  => (rank, E)
+    // In column-major: dB^T(E, rank) = d_logits_bf16^T(E, BT) @ intermediate(BT, rank)
+    matmul(dB, intermediate, d_logits_bf16, std::nullopt, nullptr, nullptr,
+           handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+
+    // For dA, we need: dA = (B @ d_logits^T)^T @ input
+    // First: temp = d_logits_bf16 @ B^T  => (BT x rank)
+    // Then: dA = temp^T @ input  => (rank x C)
+    Tensor temp = intermediate2;
+    if (temp.nelem() < (long)(BT * rank)) {
+        // Use a portion of workspace or reuse intermediate (they're the same size)
+        temp = intermediate;  // Recompute intermediate after using it
+    }
+    temp.DType = intermediate.DType;
+    temp.Rank = 2;
+    temp.Sizes[0] = BT;
+    temp.Sizes[1] = rank;
+
+    // temp = d_logits_bf16 @ B^T  => (BT, rank)
+    // In column-major: temp^T(rank, BT) = B(rank, E) @ d_logits_bf16^T(E, BT)
+    matmul(temp, B, d_logits_bf16, std::nullopt, nullptr, nullptr,
+           handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+    // Apply scaling
+    if (scaling != 1.0f) {
+        vector_add_sr(temp, temp, temp, 0.5f * scaling, temp.nelem(), /*seed=*/0, stream);
+    }
+
+    // dA = temp^T @ input  => (rank, C)
+    // In column-major: dA^T(C, rank) = input^T(C, BT) @ temp(BT, rank)
+    matmul(dA, input, temp, std::nullopt, nullptr, nullptr,
+           handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+}
+
+/**
  * @brief Apply LoRA contributions for a single MoE expert
  *
  * This function applies LoRA to an expert's gate_up and down projections.

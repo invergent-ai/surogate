@@ -495,6 +495,16 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     main_stream
                 );
 
+                // Hook point for router LoRA: add LoRA delta to logits before softmax
+                if (hook) {
+                    MoERouterContext router_ctx;
+                    router_ctx.logits = &router_logits;
+                    router_ctx.input = &flat_ln2;
+                    router_ctx.num_experts = num_experts;
+                    router_ctx.hidden_size = (int)C;
+                    hook(l, main_stream, ForwardHookPoint::AfterRouterProjection, &router_ctx);
+                }
+
                 // Step 2: Softmax over experts
                 moe_softmax_forward(
                     router_probs.get<float>(),

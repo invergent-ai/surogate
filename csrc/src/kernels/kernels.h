@@ -413,6 +413,15 @@ void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size, c
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size, cudaStream_t stream);
 
+// Fused BF16->FP32 accumulation for router LoRA
+// Accumulates BF16 values into FP32 output: out[i] += (float)src[i]
+void fused_bf16_accum_to_fp32(float* out, const nv_bfloat16* src, std::size_t count, cudaStream_t stream);
+
+// Strided version for non-contiguous accumulation
+// out[row * out_stride + col] += (float)src[row * src_cols + col]
+void fused_bf16_accum_to_fp32_strided(float* out, const nv_bfloat16* src,
+                                       int rows, int src_cols, int out_stride, cudaStream_t stream);
+
 // Per-block quantization (QLoRA-style)
 // Quantizes BF16 weights to FP8 E4M3 with per-block scales for memory-efficient QLoRA training.
 // Each (block_size x block_size) tile gets its own scale factor.

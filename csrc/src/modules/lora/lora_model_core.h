@@ -28,6 +28,9 @@
 
 namespace modules {
 
+// Forward declarations
+struct MoERouterBackwardContext;
+
 template<typename Block>
 class ModularLoRAModel final : public IModel {
 public:
@@ -129,6 +132,7 @@ private:
     void backward_lora_attn_out(int layer_idx, int B, int T, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream);
     void backward_lora_mlp_up(int layer_idx, int B, int T, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream);
     void backward_lora_mlp_down(int layer_idx, int B, int T, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream);
+    void backward_lora_router(int layer_idx, MoERouterBackwardContext* ctx, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream);
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
 
     // Optimizer helpers
@@ -136,9 +140,6 @@ private:
     void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void initialize_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);
     void update_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
-
-    // Router training helpers
-    void copy_routers_from_base(NCCLCommunicator& comm);
 };
 
 } // namespace modules

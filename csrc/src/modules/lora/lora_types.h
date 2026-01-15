@@ -146,7 +146,7 @@ struct LoRABlockWeights {
     LoRAAttentionWeights<TTensor> attention;
     LoRAMLPWeights<TTensor> mlp;       ///< For dense models
     LoRAMoEWeights<TTensor> moe;       ///< For MoE models (per-expert LoRA)
-    std::optional<TTensor> router_gate; ///< Router gate weight for MoE (when train_router enabled)
+    std::optional<LoRALayerWeights<TTensor>> router;  ///< Router gate LoRA for MoE (when train_router enabled) - PEFT-compatible
 };
 
 /**

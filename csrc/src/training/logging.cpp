@@ -309,7 +309,7 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
  * @param moe_load_imbalance MoE load imbalance ratio.
  */
 void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int duration_ms, float norm, float loss, float lr,
-                                  float moe_aux_loss, float moe_z_loss, float moe_load_imbalance)
+                                  float moe_aux_loss, float moe_z_loss, float moe_load_imbalance, float moe_expert_utilization)
 {
     if(mRank != 0) return;
     mTotalTrainingLoss += loss;
@@ -381,8 +381,8 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
                step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, moe_str.c_str(), sol_str.c_str(), eta_str.c_str());
         fflush(stdout);
     }
-    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {:.6f}, "moe_z_loss": {:.6f}, "moe_load_imbalance": {:.4f}}})",
-        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms, norm, loss, lr, moe_aux_loss, moe_z_loss, moe_load_imbalance));
+    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {:.6f}, "moe_z_loss": {:.6f}, "moe_load_imbalance": {:.4f}, "moe_expert_utilization": {:.4f}}})",
+        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms, norm, loss, lr, moe_aux_loss, moe_z_loss, moe_load_imbalance, moe_expert_utilization));
 }
 
 /**

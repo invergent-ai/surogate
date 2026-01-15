@@ -256,3 +256,76 @@ void vector_reduce_sr(float* dest, const float* src, float scale, int n_shards, 
 void vector_reduce_sr(nv_bfloat16* dest, const nv_bfloat16* src, float scale, int n_shards, int skip, long nelem, bool accumulate, unsigned seed, cudaStream_t stream) {
     vector_reduce_sr_imp(dest, src, scale, n_shards, skip, nelem, accumulate, seed, stream);
 }
+
+// ============================================================================
+// Fused BF16 -> FP32 accumulation kernels for router LoRA
+// ============================================================================
+
+/**
+ * @brief CUDA kernel for fused BF16->FP32 accumulation.
+ *
+ * Accumulates BF16 values into FP32 output: out[i] += (float)src[i]
+ */
+__global__ void fused_bf16_accum_to_fp32_kernel(float* out, const nv_bfloat16* src, std::size_t count) {
+    std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        out[idx] += __bfloat162float(src[idx]);
+    }
+}
+
+/**
+ * @brief CUDA kernel for fused BF16->FP32 strided accumulation.
+ *
+ * Accumulates BF16 values into strided FP32 output:
+ * out[row * out_stride + col] += (float)src[row * src_cols + col]
+ */
+__global__ void fused_bf16_accum_to_fp32_strided_kernel(
+    float* out, const nv_bfloat16* src,
+    int rows, int src_cols, int out_stride) {
+    int row = blockIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows && col < src_cols) {
+        out[row * out_stride + col] += __bfloat162float(src[row * src_cols + col]);
+    }
+}
+
+/**
+ * @brief Fused BF16->FP32 accumulation for router LoRA.
+ *
+ * Accumulates BF16 values into FP32 output: out[i] += (float)src[i]
+ *
+ * @param[in,out] out FP32 output array
+ * @param[in] src BF16 source array
+ * @param[in] count Number of elements
+ * @param[in] stream CUDA stream
+ */
+void fused_bf16_accum_to_fp32(float* out, const nv_bfloat16* src, std::size_t count, cudaStream_t stream) {
+    if (count == 0) return;
+    constexpr int block_size = 256;
+    int grid_size = (count + block_size - 1) / block_size;
+    fused_bf16_accum_to_fp32_kernel<<<grid_size, block_size, 0, stream>>>(out, src, count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Fused BF16->FP32 strided accumulation for router LoRA.
+ *
+ * Accumulates BF16 values into strided FP32 output:
+ * out[row * out_stride + col] += (float)src[row * src_cols + col]
+ *
+ * @param[in,out] out FP32 output array (strided)
+ * @param[in] src BF16 source array (packed)
+ * @param[in] rows Number of rows
+ * @param[in] src_cols Number of columns in source (output columns too)
+ * @param[in] out_stride Stride of output rows
+ * @param[in] stream CUDA stream
+ */
+void fused_bf16_accum_to_fp32_strided(float* out, const nv_bfloat16* src,
+                                       int rows, int src_cols, int out_stride, cudaStream_t stream) {
+    if (rows == 0 || src_cols == 0) return;
+    constexpr int block_size = 256;
+    int grid_x = (src_cols + block_size - 1) / block_size;
+    dim3 grid(grid_x, rows);
+    fused_bf16_accum_to_fp32_strided_kernel<<<grid, block_size, 0, stream>>>(out, src, rows, src_cols, out_stride);
+    CUDA_CHECK(cudaGetLastError());
+}

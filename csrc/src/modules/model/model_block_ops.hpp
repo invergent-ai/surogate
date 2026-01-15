@@ -1359,6 +1359,17 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
                 }
             }
 
+            // Hook for router LoRA backward: compute gradients for router lora_A and lora_B
+            if (hook) {
+                MoERouterBackwardContext router_bwd_ctx;
+                router_bwd_ctx.d_logits = &d_logits;  // FP32
+                router_bwd_ctx.input = &flat_ln2;     // BF16
+                router_bwd_ctx.num_experts = num_experts;
+                router_bwd_ctx.hidden_size = (int)C;
+                router_bwd_ctx.BT = BT;
+                (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterRouterBackward, &router_bwd_ctx);
+            }
+
             rs.temp_free(d_logits_bf16);
             rs.temp_free(d_logits);
             rs.temp_free(d_probs);

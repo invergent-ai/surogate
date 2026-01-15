@@ -104,15 +104,6 @@ public:
     [[nodiscard]] bool train_router() const { return mConfig.train_router; }
 
     /**
-     * @brief Copy router weights from base model (for train_router mode)
-     *
-     * @param layer_idx Layer index
-     * @param router_weight Source router weight from base model
-     * @param stream CUDA stream
-     */
-    void copy_router_from_base(int layer_idx, const Tensor& router_weight, cudaStream_t stream);
-
-    /**
      * @brief Get number of trainable parameters
      */
     [[nodiscard]] std::size_t num_parameters() const;

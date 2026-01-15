@@ -29,7 +29,7 @@ inline ITensorContainer& empty_tensor_container() {
 
 inline std::vector<std::string> targets_to_peft_names(const ModularLoRAConfig& cfg) {
     std::vector<std::string> out;
-    out.reserve(8);
+    out.reserve(10);
     if (cfg.applies_to_q()) out.emplace_back("q_proj");
     if (cfg.applies_to_k()) out.emplace_back("k_proj");
     if (cfg.applies_to_v()) out.emplace_back("v_proj");
@@ -37,6 +37,8 @@ inline std::vector<std::string> targets_to_peft_names(const ModularLoRAConfig& c
     if (cfg.applies_to_gate()) out.emplace_back("gate_proj");
     if (cfg.applies_to_up()) out.emplace_back("up_proj");
     if (cfg.applies_to_down()) out.emplace_back("down_proj");
+    // MoE router gate (when train_router is enabled)
+    if (cfg.train_router) out.emplace_back("mlp.gate");
     return out;
 }
 

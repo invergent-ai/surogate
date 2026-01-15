@@ -107,6 +107,13 @@ void ModularLoRAGradsManager::allocate_gradients() {
                     shard.moe.grouped.down = alloc_grouped_shard(D_moe, C, exp_prefix + "_down_shard");
                 }
             }
+
+            // Router LoRA gradients (when train_router is enabled)
+            // Router shape: (hidden_size -> num_experts), so lora_A: (r, C), lora_B: (E, r)
+            if (mConfig.train_router) {
+                full.router = alloc_full(C, E, prefix + "_router");
+                shard.router = alloc_shard(C, E, prefix + "_router_shard");
+            }
         } else {
             // Dense MLP LoRA gradients
             if (mConfig.lora_config.applies_to_gate()) {
@@ -158,6 +165,9 @@ void ModularLoRAGradsManager::start_micro_step(cudaStream_t stream, int micro_st
                     zero_layer(expert.down);
                 }
             }
+
+            // Router LoRA gradients
+            zero_layer(block.router);
         }
     }
 }
@@ -225,6 +235,9 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
                 all_reduce_layer(expert.down);
             }
         }
+
+        // Router LoRA gradients
+        all_reduce_layer(block.router);
     }
 }
 

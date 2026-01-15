@@ -180,6 +180,20 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
+            case ForwardHookPoint::AfterRouterProjection: {
+                // Apply router LoRA: logits += scaling * (input @ A^T @ B^T)
+                if (lora_block.router.has_value() && lora_block.router->has_value() && context) {
+                    auto* router_ctx = static_cast<MoERouterContext*>(context);
+                    const int E = router_ctx->num_experts;
+                    // Router logits are in FP32 for numerical stability, but we compute LoRA in work dtype
+                    // and add to the FP32 logits
+                    detail::apply_lora_contribution_fp32(
+                        *router_ctx->logits, 0, *router_ctx->input, *lora_block.router,
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        scaling, B * T, C, E, rank,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
         }
     };
 

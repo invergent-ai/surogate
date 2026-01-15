@@ -1122,10 +1122,11 @@ NB_MODULE(_surogate, m) {
              "- norm: Gradient norm.\n"
              "- loss: Training loss.\n"
              "- lr: Learning rate.")
-        .def("log_step_moe", nb::overload_cast<int, float, int, int, float, float, float, float, float, float>(&TrainingRunLogger::log_step),
+        .def("log_step_moe", nb::overload_cast<int, float, int, int, float, float, float, float, float, float, float>(&TrainingRunLogger::log_step),
              nb::arg("step"), nb::arg("epoch"), nb::arg("step_tokens"), nb::arg("duration_ms"),
              nb::arg("norm"), nb::arg("loss"), nb::arg("lr"),
              nb::arg("moe_aux_loss"), nb::arg("moe_z_loss"), nb::arg("moe_load_imbalance"),
+             nb::arg("moe_expert_utilization"),
              "Log a training step with MoE metrics inline.\n\n"
              "Parameters:\n"
              "- step: Global step index.\n"
@@ -1137,7 +1138,8 @@ NB_MODULE(_surogate, m) {
              "- lr: Learning rate.\n"
              "- moe_aux_loss: MoE auxiliary load balancing loss.\n"
              "- moe_z_loss: MoE router z-loss.\n"
-             "- moe_load_imbalance: MoE load imbalance ratio.")
+             "- moe_load_imbalance: MoE load imbalance ratio.\n"
+             "- moe_expert_utilization: Fraction of experts receiving tokens.")
         .def("log_eval", &TrainingRunLogger::log_eval,
              nb::arg("step"), nb::arg("epoch"), nb::arg("eval_tokens"), nb::arg("duration_ms"), nb::arg("loss"),
              "Log an evaluation step.\n\n"

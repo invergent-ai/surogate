@@ -138,9 +138,9 @@ template<typename Block>
 void ModularLoRAModel<Block>::init_weights(NCCLCommunicator& comm) {
     mBaseModel->init_weights(comm);
     if (lora_enabled()) {
+        // LoRA weights are randomly initialized (A with kaiming uniform, B with zeros)
+        // Router LoRA is also initialized this way for PEFT compatibility
         mLoRAWeights->random_init(42, comm);
-        // Copy router weights from base model when train_router is enabled
-        copy_routers_from_base(comm);
     }
 }
 
@@ -223,29 +223,6 @@ Tensor ModularLoRAModel<Block>::recompute_rmsnorm(const Tensor& residual, const 
     return mLoRARunState->recompute_ln;
 }
 
-template<typename Block>
-void ModularLoRAModel<Block>::copy_routers_from_base(NCCLCommunicator& comm) {
-    if (!mLoRAWeights->train_router() || !mIsMoEModel) return;
-
-    auto& rs = mBaseModel->run_state();
-    cudaStream_t stream = rs.MainStream;
-
-    const int L = (int)mBaseModel->config().NumLayers;
-    for (int l = 0; l < L; ++l) {
-        // Get base model weights for this layer
-        auto& base_w = mBaseModel->weights_manager().get_block(l, stream);
-
-        // Copy router from base to LoRA storage (for MoE blocks that have router)
-        if constexpr (requires { base_w.router.gate; }) {
-            if (base_w.router.gate.Data) {
-                mLoRAWeights->copy_router_from_base(l, base_w.router.gate, stream);
-            }
-        }
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    comm.barrier();
-}
 
 } // namespace modules
 

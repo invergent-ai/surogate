@@ -152,6 +152,40 @@ inline void SelectiveExpertInfo::build_from_router_output(
     enabled = true;
 }
 
+/**
+ * @brief Context for router LoRA forward hook
+ *
+ * This struct is passed to the AfterRouterProjection hook to allow
+ * LoRA to add its contribution to the router logits before softmax.
+ */
+struct MoERouterContext {
+    Tensor* logits;           ///< (B*T, num_experts) router logits to modify in-place
+    const Tensor* input;      ///< (B*T, hidden_size) input to router (ln2 output)
+    int num_experts;
+    int hidden_size;
+    bool handled = false;     ///< Set to true if hook handled the computation
+};
+
+/**
+ * @brief Context for router LoRA backward hook
+ *
+ * This struct is passed to the AfterRouterBackward hook to allow
+ * LoRA to compute gradients for the router's lora_A and lora_B matrices.
+ *
+ * The router LoRA forward computes: logits += scaling * (input @ A^T @ B^T)
+ * The backward computes:
+ *   d_lora_B = d_logits^T @ intermediate   where intermediate = input @ A^T
+ *   d_lora_A = B^T @ d_logits^T @ input
+ */
+struct MoERouterBackwardContext {
+    const Tensor* d_logits;   ///< (B*T, num_experts) FP32 gradient w.r.t router logits
+    const Tensor* input;      ///< (B*T, hidden_size) input to router (ln2 output, BF16)
+    int num_experts;
+    int hidden_size;
+    int BT;                   ///< Batch * Sequence length (total tokens)
+    bool handled = false;     ///< Set to true if hook handled the computation
+};
+
 } // namespace modules
 
 #endif // SUROGATE_SRC_MODULES_MOE_MOE_TYPES_H

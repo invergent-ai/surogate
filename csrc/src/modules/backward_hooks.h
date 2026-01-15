@@ -32,6 +32,9 @@ enum class BackwardHookPoint {
     AfterMLPUpBackward,     ///< After MLP up projection backward
     MoEExpertGroupManual,    ///< Manual expert group backward (fused)
 
+    // MoE router
+    AfterRouterBackward,    ///< After router backward (for router LoRA gradients)
+
     // Layer-level
     BeforeLayerBackward,    ///< Before any backward computation for this layer
     AfterLayerBackward,     ///< After all backward computation for this layer
@@ -51,6 +54,7 @@ constexpr const char* hook_point_name(BackwardHookPoint point) {
         case BackwardHookPoint::BeforeMLPUpBackward: return "BeforeMLPUpBackward";
         case BackwardHookPoint::AfterMLPUpBackward: return "AfterMLPUpBackward";
         case BackwardHookPoint::MoEExpertGroupManual: return "MoEExpertGroupManual";
+        case BackwardHookPoint::AfterRouterBackward: return "AfterRouterBackward";
         case BackwardHookPoint::BeforeLayerBackward: return "BeforeLayerBackward";
         case BackwardHookPoint::AfterLayerBackward: return "AfterLayerBackward";
         default: return "Unknown";

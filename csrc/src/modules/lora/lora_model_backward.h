@@ -233,6 +233,13 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
             case BackwardHookPoint::AfterMLPUpBackward:
                 backward_lora_mlp_up(layer_idx, B, T, accumulate, comm, stream);
                 break;
+            case BackwardHookPoint::AfterRouterBackward: {
+                // Router LoRA backward: compute gradients for router lora_A and lora_B
+                if (lora_block.router.has_value() && lora_block.router->has_value() && context) {
+                    auto* router_ctx = static_cast<MoERouterBackwardContext*>(context);
+                    backward_lora_router(layer_idx, router_ctx, accumulate, comm, stream);
+                }
+            } break;
             case BackwardHookPoint::AfterAttnOutBackward:
                 backward_lora_attn_out(layer_idx, B, T, accumulate, comm, stream);
                 break;
@@ -452,6 +459,42 @@ void ModularLoRAModel<Block>::backward_lora_mlp_down(int layer_idx, int B, int T
                                mLoRARunState->intermediate, mLoRARunState->slice,
                                B * T, D, C, rank, lora_accum,
                                rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+}
+
+template<typename Block>
+void ModularLoRAModel<Block>::backward_lora_router(int layer_idx, MoERouterBackwardContext* ctx, bool accumulate, NCCLCommunicator& comm, cudaStream_t stream) {
+    const auto& cfg = mBaseModel->config();
+    const int C = (int)cfg.HiddenSize;
+    const int E = ctx->num_experts;
+    const int BT = ctx->BT;
+    const int rank = mLoRAConfig.rank;
+
+    auto& rs = mBaseModel->run_state();
+
+    auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+    if (!lora_block.router.has_value() || !lora_block.router->has_value()) return;
+
+    bool lora_accum = false;
+    auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+    lora_accum = lora_accum || accumulate;
+    if (!lora_grads.router.has_value()) return;
+
+    // d_logits is FP32, input (flat_ln2) is BF16
+    // Router: logits += scaling * (input @ A^T @ B^T)
+    // We compute gradients for A and B (no gradient propagation to input needed)
+    detail::backward_lora_router(
+        lora_grads.router->A,
+        lora_grads.router->B,
+        *ctx->d_logits,
+        *ctx->input,
+        lora_block.router->A,
+        lora_block.router->B,
+        mLoRAConfig.scaling(),
+        mLoRARunState->intermediate,
+        mLoRARunState->intermediate2,
+        mLoRARunState->slice,
+        BT, C, E, rank, lora_accum,
+        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
 }
 
 } // namespace modules
