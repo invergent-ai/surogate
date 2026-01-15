@@ -59,6 +59,8 @@ module.exports = {
         'guides/optimizers',
         'guides/precision-and-recipes',
         'guides/qlora',
+        'guides/metrics',
+        'guides/moe',
         'guides/multi-gpu',
         'guides/multi-node',
         'guides/offloading',

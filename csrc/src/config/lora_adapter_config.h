@@ -22,6 +22,7 @@ struct LoRAAdapterConfig {
     bool InitAKaimingUniform = true;
     bool UseRSLoRA = false;
     std::string FanInFanOut = "fan_in";
+    bool TrainRouter = false;  ///< Train MoE router gate during LoRA fine-tuning
 
     [[nodiscard]] float scaling() const {
         if (UseRSLoRA) {

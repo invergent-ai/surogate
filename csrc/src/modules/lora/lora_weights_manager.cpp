@@ -97,6 +97,19 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         if (has_mlp_lora) {
             allocate_grouped_moe_weights(master.moe.grouped, work.moe.grouped, layer_idx);
         }
+
+        // Allocate router gate storage when train_router is enabled
+        if (mConfig.train_router) {
+            const int E = mConfig.num_experts;
+            const ETensorDType master_dtype = mConfig.lora_config.dtype;
+            const ETensorDType work_dtype = mConfig.work_dtype;
+            const std::string router_name = fmt::format("lora_layer_{}_router_gate", layer_idx);
+
+            master.router_gate.emplace(TensorShard(
+                mAllocator->allocate(master_dtype, router_name.c_str(), EAllocationType::ON_DEVICE, {E, C})));
+            work.router_gate.emplace(
+                mAllocator->allocate(work_dtype, (router_name + "_work").c_str(), EAllocationType::ON_DEVICE, {E, C}));
+        }
     } else {
         // Dense model: standard MLP LoRA
         if (mConfig.lora_config.applies_to_gate()) {
@@ -330,6 +343,11 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
         }
     }
 
+    // Sync router gate (when train_router is enabled)
+    if (master.router_gate.has_value() && work.router_gate.has_value()) {
+        sync_tensor(*work.router_gate, *master.router_gate, "router_gate");
+    }
+
     return work;
 }
 
@@ -368,6 +386,11 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
         if (mConfig.lora_config.applies_to_up()) per_expert += r * C + D_moe * r;
         if (mConfig.lora_config.applies_to_down()) per_expert += r * D_moe + C * r;
         per_layer += per_expert * E;
+
+        // Router gate parameters (when train_router is enabled)
+        if (mConfig.train_router) {
+            per_layer += E * C;  // router gate shape: [num_experts, hidden_size]
+        }
     } else {
         // Dense MLP LoRA
         if (mConfig.lora_config.applies_to_gate()) per_layer += r * C + D * r;
@@ -467,6 +490,51 @@ void ModularLoRAWeightsManager::iterate_tensors(
                     callback(expert_prefix + ".down_proj.lora_A.weight", expert.down->A);
                     callback(expert_prefix + ".down_proj.lora_B.weight", expert.down->B);
                 }
+            }
+        }
+
+        // Export router gate for per-expert layout (if train_router is enabled)
+        if (block.router_gate.has_value()) {
+            callback(prefix + ".mlp.gate.weight", *block.router_gate);
+        }
+    }
+}
+
+void ModularLoRAWeightsManager::copy_router_from_base(int layer_idx, const Tensor& router_weight, cudaStream_t stream) {
+    if (!mConfig.train_router || layer_idx >= (int)mMaster.blocks.size()) return;
+
+    auto& master = mMaster.blocks[layer_idx];
+    auto& work = mWork.blocks[layer_idx];
+
+    if (!master.router_gate.has_value()) return;
+
+    // Copy from base model router to our master storage
+    CUDA_CHECK(cudaMemcpyAsync(
+        master.router_gate->Data,
+        router_weight.Data,
+        router_weight.bytes(),
+        cudaMemcpyDeviceToDevice,
+        stream));
+
+    // Also copy to work buffer
+    if (work.router_gate.has_value()) {
+        if (work.router_gate->DType == master.router_gate->DType) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                work.router_gate->Data,
+                master.router_gate->Data,
+                master.router_gate->bytes(),
+                cudaMemcpyDeviceToDevice,
+                stream));
+        } else {
+            // Handle dtype conversion if needed
+            if (work.router_gate->DType == ETensorDType::BF16 && master.router_gate->DType == ETensorDType::FP32) {
+                convert_dtype(work.router_gate->get<nv_bfloat16>(),
+                             master.router_gate->get<float>(),
+                             work.router_gate->nelem(), stream);
+            } else if (work.router_gate->DType == ETensorDType::FP32 && master.router_gate->DType == ETensorDType::BF16) {
+                convert_dtype(work.router_gate->get<float>(),
+                             master.router_gate->get<nv_bfloat16>(),
+                             work.router_gate->nelem(), stream);
             }
         }
     }

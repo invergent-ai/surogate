@@ -285,6 +285,29 @@ public:
     /// @brief Get FP8 scaling state for delayed scaling (nullptr if not available)
     [[nodiscard]] virtual modules::FP8ScalingState* get_fp8_scaling_state() { return nullptr; }
 
+    // =========================================================================
+    // MoE Metrics (for monitoring MoE training)
+    // =========================================================================
+
+    /// @brief MoE training statistics (accumulated across layers per step)
+    struct MoEStats {
+        float aux_loss = 0.0f;           ///< Load balancing auxiliary loss (summed across layers)
+        float z_loss = 0.0f;             ///< Router z-loss (summed across layers)
+        float expert_utilization = 0.0f; ///< Fraction of experts that received tokens (0-1)
+        float load_imbalance = 0.0f;     ///< max(token_counts) / mean(token_counts)
+        int num_layers = 0;              ///< Number of MoE layers in model
+        bool valid = false;              ///< True if stats were computed this step
+    };
+
+    /// @brief Get MoE stats from the last forward pass (only valid for MoE models)
+    [[nodiscard]] virtual MoEStats get_moe_stats() const { return {}; }
+
+    /// @brief Reset MoE stats for next step
+    virtual void reset_moe_stats() {}
+
+    /// @brief Check if this is an MoE model
+    [[nodiscard]] virtual bool is_moe_model() const { return false; }
+
 private:
     // ring-buffers that keep a history of past losses
     struct OutlierDetector {

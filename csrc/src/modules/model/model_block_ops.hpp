@@ -1338,7 +1338,9 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
             );
 
             // d_router_gate (weight grad): dW = d_logits^T @ ln2  (E, C)
-            if (!lora_only) {
+            // In lora_only mode, skip base weight gradients - but if train_router is enabled,
+            // we still need to compute the router gradient even in lora_only mode.
+            if (!lora_only || rs.is_train_router()) {
                 if constexpr (requires { grads.router.d_gate; }) {
                     if (grads.router.d_gate.Data && grads.router.d_gate.nelem() > 0) {
                         matmul(

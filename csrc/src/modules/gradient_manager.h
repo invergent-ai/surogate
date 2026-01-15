@@ -59,6 +59,10 @@ public:
         // The gradients are computed but immediately discarded (not accumulated or reduced)
         bool skip_allocation = false;
 
+        // Train MoE router gate during LoRA fine-tuning
+        // When enabled, router gradient is allocated and reduced even in skip_allocation mode
+        bool train_router = false;
+
         // Non-block config
         int vocab_size;
         int hidden_size;
@@ -1083,10 +1087,13 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
     }
 
     // MoE-specific gradients can be extremely large; avoid allocating them in LoRA-only mode where base weights are frozen.
-    if (!mConfig.skip_allocation) {
+    // Exception: router gradient is allocated when train_router is enabled (for LoRA + router training mode).
+    if (!mConfig.skip_allocation || mConfig.train_router) {
         if constexpr (requires { grads.router.d_gate; }) {
             grads.router.d_gate = mAllocator->allocate(dtype, "d_router_gate_w", kind, {cfg.num_experts, C});
         }
+    }
+    if (!mConfig.skip_allocation) {
         if constexpr (requires { grads.experts.d_gate_up_proj; }) {
             grads.experts.d_gate_up_proj = mAllocator->allocate(dtype, "d_experts_gate_up_w", kind, {cfg.num_experts, 2 * D, C});
         }

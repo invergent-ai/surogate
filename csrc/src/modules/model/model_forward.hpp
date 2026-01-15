@@ -35,6 +35,9 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
             }
             fp8_state.zero_recorded_amaxes(main_stream);
         }
+
+        // Reset MoE stats for new training step
+        rs.reset_moe_stats();
     }
 
     // Copy inputs to device
@@ -514,6 +517,36 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     BT, top_k, num_experts, main_stream
                 );
 
+                // Step 4.5: Compute MoE training stats for monitoring
+                // Allocate device memory for aux_loss and z_loss (will copy to host during sync)
+                float* d_aux_loss = nullptr;
+                float* d_z_loss = nullptr;
+                CUDA_CHECK(cudaMallocAsync(&d_aux_loss, sizeof(float), main_stream));
+                CUDA_CHECK(cudaMallocAsync(&d_z_loss, sizeof(float), main_stream));
+                CUDA_CHECK(cudaMemsetAsync(d_aux_loss, 0, sizeof(float), main_stream));
+                CUDA_CHECK(cudaMemsetAsync(d_z_loss, 0, sizeof(float), main_stream));
+
+                // Compute aux_loss (load balancing loss)
+                // Use runtime override if >= 0, otherwise use model config
+                const float aux_loss_coef = (mOptions.router_aux_loss_coef >= 0.0f)
+                    ? mOptions.router_aux_loss_coef : moe_cfg.router_aux_loss_coef;
+                moe_compute_aux_loss(
+                    d_aux_loss,
+                    router_probs.get<float>(),
+                    expert_indices.get<int>(),
+                    BT, num_experts, top_k, aux_loss_coef, main_stream
+                );
+
+                // Compute z_loss (router logit regularization)
+                // Use runtime override if >= 0, otherwise use model config
+                const float z_loss_coef = (mOptions.router_z_loss_coef >= 0.0f)
+                    ? mOptions.router_z_loss_coef : moe_cfg.router_z_loss_coef;
+                moe_router_z_loss_forward(
+                    d_z_loss,
+                    router_logits.get<float>(),
+                    BT, num_experts, z_loss_coef, main_stream
+                );
+
                 // Step 5: Build gather/scatter indices for token permutation
                 // gather_indices: maps permuted position -> original token index
                 // scatter_indices: maps original token assignment -> permuted position
@@ -539,12 +572,26 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
 
                 // Cache expert offsets on host to avoid repeated D2H sync in grouped GEMM
                 // Single sync here, reused for all GEMM calls (forward + backward)
+                // Also copy MoE stats for monitoring during this sync
                 rs.MoeHostExpertOffsets.resize(num_experts + 1);
+                float h_aux_loss = 0.0f, h_z_loss = 0.0f;
                 CUDA_CHECK(cudaMemcpyAsync(rs.MoeHostExpertOffsets.data(), expert_offsets.get<int>(),
                                            (num_experts + 1) * sizeof(int),
                                            cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaMemcpyAsync(&h_aux_loss, d_aux_loss, sizeof(float),
+                                           cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaMemcpyAsync(&h_z_loss, d_z_loss, sizeof(float),
+                                           cudaMemcpyDeviceToHost, main_stream));
                 CUDA_CHECK(cudaStreamSynchronize(main_stream));
                 rs.MoeHostOffsetsValid = true;
+
+                // Accumulate MoE stats for this layer (uses expert_counts from device)
+                rs.accumulate_moe_stats(h_aux_loss, h_z_loss, num_experts,
+                                        expert_counts.get<int>(), main_stream);
+
+                // Free device memory for stats
+                CUDA_CHECK(cudaFreeAsync(d_aux_loss, main_stream));
+                CUDA_CHECK(cudaFreeAsync(d_z_loss, main_stream));
 
                 // Build gather/scatter indices
                 moe_build_indices(

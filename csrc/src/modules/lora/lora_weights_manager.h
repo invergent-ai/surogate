@@ -45,6 +45,7 @@ public:
         // MoE-specific configuration (only used when is_moe = true)
         int num_experts = 0;              ///< Number of experts per layer
         int moe_intermediate_size = 0;    ///< Per-expert intermediate size (0 = use intermediate_size)
+        bool train_router = false;         ///< Train MoE router gate during LoRA fine-tuning
 
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
@@ -96,6 +97,20 @@ public:
      * @brief Get the LoRA configuration
      */
     [[nodiscard]] const ModularLoRAConfig& lora_config() const { return mConfig.lora_config; }
+
+    /**
+     * @brief Check if router training is enabled
+     */
+    [[nodiscard]] bool train_router() const { return mConfig.train_router; }
+
+    /**
+     * @brief Copy router weights from base model (for train_router mode)
+     *
+     * @param layer_idx Layer index
+     * @param router_weight Source router weight from base model
+     * @param stream CUDA stream
+     */
+    void copy_router_from_base(int layer_idx, const Tensor& router_weight, cudaStream_t stream);
 
     /**
      * @brief Get number of trainable parameters

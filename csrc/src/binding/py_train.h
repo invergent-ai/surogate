@@ -75,6 +75,10 @@ public:
 
     std::vector<GPUUtilInfo> get_gpu_info();
 
+    // MoE stats (returns {aux_loss, z_loss, expert_utilization, load_imbalance, valid})
+    // Returns zeros with valid=false for non-MoE models
+    std::tuple<float, float, float, float, bool> get_moe_stats();
+
     int world_size() const;
     int local_world_size() const { return static_cast<int>(mContexts.size()); }
     int batch_size() const { return B; }

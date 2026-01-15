@@ -476,6 +476,12 @@ class NodeTrainer:
 
         return result['loss'], result['norm']
 
+    def get_moe_stats(self) -> Dict[str, Any]:
+        """Get MoE training statistics from the last forward pass."""
+        if self._trainer is not None:
+            return self._trainer.get_moe_stats()
+        return {'valid': False}
+
     def validate(self, max_steps: int = 100) -> float:
         """Run validation and return mean loss."""
         if not self._eval_loader:
@@ -700,6 +706,10 @@ class RayDistributedTrainer:
                 """Get the number of tokens in the training dataset."""
                 return self.trainer._train_loader.num_tokens
 
+            def get_moe_stats(self) -> Dict[str, Any]:
+                """Get MoE training statistics from the last forward pass."""
+                return self.trainer.get_moe_stats()
+
         # Spawn actors with shared NCCL IDs
         self.node_trainers = [
             NodeTrainerActor.remote(
@@ -826,6 +836,14 @@ class RayDistributedTrainer:
                 f"Step {step}/{max_steps} | Loss: {avg_loss:.4f} | Norm: {avg_norm:.4f} | "
                 f"LR: {lr:.2e} | {step_time:.2f}s | {tokens_per_sec:.0f} tok/s"
             )
+
+            # Log MoE stats for MoE models (get from node 0)
+            moe_stats = ray.get(self.node_trainers[0].get_moe_stats.remote())
+            if moe_stats.get('valid', False):
+                logger.info(
+                    f"  MoE: aux_loss={moe_stats['aux_loss']:.4f} z_loss={moe_stats['z_loss']:.4f} "
+                    f"util={moe_stats['expert_utilization']:.2%} imbalance={moe_stats['load_imbalance']:.2f}"
+                )
 
             # Reset timer for next step
             step_start_time = time.time()

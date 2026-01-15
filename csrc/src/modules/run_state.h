@@ -187,6 +187,7 @@ public:
     }
 
     [[nodiscard]] bool is_lora_only_mode() const { return mConfig.lora_only_mode; }
+    [[nodiscard]] bool is_train_router() const { return mConfig.train_router; }
 
     // ========================================================================
     // IRunState virtual method overrides (for recipe-driven dispatch)
@@ -301,9 +302,59 @@ public:
     [[nodiscard]] int batch_size() const { return mConfig.batch_size; }
     [[nodiscard]] int seq_length() const { return mConfig.seq_length; }
 
+    // ========================================================================
+    // MoE Metrics
+    // ========================================================================
+
+    /// @brief Accumulate MoE stats from a single layer
+    void accumulate_moe_stats(float aux_loss, float z_loss, int num_experts, const int* token_counts, cudaStream_t stream) {
+        mMoEStats.aux_loss += aux_loss;
+        mMoEStats.z_loss += z_loss;
+        mMoEStats.num_layers++;
+        mMoEStats.valid = true;
+
+        // Copy token counts to host and compute utilization/imbalance
+        if (num_experts > 0 && token_counts != nullptr) {
+            std::vector<int> h_counts(num_experts);
+            CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), token_counts, num_experts * sizeof(int),
+                                        cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            int max_count = 0, total_count = 0, used_experts = 0;
+            for (int e = 0; e < num_experts; ++e) {
+                if (h_counts[e] > 0) {
+                    used_experts++;
+                    max_count = std::max(max_count, h_counts[e]);
+                }
+                total_count += h_counts[e];
+            }
+
+            float utilization = static_cast<float>(used_experts) / static_cast<float>(num_experts);
+            float mean_count = static_cast<float>(total_count) / static_cast<float>(num_experts);
+            float imbalance = (mean_count > 0) ? static_cast<float>(max_count) / mean_count : 1.0f;
+
+            // Running average across layers
+            float n = static_cast<float>(mMoEStats.num_layers);
+            mMoEStats.expert_utilization = ((n - 1) * mMoEStats.expert_utilization + utilization) / n;
+            mMoEStats.load_imbalance = ((n - 1) * mMoEStats.load_imbalance + imbalance) / n;
+        }
+    }
+
+    /// @brief Get accumulated MoE stats
+    [[nodiscard]] MoEStats get_moe_stats() const override { return mMoEStats; }
+
+    /// @brief Reset MoE stats for next step
+    void reset_moe_stats() override { mMoEStats = MoEStats{}; }
+
+    /// @brief Check if this is an MoE model
+    [[nodiscard]] bool is_moe_model() const override { return mConfig.is_moe; }
+
 private:
     Config mConfig;
     std::shared_ptr<TensorAllocator> mAllocator;
+
+    // MoE stats (accumulated across layers during forward pass)
+    MoEStats mMoEStats{};
 
     // Per-block storage
     std::vector<BlockActivations> mBlockActivations;

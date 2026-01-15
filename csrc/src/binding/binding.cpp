@@ -432,6 +432,8 @@ NB_MODULE(_surogate, m) {
         .def_rw("init_projections_to_zero", &RuntimeOptions::InitProjectionsToZero, "Initialize certain projections to zero (for experiments).")
         .def_rw("debug_memory_breakdown", &RuntimeOptions::DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation.")
         .def_rw("use_fused_rope", &RuntimeOptions::UseFusedRope, "Use fused RoPE kernel with on-the-fly cos/sin computation.")
+        .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
+        .def_rw("router_z_loss_coef", &RuntimeOptions::RouterZLossCoef, "MoE z-loss coefficient (-1 = use model config).")
         .def_prop_rw("matmul_type", [](const RuntimeOptions* opt){ return opt->matmul_dtype(); },
                      [](RuntimeOptions* opt, const std::string& dtype_str){ opt->MatmulType = opt_dtype_from_str(dtype_str); },
                      "Optional override dtype for matmul kernels (empty/None means default).")
@@ -464,14 +466,15 @@ NB_MODULE(_surogate, m) {
         "Backwards-compatibility: `LoRAConfig` is an alias of this class.")
         .def("__init__", [](LoRAAdapterConfig *t, int rank, float alpha, float dropout,
                            const std::vector<std::string>& target_modules, const std::string& dtype,
-                           bool use_rslora) {
+                           bool use_rslora, bool train_router) {
             new (t) LoRAAdapterConfig{
                 .Rank = rank,
                 .Alpha = alpha,
                 .Dropout = dropout,
                 .TargetModules = std::set<std::string>(target_modules.begin(), target_modules.end()),
                 .DType = dtype.empty() ? ETensorDType::BF16 : dtype_from_str(dtype),
-                .UseRSLoRA = use_rslora
+                .UseRSLoRA = use_rslora,
+                .TrainRouter = train_router
             };
         }, nb::kw_only(),
              nb::arg("rank") = 8,
@@ -480,6 +483,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("target_modules") = std::vector<std::string>{"q_proj", "k_proj", "v_proj", "o_proj"},
              nb::arg("dtype") = "bf16",
              nb::arg("use_rslora") = false,
+             nb::arg("train_router") = false,
              "Create a LoRA configuration.\n\n"
              "Parameters:\n"
              "- rank: LoRA rank.\n"
@@ -487,11 +491,13 @@ NB_MODULE(_surogate, m) {
              "- dropout: LoRA dropout probability.\n"
              "- target_modules: Module name suffixes to apply LoRA to.\n"
              "- dtype: Adapter dtype.\n"
-             "- use_rslora: Enable RS-LoRA scaling variant.")
+             "- use_rslora: Enable RS-LoRA scaling variant.\n"
+             "- train_router: Train MoE router gate during LoRA fine-tuning.")
         .def_rw("rank", &LoRAAdapterConfig::Rank, "LoRA rank.")
         .def_rw("alpha", &LoRAAdapterConfig::Alpha, "LoRA alpha.")
         .def_rw("dropout", &LoRAAdapterConfig::Dropout, "LoRA dropout probability.")
         .def_rw("use_rslora", &LoRAAdapterConfig::UseRSLoRA, "Whether to use RS-LoRA variant.")
+        .def_rw("train_router", &LoRAAdapterConfig::TrainRouter, "Train MoE router gate during LoRA fine-tuning.")
         .def_prop_rw("target_modules",
                      [](const LoRAAdapterConfig* cfg) {
                          return std::vector<std::string>(cfg->TargetModules.begin(), cfg->TargetModules.end());
@@ -513,8 +519,8 @@ NB_MODULE(_surogate, m) {
                 if (!modules.empty()) modules += ", ";
                 modules += "'" + m + "'";
             }
-            return fmt::format("LoRAAdapterConfig(rank={}, alpha={}, dropout={}, target_modules=[{}], dtype='{}', use_rslora={})",
-                              cfg.Rank, cfg.Alpha, cfg.Dropout, modules, dtype_to_str(cfg.DType), cfg.UseRSLoRA);
+            return fmt::format("LoRAAdapterConfig(rank={}, alpha={}, dropout={}, target_modules=[{}], dtype='{}', use_rslora={}, train_router={})",
+                              cfg.Rank, cfg.Alpha, cfg.Dropout, modules, dtype_to_str(cfg.DType), cfg.UseRSLoRA, cfg.TrainRouter);
         }, "Return a debug string representation.")
         ;
 
@@ -888,6 +894,18 @@ NB_MODULE(_surogate, m) {
            "Note: blocking; intended for debugging only.")
         .def("get_gpu_info", &MultiGPUPyTrainer::get_gpu_info,
              "Return current GPU utilization info for all GPUs (implementation-defined structure).")
+        .def("get_moe_stats", [](MultiGPUPyTrainer* trainer) {
+            auto [aux_loss, z_loss, utilization, imbalance, valid] = trainer->get_moe_stats();
+            nb::dict ret;
+            ret["aux_loss"] = aux_loss;
+            ret["z_loss"] = z_loss;
+            ret["expert_utilization"] = utilization;
+            ret["load_imbalance"] = imbalance;
+            ret["valid"] = valid;
+            return ret;
+        }, "Get MoE training statistics from the last forward pass.\n\n"
+           "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, valid}.\n"
+           "For non-MoE models, valid=False and other values are zero.")
         .def_prop_ro("world_size", &MultiGPUPyTrainer::world_size, "Number of participating GPUs.")
         .def_prop_ro("batch_size", &MultiGPUPyTrainer::batch_size, "Per-GPU batch size configured for this trainer.")
         .def_prop_ro("seq_length", &MultiGPUPyTrainer::seq_length, "Sequence length configured for this trainer.")
@@ -1092,7 +1110,7 @@ NB_MODULE(_surogate, m) {
         .def("log_dataset", &TrainingRunLogger::log_dataset, nb::arg("train_loader"), nb::arg("eval_loader"),
              "Log dataset information.\n\n"
              "Parameters:\n- train_loader: Training DataLoader.\n- eval_loader: Evaluation DataLoader.")
-        .def("log_step", &TrainingRunLogger::log_step,
+        .def("log_step", nb::overload_cast<int, float, int, int, float, float, float>(&TrainingRunLogger::log_step),
              nb::arg("step"), nb::arg("epoch"), nb::arg("step_tokens"), nb::arg("duration_ms"),
              nb::arg("norm"), nb::arg("loss"), nb::arg("lr"),
              "Log a training step.\n\n"
@@ -1104,6 +1122,22 @@ NB_MODULE(_surogate, m) {
              "- norm: Gradient norm.\n"
              "- loss: Training loss.\n"
              "- lr: Learning rate.")
+        .def("log_step_moe", nb::overload_cast<int, float, int, int, float, float, float, float, float, float>(&TrainingRunLogger::log_step),
+             nb::arg("step"), nb::arg("epoch"), nb::arg("step_tokens"), nb::arg("duration_ms"),
+             nb::arg("norm"), nb::arg("loss"), nb::arg("lr"),
+             nb::arg("moe_aux_loss"), nb::arg("moe_z_loss"), nb::arg("moe_load_imbalance"),
+             "Log a training step with MoE metrics inline.\n\n"
+             "Parameters:\n"
+             "- step: Global step index.\n"
+             "- epoch: Current epoch.\n"
+             "- step_tokens: Tokens processed in this step.\n"
+             "- duration_ms: Step wall time.\n"
+             "- norm: Gradient norm.\n"
+             "- loss: Training loss.\n"
+             "- lr: Learning rate.\n"
+             "- moe_aux_loss: MoE auxiliary load balancing loss.\n"
+             "- moe_z_loss: MoE router z-loss.\n"
+             "- moe_load_imbalance: MoE load imbalance ratio.")
         .def("log_eval", &TrainingRunLogger::log_eval,
              nb::arg("step"), nb::arg("epoch"), nb::arg("eval_tokens"), nb::arg("duration_ms"), nb::arg("loss"),
              "Log an evaluation step.\n\n"
@@ -1113,6 +1147,16 @@ NB_MODULE(_surogate, m) {
              "- eval_tokens: Tokens processed.\n"
              "- duration_ms: Eval wall time.\n"
              "- loss: Eval loss.")
+        .def("log_moe_stats", &TrainingRunLogger::log_moe_stats,
+             nb::arg("step"), nb::arg("aux_loss"), nb::arg("z_loss"),
+             nb::arg("expert_utilization"), nb::arg("load_imbalance"),
+             "Log MoE training statistics.\n\n"
+             "Parameters:\n"
+             "- step: Global step index.\n"
+             "- aux_loss: Load balancing auxiliary loss.\n"
+             "- z_loss: Router z-loss.\n"
+             "- expert_utilization: Fraction of experts receiving tokens (0-1).\n"
+             "- load_imbalance: Ratio of max to mean token counts (1.0 = balanced).")
         .def("log_gpu_state", &TrainingRunLogger::log_gpu_state,
              nb::arg("step"), nb::arg("gpu_id"), nb::arg("gpu_util"),
              "Log GPU utilization state.\n\n"

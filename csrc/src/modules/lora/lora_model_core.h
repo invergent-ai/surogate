@@ -136,6 +136,9 @@ private:
     void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void initialize_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);
     void update_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
+
+    // Router training helpers
+    void copy_routers_from_base(NCCLCommunicator& comm);
 };
 
 } // namespace modules

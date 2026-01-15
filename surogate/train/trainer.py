@@ -301,8 +301,18 @@ class SurogateTrainerWrapper():
             # Log training step
             tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
             epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
-            train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
-                                  result['norm'], result['loss'], lr)
+
+            # Check for MoE stats and log with inline metrics if available
+            moe_stats = self.trainer.get_moe_stats()
+            if moe_stats.get('valid', False):
+                train_logger.log_step_moe(step, epoch, tokens_processed, elapsed_ms,
+                                          result['norm'], result['loss'], lr,
+                                          moe_stats['aux_loss'],
+                                          moe_stats['z_loss'],
+                                          moe_stats['load_imbalance'])
+            else:
+                train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
+                                      result['norm'], result['loss'], lr)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 

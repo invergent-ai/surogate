@@ -151,6 +151,24 @@ def merge_adapter(
         if merged_count % 100 == 0:
             logger.info(f"  Merged {merged_count}/{len(lora_pairs)} weights...")
 
+    # Handle trained router weights (not LoRA, just direct replacement)
+    # Router keys are like: model.layers.X.mlp.gate (without lora_A/B suffix)
+    router_count = 0
+    for key, tensor in normalized_weights.items():
+        if ".mlp.gate" in key and ".lora_" not in key:
+            # This is a trained router weight, replace directly
+            base_key_with_weight = key + ".weight"
+            if base_key_with_weight in base_state_dict:
+                base_state_dict[base_key_with_weight] = tensor.to(
+                    base_state_dict[base_key_with_weight].device
+                )
+                router_count += 1
+            else:
+                logger.warning(f"Router weight not found in base model: {base_key_with_weight}")
+
+    if router_count > 0:
+        logger.info(f"Replaced {router_count} trained router weights")
+
     # Load merged weights back into model
     base_model.load_state_dict(base_state_dict)
 

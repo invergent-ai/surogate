@@ -62,6 +62,7 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     rs_config.attention_bwd_chunks = options.attention_bwd_chunks;
     rs_config.lora_only_mode = options.lora_only_mode;
     rs_config.recompute_lora = options.recompute_lora;
+    rs_config.train_router = options.train_router;
     rs_config.use_fused_rope = options.use_fused_rope;
 
     // Set block config for run state
@@ -119,6 +120,7 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     gm_config.hidden_size = mConfig.HiddenSize;
     gm_config.tied_embeddings = mConfig.TiedWordEmbeddings;
     gm_config.skip_allocation = options.skip_base_gradients;  // Skip allocating large gradient buffers
+    gm_config.train_router = options.train_router;  // Allocate router gradient even in LoRA mode
 
     mGrads = std::make_unique<ModularGradientManager<Block>>(42, 0, gm_config, mAllocator);
 

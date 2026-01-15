@@ -57,6 +57,9 @@ struct ModularLoRAConfig {
     /// Use RSLoRA scaling (alpha / sqrt(rank) instead of alpha / rank)
     bool use_rs_lora = false;
 
+    /// Train MoE router gate weights during LoRA fine-tuning
+    bool train_router = false;
+
     /// Target modules for LoRA adaptation
     std::set<LoRATarget> targets = {
         LoRATarget::Q_PROJ,

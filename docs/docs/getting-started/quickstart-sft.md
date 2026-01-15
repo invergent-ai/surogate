@@ -126,7 +126,7 @@ MoE models require different hyperparameters than dense models, especially when 
 
 **Monitoring MoE Training:**
 - **Gradient norms**: Should stay below `0.4` during training
-  - If norms exceed `0.5`: reduce learning rate or increase `router_aux_loss_coef`
+  - If norms exceed `0.5`: reduce learning rate or increase `router_aux_loss_coef` in the model's `config.json` file
   - If norms spike above `0.8`: training is likely diverging
 - **Router collapse symptoms**:
   - Sudden loss increases after initial decrease

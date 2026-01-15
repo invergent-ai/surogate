@@ -64,6 +64,7 @@ struct MoEConfig {
     bool use_shared_expert = false; ///< Nemotron/DeepSeek shared expert
     int shared_expert_size = 0;     ///< Size of shared expert (0 = same as regular)
     float router_aux_loss_coef = 0.01f;  ///< Load balancing auxiliary loss coefficient
+    float router_z_loss_coef = 0.001f;   ///< Router z-loss (logit regularization) coefficient
     bool router_jitter = false;     ///< Add noise during routing for training stability
     float capacity_factor = 1.25f;  ///< Expert capacity factor for load balancing
 
@@ -216,6 +217,7 @@ struct ModelConfig : public PretrainedConfig {
                 moe.mlp_only_layers = moe_cfg->MlpOnlyLayers;
                 moe.norm_topk_prob = moe_cfg->NormTopkProb;
                 moe.router_aux_loss_coef = moe_cfg->RouterAuxLossCoef;
+                moe.router_z_loss_coef = moe_cfg->RouterZLossCoef;
                 config.moe_config = moe;
 
                 // Also populate convenience fields for direct access
@@ -392,6 +394,13 @@ struct ModelOptions {
     // Skip base model gradient allocation (used in LoRA mode where base weights are frozen)
     bool skip_base_gradients = false;
 
+    // Train MoE router gate during LoRA fine-tuning (router gradients computed even in lora_only mode)
+    bool train_router = false;
+
+    // MoE loss coefficients (override model config when >= 0)
+    float router_aux_loss_coef = -1.0f;  ///< Load balancing auxiliary loss coefficient (-1 = use model config)
+    float router_z_loss_coef = -1.0f;    ///< Router z-loss (logit regularization) coefficient (-1 = use model config)
+
     // Data types
     std::optional<ETensorDType> model_dtype;
     std::optional<ETensorDType> matmul_dtype;
@@ -555,6 +564,9 @@ struct ModelOptions {
         options.matmul_dtype = opts.MatmulType;
         options.gradient_dtype = opts.GradientType;
         options.master_dtype = opts.MasterDType;
+        // MoE loss coefficients
+        options.router_aux_loss_coef = opts.RouterAuxLossCoef;
+        options.router_z_loss_coef = opts.RouterZLossCoef;
         return options;
     }
 };

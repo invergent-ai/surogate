@@ -218,6 +218,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Dropout rate for LoRA adapters.
         lora_target_modules (Optional[str], default to 'all-linear'):
             List of comma-separated module names to apply LoRA adapters to.
+        train_router (Optional[bool], defaults to False):
+            Train the MoE router gate weights during LoRA fine-tuning.
+            When enabled, the router weights are unfrozen and included in the adapter.
+        router_aux_loss_coef (Optional[float], defaults to None):
+            MoE auxiliary (load balancing) loss coefficient. None uses the model config default.
+        router_z_loss_coef (Optional[float], defaults to None):
+            MoE z-loss (router logit regularization) coefficient. None uses the model config default.
         qlora_fp4: (Optional[bool], defaults to False):
             Enable NVFP4 QLoRA mode (base weights quantized to FP4 E2M1). Requires Blackwell GPU (SM100+)
         qlora_fp8: (Optional[bool], defaults to False):
@@ -340,6 +347,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     lora_dropout: Optional[float] = 0.05
     lora_dtype: Optional[Literal['bf16','fp32']] = 'fp32'
     lora_target_modules: Optional[List[str]] = None
+    train_router: Optional[bool] = False
+    router_aux_loss_coef: Optional[float] = None
+    router_z_loss_coef: Optional[float] = None
     qlora_fp4: Optional[bool] = False
     qlora_fp8: Optional[bool] = False
     qlora_bnb: Optional[bool] = False
@@ -441,6 +451,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.lora_dropout = cfg['lora_dropout'] if 'lora_dropout' in cfg else self.lora_dropout
         self.lora_dtype = cfg.get('lora_dtype', self.lora_dtype)
         self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
+        self.train_router = cfg.get('train_router', self.train_router)
+        self.router_aux_loss_coef = cfg.get('router_aux_loss_coef', self.router_aux_loss_coef)
+        self.router_z_loss_coef = cfg.get('router_z_loss_coef', self.router_z_loss_coef)
         self.qlora_fp4 = cfg.get('qlora_fp4', self.qlora_fp4)
         self.qlora_fp8 = cfg.get('qlora_fp8', self.qlora_fp8)
         self.qlora_bnb = cfg.get('qlora_bnb', self.qlora_bnb)
@@ -638,6 +651,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.runtime_config.use_write_combined = self.use_write_combined
         self.runtime_config.selective_expert_dequant = self.qlora_selective_expert_dequant
         self.runtime_config.offload_experts = self.qlora_offload_experts
+        # MoE loss coefficients (None means use model config default)
+        if self.router_aux_loss_coef is not None:
+            self.runtime_config.router_aux_loss_coef = float(self.router_aux_loss_coef)
+        if self.router_z_loss_coef is not None:
+            self.runtime_config.router_z_loss_coef = float(self.router_z_loss_coef)
 
     def create_lora_config(self):
         # Only create LoRA config when lora is enabled
@@ -651,7 +669,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             dropout=self.lora_dropout,
             dtype=self.lora_dtype,
             target_modules=self.lora_target_modules,
-            use_rslora=False
+            use_rslora=False,
+            train_router=self.train_router
         )
 
     def create_qlora_config(self):

@@ -164,6 +164,13 @@ def log_line_to_wandb(run: "wandb.Run", entry: dict):
             title=f"FLOPs",
         )
         run.log({"ops": fig}, step=step)
+    elif kind == "moe":
+        run.log({
+            "moe/aux_loss": entry.get("aux_loss", 0),
+            "moe/z_loss": entry.get("z_loss", 0),
+            "moe/expert_utilization": entry.get("expert_utilization", 0),
+            "moe/load_imbalance": entry.get("load_imbalance", 0),
+        }, step=step)
     else:
         raise RuntimeError(f"Unknown kind {kind}")
 
@@ -241,6 +248,11 @@ def log_line_to_aim(run: "aim.Run", entry: dict):
         run.track(entry.get("blocks", 0), name="flops/blocks", step=step)
         run.track(entry.get("lm_head", 0), name="flops/lm_head", step=step)
         run.track(entry.get("attention", 0), name="flops/attention", step=step)
+    elif kind == "moe":
+        run.track(entry.get("aux_loss", 0), name="moe/aux_loss", step=step)
+        run.track(entry.get("z_loss", 0), name="moe/z_loss", step=step)
+        run.track(entry.get("expert_utilization", 0), name="moe/expert_utilization", step=step)
+        run.track(entry.get("load_imbalance", 0), name="moe/load_imbalance", step=step)
     else:
         raise RuntimeError(f"Unknown kind {kind}")
 

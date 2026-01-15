@@ -283,7 +283,22 @@ datasets:
 | `lora_dropout`        | float  | `0.05`           | Dropout rate for LoRA adapters.                                    |
 | `lora_dtype`          | string | `"fp32"`         | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                 |
 | `lora_target_modules` | list   | `["all-linear"]` | List of module names to apply LoRA adapters to.                    |
+| `train_router`        | bool   | `false`          | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
 | `merge_adapter`       | bool   | `false`          | Whether to merge LoRA adapters into the base model after training. |
+
+## MoE Settings
+
+MoE (Mixture-of-Experts) settings control router loss coefficients for load balancing during training.
+
+| Option                | Type  | Default         | Description                                                                                       |
+| --------------------- | ----- | --------------- | ------------------------------------------------------------------------------------------------- |
+| `router_aux_loss_coef`| float | model config    | MoE auxiliary (load balancing) loss coefficient. None uses model config default (typically 0.001). |
+| `router_z_loss_coef`  | float | model config    | MoE z-loss (router logit regularization) coefficient. None uses model config default (typically 0.001). |
+
+**Understanding MoE Losses:**
+
+- **Auxiliary Loss (`aux_loss`)**: Encourages load balancing across experts. Higher values enforce more even token distribution but may reduce model capacity. Typical range: 0.001-0.1.
+- **Z-Loss (`z_loss`)**: Regularizes router logits to prevent them from growing too large, which can cause routing collapse. Typical range: 0.0001-0.01.
 
 ## QLoRA Settings
 

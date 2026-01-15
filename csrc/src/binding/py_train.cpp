@@ -405,6 +405,21 @@ std::vector<GPUUtilInfo> MultiGPUPyTrainer::get_gpu_info() {
 }
 
 /**
+ * @brief Get MoE training statistics from the last forward pass.
+ *
+ * Returns accumulated MoE metrics from rank 0's run state. For non-MoE models,
+ * returns zeros with valid=false.
+ *
+ * @return Tuple of (aux_loss, z_loss, expert_utilization, load_imbalance, valid)
+ */
+std::tuple<float, float, float, float, bool> MultiGPUPyTrainer::get_moe_stats() {
+    auto& ctx = mContexts.at(0);
+    auto& rs = ctx.Model->get_run_state();
+    auto stats = rs.get_moe_stats();
+    return {stats.aux_loss, stats.z_loss, stats.expert_utilization, stats.load_imbalance, stats.valid};
+}
+
+/**
  * @brief Request all worker threads to stop processing new work.
  *
  * This sets the running flag to false. The destructor additionally synchronizes and joins.
@@ -498,6 +513,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         mod_lora.dtype = mLoRAConfig->DType;
         mod_lora.init_a_kaiming = mLoRAConfig->InitAKaimingUniform;
         mod_lora.use_rs_lora = mLoRAConfig->UseRSLoRA;
+        mod_lora.train_router = mLoRAConfig->TrainRouter;
         mod_lora.targets.clear();
         if (mLoRAConfig->TargetModules.count("all") > 0) {
             mod_lora.with_all();

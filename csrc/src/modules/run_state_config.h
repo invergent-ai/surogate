@@ -93,6 +93,16 @@ struct ModularRunStateConfig {
     // Requires: recompute_block or (recompute_attention + recompute_ffn)
     bool recompute_lora = false;
 
+    // Train MoE router gate during LoRA fine-tuning
+    // When enabled, router gradients are computed even in lora_only mode
+    bool train_router = false;
+
+    // MoE model flag (set when model has MoE blocks)
+    bool is_moe = false;
+
+    // MoE-specific configuration (when is_moe=true)
+    int num_experts = 0;
+
     // PretrainedConfig for IRunState base class initialization
     PretrainedConfig pretrained_config;
 };

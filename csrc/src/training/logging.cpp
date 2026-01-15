@@ -291,6 +291,101 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
 }
 
 /**
+ * @brief Log a training step with MoE metrics (rank 0 only).
+ *
+ * Extended version for MoE models that includes router metrics in console output.
+ * Updates running totals used to compute average training loss between evals.
+ * Writes JSON lines for both step and moe logs.
+ *
+ * @param step Global step index.
+ * @param epoch Fractional epoch progress (used to compute percent-within-epoch).
+ * @param step_tokens Tokens processed this step.
+ * @param duration_ms Step duration in milliseconds.
+ * @param norm Gradient/parameter norm (as reported by training loop).
+ * @param loss Training loss for this step.
+ * @param lr Learning rate for this step.
+ * @param moe_aux_loss MoE auxiliary load balancing loss.
+ * @param moe_z_loss MoE router z-loss.
+ * @param moe_load_imbalance MoE load imbalance ratio.
+ */
+void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int duration_ms, float norm, float loss, float lr,
+                                  float moe_aux_loss, float moe_z_loss, float moe_load_imbalance)
+{
+    if(mRank != 0) return;
+    mTotalTrainingLoss += loss;
+    ++mTotalTrainingSteps;
+
+    if(mVerbosity >= 0) {
+        float iptr;
+        float progress = 100.f * std::modf(epoch,  &iptr);
+
+        // Tokens per second
+        long tps = (duration_ms > 0) ? (1000ll * step_tokens / duration_ms) : 0;
+
+        // Loss trend indicator
+        char trend = ' ';
+        if (mPreviousLoss > 0) {
+            if (loss < mPreviousLoss) {
+                trend = '\\';
+            } else if (loss > mPreviousLoss) {
+                trend = '/';
+            }
+        }
+        mPreviousLoss = loss;
+
+        // Update norm moving average
+        if (mNormSampleCount < 100) {
+            mNormMovingAverage = (mNormMovingAverage * mNormSampleCount + norm) / (mNormSampleCount + 1);
+            ++mNormSampleCount;
+        } else {
+            // Exponential moving average with alpha=0.1
+            mNormMovingAverage = 0.9f * mNormMovingAverage + 0.1f * norm;
+        }
+
+        // Check if norm exceeds threshold
+        char norm_flag = ' ';
+        if (mNormSampleCount >= 10 && mNormMovingAverage > 0 && norm > 5.0f * mNormMovingAverage) {
+            norm_flag = '!';
+        }
+
+        // Speed of light percentage
+        std::string sol_str = "";
+        if (mExpectedTimePerToken > 0) {
+            long peak = mExpectedTimePerToken * step_tokens / 1'000'000;
+            double ratio = static_cast<double>(peak) / static_cast<double>(duration_ms);
+            sol_str = fmt::format(" | sol {:4.1f}", ratio * 100.0);
+        }
+
+        // ETA calculation
+        std::string eta_str = "";
+        if (mRemainingTokens > 0 && mTotalTokens > 0) {
+            mRemainingTokens -= step_tokens;
+            auto elapsed = std::chrono::steady_clock::now() - mTrainingStartTime;
+            long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            long tokens_processed = mTotalTokens - mRemainingTokens;
+
+            if (tokens_processed > 0 && elapsed_ms > 0) {
+                double tokens_per_ms = static_cast<double>(tokens_processed) / elapsed_ms;
+                long eta_ms = static_cast<long>(mRemainingTokens / tokens_per_ms);
+
+                long eta_hours = eta_ms / (1000 * 60 * 60);
+                long eta_minutes = (eta_ms % (1000 * 60 * 60)) / (1000 * 60);
+                eta_str = fmt::format(" | eta {:02d}h{:02d}m", eta_hours, eta_minutes);
+            }
+        }
+
+        // MoE metrics string
+        std::string moe_str = fmt::format(" | aux {:.4f} | imbal {:.2f}", moe_aux_loss, moe_load_imbalance);
+
+        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s%s\n",
+               step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, moe_str.c_str(), sol_str.c_str(), eta_str.c_str());
+        fflush(stdout);
+    }
+    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {:.6f}, "moe_z_loss": {:.6f}, "moe_load_imbalance": {:.4f}}})",
+        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms, norm, loss, lr, moe_aux_loss, moe_z_loss, moe_load_imbalance));
+}
+
+/**
  * @brief Log an evaluation result (rank 0 only).
  *
  * Prints an eval line (verbosity-dependent), resets accumulated training-loss totals,
@@ -320,6 +415,25 @@ void TrainingRunLogger::log_eval(int step, float epoch, int eval_tokens, int dur
     mTotalTrainingSteps = 0;
     log_line(fmt::format(R"(  {{"log": "eval", "time": "{}", "step": {}, "epoch": {}, "eval_tokens": {}, "duration_ms": {}, "loss": {}}})",
         std::chrono::system_clock::now(), step, epoch, eval_tokens, duration_ms, loss ));
+}
+
+/**
+ * @brief Log MoE training statistics (rank 0 only).
+ *
+ * Writes metrics specific to Mixture-of-Experts models to help monitor router health
+ * and expert utilization during training.
+ *
+ * @param step Global step index.
+ * @param aux_loss Load balancing auxiliary loss (summed across layers).
+ * @param z_loss Router z-loss for regularization (summed across layers).
+ * @param expert_utilization Fraction of experts receiving tokens (0-1 average across layers).
+ * @param load_imbalance Ratio of max to mean token counts per expert (1.0 = perfect balance).
+ */
+void TrainingRunLogger::log_moe_stats(int step, float aux_loss, float z_loss, float expert_utilization, float load_imbalance)
+{
+    if (mRank != 0) return;
+    log_line(fmt::format(R"(  {{"log": "moe", "time": "{}", "step": {}, "aux_loss": {:.6f}, "z_loss": {:.6f}, "expert_utilization": {:.4f}, "load_imbalance": {:.4f}}})",
+        std::chrono::system_clock::now(), step, aux_loss, z_loss, expert_utilization, load_imbalance));
 }
 
 /**

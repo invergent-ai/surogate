@@ -53,6 +53,10 @@ struct RuntimeOptions {
     // MoE optimization: Offload expert NF4 weights to CPU, stream on-demand (saves ~12GB for 128-expert models)
     bool OffloadExperts = false;
 
+    // MoE loss coefficients (override model config when >= 0)
+    float RouterAuxLossCoef = -1.0f;  ///< Load balancing auxiliary loss coefficient (-1 = use model config)
+    float RouterZLossCoef = -1.0f;    ///< Router z-loss (logit regularization) coefficient (-1 = use model config)
+
     // Debug: print detailed memory breakdown after model allocation (useful for QLoRA optimization)
     bool DebugMemoryBreakdown = false;
 

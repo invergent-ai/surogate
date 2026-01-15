@@ -86,6 +86,7 @@ std::unique_ptr<PretrainedConfig> Qwen3MoEArchitecture::load_from_hf_config_json
     result->DecoderSparseStep = config_json.value("decoder_sparse_step", 1);
     result->NormTopkProb = config_json.value("norm_topk_prob", false);
     result->RouterAuxLossCoef = config_json.value("router_aux_loss_coef", 0.001f);
+    result->RouterZLossCoef = config_json.value("router_z_loss_coef", 0.001f);
 
     // Parse mlp_only_layers array if present
     if (config_json.contains("mlp_only_layers") && config_json["mlp_only_layers"].is_array()) {
@@ -126,6 +127,7 @@ void Qwen3MoEArchitecture::save_to_hf_config_json(const PretrainedConfig& config
         config_json["decoder_sparse_step"] = moe_config->DecoderSparseStep;
         config_json["norm_topk_prob"] = moe_config->NormTopkProb;
         config_json["router_aux_loss_coef"] = moe_config->RouterAuxLossCoef;
+        config_json["router_z_loss_coef"] = moe_config->RouterZLossCoef;
 
         if (!moe_config->MlpOnlyLayers.empty()) {
             config_json["mlp_only_layers"] = moe_config->MlpOnlyLayers;

@@ -26,6 +26,7 @@ struct Qwen3MoEConfig : public Qwen3Config {
     std::vector<int> MlpOnlyLayers; ///< Explicit list of layer indices using dense MLP instead of MoE
     bool NormTopkProb = false;      ///< Normalize top-k routing weights to sum to 1
     float RouterAuxLossCoef = 0.001f; ///< Load balancing auxiliary loss coefficient
+    float RouterZLossCoef = 0.001f;   ///< Router z-loss (logit regularization) coefficient
 
     Qwen3MoEConfig() {
         Architecture = QWEN3_MOE;

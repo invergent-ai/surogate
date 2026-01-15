@@ -203,6 +203,11 @@ void ModularLoRAModel<Block>::update_normuon(NCCLCommunicator& comm, const optim
                     if (expert.down.has_value()) { add_param(expert.down->A); add_param(expert.down->B); }
                 }
             }
+
+            // Router gate (full weight, not LoRA pair) when train_router is enabled
+            if (lora_w.router_gate.has_value() && lora_w.router_gate->Data) {
+                add_param(*lora_w.router_gate);
+            }
         }
 
         state.num_blocks = (state.state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -331,6 +336,16 @@ void ModularLoRAModel<Block>::update_normuon(NCCLCommunicator& comm, const optim
                 if (w_exp.down.has_value() && g_exp.down.has_value()) { update_param(w_exp.down->A, g_exp.down->A); update_param(w_exp.down->B, g_exp.down->B); }
             }
         }
+
+        // Router gate update (gradient comes from base model) when train_router is enabled
+        if (lora_w.router_gate.has_value() && lora_w.router_gate->Data) {
+            auto& base_g = mBaseModel->grads().get_block_full(l, main_stream, comm, unused_acc);
+            if constexpr (requires { base_g.router.d_gate; }) {
+                if (base_g.router.d_gate.Data) {
+                    update_param(*lora_w.router_gate, base_g.router.d_gate);
+                }
+            }
+        }
     }
 
     CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, main_stream));
@@ -376,6 +391,14 @@ void ModularLoRAModel<Block>::calculate_lora_gradient_norm(NCCLCommunicator& com
                 if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
                 if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
                 if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
+            }
+        }
+
+        // Router gradient comes from base model when train_router is enabled
+        if (mLoRAWeights->train_router()) {
+            auto& base_g = mBaseModel->grads().get_block_full(l, stream, comm, unused_acc);
+            if constexpr (requires { base_g.router.d_gate; }) {
+                norm_squared(base_g.router.d_gate);
             }
         }
     }
@@ -432,6 +455,11 @@ void ModularLoRAModel<Block>::initialize_multi_tensor_state(NCCLCommunicator& co
                 if (expert.up.has_value()) { collect_tensor(expert.up->A); collect_tensor(expert.up->B); }
                 if (expert.down.has_value()) { collect_tensor(expert.down->A); collect_tensor(expert.down->B); }
             }
+        }
+
+        // Router gate (trained as full weight, not LoRA pair) when train_router is enabled
+        if (lora_w.router_gate.has_value() && lora_w.router_gate->Data) {
+            collect_tensor(*lora_w.router_gate);
         }
     }
 
@@ -500,6 +528,17 @@ void ModularLoRAModel<Block>::update_grad_pointers(NCCLCommunicator& comm, cudaS
                 collect_grad(expert.gate);
                 collect_grad(expert.up);
                 collect_grad(expert.down);
+            }
+        }
+
+        // Router gradient comes from base model's gradient manager (not LoRA gradient manager)
+        // when train_router is enabled
+        if (mLoRAWeights->train_router()) {
+            auto& base_g = mBaseModel->grads().get_block_full(l, stream, comm, unused_acc);
+            if constexpr (requires { base_g.router.d_gate; }) {
+                if (base_g.router.d_gate.Data) {
+                    h_grad_ptrs.push_back(base_g.router.d_gate.Data);
+                }
             }
         }
     }
