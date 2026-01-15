@@ -572,8 +572,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         else:
             _output_dir.mkdir(parents=True, exist_ok=True)
 
-        _checkpoint_dir = self.checkpoint_dir or self.output_dir
-        _checkpoint_dir = Path(_checkpoint_dir)
+        # Set checkpoint_dir to output_dir if not specified, then convert to absolute path
+        self.checkpoint_dir = str(Path(self.checkpoint_dir or self.output_dir).resolve())
+        _checkpoint_dir = Path(self.checkpoint_dir)
         if not _checkpoint_dir.exists():
             _checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
