@@ -168,8 +168,8 @@ module.exports = {
                     lastmod: 'date',
                     changefreq: 'weekly',
                 },
-                googleTagManager: {
-                    containerId: 'G-7YRDGYZN0R',
+                gtag: {
+                    trackingID: 'G-7YRDGYZN0R',
                 }
             },
         ],
