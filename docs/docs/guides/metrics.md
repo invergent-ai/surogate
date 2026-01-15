@@ -151,10 +151,10 @@ For Mixture-of-Experts models (e.g., Qwen3-MoE), additional metrics track router
 ### Tracking in External Backends
 
 **Weights & Biases:**
-- `moe/aux_loss`
-- `moe/z_loss`
-- `moe/expert_utilization`
-- `moe/load_imbalance`
+- `train/aux_loss`
+- `train/z_loss`
+- `train/expert_utilization`
+- `train/load_imbalance`
 
 **Aim:**
 - Same metric names tracked via `run.track()`

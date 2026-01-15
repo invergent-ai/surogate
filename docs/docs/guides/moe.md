@@ -211,8 +211,6 @@ qlora_bnb_double_quant: true
 
 # Optional: Router training works with QLoRA too
 train_router: true
-
-use_cuda_graphs: false
 ```
 
 ## Configuring MoE Loss Coefficients
@@ -457,8 +455,6 @@ Tips for reducing memory:
 1. **CUDA Graphs:** MoE models cannot use CUDA graphs due to dynamic expert routing. Always set `use_cuda_graphs: false`.
 
 2. **ZeRO-3:** MoE expert weights can be sharded with ZeRO-3, but routing overhead increases with world size.
-
-3. **Sequence Parallelism:** Not currently supported for MoE models.
 
 ## Example Configurations
 

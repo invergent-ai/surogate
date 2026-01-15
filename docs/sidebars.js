@@ -75,8 +75,7 @@ module.exports = {
       items: [
         'reference/python-api',
         'reference/cli',
-        'reference/config',
-        'config-reference',
+        'reference/config'
       ],
     },
     {

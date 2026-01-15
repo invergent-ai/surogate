@@ -184,4 +184,7 @@ module.exports = {
     ],
     plugins: [
     ],
+    markdown: {
+        format: 'detect',
+    }
 };
