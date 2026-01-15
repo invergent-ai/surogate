@@ -309,7 +309,8 @@ class SurogateTrainerWrapper():
                                           result['norm'], result['loss'], lr,
                                           moe_stats['aux_loss'],
                                           moe_stats['z_loss'],
-                                          moe_stats['load_imbalance'])
+                                          moe_stats['load_imbalance'],
+                                          moe_stats['expert_utilization'])
             else:
                 train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
                                       result['norm'], result['loss'], lr)

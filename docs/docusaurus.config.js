@@ -167,6 +167,9 @@ module.exports = {
                 sitemap: {
                     lastmod: 'date',
                     changefreq: 'weekly',
+                },
+                googleTagManager: {
+                    containerId: 'G-7YRDGYZN0R',
                 }
             },
         ],

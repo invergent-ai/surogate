@@ -16,8 +16,9 @@
   "dependencies": {
     "@docusaurus/core": "^3.9.2",
     "@docusaurus/plugin-client-redirects": "^3.9.2",
-    "@docusaurus/preset-classic": "^3.9.2",
+    "@docusaurus/plugin-google-tag-manager": "^3.9.2",
     "@docusaurus/plugin-sitemap": "^3.9.2",
+    "@docusaurus/preset-classic": "^3.9.2",
     "@docusaurus/theme-common": "^3.9.2",
     "@docusaurus/theme-mermaid": "^3.9.2",
     "@emotion/react": "^11.14.0",

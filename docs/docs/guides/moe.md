@@ -301,14 +301,16 @@ report_to: wandb  # or [wandb, aim]
 ```
 
 Metrics appear as:
-- **wandb**: `moe/aux_loss`, `moe/z_loss`, `moe/expert_utilization`, `moe/load_imbalance`
-- **Aim**: Same metric names via `run.track()`
+- **wandb/Aim**: `train/moe_aux_loss`, `train/moe_z_loss`, `train/moe_load_imbalance`, `train/moe_expert_utilization` (logged with each training step)
 
 ### Interpreting the Metrics
 
 #### Expert Utilization
 
-Measures what fraction of experts are receiving tokens each step:
+Measures what fraction of experts are receiving tokens each step. Monitor via:
+- **Console**: Not shown inline
+- **JSON logs**: `moe_expert_utilization` field in step logs
+- **wandb/Aim**: `train/moe_expert_utilization`
 
 | Value     | Interpretation                       |
 | --------- | ------------------------------------ |
@@ -321,7 +323,10 @@ Measures what fraction of experts are receiving tokens each step:
 
 #### Load Imbalance
 
-Measures how evenly tokens are distributed across active experts:
+Measures how evenly tokens are distributed across active experts. Monitor via:
+- **Console**: `imbal` field shown inline for MoE models
+- **JSON logs**: `moe_load_imbalance` field in step logs
+- **wandb/Aim**: `train/moe_load_imbalance`
 
 | Value     | Interpretation                    |
 | --------- | --------------------------------- |
@@ -332,7 +337,11 @@ Measures how evenly tokens are distributed across active experts:
 
 #### Auxiliary Loss
 
-The load balancing loss that encourages uniform expert utilization:
+The load balancing loss that encourages uniform expert utilization. Monitor via:
+- **Console**: `aux` field shown inline for MoE models
+- **JSON logs**: `moe_aux_loss` field in step logs
+- **wandb/Aim**: `train/moe_aux_loss`
+- **Config**: Adjust strength with `router_aux_loss_coef` (see [Configuring MoE Loss Coefficients](#configuring-moe-loss-coefficients))
 
 | Value      | Interpretation                        |
 | ---------- | ------------------------------------- |
@@ -343,7 +352,11 @@ The load balancing loss that encourages uniform expert utilization:
 
 #### Z-Loss
 
-Regularization term that prevents router logits from becoming too large:
+Regularization term that prevents router logits from becoming too large. Monitor via:
+- **Console**: Not shown inline (check JSON logs or external backends)
+- **JSON logs**: `moe_z_loss` field in step logs
+- **wandb/Aim**: `train/moe_z_loss`
+- **Config**: Adjust strength with `router_z_loss_coef` (see [Configuring MoE Loss Coefficients](#configuring-moe-loss-coefficients))
 
 | Value        | Interpretation                          |
 | ------------ | --------------------------------------- |
