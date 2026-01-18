@@ -44,6 +44,8 @@ PretrainedConfig load_pretrained_config_legacy(const char* file_name, ETensorDTy
             return "Qwen3-MoE";
         case PretrainedConfig::LLAMA:
             return "LLaMA";
+        case PretrainedConfig::NEMOTRON_H:
+            return "Nemotron-H";
         default:
             throw std::logic_error("Unknown architecture");
     }
@@ -66,4 +68,3 @@ std::unique_ptr<PretrainedConfig> create_pretrained_config_from_name(std::string
     if (auto cfg = models::create_from_preset_name(name, dtype)) return cfg;
     throw std::runtime_error(fmt::format("unknown model name {}", name));
 }
-

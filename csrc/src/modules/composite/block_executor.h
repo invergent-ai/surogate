@@ -72,16 +72,37 @@ struct BlockExecutor {
         const int T = (int)rs.T;
         const int C = config.HiddenSize;
         const int D = config.IntermediateSize;
+        const int M = config.mlp_up_rows();
         const int Hq = config.NumQueryHeads;
         const int Hkv = config.NumKeyValHeads;
         const int Hs = config.head_size();
         const int qkv_channels = config.qkv_channels();
+        const int mamba_heads = config.MambaNumHeads;
+        const int mamba_head_dim = config.MambaHeadDim;
+        const int mamba_state = config.MambaSsmStateSize;
+        const int mamba_groups = config.MambaNGroups > 0 ? config.MambaNGroups : 1;
+        const int mamba_conv_dim = D + 2 * mamba_groups * mamba_state;
+        const int mamba_proj_size = D + mamba_conv_dim + mamba_heads;
+        const int mamba_chunk_size = config.MambaChunkSize > 0 ? config.MambaChunkSize : 2048;
+        const int mamba_chunks = (T + mamba_chunk_size - 1) / mamba_chunk_size;
 
         using WeightsType = std::decay_t<decltype(weights)>;
         constexpr bool kHasMoE = has_moe_weights<WeightsType>::value;
         constexpr bool kHasMLP = has_mlp_weights<WeightsType>::value;
 
         recipe_ops::ForwardQuantView qv{fp8_fwd_quants, fp4_fwd_quants, &quant_acts};
+
+        auto has_op = [&](BlockOp op) {
+            for (int i = 0; i < spec.forward_ops_count; ++i) {
+                if (spec.forward_ops[i] == op) return true;
+            }
+            return false;
+        };
+
+        const bool has_attention = has_op(BlockOp::Attention) || has_op(BlockOp::AttnOut) || has_op(BlockOp::QKV);
+        const bool has_ln2 = has_op(BlockOp::LN2) || has_op(BlockOp::ResidualLN2);
+        const bool mlp_uses_ln1 = !has_ln2;
+        const bool has_mlp_output = has_op(BlockOp::MLPDown) || has_op(BlockOp::Mamba);
 
         auto run_ln1 = [&]() {
             if (layer_idx == 0) {
@@ -158,7 +179,15 @@ struct BlockExecutor {
 
         auto run_residual_add = [&]() {
             const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
-            vector_add_sr(acts.residual_att, residual, acts.att_out, 1.0f, N, /*seed=*/0, stream);
+            if (has_attention) {
+                vector_add_sr(acts.residual_att, residual, acts.att_out, 1.0f, N, /*seed=*/0, stream);
+            } else {
+                // No attention path: residual_att should mirror residual.
+                vector_add_sr(acts.residual_att, residual, residual, 0.0f, N, /*seed=*/0, stream);
+            }
+            if (!has_mlp_output) {
+                fill_zero(acts.mlp_down, stream);
+            }
         };
 
         auto run_ln2 = [&]() {
@@ -532,16 +561,18 @@ struct BlockExecutor {
             if constexpr (!kHasMLP) {
                 throw std::logic_error("BlockExecutor::forward: MLPUp op requires dense weights");
             } else {
+                Tensor& mlp_in = mlp_uses_ln1 ? acts.ln1 : acts.ln2;
+                Tensor* mlp_in_quant = mlp_uses_ln1 ? qv.ln1_inp_quant() : qv.ln2_inp_quant();
                 const int qidx = allow_quant_layer ?
-                    get_quantizer_index(layer_idx, QuantizerIndex::FWD_LN2) : -1;
+                    get_quantizer_index(layer_idx, mlp_uses_ln1 ? QuantizerIndex::FWD_LN1 : QuantizerIndex::FWD_LN2) : -1;
                 const auto cache = recipe_ops::forward_cached_weights(weight_manager, MatmulOp::MLPUp, allow_quant_layer);
                 recipe_ops::forward_matmul(
                     recipe, rs,
-                    acts.mlp_up, acts.ln2, weights.mlp_up_weight,
+                    acts.mlp_up, mlp_in, weights.mlp_up_weight,
                     nullptr,
-                    B, T, C, 2 * D,
+                    B, T, C, M,
                     layer_idx, MatmulOp::MLPUp,
-                    qv.ln2_inp_quant(), qidx, cache, stream, allow_quant_layer);
+                    mlp_in_quant, qidx, cache, stream, allow_quant_layer);
             }
         };
 
@@ -560,6 +591,37 @@ struct BlockExecutor {
             }
         };
 
+        auto run_mlp_act = [&]() {
+            if constexpr (!kHasMLP) {
+                throw std::logic_error("BlockExecutor::forward: MLPAct op requires dense weights");
+            } else {
+                switch (config.activation_type) {
+                    case ActivationType::SwiGLU:
+                        run_swiglu();
+                        break;
+                    case ActivationType::GeGLU:
+                        throw std::logic_error("BlockExecutor::forward: GeGLU activation not implemented");
+                    case ActivationType::SiLU: {
+                        const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(M);
+                        silu_forward(acts.swiglu, acts.mlp_up, N, stream);
+                        recipe_ops::record_abs_max(qv.swiglu_abs_max(), acts.swiglu, rs.DeviceProp, stream);
+                        break;
+                    }
+                    case ActivationType::ReLU2: {
+                        const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(M);
+                        relu2_forward(acts.swiglu, acts.mlp_up, N, stream);
+                        recipe_ops::record_abs_max(qv.swiglu_abs_max(), acts.swiglu, rs.DeviceProp, stream);
+                        break;
+                    }
+                    case ActivationType::ReLU:
+                    case ActivationType::GeLU:
+                        throw std::logic_error("BlockExecutor::forward: Activation type not supported yet");
+                    default:
+                        throw std::logic_error("BlockExecutor::forward: Unknown activation type");
+                }
+            }
+        };
+
         auto run_mlp_down = [&]() {
             if constexpr (!kHasMLP) {
                 throw std::logic_error("BlockExecutor::forward: MLPDown op requires dense weights");
@@ -574,6 +636,92 @@ struct BlockExecutor {
                     B, T, D, C,
                     layer_idx, MatmulOp::MLPDown,
                     qv.swiglu_inp_quant(), qidx, cache, stream, allow_quant_layer);
+            }
+        };
+
+        auto run_mamba = [&]() {
+            if constexpr (!kHasMLP) {
+                throw std::logic_error("BlockExecutor::forward: Mamba op requires dense weights");
+            } else {
+                if (!weights.mamba.has_value()) {
+                    throw std::logic_error("BlockExecutor::forward: Mamba weights missing");
+                }
+                auto& mw = *weights.mamba;
+                const int dev = rs.DeviceId;
+
+                // 1) Input projection
+                Tensor proj{acts.ln1.DType, {B, T, mamba_proj_size}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(proj);
+                recipe_ops::CachedWeights dummy_cache{};
+                recipe_ops::forward_matmul(
+                    recipe, rs,
+                    proj, acts.ln1, mw.in_proj_weight,
+                    mw.in_proj_bias.has_value() ? &mw.in_proj_bias.value() : nullptr,
+                    B, T, C, mamba_proj_size,
+                    layer_idx, MatmulOp::MLPUp,
+                    nullptr, -1, dummy_cache, stream, /*allow_quant=*/false);
+
+                // Split projection: gate, conv_in, delta
+                mamba_split_proj(acts.mamba_gate, acts.mamba_conv_in, acts.mamba_delta,
+                                 proj, B, T, D, mamba_conv_dim, mamba_heads, mamba_head_dim, stream);
+                rs.temp_free(proj);
+
+                // 2) Causal conv1d (depthwise) + activation
+                Tensor conv_out{acts.ln1.DType, {B, mamba_conv_dim, T}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(conv_out);
+                mamba_causal_conv1d_forward(conv_out, acts.mamba_conv_in, mw.conv1d_weight,
+                                            mw.conv1d_bias.has_value() ? &mw.conv1d_bias.value() : nullptr,
+                                            B, T, mamba_conv_dim, config.MambaConvKernel,
+                                            /*silu=*/true, stream);
+
+                // Split conv output: u, B, C
+                mamba_split_conv_out(acts.mamba_u, acts.mamba_B, acts.mamba_C,
+                                     conv_out, B, T, D, mamba_groups, mamba_state, stream);
+
+                // 3) Selective scan
+                Tensor A_exp{ETensorDType::FP32, {D, mamba_state}, nullptr, nullptr, 2, dev};
+                Tensor D_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor dt_bias_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor scan_out_bdt{acts.ln1.DType, {B, D, T}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(A_exp);
+                rs.temp_acquire(D_exp);
+                rs.temp_acquire(dt_bias_exp);
+                rs.temp_acquire(scan_out_bdt);
+
+                mamba_expand_A(A_exp, mw.A_log, mamba_heads, mamba_head_dim, mamba_state, stream);
+                mamba_expand_head_param(D_exp, mw.D, mamba_heads, mamba_head_dim, stream);
+                mamba_expand_head_param(dt_bias_exp, mw.dt_bias, mamba_heads, mamba_head_dim, stream);
+
+                mamba_selective_scan_forward(scan_out_bdt,
+                                             acts.mamba_u, acts.mamba_delta,
+                                             A_exp, acts.mamba_B, acts.mamba_C,
+                                             D_exp, dt_bias_exp,
+                                             acts.mamba_x,
+                                             B, T, D, mamba_state, mamba_groups, mamba_chunks, stream);
+
+                mamba_transpose_bdt_to_btd(acts.mamba_scan_out, scan_out_bdt, B, T, D, stream);
+
+                // Free scan temporaries (LIFO)
+                rs.temp_free(scan_out_bdt);
+                rs.temp_free(dt_bias_exp);
+                rs.temp_free(D_exp);
+                rs.temp_free(A_exp);
+                rs.temp_free(conv_out);
+
+                // 4) Gated RMSNorm
+                silu_mul_forward(acts.mamba_gated, acts.mamba_gate, acts.mamba_scan_out, B * T, D, stream);
+                mamba_group_rmsnorm_forward(acts.mamba_normed, acts.mamba_rstd,
+                                            acts.mamba_gated, mw.norm_weight,
+                                            config.RmsNormEps, B, T, D, mamba_groups, stream);
+
+                // 5) Output projection
+                recipe_ops::forward_matmul(
+                    recipe, rs,
+                    acts.mlp_down, acts.mamba_normed, mw.out_proj_weight,
+                    mw.out_proj_bias.has_value() ? &mw.out_proj_bias.value() : nullptr,
+                    B, T, D, C,
+                    layer_idx, MatmulOp::MLPDown,
+                    nullptr, -1, dummy_cache, stream, /*allow_quant=*/false);
             }
         };
 
@@ -610,6 +758,7 @@ struct BlockExecutor {
                     if (hook) (*hook)(layer_idx, stream, ForwardHookPoint::AfterMLPUpProjection, nullptr);
                     break;
                 case BlockOp::SwiGLU: run_swiglu(); break;
+                case BlockOp::MLPAct: run_mlp_act(); break;
                 case BlockOp::MLPDown:
                     run_mlp_down();
                     if (hook) (*hook)(layer_idx, stream, ForwardHookPoint::AfterMLPDownProjection, nullptr);
@@ -627,6 +776,9 @@ struct BlockExecutor {
                     break;
                 case BlockOp::Combine:
                     run_combine();
+                    break;
+                case BlockOp::Mamba:
+                    run_mamba();
                     break;
                 default: break;
             }
@@ -656,10 +808,19 @@ struct BlockExecutor {
         const int T = (int)rs.T;
         const int C = config.HiddenSize;
         const int D = config.IntermediateSize;
+        const int M = config.mlp_up_rows();
         const int Hq = config.NumQueryHeads;
         const int Hkv = config.NumKeyValHeads;
         const int Hs = config.head_size();
         const int qkv_channels = config.qkv_channels();
+        const int mamba_heads = config.MambaNumHeads;
+        const int mamba_head_dim = config.MambaHeadDim;
+        const int mamba_state = config.MambaSsmStateSize;
+        const int mamba_groups = config.MambaNGroups > 0 ? config.MambaNGroups : 1;
+        const int mamba_conv_dim = D + 2 * mamba_groups * mamba_state;
+        const int mamba_proj_size = D + mamba_conv_dim + mamba_heads;
+        const int mamba_chunk_size = config.MambaChunkSize > 0 ? config.MambaChunkSize : 2048;
+        const int mamba_chunks = (T + mamba_chunk_size - 1) / mamba_chunk_size;
 
         const bool skip_weight_grad = rs.is_lora_only_mode();
 
@@ -669,6 +830,20 @@ struct BlockExecutor {
         constexpr bool kHasMoE = has_moe_weights<WeightsType>::value;
         constexpr bool kHasMLP = has_mlp_weights<WeightsType>::value;
         auto& att_grads = attention_grads(grads);
+        auto has_op = [&](BlockOp op) {
+            for (int i = 0; i < spec.forward_ops_count; ++i) {
+                if (spec.forward_ops[i] == op) return true;
+            }
+            return false;
+        };
+
+        const bool has_attention = has_op(BlockOp::Attention) || has_op(BlockOp::AttnOut) || has_op(BlockOp::QKV);
+        const bool has_mlp = has_op(BlockOp::MLPUp) || has_op(BlockOp::MLPDown) ||
+                             has_op(BlockOp::SwiGLU) || has_op(BlockOp::MLPAct) ||
+                             has_op(BlockOp::Mamba);
+        const bool has_mamba = has_op(BlockOp::Mamba);
+        const bool has_ln2 = has_op(BlockOp::LN2) || has_op(BlockOp::ResidualLN2);
+        const bool mlp_uses_ln1 = !has_ln2;
 
         auto bwd_mlp_down = [&]() {
             if constexpr (!kHasMLP) {
@@ -703,20 +878,269 @@ struct BlockExecutor {
             }
         };
 
+        auto bwd_mlp_act = [&]() {
+            if constexpr (!kHasMLP) {
+                throw std::logic_error("BlockExecutor::backward: MLPAct op requires dense weights");
+            } else {
+                switch (config.activation_type) {
+                    case ActivationType::SwiGLU:
+                        bwd_swiglu();
+                        break;
+                    case ActivationType::GeGLU:
+                        throw std::logic_error("BlockExecutor::backward: GeGLU activation not implemented");
+                    case ActivationType::SiLU: {
+                        const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(M);
+                        silu_backward(d_acts.d_mlp_up, acts.mlp_up, d_acts.d_swiglu, N, stream);
+                        recipe_ops::record_abs_max(qg.d_mlp_up_abs_max(), d_acts.d_mlp_up, rs.DeviceProp, stream);
+                        break;
+                    }
+                    case ActivationType::ReLU2: {
+                        const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(M);
+                        relu2_backward(d_acts.d_mlp_up, acts.mlp_up, d_acts.d_swiglu, N, stream);
+                        recipe_ops::record_abs_max(qg.d_mlp_up_abs_max(), d_acts.d_mlp_up, rs.DeviceProp, stream);
+                        break;
+                    }
+                    case ActivationType::ReLU:
+                    case ActivationType::GeLU:
+                        throw std::logic_error("BlockExecutor::backward: Activation type not supported yet");
+                    default:
+                        throw std::logic_error("BlockExecutor::backward: Unknown activation type");
+                }
+            }
+        };
+
         auto bwd_mlp_up = [&]() {
             if constexpr (!kHasMLP) {
                 throw std::logic_error("BlockExecutor::backward: MLPUp op requires dense weights");
             } else {
+                Tensor& mlp_in = mlp_uses_ln1 ? acts.ln1 : acts.ln2;
+                Tensor& d_mlp_in = mlp_uses_ln1 ? d_acts.d_ln1 : d_acts.d_ln2;
+                Tensor* q_in = mlp_uses_ln1 ? qg.inp_ln1() : qg.inp_ln2();
                 recipe_ops::CachedWeights dgrad_cache{};
                 recipe_ops::backward_matmul(
                     recipe, rs,
-                    d_acts.d_ln2, grads.d_mlp_up_weight, nullptr,
-                    d_acts.d_mlp_up, acts.ln2, weights.mlp_up_weight,
-                    B, T, C, 2 * D,
+                    d_mlp_in, grads.d_mlp_up_weight, nullptr,
+                    d_acts.d_mlp_up, mlp_in, weights.mlp_up_weight,
+                    B, T, C, M,
                     layer_idx, MatmulOp::MLPUp,
                     accumulate, skip_weight_grad,
-                    qg.inp_ln2(), qg.dout_d_mlp_up(),
+                    q_in, qg.dout_d_mlp_up(),
                     nullptr, dgrad_cache, stream, allow_quant_layer);
+            }
+        };
+
+        auto bwd_mamba = [&]() {
+            if constexpr (!kHasMLP) {
+                throw std::logic_error("BlockExecutor::backward: Mamba op requires dense weights");
+            } else {
+                if (!weights.mamba.has_value() || !grads.mamba.has_value()) {
+                    throw std::logic_error("BlockExecutor::backward: Mamba weights/gradients missing");
+                }
+                auto& mw = *weights.mamba;
+                auto& mg = *grads.mamba;
+                const int dev = rs.DeviceId;
+
+                recipe_ops::CachedWeights dummy_cache{};
+
+                // 1) Output projection backward: d_normed + d_out_proj_weight
+                recipe_ops::backward_matmul(
+                    recipe, rs,
+                    d_acts.d_mamba_normed, mg.d_out_proj_weight,
+                    mg.d_out_proj_bias.has_value() ? &mg.d_out_proj_bias.value() : nullptr,
+                    d_acts.d_res_ffn, acts.mamba_normed, mw.out_proj_weight,
+                    B, T, D, C,
+                    layer_idx, MatmulOp::MLPDown,
+                    accumulate, skip_weight_grad,
+                    nullptr, nullptr,
+                    nullptr, dummy_cache, stream, /*allow_quant=*/false);
+
+                if (!skip_weight_grad && mg.d_out_proj_bias.has_value()) {
+                    const long scratch_bytes = get_bias_backward_scratch_size(mg.d_out_proj_bias->DType, C, rs.DeviceProp);
+                    Tensor bias_scratch = rs.temp_alloc(ETensorDType::FP32, {scratch_bytes / (long)sizeof(float)});
+                    backward_bias(mg.d_out_proj_bias.value(), d_acts.d_res_ffn,
+                                  nullptr, nullptr, bias_scratch,
+                                  B, T, C, rs.DeviceProp, stream);
+                    rs.temp_free(bias_scratch);
+                }
+
+                // 2) Group RMSNorm backward
+                Tensor d_norm_weight_fp32{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                rs.temp_acquire(d_norm_weight_fp32);
+                mamba_group_rmsnorm_backward_dx(d_acts.d_mamba_gated, d_acts.d_mamba_normed,
+                                                acts.mamba_gated, mw.norm_weight,
+                                                acts.mamba_rstd, B, T, D, mamba_groups, stream);
+                if (!skip_weight_grad) {
+                    mamba_group_rmsnorm_backward_dweight_fp32(d_norm_weight_fp32, d_acts.d_mamba_normed,
+                                                              acts.mamba_gated, acts.mamba_rstd,
+                                                              B, T, D, mamba_groups, stream);
+                    if (accumulate) {
+                        Tensor d_norm_bf16{ETensorDType::BF16, {D}, nullptr, nullptr, 1, dev};
+                        rs.temp_acquire(d_norm_bf16);
+                        convert_dtype(d_norm_bf16.get<nv_bfloat16>(), d_norm_weight_fp32.get<float>(), D, stream);
+                        vector_add_sr(mg.d_norm_weight.template get<nv_bfloat16>(),
+                                      mg.d_norm_weight.template get<nv_bfloat16>(),
+                                      d_norm_bf16.get<nv_bfloat16>(),
+                                      1.0f, D, 0, stream);
+                        rs.temp_free(d_norm_bf16);
+                    } else {
+                        convert_dtype(mg.d_norm_weight.template get<nv_bfloat16>(), d_norm_weight_fp32.get<float>(), D, stream);
+                    }
+                }
+                rs.temp_free(d_norm_weight_fp32);
+
+                // 3) Gate backward (in-place): d_gate + d_scan_out
+                silu_mul_backward_inplace(acts.mamba_gate, acts.mamba_scan_out, d_acts.d_mamba_gated,
+                                          nullptr, B * T, D, stream);
+
+                // 4) Transpose d_scan_out to (B, D, T)
+                Tensor d_scan_out_bdt{acts.mamba_scan_out.DType, {B, D, T}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(d_scan_out_bdt);
+                mamba_transpose_btd_to_bdt(d_scan_out_bdt, acts.mamba_scan_out, B, T, D, stream);
+
+                // 5) Selective scan backward
+                Tensor A_exp{ETensorDType::FP32, {D, mamba_state}, nullptr, nullptr, 2, dev};
+                Tensor D_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor dt_bias_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor dA{ETensorDType::FP32, {D, mamba_state}, nullptr, nullptr, 2, dev};
+                Tensor dD_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor d_dt_bias_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                rs.temp_acquire(A_exp);
+                rs.temp_acquire(D_exp);
+                rs.temp_acquire(dt_bias_exp);
+                rs.temp_acquire(dA);
+                if (!skip_weight_grad) {
+                    rs.temp_acquire(dD_exp);
+                    rs.temp_acquire(d_dt_bias_exp);
+                }
+
+                mamba_expand_A(A_exp, mw.A_log, mamba_heads, mamba_head_dim, mamba_state, stream);
+                mamba_expand_head_param(D_exp, mw.D, mamba_heads, mamba_head_dim, stream);
+                mamba_expand_head_param(dt_bias_exp, mw.dt_bias, mamba_heads, mamba_head_dim, stream);
+
+                mamba_selective_scan_backward(d_acts.d_mamba_u, d_acts.d_mamba_delta,
+                                              dA, d_acts.d_mamba_B, d_acts.d_mamba_C,
+                                              skip_weight_grad ? nullptr : &dD_exp,
+                                              skip_weight_grad ? nullptr : &d_dt_bias_exp,
+                                              acts.mamba_u, acts.mamba_delta,
+                                              A_exp, acts.mamba_B, acts.mamba_C,
+                                              D_exp, dt_bias_exp,
+                                              d_scan_out_bdt, acts.mamba_x,
+                                              B, T, D, mamba_state, mamba_groups, mamba_chunks, stream);
+
+                if (!skip_weight_grad) {
+                    mamba_reduce_dA_log(mg.d_A_log, dA, A_exp,
+                                        mamba_heads, mamba_head_dim, mamba_state, accumulate, stream);
+                    mamba_reduce_head_param(mg.d_D, dD_exp, mamba_heads, mamba_head_dim, accumulate, stream);
+                    mamba_reduce_head_param(mg.d_dt_bias, d_dt_bias_exp, mamba_heads, mamba_head_dim, accumulate, stream);
+                }
+
+                if (!skip_weight_grad) {
+                    rs.temp_free(d_dt_bias_exp);
+                    rs.temp_free(dD_exp);
+                }
+                rs.temp_free(dA);
+                rs.temp_free(dt_bias_exp);
+                rs.temp_free(D_exp);
+                rs.temp_free(A_exp);
+                rs.temp_free(d_scan_out_bdt);
+
+                // 6) Pack conv1d output gradients (BF16)
+                mamba_pack_conv_out(d_acts.d_mamba_conv_out, d_acts.d_mamba_u,
+                                    d_acts.d_mamba_B, d_acts.d_mamba_C,
+                                    B, T, D, mamba_groups, mamba_state, stream);
+
+                // 7) Conv1d backward: dx + d_conv_weight/bias
+                Tensor d_conv_in{acts.mamba_conv_in.DType, {B, mamba_conv_dim, T}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(d_conv_in);
+                Tensor d_conv_w_fp32{ETensorDType::FP32, {mamba_conv_dim, config.MambaConvKernel}, nullptr, nullptr, 2, dev};
+                Tensor d_conv_b_fp32{ETensorDType::FP32, {mamba_conv_dim}, nullptr, nullptr, 1, dev};
+                rs.temp_acquire(d_conv_w_fp32);
+                Tensor* d_conv_b_ptr = nullptr;
+                if (mw.conv1d_bias.has_value()) {
+                    rs.temp_acquire(d_conv_b_fp32);
+                    d_conv_b_ptr = &d_conv_b_fp32;
+                }
+
+                mamba_causal_conv1d_backward(d_conv_in, d_conv_w_fp32, d_conv_b_ptr,
+                                             acts.mamba_conv_in, mw.conv1d_weight,
+                                             d_acts.d_mamba_conv_out,
+                                             B, T, mamba_conv_dim, config.MambaConvKernel,
+                                             /*silu=*/true, stream);
+
+                if (!skip_weight_grad) {
+                    if (accumulate) {
+                        Tensor d_conv_w_bf16{ETensorDType::BF16, {mamba_conv_dim, config.MambaConvKernel}, nullptr, nullptr, 2, dev};
+                        rs.temp_acquire(d_conv_w_bf16);
+                        convert_dtype(d_conv_w_bf16.get<nv_bfloat16>(), d_conv_w_fp32.get<float>(),
+                                      d_conv_w_fp32.nelem(), stream);
+                        vector_add_sr(mg.d_conv1d_weight.template get<nv_bfloat16>(),
+                                      mg.d_conv1d_weight.template get<nv_bfloat16>(),
+                                      d_conv_w_bf16.get<nv_bfloat16>(),
+                                      1.0f, d_conv_w_fp32.nelem(), 0, stream);
+                        rs.temp_free(d_conv_w_bf16);
+                    } else {
+                        convert_dtype(mg.d_conv1d_weight.template get<nv_bfloat16>(), d_conv_w_fp32.get<float>(),
+                                      d_conv_w_fp32.nelem(), stream);
+                    }
+
+                    if (mw.conv1d_bias.has_value() && mg.d_conv1d_bias.has_value() && d_conv_b_ptr) {
+                        if (accumulate) {
+                            Tensor d_conv_b_bf16{ETensorDType::BF16, {mamba_conv_dim}, nullptr, nullptr, 1, dev};
+                            rs.temp_acquire(d_conv_b_bf16);
+                            convert_dtype(d_conv_b_bf16.get<nv_bfloat16>(), d_conv_b_fp32.get<float>(),
+                                          d_conv_b_fp32.nelem(), stream);
+                            vector_add_sr(mg.d_conv1d_bias->template get<nv_bfloat16>(),
+                                          mg.d_conv1d_bias->template get<nv_bfloat16>(),
+                                          d_conv_b_bf16.get<nv_bfloat16>(),
+                                          1.0f, d_conv_b_fp32.nelem(), 0, stream);
+                            rs.temp_free(d_conv_b_bf16);
+                        } else {
+                            convert_dtype(mg.d_conv1d_bias->template get<nv_bfloat16>(), d_conv_b_fp32.get<float>(),
+                                          d_conv_b_fp32.nelem(), stream);
+                        }
+                    }
+                }
+
+                if (d_conv_b_ptr) {
+                    rs.temp_free(d_conv_b_fp32);
+                }
+                rs.temp_free(d_conv_w_fp32);
+
+                // 8) Reduce d_delta -> d_dt
+                Tensor d_dt{acts.mamba_gate.DType, {B, T, mamba_heads}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(d_dt);
+                mamba_reduce_delta_to_dt(d_dt, d_acts.d_mamba_delta,
+                                         B, T, mamba_heads, mamba_head_dim, stream);
+
+                // 9) Pack d_proj and run in_proj backward
+                Tensor d_proj{acts.ln1.DType, {B, T, mamba_proj_size}, nullptr, nullptr, 3, dev};
+                rs.temp_acquire(d_proj);
+                mamba_pack_dproj(d_proj, acts.mamba_gate, d_conv_in, d_dt,
+                                 B, T, D, mamba_conv_dim, mamba_heads, stream);
+
+                recipe_ops::backward_matmul(
+                    recipe, rs,
+                    d_acts.d_ln1, mg.d_in_proj_weight,
+                    mg.d_in_proj_bias.has_value() ? &mg.d_in_proj_bias.value() : nullptr,
+                    d_proj, acts.ln1, mw.in_proj_weight,
+                    B, T, C, mamba_proj_size,
+                    layer_idx, MatmulOp::MLPUp,
+                    accumulate, skip_weight_grad,
+                    nullptr, nullptr,
+                    nullptr, dummy_cache, stream, /*allow_quant=*/false);
+
+                if (!skip_weight_grad && mg.d_in_proj_bias.has_value()) {
+                    const long scratch_bytes = get_bias_backward_scratch_size(mg.d_in_proj_bias->DType, mamba_proj_size, rs.DeviceProp);
+                    Tensor bias_scratch = rs.temp_alloc(ETensorDType::FP32, {scratch_bytes / (long)sizeof(float)});
+                    backward_bias(mg.d_in_proj_bias.value(), d_proj,
+                                  nullptr, nullptr, bias_scratch,
+                                  B, T, mamba_proj_size, rs.DeviceProp, stream);
+                    rs.temp_free(bias_scratch);
+                }
+
+                rs.temp_free(d_proj);
+                rs.temp_free(d_dt);
+                rs.temp_free(d_conv_in);
             }
         };
 
@@ -1374,48 +1798,69 @@ struct BlockExecutor {
             return;
         }
 
+        // -------------------- Mamba backward --------------------
+        if (has_mamba) {
+            bwd_mamba();
+            if (has_attention) {
+                throw std::logic_error("BlockExecutor::backward: Mamba blocks cannot include attention yet");
+            }
+            const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
+            vector_add_sr(d_acts.d_res_att, d_acts.d_res_ffn, d_acts.d_res_ffn, 0.0f, N, /*seed=*/0, stream);
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward, nullptr);
+            return;
+        }
+
         // -------------------- MLP backward --------------------
         Tensor saved_d_mlp_up{};
         bool restore_mlp_up = false;
-        if constexpr (kHasMLP) {
-            if (stack_large_bwd_temps) {
-                if (d_acts.d_swiglu.Data == nullptr) {
-                    rs.temp_acquire(d_acts.d_swiglu);
+        if (has_mlp) {
+            if constexpr (kHasMLP) {
+                if (stack_large_bwd_temps) {
+                    if (d_acts.d_swiglu.Data == nullptr) {
+                        rs.temp_acquire(d_acts.d_swiglu);
+                    }
+                    // Reuse the (recomputed) mlp_up buffer in-place for d_mlp_up.
+                    saved_d_mlp_up = d_acts.d_mlp_up;
+                    d_acts.d_mlp_up = acts.mlp_up;
+                    restore_mlp_up = true;
                 }
-                // Reuse the (recomputed) mlp_up buffer in-place for d_mlp_up.
-                saved_d_mlp_up = d_acts.d_mlp_up;
-                d_acts.d_mlp_up = acts.mlp_up;
-                restore_mlp_up = true;
+            }
+
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward, nullptr);
+            bwd_mlp_down();
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward, nullptr);
+
+            bwd_mlp_act();
+            if constexpr (kHasMLP) {
+                if (stack_large_bwd_temps) {
+                    rs.temp_free(d_acts.d_swiglu);
+                    // We no longer need activation output after backward.
+                    if (rs.ffn_temps_on_stack()) {
+                        rs.temp_free(acts.swiglu);
+                    }
+                }
+            }
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPUpBackward, nullptr);
+            bwd_mlp_up();
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward, nullptr);
+            if constexpr (kHasMLP) {
+                if (restore_mlp_up) {
+                    d_acts.d_mlp_up = saved_d_mlp_up;
+                    if (rs.ffn_temps_on_stack()) {
+                        rs.temp_free(acts.mlp_up);
+                    }
+                }
             }
         }
 
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward, nullptr);
-        bwd_mlp_down();
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward, nullptr);
-
-        bwd_swiglu();
-        if constexpr (kHasMLP) {
-            if (stack_large_bwd_temps) {
-                rs.temp_free(d_acts.d_swiglu);
-                // We no longer need swiglu activations after swiglu_backward.
-                if (rs.ffn_temps_on_stack()) {
-                    rs.temp_free(acts.swiglu);
-                }
-            }
-        }
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPUpBackward, nullptr);
-        bwd_mlp_up();
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward, nullptr);
-        if constexpr (kHasMLP) {
-            if (restore_mlp_up) {
-                d_acts.d_mlp_up = saved_d_mlp_up;
-                if (rs.ffn_temps_on_stack()) {
-                    rs.temp_free(acts.mlp_up);
-                }
-            }
+        if (!has_attention) {
+            const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
+            vector_add_sr(d_acts.d_res_att, d_acts.d_res_ffn, d_acts.d_res_ffn, 0.0f, N, /*seed=*/0, stream);
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward, nullptr);
+            return;
         }
 
-        if (spec.variant == BlockVariant::Parallel) {
+        if (spec.variant == BlockVariant::Parallel && has_ln2) {
             const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
             // Preserve residual gradient for attention path.
             vector_add_sr(d_acts.d_res_att, d_acts.d_res_ffn, d_acts.d_res_ffn, 0.0f, N, /*seed=*/0, stream);
@@ -1445,8 +1890,20 @@ struct BlockExecutor {
 
             // Merge MLP residual grad into d_res_att for LN1 backward.
             vector_add_sr(d_acts.d_res_att, d_acts.d_res_att, d_acts.d_res_ffn, 1.0f, N, /*seed=*/0, stream);
-        } else {
+        } else if (has_ln2) {
             bwd_ln2_dense();
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward, nullptr);
+            bwd_attn_out();
+            if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward, nullptr);
+            if (stack_large_bwd_temps && d_acts.d_qkv.Data == nullptr) {
+                rs.temp_acquire(d_acts.d_qkv);
+                acquired_d_qkv = true;
+            }
+            bwd_attention();
+        } else {
+            // Attention-only block: d_res_att is directly the upstream gradient.
+            const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
+            vector_add_sr(d_acts.d_res_att, d_acts.d_res_ffn, d_acts.d_res_ffn, 0.0f, N, /*seed=*/0, stream);
             if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward, nullptr);
             bwd_attn_out();
             if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward, nullptr);
@@ -1502,6 +1959,7 @@ struct BlockExecutor {
         const int T = (int)rs.T;
         const int C = config.HiddenSize;
         const int D = config.IntermediateSize;
+        const int M = config.mlp_up_rows();
         const int Hq = config.NumQueryHeads;
         const int Hkv = config.NumKeyValHeads;
         const int Hs = config.head_size();
@@ -1518,6 +1976,16 @@ struct BlockExecutor {
         const bool recompute_swiglu = options.recompute_swiglu || options.recompute_ffn || options.recompute_block;
 
         recipe_ops::ForwardQuantView qv{fp8_fwd_quants, fp4_fwd_quants, &quant_acts};
+
+        auto has_op = [&](BlockOp op) {
+            for (int i = 0; i < spec.forward_ops_count; ++i) {
+                if (spec.forward_ops[i] == op) return true;
+            }
+            return false;
+        };
+
+        const bool has_ln2 = has_op(BlockOp::LN2) || has_op(BlockOp::ResidualLN2);
+        const bool mlp_uses_ln1 = !has_ln2;
 
         if (recompute_ln1) {
             rmsnorm_forward(acts.ln1, acts.ln1_rstd, residual, weights.ln1.weight,
@@ -1593,14 +2061,16 @@ struct BlockExecutor {
                     if (acts.swiglu.Data == nullptr) rs.temp_acquire(acts.swiglu);
                 }
 
+                Tensor& mlp_in = mlp_uses_ln1 ? acts.ln1 : acts.ln2;
+                Tensor* mlp_in_quant = mlp_uses_ln1 ? qv.ln1_inp_quant() : qv.ln2_inp_quant();
                 const auto cache = recipe_ops::forward_cached_weights(weight_manager, MatmulOp::MLPUp, allow_quant_layer);
                 recipe_ops::forward_matmul(
                     recipe, rs,
-                    acts.mlp_up, acts.ln2, weights.mlp_up_weight,
+                    acts.mlp_up, mlp_in, weights.mlp_up_weight,
                     nullptr,
-                    B, T, C, 2 * D,
+                    B, T, C, M,
                     layer_idx, MatmulOp::MLPUp,
-                    qv.ln2_inp_quant(), /*delayed_quantizer_idx=*/-1,
+                    mlp_in_quant, /*delayed_quantizer_idx=*/-1,
                     cache, stream, allow_quant_layer);
             }
         }
@@ -1610,14 +2080,37 @@ struct BlockExecutor {
                 if (rs.ffn_temps_on_stack()) {
                     if (acts.swiglu.Data == nullptr) rs.temp_acquire(acts.swiglu);
                 }
-                recipe_ops::swiglu_forward(
-                    recipe,
-                    acts.swiglu,
-                    nullptr,
-                    acts.mlp_up,
-                    qv.swiglu_abs_max(),
-                    B, T, D,
-                    stream);
+                switch (config.activation_type) {
+                    case ActivationType::SwiGLU:
+                        recipe_ops::swiglu_forward(
+                            recipe,
+                            acts.swiglu,
+                            nullptr,
+                            acts.mlp_up,
+                            qv.swiglu_abs_max(),
+                            B, T, D,
+                            stream);
+                        break;
+                    case ActivationType::GeGLU:
+                        throw std::logic_error("BlockExecutor::recompute: GeGLU activation not implemented");
+                    case ActivationType::SiLU: {
+                        const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(M);
+                        silu_forward(acts.swiglu, acts.mlp_up, N, stream);
+                        recipe_ops::record_abs_max(qv.swiglu_abs_max(), acts.swiglu, rs.DeviceProp, stream);
+                        break;
+                    }
+                    case ActivationType::ReLU2: {
+                        const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(M);
+                        relu2_forward(acts.swiglu, acts.mlp_up, N, stream);
+                        recipe_ops::record_abs_max(qv.swiglu_abs_max(), acts.swiglu, rs.DeviceProp, stream);
+                        break;
+                    }
+                    case ActivationType::ReLU:
+                    case ActivationType::GeLU:
+                        throw std::logic_error("BlockExecutor::recompute: Activation type not supported yet");
+                    default:
+                        throw std::logic_error("BlockExecutor::recompute: Unknown activation type");
+                }
             }
         }
     }

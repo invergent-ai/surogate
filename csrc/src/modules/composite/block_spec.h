@@ -28,10 +28,12 @@ enum class BlockOp {
     ResidualLN2,
     MLPUp,
     SwiGLU,
+    MLPAct,
     MLPDown,
     Router,
     Experts,
     Combine,
+    Mamba,
 };
 
 struct BlockSpec {

@@ -17,6 +17,12 @@ struct BlockBuilder {
             case BlockType::MoE:
             case BlockType::SwitchMoE:
                 return moe(config);
+            case BlockType::Attention:
+                return attention_only(config);
+            case BlockType::MLP:
+                return mlp_only(config);
+            case BlockType::Mamba:
+                return mamba(config);
             case BlockType::Dense:
             case BlockType::Conv:
             default:
@@ -40,7 +46,11 @@ struct BlockBuilder {
         spec.push_op(BlockOp::AttnOut);
         spec.push_op(BlockOp::ResidualLN2);
         spec.push_op(BlockOp::MLPUp);
-        spec.push_op(BlockOp::SwiGLU);
+        if (is_gated_activation(config.activation_type)) {
+            spec.push_op(BlockOp::SwiGLU);
+        } else {
+            spec.push_op(BlockOp::MLPAct);
+        }
         spec.push_op(BlockOp::MLPDown);
         return spec;
     }
@@ -62,8 +72,60 @@ struct BlockBuilder {
         spec.push_op(BlockOp::ResidualAdd);
         spec.push_op(BlockOp::LN2);
         spec.push_op(BlockOp::MLPUp);
-        spec.push_op(BlockOp::SwiGLU);
+        if (is_gated_activation(config.activation_type)) {
+            spec.push_op(BlockOp::SwiGLU);
+        } else {
+            spec.push_op(BlockOp::MLPAct);
+        }
         spec.push_op(BlockOp::MLPDown);
+        return spec;
+    }
+
+    static BlockSpec attention_only(const ModelConfig& config) {
+        BlockSpec spec;
+        spec.variant = BlockVariant::Dense;
+        spec.use_qk_norm = config.use_qk_norm;
+        spec.ln2_on_residual_att = false;
+
+        spec.push_op(BlockOp::LN1);
+        spec.push_op(BlockOp::QKV);
+        if (spec.use_qk_norm) {
+            spec.push_op(BlockOp::QKNorm);
+        }
+        spec.push_op(BlockOp::RoPE);
+        spec.push_op(BlockOp::Attention);
+        spec.push_op(BlockOp::AttnOut);
+        spec.push_op(BlockOp::ResidualAdd);
+        return spec;
+    }
+
+    static BlockSpec mlp_only(const ModelConfig& config) {
+        BlockSpec spec;
+        spec.variant = BlockVariant::Dense;
+        spec.use_qk_norm = false;
+        spec.ln2_on_residual_att = false;
+
+        spec.push_op(BlockOp::LN1);
+        spec.push_op(BlockOp::MLPUp);
+        if (is_gated_activation(config.activation_type)) {
+            spec.push_op(BlockOp::SwiGLU);
+        } else {
+            spec.push_op(BlockOp::MLPAct);
+        }
+        spec.push_op(BlockOp::MLPDown);
+        spec.push_op(BlockOp::ResidualAdd);
+        return spec;
+    }
+
+    static BlockSpec mamba(const ModelConfig& config) {
+        BlockSpec spec;
+        spec.variant = BlockVariant::Dense;
+        spec.use_qk_norm = false;
+        spec.ln2_on_residual_att = false;
+
+        spec.push_op(BlockOp::LN1);
+        spec.push_op(BlockOp::Mamba);
+        spec.push_op(BlockOp::ResidualAdd);
         return spec;
     }
 

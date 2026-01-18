@@ -75,6 +75,18 @@ enum class TensorTarget {
     MLPUpWeight,
     MLPDownWeight,
 
+    // Mamba / SSM tensors
+    MambaInProjWeight,
+    MambaInProjBias,
+    MambaOutProjWeight,
+    MambaOutProjBias,
+    MambaConv1dWeight,
+    MambaConv1dBias,
+    MambaALog,
+    MambaD,
+    MambaDtBias,
+    MambaNormWeight,
+
     // MoE tensors
     RouterGate,
     RouterBias,

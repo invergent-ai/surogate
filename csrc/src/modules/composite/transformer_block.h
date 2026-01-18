@@ -14,6 +14,7 @@
 #include "modules/primitives/mlp.h"
 #include "modules/forward_hooks.h"
 #include "modules/backward_hooks.h"
+#include "modules/model_config.h"
 #include "kernels/kernels.h"
 
 // Forward declaration for recipe types (global ::recipes namespace)
@@ -101,9 +102,21 @@ public:
 
         // MLP config
         int intermediate_size;
+        int mlp_up_factor = 2;     ///< 2 for gated (SwiGLU/GeGLU), 1 for standard MLP
 
         // Norm config
         float rms_norm_eps = 1e-5f;
+
+        // Mamba / SSM config (optional; used by Nemotron-H hybrid blocks)
+        int mamba_num_heads = 0;
+        int mamba_head_dim = 0;
+        int mamba_ssm_state_size = 0;
+        int mamba_conv_kernel = 0;
+        int mamba_n_groups = 1;
+        int mamba_chunk_size = 0;
+        bool mamba_use_bias = false;
+        bool mamba_use_conv_bias = false;
+        ActivationType mamba_activation = ActivationType::SiLU;
 
         // Derived configs for sub-modules
         [[nodiscard]] typename AttentionType::Config attention_config() const {
@@ -132,6 +145,23 @@ public:
                 .intermediate_size = intermediate_size
             };
         }
+
+        // Mamba helper dimensions
+        [[nodiscard]] int mamba_dim() const {
+            return intermediate_size;
+        }
+
+        [[nodiscard]] int mamba_conv_dim() const {
+            return intermediate_size + 2 * mamba_n_groups * mamba_ssm_state_size;
+        }
+
+        [[nodiscard]] int mamba_proj_size() const {
+            return intermediate_size + mamba_conv_dim() + mamba_num_heads;
+        }
+
+        [[nodiscard]] int mamba_group_size() const {
+            return (mamba_n_groups > 0) ? (intermediate_size / mamba_n_groups) : intermediate_size;
+        }
     };
 
     /**
@@ -158,6 +188,21 @@ public:
             Tensor& down_weight;
         };
         MLPWeightsProxy mlp_weights() { return {mlp_up_weight, mlp_down_weight}; }
+
+        // Mamba / SSM weights (optional for hybrid architectures)
+        struct MambaWeights {
+            Tensor in_proj_weight;             ///< (proj_size, hidden_size)
+            std::optional<Tensor> in_proj_bias;
+            Tensor out_proj_weight;            ///< (hidden_size, intermediate_size)
+            std::optional<Tensor> out_proj_bias;
+            Tensor conv1d_weight;              ///< (conv_dim, 1, kernel)
+            std::optional<Tensor> conv1d_bias;  ///< (conv_dim)
+            Tensor A_log;                      ///< (num_heads) FP32
+            Tensor D;                          ///< (num_heads) FP32
+            Tensor dt_bias;                    ///< (num_heads) FP32
+            Tensor norm_weight;                ///< (intermediate_size)
+        };
+        std::optional<MambaWeights> mamba;
     };
 
     /**
@@ -205,6 +250,21 @@ public:
             Tensor& d_down_weight;
         };
         MLPGradientsProxy mlp_grads() { return {d_mlp_up_weight, d_mlp_down_weight}; }
+
+        // Mamba / SSM gradients (optional for hybrid architectures)
+        struct MambaGradients {
+            Tensor d_in_proj_weight;
+            std::optional<Tensor> d_in_proj_bias;
+            Tensor d_out_proj_weight;
+            std::optional<Tensor> d_out_proj_bias;
+            Tensor d_conv1d_weight;
+            std::optional<Tensor> d_conv1d_bias;
+            Tensor d_A_log;
+            Tensor d_D;
+            Tensor d_dt_bias;
+            Tensor d_norm_weight;
+        };
+        std::optional<MambaGradients> mamba;
     };
 
     explicit DenseTransformerBlock(Config config)

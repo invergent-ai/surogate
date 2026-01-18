@@ -25,6 +25,7 @@
 #include "modules/model_factory.h"
 #include "models/llama/llama_model.h"
 #include "models/llama/transformer_block.h"
+#include "models/nemotron_h/config.h"
 #include "models/qwen25/qwen25_model.h"
 #include "models/qwen25/transformer_block.h"
 #include "training/model.h"
@@ -164,6 +165,56 @@ TEST_CASE("Modular dense model: 1 step forward/backward/update runs", "[training
         float norm = model->get_norm();
         REQUIRE(std::isfinite(loss));
         REQUIRE(std::isfinite(norm));
+    });
+}
+
+TEST_CASE("Nemotron-H: mamba forward runs", "[training][modular][nemotron-h][gpu]") {
+    if (!gpu_available()) SKIP("CUDA not available");
+
+    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        constexpr int B = 2;
+        constexpr int T = 32;
+
+        NemotronHConfig cfg;
+        cfg.HiddenSize = 64;
+        cfg.IntermediateSize = 64;
+        cfg.NumQueryHeads = 2;
+        cfg.NumKeyValHeads = 2;
+        cfg.NumLayers = 2;
+        cfg.VocabSize = 128;
+        cfg.MaxPositionEmbeddings = 128;
+        cfg.RmsNormEps = 1e-6f;
+        cfg.DType = ETensorDType::BF16;
+
+        cfg.MambaNumHeads = 2;
+        cfg.MambaHeadDim = 32;
+        cfg.SsmStateSize = 16;
+        cfg.ConvKernel = 4;
+        cfg.NGroups = 1;
+        cfg.ChunkSize = 32;
+        cfg.UseBias = false;
+        cfg.UseConvBias = false;
+        cfg.MambaHiddenAct = "silu";
+        cfg.MlpHiddenAct = "silu";
+
+        cfg.AttentionBias = false;
+        cfg.MlpBias = false;
+        cfg.LayersBlockType = {"mamba", "attention"};
+
+        RuntimeOptions opts = create_test_options();
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
+        model->allocate_run_state(opts, comm, B, T, /*allocate_optimizer=*/false);
+        model->init_weights(comm);
+
+        auto& inputs = model->get_input_buffer();
+        auto& pos_ids = model->get_position_ids_buffer();
+        std::fill(inputs.get<std::int32_t>(), inputs.get<std::int32_t>() + B * T, 1);
+        fill_position_ids(pos_ids, B, T);
+
+        model->forward(inputs, pos_ids, comm, /*micro_step=*/0);
+        CUDA_CHECK(cudaDeviceSynchronize());
     });
 }
 

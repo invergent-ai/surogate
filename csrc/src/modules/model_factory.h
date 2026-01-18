@@ -19,6 +19,7 @@
 #include "models/qwen25/qwen25_model.h"
 #include "models/qwen3/qwen3_model.h"
 #include "models/qwen3moe/qwen3_moe_model.h"
+#include "models/nemotron_h/nemotron_h_model.h"
 #include "models/llama/transformer_block.h"
 #include "models/qwen25/transformer_block.h"
 #include "models/qwen3/transformer_block.h"
@@ -123,6 +124,9 @@ public:
             case PretrainedConfig::QWEN2:
                 return std::make_unique<Qwen2Model>(mod_config, mod_options, rank, world, alloc);
 
+            case PretrainedConfig::NEMOTRON_H:
+                return std::make_unique<NemotronHModel>(mod_config, mod_options, rank, world, alloc);
+
             case PretrainedConfig::LLAMA:
             default:
                 return std::make_unique<LlamaModel>(mod_config, mod_options, rank, world, alloc);
@@ -183,6 +187,14 @@ public:
             case PretrainedConfig::QWEN2: {
                 // Qwen2 dense
                 using Block = Qwen2TransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::NEMOTRON_H: {
+                using Block = DenseTransformerBlock<>;
                 auto base = std::make_unique<ModularTransformerModel<Block>>(
                     mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
                 return std::make_unique<ModularLoRAModel<Block>>(
@@ -335,21 +347,29 @@ private:
     }
 
     /**
-     * @brief Create a hybrid (mixed dense/MoE) model
+     * @brief Create a hybrid model (per-layer Attention/MLP/Mamba)
      *
-     * Note: Hybrid models with different block types per layer are not currently supported.
-     * Use pure Dense or pure MoE architectures instead.
+     * Note: Mixed MoE/Dense per-layer routing is not supported yet.
      */
     static std::unique_ptr<IModel> create_hybrid_model(
-        const ModelConfig& /*config*/,
-        const ModelOptions& /*options*/,
-        int /*rank*/,
-        int /*world*/,
-        const std::shared_ptr<TensorAllocator>& /*alloc*/) {
+        const ModelConfig& config,
+        const ModelOptions& options,
+        int rank,
+        int world,
+        const std::shared_ptr<TensorAllocator>& alloc) {
 
-        throw std::runtime_error(
-            "Hybrid architecture (mixed Dense/MoE per layer) is not currently supported. "
-            "Use pure Dense or pure MoE architectures instead.");
+        // Hybrid (non-MoE) path: use the composable DenseTransformerBlock and per-layer specs.
+        // Mixed MoE/Dense per layer is not supported yet.
+        for (int i = 0; i < config.NumLayers; ++i) {
+            if (config.is_layer_moe(i)) {
+                throw std::runtime_error(
+                    "Hybrid MoE per-layer routing is not supported in the modular path yet.");
+            }
+        }
+
+        using Block = DenseTransformerBlock<>;
+        return std::make_unique<ModularTransformerModel<Block>>(
+            config, options, rank, world, alloc);
     }
 };
 

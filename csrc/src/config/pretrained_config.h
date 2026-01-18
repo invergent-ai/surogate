@@ -36,6 +36,7 @@ struct PretrainedConfig {
         QWEN2,
         QWEN3,
         QWEN3_MOE,
+        NEMOTRON_H,
     };
 
     // Architecture identifier

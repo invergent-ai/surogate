@@ -17,6 +17,7 @@
 #include "modules/weights/weight_manager_types.h"
 #include "recipes/recipe.h"
 #include "kernels/kernels.h"
+#include "utilities/utils.h"
 
 namespace modules {
 
@@ -377,10 +378,20 @@ inline void rope_forward_dispatch(
     int B, int T, int Hq, int Hkv, int Hs,
     cudaStream_t stream)
 {
-    if (options.use_fused_rope) {
+    const int rotary_dim = config.Rope.rotary_dim(Hs);
+    if (rotary_dim == 0) {
+        if (out.Data != inp.Data) {
+            CUDA_CHECK(cudaMemcpyAsync(out.Data, inp.Data, inp.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
+
+    if (options.use_fused_rope && rotary_dim == Hs) {
         rope_fused_forward(out, inp, pos_ids, nullptr, config.RopeTheta, B, T, Hq, Hkv, Hs, stream);
-    } else {
+    } else if (rotary_dim == Hs) {
         rope_forward(out, inp, freq_cis, pos_ids, nullptr, B, T, Hq, Hkv, Hs, stream);
+    } else {
+        rope_forward(out, inp, freq_cis, pos_ids, nullptr, B, T, Hq, Hkv, Hs, rotary_dim, stream);
     }
 }
 
@@ -395,10 +406,20 @@ inline void rope_backward_dispatch(
     int B, int T, int Hq, int Hkv, int Hs,
     cudaStream_t stream)
 {
-    if (options.use_fused_rope) {
+    const int rotary_dim = config.Rope.rotary_dim(Hs);
+    if (rotary_dim == 0) {
+        if (out.Data != inp.Data) {
+            CUDA_CHECK(cudaMemcpyAsync(out.Data, inp.Data, inp.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
+
+    if (options.use_fused_rope && rotary_dim == Hs) {
         rope_fused_backward(out, inp, pos_ids, abs_max, config.RopeTheta, B, T, Hq, Hkv, Hs, stream);
-    } else {
+    } else if (rotary_dim == Hs) {
         rope_backward(out, inp, freq_cis, pos_ids, abs_max, B, T, Hq, Hkv, Hs, stream);
+    } else {
+        rope_backward(out, inp, freq_cis, pos_ids, abs_max, B, T, Hq, Hkv, Hs, rotary_dim, stream);
     }
 }
 

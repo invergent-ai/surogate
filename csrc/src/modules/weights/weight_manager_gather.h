@@ -9,6 +9,7 @@
 #include <string>
 
 #include "kernels/kernels.h"
+#include "modules/mlp_utils.h"
 #include "modules/weights/weight_manager_helpers.h"
 #include "utilities/comm.h"
 
@@ -85,14 +86,36 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
         if (src.attention.qkv_bias.has_value() && dst.attention.qkv_bias.has_value()) {
             dst.attention.qkv_bias->Stats = src.attention.qkv_bias->Stats;
         }
-	        if constexpr (has_mlp_weights<BlockWeights>::value) {
-	            dst.mlp_up_weight.Stats = src.mlp_up_weight.Stats;
-	            dst.mlp_down_weight.Stats = src.mlp_down_weight.Stats;
-	        }
-	        if constexpr (has_moe_weights<BlockWeights>::value) {
-	            dst.router.gate.Stats = src.router.gate.Stats;
-	            if (src.router.bias.has_value() && dst.router.bias.has_value()) {
-	                dst.router.bias->Stats = src.router.bias->Stats;
+        if constexpr (has_mlp_weights<BlockWeights>::value) {
+            dst.mlp_up_weight.Stats = src.mlp_up_weight.Stats;
+            dst.mlp_down_weight.Stats = src.mlp_down_weight.Stats;
+        }
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (src.mamba.has_value() && dst.mamba.has_value()) {
+                auto& ms = *src.mamba;
+                auto& md = *dst.mamba;
+                md.in_proj_weight.Stats = ms.in_proj_weight.Stats;
+                if (ms.in_proj_bias.has_value() && md.in_proj_bias.has_value()) {
+                    md.in_proj_bias->Stats = ms.in_proj_bias->Stats;
+                }
+                md.out_proj_weight.Stats = ms.out_proj_weight.Stats;
+                if (ms.out_proj_bias.has_value() && md.out_proj_bias.has_value()) {
+                    md.out_proj_bias->Stats = ms.out_proj_bias->Stats;
+                }
+                md.conv1d_weight.Stats = ms.conv1d_weight.Stats;
+                if (ms.conv1d_bias.has_value() && md.conv1d_bias.has_value()) {
+                    md.conv1d_bias->Stats = ms.conv1d_bias->Stats;
+                }
+                md.A_log.Stats = ms.A_log.Stats;
+                md.D.Stats = ms.D.Stats;
+                md.dt_bias.Stats = ms.dt_bias.Stats;
+                md.norm_weight.Stats = ms.norm_weight.Stats;
+            }
+        }
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            dst.router.gate.Stats = src.router.gate.Stats;
+            if (src.router.bias.has_value() && dst.router.bias.has_value()) {
+                dst.router.bias->Stats = src.router.bias->Stats;
 	            }
 	            if (src.experts.use_batched && dst.experts.use_batched) {
 	                dst.experts.gate_up_proj.Stats = src.experts.gate_up_proj.Stats;
@@ -121,15 +144,37 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             }
         }
         convert_into(src.ln2.weight, shard_dst(dst.ln2.weight));
-	        if constexpr (has_mlp_weights<BlockWeights>::value) {
-	            convert_into(src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
-	            convert_into(src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
-	        }
-	        if constexpr (has_moe_weights<BlockWeights>::value) {
-	            convert_into(src.router.gate, shard_dst(dst.router.gate));
-	            if (src.router.bias.has_value() && dst.router.bias.has_value()) {
-	                convert_into(src.router.bias.value(), shard_dst(dst.router.bias.value()));
-	            }
+        if constexpr (has_mlp_weights<BlockWeights>::value) {
+            convert_into(src.mlp_up_weight, shard_dst(dst.mlp_up_weight));
+            convert_into(src.mlp_down_weight, shard_dst(dst.mlp_down_weight));
+        }
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (src.mamba.has_value() && dst.mamba.has_value()) {
+                auto& ms = *src.mamba;
+                auto& md = *dst.mamba;
+                convert_into(ms.in_proj_weight, shard_dst(md.in_proj_weight));
+                if (ms.in_proj_bias.has_value() && md.in_proj_bias.has_value()) {
+                    convert_into(ms.in_proj_bias.value(), shard_dst(md.in_proj_bias.value()));
+                }
+                convert_into(ms.out_proj_weight, shard_dst(md.out_proj_weight));
+                if (ms.out_proj_bias.has_value() && md.out_proj_bias.has_value()) {
+                    convert_into(ms.out_proj_bias.value(), shard_dst(md.out_proj_bias.value()));
+                }
+                convert_into(ms.conv1d_weight, shard_dst(md.conv1d_weight));
+                if (ms.conv1d_bias.has_value() && md.conv1d_bias.has_value()) {
+                    convert_into(ms.conv1d_bias.value(), shard_dst(md.conv1d_bias.value()));
+                }
+                convert_into(ms.A_log, shard_dst(md.A_log));
+                convert_into(ms.D, shard_dst(md.D));
+                convert_into(ms.dt_bias, shard_dst(md.dt_bias));
+                convert_into(ms.norm_weight, shard_dst(md.norm_weight));
+            }
+        }
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            convert_into(src.router.gate, shard_dst(dst.router.gate));
+            if (src.router.bias.has_value() && dst.router.bias.has_value()) {
+                convert_into(src.router.bias.value(), shard_dst(dst.router.bias.value()));
+            }
 	            if (src.experts.use_batched && dst.experts.use_batched) {
 	                convert_into(src.experts.gate_up_proj, shard_dst(dst.experts.gate_up_proj));
 	                convert_into(src.experts.down_proj, shard_dst(dst.experts.down_proj));
@@ -167,6 +212,21 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
 	            gather_full(dst.mlp_up_weight);
 	            gather_full(dst.mlp_down_weight);
 	        }
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (dst.mamba.has_value()) {
+                auto& md = *dst.mamba;
+                gather_full(md.in_proj_weight);
+                if (md.in_proj_bias.has_value()) gather_full(md.in_proj_bias.value());
+                gather_full(md.out_proj_weight);
+                if (md.out_proj_bias.has_value()) gather_full(md.out_proj_bias.value());
+                gather_full(md.conv1d_weight);
+                if (md.conv1d_bias.has_value()) gather_full(md.conv1d_bias.value());
+                gather_full(md.A_log);
+                gather_full(md.D);
+                gather_full(md.dt_bias);
+                gather_full(md.norm_weight);
+            }
+        }
 	        if constexpr (has_moe_weights<BlockWeights>::value) {
 	            gather_full(dst.router.gate);
 	            if (dst.router.bias.has_value()) gather_full(dst.router.bias.value());
@@ -215,6 +275,28 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
 	        dst.mlp_up_weight.Stats = master_src.mlp_up_weight.Stats;
 	        dst.mlp_down_weight.Stats = master_src.mlp_down_weight.Stats;
 	    }
+    if constexpr (has_mamba_weights<BlockWeights>::value) {
+        if (master_src.mamba.has_value() && dst.mamba.has_value()) {
+            auto& ms = *master_src.mamba;
+            auto& md = *dst.mamba;
+            md.in_proj_weight.Stats = ms.in_proj_weight.Stats;
+            if (ms.in_proj_bias.has_value() && md.in_proj_bias.has_value()) {
+                md.in_proj_bias->Stats = ms.in_proj_bias->Stats;
+            }
+            md.out_proj_weight.Stats = ms.out_proj_weight.Stats;
+            if (ms.out_proj_bias.has_value() && md.out_proj_bias.has_value()) {
+                md.out_proj_bias->Stats = ms.out_proj_bias->Stats;
+            }
+            md.conv1d_weight.Stats = ms.conv1d_weight.Stats;
+            if (ms.conv1d_bias.has_value() && md.conv1d_bias.has_value()) {
+                md.conv1d_bias->Stats = ms.conv1d_bias->Stats;
+            }
+            md.A_log.Stats = ms.A_log.Stats;
+            md.D.Stats = ms.D.Stats;
+            md.dt_bias.Stats = ms.dt_bias.Stats;
+            md.norm_weight.Stats = ms.norm_weight.Stats;
+        }
+    }
 	    if constexpr (has_moe_weights<BlockWeights>::value) {
 	        dst.router.gate.Stats = master_src.router.gate.Stats;
 	        if (master_src.router.bias.has_value() && dst.router.bias.has_value()) {
@@ -256,6 +338,28 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
 	            convert_into(master_src.mlp_up_weight, quant_dst.mlp_up_weight);
 	            convert_into(master_src.mlp_down_weight, quant_dst.mlp_down_weight);
 	        }
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (master_src.mamba.has_value() && quant_dst.mamba.has_value()) {
+                auto& ms = *master_src.mamba;
+                auto& md = *quant_dst.mamba;
+                convert_into(ms.in_proj_weight, md.in_proj_weight);
+                if (ms.in_proj_bias.has_value() && md.in_proj_bias.has_value()) {
+                    convert_into(ms.in_proj_bias.value(), md.in_proj_bias.value());
+                }
+                convert_into(ms.out_proj_weight, md.out_proj_weight);
+                if (ms.out_proj_bias.has_value() && md.out_proj_bias.has_value()) {
+                    convert_into(ms.out_proj_bias.value(), md.out_proj_bias.value());
+                }
+                convert_into(ms.conv1d_weight, md.conv1d_weight);
+                if (ms.conv1d_bias.has_value() && md.conv1d_bias.has_value()) {
+                    convert_into(ms.conv1d_bias.value(), md.conv1d_bias.value());
+                }
+                convert_into(ms.A_log, md.A_log);
+                convert_into(ms.D, md.D);
+                convert_into(ms.dt_bias, md.dt_bias);
+                convert_into(ms.norm_weight, md.norm_weight);
+            }
+        }
 	        if constexpr (has_moe_weights<BlockWeights>::value) {
 	            convert_into(master_src.router.gate, quant_dst.router.gate);
 	            if (master_src.router.bias.has_value() && quant_dst.router.bias.has_value()) {
@@ -301,6 +405,28 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
 	                convert_into(master_src.mlp_up_weight, quant_device.mlp_up_weight);
 	                convert_into(master_src.mlp_down_weight, quant_device.mlp_down_weight);
 	            }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (master_src.mamba.has_value() && quant_device.mamba.has_value()) {
+                    auto& ms = *master_src.mamba;
+                    auto& md = *quant_device.mamba;
+                    convert_into(ms.in_proj_weight, md.in_proj_weight);
+                    if (ms.in_proj_bias.has_value() && md.in_proj_bias.has_value()) {
+                        convert_into(ms.in_proj_bias.value(), md.in_proj_bias.value());
+                    }
+                    convert_into(ms.out_proj_weight, md.out_proj_weight);
+                    if (ms.out_proj_bias.has_value() && md.out_proj_bias.has_value()) {
+                        convert_into(ms.out_proj_bias.value(), md.out_proj_bias.value());
+                    }
+                    convert_into(ms.conv1d_weight, md.conv1d_weight);
+                    if (ms.conv1d_bias.has_value() && md.conv1d_bias.has_value()) {
+                        convert_into(ms.conv1d_bias.value(), md.conv1d_bias.value());
+                    }
+                    convert_into(ms.A_log, md.A_log);
+                    convert_into(ms.D, md.D);
+                    convert_into(ms.dt_bias, md.dt_bias);
+                    convert_into(ms.norm_weight, md.norm_weight);
+                }
+            }
 	            if constexpr (has_moe_weights<BlockWeights>::value) {
 	                convert_into(master_src.router.gate, quant_device.router.gate);
 	                if (master_src.router.bias.has_value() && quant_device.router.bias.has_value()) {
@@ -333,6 +459,28 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
 	                copy_d2h(quant_device.mlp_up_weight, quant_host.mlp_up_weight);
 	                copy_d2h(quant_device.mlp_down_weight, quant_host.mlp_down_weight);
 	            }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (quant_device.mamba.has_value() && quant_host.mamba.has_value()) {
+                    auto& ms = *quant_device.mamba;
+                    auto& mh = *quant_host.mamba;
+                    copy_d2h(ms.in_proj_weight, mh.in_proj_weight);
+                    if (ms.in_proj_bias.has_value() && mh.in_proj_bias.has_value()) {
+                        copy_d2h(ms.in_proj_bias.value(), mh.in_proj_bias.value());
+                    }
+                    copy_d2h(ms.out_proj_weight, mh.out_proj_weight);
+                    if (ms.out_proj_bias.has_value() && mh.out_proj_bias.has_value()) {
+                        copy_d2h(ms.out_proj_bias.value(), mh.out_proj_bias.value());
+                    }
+                    copy_d2h(ms.conv1d_weight, mh.conv1d_weight);
+                    if (ms.conv1d_bias.has_value() && mh.conv1d_bias.has_value()) {
+                        copy_d2h(ms.conv1d_bias.value(), mh.conv1d_bias.value());
+                    }
+                    copy_d2h(ms.A_log, mh.A_log);
+                    copy_d2h(ms.D, mh.D);
+                    copy_d2h(ms.dt_bias, mh.dt_bias);
+                    copy_d2h(ms.norm_weight, mh.norm_weight);
+                }
+            }
 	            if constexpr (has_moe_weights<BlockWeights>::value) {
 	                copy_d2h(quant_device.router.gate, quant_host.router.gate);
 	                if (quant_device.router.bias.has_value() && quant_host.router.bias.has_value()) {
@@ -366,6 +514,28 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
 	                copy_h2d(quant_host.mlp_up_weight, quant_device.mlp_up_weight);
 	                copy_h2d(quant_host.mlp_down_weight, quant_device.mlp_down_weight);
 	            }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (quant_host.mamba.has_value() && quant_device.mamba.has_value()) {
+                    auto& mh = *quant_host.mamba;
+                    auto& md = *quant_device.mamba;
+                    copy_h2d(mh.in_proj_weight, md.in_proj_weight);
+                    if (mh.in_proj_bias.has_value() && md.in_proj_bias.has_value()) {
+                        copy_h2d(mh.in_proj_bias.value(), md.in_proj_bias.value());
+                    }
+                    copy_h2d(mh.out_proj_weight, md.out_proj_weight);
+                    if (mh.out_proj_bias.has_value() && md.out_proj_bias.has_value()) {
+                        copy_h2d(mh.out_proj_bias.value(), md.out_proj_bias.value());
+                    }
+                    copy_h2d(mh.conv1d_weight, md.conv1d_weight);
+                    if (mh.conv1d_bias.has_value() && md.conv1d_bias.has_value()) {
+                        copy_h2d(mh.conv1d_bias.value(), md.conv1d_bias.value());
+                    }
+                    copy_h2d(mh.A_log, md.A_log);
+                    copy_h2d(mh.D, md.D);
+                    copy_h2d(mh.dt_bias, md.dt_bias);
+                    copy_h2d(mh.norm_weight, md.norm_weight);
+                }
+            }
 	            if constexpr (has_moe_weights<BlockWeights>::value) {
 	                copy_h2d(quant_host.router.gate, quant_device.router.gate);
 	                if (quant_host.router.bias.has_value() && quant_device.router.bias.has_value()) {
@@ -516,15 +686,30 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
         if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
     }
     gather_full(dst.ln2.weight);
-	    if constexpr (has_mlp_weights<BlockWeights>::value) {
-	        gather_full(dst.mlp_up_weight);
-	        gather_full(dst.mlp_down_weight);
-	    }
-	    if constexpr (has_moe_weights<BlockWeights>::value) {
-	        gather_full(dst.router.gate);
-	        if (dst.router.bias.has_value()) gather_full(dst.router.bias.value());
-	        if (dst.experts.use_batched) {
-	            gather_full(dst.experts.gate_up_proj);
+	        if constexpr (has_mlp_weights<BlockWeights>::value) {
+	            gather_full(dst.mlp_up_weight);
+	            gather_full(dst.mlp_down_weight);
+	        }
+    if constexpr (has_mamba_weights<BlockWeights>::value) {
+        if (dst.mamba.has_value()) {
+            auto& md = *dst.mamba;
+            gather_full(md.in_proj_weight);
+            if (md.in_proj_bias.has_value()) gather_full(md.in_proj_bias.value());
+            gather_full(md.out_proj_weight);
+            if (md.out_proj_bias.has_value()) gather_full(md.out_proj_bias.value());
+            gather_full(md.conv1d_weight);
+            if (md.conv1d_bias.has_value()) gather_full(md.conv1d_bias.value());
+            gather_full(md.A_log);
+            gather_full(md.D);
+            gather_full(md.dt_bias);
+            gather_full(md.norm_weight);
+        }
+    }
+	        if constexpr (has_moe_weights<BlockWeights>::value) {
+	            gather_full(dst.router.gate);
+	            if (dst.router.bias.has_value()) gather_full(dst.router.bias.value());
+	            if (dst.experts.use_batched) {
+	                gather_full(dst.experts.gate_up_proj);
 	            gather_full(dst.experts.down_proj);
 	        }
 	        if (dst.shared_expert.has_value()) {
@@ -578,6 +763,7 @@ typename Block::Weights& ModularWeightManager<Block>::get_block(int layer_idx, c
             const long Hkv = cfg.num_kv_heads;
             const long Hs = cfg.head_size;
             const long D = cfg.intermediate_size;
+            const long M = mlp_up_rows(cfg);
             const long QKV_C = (Hq + 2 * Hkv) * Hs;
 
             auto cutlass_scale_size = [](long rows, long cols) -> long {
@@ -599,9 +785,9 @@ typename Block::Weights& ModularWeightManager<Block>::get_block(int layer_idx, c
             long mlp_up_scale_size_t = 0;
             long mlp_down_scale_size_t = 0;
             if constexpr (has_mlp_weights<BlockWeights>::value) {
-                mlp_up_scale_size = cutlass_scale_size(2 * D, C);
+                mlp_up_scale_size = cutlass_scale_size(M, C);
                 mlp_down_scale_size = cutlass_scale_size(C, D);
-                mlp_up_scale_size_t = cutlass_scale_size(C, 2 * D);
+                mlp_up_scale_size_t = cutlass_scale_size(C, M);
                 mlp_down_scale_size_t = cutlass_scale_size(D, C);
             }
 
@@ -619,7 +805,7 @@ typename Block::Weights& ModularWeightManager<Block>::get_block(int layer_idx, c
                 mFP4WeightCache.o_weight.scales = slice(mFP4WeightScalesAll[1], 0, l * o_scale_size, (l + 1) * o_scale_size);
 
                 if constexpr (has_mlp_weights<BlockWeights>::value) {
-                    mFP4WeightCache.mlp_up_weight.data = slice(mFP4WeightDataAll[2], 0, l * (2 * D), (l + 1) * (2 * D));
+                    mFP4WeightCache.mlp_up_weight.data = slice(mFP4WeightDataAll[2], 0, l * M, (l + 1) * M);
                     mFP4WeightCache.mlp_up_weight.scales = slice(mFP4WeightScalesAll[2], 0, l * mlp_up_scale_size, (l + 1) * mlp_up_scale_size);
 
                     mFP4WeightCache.mlp_down_weight.data = slice(mFP4WeightDataAll[3], 0, l * C, (l + 1) * C);

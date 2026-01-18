@@ -27,6 +27,7 @@
 #include "kernels/kernels.h"
 #include "models/llama/config.h"
 #include "models/registry.h"
+#include "modules/mlp_utils.h"
 #include "modules/weights/weight_manager_helpers.h"
 #include "modules/weights/weight_mapping.h"
 #include "utilities/comm.h"
@@ -43,11 +44,24 @@ void ModularWeightManager<Block>::iterate_tensors(
     const auto& cfg = mConfig.block_config;
     long C = cfg.hidden_size;
     long D = cfg.intermediate_size;
+    long M = mlp_up_rows(cfg);
     long HS = cfg.head_size;
     long HQ = cfg.num_query_heads;
     long HKV = cfg.num_kv_heads;
     long qkv_rows = HS * (HQ + 2 * HKV);
     long q_rows = HS * HQ;
+    long mamba_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_dim(); }) return cfg.mamba_dim();
+        return 0;
+    }();
+    long mamba_conv_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_conv_dim(); }) return cfg.mamba_conv_dim();
+        return 0;
+    }();
+    long mamba_proj = [&]() -> long {
+        if constexpr (requires { cfg.mamba_proj_size(); }) return cfg.mamba_proj_size();
+        return 0;
+    }();
 
     auto shard = [&](const Tensor& t, const std::vector<long>& global_shape) -> TensorShard {
         if (mConfig.num_shards == 1) return TensorShard(t);
@@ -97,8 +111,31 @@ void ModularWeightManager<Block>::iterate_tensors(
 
         // MLP weights - only for dense blocks
         if constexpr (has_mlp_weights<BlockWeights>::value) {
-            callback(prefix + ".mlp.up.weight", shard(block.mlp_up_weight, {2 * D, C}));
+            callback(prefix + ".mlp.up.weight", shard(block.mlp_up_weight, {M, C}));
             callback(prefix + ".mlp.down_proj.weight", shard(block.mlp_down_weight, {C, D}));
+        }
+
+        // Mamba weights (optional for hybrid blocks)
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (block.mamba.has_value()) {
+                const auto& mw = *block.mamba;
+                callback(prefix + ".mamba.in_proj.weight", shard(mw.in_proj_weight, {mamba_proj, C}));
+                if (mw.in_proj_bias.has_value()) {
+                    callback(prefix + ".mamba.in_proj.bias", shard(mw.in_proj_bias.value(), {mamba_proj}));
+                }
+                callback(prefix + ".mamba.out_proj.weight", shard(mw.out_proj_weight, {C, mamba_dim}));
+                if (mw.out_proj_bias.has_value()) {
+                    callback(prefix + ".mamba.out_proj.bias", shard(mw.out_proj_bias.value(), {C}));
+                }
+                callback(prefix + ".mamba.conv1d.weight", shard(mw.conv1d_weight, {mamba_conv_dim, 1, cfg.mamba_conv_kernel}));
+                if (mw.conv1d_bias.has_value()) {
+                    callback(prefix + ".mamba.conv1d.bias", shard(mw.conv1d_bias.value(), {mamba_conv_dim}));
+                }
+                callback(prefix + ".mamba.A_log", shard(mw.A_log, {cfg.mamba_num_heads}));
+                callback(prefix + ".mamba.D", shard(mw.D, {cfg.mamba_num_heads}));
+                callback(prefix + ".mamba.dt_bias", shard(mw.dt_bias, {cfg.mamba_num_heads}));
+                callback(prefix + ".mamba.norm.weight", shard(mw.norm_weight, {mamba_dim}));
+            }
         }
 
         // MoE-specific weights (router, experts) - only for MoE blocks
@@ -146,9 +183,11 @@ void ModularWeightManager<Block>::random_init(int seed, NCCLCommunicator& comm) 
 
     float scale = 0.02f;
     float residual_scale = 1.0f / std::sqrt(2.0f * static_cast<float>(mConfig.num_layers));
+    const auto& cfg = mConfig.block_config;
 
     for (int l = 0; l < mConfig.num_layers; ++l) {
         auto local_seeds = rng.generate(comm.rank(), l);
+        auto mamba_seeds = rng.generate(comm.rank(), l + 7919);
         auto& layer = mMasterBlocks[l];
 
         fill_constant(layer.ln1.weight, 1.f, layer.ln1.weight.nelem(), nullptr);
@@ -171,15 +210,61 @@ void ModularWeightManager<Block>::random_init(int seed, NCCLCommunicator& comm) 
             fill_zero(layer.attention.qkv_bias.value(), nullptr);
         }
 
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (layer.mamba.has_value()) {
+                auto& mw = *layer.mamba;
+                fill_normal(mw.in_proj_weight, mw.in_proj_weight.nelem(), 0.f, scale, seed, mamba_seeds[0], nullptr);
+                if (mw.in_proj_bias.has_value()) {
+                    fill_zero(mw.in_proj_bias.value(), nullptr);
+                }
+                fill_normal(mw.conv1d_weight, mw.conv1d_weight.nelem(), 0.f, scale, seed, mamba_seeds[1], nullptr);
+                if (mw.conv1d_bias.has_value()) {
+                    fill_zero(mw.conv1d_bias.value(), nullptr);
+                }
+                fill_constant(mw.norm_weight, 1.f, mw.norm_weight.nelem(), nullptr);
+
+                // Initialize SSM parameters
+                if (mw.A_log.Data) {
+                    std::vector<float> h_A(cfg.mamba_num_heads);
+                    for (int i = 0; i < cfg.mamba_num_heads; ++i) {
+                        h_A[i] = std::log(static_cast<float>(i + 1));
+                    }
+                    CUDA_CHECK(cudaMemcpy(mw.A_log.Data, h_A.data(), h_A.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+                if (mw.D.Data) {
+                    fill_constant(mw.D, 1.f, mw.D.nelem(), nullptr);
+                }
+                if (mw.dt_bias.Data) {
+                    fill_constant(mw.dt_bias, 1.f, mw.dt_bias.nelem(), nullptr);
+                }
+            }
+        }
+
         if (mConfig.init_projections_to_zero) {
             fill_zero(layer.attention.out_weight, nullptr);
             if constexpr (has_mlp_weights<BlockWeights>::value) {
                 fill_zero(layer.mlp_down_weight, nullptr);
             }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (layer.mamba.has_value()) {
+                    fill_zero(layer.mamba->out_proj_weight, nullptr);
+                    if (layer.mamba->out_proj_bias.has_value()) {
+                        fill_zero(layer.mamba->out_proj_bias.value(), nullptr);
+                    }
+                }
+            }
         } else {
             fill_normal(layer.attention.out_weight, layer.attention.out_weight.nelem(), 0.f, scale * residual_scale, seed, local_seeds[3], nullptr);
             if constexpr (has_mlp_weights<BlockWeights>::value) {
                 fill_normal(layer.mlp_down_weight, layer.mlp_down_weight.nelem(), 0.f, scale * residual_scale, seed, local_seeds[2], nullptr);
+            }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (layer.mamba.has_value()) {
+                    fill_normal(layer.mamba->out_proj_weight, layer.mamba->out_proj_weight.nelem(), 0.f, scale * residual_scale, seed, mamba_seeds[2], nullptr);
+                    if (layer.mamba->out_proj_bias.has_value()) {
+                        fill_zero(layer.mamba->out_proj_bias.value(), nullptr);
+                    }
+                }
             }
         }
     }
@@ -240,12 +325,25 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
     const auto& cfg = mConfig.block_config;
     const long C = cfg.hidden_size;
     const long D = cfg.intermediate_size;
+    const long M = mlp_up_rows(cfg);
     const long HS = cfg.head_size;
     const long HQ = cfg.num_query_heads;
     const long HKV = cfg.num_kv_heads;
     const long q_rows = HS * HQ;
     const long kv_rows = HS * HKV;
     const long fused_rows = q_rows + 2 * kv_rows;
+    const long mamba_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_dim(); }) return cfg.mamba_dim();
+        return 0;
+    }();
+    const long mamba_conv_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_conv_dim(); }) return cfg.mamba_conv_dim();
+        return 0;
+    }();
+    const long mamba_proj = [&]() -> long {
+        if constexpr (requires { cfg.mamba_proj_size(); }) return cfg.mamba_proj_size();
+        return 0;
+    }();
 
     const bool load_sharded =
         mStreamWeights ||
@@ -317,12 +415,82 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
                 return std::nullopt;
             case TensorTarget::MLPUpWeight:
                 if constexpr (has_mlp_weights<BlockWeights>::value) {
-                    return make_shard(block.mlp_up_weight, {2 * D, C});
+                    return make_shard(block.mlp_up_weight, {M, C});
                 }
                 return std::nullopt;
             case TensorTarget::MLPDownWeight:
                 if constexpr (has_mlp_weights<BlockWeights>::value) {
                     return make_shard(block.mlp_down_weight, {C, D});
+                }
+                return std::nullopt;
+            case TensorTarget::MambaInProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->in_proj_weight, {mamba_proj, C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaInProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->in_proj_bias.has_value()) {
+                        return make_shard(block.mamba->in_proj_bias.value(), {mamba_proj});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->out_proj_weight, {C, mamba_dim});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->out_proj_bias.has_value()) {
+                        return make_shard(block.mamba->out_proj_bias.value(), {C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->conv1d_weight, {mamba_conv_dim, 1, cfg.mamba_conv_kernel});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->conv1d_bias.has_value()) {
+                        return make_shard(block.mamba->conv1d_bias.value(), {mamba_conv_dim});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaALog:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->A_log, {cfg.mamba_num_heads});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaD:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->D, {cfg.mamba_num_heads});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaDtBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->dt_bias, {cfg.mamba_num_heads});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaNormWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->norm_weight, {mamba_dim});
+                    }
                 }
                 return std::nullopt;
 
@@ -653,6 +821,76 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
             case TensorTarget::MLPDownWeight:
                 if constexpr (has_mlp_weights<BlockWeights>::value) {
                     return block.mlp_down_weight;
+                }
+                return std::nullopt;
+            case TensorTarget::MambaInProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->in_proj_weight;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaInProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->in_proj_bias.has_value()) {
+                        return block.mamba->in_proj_bias.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->out_proj_weight;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->out_proj_bias.has_value()) {
+                        return block.mamba->out_proj_bias.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->conv1d_weight;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->conv1d_bias.has_value()) {
+                        return block.mamba->conv1d_bias.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaALog:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->A_log;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaD:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->D;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaDtBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->dt_bias;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaNormWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->norm_weight;
+                    }
                 }
                 return std::nullopt;
 

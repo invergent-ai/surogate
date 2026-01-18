@@ -108,6 +108,28 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                 add_tensor(bw.mlp_down_weight.nelem());
             }
 
+            if constexpr (requires { bw.mamba; }) {
+                if (bw.mamba.has_value()) {
+                    auto& mw = *bw.mamba;
+                    add_tensor(mw.in_proj_weight.nelem());
+                    if (mw.in_proj_bias.has_value()) {
+                        add_tensor(mw.in_proj_bias->nelem());
+                    }
+                    add_tensor(mw.out_proj_weight.nelem());
+                    if (mw.out_proj_bias.has_value()) {
+                        add_tensor(mw.out_proj_bias->nelem());
+                    }
+                    add_tensor(mw.conv1d_weight.nelem());
+                    if (mw.conv1d_bias.has_value()) {
+                        add_tensor(mw.conv1d_bias->nelem());
+                    }
+                    add_tensor(mw.A_log.nelem());
+                    add_tensor(mw.D.nelem());
+                    add_tensor(mw.dt_bias.nelem());
+                    add_tensor(mw.norm_weight.nelem());
+                }
+            }
+
             if constexpr (has_moe_weights<typename Block::Weights>::value) {
                 add_tensor(bw.router.gate.nelem());
                 if (bw.experts.use_batched) {
@@ -316,6 +338,29 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
         if constexpr (has_mlp_weights<typename Block::Weights>::value) {
             run_8bit_update("mlp_up_weight", bw.mlp_up_weight, bg.d_mlp_up_weight, weight_decay);
             run_8bit_update("mlp_down_weight", bw.mlp_down_weight, bg.d_mlp_down_weight, weight_decay);
+        }
+
+        if constexpr (requires { bw.mamba; bg.mamba; }) {
+            if (bw.mamba.has_value() && bg.mamba.has_value()) {
+                auto& mw = *bw.mamba;
+                auto& mg = *bg.mamba;
+                run_8bit_update("mamba.in_proj_weight", mw.in_proj_weight, mg.d_in_proj_weight, weight_decay);
+                if (mw.in_proj_bias.has_value() && mg.d_in_proj_bias.has_value()) {
+                    run_8bit_update("mamba.in_proj_bias", mw.in_proj_bias.value(), mg.d_in_proj_bias.value(), 0.f);
+                }
+                run_8bit_update("mamba.out_proj_weight", mw.out_proj_weight, mg.d_out_proj_weight, weight_decay);
+                if (mw.out_proj_bias.has_value() && mg.d_out_proj_bias.has_value()) {
+                    run_8bit_update("mamba.out_proj_bias", mw.out_proj_bias.value(), mg.d_out_proj_bias.value(), 0.f);
+                }
+                run_8bit_update("mamba.conv1d_weight", mw.conv1d_weight, mg.d_conv1d_weight, weight_decay);
+                if (mw.conv1d_bias.has_value() && mg.d_conv1d_bias.has_value()) {
+                    run_8bit_update("mamba.conv1d_bias", mw.conv1d_bias.value(), mg.d_conv1d_bias.value(), 0.f);
+                }
+                run_8bit_update("mamba.A_log", mw.A_log, mg.d_A_log, 0.f);
+                run_8bit_update("mamba.D", mw.D, mg.d_D, 0.f);
+                run_8bit_update("mamba.dt_bias", mw.dt_bias, mg.d_dt_bias, 0.f);
+                run_8bit_update("mamba.norm_weight", mw.norm_weight, mg.d_norm_weight, 0.f);
+            }
         }
 
         if constexpr (has_moe_weights<typename Block::Weights>::value) {

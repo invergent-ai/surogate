@@ -6,6 +6,7 @@
 #define SUROGATE_SRC_MODULES_GRADIENT_MANAGER_H
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "utilities/tensor.h"
 #include "utilities/philox.h"
 #include "utilities/comm.h"
+#include "modules/mlp_utils.h"
 
 namespace modules {
 
@@ -67,6 +69,10 @@ public:
         int vocab_size;
         int hidden_size;
         bool tied_embeddings = false;
+
+        // Hybrid layer markers (optional)
+        bool has_mamba = false;
+        std::vector<std::uint8_t> layer_is_mamba;
     };
 
     /**
@@ -193,8 +199,8 @@ private:
     void all_to_all_block(int layer_idx, BlockGradients& grads, cudaStream_t stream, cudaEvent_t signal, NCCLCommunicator& comm);
     void sr_accumulate_layer_all_to_all(int layer_idx, BlockGradients& full, BlockGradients& shard, cudaStream_t stream, NCCLCommunicator& comm);
     void sr_accumulate_tensor_shard(Tensor& dst, Tensor& src, cudaStream_t stream, bool first, float scale, int shard, unsigned seed);
-    void allocate_block_gradients(BlockGradients& grads, ETensorDType dtype);
-    void allocate_block_gradients_shard(BlockGradients& grads, ETensorDType dtype);
+    void allocate_block_gradients(BlockGradients& grads, ETensorDType dtype, int layer_idx, bool force_mamba = false);
+    void allocate_block_gradients_shard(BlockGradients& grads, ETensorDType dtype, int layer_idx);
     void allocate_non_block_gradients(NonBlockGradients& grads, ETensorDType dtype);
 };
 
@@ -219,7 +225,7 @@ ModularGradientManager<Block>::ModularGradientManager(
         // optimization anyway - the double-buffering logic would fail with only one buffer.
         mConfig.shard_gradients = false;
         
-        allocate_block_gradients(mBlockBuffers[0], config.grad_dtype);
+        allocate_block_gradients(mBlockBuffers[0], config.grad_dtype, /*layer_idx=*/-1);
         CUDA_CHECK(cudaEventCreate(&mBlockStates[0].Event));
 
         // Point all layers to the shared buffer
@@ -232,20 +238,20 @@ ModularGradientManager<Block>::ModularGradientManager(
     } else if (config.shard_gradients) {
         // ZeRO-2: persistent per-layer sharded gradients + 2 full buffers for backward.
         for (int i = 0; i < 2; ++i) {
-            allocate_block_gradients(mBlockBuffers[i], config.grad_dtype);
+            allocate_block_gradients(mBlockBuffers[i], config.grad_dtype, /*layer_idx=*/-1);
             CUDA_CHECK(cudaEventCreate(&mBlockStates[i].Event));
         }
 
         mShardGradients.resize(config.num_layers);
         for (int i = 0; i < config.num_layers; ++i) {
-            allocate_block_gradients_shard(mShardGradients[i], config.grad_dtype);
+            allocate_block_gradients_shard(mShardGradients[i], config.grad_dtype, i);
         }
     } else {
         // ZeRO-1: full gradients per layer; optimizer reads a shard view after reduce-scatter.
         mFullGradients.resize(config.num_layers);
         mShardGradients.resize(config.num_layers);
         for (int i = 0; i < config.num_layers; ++i) {
-            allocate_block_gradients(mFullGradients[i], config.grad_dtype);
+            allocate_block_gradients(mFullGradients[i], config.grad_dtype, i);
             mShardGradients[i] = mFullGradients[i];
 
             if (config.num_shards > 1) {
@@ -312,6 +318,32 @@ ModularGradientManager<Block>::ModularGradientManager(
 
                 if constexpr (requires { full.d_mlp_up_weight; shard.d_mlp_up_weight; }) shard.d_mlp_up_weight = shard_tensor(full.d_mlp_up_weight);
                 if constexpr (requires { full.d_mlp_down_weight; shard.d_mlp_down_weight; }) shard.d_mlp_down_weight = shard_tensor(full.d_mlp_down_weight);
+
+                if constexpr (requires { full.mamba; shard.mamba; }) {
+                    if (full.mamba.has_value()) {
+                        if (!shard.mamba.has_value()) {
+                            shard.mamba.emplace();
+                        }
+                        auto& fs = *full.mamba;
+                        auto& ss = *shard.mamba;
+                        ss.d_in_proj_weight = shard_tensor(fs.d_in_proj_weight);
+                        if (fs.d_in_proj_bias.has_value()) {
+                            ss.d_in_proj_bias = shard_tensor(fs.d_in_proj_bias.value());
+                        }
+                        ss.d_out_proj_weight = shard_tensor(fs.d_out_proj_weight);
+                        if (fs.d_out_proj_bias.has_value()) {
+                            ss.d_out_proj_bias = shard_tensor(fs.d_out_proj_bias.value());
+                        }
+                        ss.d_conv1d_weight = shard_tensor(fs.d_conv1d_weight);
+                        if (fs.d_conv1d_bias.has_value()) {
+                            ss.d_conv1d_bias = shard_tensor(fs.d_conv1d_bias.value());
+                        }
+                        ss.d_A_log = shard_tensor(fs.d_A_log);
+                        ss.d_D = shard_tensor(fs.d_D);
+                        ss.d_dt_bias = shard_tensor(fs.d_dt_bias);
+                        ss.d_norm_weight = shard_tensor(fs.d_norm_weight);
+                    }
+                }
             }
         }
     }
@@ -452,6 +484,22 @@ template<typename Block>
 
             if constexpr (requires { block.d_mlp_up_weight; }) fill_zero(block.d_mlp_up_weight, stream);
             if constexpr (requires { block.d_mlp_down_weight; }) fill_zero(block.d_mlp_down_weight, stream);
+
+            if constexpr (requires { block.mamba; }) {
+                if (block.mamba.has_value()) {
+                    auto& mg = *block.mamba;
+                    fill_zero(mg.d_in_proj_weight, stream);
+                    if (mg.d_in_proj_bias.has_value()) fill_zero(mg.d_in_proj_bias.value(), stream);
+                    fill_zero(mg.d_out_proj_weight, stream);
+                    if (mg.d_out_proj_bias.has_value()) fill_zero(mg.d_out_proj_bias.value(), stream);
+                    fill_zero(mg.d_conv1d_weight, stream);
+                    if (mg.d_conv1d_bias.has_value()) fill_zero(mg.d_conv1d_bias.value(), stream);
+                    fill_zero(mg.d_A_log, stream);
+                    fill_zero(mg.d_D, stream);
+                    fill_zero(mg.d_dt_bias, stream);
+                    fill_zero(mg.d_norm_weight, stream);
+                }
+            }
 
             if constexpr (requires { block.router.d_gate; }) fill_zero(block.router.d_gate, stream);
             if constexpr (requires { block.experts.d_gate_up_proj; }) fill_zero(block.experts.d_gate_up_proj, stream);
@@ -705,6 +753,22 @@ void ModularGradientManager<Block>::scatter_reduce_block(BlockGradients& grads, 
     if constexpr (requires { grads.d_mlp_up_weight; }) maybe_schedule(grads.d_mlp_up_weight);
     if constexpr (requires { grads.d_mlp_down_weight; }) maybe_schedule(grads.d_mlp_down_weight);
 
+    if constexpr (requires { grads.mamba; }) {
+        if (grads.mamba.has_value()) {
+            auto& mg = *grads.mamba;
+            maybe_schedule(mg.d_in_proj_weight);
+            if (mg.d_in_proj_bias.has_value()) maybe_schedule(mg.d_in_proj_bias.value());
+            maybe_schedule(mg.d_out_proj_weight);
+            if (mg.d_out_proj_bias.has_value()) maybe_schedule(mg.d_out_proj_bias.value());
+            maybe_schedule(mg.d_conv1d_weight);
+            if (mg.d_conv1d_bias.has_value()) maybe_schedule(mg.d_conv1d_bias.value());
+            maybe_schedule(mg.d_A_log);
+            maybe_schedule(mg.d_D);
+            maybe_schedule(mg.d_dt_bias);
+            maybe_schedule(mg.d_norm_weight);
+        }
+    }
+
     if constexpr (requires { grads.router.d_gate; }) maybe_schedule(grads.router.d_gate);
     if constexpr (requires { grads.experts.d_gate_up_proj; }) maybe_schedule(grads.experts.d_gate_up_proj);
     if constexpr (requires { grads.experts.d_down_proj; }) maybe_schedule(grads.experts.d_down_proj);
@@ -761,6 +825,29 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
 
     if constexpr (requires { shard.d_mlp_up_weight; grads.d_mlp_up_weight; }) acc_local(shard.d_mlp_up_weight, grads.d_mlp_up_weight, rng_2[0]);
     if constexpr (requires { shard.d_mlp_down_weight; grads.d_mlp_down_weight; }) acc_local(shard.d_mlp_down_weight, grads.d_mlp_down_weight, rng_2[1]);
+
+    if constexpr (requires { shard.mamba; grads.mamba; }) {
+        if (shard.mamba.has_value() && grads.mamba.has_value()) {
+            auto& ss = *shard.mamba;
+            auto& gs = *grads.mamba;
+            acc_local(ss.d_in_proj_weight, gs.d_in_proj_weight, rng_1[2] ^ 0x1f83d9abu);
+            if (ss.d_in_proj_bias.has_value() && gs.d_in_proj_bias.has_value()) {
+                acc_local(ss.d_in_proj_bias.value(), gs.d_in_proj_bias.value(), rng_1[2] ^ 0x85ebca6bu);
+            }
+            acc_local(ss.d_out_proj_weight, gs.d_out_proj_weight, rng_1[3] ^ 0x9e3779b9u);
+            if (ss.d_out_proj_bias.has_value() && gs.d_out_proj_bias.has_value()) {
+                acc_local(ss.d_out_proj_bias.value(), gs.d_out_proj_bias.value(), rng_1[3] ^ 0xc2b2ae35u);
+            }
+            acc_local(ss.d_conv1d_weight, gs.d_conv1d_weight, rng_2[1] ^ 0x27d4eb2fu);
+            if (ss.d_conv1d_bias.has_value() && gs.d_conv1d_bias.has_value()) {
+                acc_local(ss.d_conv1d_bias.value(), gs.d_conv1d_bias.value(), rng_2[1] ^ 0x165667b1u);
+            }
+            acc_local(ss.d_A_log, gs.d_A_log, rng_2[2] ^ 0xd3a2646cu);
+            acc_local(ss.d_D, gs.d_D, rng_2[2] ^ 0xfd7046c5u);
+            acc_local(ss.d_dt_bias, gs.d_dt_bias, rng_2[3] ^ 0x5a48dfe7u);
+            acc_local(ss.d_norm_weight, gs.d_norm_weight, rng_2[3] ^ 0x6a09e667u);
+        }
+    }
 
     if constexpr (requires { shard.router.d_gate; grads.router.d_gate; }) acc_local(shard.router.d_gate, grads.router.d_gate, rng_2[0] ^ 0xa54ff53au);
     if constexpr (requires { shard.experts.d_gate_up_proj; grads.experts.d_gate_up_proj; }) acc_local(shard.experts.d_gate_up_proj, grads.experts.d_gate_up_proj, rng_2[1] ^ 0x510e527fu);
@@ -831,6 +918,22 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
 
     if constexpr (requires { grads.d_mlp_up_weight; }) maybe_schedule(grads.d_mlp_up_weight);
     if constexpr (requires { grads.d_mlp_down_weight; }) maybe_schedule(grads.d_mlp_down_weight);
+
+    if constexpr (requires { grads.mamba; }) {
+        if (grads.mamba.has_value()) {
+            auto& mg = *grads.mamba;
+            maybe_schedule(mg.d_in_proj_weight);
+            if (mg.d_in_proj_bias.has_value()) maybe_schedule(mg.d_in_proj_bias.value());
+            maybe_schedule(mg.d_out_proj_weight);
+            if (mg.d_out_proj_bias.has_value()) maybe_schedule(mg.d_out_proj_bias.value());
+            maybe_schedule(mg.d_conv1d_weight);
+            if (mg.d_conv1d_bias.has_value()) maybe_schedule(mg.d_conv1d_bias.value());
+            maybe_schedule(mg.d_A_log);
+            maybe_schedule(mg.d_D);
+            maybe_schedule(mg.d_dt_bias);
+            maybe_schedule(mg.d_norm_weight);
+        }
+    }
 
     if constexpr (requires { grads.router.d_gate; }) maybe_schedule(grads.router.d_gate);
     if constexpr (requires { grads.experts.d_gate_up_proj; }) maybe_schedule(grads.experts.d_gate_up_proj);
@@ -930,6 +1033,29 @@ void ModularGradientManager<Block>::sr_accumulate_layer(int layer_idx, BlockGrad
         sr_accumulate_tensor(shard.d_mlp_down_weight, full.d_mlp_down_weight, stream, rng_1[3]);
     }
 
+    if constexpr (requires { shard.mamba; full.mamba; }) {
+        if (shard.mamba.has_value() && full.mamba.has_value()) {
+            auto& ss = *shard.mamba;
+            auto& fs = *full.mamba;
+            sr_accumulate_tensor(ss.d_in_proj_weight, fs.d_in_proj_weight, stream, rng_1[2] ^ 0x1f83d9abu);
+            if (ss.d_in_proj_bias.has_value() && fs.d_in_proj_bias.has_value()) {
+                sr_accumulate_tensor(ss.d_in_proj_bias.value(), fs.d_in_proj_bias.value(), stream, rng_1[2] ^ 0x85ebca6bu);
+            }
+            sr_accumulate_tensor(ss.d_out_proj_weight, fs.d_out_proj_weight, stream, rng_1[3] ^ 0x9e3779b9u);
+            if (ss.d_out_proj_bias.has_value() && fs.d_out_proj_bias.has_value()) {
+                sr_accumulate_tensor(ss.d_out_proj_bias.value(), fs.d_out_proj_bias.value(), stream, rng_1[3] ^ 0xc2b2ae35u);
+            }
+            sr_accumulate_tensor(ss.d_conv1d_weight, fs.d_conv1d_weight, stream, rng_2[1] ^ 0x27d4eb2fu);
+            if (ss.d_conv1d_bias.has_value() && fs.d_conv1d_bias.has_value()) {
+                sr_accumulate_tensor(ss.d_conv1d_bias.value(), fs.d_conv1d_bias.value(), stream, rng_2[1] ^ 0x165667b1u);
+            }
+            sr_accumulate_tensor(ss.d_A_log, fs.d_A_log, stream, rng_2[2] ^ 0xd3a2646cu);
+            sr_accumulate_tensor(ss.d_D, fs.d_D, stream, rng_2[2] ^ 0xfd7046c5u);
+            sr_accumulate_tensor(ss.d_dt_bias, fs.d_dt_bias, stream, rng_2[3] ^ 0x5a48dfe7u);
+            sr_accumulate_tensor(ss.d_norm_weight, fs.d_norm_weight, stream, rng_2[3] ^ 0x6a09e667u);
+        }
+    }
+
     if constexpr (requires { shard.router.d_gate; full.router.d_gate; }) {
         sr_accumulate_tensor(shard.router.d_gate, full.router.d_gate, stream, rng_2[0] ^ 0xa54ff53au);
     }
@@ -970,6 +1096,29 @@ void ModularGradientManager<Block>::sr_accumulate_layer_all_to_all(
 
     if constexpr (requires { shard.d_mlp_up_weight; full.d_mlp_up_weight; }) reduce(shard.d_mlp_up_weight, full.d_mlp_up_weight, rng_1[2]);
     if constexpr (requires { shard.d_mlp_down_weight; full.d_mlp_down_weight; }) reduce(shard.d_mlp_down_weight, full.d_mlp_down_weight, rng_1[3]);
+
+    if constexpr (requires { shard.mamba; full.mamba; }) {
+        if (shard.mamba.has_value() && full.mamba.has_value()) {
+            auto& ss = *shard.mamba;
+            auto& fs = *full.mamba;
+            reduce(ss.d_in_proj_weight, fs.d_in_proj_weight, rng_1[2] ^ 0x1f83d9abu);
+            if (ss.d_in_proj_bias.has_value() && fs.d_in_proj_bias.has_value()) {
+                reduce(ss.d_in_proj_bias.value(), fs.d_in_proj_bias.value(), rng_1[2] ^ 0x85ebca6bu);
+            }
+            reduce(ss.d_out_proj_weight, fs.d_out_proj_weight, rng_1[3] ^ 0x9e3779b9u);
+            if (ss.d_out_proj_bias.has_value() && fs.d_out_proj_bias.has_value()) {
+                reduce(ss.d_out_proj_bias.value(), fs.d_out_proj_bias.value(), rng_1[3] ^ 0xc2b2ae35u);
+            }
+            reduce(ss.d_conv1d_weight, fs.d_conv1d_weight, rng_2[1] ^ 0x27d4eb2fu);
+            if (ss.d_conv1d_bias.has_value() && fs.d_conv1d_bias.has_value()) {
+                reduce(ss.d_conv1d_bias.value(), fs.d_conv1d_bias.value(), rng_2[1] ^ 0x165667b1u);
+            }
+            reduce(ss.d_A_log, fs.d_A_log, rng_2[2] ^ 0xd3a2646cu);
+            reduce(ss.d_D, fs.d_D, rng_2[2] ^ 0xfd7046c5u);
+            reduce(ss.d_dt_bias, fs.d_dt_bias, rng_2[3] ^ 0x5a48dfe7u);
+            reduce(ss.d_norm_weight, fs.d_norm_weight, rng_2[3] ^ 0x6a09e667u);
+        }
+    }
 
     if constexpr (requires { shard.attention_grads.d_qkv_weight; full.attention_grads.d_qkv_weight; }) reduce(shard.attention_grads.d_qkv_weight, full.attention_grads.d_qkv_weight, rng_2[0]);
     if constexpr (requires { shard.attention.d_qkv_weight; full.attention.d_qkv_weight; }) reduce(shard.attention.d_qkv_weight, full.attention.d_qkv_weight, rng_2[0]);
@@ -1013,15 +1162,20 @@ void ModularGradientManager<Block>::sr_accumulate_layer_all_to_all(
 }
 
 template<typename Block>
-void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& grads, ETensorDType dtype) {
+void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& grads, ETensorDType dtype, int layer_idx, bool force_mamba) {
     const auto& cfg = mConfig.block_config;
     long C = cfg.hidden_size;
     long D = cfg.intermediate_size;
+    long M = mlp_up_rows(cfg);
     long HS = cfg.head_size;
     long HQ = cfg.num_query_heads;
     long HKV = cfg.num_kv_heads;
     long qkv_channels = HS * (HQ + 2 * HKV);
     long q_rows = HS * HQ;
+    const bool allocate_mamba = mConfig.has_mamba &&
+        (force_mamba || (layer_idx >= 0 &&
+                         layer_idx < static_cast<int>(mConfig.layer_is_mamba.size()) &&
+                         mConfig.layer_is_mamba[static_cast<std::size_t>(layer_idx)] != 0));
 
     auto kind = EAllocationType::ON_DEVICE;
 
@@ -1080,10 +1234,47 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
     }
 
     if constexpr (requires { grads.d_mlp_up_weight; }) {
-        grads.d_mlp_up_weight = mAllocator->allocate(dtype, "d_mlp_up_w", kind, {2 * D, C});
+        grads.d_mlp_up_weight = mAllocator->allocate(dtype, "d_mlp_up_w", kind, {M, C});
     }
     if constexpr (requires { grads.d_mlp_down_weight; }) {
         grads.d_mlp_down_weight = mAllocator->allocate(dtype, "d_mlp_down_w", kind, {C, D});
+    }
+
+    if constexpr (requires { grads.mamba; }) {
+        if (allocate_mamba) {
+            if (!grads.mamba.has_value()) {
+                grads.mamba.emplace();
+            }
+            auto& mg = *grads.mamba;
+            const int mamba_dim = cfg.mamba_dim();
+            const int conv_dim = cfg.mamba_conv_dim();
+            const int proj_size = cfg.mamba_proj_size();
+
+            mg.d_in_proj_weight = mAllocator->allocate(dtype, "d_mamba_in_w", kind, {proj_size, C});
+            if (cfg.mamba_use_bias) {
+                mg.d_in_proj_bias = mAllocator->allocate(dtype, "d_mamba_in_b", kind, {proj_size});
+            } else {
+                mg.d_in_proj_bias.reset();
+            }
+            mg.d_out_proj_weight = mAllocator->allocate(dtype, "d_mamba_out_w", kind, {C, mamba_dim});
+            if (cfg.mamba_use_bias) {
+                mg.d_out_proj_bias = mAllocator->allocate(dtype, "d_mamba_out_b", kind, {C});
+            } else {
+                mg.d_out_proj_bias.reset();
+            }
+            mg.d_conv1d_weight = mAllocator->allocate(dtype, "d_mamba_conv_w", kind, {conv_dim, cfg.mamba_conv_kernel});
+            if (cfg.mamba_use_conv_bias) {
+                mg.d_conv1d_bias = mAllocator->allocate(dtype, "d_mamba_conv_b", kind, {conv_dim});
+            } else {
+                mg.d_conv1d_bias.reset();
+            }
+            mg.d_A_log = mAllocator->allocate(ETensorDType::FP32, "d_mamba_A_log", kind, {cfg.mamba_num_heads});
+            mg.d_D = mAllocator->allocate(ETensorDType::FP32, "d_mamba_D", kind, {cfg.mamba_num_heads});
+            mg.d_dt_bias = mAllocator->allocate(ETensorDType::FP32, "d_mamba_dt_bias", kind, {cfg.mamba_num_heads});
+            mg.d_norm_weight = mAllocator->allocate(dtype, "d_mamba_norm_w", kind, {mamba_dim});
+        } else {
+            grads.mamba.reset();
+        }
     }
 
     // MoE-specific gradients can be extremely large; avoid allocating them in LoRA-only mode where base weights are frozen.
@@ -1104,15 +1295,20 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
 }
 
 template<typename Block>
-void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradients& grads, ETensorDType dtype) {
+void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradients& grads, ETensorDType dtype, int layer_idx) {
     const auto& cfg = mConfig.block_config;
     long C = cfg.hidden_size;
     long D = cfg.intermediate_size;
+    long M = mlp_up_rows(cfg);
     long HS = cfg.head_size;
     long HQ = cfg.num_query_heads;
     long HKV = cfg.num_kv_heads;
     long qkv_channels = HS * (HQ + 2 * HKV);
     long q_rows = HS * HQ;
+    const bool allocate_mamba = mConfig.has_mamba &&
+        (layer_idx >= 0 &&
+         layer_idx < static_cast<int>(mConfig.layer_is_mamba.size()) &&
+         mConfig.layer_is_mamba[static_cast<std::size_t>(layer_idx)] != 0);
 
     auto kind = mConfig.offload_grads ? mConfig.offload_alloc : EAllocationType::ON_DEVICE;
 
@@ -1184,10 +1380,59 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
     }
 
     if constexpr (requires { grads.d_mlp_up_weight; }) {
-        grads.d_mlp_up_weight = alloc_shard_2d("d_mlp_up_w_shard", 2 * D, C);
+        grads.d_mlp_up_weight = alloc_shard_2d("d_mlp_up_w_shard", M, C);
     }
     if constexpr (requires { grads.d_mlp_down_weight; }) {
         grads.d_mlp_down_weight = alloc_shard_2d("d_mlp_down_w_shard", C, D);
+    }
+
+    if constexpr (requires { grads.mamba; }) {
+        if (allocate_mamba) {
+            if (!grads.mamba.has_value()) {
+                grads.mamba.emplace();
+            }
+            auto& mg = *grads.mamba;
+            const int mamba_dim = cfg.mamba_dim();
+            const int conv_dim = cfg.mamba_conv_dim();
+            const int proj_size = cfg.mamba_proj_size();
+
+            mg.d_in_proj_weight = alloc_shard_2d("d_mamba_in_w_shard", proj_size, C);
+            if (cfg.mamba_use_bias) {
+                mg.d_in_proj_bias = alloc_shard_1d("d_mamba_in_b_shard", proj_size);
+            } else {
+                mg.d_in_proj_bias.reset();
+            }
+            mg.d_out_proj_weight = alloc_shard_2d("d_mamba_out_w_shard", C, mamba_dim);
+            if (cfg.mamba_use_bias) {
+                mg.d_out_proj_bias = alloc_shard_1d("d_mamba_out_b_shard", C);
+            } else {
+                mg.d_out_proj_bias.reset();
+            }
+            mg.d_conv1d_weight = alloc_shard_2d("d_mamba_conv_w_shard", conv_dim, cfg.mamba_conv_kernel);
+            if (cfg.mamba_use_conv_bias) {
+                mg.d_conv1d_bias = alloc_shard_1d("d_mamba_conv_b_shard", conv_dim);
+            } else {
+                mg.d_conv1d_bias.reset();
+            }
+            {
+                TensorShard shard = mAllocator->allocate_shard(ETensorDType::FP32, mConfig.shard_idx, mConfig.num_shards,
+                                                               "d_mamba_A_log_shard", {cfg.mamba_num_heads}, kind);
+                mg.d_A_log = static_cast<Tensor>(shard);
+            }
+            {
+                TensorShard shard = mAllocator->allocate_shard(ETensorDType::FP32, mConfig.shard_idx, mConfig.num_shards,
+                                                               "d_mamba_D_shard", {cfg.mamba_num_heads}, kind);
+                mg.d_D = static_cast<Tensor>(shard);
+            }
+            {
+                TensorShard shard = mAllocator->allocate_shard(ETensorDType::FP32, mConfig.shard_idx, mConfig.num_shards,
+                                                               "d_mamba_dt_bias_shard", {cfg.mamba_num_heads}, kind);
+                mg.d_dt_bias = static_cast<Tensor>(shard);
+            }
+            mg.d_norm_weight = alloc_shard_1d("d_mamba_norm_w_shard", mamba_dim);
+        } else {
+            grads.mamba.reset();
+        }
     }
 
     // MoE-specific gradients

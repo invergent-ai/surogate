@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "kernels/kernels.h"
+#include "modules/mlp_utils.h"
 #include "modules/weights/weight_manager.h"
 
 namespace modules {
@@ -46,7 +47,8 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
 
         // Full block work weights are gathered into double-buffered prefetch slots.
         for (int i = 0; i < 2; ++i) {
-            allocate_block_weights(mPrefetchBuffer[i], config.matmul_dtype, config.model_dtype, /*on_host=*/false, /*sharded=*/false);
+            allocate_block_weights(mPrefetchBuffer[i], config.matmul_dtype, config.model_dtype,
+                                   /*on_host=*/false, /*sharded=*/false, /*layer_idx=*/-1);
             CUDA_CHECK(cudaEventCreate(&mPrefetchStatus[i].done_event));
             CUDA_CHECK(cudaEventRecord(mPrefetchStatus[i].done_event, 0));
         }
@@ -54,7 +56,8 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         // Keep full per-layer work weights on device (like legacy ZeRO-1/2 path).
         mWorkBlocks.resize(config.num_layers);
         for (int i = 0; i < config.num_layers; ++i) {
-            allocate_block_weights(mWorkBlocks[i], config.matmul_dtype, config.model_dtype, /*on_host=*/false, /*sharded=*/false);
+            allocate_block_weights(mWorkBlocks[i], config.matmul_dtype, config.model_dtype,
+                                   /*on_host=*/false, /*sharded=*/false, i);
         }
         allocate_non_block_weights(mWorkNonBlock, config.model_dtype, /*on_host=*/false, /*sharded=*/false);
 
@@ -78,7 +81,8 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
     } else if (separate_master_storage) {
         mMasterBlocks.resize(config.num_layers);
         for (int i = 0; i < config.num_layers; ++i) {
-            allocate_block_weights(mMasterBlocks[i], config.master_dtype, config.master_dtype, config.offload_master, sharded_master);
+            allocate_block_weights(mMasterBlocks[i], config.master_dtype, config.master_dtype,
+                                   config.offload_master, sharded_master, i);
         }
         allocate_non_block_weights(mMasterNonBlock, config.master_dtype, config.offload_master, sharded_master);
 	    } else {
@@ -98,14 +102,39 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
             if (src.attention.qkv_bias.has_value()) {
                 dst.attention.qkv_bias = shard(src.attention.qkv_bias.value());
             }
-	            dst.attention.out_weight = shard(src.attention.out_weight);
-	            dst.ln2.weight = shard(src.ln2.weight);
-	            if constexpr (has_mlp_weights<BlockWeights>::value) {
-	                dst.mlp_up_weight = shard(src.mlp_up_weight);
-	                dst.mlp_down_weight = shard(src.mlp_down_weight);
-	            }
-	            if constexpr (has_moe_weights<BlockWeights>::value) {
-	                dst.router.gate = shard(src.router.gate);
+            dst.attention.out_weight = shard(src.attention.out_weight);
+            dst.ln2.weight = shard(src.ln2.weight);
+            if constexpr (has_mlp_weights<BlockWeights>::value) {
+                dst.mlp_up_weight = shard(src.mlp_up_weight);
+                dst.mlp_down_weight = shard(src.mlp_down_weight);
+            }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (src.mamba.has_value()) {
+                    dst.mamba.emplace();
+                    auto& ms = *src.mamba;
+                    auto& md = *dst.mamba;
+                    md.in_proj_weight = shard(ms.in_proj_weight);
+                    if (ms.in_proj_bias.has_value()) {
+                        md.in_proj_bias = shard(ms.in_proj_bias.value());
+                    }
+                    md.out_proj_weight = shard(ms.out_proj_weight);
+                    if (ms.out_proj_bias.has_value()) {
+                        md.out_proj_bias = shard(ms.out_proj_bias.value());
+                    }
+                    md.conv1d_weight = shard(ms.conv1d_weight);
+                    if (ms.conv1d_bias.has_value()) {
+                        md.conv1d_bias = shard(ms.conv1d_bias.value());
+                    }
+                    md.A_log = shard(ms.A_log);
+                    md.D = shard(ms.D);
+                    md.dt_bias = shard(ms.dt_bias);
+                    md.norm_weight = shard(ms.norm_weight);
+                } else {
+                    dst.mamba.reset();
+                }
+            }
+            if constexpr (has_moe_weights<BlockWeights>::value) {
+                dst.router.gate = shard(src.router.gate);
 	                if (src.router.bias.has_value()) {
 	                    dst.router.bias = shard(src.router.bias.value());
 	                }
@@ -220,7 +249,8 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
     // QLoRA mode: skip staging buffer allocation - base weights are frozen and stored externally
     if (config.offload_master && !config.use_zero_copy && !config.skip_block_allocation) {
         for (int i = 0; i < 2; ++i) {
-            allocate_block_weights(mMasterBuffer[i], config.master_dtype, config.master_dtype, /*on_host=*/false, /*sharded=*/sharded_master);
+            allocate_block_weights(mMasterBuffer[i], config.master_dtype, config.master_dtype,
+                                   /*on_host=*/false, /*sharded=*/sharded_master, /*layer_idx=*/-1);
             CUDA_CHECK(cudaEventCreate(&mMasterStatus[i].done_event));
             CUDA_CHECK(cudaEventRecord(mMasterStatus[i].done_event, 0));
         }
@@ -235,12 +265,14 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         mQuantBlocks.resize(config.num_layers);
         mQuantBlockVersion.resize(config.num_layers, -1);
         for (int i = 0; i < config.num_layers; ++i) {
-            allocate_block_weights(mQuantBlocks[i], config.matmul_dtype, config.model_dtype, quants_on_host, sharded_master);
+            allocate_block_weights(mQuantBlocks[i], config.matmul_dtype, config.model_dtype,
+                                   quants_on_host, sharded_master, i);
         }
 
         if (config.offload_quants && !config.use_zero_copy) {
             for (int i = 0; i < 2; ++i) {
-                allocate_block_weights(mQuantBuffer[i], config.matmul_dtype, config.model_dtype, /*on_host=*/false, /*sharded=*/false);
+                allocate_block_weights(mQuantBuffer[i], config.matmul_dtype, config.model_dtype,
+                                       /*on_host=*/false, /*sharded=*/false, /*layer_idx=*/-1);
                 CUDA_CHECK(cudaEventCreate(&mQuantStatus[i].done_event));
                 CUDA_CHECK(cudaEventRecord(mQuantStatus[i].done_event, 0));
             }
@@ -257,6 +289,7 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         const long Hkv = bc.num_kv_heads;
         const long Hs = bc.head_size;
         const long D = bc.intermediate_size;
+        const long M = mlp_up_rows(bc);
         const long QKV_C = (Hq + 2 * Hkv) * Hs;
 
         // Stats buffer: 4 weights * 2 floats (abs_max, scale) = 8 floats
@@ -266,7 +299,7 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         mFP8WeightCache.qkv_weight = mAllocator->allocate(ETensorDType::FP8_E4M3, "fp8_qkv_weight", EAllocationType::ON_DEVICE, {QKV_C, C});
         mFP8WeightCache.o_weight = mAllocator->allocate(ETensorDType::FP8_E4M3, "fp8_o_weight", EAllocationType::ON_DEVICE, {C, Hq * Hs});
         if constexpr (has_mlp_weights<BlockWeights>::value) {
-            mFP8WeightCache.mlp_up_weight = mAllocator->allocate(ETensorDType::FP8_E4M3, "fp8_mlp_up_weight", EAllocationType::ON_DEVICE, {2 * D, C});
+            mFP8WeightCache.mlp_up_weight = mAllocator->allocate(ETensorDType::FP8_E4M3, "fp8_mlp_up_weight", EAllocationType::ON_DEVICE, {M, C});
             mFP8WeightCache.mlp_down_weight = mAllocator->allocate(ETensorDType::FP8_E4M3, "fp8_mlp_down_weight", EAllocationType::ON_DEVICE, {C, D});
         }
 
@@ -290,6 +323,7 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
         const long Hkv = bc.num_kv_heads;
         const long Hs = bc.head_size;
         const long D = bc.intermediate_size;
+        const long M = mlp_up_rows(bc);
         const long QKV_C = (Hq + 2 * Hkv) * Hs;
 
         mFP4WeightAmax = mAllocator->allocate(ETensorDType::FP32, "fp4_weight_amax", EAllocationType::ON_DEVICE, {4});
@@ -316,8 +350,8 @@ ModularWeightManager<Block>::ModularWeightManager(const Config& config, TensorAl
 
         if constexpr (has_mlp_weights<BlockWeights>::value) {
             // MLP up weight: (2*D, C)
-            long mlp_up_scale_size = cutlass_scale_size(2 * D, C);
-            mFP4WeightCache.mlp_up_weight.data = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_up_data", EAllocationType::ON_DEVICE, {2 * D, C / 2});
+            long mlp_up_scale_size = cutlass_scale_size(M, C);
+            mFP4WeightCache.mlp_up_weight.data = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_up_data", EAllocationType::ON_DEVICE, {M, C / 2});
             mFP4WeightCache.mlp_up_weight.scales = mAllocator->allocate(ETensorDType::BYTE, "fp4_mlp_up_scales", EAllocationType::ON_DEVICE, {mlp_up_scale_size});
 
             // MLP down weight: (C, D)
@@ -373,6 +407,7 @@ void ModularWeightManager<Block>::maybe_enable_fp4_persistent_cache(bool weights
     const long Hkv = bc.num_kv_heads;
     const long Hs = bc.head_size;
     const long D = bc.intermediate_size;
+    const long M = mlp_up_rows(bc);
     const long QKV_C = (Hq + 2 * Hkv) * Hs;
 
     // Helper to compute CUTLASS scale size (matches compute_nvfp4_cutlass_scale_size()).
@@ -407,9 +442,9 @@ void ModularWeightManager<Block>::maybe_enable_fp4_persistent_cache(bool weights
 
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         mFP4WeightDataAll[2] = mAllocator->allocate(
-            ETensorDType::BYTE, "fp4_mlp_up_data_all", EAllocationType::ON_DEVICE, {L * (2 * D), C / 2});
+            ETensorDType::BYTE, "fp4_mlp_up_data_all", EAllocationType::ON_DEVICE, {L * M, C / 2});
         mFP4WeightScalesAll[2] = mAllocator->allocate(
-            ETensorDType::BYTE, "fp4_mlp_up_scales_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(2 * D, C)});
+            ETensorDType::BYTE, "fp4_mlp_up_scales_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(M, C)});
 
         mFP4WeightDataAll[3] = mAllocator->allocate(
             ETensorDType::BYTE, "fp4_mlp_down_data_all", EAllocationType::ON_DEVICE, {L * C, D / 2});
@@ -430,9 +465,9 @@ void ModularWeightManager<Block>::maybe_enable_fp4_persistent_cache(bool weights
 
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         mFP4WeightDataAllT[2] = mAllocator->allocate(
-            ETensorDType::BYTE, "fp4_mlp_up_data_t_all", EAllocationType::ON_DEVICE, {L * C, (2 * D) / 2});
+            ETensorDType::BYTE, "fp4_mlp_up_data_t_all", EAllocationType::ON_DEVICE, {L * C, M / 2});
         mFP4WeightScalesAllT[2] = mAllocator->allocate(
-            ETensorDType::BYTE, "fp4_mlp_up_scales_t_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(C, 2 * D)});
+            ETensorDType::BYTE, "fp4_mlp_up_scales_t_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(C, M)});
 
         mFP4WeightDataAllT[3] = mAllocator->allocate(
             ETensorDType::BYTE, "fp4_mlp_down_data_t_all", EAllocationType::ON_DEVICE, {L * D, C / 2});
@@ -461,7 +496,8 @@ void ModularWeightManager<Block>::allocate_block_weights(
     ETensorDType matmul_dtype,
     ETensorDType other_dtype,
     bool on_host,
-    bool sharded) {
+    bool sharded,
+    int layer_idx) {
 
     auto kind = on_host ? mConfig.offload_alloc : EAllocationType::ON_DEVICE;
     const auto& cfg = mConfig.block_config;
@@ -510,8 +546,59 @@ void ModularWeightManager<Block>::allocate_block_weights(
     // MLP weights (only for dense blocks)
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         long D = cfg.intermediate_size;
-        block.mlp_up_weight = alloc(matmul_dtype, "mlp_up_w", {2 * D, C});
+        long M = mlp_up_rows(cfg);
+        block.mlp_up_weight = alloc(matmul_dtype, "mlp_up_w", {M, C});
         block.mlp_down_weight = alloc(matmul_dtype, "mlp_down_w", {C, D});
+    }
+
+    // Mamba weights (optional for hybrid blocks)
+    if constexpr (has_mamba_weights<BlockWeights>::value) {
+        const bool is_mamba_layer = (layer_idx >= 0 &&
+                                     layer_idx < static_cast<int>(mConfig.layer_is_mamba.size()) &&
+                                     mConfig.layer_is_mamba[static_cast<std::size_t>(layer_idx)] != 0);
+        const bool allocate_mamba = mConfig.has_mamba && (layer_idx < 0 || is_mamba_layer);
+
+        if (allocate_mamba) {
+            if (!block.mamba.has_value()) {
+                block.mamba.emplace();
+            }
+            auto& mw = *block.mamba;
+            const int mamba_dim = cfg.mamba_dim();
+            const int conv_dim = cfg.mamba_conv_dim();
+            const int proj_size = cfg.mamba_proj_size();
+
+            mw.in_proj_weight = alloc(matmul_dtype, "mamba_in_w", {proj_size, C});
+            if (cfg.mamba_use_bias) {
+                mw.in_proj_bias = alloc(other_dtype, "mamba_in_b", {proj_size});
+            } else {
+                mw.in_proj_bias.reset();
+            }
+
+            mw.out_proj_weight = alloc(matmul_dtype, "mamba_out_w", {C, mamba_dim});
+            if (cfg.mamba_use_bias) {
+                mw.out_proj_bias = alloc(other_dtype, "mamba_out_b", {C});
+            } else {
+                mw.out_proj_bias.reset();
+            }
+
+            // Conv1d weights/bias in model dtype (BF16/FP16)
+            mw.conv1d_weight = alloc(other_dtype, "mamba_conv_w", {conv_dim, 1, cfg.mamba_conv_kernel});
+            if (cfg.mamba_use_conv_bias) {
+                mw.conv1d_bias = alloc(other_dtype, "mamba_conv_b", {conv_dim});
+            } else {
+                mw.conv1d_bias.reset();
+            }
+
+            // SSM parameters kept in FP32
+            mw.A_log = alloc(ETensorDType::FP32, "mamba_A_log", {cfg.mamba_num_heads});
+            mw.D = alloc(ETensorDType::FP32, "mamba_D", {cfg.mamba_num_heads});
+            mw.dt_bias = alloc(ETensorDType::FP32, "mamba_dt_bias", {cfg.mamba_num_heads});
+
+            // Gated RMSNorm weight
+            mw.norm_weight = alloc(other_dtype, "mamba_norm_w", {mamba_dim});
+        } else {
+            block.mamba.reset();
+        }
     }
 
     // MoE-specific weight allocation (router, experts) - only for MoE blocks

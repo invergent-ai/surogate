@@ -6,6 +6,7 @@
 #define LLMQ_SRC_MODULES_WEIGHTS_WEIGHT_MANAGER_QUANTIZATION_H
 
 #include "kernels/kernels.h"
+#include "modules/mlp_utils.h"
 #include "modules/weights/weight_manager_helpers.h"
 
 namespace modules {
@@ -72,6 +73,7 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache(const BlockWeigh
     const int Hkv = static_cast<int>(cfg.num_kv_heads);
     const int Hs = static_cast<int>(cfg.head_size);
     const int D = static_cast<int>(cfg.intermediate_size);
+    const int M = static_cast<int>(mlp_up_rows(cfg));
     const int QKV_C = (Hq + 2 * Hkv) * Hs;
 
     auto quantize_fp4_weight = [&](const Tensor& bf16_weight, FP4WeightCacheEntry& fp4_cache,
@@ -120,7 +122,7 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache(const BlockWeigh
     quantize_fp4_weight(src.attention.out_weight, mFP4WeightCache.o_weight, C, Hq * Hs);
 
     if constexpr (has_mlp_weights<BlockWeights>::value) {
-        quantize_fp4_weight(src.mlp_up_weight, mFP4WeightCache.mlp_up_weight, 2 * D, C);
+        quantize_fp4_weight(src.mlp_up_weight, mFP4WeightCache.mlp_up_weight, M, C);
         quantize_fp4_weight(src.mlp_down_weight, mFP4WeightCache.mlp_down_weight, C, D);
     }
 }
@@ -138,6 +140,7 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache_transposed(const
     const int Hkv = static_cast<int>(cfg.num_kv_heads);
     const int Hs = static_cast<int>(cfg.head_size);
     const int D = static_cast<int>(cfg.intermediate_size);
+    const int M = static_cast<int>(mlp_up_rows(cfg));
     const int QKV_C = (Hq + 2 * Hkv) * Hs;
 
     auto quantize_fp4_weight_t = [&](const Tensor& bf16_weight, FP4WeightCacheEntry& fp4_cache_t,
@@ -175,7 +178,7 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache_transposed(const
     quantize_fp4_weight_t(src.attention.out_weight, mFP4WeightCacheT.o_weight, C, Hq * Hs);
 
     if constexpr (has_mlp_weights<BlockWeights>::value) {
-        quantize_fp4_weight_t(src.mlp_up_weight, mFP4WeightCacheT.mlp_up_weight, 2 * D, C);
+        quantize_fp4_weight_t(src.mlp_up_weight, mFP4WeightCacheT.mlp_up_weight, M, C);
         quantize_fp4_weight_t(src.mlp_down_weight, mFP4WeightCacheT.mlp_down_weight, C, D);
     }
 }

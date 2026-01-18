@@ -25,6 +25,9 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     } else {
         block_config.intermediate_size = config.IntermediateSize;
     }
+    if constexpr (requires { block_config.mlp_up_factor; }) {
+        block_config.mlp_up_factor = config.mlp_up_factor();
+    }
     block_config.num_query_heads = config.NumQueryHeads;
     block_config.num_kv_heads = config.NumKeyValHeads;
     block_config.head_size = config.head_size();
@@ -35,6 +38,18 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     block_config.use_qkv_bias = config.UseQKVBias;
     if constexpr (requires { block_config.use_qk_norm; }) {
         block_config.use_qk_norm = config.UseQKNorm;
+    }
+    // Mamba / SSM config (for hybrid Nemotron-H blocks)
+    if constexpr (requires { block_config.mamba_num_heads; }) {
+        block_config.mamba_num_heads = config.MambaNumHeads;
+        block_config.mamba_head_dim = config.MambaHeadDim;
+        block_config.mamba_ssm_state_size = config.MambaSsmStateSize;
+        block_config.mamba_conv_kernel = config.MambaConvKernel;
+        block_config.mamba_n_groups = config.MambaNGroups;
+        block_config.mamba_chunk_size = config.MambaChunkSize;
+        block_config.mamba_use_bias = config.MambaUseBias;
+        block_config.mamba_use_conv_bias = config.MambaUseConvBias;
+        block_config.mamba_activation = config.MambaActivation;
     }
     if (config.moe_config.has_value()) {
         const auto& moe = config.moe_config.value();
@@ -89,6 +104,13 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     wm_config.skip_block_allocation = options.skip_block_allocation;
     wm_config.enable_fp8_forward = options.enable_fp8_forward;
     wm_config.enable_fp4_forward = options.enable_fp4_forward;
+    wm_config.layer_is_mamba.resize(config.NumLayers);
+    wm_config.has_mamba = false;
+    for (int i = 0; i < config.NumLayers; ++i) {
+        const bool is_mamba = (config.get_block_type(i) == BlockType::Mamba);
+        wm_config.layer_is_mamba[i] = static_cast<std::uint8_t>(is_mamba ? 1 : 0);
+        wm_config.has_mamba = wm_config.has_mamba || is_mamba;
+    }
 
     mWeights = std::make_unique<ModularWeightManager<Block>>(wm_config, *mAllocator);
 }
