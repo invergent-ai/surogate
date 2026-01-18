@@ -13,11 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <iomanip>
-#include <iostream>
 #include <memory>
-#include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -39,7 +35,6 @@
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
-#include "utilities/tensor_container.h"
 
 namespace {
 
@@ -167,41 +162,6 @@ struct LearningTestResult {
     bool learned = false;
 };
 
-using WeightMap = std::unordered_map<std::string, TensorShard>;
-
-WeightMap collect_weights(ITensorContainer& container) {
-    WeightMap weights;
-    container.iterate_tensors([&](std::string name, const TensorShard& t) {
-        weights.emplace(std::move(name), t);
-    });
-    return weights;
-}
-
-WeightMap collect_weights(IModel& model) {
-    return collect_weights(model.weights());
-}
-
-void copy_weights(ITensorContainer& src, ITensorContainer& dst) {
-    auto src_weights = collect_weights(src);
-    auto dst_weights = collect_weights(dst);
-
-    for (const auto& [name, s] : src_weights) {
-        auto it = dst_weights.find(name);
-        REQUIRE(it != dst_weights.end());
-        const auto& d = it->second;
-        REQUIRE(s.DType == d.DType);
-        REQUIRE(s.nelem() == d.nelem());
-        if (s.Data && d.Data) {
-            CUDA_CHECK(cudaMemcpy(d.Data, s.Data, s.bytes(), cudaMemcpyDeviceToDevice));
-        }
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void copy_weights(IModel& src, IModel& dst) {
-    copy_weights(src.weights(), dst.weights());
-}
-
 } // namespace
 
 // ============================================================================
@@ -278,95 +238,6 @@ TEST_CASE("Dense model learns: loss decreases over training steps", "[training][
     });
 }
 
-TEST_CASE("Dense model modular path matches classic learning curve", "[training][learning][dense][modular][gpu]") {
-    if (!gpu_available()) SKIP("CUDA not available");
-
-    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
-        constexpr int B = 2;
-        constexpr int T = 64;
-        constexpr int num_steps = 30;
-        constexpr float lr = 1e-3f;
-        constexpr float rel_tol = 1e-2f;
-
-        PretrainedConfig cfg = create_dense_config(/*num_layers=*/2, /*vocab_size=*/128);
-
-        RuntimeOptions opts_classic = create_test_options();
-        opts_classic.UseModularBlocks = false;
-
-        RuntimeOptions opts_modular = create_test_options();
-        opts_modular.UseModularBlocks = true;
-
-        auto allocator_classic = std::make_shared<TensorAllocator>();
-        auto allocator_modular = std::make_shared<TensorAllocator>();
-
-        auto model_classic = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_classic, comm.rank(), comm.world_size(), allocator_classic);
-        auto model_modular = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_modular, comm.rank(), comm.world_size(), allocator_modular);
-
-        model_classic->allocate_run_state(opts_classic, comm, B, T, /*allocate_optimizer=*/true);
-        model_modular->allocate_run_state(opts_modular, comm, B, T, /*allocate_optimizer=*/true);
-
-        model_classic->init_weights(comm);
-        model_modular->init_weights(comm);
-        copy_weights(*model_classic, *model_modular);
-
-        auto& inputs_classic = model_classic->get_input_buffer();
-        auto& targets_classic = model_classic->get_target_buffer();
-        auto& pos_ids_classic = model_classic->get_position_ids_buffer();
-
-        auto& inputs_mod = model_modular->get_input_buffer();
-        auto& targets_mod = model_modular->get_target_buffer();
-        auto& pos_ids_mod = model_modular->get_position_ids_buffer();
-
-        fill_position_ids(pos_ids_classic, B, T);
-        fill_position_ids(pos_ids_mod, B, T);
-
-        std::vector<float> classic_losses;
-        std::vector<float> modular_losses;
-        classic_losses.reserve(num_steps);
-        modular_losses.reserve(num_steps);
-
-        for (int step = 0; step < num_steps; ++step) {
-            fill_training_data(inputs_classic, targets_classic, B, T, cfg.VocabSize, step);
-            fill_training_data(inputs_mod, targets_mod, B, T, cfg.VocabSize, step);
-
-            model_classic->forward(inputs_classic, pos_ids_classic, comm, /*micro_step=*/0);
-            model_classic->backward(inputs_classic, targets_classic, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_classic = model_classic->get_loss();
-
-            model_modular->forward(inputs_mod, pos_ids_mod, comm, /*micro_step=*/0);
-            model_modular->backward(inputs_mod, targets_mod, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_mod = model_modular->get_loss();
-
-            REQUIRE(std::isfinite(loss_classic));
-            REQUIRE(std::isfinite(loss_mod));
-
-            const float denom = std::max(1.0f, std::abs(loss_classic));
-            const float rel_diff = std::abs(loss_classic - loss_mod) / denom;
-            INFO("Step " << step << " classic loss=" << loss_classic << " modular loss=" << loss_mod
-                         << " rel_diff=" << rel_diff);
-            REQUIRE(rel_diff < rel_tol);
-
-            classic_losses.push_back(loss_classic);
-            modular_losses.push_back(loss_mod);
-
-            model_classic->update(comm, lr, /*beta1=*/0.9f, /*beta2=*/0.999f, /*t=*/step + 1,
-                                  /*epsilon=*/1e-8f, /*weight_decay=*/0.0f, /*grad_clip=*/1.0f);
-            model_modular->update(comm, lr, /*beta1=*/0.9f, /*beta2=*/0.999f, /*t=*/step + 1,
-                                  /*epsilon=*/1e-8f, /*weight_decay=*/0.0f, /*grad_clip=*/1.0f);
-
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
-
-        // Both paths should learn (loss decreasing)
-        REQUIRE(classic_losses.back() < classic_losses.front());
-        REQUIRE(modular_losses.back() < modular_losses.front());
-    });
-}
-
 TEST_CASE("Dense model with LoRA learns properly", "[training][learning][dense][lora][gpu]") {
     if (!gpu_available()) SKIP("CUDA not available");
 
@@ -437,118 +308,7 @@ TEST_CASE("Dense model with LoRA learns properly", "[training][learning][dense][
     });
 }
 
-TEST_CASE("Dense model with LoRA modular path matches classic learning curve", "[training][learning][dense][lora][modular][gpu]") {
-    if (!gpu_available()) SKIP("CUDA not available");
-
-    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
-        constexpr int B = 2;
-        constexpr int T = 64;
-        constexpr int num_steps = 30;
-        constexpr float lr = 1e-3f;
-        constexpr float rel_tol = 1e-2f;
-
-        PretrainedConfig cfg = create_dense_config(/*num_layers=*/2, /*vocab_size=*/128);
-
-        RuntimeOptions opts_classic = create_test_options();
-        opts_classic.UseModularBlocks = false;
-
-        RuntimeOptions opts_modular = create_test_options();
-        opts_modular.UseModularBlocks = true;
-
-        auto allocator_classic = std::make_shared<TensorAllocator>();
-        auto allocator_modular = std::make_shared<TensorAllocator>();
-
-        using DenseBlock = modules::Qwen2TransformerBlock;
-        using DenseModel = modules::Qwen2Model;
-
-        auto base_any_classic = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_classic, comm.rank(), comm.world_size(), allocator_classic);
-        auto* classic_ptr = dynamic_cast<DenseModel*>(base_any_classic.release());
-        REQUIRE(classic_ptr != nullptr);
-        std::unique_ptr<DenseModel> base_model_classic(classic_ptr);
-
-        auto base_any_modular = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_modular, comm.rank(), comm.world_size(), allocator_modular);
-        auto* modular_ptr = dynamic_cast<DenseModel*>(base_any_modular.release());
-        REQUIRE(modular_ptr != nullptr);
-        std::unique_ptr<DenseModel> base_model_modular(modular_ptr);
-
-        modules::ModularLoRAConfig lora_cfg;
-        lora_cfg.rank = 8;
-        lora_cfg.alpha = 16.0f;
-        lora_cfg.dtype = ETensorDType::FP32;
-        lora_cfg.dropout = 0.0f;
-        lora_cfg.with_all();
-
-        modules::ModularLoRAModel<DenseBlock> model_classic(
-            std::move(base_model_classic), lora_cfg, opts_classic, comm, allocator_classic);
-        modules::ModularLoRAModel<DenseBlock> model_modular(
-            std::move(base_model_modular), lora_cfg, opts_modular, comm, allocator_modular);
-
-        model_classic.allocate_run_state(opts_classic, comm, B, T, /*allocate_optimizer=*/true);
-        model_modular.allocate_run_state(opts_modular, comm, B, T, /*allocate_optimizer=*/true);
-
-        model_classic.init_weights(comm);
-        model_modular.init_weights(comm);
-
-        copy_weights(model_classic.base_model(), model_modular.base_model());
-        copy_weights(model_classic.lora_weights(), model_modular.lora_weights());
-
-        auto& inputs_classic = model_classic.get_input_buffer();
-        auto& targets_classic = model_classic.get_target_buffer();
-        auto& pos_ids_classic = model_classic.get_position_ids_buffer();
-
-        auto& inputs_mod = model_modular.get_input_buffer();
-        auto& targets_mod = model_modular.get_target_buffer();
-        auto& pos_ids_mod = model_modular.get_position_ids_buffer();
-
-        fill_position_ids(pos_ids_classic, B, T);
-        fill_position_ids(pos_ids_mod, B, T);
-
-        std::vector<float> classic_losses;
-        std::vector<float> modular_losses;
-        classic_losses.reserve(num_steps);
-        modular_losses.reserve(num_steps);
-
-        for (int step = 0; step < num_steps; ++step) {
-            fill_training_data(inputs_classic, targets_classic, B, T, cfg.VocabSize, step);
-            fill_training_data(inputs_mod, targets_mod, B, T, cfg.VocabSize, step);
-
-            model_classic.forward(inputs_classic, pos_ids_classic, comm, /*micro_step=*/0);
-            model_classic.backward(inputs_classic, targets_classic, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_classic = model_classic.get_loss();
-
-            model_modular.forward(inputs_mod, pos_ids_mod, comm, /*micro_step=*/0);
-            model_modular.backward(inputs_mod, targets_mod, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_mod = model_modular.get_loss();
-
-            REQUIRE(std::isfinite(loss_classic));
-            REQUIRE(std::isfinite(loss_mod));
-
-            const float denom = std::max(1.0f, std::abs(loss_classic));
-            const float rel_diff = std::abs(loss_classic - loss_mod) / denom;
-            INFO("Step " << step << " classic loss=" << loss_classic << " modular loss=" << loss_mod
-                         << " rel_diff=" << rel_diff);
-            REQUIRE(rel_diff < rel_tol);
-
-            classic_losses.push_back(loss_classic);
-            modular_losses.push_back(loss_mod);
-
-            model_classic.update(comm, lr, 0.9f, 0.999f, step + 1, 1e-8f, 0.0f, 1.0f);
-            model_modular.update(comm, lr, 0.9f, 0.999f, step + 1, 1e-8f, 0.0f, 1.0f);
-
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
-
-        REQUIRE(classic_losses.back() < classic_losses.front());
-        REQUIRE(modular_losses.back() < modular_losses.front());
-    });
-}
-
-// QLoRA tests are disabled for now - require proper weight loading from file
-// TEST_CASE("Dense model with QLoRA-FP8 learns properly", "[training][learning][dense][qlora][fp8][gpu][.disabled]") {
+TEST_CASE("Dense model with QLoRA-FP8 learns properly", "[training][learning][dense][qlora][fp8][gpu][.disabled]") {
 
 // ============================================================================
 // MoE Model Learning Tests
@@ -617,92 +377,6 @@ TEST_CASE("MoE model learns: loss decreases over training steps", "[training][le
         float decrease_rate = static_cast<float>(decreasing_steps) / (losses.size() - 1);
         INFO("MoE - Fraction of decreasing steps: " << decrease_rate);
         REQUIRE(decrease_rate > 0.6f);
-    });
-}
-
-TEST_CASE("MoE model modular path matches classic learning curve", "[training][learning][moe][modular][gpu]") {
-    if (!gpu_available()) SKIP("CUDA not available");
-
-    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
-        constexpr int B = 2;
-        constexpr int T = 64;
-        constexpr int num_steps = 30;
-        constexpr float lr = 1e-3f;
-        constexpr float rel_tol = 1e-2f;
-
-        Qwen3MoEConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
-
-        RuntimeOptions opts_classic = create_test_options();
-        opts_classic.UseModularBlocks = false;
-
-        RuntimeOptions opts_modular = create_test_options();
-        opts_modular.UseModularBlocks = true;
-
-        auto allocator_classic = std::make_shared<TensorAllocator>();
-        auto allocator_modular = std::make_shared<TensorAllocator>();
-
-        auto model_classic = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_classic, comm.rank(), comm.world_size(), allocator_classic);
-        auto model_modular = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_modular, comm.rank(), comm.world_size(), allocator_modular);
-
-        model_classic->allocate_run_state(opts_classic, comm, B, T, /*allocate_optimizer=*/true);
-        model_modular->allocate_run_state(opts_modular, comm, B, T, /*allocate_optimizer=*/true);
-
-        model_classic->init_weights(comm);
-        model_modular->init_weights(comm);
-        copy_weights(*model_classic, *model_modular);
-
-        auto& inputs_classic = model_classic->get_input_buffer();
-        auto& targets_classic = model_classic->get_target_buffer();
-        auto& pos_ids_classic = model_classic->get_position_ids_buffer();
-
-        auto& inputs_mod = model_modular->get_input_buffer();
-        auto& targets_mod = model_modular->get_target_buffer();
-        auto& pos_ids_mod = model_modular->get_position_ids_buffer();
-
-        fill_position_ids(pos_ids_classic, B, T);
-        fill_position_ids(pos_ids_mod, B, T);
-
-        std::vector<float> classic_losses;
-        std::vector<float> modular_losses;
-        classic_losses.reserve(num_steps);
-        modular_losses.reserve(num_steps);
-
-        for (int step = 0; step < num_steps; ++step) {
-            fill_training_data(inputs_classic, targets_classic, B, T, cfg.VocabSize, step);
-            fill_training_data(inputs_mod, targets_mod, B, T, cfg.VocabSize, step);
-
-            model_classic->forward(inputs_classic, pos_ids_classic, comm, /*micro_step=*/0);
-            model_classic->backward(inputs_classic, targets_classic, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_classic = model_classic->get_loss();
-
-            model_modular->forward(inputs_mod, pos_ids_mod, comm, /*micro_step=*/0);
-            model_modular->backward(inputs_mod, targets_mod, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_mod = model_modular->get_loss();
-
-            REQUIRE(std::isfinite(loss_classic));
-            REQUIRE(std::isfinite(loss_mod));
-
-            const float denom = std::max(1.0f, std::abs(loss_classic));
-            const float rel_diff = std::abs(loss_classic - loss_mod) / denom;
-            INFO("Step " << step << " classic loss=" << loss_classic << " modular loss=" << loss_mod
-                         << " rel_diff=" << rel_diff);
-            REQUIRE(rel_diff < rel_tol);
-
-            classic_losses.push_back(loss_classic);
-            modular_losses.push_back(loss_mod);
-
-            model_classic->update(comm, lr, 0.9f, 0.999f, step + 1, 1e-8f, 0.0f, 1.0f);
-            model_modular->update(comm, lr, 0.9f, 0.999f, step + 1, 1e-8f, 0.0f, 1.0f);
-
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
-
-        REQUIRE(classic_losses.back() < classic_losses.front());
-        REQUIRE(modular_losses.back() < modular_losses.front());
     });
 }
 
@@ -776,118 +450,7 @@ TEST_CASE("MoE model with LoRA learns properly", "[training][learning][moe][lora
     });
 }
 
-TEST_CASE("MoE model with LoRA modular path matches classic learning curve", "[training][learning][moe][lora][modular][gpu]") {
-    if (!gpu_available()) SKIP("CUDA not available");
-
-    NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
-        constexpr int B = 2;
-        constexpr int T = 64;
-        constexpr int num_steps = 30;
-        constexpr float lr = 1e-3f;
-        constexpr float rel_tol = 1e-2f;
-
-        Qwen3MoEConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
-
-        RuntimeOptions opts_classic = create_test_options();
-        opts_classic.UseModularBlocks = false;
-
-        RuntimeOptions opts_modular = create_test_options();
-        opts_modular.UseModularBlocks = true;
-
-        auto allocator_classic = std::make_shared<TensorAllocator>();
-        auto allocator_modular = std::make_shared<TensorAllocator>();
-
-        using MoEBlock = modules::Qwen3MoEBlock;
-        using MoEModel = modules::Qwen3MoEModel;
-
-        auto base_any_classic = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_classic, comm.rank(), comm.world_size(), allocator_classic);
-        auto* classic_ptr = dynamic_cast<MoEModel*>(base_any_classic.release());
-        REQUIRE(classic_ptr != nullptr);
-        std::unique_ptr<MoEModel> base_model_classic(classic_ptr);
-
-        auto base_any_modular = modules::ModelFactory::create_from_pretrained_config(
-            cfg, opts_modular, comm.rank(), comm.world_size(), allocator_modular);
-        auto* modular_ptr = dynamic_cast<MoEModel*>(base_any_modular.release());
-        REQUIRE(modular_ptr != nullptr);
-        std::unique_ptr<MoEModel> base_model_modular(modular_ptr);
-
-        modules::ModularLoRAConfig lora_cfg;
-        lora_cfg.rank = 8;
-        lora_cfg.alpha = 16.0f;
-        lora_cfg.dtype = ETensorDType::BF16;
-        lora_cfg.dropout = 0.0f;
-        lora_cfg.with_all();
-
-        modules::ModularLoRAModel<MoEBlock> model_classic(
-            std::move(base_model_classic), lora_cfg, opts_classic, comm, allocator_classic);
-        modules::ModularLoRAModel<MoEBlock> model_modular(
-            std::move(base_model_modular), lora_cfg, opts_modular, comm, allocator_modular);
-
-        model_classic.allocate_run_state(opts_classic, comm, B, T, /*allocate_optimizer=*/true);
-        model_modular.allocate_run_state(opts_modular, comm, B, T, /*allocate_optimizer=*/true);
-
-        model_classic.init_weights(comm);
-        model_modular.init_weights(comm);
-
-        copy_weights(model_classic.base_model(), model_modular.base_model());
-        copy_weights(model_classic.lora_weights(), model_modular.lora_weights());
-
-        auto& inputs_classic = model_classic.get_input_buffer();
-        auto& targets_classic = model_classic.get_target_buffer();
-        auto& pos_ids_classic = model_classic.get_position_ids_buffer();
-
-        auto& inputs_mod = model_modular.get_input_buffer();
-        auto& targets_mod = model_modular.get_target_buffer();
-        auto& pos_ids_mod = model_modular.get_position_ids_buffer();
-
-        fill_position_ids(pos_ids_classic, B, T);
-        fill_position_ids(pos_ids_mod, B, T);
-
-        std::vector<float> classic_losses;
-        std::vector<float> modular_losses;
-        classic_losses.reserve(num_steps);
-        modular_losses.reserve(num_steps);
-
-        for (int step = 0; step < num_steps; ++step) {
-            fill_training_data(inputs_classic, targets_classic, B, T, cfg.VocabSize, step);
-            fill_training_data(inputs_mod, targets_mod, B, T, cfg.VocabSize, step);
-
-            model_classic.forward(inputs_classic, pos_ids_classic, comm, /*micro_step=*/0);
-            model_classic.backward(inputs_classic, targets_classic, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_classic = model_classic.get_loss();
-
-            model_modular.forward(inputs_mod, pos_ids_mod, comm, /*micro_step=*/0);
-            model_modular.backward(inputs_mod, targets_mod, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            float loss_mod = model_modular.get_loss();
-
-            REQUIRE(std::isfinite(loss_classic));
-            REQUIRE(std::isfinite(loss_mod));
-
-            const float denom = std::max(1.0f, std::abs(loss_classic));
-            const float rel_diff = std::abs(loss_classic - loss_mod) / denom;
-            INFO("Step " << step << " classic loss=" << loss_classic << " modular loss=" << loss_mod
-                         << " rel_diff=" << rel_diff);
-            REQUIRE(rel_diff < rel_tol);
-
-            classic_losses.push_back(loss_classic);
-            modular_losses.push_back(loss_mod);
-
-            model_classic.update(comm, lr, 0.9f, 0.999f, step + 1, 1e-8f, 0.0f, 1.0f);
-            model_modular.update(comm, lr, 0.9f, 0.999f, step + 1, 1e-8f, 0.0f, 1.0f);
-
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
-
-        REQUIRE(classic_losses.back() < classic_losses.front());
-        REQUIRE(modular_losses.back() < modular_losses.front());
-    });
-}
-
-// QLoRA tests are disabled for now - require proper weight loading from file
-// TEST_CASE("MoE model with QLoRA-FP8 learns properly", "[training][learning][moe][qlora][fp8][gpu][.disabled]") {
+TEST_CASE("MoE model with QLoRA-FP8 learns properly", "[training][learning][moe][qlora][fp8][gpu][.disabled]") {
 
 // ============================================================================
 // Comparative Learning Tests

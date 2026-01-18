@@ -71,9 +71,8 @@ struct ModelOptions;
  *
  * == Modular Block Execution ==
  *
- * When ModelOptions::use_modular_blocks is enabled, the model uses the
- * static methods forward_block_modular(), backward_block_modular(), and
- * recompute_block_modular() instead of the hand-optimized kernel sequences.
+ * The model uses the static methods forward_block_modular(), backward_block_modular(),
+ * and recompute_block_modular() as the production execution path.
  *
  * These methods provide a clean, composable implementation that is fully
  * compatible with the training infrastructure (recipes, FP8/FP4 quantization,
@@ -229,7 +228,7 @@ public:
     // - Full quantization support
     // - Hook compatibility
     //
-    // Usage: Enable via ModelOptions::use_modular_blocks = true
+    // Usage: Default path for ModularTransformerModel
     // ========================================================================
 
     /**
