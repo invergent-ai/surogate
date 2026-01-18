@@ -29,11 +29,11 @@
 #include "module_base.h"
 
 // Primitive modules
-#include "primitives/linear.h"
 #include "primitives/rmsnorm.h"
 #include "primitives/swiglu.h"
 #include "primitives/embedding.h"
 #include "primitives/attention.h"
+#include "primitives/mlp.h"
 
 // Composite modules
 #include "composite/transformer_block.h"

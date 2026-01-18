@@ -77,6 +77,12 @@ struct RuntimeOptions {
     // CUTLASS: Force CUTLASS (SM90: per-tensor, SM120+: block-scaled MX FP8)
     EMatmulBackend MatmulBackend = EMatmulBackend::AUTO;
 
+    // Use modular block implementation instead of legacy optimized kernel path.
+    // When enabled, uses DenseTransformerBlock::forward_impl/backward_impl
+    // instead of the hand-optimized kernel calls in model_forward.hpp/model_block_ops.hpp.
+    // Default is enabled; set false to force the legacy path.
+    bool UseModularBlocks = true;
+
     // ModelType is just a copy of the dtype set in config
     std::optional<ETensorDType> ModelType = std::nullopt;
     std::optional<ETensorDType> MatmulType = std::nullopt;

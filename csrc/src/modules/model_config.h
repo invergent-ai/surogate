@@ -453,6 +453,12 @@ struct ModelOptions {
     // CUTLASS: Force CUTLASS (SM90: per-tensor, SM120+: block-scaled MX FP8)
     EMatmulBackend matmul_backend = EMatmulBackend::AUTO;
 
+    // Use modular block implementation instead of legacy optimized kernel path.
+    // When enabled, uses DenseTransformerBlock::forward_impl/backward_impl
+    // instead of the hand-optimized kernel calls in model_forward.hpp/model_block_ops.hpp.
+    // Default is enabled; set false to force the legacy path.
+    bool use_modular_blocks = true;
+
     [[nodiscard]] ETensorDType get_matmul_dtype() const {
         return matmul_dtype.value_or(model_dtype.value());
     }
@@ -520,6 +526,7 @@ struct ModelOptions {
         // The recipe should be set separately after calling to_runtime_options()
         opts.UseFusedRope = use_fused_rope;
         opts.MatmulBackend = matmul_backend;
+        opts.UseModularBlocks = use_modular_blocks;
         opts.ModelType = model_dtype;
         opts.MatmulType = matmul_dtype;
         opts.GradientType = gradient_dtype;
@@ -567,6 +574,7 @@ struct ModelOptions {
         }
         options.use_fused_rope = opts.UseFusedRope;
         options.matmul_backend = opts.MatmulBackend;
+        options.use_modular_blocks = opts.UseModularBlocks;
         options.model_dtype = opts.ModelType;
         options.matmul_dtype = opts.MatmulType;
         options.gradient_dtype = opts.GradientType;

@@ -210,7 +210,7 @@ public:
     /**
      * @brief Backward pass
      *
-     * In practice, fused_classifier handles this during training.
+     * In practice, the training path handles this via the LM head loss.
      */
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
                          Tensor& grad_output, Gradients& grads, bool accumulate = false);

@@ -1,6 +1,6 @@
-model: Qwen/Qwen3-30B-A3B-Instruct-2507
+model: ./output_moe
 model_type: qwen3_moe
-output_dir: ./output
+output_dir: ./output_moe_2
 merge_adapter: false
 apply_recommended_values: false
 
@@ -35,14 +35,14 @@ lora_target_modules:
   - up_proj
   - down_proj
 
-qlora_bnb: true
-qlora_bnb_block_size: 64
-qlora_bnb_double_quant: true
-qlora_offload_experts: true
-debug_memory_breakdown: true
-offload_residual: true
-offload_optimizer: true
-use_cuda_graphs: false
+# qlora_bnb: true
+# qlora_bnb_block_size: 64
+# qlora_bnb_double_quant: true
+# qlora_offload_experts: true
+# debug_memory_breakdown: true
+# offload_residual: true
+# offload_optimizer: true
+# use_cuda_graphs: false
 
 dataloader_num_workers: 4
 datasets:

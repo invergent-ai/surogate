@@ -59,6 +59,8 @@ public:
     struct Activations {
         QuantizableTensor input_cached;     ///< Input tensor (may be quantized)
         bool input_was_quantized = false;   ///< Whether input was already quantized
+        Tensor output;                      ///< Output tensor (pre-allocated by caller)
+        Tensor grad_input;                  ///< Gradient w.r.t. input (pre-allocated by caller)
     };
 
     /**
@@ -150,14 +152,9 @@ inline Tensor LinearModule::forward_impl(ModuleContext& ctx, Weights& w, Tensor&
     float* scale_a = w.weight.scale();
     float* scale_b = acts.input_cached.scale();
 
-    // Allocate output - for fused case, output is pre-allocated by caller
-    // Here we assume output is passed in or pre-allocated
-    // In practice, the caller provides the output buffer
-
-    // For now, create a placeholder - actual allocation handled by run state
-    Tensor output;
+    // Output must be pre-allocated by caller
+    Tensor& output = acts.output;
     output.DType = w.weight.DType == ETensorDType::FP8_E4M3 ? ctx.matmul_dtype : w.weight.DType;
-    // Caller must set output.Data appropriately
 
     if (mConfig.is_fused()) {
         // Write to slice of larger output tensor
@@ -192,10 +189,9 @@ inline Tensor LinearModule::backward_impl(ModuleContext& ctx, Weights& w, Activa
     QuantizableTensor d_out;
     d_out.Value = grad_output;
 
-    // Allocate gradient input tensor
-    Tensor grad_input;
+    // Gradient input must be pre-allocated by caller
+    Tensor& grad_input = acts.grad_input;
     grad_input.DType = acts.input_cached.Value.DType;
-    // Caller must set grad_input.Data appropriately
 
     if (w.weight.DType == acts.input_cached.Value.DType) {
         // No quantization path

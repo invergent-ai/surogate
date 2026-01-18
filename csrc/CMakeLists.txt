@@ -415,7 +415,6 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/moe/test_moe.cpp
 
             # Models
-            src/testing/models/test-heterogeneous.cu
             src/testing/models/test_pretrained_config.cpp
 
             # Utilities

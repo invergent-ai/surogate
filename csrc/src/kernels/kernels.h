@@ -147,6 +147,10 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
             cublasLtHandle_t handle, Tensor& workspace,
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
 
+// Initialize fallback cuBLAS handle used when cuBLASLt matmul fails.
+// Call once during startup (before CUDA graph capture) to avoid cublasCreate in capture.
+void init_cublas_fallback_handle();
+
 // Like `matmul`, but allows overriding the output leading dimension (stride between columns)
 // for the destination matrix in column-major cuBLASLt terms. Useful for writing into slices
 // of a larger fused output (e.g. QKV, gate+up).

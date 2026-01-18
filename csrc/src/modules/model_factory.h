@@ -11,7 +11,6 @@
 
 #include "model_config.h"
 #include "model/modular_model.h"
-#include "model/heterogeneous_model.h"
 #include "composite/transformer_block.h"
 #include "moe/moe_block.h"
 
@@ -338,49 +337,19 @@ private:
     /**
      * @brief Create a hybrid (mixed dense/MoE) model
      *
-     * Uses HeterogeneousTransformerModel with std::variant to support
-     * different block types per layer while preserving type safety.
-     *
-     * Supports:
-     * - Dense + MoE hybrid (DeepSeek, Nemotron style)
-     * - Dense + SwitchMoE hybrid
-     * - Future: Dense + Conv hybrid (LFM2)
+     * Note: Hybrid models with different block types per layer are not currently supported.
+     * Use pure Dense or pure MoE architectures instead.
      */
     static std::unique_ptr<IModel> create_hybrid_model(
-        const ModelConfig& config,
-        const ModelOptions& options,
-        int rank,
-        int world,
-        const std::shared_ptr<TensorAllocator>& alloc) {
+        const ModelConfig& /*config*/,
+        const ModelOptions& /*options*/,
+        int /*rank*/,
+        int /*world*/,
+        const std::shared_ptr<TensorAllocator>& /*alloc*/) {
 
-        // Validate that we have layer overrides
-        if (config.layer_overrides.empty()) {
-            throw std::invalid_argument(
-                "Hybrid architecture requires layer_overrides to specify per-layer block types");
-        }
-
-        // Check what block types are needed
-        bool has_switch_moe = false;
-        for (const auto& override : config.layer_overrides) {
-            if (override.block_type == BlockType::SwitchMoE) {
-                has_switch_moe = true;
-                break;
-            }
-        }
-
-        // For now, we support Dense + MoE and Dense + SwitchMoE
-        // More combinations can be added by extending the template instantiation
-        if (has_switch_moe) {
-            // Dense + SwitchMoE variant
-            using HybridModel = HeterogeneousTransformerModel<
-                DenseTransformerBlock<>,
-                SwitchTransformerBlock
-            >;
-            return std::make_unique<HybridModel>(config, options, rank, world, alloc);
-        } else {
-            // Default: Dense + MoE variant
-            return std::make_unique<DefaultHeterogeneousModel>(config, options, rank, world, alloc);
-        }
+        throw std::runtime_error(
+            "Hybrid architecture (mixed Dense/MoE per layer) is not currently supported. "
+            "Use pure Dense or pure MoE architectures instead.");
     }
 };
 

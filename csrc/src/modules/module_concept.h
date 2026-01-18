@@ -15,6 +15,9 @@
 struct cudaDeviceProp;
 typedef struct cudnnContext* cudnnHandle_t;
 typedef struct cublasLtContext* cublasLtHandle_t;
+class IRunState;
+
+namespace recipes { class Recipe; }
 
 namespace modules {
 
@@ -53,6 +56,61 @@ struct ModuleContext {
 
     std::size_t workspace_size() const {
         return workspace ? workspace->bytes() : 0;
+    }
+};
+
+/**
+ * @brief Extended context with recipe and run state for production training
+ *
+ * This context extends ModuleContext with additional fields needed for
+ * recipe-driven matmul dispatch. It provides modules with access to:
+ * - The training recipe for forward/backward matmul dispatch
+ * - The run state for quantization buffers and FP8/FP4 state
+ * - Layer index for recipe quantizer indices
+ * - Operation type for recipe-specific handling
+ *
+ * Usage:
+ * @code
+ * RecipeAwareContext ctx;
+ * ctx.stream = main_stream;
+ * ctx.B = batch_size;
+ * ctx.T = seq_length;
+ * ctx.recipe = &recipe;
+ * ctx.run_state = &rs;
+ * ctx.layer_idx = l;
+ * ctx.allow_quant = allow_quant_layer;
+ *
+ * module.forward(ctx, weights, input, acts);
+ * @endcode
+ */
+struct RecipeAwareContext : ModuleContext {
+    // Recipe for matmul dispatch (BF16, FP8, FP4)
+    const recipes::Recipe* recipe = nullptr;
+
+    // Run state with quantization buffers and FP8/FP4 state
+    IRunState* run_state = nullptr;
+
+    // Layer index (for delayed scaling quantizer indices)
+    int layer_idx = 0;
+
+    // Whether quantization is allowed for this layer
+    // (false for skip_quant_first/last layers)
+    bool allow_quant = true;
+
+    // Accumulate into gradients (for gradient accumulation)
+    bool accumulate = false;
+
+    // Skip weight gradient computation (for LoRA-only mode)
+    bool skip_weight_grad = false;
+
+    // Helper to check if recipe is available
+    [[nodiscard]] bool has_recipe() const {
+        return recipe != nullptr;
+    }
+
+    // Helper to check if run state is available
+    [[nodiscard]] bool has_run_state() const {
+        return run_state != nullptr;
     }
 };
 

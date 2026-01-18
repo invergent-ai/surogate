@@ -45,6 +45,18 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
     const bool in_skip_range = (layer_idx < skip_first) || (layer_idx >= mConfig.NumLayers - skip_last);
     const bool allow_quant_layer = !in_skip_range;
 
+    if constexpr (requires { &Block::template recompute_block_modular<Block>; }) {
+        if (mOptions.use_modular_blocks) {
+            Block::template recompute_block_modular<Block>(
+                *mRecipe, rs, weights, a, q, residual, layer_idx,
+                mConfig, mOptions, stream,
+                rs.has_fp8_forward() ? &rs.fp8_forward_quants() : nullptr,
+                rs.has_fp4_forward() ? &rs.fp4_forward_quants() : nullptr,
+                mWeights.get(), allow_quant_layer);
+            return;
+        }
+    }
+
     // recompute dependency rules
     const bool recompute_ln1 = mOptions.recompute_rmsnorm || mOptions.recompute_attention || mOptions.recompute_block;
     const bool recompute_ln2 = mOptions.recompute_rmsnorm || mOptions.recompute_ffn || mOptions.recompute_block;
@@ -285,6 +297,16 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
     auto& da = rs.simplified_grads(layer_idx);
     auto& qa = rs.simplified_quant_acts(layer_idx);
     auto& qg = rs.simplified_quant_grads();
+
+    if constexpr (requires { &Block::template backward_block_modular<Block>; }) {
+        if (mOptions.use_modular_blocks) {
+            Block::template backward_block_modular<Block>(
+                *mRecipe, rs, weights, grads, a, da, qa, qg,
+                layer_idx, mConfig, mOptions, accumulate,
+                stream, allow_quant_layer, hook);
+            return;
+        }
+    }
 
     // Keep compilation valid for non-dense block types (MoE/hybrid), even if the
     // simplified backward path isn't implemented for them yet.

@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "utilities/allocator.h"
+#include "kernels/kernels.h"
 
 cudnnHandle_t create_cudnn_handle();
 cublasLtHandle_t create_cublaslt_handle();
@@ -60,6 +61,8 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
 
     CudnnHandle = create_cudnn_handle();
     CublasLtHandle = create_cublaslt_handle();
+    // Ensure fallback cuBLAS handle exists before any CUDA graph capture.
+    init_cublas_fallback_handle();
 
     // https://docs.nvidia.com/cuda/cublas/index.html#cublassetworkspace
     // recommended workspace size 32MB for sm_90+

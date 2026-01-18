@@ -82,6 +82,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
     // Process transformer blocks
     // Hooks can be captured safely as long as their topology is stable for the run (e.g. LoRA hooks).
     const bool use_cuda_graphs = mOptions.use_cuda_graphs;
+    const bool use_modular_blocks = mOptions.use_modular_blocks;
     if (use_cuda_graphs) {
         rs.configure_forward_graphs(/*hooked=*/static_cast<bool>(hook));
     }
@@ -110,6 +111,27 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
         // For layer L>0: residual is get_residual(l-1) which gets populated by the LN1 fused op
         Tensor& residual = l == 0 ? rs.non_block_activations().encoded :
                                     rs.get_residual(l - 1, main_stream);
+
+        if constexpr (requires { &Block::template forward_block_modular<Block>; }) {
+            if (use_modular_blocks) {
+                const ForwardBlockHook* hook_ptr = hook ? &hook : nullptr;
+                detail::trace_or_execute_cuda_graph_with_stack([&]() {
+                    Block::template forward_block_modular<Block>(
+                        *mRecipe, rs, weights, acts, q, residual, l,
+                        mConfig, mOptions, main_stream,
+                        rs.has_fp8_forward() ? &rs.fp8_forward_quants() : nullptr,
+                        rs.has_fp4_forward() ? &rs.fp4_forward_quants() : nullptr,
+                        mWeights.get(), allow_quant_layer, hook_ptr);
+                }, main_stream, rs.forward_block_graph(l), use_cuda_graphs,
+                   rs.Stack, rs.forward_block_stack_checkpoint(l));
+
+                mWeights->release_block(l, main_stream);
+                if (l > 0 && mOptions.offload_residuals) {
+                    rs.put_residual(l - 1, rs.side_stream());
+                }
+                continue;
+            }
+        }
 
         // 1) First layer norm
         // The fused op writes: output_residual = inp1 + inp2, output_norm = rmsnorm(output_residual)
