@@ -155,6 +155,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Number of GPUs to use for training. Default is the first available GPU. Use 0 for all available GPUs.
         use_cuda_graphs (Optional[bool], defaults to True):
             Enable or disable CUDA graphs for performance.
+        use_dsl_ir (Optional[bool], defaults to False):
+            Enable DSL IR backend (validation-only placeholder).
 
         optimizer (Optional[Literal['adamw_8bit', 'normuon']], defaults to 'adamw_8bit'):
             Optimizer type to use for training. Supports:
@@ -315,6 +317,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
+    use_dsl_ir: Optional[bool] = True
 
     optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
@@ -422,6 +425,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         self.gpus = cfg.get('gpus', self.gpus)
         self.use_cuda_graphs = cfg.get('use_cuda_graphs', self.use_cuda_graphs)
+        self.use_dsl_ir = cfg.get('use_dsl_ir', self.use_dsl_ir)
 
         self.optimizer = cfg.get('optimizer', self.optimizer)
         self.learning_rate = float(cfg.get('learning_rate', self.learning_rate))
@@ -647,6 +651,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             fp4_backend=self.fp4_backend,
             skip_quant_first_layers=self.skip_quant_first_layers,
             skip_quant_last_layers=self.skip_quant_last_layers,
+            use_dsl_ir=self.use_dsl_ir,
         )
         self.runtime_config.use_zero_copy = self.use_zero_copy
         self.runtime_config.use_write_combined = self.use_write_combined

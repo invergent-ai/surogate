@@ -632,6 +632,7 @@ class HFConfigMapping(ASTNode):
     architecture: str
     config_class: str
     param_mapping: Dict[str, str] = field(default_factory=dict)
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

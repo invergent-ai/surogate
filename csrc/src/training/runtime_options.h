@@ -71,6 +71,10 @@ struct RuntimeOptions {
     // Eliminates precomputed freq_cis tensor, reduces memory bandwidth.
     bool UseFusedRope = false;
 
+    // DSL IR execution (placeholder backend).
+    bool UseDslIr = false;
+    std::string DslIrJson;
+
     // Matmul backend selection
     // AUTO: Let the system auto-detect (CUTLASS for SM120+ FP8, cuBLAS otherwise)
     // CUBLASLT: Force cuBLAS Lt (per-tensor FP8 scaling)

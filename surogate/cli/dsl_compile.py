@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 
 from surogate.dsl.types import ConcreteDim, SymbolicDim, VariadicDim, ComputedDim, Dtype, Shape
+from surogate.dsl.ast_nodes import CallExpr, Identifier, Literal, WeightMapping
 
 def prepare_command_parser(parser: argparse.ArgumentParser):
     """Prepare the compile command argument parser."""
@@ -158,6 +159,67 @@ def _serialize_attr(value: Any) -> Any:
         return value
 
 
+def _expr_to_value(expr: Any) -> Any:
+    if isinstance(expr, Literal):
+        return expr.value
+    if isinstance(expr, Identifier):
+        return expr.name
+    if isinstance(expr, CallExpr):
+        return str(expr)
+    return _serialize_attr(expr)
+
+
+def _serialize_weight_spec(spec: Any) -> Any:
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, CallExpr):
+        kind = spec.func
+        if kind == "fuse":
+            payload = {
+                "type": "fuse",
+                "sources": [_expr_to_value(arg) for arg in spec.args],
+            }
+            if "dim" in spec.kwargs:
+                payload["dim"] = _expr_to_value(spec.kwargs["dim"])
+            return payload
+        if kind == "transform":
+            payload = {
+                "type": "transform",
+                "source": _expr_to_value(spec.args[0]) if spec.args else None,
+            }
+            if "fn" in spec.kwargs:
+                payload["fn"] = _expr_to_value(spec.kwargs["fn"])
+            return payload
+        if kind == "split":
+            payload = {
+                "type": "split",
+                "targets": [_expr_to_value(arg) for arg in spec.args],
+            }
+            if "dim" in spec.kwargs:
+                payload["dim"] = _expr_to_value(spec.kwargs["dim"])
+            return payload
+        if kind == "tied_to":
+            return {
+                "type": "tied_to",
+                "source": _expr_to_value(spec.args[0]) if spec.args else None,
+            }
+        return {"type": kind, "expr": str(spec)}
+    return _serialize_attr(spec)
+
+
+def _serialize_weight_mapping(mapping: Any) -> Any:
+    if isinstance(mapping, WeightMapping):
+        payload = _serialize_weight_spec(mapping.external_spec)
+        if mapping.optional:
+            if isinstance(payload, str):
+                payload = {"type": "direct", "source": payload}
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["optional"] = True
+        return payload
+    return _serialize_weight_spec(mapping)
+
+
 def format_module_ir(module_ir, indent: int = 0) -> str:
     """Format a ModuleIR for text output."""
     prefix = "  " * indent
@@ -238,14 +300,28 @@ def format_graph_ir(graph_ir, name: str = "graph", indent: int = 0) -> str:
 
 def module_ir_to_dict(module_ir) -> Dict[str, Any]:
     """Convert a ModuleIR to a JSON-serializable dictionary."""
+    hf_config = getattr(module_ir, "hf_config_mapping", {})
+    hf_mapping = getattr(module_ir, "hf_weight_mapping", {})
+    hf_export = getattr(module_ir, "hf_export_mapping", {})
+
+    hf_mapping_out = {
+        name: _serialize_weight_mapping(spec) for name, spec in hf_mapping.items()
+    } if isinstance(hf_mapping, dict) else hf_mapping
+
+    hf_export_out = {
+        name: _serialize_weight_mapping(spec) for name, spec in hf_export.items()
+    } if isinstance(hf_export, dict) else hf_export
+
     result = {
         "name": module_ir.name,
         "kind": "model" if module_ir.is_model else "block" if module_ir.is_block else "module",
         "extends": module_ir.extends,
         "config": module_ir.config,
-        "hf_config": getattr(module_ir, "hf_config_mapping", {}),
-        "hf_mapping": getattr(module_ir, "hf_weight_mapping", {}),
+        "hf_config": hf_config,
+        "hf_mapping": hf_mapping_out,
     }
+    if hf_export_out:
+        result["hf_export"] = hf_export_out
 
     # Parameters (use forward graph params if available for full shape info)
     result["params"] = {}

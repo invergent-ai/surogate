@@ -25,6 +25,8 @@
 #include "models/qwen3/transformer_block.h"
 #include "models/qwen3moe/qwen3_moe_block.h"
 
+#include "dsl/dsl_model.h"
+
 #include "training/model.h"
 #include "utilities/allocator.h"
 #include "lora/lora_model.h"
@@ -104,6 +106,13 @@ public:
         int world,
         const std::shared_ptr<TensorAllocator>& alloc = nullptr) {
 
+        if (options.UseDslIr) {
+            if (options.DslIrJson.empty()) {
+                throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
+            }
+            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc);
+        }
+
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
         ModelOptions mod_options = ModelOptions::from_runtime_options(options);
 
@@ -155,6 +164,10 @@ public:
         NCCLCommunicator& comm,
         const std::shared_ptr<TensorAllocator>& alloc,
         const QLoRAConfig& qlora_config = QLoRAConfig{}) {
+
+        if (options.UseDslIr) {
+            throw std::runtime_error("DSL IR path does not support LoRA/QLoRA yet");
+        }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
         ModelOptions mod_options = ModelOptions::from_runtime_options(options);

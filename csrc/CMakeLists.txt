@@ -243,6 +243,9 @@ target_sources(surogate-common PRIVATE
     src/training/checkpoint.cpp
     src/training/model.cpp
 
+    src/dsl/ir.cpp
+    src/dsl/dsl_model.cpp
+
     src/config/pretrained_config.cpp
     src/models/registry.cpp
     src/models/qwen25/qwen25.cpp
@@ -433,6 +436,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # Utilities
             src/testing/utilities/test-sol.cpp
+            src/testing/utilities/test_dsl_ir.cpp
         )
         target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
         target_compile_options(unit-tests PRIVATE

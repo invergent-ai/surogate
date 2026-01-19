@@ -30,6 +30,14 @@ class SurogateTrainerWrapper():
         self.config = config
 
         model_weights_path = get_model_weights_path(config.model_dir)
+
+        if config.use_dsl_ir:
+            if config.lora:
+                raise ValueError("DSL IR backend does not support LoRA/QLoRA yet. Set lora: false.")
+            from surogate.dsl.ir_builder import build_dsl_ir_for_model
+            ir_json = build_dsl_ir_for_model(config.model_dir)
+            config.runtime_config.use_dsl_ir = True
+            config.runtime_config.dsl_ir_json = ir_json
         
         # Setup data loaders
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps

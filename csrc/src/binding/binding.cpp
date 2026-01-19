@@ -305,7 +305,8 @@ NB_MODULE(_surogate, m) {
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope,
             int fp8_amax_history, const std::string& fp4_backend,
-            int skip_quant_first_layers, int skip_quant_last_layers) {
+            int skip_quant_first_layers, int skip_quant_last_layers,
+            bool use_dsl_ir) {
 
             // Build recipe options
             recipes::RecipeConfig recipe_options;
@@ -349,6 +350,7 @@ NB_MODULE(_surogate, m) {
                 .TrainingRecipe = std::move(training_recipe),
                 .RecipeOptions = recipe_options,
                 .UseFusedRope = use_fused_rope,
+                .UseDslIr = use_dsl_ir,
                 .MatmulBackend = backend,
                 .MatmulType = opt_dtype_from_str(matmul_type),
                 .GradientType = opt_dtype_from_str(gradient_type),
@@ -389,6 +391,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("fp4_backend") = "cutlass",
              nb::arg("skip_quant_first_layers") = 0,
              nb::arg("skip_quant_last_layers") = 0,
+             nb::arg("use_dsl_ir") = false,
              "Create runtime/training options.\n\n"
              "Parameters:\n"
              "- recompute_*: Enable recomputation for submodules to reduce activation memory.\n"
@@ -404,7 +407,8 @@ NB_MODULE(_surogate, m) {
              "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
-             "- skip_quant_last_layers: Skip quantization for last N layers.")
+             "- skip_quant_last_layers: Skip quantization for last N layers.\n"
+             "- use_dsl_ir: Enable DSL IR backend (validation-only placeholder).")
         .def_rw("recompute_swiglu", &RuntimeOptions::RecomputeSwiGLu, "Recompute SwiGLU activations in backward.")
         .def_rw("recompute_rms_norm", &RuntimeOptions::RecomputeRMSNorm, "Recompute RMSNorm in backward.")
         .def_rw("recompute_ffn", &RuntimeOptions::RecomputeFFN, "Recompute FFN in backward.")
@@ -432,6 +436,8 @@ NB_MODULE(_surogate, m) {
         .def_rw("init_projections_to_zero", &RuntimeOptions::InitProjectionsToZero, "Initialize certain projections to zero (for experiments).")
         .def_rw("debug_memory_breakdown", &RuntimeOptions::DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation.")
         .def_rw("use_fused_rope", &RuntimeOptions::UseFusedRope, "Use fused RoPE kernel with on-the-fly cos/sin computation.")
+        .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Enable DSL IR backend (validation-only placeholder).")
+        .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
         .def_rw("router_z_loss_coef", &RuntimeOptions::RouterZLossCoef, "MoE z-loss coefficient (-1 = use model config).")
         .def_prop_rw("matmul_type", [](const RuntimeOptions* opt){ return opt->matmul_dtype(); },

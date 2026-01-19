@@ -332,6 +332,135 @@ class DSLTransformer(Transformer):
         return result
 
     # =========================================================================
+    # HuggingFace sections
+    # =========================================================================
+
+    def _strip_quotes(self, value: str) -> str:
+        if value.startswith(('"""', "'''")):
+            return value[3:-3]
+        if value.startswith(('"', "'")):
+            return value[1:-1]
+        return value
+
+    def hf_config_section(self, items):
+        data = {}
+        for item in items:
+            if not item:
+                continue
+            if isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, tuple) and len(sub) == 2:
+                        key, value = sub
+                        data[key] = value
+            elif isinstance(item, tuple) and len(item) == 2:
+                key, value = item
+                data[key] = value
+        param_mapping = data.get("param_mapping", {})
+        extras = {k: v for k, v in data.items() if k not in {"architecture", "config_class", "param_mapping"}}
+        return HFConfigMapping(
+            architecture=str(data.get("architecture", "")),
+            config_class=str(data.get("config_class", "")),
+            param_mapping=param_mapping,
+            extras=extras,
+        )
+
+    def hf_config_body(self, items):
+        return items
+
+    def hf_config_item(self, items):
+        key = str(items[0])
+        value = items[1]
+        if isinstance(value, Token) and value.type == "STRING":
+            value = self._strip_quotes(str(value))
+        return (key, value)
+
+    def hf_param_mapping(self, items):
+        mapping = {}
+        i = 0
+        while i + 1 < len(items):
+            key = str(items[i])
+            val = str(items[i + 1])
+            mapping[key] = val
+            i += 2
+        return mapping
+
+    def hf_mapping_section(self, items):
+        mappings = [m for m in items if isinstance(m, WeightMapping)]
+        return HFMappingSection(mappings=mappings)
+
+    def hf_export_section(self, items):
+        mappings = [m for m in items if isinstance(m, WeightMapping)]
+        return HFMappingSection(mappings=mappings)
+
+    def hf_weight_mapping(self, items):
+        optional = False
+        internal_name = items[0]
+        external_spec = items[-1]
+        if len(items) >= 2:
+            for item in items[1:-1]:
+                if isinstance(item, Token) and str(item) == "?":
+                    optional = True
+        return WeightMapping(internal_name=internal_name, external_spec=external_spec, optional=optional)
+
+    def weight_pattern(self, items):
+        return items[0]
+
+    def weight_pattern_indexed(self, items):
+        if not items:
+            return ""
+        result = str(items[0])
+        idx = 1
+        while idx + 1 < len(items):
+            placeholder = str(items[idx])
+            field = str(items[idx + 1])
+            result += f"[{{{placeholder}}}].{field}"
+            idx += 2
+        return result
+
+    def weight_pattern_dotted(self, items):
+        return ".".join(str(item) for item in items)
+
+    def direct_mapping(self, items):
+        return self._strip_quotes(str(items[0]))
+
+    def fuse_mapping(self, items):
+        dim = None
+        if items and isinstance(items[-1], Token) and items[-1].type == "INT":
+            dim = int(str(items[-1]))
+            items = items[:-1]
+        args = [Literal(value=self._strip_quotes(str(item))) for item in items]
+        kwargs = {}
+        if dim is not None:
+            kwargs["dim"] = Literal(value=dim)
+        return CallExpr(func="fuse", args=args, kwargs=kwargs)
+
+    def transform_mapping(self, items):
+        src = Literal(value=self._strip_quotes(str(items[0])))
+        fn = Identifier(name=str(items[1]))
+        return CallExpr(func="transform", args=[src], kwargs={"fn": fn})
+
+    def split_spec(self, items):
+        name = self._strip_quotes(str(items[0]))
+        start = int(str(items[1]))
+        end = int(str(items[2]))
+        return Literal(value={"name": name, "range": [start, end]})
+
+    def split_mapping(self, items):
+        dim = None
+        if items and isinstance(items[-1], Token) and items[-1].type == "INT":
+            dim = int(str(items[-1]))
+            items = items[:-1]
+        args = list(items)
+        kwargs = {}
+        if dim is not None:
+            kwargs["dim"] = Literal(value=dim)
+        return CallExpr(func="split", args=args, kwargs=kwargs)
+
+    def tied_mapping(self, items):
+        name = str(items[0])
+        return CallExpr(func="tied_to", args=[Identifier(name=name)], kwargs={})
+
+    # =========================================================================
     # Primitive Declaration
     # =========================================================================
 

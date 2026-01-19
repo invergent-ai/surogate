@@ -281,7 +281,6 @@ __global__ void moe_topk_backward_kernel(
         return;
     }
 
-    float p_k[MAX_K];
     float sum_p = 0.0f;
     float dot = 0.0f;
 
@@ -290,7 +289,6 @@ __global__ void moe_topk_backward_kernel(
         if (k >= top_k) break;
         int e = idx_row[k];
         float p = (e >= 0 && e < num_experts) ? p_row[e] : 0.0f;
-        p_k[k] = p;
         sum_p += p;
         dot += d_w_row[k] * p;
     }

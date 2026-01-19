@@ -1068,12 +1068,25 @@ class ModuleLowerer:
 
         # Process HuggingFace mappings
         if node.hf_config:
-            module_ir.hf_config_mapping = node.hf_config.param_mapping
+            hf_config = {}
+            if node.hf_config.architecture:
+                hf_config["architecture"] = node.hf_config.architecture
+            if node.hf_config.config_class:
+                hf_config["config_class"] = node.hf_config.config_class
+            if node.hf_config.param_mapping:
+                hf_config["param_mapping"] = node.hf_config.param_mapping
+            if node.hf_config.extras:
+                for key, value in node.hf_config.extras.items():
+                    hf_config.setdefault(key, value)
+            module_ir.hf_config_mapping = hf_config
 
         if node.hf_mapping:
             for mapping in node.hf_mapping.mappings:
-                if isinstance(mapping.external_spec, str):
-                    module_ir.hf_weight_mapping[mapping.internal_name] = mapping.external_spec
+                module_ir.hf_weight_mapping[mapping.internal_name] = mapping
+
+        if node.hf_export:
+            for mapping in node.hf_export.mappings:
+                module_ir.hf_export_mapping[mapping.internal_name] = mapping
 
         return module_ir
 

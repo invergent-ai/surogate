@@ -222,9 +222,10 @@ hf_param_mapping: _NL _INDENT (NAME ":" NAME _NL)* _NL* _DEDENT
 
 hf_mapping_section: "hf_mapping:" _NL _INDENT (hf_weight_mapping _NL)* _DEDENT
 hf_export_section: "hf_export:" _NL _INDENT (hf_weight_mapping _NL)* _DEDENT
-hf_weight_mapping: weight_pattern ":" hf_weight_spec
-weight_pattern: NAME ("[" "{" NAME "}" "]" "." NAME)*
-              | NAME ("." NAME)*
+hf_weight_mapping: weight_pattern ["?"] ":" hf_weight_spec
+weight_pattern: weight_pattern_indexed | weight_pattern_dotted
+weight_pattern_indexed: NAME ("[" "{" NAME "}" "]" "." NAME)+
+weight_pattern_dotted: NAME ("." NAME)*
 
 hf_weight_spec: STRING -> direct_mapping
               | "fuse" "(" STRING ("," STRING)* ["," "dim" "=" INT] ")" -> fuse_mapping
@@ -386,7 +387,7 @@ block_body: docstring? let_section? params_section? forward_section? backward_se
 // Model Declaration (simplified)
 model_decl: "model" NAME "(" param_list? ")" "{" model_body "}"
 
-model_body: docstring? let_section? params_section? forward_section? backward_section? hf_config_section? hf_mapping_section?
+model_body: docstring? let_section? params_section? forward_section? backward_section? hf_config_section? hf_mapping_section? hf_export_section?
 
 // Primitive Declaration (simplified)
 primitive_decl: "primitive" NAME "{" primitive_body "}"
@@ -431,10 +432,18 @@ hf_config_section: "hf_config" "{" (hf_config_item ";")* "}"
 hf_config_item: NAME ":" STRING
 
 hf_mapping_section: "hf_mapping" "{" (hf_weight_mapping ";")* "}"
-hf_weight_mapping: NAME ":" hf_weight_spec
+hf_export_section: "hf_export" "{" (hf_weight_mapping ";")* "}"
+hf_weight_mapping: weight_pattern "?"? ":" hf_weight_spec
+weight_pattern: weight_pattern_indexed | weight_pattern_dotted
+weight_pattern_indexed: NAME ("[" "{" NAME "}" "]" "." NAME)+
+weight_pattern_dotted: NAME ("." NAME)*
 
 hf_weight_spec: STRING
               | "fuse" "(" STRING ("," STRING)* ("," "dim" "=" INT)? ")"
+              | "transform" "(" STRING "," "fn" ":" NAME ")"
+              | "split" "(" split_spec ("," split_spec)* ("," "dim" "=" INT)? ")"
+              | "tied_to" "(" NAME ")"
+split_spec: STRING ":" "[" INT "," INT "]"
 
 // Annotations
 annotation: "@" NAME ("(" annotation_args ")")?

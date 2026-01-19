@@ -424,8 +424,9 @@ class ModuleIR:
     backward_schedule: Optional[ScheduleIR] = None
 
     # HuggingFace mapping
-    hf_weight_mapping: Dict[str, str] = field(default_factory=dict)
-    hf_config_mapping: Dict[str, str] = field(default_factory=dict)
+    hf_weight_mapping: Dict[str, Any] = field(default_factory=dict)
+    hf_export_mapping: Dict[str, Any] = field(default_factory=dict)
+    hf_config_mapping: Dict[str, Any] = field(default_factory=dict)
 
     # Metadata
     is_block: bool = False

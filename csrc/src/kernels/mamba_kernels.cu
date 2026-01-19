@@ -38,11 +38,6 @@ template<typename T>
 __device__ __forceinline__ T from_float(float v);
 
 template<>
-__device__ __forceinline__ float from_float<float>(float v) {
-    return v;
-}
-
-template<>
 __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
