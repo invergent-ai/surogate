@@ -673,9 +673,18 @@ class DSLTransformer(Transformer):
 
         if len(items) > 1 and items[1] is not None:
             for arg in items[1:]:
+                if arg is None:
+                    continue
+                if isinstance(arg, list):
+                    for elem in arg:
+                        if isinstance(elem, tuple):
+                            kwargs[elem[0]] = elem[1]
+                        else:
+                            args.append(elem)
+                    continue
                 if isinstance(arg, tuple):
                     kwargs[arg[0]] = arg[1]
-                elif arg is not None:
+                else:
                     args.append(arg)
 
         return Operation(
@@ -792,6 +801,12 @@ class DSLTransformer(Transformer):
                     dims.append(item)
             elif isinstance(item, int):
                 dims.append(item)
+
+        # If dtype was parsed as a dim, fix it up (e.g., [B, T, int32]).
+        if dtype is None and dims:
+            last = dims[-1]
+            if isinstance(last, str) and last in ("bf16", "fp32", "fp16", "fp8_e4m3", "fp8_e5m2", "fp4_e2m1", "int8", "int32"):
+                dtype = dims.pop()
 
         return TensorType(
             dims=dims,
@@ -993,6 +1008,13 @@ class DSLTransformer(Transformer):
 
         for item in items[1:]:
             if item is None:
+                continue
+            if isinstance(item, list):
+                for elem in item:
+                    if isinstance(elem, tuple):
+                        kwargs[elem[0]] = elem[1]
+                    else:
+                        args.append(elem)
                 continue
             if isinstance(item, tuple):
                 kwargs[item[0]] = item[1]

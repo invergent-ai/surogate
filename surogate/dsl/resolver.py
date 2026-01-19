@@ -33,6 +33,7 @@ from .ast_nodes import (
     BinaryOp,
     UnaryOp,
     CallExpr,
+    TernaryExpr,
     Annotation,
     LetBinding,
     ConstraintDecl,
@@ -1030,6 +1031,8 @@ class ModuleResolver:
                 # Allow dtype literals (bf16, fp32, int32, etc.) as built-ins.
                 if expr.name in {dtype.value for dtype in Dtype}:
                     return
+                if expr.name in {"NN", "NT", "TN", "TT"}:
+                    return
                 raise DSLUndefinedError(expr.name)
         elif isinstance(expr, BinaryOp):
             self._resolve_expr(expr.left)
@@ -1046,6 +1049,10 @@ class ModuleResolver:
                     raise DSLUndefinedError(expr.func)
             for arg in expr.args:
                 self._resolve_expr(arg)
+        elif isinstance(expr, TernaryExpr):
+            self._resolve_expr(expr.condition)
+            self._resolve_expr(expr.true_value)
+            self._resolve_expr(expr.false_value)
 
     def _evaluate_expr(self, expr) -> Any:
         """Evaluate an expression to a value."""
@@ -1060,6 +1067,8 @@ class ModuleResolver:
                 return info.value
             if expr.name in {dtype.value for dtype in Dtype}:
                 return Dtype.from_string(expr.name)
+            if expr.name in {"NN", "NT", "TN", "TT"}:
+                return expr.name
             return None
 
         if isinstance(expr, BinaryOp):
@@ -1116,6 +1125,12 @@ class ModuleResolver:
             if expr.func in builtins:
                 return builtins[expr.func](*args)
 
+            return None
+
+        if isinstance(expr, TernaryExpr):
+            cond = self._evaluate_expr(expr.condition)
+            if isinstance(cond, bool):
+                return self._evaluate_expr(expr.true_value if cond else expr.false_value)
             return None
 
         return None

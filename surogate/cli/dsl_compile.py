@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
+from surogate.dsl.types import ConcreteDim, SymbolicDim, VariadicDim, ComputedDim, Dtype, Shape
+
 def prepare_command_parser(parser: argparse.ArgumentParser):
     """Prepare the compile command argument parser."""
     parser.add_argument(
@@ -102,6 +104,60 @@ def parse_params(param_list: List[str]) -> Dict[str, Any]:
     return params
 
 
+def _dtype_to_str(dtype: Any) -> Optional[str]:
+    if dtype is None:
+        return None
+    if isinstance(dtype, Dtype):
+        return dtype.value
+    if hasattr(dtype, "value"):
+        return str(dtype.value)
+    return str(dtype)
+
+
+def _shape_to_list(shape: Optional[Shape]) -> Optional[List[Any]]:
+    if shape is None:
+        return None
+    dims = []
+    for d in shape.dims:
+        if isinstance(d, ConcreteDim):
+            dims.append(d.value)
+        elif isinstance(d, SymbolicDim):
+            dims.append(d.name)
+        elif isinstance(d, VariadicDim):
+            dims.append("*")
+        elif isinstance(d, ComputedDim):
+            dims.append(str(d))
+        else:
+            dims.append(str(d))
+    return dims
+
+
+def _tensor_ref_to_dict(tref) -> Dict[str, Any]:
+    return {
+        "shape": _shape_to_list(getattr(tref, "shape", None)),
+        "dtype": _dtype_to_str(getattr(tref, "dtype", None)),
+        "is_param": getattr(tref, "is_param", False),
+        "is_input": getattr(tref, "is_input", False),
+        "is_output": getattr(tref, "is_output", False),
+    }
+
+
+def _serialize_attr(value: Any) -> Any:
+    if isinstance(value, Dtype):
+        return value.value
+    if isinstance(value, (ConcreteDim, SymbolicDim, VariadicDim, ComputedDim)):
+        return str(value)
+    if isinstance(value, list):
+        return [_serialize_attr(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _serialize_attr(v) for k, v in value.items()}
+    try:
+        # Expression nodes stringify nicely
+        return str(value)
+    except Exception:
+        return value
+
+
 def format_module_ir(module_ir, indent: int = 0) -> str:
     """Format a ModuleIR for text output."""
     prefix = "  " * indent
@@ -185,20 +241,24 @@ def module_ir_to_dict(module_ir) -> Dict[str, Any]:
     result = {
         "name": module_ir.name,
         "kind": "model" if module_ir.is_model else "block" if module_ir.is_block else "module",
+        "extends": module_ir.extends,
+        "config": module_ir.config,
+        "hf_config": getattr(module_ir, "hf_config_mapping", {}),
+        "hf_mapping": getattr(module_ir, "hf_weight_mapping", {}),
     }
 
-    # Parameters
-    if module_ir.params:
-        result["params"] = {}
+    # Parameters (use forward graph params if available for full shape info)
+    result["params"] = {}
+    if module_ir.forward_graph and module_ir.forward_graph.params:
+        for name, param in module_ir.forward_graph.params.items():
+            result["params"][name] = _tensor_ref_to_dict(param)
+    elif module_ir.params:
         if isinstance(module_ir.params, dict):
             param_items = module_ir.params.items()
         else:
             param_items = [(p.name, p) for p in module_ir.params]
         for name, param in param_items:
-            result["params"][name] = {
-                "dtype": str(getattr(param, "dtype", "unknown")),
-                "shape": str(getattr(param, "shape", "?")),
-            }
+            result["params"][name] = _tensor_ref_to_dict(param)
 
     # Forward graph
     if module_ir.forward_graph:
@@ -220,22 +280,29 @@ def module_ir_to_dict(module_ir) -> Dict[str, Any]:
 def graph_ir_to_dict(graph_ir) -> Dict[str, Any]:
     """Convert a GraphIR to a JSON-serializable dictionary."""
     result = {
+        "name": getattr(graph_ir, "name", None),
         "num_ops": len(graph_ir.nodes),
-        "inputs": [str(x) for x in getattr(graph_ir, 'inputs', [])],
-        "outputs": [str(x) for x in getattr(graph_ir, 'outputs', [])],
+        "inputs": {name: _tensor_ref_to_dict(t) for name, t in getattr(graph_ir, "inputs", {}).items()},
+        "outputs": {name: _tensor_ref_to_dict(t) for name, t in getattr(graph_ir, "outputs", {}).items()},
+        "params": {name: _tensor_ref_to_dict(t) for name, t in getattr(graph_ir, "params", {}).items()},
+        "intermediates": {name: _tensor_ref_to_dict(t) for name, t in getattr(graph_ir, "intermediates", {}).items()},
+        "save": getattr(graph_ir, "save_list", []),
+        "recompute": getattr(graph_ir, "recompute_list", []),
         "operations": [],
     }
 
     for node in graph_ir.nodes:
         op_dict = {
-            "op": getattr(node, 'op_type', getattr(node, 'op', 'unknown')),
-            "inputs": [str(x) for x in getattr(node, 'inputs', [])],
-            "outputs": [str(x) for x in getattr(node, 'outputs', [])],
+            "id": getattr(node, "id", None),
+            "name": getattr(node, "name", None),
+            "kernel_type": getattr(getattr(node, "kernel_type", None), "value", getattr(node, "kernel_type", None)),
+            "inputs": [str(x) for x in getattr(node, "inputs", [])],
+            "outputs": [str(x) for x in getattr(node, "outputs", [])],
         }
 
         # Include attributes if present
         if hasattr(node, 'attrs') and node.attrs:
-            op_dict["attrs"] = {k: str(v) for k, v in node.attrs.items()}
+            op_dict["attrs"] = {k: _serialize_attr(v) for k, v in node.attrs.items()}
 
         result["operations"].append(op_dict)
 

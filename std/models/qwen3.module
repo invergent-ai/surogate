@@ -5,14 +5,14 @@ import std.primitives.rmsnorm
 import std.blocks.qwen3
 import std.modules.stacked_blocks
 model Qwen3Model(
-  vocab_size: int,
-  d_model: int,
-  n_layers: int,
-  num_query_heads: int,
-  num_kv_heads: int,
-  d_ff: int,
-  max_seq: int,
-  head_size: int = 0,
+  vocab_size: int = 151936,
+  d_model: int = 1024,
+  n_layers: int = 28,
+  num_query_heads: int = 16,
+  num_kv_heads: int = 8,
+  d_ff: int = 3072,
+  max_seq: int = 40960,
+  head_size: int = 128,
   eps: float = 1e-6,
   use_qkv_bias: bool = false,
   use_qk_norm: bool = true
