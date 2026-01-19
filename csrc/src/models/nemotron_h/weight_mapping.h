@@ -64,6 +64,108 @@ public:
         add_layer_pattern("backbone.layers.{layer}.mixer.up_proj.weight", TensorTarget::MLPUpWeight);
         add_layer_pattern("backbone.layers.{layer}.mixer.down_proj.weight", TensorTarget::MLPDownWeight);
 
+        // ====================================================================
+        // MoE (Nemotron-H hybrid) - routed experts + optional shared expert
+        // ====================================================================
+
+        // Router weights (various naming conventions)
+        add_layer_pattern("model.layers.{layer}.mlp.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("model.layers.{layer}.mlp.router.weight", TensorTarget::RouterGate);
+        add_layer_pattern("model.layers.{layer}.mlp.router.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("model.layers.{layer}.mixer.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("model.layers.{layer}.mixer.router.weight", TensorTarget::RouterGate);
+        add_layer_pattern("model.layers.{layer}.mixer.router.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("backbone.layers.{layer}.mlp.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("backbone.layers.{layer}.mlp.router.weight", TensorTarget::RouterGate);
+        add_layer_pattern("backbone.layers.{layer}.mixer.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("backbone.layers.{layer}.mixer.router.weight", TensorTarget::RouterGate);
+
+        // Router bias (optional)
+        add_layer_pattern("model.layers.{layer}.mlp.router.bias", TensorTarget::RouterBias, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.router.bias", TensorTarget::RouterBias, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.router.bias", TensorTarget::RouterBias, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.router.bias", TensorTarget::RouterBias, nullptr, true);
+
+        // Batched expert weights (pre-fused format)
+        add_layer_pattern("model.layers.{layer}.mlp.experts.gate_up_proj.weight",
+                          TensorTarget::ExpertsGateUp, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mlp.experts.down_proj.weight",
+                          TensorTarget::ExpertsDown, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.experts.gate_up_proj.weight",
+                          TensorTarget::ExpertsGateUp, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.experts.down_proj.weight",
+                          TensorTarget::ExpertsDown, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.experts.gate_up_proj.weight",
+                          TensorTarget::ExpertsGateUp, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.experts.down_proj.weight",
+                          TensorTarget::ExpertsDown, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.experts.gate_up_proj.weight",
+                          TensorTarget::ExpertsGateUp, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.experts.down_proj.weight",
+                          TensorTarget::ExpertsDown, nullptr, true);
+
+        // Per-expert weights (non-batched format)
+        add_expert_pattern("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+                           TensorTarget::ExpertGate, nullptr, true);
+        add_expert_pattern("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight",
+                           TensorTarget::ExpertUp);
+        add_expert_pattern("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+                           TensorTarget::ExpertDown);
+        add_expert_pattern("model.layers.{layer}.mixer.experts.{expert}.gate_proj.weight",
+                           TensorTarget::ExpertGate, nullptr, true);
+        add_expert_pattern("model.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
+                           TensorTarget::ExpertUp);
+        add_expert_pattern("model.layers.{layer}.mixer.experts.{expert}.down_proj.weight",
+                           TensorTarget::ExpertDown);
+        add_expert_pattern("backbone.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+                           TensorTarget::ExpertGate, nullptr, true);
+        add_expert_pattern("backbone.layers.{layer}.mlp.experts.{expert}.up_proj.weight",
+                           TensorTarget::ExpertUp);
+        add_expert_pattern("backbone.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+                           TensorTarget::ExpertDown);
+        add_expert_pattern("backbone.layers.{layer}.mixer.experts.{expert}.gate_proj.weight",
+                           TensorTarget::ExpertGate, nullptr, true);
+        add_expert_pattern("backbone.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
+                           TensorTarget::ExpertUp);
+        add_expert_pattern("backbone.layers.{layer}.mixer.experts.{expert}.down_proj.weight",
+                           TensorTarget::ExpertDown);
+
+        // Shared expert (optional)
+        add_layer_pattern("model.layers.{layer}.mlp.shared_expert.gate_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mlp.shared_expert.up_proj.weight",
+                          TensorTarget::SharedExpertUp, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mlp.shared_expert.down_proj.weight",
+                          TensorTarget::SharedExpertDown, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.shared_expert.gate_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.shared_expert.up_proj.weight",
+                          TensorTarget::SharedExpertUp, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.shared_expert.down_proj.weight",
+                          TensorTarget::SharedExpertDown, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.shared_expert.gate_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.shared_expert.up_proj.weight",
+                          TensorTarget::SharedExpertUp, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.shared_expert.down_proj.weight",
+                          TensorTarget::SharedExpertDown, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.shared_expert.gate_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.shared_expert.up_proj.weight",
+                          TensorTarget::SharedExpertUp, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.shared_expert.down_proj.weight",
+                          TensorTarget::SharedExpertDown, nullptr, true);
+
+        // Fused shared expert pattern (optional)
+        add_layer_pattern("model.layers.{layer}.mlp.shared_expert.gate_up_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("model.layers.{layer}.mixer.shared_expert.gate_up_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mlp.shared_expert.gate_up_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+        add_layer_pattern("backbone.layers.{layer}.mixer.shared_expert.gate_up_proj.weight",
+                          TensorTarget::SharedExpertGate, nullptr, true);
+
         // Mamba (Nemotron-H)
         add_layer_pattern("model.layers.{layer}.mixer.in_proj.weight", TensorTarget::MambaInProjWeight);
         add_layer_pattern("model.layers.{layer}.mixer.in_proj.bias", TensorTarget::MambaInProjBias, nullptr, true);

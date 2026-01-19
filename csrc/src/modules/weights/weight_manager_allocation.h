@@ -603,8 +603,24 @@ void ModularWeightManager<Block>::allocate_block_weights(
 
     // MoE-specific weight allocation (router, experts) - only for MoE blocks
     if constexpr (has_moe_weights<BlockWeights>::value) {
+        const bool is_moe_layer = (layer_idx < 0)
+            ? (mConfig.NumExperts > 0)
+            : mConfig.is_layer_moe(layer_idx);
+
+        if (!is_moe_layer) {
+            block.router.gate = Tensor();
+            block.router.bias.reset();
+            block.experts.use_batched = false;
+            block.experts.gate_up_proj = Tensor();
+            block.experts.down_proj = Tensor();
+            block.experts.experts.clear();
+            block.shared_expert.reset();
+            return;
+        }
+
         int num_experts = cfg.num_experts;
-        long D = cfg.intermediate_size;
+        long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : cfg.intermediate_size;
+        long moe_M = static_cast<long>(mlp_up_factor(cfg)) * moe_D;
 
         // Router gate: (num_experts, hidden_size)
         // Keep router weights in the model dtype (BF16). The router matmul is executed via the
@@ -616,15 +632,18 @@ void ModularWeightManager<Block>::allocate_block_weights(
 
         // Batched expert weights
         // Keep expert weights in BF16 as well (grouped GEMM kernels are BF16/FP32 only).
-        block.experts.gate_up_proj = alloc(other_dtype, "experts_gate_up_w", {num_experts, 2 * D, C});
-        block.experts.down_proj = alloc(other_dtype, "experts_down_w", {num_experts, C, D});
+        block.experts.gate_up_proj = alloc(other_dtype, "experts_gate_up_w", {num_experts, moe_M, C});
+        block.experts.down_proj = alloc(other_dtype, "experts_down_w", {num_experts, C, moe_D});
 
         // Shared expert (if configured)
         if (cfg.use_shared_expert) {
             int shared_D = cfg.shared_expert_intermediate > 0 ?
-                           cfg.shared_expert_intermediate : static_cast<int>(D);
+                           cfg.shared_expert_intermediate : static_cast<int>(moe_D);
+            const long shared_M = static_cast<long>(mlp_up_factor(cfg)) * shared_D;
             block.shared_expert.emplace();
-            block.shared_expert->gate_proj = alloc(other_dtype, "shared_expert_gate_w", {shared_D, C});
+            // gate_proj stores fused [up | gate] when gated, or just up when non-gated.
+            block.shared_expert->gate_proj = alloc(other_dtype, "shared_expert_gate_w", {shared_M, C});
+            // Keep a separate up_proj buffer for compatibility with legacy tooling (unused in modular path).
             block.shared_expert->up_proj = alloc(other_dtype, "shared_expert_up_w", {shared_D, C});
             block.shared_expert->down_proj = alloc(other_dtype, "shared_expert_down_w", {C, shared_D});
         }

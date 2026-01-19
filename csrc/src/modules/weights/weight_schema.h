@@ -22,6 +22,7 @@
 
 #include "config/pretrained_config.h"
 #include "models/qwen3moe/config.h"
+#include "models/nemotron_h/config.h"
 #include "utilities/tensor.h"
 
 namespace modules {
@@ -193,16 +194,21 @@ class RouterModule;
 template<>
 struct ModuleWeightSchema<RouterModule> {
     static ModuleSchema describe(const PretrainedConfig& cfg) {
-        // Only MoE configs have router weights
-        const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&cfg);
-        if (!moe_cfg || moe_cfg->NumExperts == 0) {
+        int num_experts = 0;
+        if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&cfg)) {
+            num_experts = moe_cfg->NumExperts;
+        } else if (const auto* nemo_cfg = dynamic_cast<const NemotronHConfig*>(&cfg)) {
+            num_experts = nemo_cfg->NRoutedExperts;
+        }
+
+        if (num_experts == 0) {
             return ModuleSchema{"RouterModule", {}};
         }
 
         ModuleSchema schema;
         schema.module_name = "RouterModule";
         schema.weights = {
-            {"gate_weight", {moe_cfg->NumExperts, cfg.HiddenSize}, WeightRequirement::Required,
+            {"gate_weight", {num_experts, cfg.HiddenSize}, WeightRequirement::Required,
              "Router gate projection weight"},
         };
         return schema;
@@ -218,20 +224,31 @@ class ExpertGroupModule;
 template<>
 struct ModuleWeightSchema<ExpertGroupModule> {
     static ModuleSchema describe(const PretrainedConfig& cfg) {
-        const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&cfg);
-        if (!moe_cfg || moe_cfg->NumExperts == 0) {
+        int num_experts = 0;
+        int d = 0;
+        int mlp_up_factor = 2;
+        if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&cfg)) {
+            num_experts = moe_cfg->NumExperts;
+            d = moe_cfg->MoeIntermediateSize > 0 ? moe_cfg->MoeIntermediateSize : cfg.IntermediateSize;
+            mlp_up_factor = 2;
+        } else if (const auto* nemo_cfg = dynamic_cast<const NemotronHConfig*>(&cfg)) {
+            num_experts = nemo_cfg->NRoutedExperts;
+            d = nemo_cfg->MoeIntermediateSize > 0 ? nemo_cfg->MoeIntermediateSize : cfg.IntermediateSize;
+            const std::string act = nemo_cfg->MlpHiddenAct;
+            mlp_up_factor = (act == "swiglu" || act == "geglu") ? 2 : 1;
+        }
+
+        if (num_experts == 0) {
             return ModuleSchema{"ExpertGroupModule", {}};
         }
 
         const int c = cfg.HiddenSize;
-        const int d = moe_cfg->MoeIntermediateSize > 0 ? moe_cfg->MoeIntermediateSize : cfg.IntermediateSize;
-        const int num_experts = moe_cfg->NumExperts;
 
         ModuleSchema schema;
         schema.module_name = "ExpertGroupModule";
         schema.weights = {
             // Batched layout for grouped GEMM efficiency
-            {"gate_up_weight", {num_experts, 2 * d, c}, WeightRequirement::Required,
+            {"gate_up_weight", {num_experts, mlp_up_factor * d, c}, WeightRequirement::Required,
              "Batched expert gate+up projection weights"},
             {"down_weight", {num_experts, c, d}, WeightRequirement::Required,
              "Batched expert down projection weights"},
@@ -249,15 +266,28 @@ class SharedExpertModule;
 template<>
 struct ModuleWeightSchema<SharedExpertModule> {
     static ModuleSchema describe(const PretrainedConfig& cfg) {
-        const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&cfg);
+        bool has_moe = false;
+        int d = 0;
+        if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&cfg)) {
+            has_moe = moe_cfg->NumExperts > 0;
+            d = moe_cfg->MoeIntermediateSize > 0 ? moe_cfg->MoeIntermediateSize : cfg.IntermediateSize;
+        } else if (const auto* nemo_cfg = dynamic_cast<const NemotronHConfig*>(&cfg)) {
+            has_moe = nemo_cfg->NRoutedExperts > 0;
+            if (nemo_cfg->MoeSharedExpertIntermediateSize > 0) {
+                d = nemo_cfg->MoeSharedExpertIntermediateSize;
+            } else if (nemo_cfg->MoeIntermediateSize > 0) {
+                d = nemo_cfg->MoeIntermediateSize;
+            } else {
+                d = cfg.IntermediateSize;
+            }
+        }
+
         // Shared expert is optional even in MoE models
-        if (!moe_cfg || moe_cfg->NumExperts == 0) {
+        if (!has_moe) {
             return ModuleSchema{"SharedExpertModule", {}};
         }
 
         const int c = cfg.HiddenSize;
-        // Shared expert may have different intermediate size
-        const int d = moe_cfg->MoeIntermediateSize > 0 ? moe_cfg->MoeIntermediateSize : cfg.IntermediateSize;
 
         ModuleSchema schema;
         schema.module_name = "SharedExpertModule";

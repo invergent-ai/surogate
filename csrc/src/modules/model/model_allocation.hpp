@@ -93,6 +93,9 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
         rs_config.block_config.mamba_conv_kernel = mConfig.MambaConvKernel;
         rs_config.block_config.mamba_n_groups = mConfig.MambaNGroups;
         rs_config.block_config.mamba_chunk_size = mConfig.MambaChunkSize;
+        if constexpr (requires { rs_config.block_config.mamba_intermediate_size; }) {
+            rs_config.block_config.mamba_intermediate_size = mConfig.MambaIntermediateSize;
+        }
         rs_config.block_config.mamba_use_bias = mConfig.MambaUseBias;
         rs_config.block_config.mamba_use_conv_bias = mConfig.MambaUseConvBias;
         rs_config.block_config.mamba_activation = mConfig.MambaActivation;
@@ -146,10 +149,15 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     gm_config.train_router = options.train_router;  // Allocate router gradient even in LoRA mode
     gm_config.layer_is_mamba.resize(mConfig.NumLayers);
     gm_config.has_mamba = false;
+    gm_config.layer_is_moe.resize(mConfig.NumLayers);
+    gm_config.has_moe = false;
     for (int i = 0; i < mConfig.NumLayers; ++i) {
         const bool is_mamba = (mConfig.get_block_type(i) == BlockType::Mamba);
         gm_config.layer_is_mamba[i] = static_cast<std::uint8_t>(is_mamba ? 1 : 0);
         gm_config.has_mamba = gm_config.has_mamba || is_mamba;
+        const bool is_moe = mConfig.is_layer_moe(i);
+        gm_config.layer_is_moe[i] = static_cast<std::uint8_t>(is_moe ? 1 : 0);
+        gm_config.has_moe = gm_config.has_moe || is_moe;
     }
 
     mGrads = std::make_unique<ModularGradientManager<Block>>(42, 0, gm_config, mAllocator);

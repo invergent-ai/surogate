@@ -73,6 +73,8 @@ public:
         // Hybrid layer markers (optional)
         bool has_mamba = false;
         std::vector<std::uint8_t> layer_is_mamba;
+        bool has_moe = false;
+        std::vector<std::uint8_t> layer_is_moe;
     };
 
     /**
@@ -772,6 +774,12 @@ void ModularGradientManager<Block>::scatter_reduce_block(BlockGradients& grads, 
     if constexpr (requires { grads.router.d_gate; }) maybe_schedule(grads.router.d_gate);
     if constexpr (requires { grads.experts.d_gate_up_proj; }) maybe_schedule(grads.experts.d_gate_up_proj);
     if constexpr (requires { grads.experts.d_down_proj; }) maybe_schedule(grads.experts.d_down_proj);
+    if constexpr (requires { grads.shared_expert; }) {
+        if (grads.shared_expert.has_value()) {
+            maybe_schedule(grads.shared_expert->d_gate_proj);
+            maybe_schedule(grads.shared_expert->d_down_proj);
+        }
+    }
 
     comm.execute_transaction(signal);
 }
@@ -852,6 +860,12 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
     if constexpr (requires { shard.router.d_gate; grads.router.d_gate; }) acc_local(shard.router.d_gate, grads.router.d_gate, rng_2[0] ^ 0xa54ff53au);
     if constexpr (requires { shard.experts.d_gate_up_proj; grads.experts.d_gate_up_proj; }) acc_local(shard.experts.d_gate_up_proj, grads.experts.d_gate_up_proj, rng_2[1] ^ 0x510e527fu);
     if constexpr (requires { shard.experts.d_down_proj; grads.experts.d_down_proj; }) acc_local(shard.experts.d_down_proj, grads.experts.d_down_proj, rng_2[2] ^ 0x9b05688cu);
+    if constexpr (requires { shard.shared_expert; grads.shared_expert; }) {
+        if (shard.shared_expert.has_value() && grads.shared_expert.has_value()) {
+            acc_local(shard.shared_expert->d_gate_proj, grads.shared_expert->d_gate_proj, rng_2[2] ^ 0x3c6ef372u);
+            acc_local(shard.shared_expert->d_down_proj, grads.shared_expert->d_down_proj, rng_2[3] ^ 0xbb67ae85u);
+        }
+    }
 
     if constexpr (requires { shard.attention_grads.d_qkv_bias; grads.attention_grads.d_qkv_bias; }) {
         if (shard.attention_grads.d_qkv_bias.has_value() && grads.attention_grads.d_qkv_bias.has_value()) {
@@ -938,6 +952,12 @@ void ModularGradientManager<Block>::all_to_all_block(int layer_idx, BlockGradien
     if constexpr (requires { grads.router.d_gate; }) maybe_schedule(grads.router.d_gate);
     if constexpr (requires { grads.experts.d_gate_up_proj; }) maybe_schedule(grads.experts.d_gate_up_proj);
     if constexpr (requires { grads.experts.d_down_proj; }) maybe_schedule(grads.experts.d_down_proj);
+    if constexpr (requires { grads.shared_expert; }) {
+        if (grads.shared_expert.has_value()) {
+            maybe_schedule(grads.shared_expert->d_gate_proj);
+            maybe_schedule(grads.shared_expert->d_down_proj);
+        }
+    }
 
     comm.execute_transaction(signal);
 }
@@ -1176,6 +1196,10 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
         (force_mamba || (layer_idx >= 0 &&
                          layer_idx < static_cast<int>(mConfig.layer_is_mamba.size()) &&
                          mConfig.layer_is_mamba[static_cast<std::size_t>(layer_idx)] != 0));
+    const bool allocate_moe = mConfig.has_moe &&
+        (layer_idx < 0 ||
+         (layer_idx < static_cast<int>(mConfig.layer_is_moe.size()) &&
+          mConfig.layer_is_moe[static_cast<std::size_t>(layer_idx)] != 0));
 
     auto kind = EAllocationType::ON_DEVICE;
 
@@ -1281,15 +1305,38 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
     // Exception: router gradient is allocated when train_router is enabled (for LoRA + router training mode).
     if (!mConfig.skip_allocation || mConfig.train_router) {
         if constexpr (requires { grads.router.d_gate; }) {
-            grads.router.d_gate = mAllocator->allocate(dtype, "d_router_gate_w", kind, {cfg.num_experts, C});
+            if (allocate_moe) {
+                grads.router.d_gate = mAllocator->allocate(dtype, "d_router_gate_w", kind, {cfg.num_experts, C});
+            } else {
+                grads.router.d_gate = Tensor();
+            }
         }
     }
     if (!mConfig.skip_allocation) {
         if constexpr (requires { grads.experts.d_gate_up_proj; }) {
-            grads.experts.d_gate_up_proj = mAllocator->allocate(dtype, "d_experts_gate_up_w", kind, {cfg.num_experts, 2 * D, C});
+            if (allocate_moe) {
+                grads.experts.d_gate_up_proj = mAllocator->allocate(dtype, "d_experts_gate_up_w", kind, {cfg.num_experts, M, C});
+            } else {
+                grads.experts.d_gate_up_proj = Tensor();
+            }
         }
         if constexpr (requires { grads.experts.d_down_proj; }) {
-            grads.experts.d_down_proj = mAllocator->allocate(dtype, "d_experts_down_w", kind, {cfg.num_experts, C, D});
+            if (allocate_moe) {
+                grads.experts.d_down_proj = mAllocator->allocate(dtype, "d_experts_down_w", kind, {cfg.num_experts, C, D});
+            } else {
+                grads.experts.d_down_proj = Tensor();
+            }
+        }
+        if constexpr (requires { grads.shared_expert; }) {
+            if (allocate_moe && cfg.use_shared_expert) {
+                int shared_D = cfg.shared_expert_intermediate > 0 ? cfg.shared_expert_intermediate : static_cast<int>(D);
+                long shared_M = static_cast<long>(mlp_up_factor(cfg)) * static_cast<long>(shared_D);
+                grads.shared_expert.emplace();
+                grads.shared_expert->d_gate_proj = mAllocator->allocate(dtype, "d_shared_expert_gate_w", kind, {shared_M, C});
+                grads.shared_expert->d_down_proj = mAllocator->allocate(dtype, "d_shared_expert_down_w", kind, {C, shared_D});
+            } else {
+                grads.shared_expert.reset();
+            }
         }
     }
 }
@@ -1309,6 +1356,10 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
         (layer_idx >= 0 &&
          layer_idx < static_cast<int>(mConfig.layer_is_mamba.size()) &&
          mConfig.layer_is_mamba[static_cast<std::size_t>(layer_idx)] != 0);
+    const bool allocate_moe = mConfig.has_moe &&
+        (layer_idx < 0 ||
+         (layer_idx < static_cast<int>(mConfig.layer_is_moe.size()) &&
+          mConfig.layer_is_moe[static_cast<std::size_t>(layer_idx)] != 0));
 
     auto kind = mConfig.offload_grads ? mConfig.offload_alloc : EAllocationType::ON_DEVICE;
 
@@ -1437,13 +1488,36 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
 
     // MoE-specific gradients
     if constexpr (requires { grads.router.d_gate; }) {
-        grads.router.d_gate = alloc_shard_2d("d_router_gate_w_shard", cfg.num_experts, C);
+        if (allocate_moe) {
+            grads.router.d_gate = alloc_shard_2d("d_router_gate_w_shard", cfg.num_experts, C);
+        } else {
+            grads.router.d_gate = Tensor();
+        }
     }
     if constexpr (requires { grads.experts.d_gate_up_proj; }) {
-        grads.experts.d_gate_up_proj = alloc_shard_3d("d_experts_gate_up_w_shard", cfg.num_experts, 2 * D, C);
+        if (allocate_moe) {
+            grads.experts.d_gate_up_proj = alloc_shard_3d("d_experts_gate_up_w_shard", cfg.num_experts, M, C);
+        } else {
+            grads.experts.d_gate_up_proj = Tensor();
+        }
     }
     if constexpr (requires { grads.experts.d_down_proj; }) {
-        grads.experts.d_down_proj = alloc_shard_3d("d_experts_down_w_shard", cfg.num_experts, C, D);
+        if (allocate_moe) {
+            grads.experts.d_down_proj = alloc_shard_3d("d_experts_down_w_shard", cfg.num_experts, C, D);
+        } else {
+            grads.experts.d_down_proj = Tensor();
+        }
+    }
+    if constexpr (requires { grads.shared_expert; }) {
+        if (allocate_moe && cfg.use_shared_expert) {
+            int shared_D = cfg.shared_expert_intermediate > 0 ? cfg.shared_expert_intermediate : static_cast<int>(D);
+            long shared_M = static_cast<long>(mlp_up_factor(cfg)) * static_cast<long>(shared_D);
+            grads.shared_expert.emplace();
+            grads.shared_expert->d_gate_proj = alloc_shard_2d("d_shared_expert_gate_w_shard", shared_M, C);
+            grads.shared_expert->d_down_proj = alloc_shard_2d("d_shared_expert_down_w_shard", C, shared_D);
+        } else {
+            grads.shared_expert.reset();
+        }
     }
 }
 

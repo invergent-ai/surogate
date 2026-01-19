@@ -5,6 +5,7 @@
 #include "fp4_weights.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -72,6 +73,7 @@ void FP4WeightsManager::allocate_fp4_blocks() {
     const int num_layers = mConfig.num_layers;
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
+    const int mlp_M = mConfig.mlp_up_factor * intermediate;
     const int num_q_heads = mConfig.num_query_heads;
     const int num_kv_heads = mConfig.num_kv_heads;
     const int head_size = mConfig.head_size;
@@ -120,10 +122,12 @@ void FP4WeightsManager::allocate_fp4_blocks() {
             w.global_amax_rowwise = allocate_global_amax();
         }
 
-        // Gate+Up projection: (2 * intermediate, hidden)
+        const int mlp_M = mConfig.mlp_up_factor * intermediate;
+
+        // Gate+Up projection: (mlp_up_factor * intermediate, hidden)
         {
             auto& w = block.gate_up_proj;
-            w.M = 2 * intermediate;
+            w.M = mlp_M;
             w.K = hidden;
 
             std::size_t packed_bytes = FP4BlockScaleConfig::packed_data_bytes(w.M, w.K);
@@ -187,6 +191,7 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
     // Allocate temporary load buffer for BF16 weights
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
+    const int mlp_M = mConfig.mlp_up_factor * intermediate;
     const int num_q_heads = mConfig.num_query_heads;
     const int num_kv_heads = mConfig.num_kv_heads;
     const int head_size = mConfig.head_size;
@@ -196,15 +201,16 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
     const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
         ? mConfig.qlora_config.moe_intermediate_size
         : intermediate;
+    const int moe_M = mConfig.mlp_up_factor * moe_intermediate;
 
     std::size_t max_weight_elems = std::max({
         static_cast<std::size_t>(qkv_out) * hidden,
         static_cast<std::size_t>(hidden) * num_q_heads * head_size,
-        static_cast<std::size_t>(2 * intermediate) * hidden,
+        static_cast<std::size_t>(mlp_M) * hidden,
         static_cast<std::size_t>(hidden) * intermediate,
         static_cast<std::size_t>(mConfig.vocab_size) * hidden,
         // For MoE: expert gate_up projection
-        static_cast<std::size_t>(2 * moe_intermediate) * hidden
+        static_cast<std::size_t>(moe_M) * hidden
     });
 
     // Allocate temporary load buffer directly
@@ -300,6 +306,9 @@ void FP4WeightsManager::load_embeddings(SafeTensorsReader& reader, cudaStream_t 
     // Try common embedding weight names
     const std::vector<std::string> embed_names = {
         "model.embed_tokens.weight",
+        "model.embeddings.weight",
+        "backbone.embed_tokens.weight",
+        "backbone.embeddings.weight",
         "transformer.wte.weight",
         "embeddings.word_embeddings.weight"
     };
@@ -352,7 +361,23 @@ void FP4WeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
     const int num_kv_heads = mConfig.num_kv_heads;
     const int head_size = mConfig.head_size;
 
-    const std::string prefix = fmt::format("model.layers.{}", layer_idx);
+    auto pick_layer_prefix = [&]() {
+        const std::string model_prefix = fmt::format("model.layers.{}", layer_idx);
+        const std::string backbone_prefix = fmt::format("backbone.layers.{}", layer_idx);
+        const bool model_has = find_entry_opt(reader, model_prefix + ".self_attn.q_proj.weight")
+                               || find_entry_opt(reader, model_prefix + ".self_attn.qkv_proj.weight")
+                               || find_entry_opt(reader, model_prefix + ".mixer.q_proj.weight")
+                               || find_entry_opt(reader, model_prefix + ".norm.weight")
+                               || find_entry_opt(reader, model_prefix + ".input_layernorm.weight");
+        return model_has ? model_prefix : backbone_prefix;
+    };
+    const std::string prefix = pick_layer_prefix();
+
+    auto pick_attn_name = [&](const std::string& self_attn, const std::string& mixer) -> std::string {
+        if (find_entry_opt(reader, self_attn)) return self_attn;
+        if (find_entry_opt(reader, mixer)) return mixer;
+        return self_attn;
+    };
 
     // Helper to load and quantize a weight to FP4
     auto load_and_quantize = [&](const std::string& name, FP4BlockQuantizedWeight& dest, int M, int K) {
@@ -370,7 +395,8 @@ void FP4WeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
 
     // Load Q, K, V projections
     const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-    const std::string qkv_name = prefix + ".self_attn.qkv_proj.weight";
+    const std::string qkv_name = pick_attn_name(prefix + ".self_attn.qkv_proj.weight",
+                                                prefix + ".mixer.qkv_proj.weight");
     if (find_entry_opt(reader, qkv_name)) {
         load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
     } else {
@@ -384,21 +410,27 @@ void FP4WeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
 
         Tensor q_view = mLoadBuffer;
         q_view.Sizes[0] = q_out;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_proj.weight")) {
+        const std::string q_name = pick_attn_name(prefix + ".self_attn.q_proj.weight",
+                                                  prefix + ".mixer.q_proj.weight");
+        if (const auto* entry = find_entry_opt(reader, q_name)) {
             entry->read_tensor(q_view, true);
         }
 
         Tensor k_view = mLoadBuffer;
         k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
         k_view.Sizes[0] = kv_out;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_proj.weight")) {
+        const std::string k_name = pick_attn_name(prefix + ".self_attn.k_proj.weight",
+                                                  prefix + ".mixer.k_proj.weight");
+        if (const auto* entry = find_entry_opt(reader, k_name)) {
             entry->read_tensor(k_view, true);
         }
 
         Tensor v_view = mLoadBuffer;
         v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
         v_view.Sizes[0] = kv_out;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.v_proj.weight")) {
+        const std::string v_name = pick_attn_name(prefix + ".self_attn.v_proj.weight",
+                                                  prefix + ".mixer.v_proj.weight");
+        if (const auto* entry = find_entry_opt(reader, v_name)) {
             entry->read_tensor(v_view, true);
         }
 
@@ -407,53 +439,96 @@ void FP4WeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
     }
 
     // Output projection
-    load_and_quantize(prefix + ".self_attn.o_proj.weight",
-                      block.out_proj, hidden, num_q_heads * head_size);
+    const std::string out_name = pick_attn_name(prefix + ".self_attn.o_proj.weight",
+                                                prefix + ".mixer.o_proj.weight");
+    load_and_quantize(out_name, block.out_proj, hidden, num_q_heads * head_size);
+
+    const int mlp_M = mConfig.mlp_up_factor * intermediate;
 
     // MLP projections
-    const std::string gate_up_name = prefix + ".mlp.gate_up_proj.weight";
+    auto pick_mlp_name = [&](const std::string& mlp_name, const std::string& mixer_name) -> std::string {
+        if (find_entry_opt(reader, mlp_name)) return mlp_name;
+        if (find_entry_opt(reader, mixer_name)) return mixer_name;
+        return mlp_name;
+    };
+
+    const std::string gate_up_name = pick_mlp_name(prefix + ".mlp.gate_up_proj.weight",
+                                                   prefix + ".mixer.gate_up_proj.weight");
     if (find_entry_opt(reader, gate_up_name)) {
-        load_and_quantize(gate_up_name, block.gate_up_proj, 2 * intermediate, hidden);
+        load_and_quantize(gate_up_name, block.gate_up_proj, mlp_M, hidden);
     } else {
-        mLoadBuffer.Sizes[0] = 2 * intermediate;
-        mLoadBuffer.Sizes[1] = hidden;
-        mLoadBuffer.Rank = 2;
+        if (mConfig.mlp_up_factor == 1) {
+            mLoadBuffer.Sizes[0] = intermediate;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
 
-        Tensor up_view = mLoadBuffer;
-        up_view.Sizes[0] = intermediate;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.up_proj.weight")) {
-            entry->read_tensor(up_view, true);
+            const std::string up_name = pick_mlp_name(prefix + ".mlp.up_proj.weight",
+                                                      prefix + ".mixer.up_proj.weight");
+            if (const auto* entry = find_entry_opt(reader, up_name)) {
+                entry->read_tensor(mLoadBuffer, true);
+            }
+
+            quantize_fp4_and_store(block.gate_up_proj, mLoadBuffer, mlp_M, hidden, stream);
+        } else {
+            mLoadBuffer.Sizes[0] = 2 * intermediate;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+
+            Tensor up_view = mLoadBuffer;
+            up_view.Sizes[0] = intermediate;
+            const std::string up_name = pick_mlp_name(prefix + ".mlp.up_proj.weight",
+                                                      prefix + ".mixer.up_proj.weight");
+            if (const auto* entry = find_entry_opt(reader, up_name)) {
+                entry->read_tensor(up_view, true);
+            }
+
+            Tensor gate_view = mLoadBuffer;
+            gate_view.Data = mLoadBuffer.Data + intermediate * hidden * sizeof(nv_bfloat16);
+            gate_view.Sizes[0] = intermediate;
+            const std::string gate_name = pick_mlp_name(prefix + ".mlp.gate_proj.weight",
+                                                        prefix + ".mixer.gate_proj.weight");
+            if (const auto* entry = find_entry_opt(reader, gate_name)) {
+                entry->read_tensor(gate_view, true);
+            }
+
+            mLoadBuffer.Sizes[0] = 2 * intermediate;
+            quantize_fp4_and_store(block.gate_up_proj, mLoadBuffer, mlp_M, hidden, stream);
         }
-
-        Tensor gate_view = mLoadBuffer;
-        gate_view.Data = mLoadBuffer.Data + intermediate * hidden * sizeof(nv_bfloat16);
-        gate_view.Sizes[0] = intermediate;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate_proj.weight")) {
-            entry->read_tensor(gate_view, true);
-        }
-
-        mLoadBuffer.Sizes[0] = 2 * intermediate;
-        quantize_fp4_and_store(block.gate_up_proj, mLoadBuffer, 2 * intermediate, hidden, stream);
     }
 
     // Down projection
-    load_and_quantize(prefix + ".mlp.down_proj.weight",
-                      block.down_proj, hidden, intermediate);
+    const std::string down_name = pick_mlp_name(prefix + ".mlp.down_proj.weight",
+                                                prefix + ".mixer.down_proj.weight");
+    load_and_quantize(down_name, block.down_proj, hidden, intermediate);
 
     // Layer norms (not quantized)
+    bool ln1_loaded = false;
+    bool ln2_loaded = false;
     if (const auto* entry = find_entry_opt(reader, prefix + ".input_layernorm.weight")) {
         entry->read_tensor(block.ln1_weight, true);
+        ln1_loaded = true;
     }
     if (const auto* entry = find_entry_opt(reader, prefix + ".post_attention_layernorm.weight")) {
         entry->read_tensor(block.ln2_weight, true);
+        ln2_loaded = true;
+    }
+    if (!ln1_loaded || !ln2_loaded) {
+        if (const auto* entry = find_entry_opt(reader, prefix + ".norm.weight")) {
+            if (!ln1_loaded) entry->read_tensor(block.ln1_weight, true);
+            if (!ln2_loaded) entry->read_tensor(block.ln2_weight, true);
+        }
     }
 
     // QK-norm weights
     if (mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_norm.weight")) {
+        const std::string qn_name = pick_attn_name(prefix + ".self_attn.q_norm.weight",
+                                                   prefix + ".mixer.q_norm.weight");
+        const std::string kn_name = pick_attn_name(prefix + ".self_attn.k_norm.weight",
+                                                   prefix + ".mixer.k_norm.weight");
+        if (const auto* entry = find_entry_opt(reader, qn_name)) {
             entry->read_tensor(block.q_norm_weight.value(), true);
         }
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_norm.weight")) {
+        if (const auto* entry = find_entry_opt(reader, kn_name)) {
             entry->read_tensor(block.k_norm_weight.value(), true);
         }
     }
@@ -540,6 +615,10 @@ float FP4WeightsManager::memory_savings_ratio() const {
                 bf16_bytes += static_cast<std::size_t>(expert.gate_up_proj.M) * expert.gate_up_proj.K * 2;
                 bf16_bytes += static_cast<std::size_t>(expert.down_proj.M) * expert.down_proj.K * 2;
             }
+            if (block.shared_expert.has_value()) {
+                bf16_bytes += static_cast<std::size_t>(block.shared_expert->gate_up_proj.M) * block.shared_expert->gate_up_proj.K * 2;
+                bf16_bytes += static_cast<std::size_t>(block.shared_expert->down_proj.M) * block.shared_expert->down_proj.K * 2;
+            }
         }
     } else {
         for (const auto& block : mFP4Blocks) {
@@ -599,6 +678,12 @@ void FP4WeightsManager::allocate_moe_blocks() {
     const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
         ? mConfig.qlora_config.moe_intermediate_size
         : mConfig.intermediate_size;
+    const int moe_M = mConfig.mlp_up_factor * moe_intermediate;
+    const int shared_intermediate = (mConfig.qlora_config.moe_shared_expert_intermediate_size > 0)
+        ? mConfig.qlora_config.moe_shared_expert_intermediate_size
+        : moe_intermediate;
+    const int shared_M = mConfig.mlp_up_factor * shared_intermediate;
+    const bool use_shared = mConfig.qlora_config.num_shared_experts > 0;
 
     // Determine allocation type for expert weights
     // When offload_experts is enabled, store experts in pinned CPU memory
@@ -645,12 +730,21 @@ void FP4WeightsManager::allocate_moe_blocks() {
             auto& expert = block.experts[e];
 
             // Gate+Up projection
-            allocate_fp4_weight(expert.gate_up_proj, 2 * moe_intermediate, hidden,
+            allocate_fp4_weight(expert.gate_up_proj, moe_M, hidden,
                                 fmt::format("l{}_e{}_gate_up", layer, e), exp_alloc);
 
             // Down projection
             allocate_fp4_weight(expert.down_proj, hidden, moe_intermediate,
                                 fmt::format("l{}_e{}_down", layer, e), exp_alloc);
+        }
+
+        // Shared expert weights (optional)
+        if (use_shared) {
+            block.shared_expert.emplace();
+            allocate_fp4_weight(block.shared_expert->gate_up_proj, shared_M, hidden,
+                                fmt::format("l{}_shared_gate_up", layer), exp_alloc);
+            allocate_fp4_weight(block.shared_expert->down_proj, hidden, shared_intermediate,
+                                fmt::format("l{}_shared_down", layer), exp_alloc);
         }
     }
 
@@ -673,8 +767,28 @@ void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
         ? mConfig.qlora_config.moe_intermediate_size
         : mConfig.intermediate_size;
+    const int moe_M = mConfig.mlp_up_factor * moe_intermediate;
+    const int shared_intermediate = (mConfig.qlora_config.moe_shared_expert_intermediate_size > 0)
+        ? mConfig.qlora_config.moe_shared_expert_intermediate_size
+        : moe_intermediate;
+    const int shared_M = mConfig.mlp_up_factor * shared_intermediate;
+    auto pick_layer_prefix = [&]() {
+        const std::string model_prefix = fmt::format("model.layers.{}", layer_idx);
+        const std::string backbone_prefix = fmt::format("backbone.layers.{}", layer_idx);
+        const bool model_has = find_entry_opt(reader, model_prefix + ".self_attn.q_proj.weight")
+                               || find_entry_opt(reader, model_prefix + ".self_attn.qkv_proj.weight")
+                               || find_entry_opt(reader, model_prefix + ".mixer.q_proj.weight")
+                               || find_entry_opt(reader, model_prefix + ".norm.weight")
+                               || find_entry_opt(reader, model_prefix + ".input_layernorm.weight");
+        return model_has ? model_prefix : backbone_prefix;
+    };
+    const std::string prefix = pick_layer_prefix();
 
-    const std::string prefix = fmt::format("model.layers.{}", layer_idx);
+    auto pick_attn_name = [&](const std::string& self_attn, const std::string& mixer) -> std::string {
+        if (find_entry_opt(reader, self_attn)) return self_attn;
+        if (find_entry_opt(reader, mixer)) return mixer;
+        return self_attn;
+    };
 
     // Helper to load and quantize a weight
     auto load_and_quantize = [&](const std::string& name, FP4BlockQuantizedWeight& dest, int M, int K) {
@@ -694,7 +808,8 @@ void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     // Attention weights (same as dense)
     // =========================================================================
     const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-    const std::string qkv_name = prefix + ".self_attn.qkv_proj.weight";
+    const std::string qkv_name = pick_attn_name(prefix + ".self_attn.qkv_proj.weight",
+                                                prefix + ".mixer.qkv_proj.weight");
     if (find_entry_opt(reader, qkv_name)) {
         load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
     } else {
@@ -708,21 +823,27 @@ void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
 
         Tensor q_view = mLoadBuffer;
         q_view.Sizes[0] = q_out;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_proj.weight")) {
+        const std::string q_name = pick_attn_name(prefix + ".self_attn.q_proj.weight",
+                                                  prefix + ".mixer.q_proj.weight");
+        if (const auto* entry = find_entry_opt(reader, q_name)) {
             entry->read_tensor(q_view, true);
         }
 
         Tensor k_view = mLoadBuffer;
         k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
         k_view.Sizes[0] = kv_out;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_proj.weight")) {
+        const std::string k_name = pick_attn_name(prefix + ".self_attn.k_proj.weight",
+                                                  prefix + ".mixer.k_proj.weight");
+        if (const auto* entry = find_entry_opt(reader, k_name)) {
             entry->read_tensor(k_view, true);
         }
 
         Tensor v_view = mLoadBuffer;
         v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
         v_view.Sizes[0] = kv_out;
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.v_proj.weight")) {
+        const std::string v_name = pick_attn_name(prefix + ".self_attn.v_proj.weight",
+                                                  prefix + ".mixer.v_proj.weight");
+        if (const auto* entry = find_entry_opt(reader, v_name)) {
             entry->read_tensor(v_view, true);
         }
 
@@ -731,23 +852,39 @@ void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     }
 
     // Output projection
-    load_and_quantize(prefix + ".self_attn.o_proj.weight",
+    const std::string out_name = pick_attn_name(prefix + ".self_attn.o_proj.weight",
+                                                prefix + ".mixer.o_proj.weight");
+    load_and_quantize(out_name,
                       block.out_proj, hidden, num_q_heads * head_size);
 
     // Layer norms
+    bool ln1_loaded = false;
+    bool ln2_loaded = false;
     if (const auto* entry = find_entry_opt(reader, prefix + ".input_layernorm.weight")) {
         entry->read_tensor(block.ln1_weight, true);
+        ln1_loaded = true;
     }
     if (const auto* entry = find_entry_opt(reader, prefix + ".post_attention_layernorm.weight")) {
         entry->read_tensor(block.ln2_weight, true);
+        ln2_loaded = true;
+    }
+    if (!ln1_loaded || !ln2_loaded) {
+        if (const auto* entry = find_entry_opt(reader, prefix + ".norm.weight")) {
+            if (!ln1_loaded) entry->read_tensor(block.ln1_weight, true);
+            if (!ln2_loaded) entry->read_tensor(block.ln2_weight, true);
+        }
     }
 
     // QK-norm weights
     if (mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.q_norm.weight")) {
+        const std::string qn_name = pick_attn_name(prefix + ".self_attn.q_norm.weight",
+                                                   prefix + ".mixer.q_norm.weight");
+        const std::string kn_name = pick_attn_name(prefix + ".self_attn.k_norm.weight",
+                                                   prefix + ".mixer.k_norm.weight");
+        if (const auto* entry = find_entry_opt(reader, qn_name)) {
             entry->read_tensor(block.q_norm_weight.value(), true);
         }
-        if (const auto* entry = find_entry_opt(reader, prefix + ".self_attn.k_norm.weight")) {
+        if (const auto* entry = find_entry_opt(reader, kn_name)) {
             entry->read_tensor(block.k_norm_weight.value(), true);
         }
     }
@@ -756,24 +893,58 @@ void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     // Router gate (BF16, not quantized)
     // =========================================================================
     // Model stores as (num_experts, hidden) and our matmul(TN) expects the same layout.
-    if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate.weight")) {
-        entry->read_tensor(block.router_gate, /*allow_cast=*/true);
-    } else {
-        std::cerr << "[FP4-QLoRA WARN] layer " << layer_idx << " router gate not found: "
-                  << prefix << ".mlp.gate.weight - this will cause NaN!\n";
+    {
+        const std::array<std::string, 6> router_names = {
+            prefix + ".mlp.gate.weight",
+            prefix + ".mlp.router.weight",
+            prefix + ".mlp.router.gate.weight",
+            prefix + ".mixer.gate.weight",
+            prefix + ".mixer.router.weight",
+            prefix + ".mixer.router.gate.weight"
+        };
+        bool found = false;
+        for (const auto& name : router_names) {
+            if (const auto* entry = find_entry_opt(reader, name)) {
+                entry->read_tensor(block.router_gate, /*allow_cast=*/true);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std::cerr << "[FP4-QLoRA WARN] layer " << layer_idx
+                      << " router gate not found (tried mlp/mixer variants) - this will cause NaN!\n";
+        }
     }
 
-    // =========================================================================
     // Expert weights
     // =========================================================================
     for (int e = 0; e < n_experts; ++e) {
         auto& expert = block.experts[e];
-        const std::string exp_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+        const std::string mlp_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+        const std::string mixer_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+        const bool use_mixer = !find_entry_opt(reader, mlp_prefix + ".gate_up_proj.weight")
+                               && !find_entry_opt(reader, mlp_prefix + ".up_proj.weight")
+                               && !find_entry_opt(reader, mlp_prefix + ".down_proj.weight")
+                               && (find_entry_opt(reader, mixer_prefix + ".gate_up_proj.weight")
+                                   || find_entry_opt(reader, mixer_prefix + ".up_proj.weight")
+                                   || find_entry_opt(reader, mixer_prefix + ".down_proj.weight"));
+        const std::string exp_prefix = use_mixer ? mixer_prefix : mlp_prefix;
 
         // Gate+Up projection (may be fused or separate)
         const std::string gate_up_name = exp_prefix + ".gate_up_proj.weight";
         if (find_entry_opt(reader, gate_up_name)) {
-            load_and_quantize(gate_up_name, expert.gate_up_proj, 2 * moe_intermediate, hidden);
+            load_and_quantize(gate_up_name, expert.gate_up_proj, moe_M, hidden);
+        } else if (mConfig.mlp_up_factor == 1) {
+            // Non-gated experts: only up projection
+            mLoadBuffer.Sizes[0] = moe_intermediate;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+
+            if (const auto* entry = find_entry_opt(reader, exp_prefix + ".up_proj.weight")) {
+                entry->read_tensor(mLoadBuffer, true);
+            }
+
+            quantize_fp4_and_store(expert.gate_up_proj, mLoadBuffer, moe_M, hidden, stream);
         } else {
             // Separate gate and up - fuse them
             mLoadBuffer.Sizes[0] = 2 * moe_intermediate;
@@ -796,12 +967,69 @@ void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
             }
 
             mLoadBuffer.Sizes[0] = 2 * moe_intermediate;
-            quantize_fp4_and_store(expert.gate_up_proj, mLoadBuffer, 2 * moe_intermediate, hidden, stream);
+            quantize_fp4_and_store(expert.gate_up_proj, mLoadBuffer, moe_M, hidden, stream);
         }
 
         // Down projection
         load_and_quantize(exp_prefix + ".down_proj.weight",
                           expert.down_proj, hidden, moe_intermediate);
+    }
+
+    // Shared expert weights (optional)
+    if (block.shared_expert.has_value()) {
+        const std::string mlp_prefix = prefix + ".mlp.shared_expert";
+        const std::string mixer_prefix = prefix + ".mixer.shared_expert";
+        const bool use_mixer = !find_entry_opt(reader, mlp_prefix + ".gate_up_proj.weight")
+                               && !find_entry_opt(reader, mlp_prefix + ".up_proj.weight")
+                               && !find_entry_opt(reader, mlp_prefix + ".down_proj.weight")
+                               && (find_entry_opt(reader, mixer_prefix + ".gate_up_proj.weight")
+                                   || find_entry_opt(reader, mixer_prefix + ".up_proj.weight")
+                                   || find_entry_opt(reader, mixer_prefix + ".down_proj.weight"));
+        const std::string shared_prefix = use_mixer ? mixer_prefix : mlp_prefix;
+
+        // Gate+Up projection (may be fused or separate)
+        const std::string gate_up_name = shared_prefix + ".gate_up_proj.weight";
+        if (find_entry_opt(reader, gate_up_name)) {
+            load_and_quantize(gate_up_name, block.shared_expert->gate_up_proj, shared_M, hidden);
+        } else if (mConfig.mlp_up_factor == 1) {
+            // Non-gated shared expert: only up projection
+            mLoadBuffer.Sizes[0] = shared_intermediate;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+
+            if (const auto* entry = find_entry_opt(reader, shared_prefix + ".up_proj.weight")) {
+                entry->read_tensor(mLoadBuffer, true);
+            }
+
+            quantize_fp4_and_store(block.shared_expert->gate_up_proj, mLoadBuffer, shared_M, hidden, stream);
+        } else {
+            // Separate gate and up - fuse them
+            mLoadBuffer.Sizes[0] = 2 * shared_intermediate;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+
+            // Up in first half
+            Tensor up_view = mLoadBuffer;
+            up_view.Sizes[0] = shared_intermediate;
+            if (const auto* entry = find_entry_opt(reader, shared_prefix + ".up_proj.weight")) {
+                entry->read_tensor(up_view, true);
+            }
+
+            // Gate in second half
+            Tensor gate_view = mLoadBuffer;
+            gate_view.Data = mLoadBuffer.Data + shared_intermediate * hidden * sizeof(nv_bfloat16);
+            gate_view.Sizes[0] = shared_intermediate;
+            if (const auto* entry = find_entry_opt(reader, shared_prefix + ".gate_proj.weight")) {
+                entry->read_tensor(gate_view, true);
+            }
+
+            mLoadBuffer.Sizes[0] = 2 * shared_intermediate;
+            quantize_fp4_and_store(block.shared_expert->gate_up_proj, mLoadBuffer, shared_M, hidden, stream);
+        }
+
+        // Down projection
+        load_and_quantize(shared_prefix + ".down_proj.weight",
+                          block.shared_expert->down_proj, hidden, shared_intermediate);
     }
 }
 

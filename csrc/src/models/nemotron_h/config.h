@@ -46,6 +46,19 @@ struct NemotronHConfig : public PretrainedConfig {
     std::string MambaHiddenAct = "silu";
     std::string MlpHiddenAct = "silu";
 
+    // MoE-specific configuration (Nemotron-H hybrid MoE)
+    int NRoutedExperts = 0;                ///< Number of routed experts (0 = not MoE)
+    int NumExpertsPerTok = 0;              ///< Top-k experts per token
+    int MoeIntermediateSize = 0;           ///< Per-expert intermediate size (0 = use IntermediateSize)
+    int MoeSharedExpertIntermediateSize = 0; ///< Shared expert size (0 = use MoeIntermediateSize)
+    int NSharedExperts = 0;                ///< Number of shared experts (0 = none)
+    bool NormTopkProb = false;             ///< Normalize top-k weights after selection
+    float RoutedScalingFactor = 1.0f;      ///< Scale factor for routed expert outputs
+    int TopkGroup = 1;                     ///< Grouped top-k selection (router)
+    int NGroup = 1;                        ///< Number of expert groups (router)
+    float RouterAuxLossCoef = 0.01f;       ///< Router auxiliary loss coefficient
+    float RouterZLossCoef = 0.001f;        ///< Router z-loss coefficient
+
     NemotronHConfig() {
         Architecture = NEMOTRON_H;
     }

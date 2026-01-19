@@ -47,6 +47,9 @@ ModularTransformerModel<Block>::ModularTransformerModel(
         block_config.mamba_conv_kernel = config.MambaConvKernel;
         block_config.mamba_n_groups = config.MambaNGroups;
         block_config.mamba_chunk_size = config.MambaChunkSize;
+        if constexpr (requires { block_config.mamba_intermediate_size; }) {
+            block_config.mamba_intermediate_size = config.MambaIntermediateSize;
+        }
         block_config.mamba_use_bias = config.MambaUseBias;
         block_config.mamba_use_conv_bias = config.MambaUseConvBias;
         block_config.mamba_activation = config.MambaActivation;
@@ -111,6 +114,16 @@ ModularTransformerModel<Block>::ModularTransformerModel(
         wm_config.layer_is_mamba[i] = static_cast<std::uint8_t>(is_mamba ? 1 : 0);
         wm_config.has_mamba = wm_config.has_mamba || is_mamba;
     }
+    wm_config.layer_is_moe.resize(config.NumLayers);
+    wm_config.has_moe = false;
+    for (int i = 0; i < config.NumLayers; ++i) {
+        const bool is_moe = config.is_layer_moe(i);
+        wm_config.layer_is_moe[i] = static_cast<std::uint8_t>(is_moe ? 1 : 0);
+        wm_config.has_moe = wm_config.has_moe || is_moe;
+    }
+    wm_config.NumExperts = config.NumExperts;
+    wm_config.NumExpertsPerTok = config.NumExpertsPerTok;
+    wm_config.MoeIntermediateSize = config.MoeIntermediateSize;
 
     mWeights = std::make_unique<ModularWeightManager<Block>>(wm_config, *mAllocator);
 }

@@ -138,10 +138,21 @@ struct QLoRAConfig {
     /// Per-expert MLP intermediate size (0 = use regular intermediate_size)
     int moe_intermediate_size = 0;
 
+    /// Number of shared experts (0 = none)
+    int num_shared_experts = 0;
+
+    /// Shared expert intermediate size (0 = use moe_intermediate_size or intermediate_size)
+    int moe_shared_expert_intermediate_size = 0;
+
     /**
      * @brief Check if this is an MoE model
      */
     [[nodiscard]] bool is_moe() const { return num_experts > 0; }
+
+    /**
+     * @brief Check if shared expert is enabled
+     */
+    [[nodiscard]] bool use_shared_expert() const { return num_shared_experts > 0; }
 
     /**
      * @brief Check if quantization is active

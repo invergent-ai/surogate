@@ -43,6 +43,7 @@ public:
         int num_kv_heads;
         int head_size;
         int vocab_size;
+        int mlp_up_factor = 2;      ///< 2 for gated (SwiGLU), 1 for non-gated (ReLU2)
         QLoRAConfig qlora_config;
         bool use_qk_norm = false;  ///< Whether model uses QK-norm (Qwen3)
         bool tied_embeddings = true;  ///< Whether lm_head is tied to embeddings

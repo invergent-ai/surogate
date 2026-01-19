@@ -81,8 +81,9 @@ struct BlockExecutor {
         const int mamba_head_dim = config.MambaHeadDim;
         const int mamba_state = config.MambaSsmStateSize;
         const int mamba_groups = config.MambaNGroups > 0 ? config.MambaNGroups : 1;
-        const int mamba_conv_dim = D + 2 * mamba_groups * mamba_state;
-        const int mamba_proj_size = D + mamba_conv_dim + mamba_heads;
+        const int mamba_dim = config.mamba_dim();
+        const int mamba_conv_dim = mamba_dim + 2 * mamba_groups * mamba_state;
+        const int mamba_proj_size = mamba_dim + mamba_conv_dim + mamba_heads;
         const int mamba_chunk_size = config.MambaChunkSize > 0 ? config.MambaChunkSize : 2048;
         const int mamba_chunks = (T + mamba_chunk_size - 1) / mamba_chunk_size;
 
@@ -196,6 +197,8 @@ struct BlockExecutor {
                             qv.ln2_abs_max(), config.RmsNormEps, B, T, C, stream);
         };
 
+        const bool moe_gated = is_gated_activation(config.activation_type);
+
         struct MoEForwardState {
             Tensor router_logits;
             Tensor router_probs;
@@ -223,6 +226,9 @@ struct BlockExecutor {
                     throw std::logic_error("BlockExecutor::forward: MoE config missing");
                 }
                 const auto& moe_cfg = *config.moe_config;
+                if (moe_cfg.n_group > 1 || moe_cfg.topk_group > 1) {
+                    throw std::logic_error("BlockExecutor::forward: grouped MoE routing is not supported yet");
+                }
                 const int BT = B * T;
                 const int num_experts = moe_cfg.num_experts;
                 const int top_k = moe_cfg.top_k;
@@ -288,20 +294,38 @@ struct BlockExecutor {
                     (*hook)(layer_idx, stream, ForwardHookPoint::AfterRouterProjection, &router_ctx);
                 }
 
-                // Softmax over experts
-                moe_softmax_forward(
-                    ms.router_probs.template get<float>(),
-                    ms.router_logits.template get<float>(),
-                    BT, num_experts, stream
-                );
+                // Router activation (softmax or sigmoid)
+                if (moe_cfg.use_sigmoid) {
+                    moe_sigmoid_forward(
+                        ms.router_probs.template get<float>(),
+                        ms.router_logits.template get<float>(),
+                        BT * num_experts, stream
+                    );
+                } else {
+                    moe_softmax_forward(
+                        ms.router_probs.template get<float>(),
+                        ms.router_logits.template get<float>(),
+                        BT, num_experts, stream
+                    );
+                }
 
-                // Top-K selection with normalized weights
+                // Top-K selection (optionally normalized)
                 moe_topk_forward(
                     ms.expert_indices.template get<int>(),
                     ms.routing_weights_fp32.template get<float>(),
                     ms.router_probs.template get<float>(),
-                    BT, num_experts, top_k, true, stream
+                    BT, num_experts, top_k, moe_cfg.norm_topk_prob, stream
                 );
+
+                if (moe_cfg.routed_scaling_factor != 1.0f) {
+                    moe_scale_forward(
+                        ms.routing_weights_fp32.template get<float>(),
+                        ms.routing_weights_fp32.template get<float>(),
+                        moe_cfg.routed_scaling_factor,
+                        BT * top_k,
+                        stream
+                    );
+                }
 
                 // Expert counts
                 moe_compute_expert_counts(
@@ -416,7 +440,8 @@ struct BlockExecutor {
                 }
 
                 // Allocate gate+up buffer after permuted_input for correct stack order
-                Tensor expert_gate_up{acts.ln2.DType, {ms.total_expert_tokens, 2 * ms.expert_D}, nullptr, nullptr, 2, dev};
+                const int moe_M = moe_gated ? (2 * ms.expert_D) : ms.expert_D;
+                Tensor expert_gate_up{acts.ln2.DType, {ms.total_expert_tokens, moe_M}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(expert_gate_up);
                 fill_zero(expert_outputs, stream);
 
@@ -439,44 +464,92 @@ struct BlockExecutor {
                 if (!hook_handled) {
                     const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
-                    Tensor expert_swiglu{acts.ln2.DType, {ms.total_expert_tokens, ms.expert_D}, nullptr, nullptr, 2, dev};
-                    rs.temp_acquire(expert_swiglu);
+                    Tensor expert_act{acts.ln2.DType, {ms.total_expert_tokens, ms.expert_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(expert_act);
 
-                    if (acts.ln2.DType == ETensorDType::BF16) {
-                        moe_grouped_gemm_gate_up(
-                            expert_gate_up.template get<nv_bfloat16>(),
-                            permuted_input.template get<nv_bfloat16>(),
-                            weights.experts.gate_up_proj.template get<nv_bfloat16>(),
-                            ms.expert_offsets.template get<int>(),
-                            ms.num_experts, C, ms.expert_D,
-                            rs.CublasHandle, stream, host_offsets
-                        );
+                    if (moe_gated) {
+                        if (acts.ln2.DType == ETensorDType::BF16) {
+                            moe_grouped_gemm_gate_up(
+                                expert_gate_up.template get<nv_bfloat16>(),
+                                permuted_input.template get<nv_bfloat16>(),
+                                weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                                ms.expert_offsets.template get<int>(),
+                                ms.num_experts, C, ms.expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        } else {
+                            moe_grouped_gemm_gate_up(
+                                expert_gate_up.template get<float>(),
+                                permuted_input.template get<float>(),
+                                weights.experts.gate_up_proj.template get<float>(),
+                                ms.expert_offsets.template get<int>(),
+                                ms.num_experts, C, ms.expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        }
+
+                        Tensor expert_up{acts.ln2.DType, {ms.total_expert_tokens, ms.expert_D}, nullptr, nullptr, 2, dev};
+                        Tensor expert_gate{acts.ln2.DType, {ms.total_expert_tokens, ms.expert_D}, nullptr, nullptr, 2, dev};
+                        rs.temp_acquire(expert_up);
+                        rs.temp_acquire(expert_gate);
+
+                        split_gate_up(expert_gate_up, expert_up, expert_gate, ms.total_expert_tokens, ms.expert_D, stream);
+                        silu_mul_forward(expert_act, expert_gate, expert_up, ms.total_expert_tokens, ms.expert_D, stream);
+
+                        rs.temp_free(expert_gate);
+                        rs.temp_free(expert_up);
                     } else {
-                        moe_grouped_gemm_gate_up(
-                            expert_gate_up.template get<float>(),
-                            permuted_input.template get<float>(),
-                            weights.experts.gate_up_proj.template get<float>(),
-                            ms.expert_offsets.template get<int>(),
-                            ms.num_experts, C, ms.expert_D,
-                            rs.CublasHandle, stream, host_offsets
-                        );
+                        if (acts.ln2.DType == ETensorDType::BF16) {
+                            moe_grouped_gemm(
+                                expert_gate_up.template get<nv_bfloat16>(),
+                                permuted_input.template get<nv_bfloat16>(),
+                                weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                                ms.expert_offsets.template get<int>(),
+                                ms.num_experts,
+                                /*M=*/ms.expert_D,
+                                /*K=*/C,
+                                rs.CublasHandle,
+                                stream,
+                                host_offsets,
+                                /*alpha=*/1.0f,
+                                /*beta=*/0.0f,
+                                EMMTranspose::TN
+                            );
+                        } else {
+                            moe_grouped_gemm(
+                                expert_gate_up.template get<float>(),
+                                permuted_input.template get<float>(),
+                                weights.experts.gate_up_proj.template get<float>(),
+                                ms.expert_offsets.template get<int>(),
+                                ms.num_experts,
+                                /*M=*/ms.expert_D,
+                                /*K=*/C,
+                                rs.CublasHandle,
+                                stream,
+                                host_offsets,
+                                /*alpha=*/1.0f,
+                                /*beta=*/0.0f,
+                                EMMTranspose::TN
+                            );
+                        }
+
+                        const long N = static_cast<long>(ms.total_expert_tokens) * static_cast<long>(ms.expert_D);
+                        switch (config.activation_type) {
+                            case ActivationType::SiLU:
+                                silu_forward(expert_act, expert_gate_up, N, stream);
+                                break;
+                            case ActivationType::ReLU2:
+                                relu2_forward(expert_act, expert_gate_up, N, stream);
+                                break;
+                            default:
+                                throw std::logic_error("BlockExecutor::forward: unsupported MoE activation");
+                        }
                     }
-
-                    Tensor expert_up{acts.ln2.DType, {ms.total_expert_tokens, ms.expert_D}, nullptr, nullptr, 2, dev};
-                    Tensor expert_gate{acts.ln2.DType, {ms.total_expert_tokens, ms.expert_D}, nullptr, nullptr, 2, dev};
-                    rs.temp_acquire(expert_up);
-                    rs.temp_acquire(expert_gate);
-
-                    split_gate_up(expert_gate_up, expert_up, expert_gate, ms.total_expert_tokens, ms.expert_D, stream);
-                    silu_mul_forward(expert_swiglu, expert_gate, expert_up, ms.total_expert_tokens, ms.expert_D, stream);
-
-                    rs.temp_free(expert_gate);
-                    rs.temp_free(expert_up);
 
                     if (acts.ln2.DType == ETensorDType::BF16) {
                         moe_grouped_gemm_down(
                             expert_outputs.template get<nv_bfloat16>(),
-                            expert_swiglu.template get<nv_bfloat16>(),
+                            expert_act.template get<nv_bfloat16>(),
                             weights.experts.down_proj.template get<nv_bfloat16>(),
                             ms.expert_offsets.template get<int>(),
                             ms.num_experts, C, ms.expert_D,
@@ -485,7 +558,7 @@ struct BlockExecutor {
                     } else {
                         moe_grouped_gemm_down(
                             expert_outputs.template get<float>(),
-                            expert_swiglu.template get<float>(),
+                            expert_act.template get<float>(),
                             weights.experts.down_proj.template get<float>(),
                             ms.expert_offsets.template get<int>(),
                             ms.num_experts, C, ms.expert_D,
@@ -493,7 +566,7 @@ struct BlockExecutor {
                         );
                     }
 
-                    rs.temp_free(expert_swiglu);
+                    rs.temp_free(expert_act);
                 }
 
                 // Stash expert_outputs for combine
@@ -539,6 +612,80 @@ struct BlockExecutor {
                         ms.scatter_indices.template get<int>(),
                         BT, ms.total_expert_tokens, C, ms.top_k, stream
                     );
+                }
+
+                // Optional shared expert (Nemotron/DeepSeek-style)
+                if (config.moe_config.has_value()) {
+                    const auto& moe_cfg = *config.moe_config;
+                    if (moe_cfg.use_shared_expert && weights.shared_expert.has_value()) {
+                        const int shared_D = (moe_cfg.shared_expert_size > 0)
+                            ? moe_cfg.shared_expert_size
+                            : ms.expert_D;
+
+                        Tensor flat_ln2;
+                        flat_ln2.Data = acts.ln2.Data;
+                        flat_ln2.DType = acts.ln2.DType;
+                        flat_ln2.Sizes[0] = BT;
+                        flat_ln2.Sizes[1] = C;
+                        flat_ln2.Rank = 2;
+                        flat_ln2.Device = dev;
+
+                        Tensor shared_act{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                        Tensor shared_out{acts.ln2.DType, {BT, C}, nullptr, nullptr, 2, dev};
+                        rs.temp_acquire(shared_act);
+                        rs.temp_acquire(shared_out);
+
+                        if (moe_gated) {
+                            Tensor shared_gate_up{acts.ln2.DType, {BT, 2 * shared_D}, nullptr, nullptr, 2, dev};
+                            Tensor shared_gate{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                            Tensor shared_up{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                            rs.temp_acquire(shared_gate_up);
+                            rs.temp_acquire(shared_gate);
+                            rs.temp_acquire(shared_up);
+
+                            matmul(shared_gate_up, weights.shared_expert->gate_proj, flat_ln2, std::nullopt,
+                                   nullptr, nullptr,
+                                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                                   2 * shared_D, BT, C, EMMTranspose::TN, false,
+                                   stream);
+
+                            split_gate_up(shared_gate_up, shared_up, shared_gate, BT, shared_D, stream);
+                            silu_mul_forward(shared_act, shared_gate, shared_up, BT, shared_D, stream);
+
+                            rs.temp_free(shared_up);
+                            rs.temp_free(shared_gate);
+                            rs.temp_free(shared_gate_up);
+                        } else {
+                            matmul(shared_act, weights.shared_expert->gate_proj, flat_ln2, std::nullopt,
+                                   nullptr, nullptr,
+                                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                                   shared_D, BT, C, EMMTranspose::TN, false,
+                                   stream);
+                            const long N = static_cast<long>(BT) * static_cast<long>(shared_D);
+                            switch (config.activation_type) {
+                                case ActivationType::SiLU:
+                                    silu_forward(shared_act, shared_act, N, stream);
+                                    break;
+                                case ActivationType::ReLU2:
+                                    relu2_forward(shared_act, shared_act, N, stream);
+                                    break;
+                                default:
+                                    throw std::logic_error("BlockExecutor::forward: unsupported shared expert activation");
+                            }
+                        }
+
+                        matmul(shared_out, weights.shared_expert->down_proj, shared_act, std::nullopt,
+                               nullptr, nullptr,
+                               rs.CublasLtHandle, rs.CuBlasWorkspace,
+                               C, BT, shared_D, EMMTranspose::TN, false,
+                               stream);
+
+                        const long N = static_cast<long>(BT) * static_cast<long>(C);
+                        vector_add_sr(acts.mlp_down, acts.mlp_down, shared_out, 1.0f, N, /*seed=*/0, stream);
+
+                        rs.temp_free(shared_out);
+                        rs.temp_free(shared_act);
+                    }
                 }
 
                 // Free temporaries (reverse order where possible)
@@ -663,7 +810,7 @@ struct BlockExecutor {
 
                 // Split projection: gate, conv_in, delta
                 mamba_split_proj(acts.mamba_gate, acts.mamba_conv_in, acts.mamba_delta,
-                                 proj, B, T, D, mamba_conv_dim, mamba_heads, mamba_head_dim, stream);
+                                 proj, B, T, mamba_dim, mamba_conv_dim, mamba_heads, mamba_head_dim, stream);
                 rs.temp_free(proj);
 
                 // 2) Causal conv1d (depthwise) + activation
@@ -676,13 +823,13 @@ struct BlockExecutor {
 
                 // Split conv output: u, B, C
                 mamba_split_conv_out(acts.mamba_u, acts.mamba_B, acts.mamba_C,
-                                     conv_out, B, T, D, mamba_groups, mamba_state, stream);
+                                     conv_out, B, T, mamba_dim, mamba_groups, mamba_state, stream);
 
                 // 3) Selective scan
-                Tensor A_exp{ETensorDType::FP32, {D, mamba_state}, nullptr, nullptr, 2, dev};
-                Tensor D_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
-                Tensor dt_bias_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
-                Tensor scan_out_bdt{acts.ln1.DType, {B, D, T}, nullptr, nullptr, 3, dev};
+                Tensor A_exp{ETensorDType::FP32, {mamba_dim, mamba_state}, nullptr, nullptr, 2, dev};
+                Tensor D_exp{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
+                Tensor dt_bias_exp{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
+                Tensor scan_out_bdt{acts.ln1.DType, {B, mamba_dim, T}, nullptr, nullptr, 3, dev};
                 rs.temp_acquire(A_exp);
                 rs.temp_acquire(D_exp);
                 rs.temp_acquire(dt_bias_exp);
@@ -697,9 +844,9 @@ struct BlockExecutor {
                                              A_exp, acts.mamba_B, acts.mamba_C,
                                              D_exp, dt_bias_exp,
                                              acts.mamba_x,
-                                             B, T, D, mamba_state, mamba_groups, mamba_chunks, stream);
+                                             B, T, mamba_dim, mamba_state, mamba_groups, mamba_chunks, stream);
 
-                mamba_transpose_bdt_to_btd(acts.mamba_scan_out, scan_out_bdt, B, T, D, stream);
+                mamba_transpose_bdt_to_btd(acts.mamba_scan_out, scan_out_bdt, B, T, mamba_dim, stream);
 
                 // Free scan temporaries (LIFO)
                 rs.temp_free(scan_out_bdt);
@@ -709,17 +856,17 @@ struct BlockExecutor {
                 rs.temp_free(conv_out);
 
                 // 4) Gated RMSNorm
-                silu_mul_forward(acts.mamba_gated, acts.mamba_gate, acts.mamba_scan_out, B * T, D, stream);
+                silu_mul_forward(acts.mamba_gated, acts.mamba_gate, acts.mamba_scan_out, B * T, mamba_dim, stream);
                 mamba_group_rmsnorm_forward(acts.mamba_normed, acts.mamba_rstd,
                                             acts.mamba_gated, mw.norm_weight,
-                                            config.RmsNormEps, B, T, D, mamba_groups, stream);
+                                            config.RmsNormEps, B, T, mamba_dim, mamba_groups, stream);
 
                 // 5) Output projection
                 recipe_ops::forward_matmul(
                     recipe, rs,
                     acts.mlp_down, acts.mamba_normed, mw.out_proj_weight,
                     mw.out_proj_bias.has_value() ? &mw.out_proj_bias.value() : nullptr,
-                    B, T, D, C,
+                    B, T, mamba_dim, C,
                     layer_idx, MatmulOp::MLPDown,
                     nullptr, -1, dummy_cache, stream, /*allow_quant=*/false);
             }
@@ -817,8 +964,9 @@ struct BlockExecutor {
         const int mamba_head_dim = config.MambaHeadDim;
         const int mamba_state = config.MambaSsmStateSize;
         const int mamba_groups = config.MambaNGroups > 0 ? config.MambaNGroups : 1;
-        const int mamba_conv_dim = D + 2 * mamba_groups * mamba_state;
-        const int mamba_proj_size = D + mamba_conv_dim + mamba_heads;
+        const int mamba_dim = config.mamba_dim();
+        const int mamba_conv_dim = mamba_dim + 2 * mamba_groups * mamba_state;
+        const int mamba_proj_size = mamba_dim + mamba_conv_dim + mamba_heads;
         const int mamba_chunk_size = config.MambaChunkSize > 0 ? config.MambaChunkSize : 2048;
         const int mamba_chunks = (T + mamba_chunk_size - 1) / mamba_chunk_size;
 
@@ -948,7 +1096,7 @@ struct BlockExecutor {
                     d_acts.d_mamba_normed, mg.d_out_proj_weight,
                     mg.d_out_proj_bias.has_value() ? &mg.d_out_proj_bias.value() : nullptr,
                     d_acts.d_res_ffn, acts.mamba_normed, mw.out_proj_weight,
-                    B, T, D, C,
+                    B, T, mamba_dim, C,
                     layer_idx, MatmulOp::MLPDown,
                     accumulate, skip_weight_grad,
                     nullptr, nullptr,
@@ -964,46 +1112,46 @@ struct BlockExecutor {
                 }
 
                 // 2) Group RMSNorm backward
-                Tensor d_norm_weight_fp32{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor d_norm_weight_fp32{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
                 rs.temp_acquire(d_norm_weight_fp32);
                 mamba_group_rmsnorm_backward_dx(d_acts.d_mamba_gated, d_acts.d_mamba_normed,
                                                 acts.mamba_gated, mw.norm_weight,
-                                                acts.mamba_rstd, B, T, D, mamba_groups, stream);
+                                                acts.mamba_rstd, B, T, mamba_dim, mamba_groups, stream);
                 if (!skip_weight_grad) {
                     mamba_group_rmsnorm_backward_dweight_fp32(d_norm_weight_fp32, d_acts.d_mamba_normed,
                                                               acts.mamba_gated, acts.mamba_rstd,
-                                                              B, T, D, mamba_groups, stream);
+                                                              B, T, mamba_dim, mamba_groups, stream);
                     if (accumulate) {
-                        Tensor d_norm_bf16{ETensorDType::BF16, {D}, nullptr, nullptr, 1, dev};
+                        Tensor d_norm_bf16{ETensorDType::BF16, {mamba_dim}, nullptr, nullptr, 1, dev};
                         rs.temp_acquire(d_norm_bf16);
-                        convert_dtype(d_norm_bf16.get<nv_bfloat16>(), d_norm_weight_fp32.get<float>(), D, stream);
+                        convert_dtype(d_norm_bf16.get<nv_bfloat16>(), d_norm_weight_fp32.get<float>(), mamba_dim, stream);
                         vector_add_sr(mg.d_norm_weight.template get<nv_bfloat16>(),
                                       mg.d_norm_weight.template get<nv_bfloat16>(),
                                       d_norm_bf16.get<nv_bfloat16>(),
-                                      1.0f, D, 0, stream);
+                                      1.0f, mamba_dim, 0, stream);
                         rs.temp_free(d_norm_bf16);
                     } else {
-                        convert_dtype(mg.d_norm_weight.template get<nv_bfloat16>(), d_norm_weight_fp32.get<float>(), D, stream);
+                        convert_dtype(mg.d_norm_weight.template get<nv_bfloat16>(), d_norm_weight_fp32.get<float>(), mamba_dim, stream);
                     }
                 }
                 rs.temp_free(d_norm_weight_fp32);
 
                 // 3) Gate backward (in-place): d_gate + d_scan_out
                 silu_mul_backward_inplace(acts.mamba_gate, acts.mamba_scan_out, d_acts.d_mamba_gated,
-                                          nullptr, B * T, D, stream);
+                                          nullptr, B * T, mamba_dim, stream);
 
                 // 4) Transpose d_scan_out to (B, D, T)
-                Tensor d_scan_out_bdt{acts.mamba_scan_out.DType, {B, D, T}, nullptr, nullptr, 3, dev};
+                Tensor d_scan_out_bdt{acts.mamba_scan_out.DType, {B, mamba_dim, T}, nullptr, nullptr, 3, dev};
                 rs.temp_acquire(d_scan_out_bdt);
-                mamba_transpose_btd_to_bdt(d_scan_out_bdt, acts.mamba_scan_out, B, T, D, stream);
+                mamba_transpose_btd_to_bdt(d_scan_out_bdt, acts.mamba_scan_out, B, T, mamba_dim, stream);
 
                 // 5) Selective scan backward
-                Tensor A_exp{ETensorDType::FP32, {D, mamba_state}, nullptr, nullptr, 2, dev};
-                Tensor D_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
-                Tensor dt_bias_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
-                Tensor dA{ETensorDType::FP32, {D, mamba_state}, nullptr, nullptr, 2, dev};
-                Tensor dD_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
-                Tensor d_dt_bias_exp{ETensorDType::FP32, {D}, nullptr, nullptr, 1, dev};
+                Tensor A_exp{ETensorDType::FP32, {mamba_dim, mamba_state}, nullptr, nullptr, 2, dev};
+                Tensor D_exp{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
+                Tensor dt_bias_exp{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
+                Tensor dA{ETensorDType::FP32, {mamba_dim, mamba_state}, nullptr, nullptr, 2, dev};
+                Tensor dD_exp{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
+                Tensor d_dt_bias_exp{ETensorDType::FP32, {mamba_dim}, nullptr, nullptr, 1, dev};
                 rs.temp_acquire(A_exp);
                 rs.temp_acquire(D_exp);
                 rs.temp_acquire(dt_bias_exp);
@@ -1025,7 +1173,7 @@ struct BlockExecutor {
                                               A_exp, acts.mamba_B, acts.mamba_C,
                                               D_exp, dt_bias_exp,
                                               d_scan_out_bdt, acts.mamba_x,
-                                              B, T, D, mamba_state, mamba_groups, mamba_chunks, stream);
+                                              B, T, mamba_dim, mamba_state, mamba_groups, mamba_chunks, stream);
 
                 if (!skip_weight_grad) {
                     mamba_reduce_dA_log(mg.d_A_log, dA, A_exp,
@@ -1047,7 +1195,7 @@ struct BlockExecutor {
                 // 6) Pack conv1d output gradients (BF16)
                 mamba_pack_conv_out(d_acts.d_mamba_conv_out, d_acts.d_mamba_u,
                                     d_acts.d_mamba_B, d_acts.d_mamba_C,
-                                    B, T, D, mamba_groups, mamba_state, stream);
+                                    B, T, mamba_dim, mamba_groups, mamba_state, stream);
 
                 // 7) Conv1d backward: dx + d_conv_weight/bias
                 Tensor d_conv_in{acts.mamba_conv_in.DType, {B, mamba_conv_dim, T}, nullptr, nullptr, 3, dev};
@@ -1116,7 +1264,7 @@ struct BlockExecutor {
                 Tensor d_proj{acts.ln1.DType, {B, T, mamba_proj_size}, nullptr, nullptr, 3, dev};
                 rs.temp_acquire(d_proj);
                 mamba_pack_dproj(d_proj, acts.mamba_gate, d_conv_in, d_dt,
-                                 B, T, D, mamba_conv_dim, mamba_heads, stream);
+                                 B, T, mamba_dim, mamba_conv_dim, mamba_heads, stream);
 
                 recipe_ops::backward_matmul(
                     recipe, rs,
@@ -1223,6 +1371,7 @@ struct BlockExecutor {
         // In full-block recompute mode, keep large backward intermediates stack-backed (matches legacy path).
         const bool stack_large_bwd_temps = rs.large_bwd_temps_on_stack();
         bool acquired_d_qkv = false;
+        const bool moe_gated = is_gated_activation(config.activation_type);
 
         if (spec.variant == BlockVariant::MoE) {
             if constexpr (!kHasMoE) {
@@ -1234,6 +1383,9 @@ struct BlockExecutor {
 
                 const int BT = B * T;
                 const auto& moe_cfg = *config.moe_config;
+                if (moe_cfg.n_group > 1 || moe_cfg.topk_group > 1) {
+                    throw std::logic_error("BlockExecutor::backward: grouped MoE routing is not supported yet");
+                }
                 const int num_experts = moe_cfg.num_experts;
                 const int top_k = moe_cfg.top_k;
                 const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : D;
@@ -1286,18 +1438,36 @@ struct BlockExecutor {
                     stream
                 );
 
-                moe_softmax_forward(
-                    router_probs.template get<float>(),
-                    router_logits.template get<float>(),
-                    BT, num_experts, stream
-                );
+                if (moe_cfg.use_sigmoid) {
+                    moe_sigmoid_forward(
+                        router_probs.template get<float>(),
+                        router_logits.template get<float>(),
+                        BT * num_experts, stream
+                    );
+                } else {
+                    moe_softmax_forward(
+                        router_probs.template get<float>(),
+                        router_logits.template get<float>(),
+                        BT, num_experts, stream
+                    );
+                }
 
                 moe_topk_forward(
                     expert_indices.template get<int>(),
                     routing_weights_fp32.template get<float>(),
                     router_probs.template get<float>(),
-                    BT, num_experts, top_k, true, stream
+                    BT, num_experts, top_k, moe_cfg.norm_topk_prob, stream
                 );
+
+                if (moe_cfg.routed_scaling_factor != 1.0f) {
+                    moe_scale_forward(
+                        routing_weights_fp32.template get<float>(),
+                        routing_weights_fp32.template get<float>(),
+                        moe_cfg.routed_scaling_factor,
+                        BT * top_k,
+                        stream
+                    );
+                }
 
                 moe_compute_expert_counts(
                     expert_counts.template get<int>(),
@@ -1329,11 +1499,12 @@ struct BlockExecutor {
                 rs.MoeHostOffsetsValid = true;
 
                 // Expert temporaries
+                const int moe_M = moe_gated ? (2 * expert_D) : expert_D;
                 Tensor permuted_input{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
-                Tensor expert_gate_up{acts.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
+                Tensor expert_gate_up{acts.ln2.DType, {total_expert_tokens, moe_M}, nullptr, nullptr, 2, dev};
                 Tensor expert_outputs{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
                 Tensor d_expert_outputs{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
-                Tensor d_expert_gate_up{acts.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
+                Tensor d_expert_gate_up{acts.ln2.DType, {total_expert_tokens, moe_M}, nullptr, nullptr, 2, dev};
                 Tensor d_permuted_input{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
 
                 rs.temp_acquire(permuted_input);
@@ -1364,34 +1535,83 @@ struct BlockExecutor {
 
                 {
                     const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
-                    if (acts.ln2.DType == ETensorDType::BF16) {
-                        moe_grouped_gemm_gate_up(
-                            expert_gate_up.template get<nv_bfloat16>(),
-                            permuted_input.template get<nv_bfloat16>(),
-                            weights.experts.gate_up_proj.template get<nv_bfloat16>(),
-                            expert_offsets.template get<int>(),
-                            num_experts, C, expert_D,
-                            rs.CublasHandle, stream, host_offsets
-                        );
-                    } else {
-                        moe_grouped_gemm_gate_up(
-                            expert_gate_up.template get<float>(),
-                            permuted_input.template get<float>(),
-                            weights.experts.gate_up_proj.template get<float>(),
-                            expert_offsets.template get<int>(),
-                            num_experts, C, expert_D,
-                            rs.CublasHandle, stream, host_offsets
-                        );
-                    }
+                    Tensor expert_act{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(expert_act);
 
-                    Tensor expert_swiglu{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
-                    rs.temp_acquire(expert_swiglu);
-                    swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
+                    if (moe_gated) {
+                        if (acts.ln2.DType == ETensorDType::BF16) {
+                            moe_grouped_gemm_gate_up(
+                                expert_gate_up.template get<nv_bfloat16>(),
+                                permuted_input.template get<nv_bfloat16>(),
+                                weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                                expert_offsets.template get<int>(),
+                                num_experts, C, expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        } else {
+                            moe_grouped_gemm_gate_up(
+                                expert_gate_up.template get<float>(),
+                                permuted_input.template get<float>(),
+                                weights.experts.gate_up_proj.template get<float>(),
+                                expert_offsets.template get<int>(),
+                                num_experts, C, expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        }
+
+                        swiglu_forward(expert_act, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
+                    } else {
+                        if (acts.ln2.DType == ETensorDType::BF16) {
+                            moe_grouped_gemm(
+                                expert_gate_up.template get<nv_bfloat16>(),
+                                permuted_input.template get<nv_bfloat16>(),
+                                weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                                expert_offsets.template get<int>(),
+                                num_experts,
+                                /*M=*/expert_D,
+                                /*K=*/C,
+                                rs.CublasHandle,
+                                stream,
+                                host_offsets,
+                                /*alpha=*/1.0f,
+                                /*beta=*/0.0f,
+                                EMMTranspose::TN
+                            );
+                        } else {
+                            moe_grouped_gemm(
+                                expert_gate_up.template get<float>(),
+                                permuted_input.template get<float>(),
+                                weights.experts.gate_up_proj.template get<float>(),
+                                expert_offsets.template get<int>(),
+                                num_experts,
+                                /*M=*/expert_D,
+                                /*K=*/C,
+                                rs.CublasHandle,
+                                stream,
+                                host_offsets,
+                                /*alpha=*/1.0f,
+                                /*beta=*/0.0f,
+                                EMMTranspose::TN
+                            );
+                        }
+
+                        const long N = static_cast<long>(total_expert_tokens) * static_cast<long>(expert_D);
+                        switch (config.activation_type) {
+                            case ActivationType::SiLU:
+                                silu_forward(expert_act, expert_gate_up, N, stream);
+                                break;
+                            case ActivationType::ReLU2:
+                                relu2_forward(expert_act, expert_gate_up, N, stream);
+                                break;
+                            default:
+                                throw std::logic_error("BlockExecutor::backward: unsupported MoE activation");
+                        }
+                    }
 
                     if (acts.ln2.DType == ETensorDType::BF16) {
                         moe_grouped_gemm_down(
                             expert_outputs.template get<nv_bfloat16>(),
-                            expert_swiglu.template get<nv_bfloat16>(),
+                            expert_act.template get<nv_bfloat16>(),
                             weights.experts.down_proj.template get<nv_bfloat16>(),
                             expert_offsets.template get<int>(),
                             num_experts, C, expert_D,
@@ -1400,14 +1620,14 @@ struct BlockExecutor {
                     } else {
                         moe_grouped_gemm_down(
                             expert_outputs.template get<float>(),
-                            expert_swiglu.template get<float>(),
+                            expert_act.template get<float>(),
                             weights.experts.down_proj.template get<float>(),
                             expert_offsets.template get<int>(),
                             num_experts, C, expert_D,
                             rs.CublasHandle, stream, host_offsets
                         );
                     }
-                    rs.temp_free(expert_swiglu);
+                    rs.temp_free(expert_act);
                 }
 
                 // Combine backward
@@ -1462,6 +1682,16 @@ struct BlockExecutor {
                         routing_weights_fp32.template get<float>(),
                         scatter_indices.template get<int>(),
                         BT, total_expert_tokens, C, top_k, stream
+                    );
+                }
+
+                if (moe_cfg.routed_scaling_factor != 1.0f) {
+                    moe_scale_forward(
+                        d_routing_weights_fp32.template get<float>(),
+                        d_routing_weights_fp32.template get<float>(),
+                        moe_cfg.routed_scaling_factor,
+                        BT * top_k,
+                        stream
                     );
                 }
 
@@ -1533,12 +1763,12 @@ struct BlockExecutor {
                         }
                     }
 
-                    Tensor d_expert_swiglu{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
-                    rs.temp_acquire(d_expert_swiglu);
+                    Tensor d_expert_act{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(d_expert_act);
 
                     if (acts.ln2.DType == ETensorDType::BF16) {
                         moe_grouped_gemm_down_backward(
-                            d_expert_swiglu.template get<nv_bfloat16>(),
+                            d_expert_act.template get<nv_bfloat16>(),
                             d_expert_outputs.template get<nv_bfloat16>(),
                             weights.experts.down_proj.template get<nv_bfloat16>(),
                             expert_offsets.template get<int>(),
@@ -1547,7 +1777,7 @@ struct BlockExecutor {
                         );
                     } else {
                         moe_grouped_gemm_down_backward(
-                            d_expert_swiglu.template get<float>(),
+                            d_expert_act.template get<float>(),
                             d_expert_outputs.template get<float>(),
                             weights.experts.down_proj.template get<float>(),
                             expert_offsets.template get<int>(),
@@ -1556,29 +1786,45 @@ struct BlockExecutor {
                         );
                     }
 
-                    Tensor expert_up{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
-                    Tensor expert_gate{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
-                    rs.temp_acquire(expert_up);
-                    rs.temp_acquire(expert_gate);
+                    if (moe_gated) {
+                        Tensor expert_up{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                        Tensor expert_gate{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                        rs.temp_acquire(expert_up);
+                        rs.temp_acquire(expert_gate);
 
-                    split_gate_up(expert_gate_up, expert_up, expert_gate, total_expert_tokens, expert_D, stream);
+                        split_gate_up(expert_gate_up, expert_up, expert_gate, total_expert_tokens, expert_D, stream);
 
-                    Tensor expert_h;
-                    expert_h.Data = d_expert_gate_up.Data;
-                    expert_h.DType = acts.ln2.DType;
-                    expert_h.Sizes = {total_expert_tokens, expert_D};
-                    silu_mul_backward_inplace(expert_gate, expert_up, d_expert_swiglu, &expert_h, total_expert_tokens, expert_D, stream);
+                        Tensor expert_h;
+                        expert_h.Data = d_expert_gate_up.Data;
+                        expert_h.DType = acts.ln2.DType;
+                        expert_h.Sizes = {total_expert_tokens, expert_D};
+                        silu_mul_backward_inplace(expert_gate, expert_up, d_expert_act, &expert_h, total_expert_tokens, expert_D, stream);
 
-                    concat_d_gate_up(expert_up, expert_gate, d_expert_gate_up, total_expert_tokens, expert_D, stream);
+                        concat_d_gate_up(expert_up, expert_gate, d_expert_gate_up, total_expert_tokens, expert_D, stream);
 
-                    rs.temp_free(expert_gate);
-                    rs.temp_free(expert_up);
-                    rs.temp_free(d_expert_swiglu);
+                        rs.temp_free(expert_gate);
+                        rs.temp_free(expert_up);
+                    } else {
+                        const long N = static_cast<long>(total_expert_tokens) * static_cast<long>(expert_D);
+                        switch (config.activation_type) {
+                            case ActivationType::SiLU:
+                                silu_backward(d_expert_gate_up, expert_gate_up, d_expert_act, N, stream);
+                                break;
+                            case ActivationType::ReLU2:
+                                relu2_backward(d_expert_gate_up, expert_gate_up, d_expert_act, N, stream);
+                                break;
+                            default:
+                                throw std::logic_error("BlockExecutor::backward: unsupported MoE activation");
+                        }
+                    }
+
+                    rs.temp_free(d_expert_act);
 
                     if (!lora_only) {
                         if constexpr (requires { grads.experts.d_gate_up_proj; }) {
                             if (grads.experts.d_gate_up_proj.Data && grads.experts.d_gate_up_proj.nelem() > 0) {
                                 const float beta = accumulate ? 1.0f : 0.0f;
+                                const int gate_rows = moe_gated ? (2 * expert_D) : expert_D;
                                 if (acts.ln2.DType == ETensorDType::BF16) {
                                     moe_grouped_gemm_weight_grad(
                                         grads.experts.d_gate_up_proj.template get<nv_bfloat16>(),
@@ -1586,7 +1832,7 @@ struct BlockExecutor {
                                         permuted_input.template get<nv_bfloat16>(),
                                         expert_offsets.template get<int>(),
                                         num_experts,
-                                        2 * expert_D,
+                                        gate_rows,
                                         C,
                                         rs.CublasHandle,
                                         stream,
@@ -1601,7 +1847,7 @@ struct BlockExecutor {
                                         permuted_input.template get<float>(),
                                         expert_offsets.template get<int>(),
                                         num_experts,
-                                        2 * expert_D,
+                                        gate_rows,
                                         C,
                                         rs.CublasHandle,
                                         stream,
@@ -1615,23 +1861,45 @@ struct BlockExecutor {
                     }
 
                     if (acts.ln2.DType == ETensorDType::BF16) {
-                        moe_grouped_gemm_gate_up_backward(
-                            d_permuted_input.template get<nv_bfloat16>(),
-                            d_expert_gate_up.template get<nv_bfloat16>(),
-                            weights.experts.gate_up_proj.template get<nv_bfloat16>(),
-                            expert_offsets.template get<int>(),
-                            num_experts, C, expert_D,
-                            rs.CublasHandle, stream, host_offsets
-                        );
+                        if (moe_gated) {
+                            moe_grouped_gemm_gate_up_backward(
+                                d_permuted_input.template get<nv_bfloat16>(),
+                                d_expert_gate_up.template get<nv_bfloat16>(),
+                                weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                                expert_offsets.template get<int>(),
+                                num_experts, C, expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        } else {
+                            moe_grouped_gemm_up_backward(
+                                d_permuted_input.template get<nv_bfloat16>(),
+                                d_expert_gate_up.template get<nv_bfloat16>(),
+                                weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                                expert_offsets.template get<int>(),
+                                num_experts, C, expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        }
                     } else {
-                        moe_grouped_gemm_gate_up_backward(
-                            d_permuted_input.template get<float>(),
-                            d_expert_gate_up.template get<float>(),
-                            weights.experts.gate_up_proj.template get<float>(),
-                            expert_offsets.template get<int>(),
-                            num_experts, C, expert_D,
-                            rs.CublasHandle, stream, host_offsets
-                        );
+                        if (moe_gated) {
+                            moe_grouped_gemm_gate_up_backward(
+                                d_permuted_input.template get<float>(),
+                                d_expert_gate_up.template get<float>(),
+                                weights.experts.gate_up_proj.template get<float>(),
+                                expert_offsets.template get<int>(),
+                                num_experts, C, expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        } else {
+                            moe_grouped_gemm_up_backward(
+                                d_permuted_input.template get<float>(),
+                                d_expert_gate_up.template get<float>(),
+                                weights.experts.gate_up_proj.template get<float>(),
+                                expert_offsets.template get<int>(),
+                                num_experts, C, expert_D,
+                                rs.CublasHandle, stream, host_offsets
+                            );
+                        }
                     }
                 }
 
@@ -1663,6 +1931,150 @@ struct BlockExecutor {
                     );
                 }
 
+                // Shared expert backward (adds into d_ln2)
+                if (moe_cfg.use_shared_expert && weights.shared_expert.has_value()) {
+                    const int shared_D = (moe_cfg.shared_expert_size > 0)
+                        ? moe_cfg.shared_expert_size
+                        : expert_D;
+
+                    Tensor flat_ln2;
+                    flat_ln2.Data = acts.ln2.Data;
+                    flat_ln2.DType = acts.ln2.DType;
+                    flat_ln2.Sizes[0] = BT;
+                    flat_ln2.Sizes[1] = C;
+                    flat_ln2.Rank = 2;
+                    flat_ln2.Device = dev;
+
+                    Tensor d_res_ffn_flat = d_acts.d_res_ffn;
+                    d_res_ffn_flat.Sizes[0] = BT;
+                    d_res_ffn_flat.Sizes[1] = C;
+                    d_res_ffn_flat.Rank = 2;
+
+                    Tensor shared_act{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                    Tensor shared_up{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(shared_act);
+                    rs.temp_acquire(shared_up);
+
+                    Tensor shared_gate_up;
+                    Tensor shared_gate;
+                    if (moe_gated) {
+                        shared_gate_up = Tensor{acts.ln2.DType, {BT, 2 * shared_D}, nullptr, nullptr, 2, dev};
+                        shared_gate = Tensor{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                        rs.temp_acquire(shared_gate_up);
+                        rs.temp_acquire(shared_gate);
+
+                        matmul(shared_gate_up, weights.shared_expert->gate_proj, flat_ln2, std::nullopt,
+                               nullptr, nullptr,
+                               rs.CublasLtHandle, rs.CuBlasWorkspace,
+                               2 * shared_D, BT, C, EMMTranspose::TN, false,
+                               stream);
+
+                        split_gate_up(shared_gate_up, shared_up, shared_gate, BT, shared_D, stream);
+                        silu_mul_forward(shared_act, shared_gate, shared_up, BT, shared_D, stream);
+                    } else {
+                        matmul(shared_up, weights.shared_expert->gate_proj, flat_ln2, std::nullopt,
+                               nullptr, nullptr,
+                               rs.CublasLtHandle, rs.CuBlasWorkspace,
+                               shared_D, BT, C, EMMTranspose::TN, false,
+                               stream);
+                        const long N = static_cast<long>(BT) * static_cast<long>(shared_D);
+                        switch (config.activation_type) {
+                            case ActivationType::SiLU:
+                                silu_forward(shared_act, shared_up, N, stream);
+                                break;
+                            case ActivationType::ReLU2:
+                                relu2_forward(shared_act, shared_up, N, stream);
+                                break;
+                            default:
+                                throw std::logic_error("BlockExecutor::backward: unsupported shared expert activation");
+                        }
+                    }
+
+                    Tensor d_shared_act{acts.ln2.DType, {BT, shared_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(d_shared_act);
+                    matmul(d_shared_act, weights.shared_expert->down_proj, d_res_ffn_flat, std::nullopt,
+                           nullptr, nullptr,
+                           rs.CublasLtHandle, rs.CuBlasWorkspace,
+                           shared_D, BT, C, EMMTranspose::NN, false,
+                           stream);
+
+                    if (!lora_only && grads.shared_expert.has_value()) {
+                        matmul(grads.shared_expert->d_down_proj, d_res_ffn_flat, shared_act, std::nullopt,
+                               nullptr, nullptr,
+                               rs.CublasLtHandle, rs.CuBlasWorkspace,
+                               C, shared_D, BT, EMMTranspose::TN, accumulate,
+                               stream);
+                    }
+
+                    Tensor d_ln2_shared{acts.ln2.DType, {BT, C}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(d_ln2_shared);
+
+                    if (moe_gated) {
+                        Tensor d_shared_gate_up{acts.ln2.DType, {BT, 2 * shared_D}, nullptr, nullptr, 2, dev};
+                        rs.temp_acquire(d_shared_gate_up);
+
+                        Tensor shared_h;
+                        shared_h.Data = d_shared_gate_up.Data;
+                        shared_h.DType = acts.ln2.DType;
+                        shared_h.Sizes = {BT, shared_D};
+                        silu_mul_backward_inplace(shared_gate, shared_up, d_shared_act, &shared_h, BT, shared_D, stream);
+
+                        concat_d_gate_up(shared_up, shared_gate, d_shared_gate_up, BT, shared_D, stream);
+
+                        if (!lora_only && grads.shared_expert.has_value()) {
+                            matmul(grads.shared_expert->d_gate_proj, d_shared_gate_up, flat_ln2, std::nullopt,
+                                   nullptr, nullptr,
+                                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                                   2 * shared_D, C, BT, EMMTranspose::TN, accumulate,
+                                   stream);
+                        }
+
+                        matmul(d_ln2_shared, weights.shared_expert->gate_proj, d_shared_gate_up, std::nullopt,
+                               nullptr, nullptr,
+                               rs.CublasLtHandle, rs.CuBlasWorkspace,
+                               C, BT, 2 * shared_D, EMMTranspose::NN, false,
+                               stream);
+
+                        rs.temp_free(d_shared_gate_up);
+                        rs.temp_free(shared_gate);
+                        rs.temp_free(shared_gate_up);
+                    } else {
+                        const long N = static_cast<long>(BT) * static_cast<long>(shared_D);
+                        switch (config.activation_type) {
+                            case ActivationType::SiLU:
+                                silu_backward(d_shared_act, shared_up, d_shared_act, N, stream);
+                                break;
+                            case ActivationType::ReLU2:
+                                relu2_backward(d_shared_act, shared_up, d_shared_act, N, stream);
+                                break;
+                            default:
+                                throw std::logic_error("BlockExecutor::backward: unsupported shared expert activation");
+                        }
+
+                        if (!lora_only && grads.shared_expert.has_value()) {
+                            matmul(grads.shared_expert->d_gate_proj, d_shared_act, flat_ln2, std::nullopt,
+                                   nullptr, nullptr,
+                                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                                   shared_D, C, BT, EMMTranspose::TN, accumulate,
+                                   stream);
+                        }
+
+                        matmul(d_ln2_shared, weights.shared_expert->gate_proj, d_shared_act, std::nullopt,
+                               nullptr, nullptr,
+                               rs.CublasLtHandle, rs.CuBlasWorkspace,
+                               C, BT, shared_D, EMMTranspose::NN, false,
+                               stream);
+                    }
+
+                    const long N = static_cast<long>(BT) * static_cast<long>(C);
+                    vector_add_sr(d_acts.d_ln2, d_acts.d_ln2, d_ln2_shared, 1.0f, N, /*seed=*/0, stream);
+
+                    rs.temp_free(d_ln2_shared);
+                    rs.temp_free(d_shared_act);
+                    rs.temp_free(shared_up);
+                    rs.temp_free(shared_act);
+                }
+
                 // Router backward
                 Tensor d_probs{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
                 Tensor d_logits{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
@@ -1676,17 +2088,27 @@ struct BlockExecutor {
                     router_probs.template get<float>(),
                     expert_indices.template get<int>(),
                     BT, num_experts, top_k,
-                    true,
+                    moe_cfg.norm_topk_prob,
                     stream
                 );
 
-                moe_softmax_backward(
-                    d_logits.template get<float>(),
-                    d_probs.template get<float>(),
-                    router_probs.template get<float>(),
-                    BT, num_experts,
-                    stream
-                );
+                if (moe_cfg.use_sigmoid) {
+                    moe_sigmoid_backward(
+                        d_logits.template get<float>(),
+                        d_probs.template get<float>(),
+                        router_probs.template get<float>(),
+                        BT * num_experts,
+                        stream
+                    );
+                } else {
+                    moe_softmax_backward(
+                        d_logits.template get<float>(),
+                        d_probs.template get<float>(),
+                        router_probs.template get<float>(),
+                        BT, num_experts,
+                        stream
+                    );
+                }
 
                 Tensor d_logits_bf16{ETensorDType::BF16, {BT, num_experts}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(d_logits_bf16);

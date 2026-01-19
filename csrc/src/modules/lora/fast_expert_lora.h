@@ -15,6 +15,7 @@
 #include "lora_types.h"
 #include "kernels/kernels.h"
 #include "modules/moe/moe_types.h"
+#include "modules/model_config.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
@@ -487,6 +488,262 @@ inline void grouped_fast_expert_lora_backward(
         dispatch_grouped_gemm(total_dx, lora_intermediate1, lora.gate->A, C, lora_rank, scaling, 1.0f, EMMTranspose::NN, false);
     }
 
+    if (lora.up.has_value() && lora.up->has_value()) {
+        dispatch_grouped_gemm(lora_intermediate1, total_up, lora.up->B, lora_rank, D, 1.0f, 0.0f, EMMTranspose::NN, false);
+        dispatch_grouped_gemm(total_dx, lora_intermediate1, lora.up->A, C, lora_rank, scaling, 1.0f, EMMTranspose::NN, false);
+    }
+}
+
+/**
+ * @brief Forward pass for ALL experts (non-gated MLP) using Grouped GEMM and Batched LoRA.
+ *
+ * This variant supports non-gated activations (SiLU/ReLU2).
+ */
+inline void grouped_fast_expert_lora_forward_nongated(
+    Tensor& total_output,             ///< (total_tokens, C)
+    const Tensor& permuted_input,      ///< (total_tokens, C)
+    const Tensor& batched_up_proj,     ///< (num_experts or num_active, D, C)
+    const Tensor& batched_down_proj,   ///< (num_experts or num_active, C, D)
+    const LoRAGroupedExpertWeights<Tensor>& lora,
+    Tensor& total_up,                 ///< (total_tokens, D) - saved up pre-activation
+    const Tensor& expert_offsets,     ///< (num_experts + 1) - global expert indices
+    float scaling,
+    int num_experts, int C, int D, int lora_rank,
+    Tensor& lora_intermediate,         ///< (total_tokens, rank)
+    Tensor& h_buffer,                  ///< (total_tokens, D) - activation output
+    cublasHandle_t handle,
+    cudaStream_t stream,
+    const int* host_offsets = nullptr,
+    const SelectiveExpertInfo* selection_info = nullptr,
+    ActivationType activation_type = ActivationType::SiLU) {
+
+    const int total_tokens = total_up.Sizes[0];
+
+    const bool use_selective = selection_info && selection_info->enabled;
+    const int gemm_num_experts = use_selective ? selection_info->num_active : num_experts;
+    const int* active_indices = use_selective ? selection_info->active_experts.data() : nullptr;
+
+    auto dispatch_grouped_gemm = [&](Tensor& out, const Tensor& in, const Tensor& weight,
+                                     int M, int K, float alpha, float beta, EMMTranspose mode,
+                                     bool weight_is_compact = true, int out_offset = 0) {
+        if (in.DType != weight.DType || in.DType != out.DType) {
+            throw std::runtime_error("MoE LoRA: dtype mismatch between activation and LoRA weights. "
+                                     "Set lora_dtype='bf16' in your config to match activation dtype.");
+        }
+        if (in.DType == ETensorDType::BF16) {
+            moe_grouped_gemm(out.get<nv_bfloat16>() + out_offset, in.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
+                             expert_offsets.get<int>(), num_experts, M, K, handle, stream, host_offsets,
+                             alpha, beta, mode, active_indices, weight_is_compact, gemm_num_experts);
+        } else {
+            moe_grouped_gemm(out.get<float>() + out_offset, in.get<float>(), weight.get<float>(),
+                             expert_offsets.get<int>(), num_experts, M, K, handle, stream, host_offsets,
+                             alpha, beta, mode, active_indices, weight_is_compact, gemm_num_experts);
+        }
+    };
+
+    // 1. Base up projection
+    if (permuted_input.DType == ETensorDType::BF16) {
+        moe_grouped_gemm(
+            total_up.get<nv_bfloat16>(),
+            permuted_input.get<nv_bfloat16>(),
+            batched_up_proj.get<nv_bfloat16>(),
+            expert_offsets.get<int>(),
+            num_experts, D, C, handle, stream, host_offsets,
+            /*alpha=*/1.0f, /*beta=*/0.0f, EMMTranspose::TN,
+            active_indices, true, gemm_num_experts);
+    } else {
+        moe_grouped_gemm(
+            total_up.get<float>(),
+            permuted_input.get<float>(),
+            batched_up_proj.get<float>(),
+            expert_offsets.get<int>(),
+            num_experts, D, C, handle, stream, host_offsets,
+            /*alpha=*/1.0f, /*beta=*/0.0f, EMMTranspose::TN,
+            active_indices, true, gemm_num_experts);
+    }
+
+    // 2. LoRA up contribution
+    if (lora.up.has_value() && lora.up->has_value()) {
+        dispatch_grouped_gemm(lora_intermediate, permuted_input, lora.up->A, lora_rank, C, 1.0f, 0.0f, EMMTranspose::TN, false);
+        dispatch_grouped_gemm(total_up, lora_intermediate, lora.up->B, D, lora_rank, scaling, 1.0f, EMMTranspose::TN, false);
+    }
+
+    // 3. Activation
+    const long N = static_cast<long>(total_tokens) * static_cast<long>(D);
+    switch (activation_type) {
+        case ActivationType::SiLU:
+            silu_forward(h_buffer, total_up, N, stream);
+            break;
+        case ActivationType::ReLU2:
+            relu2_forward(h_buffer, total_up, N, stream);
+            break;
+        default:
+            throw std::logic_error("grouped_fast_expert_lora_forward_nongated: unsupported activation");
+    }
+
+    // 4. Down projection
+    if (permuted_input.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_down(
+            total_output.get<nv_bfloat16>(),
+            h_buffer.get<nv_bfloat16>(),
+            batched_down_proj.get<nv_bfloat16>(),
+            expert_offsets.get<int>(),
+            num_experts, C, D, handle, stream, host_offsets, active_indices,
+            true, gemm_num_experts);
+    } else {
+        moe_grouped_gemm_down(
+            total_output.get<float>(),
+            h_buffer.get<float>(),
+            batched_down_proj.get<float>(),
+            expert_offsets.get<int>(),
+            num_experts, C, D, handle, stream, host_offsets, active_indices,
+            true, gemm_num_experts);
+    }
+
+    if (lora.down.has_value() && lora.down->has_value()) {
+        dispatch_grouped_gemm(lora_intermediate, h_buffer, lora.down->A, lora_rank, D, 1.0f, 0.0f, EMMTranspose::TN, false);
+        dispatch_grouped_gemm(total_output, lora_intermediate, lora.down->B, C, lora_rank, scaling, 1.0f, EMMTranspose::TN, false);
+    }
+}
+
+/**
+ * @brief Backward pass for ALL experts (non-gated MLP) using Grouped GEMM and Batched LoRA.
+ */
+inline void grouped_fast_expert_lora_backward_nongated(
+    LoRAGroupedExpertWeights<Tensor>& lora_grads,
+    Tensor& total_dx,                 ///< (total_tokens, C)
+    const Tensor& total_dy,            ///< (total_tokens, C)
+    const Tensor& batched_up_proj,     ///< (num_experts or num_active, D, C)
+    const Tensor& batched_down_proj,   ///< (num_experts or num_active, C, D)
+    const LoRAGroupedExpertWeights<Tensor>& lora,
+    Tensor& total_up,                 ///< (total_tokens, D) - up pre-activation (overwritten with d_up)
+    const Tensor& total_input,         ///< (total_tokens, C)
+    const Tensor& expert_offsets,     ///< (num_experts + 1) - global expert indices
+    float scaling,
+    int num_experts, int C, int D, int lora_rank,
+    bool accumulate,
+    Tensor& lora_intermediate1,        ///< (total_tokens, rank)
+    Tensor& lora_intermediate2,        ///< (total_tokens, D)
+    Tensor& h_buffer,                  ///< (total_tokens, D)
+    cublasHandle_t handle,
+    cudaStream_t stream,
+    const int* host_offsets = nullptr,
+    const SelectiveExpertInfo* selection_info = nullptr,
+    ActivationType activation_type = ActivationType::SiLU) {
+
+    const int total_tokens = total_dy.Sizes[0];
+    const bool use_selective = selection_info && selection_info->enabled;
+    const int gemm_num_experts = use_selective ? selection_info->num_active : num_experts;
+    const int* active_indices = use_selective ? selection_info->active_experts.data() : nullptr;
+
+    auto dispatch_grouped_gemm = [&](Tensor& out, const Tensor& in, const Tensor& weight,
+                                     int M, int K, float alpha, float beta, EMMTranspose mode,
+                                     bool weight_is_compact = true, int out_offset = 0) {
+        if (in.DType != weight.DType || in.DType != out.DType) {
+            throw std::runtime_error(fmt::format(
+                "MoE LoRA backward: dtype mismatch in grouped GEMM. in={}, weight={}, out={}. "
+                "Set lora_dtype='bf16' in your config to match activation dtype.",
+                dtype_to_str(in.DType), dtype_to_str(weight.DType), dtype_to_str(out.DType)));
+        }
+        if (in.DType == ETensorDType::BF16) {
+            moe_grouped_gemm(out.get<nv_bfloat16>() + out_offset, in.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
+                             expert_offsets.get<int>(), num_experts, M, K, handle, stream, host_offsets,
+                             alpha, beta, mode, active_indices, weight_is_compact, gemm_num_experts);
+        } else {
+            moe_grouped_gemm(out.get<float>() + out_offset, in.get<float>(), weight.get<float>(),
+                             expert_offsets.get<int>(), num_experts, M, K, handle, stream, host_offsets,
+                             alpha, beta, mode, active_indices, weight_is_compact, gemm_num_experts);
+        }
+    };
+
+    auto dispatch_weight_grad = [&](Tensor& d_weight, const Tensor& dy, const Tensor& in,
+                                    int M, int N, float alpha, float beta, bool weight_is_compact = true) {
+        if (dy.DType == ETensorDType::BF16) {
+            if (d_weight.DType == ETensorDType::BF16) {
+                moe_grouped_gemm_weight_grad(d_weight.get<nv_bfloat16>(), dy.get<nv_bfloat16>(), in.get<nv_bfloat16>(),
+                                             expert_offsets.get<int>(), num_experts, M, N, handle, stream, host_offsets,
+                                             alpha, beta, active_indices, weight_is_compact, gemm_num_experts);
+            } else {
+                throw std::runtime_error("MoE LoRA backward: lora_dtype=fp32 with bf16 activations not yet supported. "
+                                         "Set lora_dtype='bf16' in your config.");
+            }
+        } else {
+            moe_grouped_gemm_weight_grad(d_weight.get<float>(), dy.get<float>(), in.get<float>(),
+                                         expert_offsets.get<int>(), num_experts, M, N, handle, stream, host_offsets,
+                                         alpha, beta, active_indices, weight_is_compact, gemm_num_experts);
+        }
+    };
+
+    // 1. dh = dy @ W_down
+    Tensor total_dh = lora_intermediate2;
+    if (total_dy.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_down_backward(
+            total_dh.get<nv_bfloat16>(), total_dy.get<nv_bfloat16>(),
+            batched_down_proj.get<nv_bfloat16>(), expert_offsets.get<int>(),
+            num_experts, C, D, handle, stream, host_offsets, active_indices,
+            true, gemm_num_experts);
+    } else {
+        moe_grouped_gemm_down_backward(
+            total_dh.get<float>(), total_dy.get<float>(),
+            batched_down_proj.get<float>(), expert_offsets.get<int>(),
+            num_experts, C, D, handle, stream, host_offsets, active_indices,
+            true, gemm_num_experts);
+    }
+
+    if (lora.down.has_value() && lora.down->has_value()) {
+        dispatch_grouped_gemm(lora_intermediate1, total_dy, lora.down->B, lora_rank, C, 1.0f, 0.0f, EMMTranspose::NN, false);
+        dispatch_grouped_gemm(total_dh, lora_intermediate1, lora.down->A, D, lora_rank, scaling, 1.0f, EMMTranspose::NN, false);
+    }
+
+    // 2. Activation forward (for LoRA down grads) and backward (compute d_up)
+    const long N = static_cast<long>(total_tokens) * static_cast<long>(D);
+    switch (activation_type) {
+        case ActivationType::SiLU:
+            silu_forward(h_buffer, total_up, N, stream);
+            silu_backward(total_up, total_up, total_dh, N, stream);
+            break;
+        case ActivationType::ReLU2:
+            relu2_forward(h_buffer, total_up, N, stream);
+            relu2_backward(total_up, total_up, total_dh, N, stream);
+            break;
+        default:
+            throw std::logic_error("grouped_fast_expert_lora_backward_nongated: unsupported activation");
+    }
+
+    // 3. Down LoRA gradients
+    if (lora.down.has_value() && lora.down->has_value() && lora_grads.down.has_value()) {
+        dispatch_grouped_gemm(lora_intermediate1, h_buffer, lora.down->A, lora_rank, D, 1.0f, 0.0f, EMMTranspose::TN, false);
+        dispatch_weight_grad(lora_grads.down->B, total_dy, lora_intermediate1, C, lora_rank, scaling, accumulate ? 1.0f : 0.0f, false);
+
+        dispatch_grouped_gemm(lora_intermediate1, total_dy, lora.down->B, lora_rank, C, 1.0f, 0.0f, EMMTranspose::NN, false);
+        dispatch_weight_grad(lora_grads.down->A, lora_intermediate1, h_buffer, lora_rank, D, scaling, accumulate ? 1.0f : 0.0f, false);
+    }
+
+    // 4. Up LoRA gradients
+    if (lora.up.has_value() && lora.up->has_value() && lora_grads.up.has_value()) {
+        dispatch_grouped_gemm(lora_intermediate1, total_input, lora.up->A, lora_rank, C, 1.0f, 0.0f, EMMTranspose::TN, false);
+        dispatch_weight_grad(lora_grads.up->B, total_up, lora_intermediate1, D, lora_rank, scaling, accumulate ? 1.0f : 0.0f, false);
+
+        dispatch_grouped_gemm(lora_intermediate1, total_up, lora.up->B, lora_rank, D, 1.0f, 0.0f, EMMTranspose::NN, false);
+        dispatch_weight_grad(lora_grads.up->A, lora_intermediate1, total_input, lora_rank, C, scaling, accumulate ? 1.0f : 0.0f, false);
+    }
+
+    // 5. dx = d_up @ W_up
+    if (total_dy.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_up_backward(
+            total_dx.get<nv_bfloat16>(), total_up.get<nv_bfloat16>(),
+            batched_up_proj.get<nv_bfloat16>(), expert_offsets.get<int>(),
+            num_experts, C, D, handle, stream, host_offsets, active_indices,
+            true, gemm_num_experts);
+    } else {
+        moe_grouped_gemm_up_backward(
+            total_dx.get<float>(), total_up.get<float>(),
+            batched_up_proj.get<float>(), expert_offsets.get<int>(),
+            num_experts, C, D, handle, stream, host_offsets, active_indices,
+            true, gemm_num_experts);
+    }
+
+    // Add LoRA contributions to dx
     if (lora.up.has_value() && lora.up->has_value()) {
         dispatch_grouped_gemm(lora_intermediate1, total_up, lora.up->B, lora_rank, D, 1.0f, 0.0f, EMMTranspose::NN, false);
         dispatch_grouped_gemm(total_dx, lora_intermediate1, lora.up->A, C, lora_rank, scaling, 1.0f, EMMTranspose::NN, false);

@@ -46,14 +46,14 @@ struct MoEWeightConfig {
  * The quantization format depends on the template parameter.
  *
  * Weight dimensions:
- * - gate_up_proj: (2 * moe_intermediate_size, hidden_size) - fused gate+up projection
+ * - gate_up_proj: (mlp_up_factor * moe_intermediate_size, hidden_size) - fused gate+up (or up-only) projection
  * - down_proj: (hidden_size, moe_intermediate_size) - down projection
  *
  * @tparam QuantizedWeight The quantized weight type (BnBBlockQuantizedWeight, FP8BlockWeight, FP4BlockWeight)
  */
 template<typename QuantizedWeight>
 struct MoEExpertWeights {
-    QuantizedWeight gate_up_proj;  ///< Fused gate+up projection (2 * intermediate, hidden)
+    QuantizedWeight gate_up_proj;  ///< Fused gate+up projection (mlp_up_factor * intermediate, hidden)
     QuantizedWeight down_proj;     ///< Down projection (hidden, intermediate)
 
     /**
@@ -121,6 +121,9 @@ struct MoEBlockWeights {
     /// Small tensor, quantization provides negligible benefit
     Tensor router_gate;
 
+    /// Optional shared expert weights (single expert applied to all tokens)
+    std::optional<MoEExpertWeights<QuantizedWeight>> shared_expert;
+
     /**
      * @brief Get total memory footprint in bytes
      */
@@ -132,6 +135,9 @@ struct MoEBlockWeights {
 
         for (const auto& expert : experts) {
             total += expert.bytes();
+        }
+        if (shared_expert.has_value()) {
+            total += shared_expert->bytes();
         }
         total += router_gate.bytes();
 
@@ -155,6 +161,9 @@ struct MoEBlockWeights {
             if (!expert.is_valid()) {
                 return false;
             }
+        }
+        if (shared_expert.has_value() && !shared_expert->is_valid()) {
+            return false;
         }
         return true;
     }

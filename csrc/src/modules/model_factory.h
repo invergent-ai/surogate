@@ -358,15 +358,8 @@ private:
         int world,
         const std::shared_ptr<TensorAllocator>& alloc) {
 
-        // Hybrid (non-MoE) path: use the composable DenseTransformerBlock and per-layer specs.
-        // Mixed MoE/Dense per layer is not supported yet.
-        for (int i = 0; i < config.NumLayers; ++i) {
-            if (config.is_layer_moe(i)) {
-                throw std::runtime_error(
-                    "Hybrid MoE per-layer routing is not supported in the modular path yet.");
-            }
-        }
-
+        // Hybrid path: use the composable DenseTransformerBlock and per-layer specs,
+        // including optional MoE/SSM layers.
         using Block = DenseTransformerBlock<>;
         return std::make_unique<ModularTransformerModel<Block>>(
             config, options, rank, world, alloc);

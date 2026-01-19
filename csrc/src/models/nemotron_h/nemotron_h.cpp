@@ -22,6 +22,9 @@ static void maybe_fill_layers_from_pattern(NemotronHConfig& cfg) {
             case 'M':
                 cfg.LayersBlockType.emplace_back("mamba");
                 break;
+            case 'E':
+                cfg.LayersBlockType.emplace_back("moe");
+                break;
             case '*':
                 cfg.LayersBlockType.emplace_back("attention");
                 break;
@@ -79,6 +82,19 @@ std::unique_ptr<PretrainedConfig> NemotronHArchitecture::load_from_hf_config_jso
     cfg->MambaHiddenAct = config_json.value("mamba_hidden_act", std::string("silu"));
     cfg->MlpHiddenAct = config_json.value("mlp_hidden_act", std::string("silu"));
 
+    // MoE-specific settings (Nemotron-H hybrid MoE)
+    cfg->NRoutedExperts = config_json.value("n_routed_experts", 0);
+    cfg->NumExpertsPerTok = config_json.value("num_experts_per_tok", 0);
+    cfg->MoeIntermediateSize = config_json.value("moe_intermediate_size", 0);
+    cfg->MoeSharedExpertIntermediateSize = config_json.value("moe_shared_expert_intermediate_size", 0);
+    cfg->NSharedExperts = config_json.value("n_shared_experts", 0);
+    cfg->NormTopkProb = config_json.value("norm_topk_prob", false);
+    cfg->RoutedScalingFactor = config_json.value("routed_scaling_factor", 1.0f);
+    cfg->TopkGroup = config_json.value("topk_group", 1);
+    cfg->NGroup = config_json.value("n_group", 1);
+    cfg->RouterAuxLossCoef = config_json.value("router_aux_loss_coef", 0.01f);
+    cfg->RouterZLossCoef = config_json.value("router_z_loss_coef", 0.001f);
+
     if (config_json.contains("layers_block_type")) {
         for (const auto& entry : config_json.at("layers_block_type")) {
             cfg->LayersBlockType.push_back(entry.get<std::string>());
@@ -135,6 +151,19 @@ void NemotronHArchitecture::save_to_hf_config_json(const PretrainedConfig& confi
     config_json["use_conv_bias"] = cfg.UseConvBias;
     config_json["mamba_hidden_act"] = cfg.MambaHiddenAct;
     config_json["mlp_hidden_act"] = cfg.MlpHiddenAct;
+
+    // MoE-specific fields (Nemotron-H hybrid MoE)
+    config_json["n_routed_experts"] = cfg.NRoutedExperts;
+    config_json["num_experts_per_tok"] = cfg.NumExpertsPerTok;
+    config_json["moe_intermediate_size"] = cfg.MoeIntermediateSize;
+    config_json["moe_shared_expert_intermediate_size"] = cfg.MoeSharedExpertIntermediateSize;
+    config_json["n_shared_experts"] = cfg.NSharedExperts;
+    config_json["norm_topk_prob"] = cfg.NormTopkProb;
+    config_json["routed_scaling_factor"] = cfg.RoutedScalingFactor;
+    config_json["topk_group"] = cfg.TopkGroup;
+    config_json["n_group"] = cfg.NGroup;
+    config_json["router_aux_loss_coef"] = cfg.RouterAuxLossCoef;
+    config_json["router_z_loss_coef"] = cfg.RouterZLossCoef;
 
     if (!cfg.LayersBlockType.empty()) {
         config_json["layers_block_type"] = cfg.LayersBlockType;

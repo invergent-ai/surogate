@@ -31,7 +31,7 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
     const auto& cfg = mBaseModel->config();
 
     // Check if this is an MoE model - per-expert LoRA is used instead of MLP LoRA
-    mIsMoEModel = (cfg.architecture == ArchitectureType::MoE);
+    mIsMoEModel = (cfg.architecture == ArchitectureType::MoE) || cfg.moe_config.has_value();
 
     ModularLoRAWeightsManager::Config wm{};
     wm.num_layers = cfg.NumLayers;
@@ -193,6 +193,7 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
         const int top_k = moe_cfg.top_k;
         const int total_tokens = BT * top_k;
         const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : (int)cfg.IntermediateSize;
+        const int moe_M = (is_gated_activation(cfg.activation_type) ? 2 : 1) * expert_D;
 
         mLoRARunState->moe_lora_intermediate1 = mAllocator->allocate(
             moe_work_dtype, "moe_lora_intermediate1", EAllocationType::ON_DEVICE, {total_tokens, rank});
@@ -204,7 +205,7 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
         mLoRARunState->moe_lora_up = mAllocator->allocate(
             moe_work_dtype, "moe_lora_up", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
         mLoRARunState->moe_lora_gate_up = mAllocator->allocate(
-            moe_work_dtype, "moe_lora_gate_up", EAllocationType::ON_DEVICE, {total_tokens, 2 * expert_D});
+            moe_work_dtype, "moe_lora_gate_up", EAllocationType::ON_DEVICE, {total_tokens, moe_M});
     }
 }
 

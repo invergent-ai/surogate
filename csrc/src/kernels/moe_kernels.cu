@@ -123,6 +123,35 @@ __global__ void moe_sigmoid_forward_kernel(
     out[idx] = static_cast<T>(sigmoid_val);
 }
 
+template<typename T>
+__global__ void moe_sigmoid_backward_kernel(
+    T* __restrict__ d_inp,
+    const T* __restrict__ grad,
+    const T* __restrict__ out,
+    int num_elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_elements) return;
+
+    float g = static_cast<float>(grad[idx]);
+    float y = static_cast<float>(out[idx]);
+    float dy = g * y * (1.0f - y);
+    d_inp[idx] = static_cast<T>(dy);
+}
+
+template<typename T>
+__global__ void moe_scale_forward_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ inp,
+    float scale,
+    int num_elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_elements) return;
+    float val = static_cast<float>(inp[idx]);
+    out[idx] = static_cast<T>(val * scale);
+}
+
 // ============================================================================
 // Top-K Selection Kernel
 // ============================================================================
@@ -679,6 +708,62 @@ void moe_sigmoid_forward(
     int grid_size = (num_elements + block_size - 1) / block_size;
     moe_sigmoid_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(
         out, inp, num_elements
+    );
+}
+
+void moe_sigmoid_backward(
+    nv_bfloat16* d_inp,
+    const nv_bfloat16* grad,
+    const nv_bfloat16* out,
+    int num_elements,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = (num_elements + block_size - 1) / block_size;
+    moe_sigmoid_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+        d_inp, grad, out, num_elements
+    );
+}
+
+void moe_sigmoid_backward(
+    float* d_inp,
+    const float* grad,
+    const float* out,
+    int num_elements,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = (num_elements + block_size - 1) / block_size;
+    moe_sigmoid_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(
+        d_inp, grad, out, num_elements
+    );
+}
+
+void moe_scale_forward(
+    nv_bfloat16* out,
+    const nv_bfloat16* inp,
+    float scale,
+    int num_elements,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = (num_elements + block_size - 1) / block_size;
+    moe_scale_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+        out, inp, scale, num_elements
+    );
+}
+
+void moe_scale_forward(
+    float* out,
+    const float* inp,
+    float scale,
+    int num_elements,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = (num_elements + block_size - 1) / block_size;
+    moe_scale_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(
+        out, inp, scale, num_elements
     );
 }
 
@@ -2094,6 +2179,117 @@ void moe_grouped_gemm_gate_up_backward_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
+template<typename T>
+void moe_grouped_gemm_up_backward_impl(
+    T* d_input,                       // (total_tokens, C) - gradient w.r.t. input
+    const T* d_up,                    // (total_tokens, D) - gradient from activation backward
+    const T* weights,                 // (num_experts, D, C) - up projection weights
+    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    int num_experts,
+    int hidden_size,                  // C
+    int intermediate_size,            // D
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
+) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
+    std::vector<int> local_offsets;
+    const int* h_offsets;
+
+    if (host_offsets) {
+        h_offsets = host_offsets;
+    } else {
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
+
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const int up_dim = intermediate_size;
+
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
+
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
+        if (tokens_e == 0) continue;
+
+        m_vec.push_back(hidden_size);
+        n_vec.push_back(tokens_e);
+        k_vec.push_back(up_dim);
+
+        lda_vec.push_back(hidden_size);
+        ldb_vec.push_back(up_dim);
+        ldc_vec.push_back(hidden_size);
+
+        A_vec.push_back(weights + (weight_is_compact ? e : global_idx) * up_dim * hidden_size);
+        B_vec.push_back(d_up + h_offsets[global_idx] * up_dim);
+        C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
+    }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
+}
+
 // Host wrappers for grouped GEMM backward
 void moe_grouped_gemm_down_backward(
     nv_bfloat16* d_input,
@@ -2173,6 +2369,46 @@ void moe_grouped_gemm_gate_up_backward(
     moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
                                             num_experts, hidden_size, intermediate_size,
                                             cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
+}
+
+void moe_grouped_gemm_up_backward(
+    nv_bfloat16* d_input,
+    const nv_bfloat16* d_up,
+    const nv_bfloat16* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int intermediate_size,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
+) {
+    moe_grouped_gemm_up_backward_impl(d_input, d_up, weights, expert_offsets,
+                                      num_experts, hidden_size, intermediate_size,
+                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
+}
+
+void moe_grouped_gemm_up_backward(
+    float* d_input,
+    const float* d_up,
+    const float* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int intermediate_size,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
+) {
+    moe_grouped_gemm_up_backward_impl(d_input, d_up, weights, expert_offsets,
+                                      num_experts, hidden_size, intermediate_size,
+                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 // ============================================================================

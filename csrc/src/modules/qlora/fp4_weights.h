@@ -46,6 +46,7 @@ public:
         int num_kv_heads;
         int head_size;
         int vocab_size;
+        int mlp_up_factor = 2;      ///< 2 for gated (SwiGLU), 1 for non-gated (ReLU2)
         QLoRAConfig qlora_config;
         bool use_qk_norm = false;
         bool tied_embeddings = true;

@@ -41,6 +41,7 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         const int D = (int)cfg.IntermediateSize;
         // For MoE models, experts have a different intermediate size
         const int moe_D = (cfg.moe_config && cfg.moe_config->moe_intermediate_size > 0) ? cfg.moe_config->moe_intermediate_size : D;
+        const bool moe_gated = is_gated_activation(cfg.activation_type);
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -107,35 +108,58 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                             // static int fwd_hook_calls = 0;
                             // if (fwd_hook_calls < 3) { ... }
 
-                            detail::grouped_fast_expert_lora_forward(
-                                const_cast<Tensor&>(*moe_ctx->expert_outputs),
-                                *moe_ctx->permuted_input,
-                                base_weights.experts.gate_up_proj,
-                                base_weights.experts.down_proj,
-                                lora_block.moe.grouped,
-                                mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
-                                mLoRARunState->moe_lora_up,     // contiguous buffer for up output
-                                *moe_ctx->expert_offsets,
-                                scaling,
-                                gemm_num_experts, C, moe_D, rank,
-                                mLoRARunState->moe_lora_intermediate1,
-                                mLoRARunState->moe_lora_intermediate2,
-                                mLoRARunState->moe_lora_gate_up,
-                                rs.CublasHandle,
-                                stream,
-                                moe_ctx->host_offsets,
-                                selection_info.enabled ? &selection_info : nullptr
-                            );
+                            if (moe_gated) {
+                                detail::grouped_fast_expert_lora_forward(
+                                    const_cast<Tensor&>(*moe_ctx->expert_outputs),
+                                    *moe_ctx->permuted_input,
+                                    base_weights.experts.gate_up_proj,
+                                    base_weights.experts.down_proj,
+                                    lora_block.moe.grouped,
+                                    mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
+                                    mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                    *moe_ctx->expert_offsets,
+                                    scaling,
+                                    gemm_num_experts, C, moe_D, rank,
+                                    mLoRARunState->moe_lora_intermediate1,
+                                    mLoRARunState->moe_lora_intermediate2,
+                                    mLoRARunState->moe_lora_gate_up,
+                                    rs.CublasHandle,
+                                    stream,
+                                    moe_ctx->host_offsets,
+                                    selection_info.enabled ? &selection_info : nullptr
+                                );
+                            } else {
+                                detail::grouped_fast_expert_lora_forward_nongated(
+                                    const_cast<Tensor&>(*moe_ctx->expert_outputs),
+                                    *moe_ctx->permuted_input,
+                                    base_weights.experts.gate_up_proj,
+                                    base_weights.experts.down_proj,
+                                    lora_block.moe.grouped,
+                                    mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                    *moe_ctx->expert_offsets,
+                                    scaling,
+                                    gemm_num_experts, C, moe_D, rank,
+                                    mLoRARunState->moe_lora_intermediate1,
+                                    mLoRARunState->moe_lora_intermediate2, // activation buffer
+                                    rs.CublasHandle,
+                                    stream,
+                                    moe_ctx->host_offsets,
+                                    selection_info.enabled ? &selection_info : nullptr,
+                                    cfg.activation_type
+                                );
+                            }
 
                             // Copy base gate_up to context for backward pass reconstruction.
                             // grouped_fast_expert_lora_forward writes the base projection (before LoRA)
                             // to moe_lora_gate_up. The backward pass needs this to reconstruct
                             // the forward activations for correct gradient computation.
                             if (moe_ctx->expert_gate_up && moe_ctx->expert_gate_up->Data) {
+                                const Tensor& base_gate_up = moe_gated ? mLoRARunState->moe_lora_gate_up
+                                                                      : mLoRARunState->moe_lora_up;
                                 CUDA_CHECK(cudaMemcpyAsync(
                                     moe_ctx->expert_gate_up->Data,
-                                    mLoRARunState->moe_lora_gate_up.Data,
-                                    mLoRARunState->moe_lora_gate_up.bytes(),
+                                    base_gate_up.Data,
+                                    base_gate_up.bytes(),
                                     cudaMemcpyDeviceToDevice,
                                     stream));
                             }
@@ -241,6 +265,7 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
         const int D = (int)cfg.IntermediateSize;
         // For MoE models, experts have a different intermediate size
         const int moe_D = (cfg.moe_config && cfg.moe_config->moe_intermediate_size > 0) ? cfg.moe_config->moe_intermediate_size : D;
+        const bool moe_gated = is_gated_activation(cfg.activation_type);
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -288,25 +313,46 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                             // iterate over ALL experts. The GEMM will skip experts with 0 tokens.
                             const int gemm_num_experts = moe_ctx->num_experts;
 
-                            detail::grouped_fast_expert_lora_forward(
-                                const_cast<Tensor&>(*moe_ctx->expert_outputs),
-                                *moe_ctx->permuted_input,
-                                base_weights.experts.gate_up_proj,
-                                base_weights.experts.down_proj,
-                                lora_block.moe.grouped,
-                                mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
-                                mLoRARunState->moe_lora_up,     // contiguous buffer for up output
-                                *moe_ctx->expert_offsets,
-                                scaling,
-                                gemm_num_experts, C, moe_D, rank,
-                                mLoRARunState->moe_lora_intermediate1,
-                                mLoRARunState->moe_lora_intermediate2,
-                                mLoRARunState->moe_lora_gate_up,
-                                rs.CublasHandle,
-                                stream,
-                                moe_ctx->host_offsets,
-                                selection_info.enabled ? &selection_info : nullptr
-                            );
+                            if (moe_gated) {
+                                detail::grouped_fast_expert_lora_forward(
+                                    const_cast<Tensor&>(*moe_ctx->expert_outputs),
+                                    *moe_ctx->permuted_input,
+                                    base_weights.experts.gate_up_proj,
+                                    base_weights.experts.down_proj,
+                                    lora_block.moe.grouped,
+                                    mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
+                                    mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                    *moe_ctx->expert_offsets,
+                                    scaling,
+                                    gemm_num_experts, C, moe_D, rank,
+                                    mLoRARunState->moe_lora_intermediate1,
+                                    mLoRARunState->moe_lora_intermediate2,
+                                    mLoRARunState->moe_lora_gate_up,
+                                    rs.CublasHandle,
+                                    stream,
+                                    moe_ctx->host_offsets,
+                                    selection_info.enabled ? &selection_info : nullptr
+                                );
+                            } else {
+                                detail::grouped_fast_expert_lora_forward_nongated(
+                                    const_cast<Tensor&>(*moe_ctx->expert_outputs),
+                                    *moe_ctx->permuted_input,
+                                    base_weights.experts.gate_up_proj,
+                                    base_weights.experts.down_proj,
+                                    lora_block.moe.grouped,
+                                    mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                    *moe_ctx->expert_offsets,
+                                    scaling,
+                                    gemm_num_experts, C, moe_D, rank,
+                                    mLoRARunState->moe_lora_intermediate1,
+                                    mLoRARunState->moe_lora_intermediate2, // activation buffer
+                                    rs.CublasHandle,
+                                    stream,
+                                    moe_ctx->host_offsets,
+                                    selection_info.enabled ? &selection_info : nullptr,
+                                    cfg.activation_type
+                                );
+                            }
                             moe_ctx->handled = true;
                         }
                     }

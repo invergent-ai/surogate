@@ -12,6 +12,8 @@
 #include "modules/primitives/attention.h"
 #include "modules/primitives/rmsnorm.h"
 #include "modules/primitives/mlp.h"
+#include "modules/moe/router.h"
+#include "modules/moe/expert.h"
 #include "modules/forward_hooks.h"
 #include "modules/backward_hooks.h"
 #include "modules/model_config.h"
@@ -104,6 +106,12 @@ public:
         int intermediate_size;
         int mlp_up_factor = 2;     ///< 2 for gated (SwiGLU/GeGLU), 1 for standard MLP
 
+        // MoE config (optional)
+        int num_experts = 0;
+        int top_k = 0;
+        bool use_shared_expert = false;
+        int shared_expert_intermediate = 0;
+
         // Norm config
         float rms_norm_eps = 1e-5f;
 
@@ -114,6 +122,7 @@ public:
         int mamba_conv_kernel = 0;
         int mamba_n_groups = 1;
         int mamba_chunk_size = 0;
+        int mamba_intermediate_size = 0; ///< Optional explicit Mamba intermediate size
         bool mamba_use_bias = false;
         bool mamba_use_conv_bias = false;
         ActivationType mamba_activation = ActivationType::SiLU;
@@ -148,19 +157,19 @@ public:
 
         // Mamba helper dimensions
         [[nodiscard]] int mamba_dim() const {
-            return intermediate_size;
+            return (mamba_intermediate_size > 0) ? mamba_intermediate_size : intermediate_size;
         }
 
         [[nodiscard]] int mamba_conv_dim() const {
-            return intermediate_size + 2 * mamba_n_groups * mamba_ssm_state_size;
+            return mamba_dim() + 2 * mamba_n_groups * mamba_ssm_state_size;
         }
 
         [[nodiscard]] int mamba_proj_size() const {
-            return intermediate_size + mamba_conv_dim() + mamba_num_heads;
+            return mamba_dim() + mamba_conv_dim() + mamba_num_heads;
         }
 
         [[nodiscard]] int mamba_group_size() const {
-            return (mamba_n_groups > 0) ? (intermediate_size / mamba_n_groups) : intermediate_size;
+            return (mamba_n_groups > 0) ? (mamba_dim() / mamba_n_groups) : mamba_dim();
         }
     };
 
@@ -188,6 +197,11 @@ public:
             Tensor& down_weight;
         };
         MLPWeightsProxy mlp_weights() { return {mlp_up_weight, mlp_down_weight}; }
+
+        // MoE weights (optional for hybrid MoE layers)
+        RouterModule::Weights router;
+        ExpertGroupModule::Weights experts;
+        std::optional<ExpertModule::Weights> shared_expert;
 
         // Mamba / SSM weights (optional for hybrid architectures)
         struct MambaWeights {
@@ -250,6 +264,11 @@ public:
             Tensor& d_down_weight;
         };
         MLPGradientsProxy mlp_grads() { return {d_mlp_up_weight, d_mlp_down_weight}; }
+
+        // MoE gradients (optional for hybrid MoE layers)
+        RouterModule::Gradients router;
+        ExpertGroupModule::Gradients experts;
+        std::optional<ExpertModule::Gradients> shared_expert;
 
         // Mamba / SSM gradients (optional for hybrid architectures)
         struct MambaGradients {

@@ -1153,6 +1153,12 @@ void moe_softmax_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_token
 /// @param stream CUDA stream.
 void moe_sigmoid_forward(float* out, const float* inp, int num_elements, cudaStream_t stream);
 void moe_sigmoid_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_elements, cudaStream_t stream);
+void moe_sigmoid_backward(float* d_inp, const float* grad, const float* out, int num_elements, cudaStream_t stream);
+void moe_sigmoid_backward(nv_bfloat16* d_inp, const nv_bfloat16* grad, const nv_bfloat16* out, int num_elements, cudaStream_t stream);
+
+/// @brief Scale tensor elements by a scalar (in-place or out-of-place).
+void moe_scale_forward(float* out, const float* inp, float scale, int num_elements, cudaStream_t stream);
+void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, int num_elements, cudaStream_t stream);
 
 /// @brief Top-K expert selection per token.
 /// @param expert_indices Output expert indices (num_tokens, top_k).
@@ -1523,21 +1529,40 @@ void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_o
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
 void moe_grouped_gemm_gate_up_backward(float* d_input, const float* d_gate_up, const float* weights,
-                                        const int* expert_offsets, int num_experts,
-                                        int hidden_size, int intermediate_size,
-                                        cublasHandle_t cublas_handle, cudaStream_t stream,
-                                        const int* host_offsets = nullptr,
-                                        const int* active_expert_indices = nullptr,
-                                        bool weight_is_compact = true,
-                                        int num_active_experts = -1);
+                                       const int* expert_offsets, int num_experts,
+                                       int hidden_size, int intermediate_size,
+                                       cublasHandle_t cublas_handle, cudaStream_t stream,
+                                       const int* host_offsets = nullptr,
+                                       const int* active_expert_indices = nullptr,
+                                       bool weight_is_compact = true,
+                                       int num_active_experts = -1);
 void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_gate_up, const nv_bfloat16* weights,
-                                        const int* expert_offsets, int num_experts,
-                                        int hidden_size, int intermediate_size,
-                                        cublasHandle_t cublas_handle, cudaStream_t stream,
-                                        const int* host_offsets = nullptr,
-                                        const int* active_expert_indices = nullptr,
-                                        bool weight_is_compact = true,
-                                        int num_active_experts = -1);
+                                       const int* expert_offsets, int num_experts,
+                                       int hidden_size, int intermediate_size,
+                                       cublasHandle_t cublas_handle, cudaStream_t stream,
+                                       const int* host_offsets = nullptr,
+                                       const int* active_expert_indices = nullptr,
+                                       bool weight_is_compact = true,
+                                       int num_active_experts = -1);
+
+/// @brief Grouped GEMM backward for non-gated up projection across all experts.
+/// Computes d_input = d_up @ W_up where W_up has shape (D, C).
+void moe_grouped_gemm_up_backward(float* d_input, const float* d_up, const float* weights,
+                                  const int* expert_offsets, int num_experts,
+                                  int hidden_size, int intermediate_size,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
+void moe_grouped_gemm_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_up, const nv_bfloat16* weights,
+                                  const int* expert_offsets, int num_experts,
+                                  int hidden_size, int intermediate_size,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
 
 // ----------------------------------------------------------------------------
 // Mamba / SSM kernels
