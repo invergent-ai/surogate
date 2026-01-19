@@ -1,0 +1,205 @@
+# Rotary Position Embedding Primitives
+# Maps to: csrc/src/kernels/rope.cu
+
+"""
+Rotary Position Embedding (RoPE) primitives.
+Essential for position encoding in modern LLMs (LLaMA, Qwen, etc.)
+"""
+
+# =============================================================================
+# rope - Rotary Position Embedding
+# =============================================================================
+
+primitive rope:
+  """
+  Rotary Position Embedding (RoPE).
+
+  Applies position-dependent rotation to query and key tensors.
+  Each pair of elements is rotated by an angle that depends on position
+  and dimension index.
+
+  For position p and dimension pair (2i, 2i+1):
+    θ_i = p / (base ^ (2i/d))
+    [x_2i, x_2i+1] → [x_2i * cos(θ) - x_2i+1 * sin(θ),
+                      x_2i * sin(θ) + x_2i+1 * cos(θ)]
+
+  Maps to: kernels.rope_forward / kernels.rope_backward
+  """
+
+  params:
+    base: float = 10000.0          # RoPE base frequency (rope_theta)
+    rotary_dim: int? = None        # Partial RoPE dimension (None = full)
+    interleaved: bool = false      # Interleaved vs split complex format
+
+  forward:
+    in: (
+      q: [B, H, T, D],             # Query tensor
+      k: [B, Hkv, T, D],           # Key tensor
+      positions: [B, T]?           # Position indices (optional, default: 0..T-1)
+    )
+    out: (
+      q_rope: [B, H, T, D],
+      k_rope: [B, Hkv, T, D]
+    )
+
+  backward:
+    in: (d_q_rope, d_k_rope, positions)
+    out: (d_q, d_k)
+
+    # RoPE backward is the inverse rotation (same as forward with -θ)
+
+  impl:
+    forward: kernels.rope_forward
+    backward: kernels.rope_backward
+
+  precision:
+    # RoPE uses precomputed sin/cos tables in fp32
+    sin_cos_precision: fp32
+
+
+# =============================================================================
+# rope_fused - Fused RoPE (On-the-fly computation)
+# =============================================================================
+
+primitive rope_fused:
+  """
+  Fused RoPE with on-the-fly sin/cos computation.
+
+  Computes sin/cos tables in shared memory rather than precomputing.
+  More memory efficient for variable sequence lengths.
+
+  Maps to: kernels.rope_fused_forward
+  """
+
+  params:
+    base: float = 10000.0
+    rotary_dim: int? = None
+
+  forward:
+    in: (
+      q: [B, H, T, D],
+      k: [B, Hkv, T, D],
+      seq_start: int = 0           # Starting position (for generation)
+    )
+    out: (
+      q_rope: [B, H, T, D],
+      k_rope: [B, Hkv, T, D]
+    )
+
+  backward:
+    in: (d_q_rope, d_k_rope, seq_start)
+    out: (d_q, d_k)
+
+  impl:
+    forward: kernels.rope_fused_forward
+    backward: kernels.rope_fused_backward
+
+
+# =============================================================================
+# rope_quant - Quantized RoPE
+# =============================================================================
+
+primitive rope_quant:
+  """
+  RoPE with FP8 quantized output.
+
+  Applies RoPE and quantizes output in a single kernel.
+  Used in FP8 training pipelines.
+
+  Maps to: kernels.rope_forward_quant
+  """
+
+  params:
+    base: float = 10000.0
+    rotary_dim: int? = None
+
+  forward:
+    in: (
+      q: [B, H, T, D],
+      k: [B, Hkv, T, D],
+      q_scale: float,              # Quantization scale for Q
+      k_scale: float               # Quantization scale for K
+    )
+    out: (
+      q_rope: [B, H, T, D, fp8_e4m3],
+      k_rope: [B, Hkv, T, D, fp8_e4m3]
+    )
+
+  impl:
+    forward: kernels.rope_forward_quant
+
+
+# =============================================================================
+# qkv_qk_norm_rope - Fused QK-Norm + RoPE (Qwen3)
+# =============================================================================
+
+primitive qkv_qk_norm_rope:
+  """
+  Fused QK normalization and RoPE application (Qwen3 style).
+
+  Combines:
+  1. Per-head RMSNorm on Q and K
+  2. RoPE position encoding
+
+  This fusion avoids intermediate materialization between norm and rope.
+
+  Maps to: kernels.qkv_qk_norm_rope_forward
+  """
+
+  params:
+    base: float = 10000.0
+    rotary_dim: int? = None
+    eps: float = 1e-6
+
+  forward:
+    in: (
+      q: [B, H, T, D],
+      k: [B, Hkv, T, D],
+      q_norm_weight: [D],
+      k_norm_weight: [D]
+    )
+    out: (
+      q_out: [B, H, T, D],
+      k_out: [B, Hkv, T, D],
+      q_rstd: [B, H, T],           # For backward
+      k_rstd: [B, Hkv, T]
+    )
+
+  backward:
+    in: (d_q_out, d_k_out, q, k, q_norm_weight, k_norm_weight, q_rstd, k_rstd)
+    out: (d_q, d_k, d_q_norm_weight, d_k_norm_weight)
+
+  save: [q, k, q_rstd, k_rstd]
+
+  impl:
+    forward: kernels.qkv_qk_norm_rope_forward
+    backward: kernels.qkv_qk_norm_rope_backward
+
+
+# =============================================================================
+# precompute_rope_freqs - Precompute RoPE Frequencies
+# =============================================================================
+
+primitive precompute_rope_freqs:
+  """
+  Precompute RoPE sin/cos frequency tables.
+
+  Used for caching frequencies when sequence length is known upfront.
+
+  Maps to: kernels.precompute_rope_freqs
+  """
+
+  params:
+    base: float = 10000.0
+    dim: int
+    max_seq_len: int
+
+  forward:
+    in: ()
+    out: (
+      sin_table: [max_seq_len, dim // 2],
+      cos_table: [max_seq_len, dim // 2]
+    )
+
+  impl:
+    forward: kernels.precompute_rope_freqs

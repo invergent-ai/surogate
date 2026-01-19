@@ -1,0 +1,246 @@
+# Mamba SSM Primitives
+# Maps to: csrc/third_party/mamba/selective_scan/, csrc/third_party/causal_conv1d/
+
+"""
+Mamba State Space Model primitives for hybrid architectures.
+Based on selective scan and causal convolution operations.
+"""
+
+# =============================================================================
+# selective_scan - Mamba Core Operation
+# =============================================================================
+
+primitive selective_scan:
+  """
+  Selective scan (S6) operation - core of Mamba architecture.
+
+  Computes state space model recurrence with input-dependent parameters:
+    h_t = A * h_{t-1} + B * x_t
+    y_t = C * h_t + D * x_t
+
+  Where A, B, C are input-dependent (selective).
+
+  Maps to: third_party/mamba/selective_scan/selective_scan_fwd_*.cu
+  """
+
+  params:
+    has_z: bool = true             # Include gating path
+    delta_softplus: bool = true    # Apply softplus to delta
+
+  forward:
+    in: (
+      u: [B, D, T],                # Input sequence
+      delta: [B, D, T],            # Time step (dt)
+      A: [D, N],                   # State matrix (log form: -exp(A_log))
+      B: [B, G, N, T],             # Input-to-state projection (G = n_groups)
+      C: [B, G, N, T],             # State-to-output projection
+      D: [D]?,                     # Skip connection
+      z: [B, D, T]?,               # Gating (for SiLU gate)
+      delta_bias: [D]?,            # Bias for delta
+      ssm_state: [B, D, N]?        # Initial state (for generation)
+    )
+    out: (
+      out: [B, D, T],
+      ssm_state_out: [B, D, N]     # Final state
+    )
+
+  backward:
+    in: (
+      d_out, u, delta, A, B, C, D, z, delta_bias,
+      out, ssm_state_out
+    )
+    out: (
+      d_u, d_delta, d_A, d_B, d_C, d_D, d_z, d_delta_bias
+    )
+
+  save: [u, delta, A, B, C, out, ssm_state_out]
+
+  impl:
+    forward: kernels.selective_scan_fwd
+    backward: kernels.selective_scan_bwd
+
+  precision:
+    supported: [fp16, bf16, fp32]
+
+
+# =============================================================================
+# causal_conv1d - Causal Convolution
+# =============================================================================
+
+primitive causal_conv1d:
+  """
+  Causal 1D convolution with optional SiLU activation.
+
+  Applies depthwise convolution where output at time t depends only
+  on inputs at times t, t-1, ..., t-k+1 (causal).
+
+  Maps to: third_party/causal_conv1d/causal_conv1d_fwd.cu
+  """
+
+  params:
+    activation: enum(silu, none) = silu
+
+  forward:
+    in: (
+      x: [B, D, T],                # Input sequence
+      weight: [D, 1, K],           # Convolution kernel (depthwise)
+      bias: [D]?,                  # Optional bias
+      conv_state: [B, D, K-1]?     # State for generation
+    )
+    out: (
+      out: [B, D, T],
+      conv_state_out: [B, D, K-1]  # Updated state
+    )
+
+  backward:
+    in: (d_out, x, weight, bias, conv_state)
+    out: (d_x, d_weight, d_bias)
+
+  save: [x]
+
+  impl:
+    forward: kernels.causal_conv1d_fwd
+    backward: kernels.causal_conv1d_bwd
+
+
+primitive causal_conv1d_update:
+  """
+  Single-step causal conv1d update for generation.
+
+  Updates convolution state and produces single output.
+
+  Maps to: kernels.causal_conv1d_update
+  """
+
+  params:
+    activation: enum(silu, none) = silu
+
+  forward:
+    in: (
+      x: [B, D],                   # Single timestep input
+      conv_state: [B, D, K-1],     # Current state
+      weight: [D, 1, K],
+      bias: [D]?
+    )
+    out: (
+      out: [B, D],
+      conv_state_out: [B, D, K-1]  # Updated state
+    )
+
+  impl:
+    forward: kernels.causal_conv1d_update
+
+
+# =============================================================================
+# mamba_split_proj - Split Mamba Input Projection
+# =============================================================================
+
+primitive mamba_split_proj:
+  """
+  Split Mamba input projection into gate, conv_in, and delta paths.
+
+  Maps to: view operations (no copy)
+  """
+
+  params:
+    d_inner: int
+    d_conv: int
+
+  forward:
+    in: proj: [B, T, d_inner + d_conv + n_groups]
+    out: (
+      gate: [B, T, d_inner],       # For gating (SiLU * scan_out)
+      conv_in: [B, T, d_conv],     # For causal conv
+      delta: [B, T, n_groups]      # For selective scan dt
+    )
+
+  backward:
+    d_proj = concat([d_gate, d_conv_in, d_delta], dim=-1)
+
+  impl:
+    forward: kernels.view  # Zero-copy split
+
+
+# =============================================================================
+# mamba_split_conv - Split Convolution Output
+# =============================================================================
+
+primitive mamba_split_conv:
+  """
+  Split Mamba convolution output into u, B, C for selective scan.
+
+  Maps to: view operations (no copy)
+  """
+
+  params:
+    d_inner: int
+    n_groups: int
+    d_state: int
+
+  forward:
+    in: conv_out: [B, T, d_inner + 2 * n_groups * d_state]
+    out: (
+      u: [B, T, d_inner],          # Main input to scan
+      B_ssm: [B, T, n_groups, d_state],  # Input-to-state
+      C_ssm: [B, T, n_groups, d_state]   # State-to-output
+    )
+
+  backward:
+    d_conv_out = concat([d_u, d_B_ssm.flatten(), d_C_ssm.flatten()], dim=-1)
+
+  impl:
+    forward: kernels.view
+
+
+# =============================================================================
+# silu_mul - SiLU Gating (used in Mamba)
+# =============================================================================
+
+primitive silu_mul:
+  """
+  SiLU gating: out = silu(gate) * x
+
+  Used in Mamba for gating the selective scan output.
+
+  Maps to: kernels.silu_mul_forward
+  """
+
+  forward:
+    in: (gate: [*], x: [*])
+    out: [*]
+
+  backward:
+    in: (d_out, gate, x)
+    out: (d_gate, d_x)
+
+  save: [gate, x]
+
+  impl:
+    forward: kernels.silu_mul_forward
+    backward: kernels.silu_mul_backward
+
+
+# =============================================================================
+# exp_neg - Negative Exponential (for A matrix)
+# =============================================================================
+
+primitive exp_neg:
+  """
+  Compute negative exponential: out = -exp(x)
+
+  Used to convert A_log to A for selective scan.
+
+  Maps to: kernels.exp_neg
+  """
+
+  forward:
+    in: x: [*]
+    out: [*]
+
+  backward:
+    d_x = d_out * out  # d/dx(-e^x) = -e^x
+
+  save: [out]
+
+  impl:
+    forward: kernels.exp_neg

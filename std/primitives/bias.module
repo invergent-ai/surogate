@@ -1,0 +1,95 @@
+# Bias Operation Primitives
+# Maps to: csrc/src/kernels/bias.cu
+
+"""
+Bias addition primitives for neural network layers.
+"""
+
+# =============================================================================
+# bias_add - Add Bias Vector
+# =============================================================================
+
+primitive bias_add:
+  """
+  Add bias vector to tensor along last dimension.
+
+  out[..., i] = x[..., i] + bias[i]
+
+  Maps to: kernels.bias_forward / kernels.bias_backward
+  """
+
+  forward:
+    in: (x: [*, D], bias: [D])
+    out: [*, D]
+
+  backward:
+    in: (d_out: [*, D])
+    out: (d_x: [*, D], d_bias: [D])
+
+    d_x = d_out
+    d_bias = reduce_sum(d_out, dims=[0, ..., -2])  # Sum over all but last dim
+
+  impl:
+    forward: kernels.bias_forward
+    backward: kernels.bias_backward
+
+
+# =============================================================================
+# fused_bias_gelu - Fused Bias + GELU
+# =============================================================================
+
+primitive fused_bias_gelu:
+  """
+  Fused bias addition and GELU activation.
+
+  out = GELU(x + bias)
+
+  Maps to: kernels.fused_bias_gelu
+  """
+
+  params:
+    approximate: bool = true
+
+  forward:
+    in: (x: [*, D], bias: [D])
+    out: [*, D]
+
+  backward:
+    in: (d_out, x, bias)
+    out: (d_x, d_bias)
+
+  save: [x, bias]  # Need pre-activation for GELU backward
+
+  impl:
+    forward: kernels.fused_bias_gelu_forward
+    backward: kernels.fused_bias_gelu_backward
+
+
+# =============================================================================
+# fused_bias_dropout - Fused Bias + Dropout
+# =============================================================================
+
+primitive fused_bias_dropout:
+  """
+  Fused bias addition and dropout.
+
+  out = dropout(x + bias, p)
+
+  Maps to: kernels.fused_bias_dropout
+  """
+
+  params:
+    p: float = 0.0                 # Dropout probability
+    training: bool = true
+
+  forward:
+    in: (x: [*, D], bias: [D], rng_state: int64)
+    out: (out: [*, D], mask: [*, D, int8]?)  # Mask saved for backward
+
+  backward:
+    in: (d_out, mask)
+    out: (d_x, d_bias)
+
+  impl:
+    forward: kernels.fused_bias_dropout_forward
+    backward: kernels.fused_bias_dropout_backward

@@ -1,0 +1,225 @@
+# Attention Primitives
+# Maps to: csrc/src/kernels/attention.cu, third_party/flash_attention
+
+"""
+Attention computation primitives.
+Includes memory-efficient FlashAttention and cuDNN-accelerated variants.
+"""
+
+# =============================================================================
+# flash_attention - Memory-Efficient Fused Attention
+# =============================================================================
+
+primitive flash_attention:
+  """
+  Memory-efficient fused attention (FlashAttention-2).
+
+  Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d)) @ V
+
+  Computes scaled dot-product attention without materializing the
+  full [T, T] attention matrix. Essential for long sequences.
+
+  Supports:
+  - Grouped Query Attention (GQA): Hq != Hkv with automatic broadcast
+  - Causal masking: future tokens masked
+  - Variable sequence lengths via cu_seqlens
+  - Sliding window attention (Mistral)
+  - ALiBi position bias
+
+  Returns log-sum-exp (lse) for numerically stable backward pass.
+
+  Maps to: kernels.flash_attention_forward / kernels.flash_attention_backward
+  """
+
+  params:
+    causal: bool = true            # Apply causal mask
+    softmax_scale: float? = None   # Default: 1/sqrt(d_head)
+    window_size: int? = None       # Sliding window attention (Mistral)
+    alibi_slopes: [H]? = None      # ALiBi position bias slopes
+
+  forward:
+    in: (
+      q: [B, Hq, T, D],            # Query: B=batch, Hq=query heads, T=seq, D=head_dim
+      k: [B, Hkv, T, D],           # Key: Hkv=kv heads (Hkv <= Hq for GQA)
+      v: [B, Hkv, T, D]            # Value
+    )
+    out: (
+      out: [B, Hq, T, D],          # Attention output
+      lse: [B, Hq, T]              # Log-sum-exp for backward
+    )
+
+  backward:
+    in: (
+      d_out: [B, Hq, T, D],
+      q: [B, Hq, T, D],
+      k: [B, Hkv, T, D],
+      v: [B, Hkv, T, D],
+      out: [B, Hq, T, D],
+      lse: [B, Hq, T]
+    )
+    out: (
+      d_q: [B, Hq, T, D],
+      d_k: [B, Hkv, T, D],
+      d_v: [B, Hkv, T, D]
+    )
+
+  save: [q, k, v, out, lse]
+
+  impl:
+    forward: kernels.flash_attention_forward
+    backward: kernels.flash_attention_backward
+
+  precision:
+    supported: [fp16, bf16]
+    accumulation: fp32
+
+
+# =============================================================================
+# flash_attention_varlen - Variable Length Sequences
+# =============================================================================
+
+primitive flash_attention_varlen:
+  """
+  FlashAttention for variable-length sequences (packed batches).
+
+  Used when sequences in a batch have different lengths and are
+  packed together without padding. cu_seqlens provides boundaries.
+
+  Maps to: kernels.flash_attention_varlen_forward
+  """
+
+  params:
+    causal: bool = true
+    softmax_scale: float? = None
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+  forward:
+    in: (
+      q: [total_q, Hq, D],          # Packed queries
+      k: [total_k, Hkv, D],         # Packed keys
+      v: [total_k, Hkv, D],         # Packed values
+      cu_seqlens_q: [B + 1],        # Query sequence boundaries
+      cu_seqlens_k: [B + 1]         # Key sequence boundaries
+    )
+    out: (
+      out: [total_q, Hq, D],
+      lse: [total_q, Hq]
+    )
+
+  backward:
+    in: (d_out, q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
+    out: (d_q, d_k, d_v)
+
+  save: [q, k, v, out, lse]
+
+  impl:
+    forward: kernels.flash_attention_varlen_forward
+    backward: kernels.flash_attention_varlen_backward
+
+
+# =============================================================================
+# attention_cudnn - cuDNN-Accelerated Attention
+# =============================================================================
+
+primitive attention_cudnn:
+  """
+  cuDNN-accelerated scaled dot-product attention.
+
+  Alternative to FlashAttention using NVIDIA cuDNN backend.
+  May be faster on certain hardware/sequence length combinations.
+
+  Maps to: kernels.attention_forward_cudnn / kernels.attention_backward_cudnn
+  """
+
+  params:
+    causal: bool = true
+    softmax_scale: float? = None
+    dropout_p: float = 0.0
+
+  forward:
+    in: (
+      q: [B, Hq, T, D],
+      k: [B, Hkv, T, D],
+      v: [B, Hkv, T, D]
+    )
+    out: (
+      out: [B, Hq, T, D],
+      softmax_lse: [B, Hq, T]
+    )
+
+  backward:
+    in: (d_out, q, k, v, out, softmax_lse)
+    out: (d_q, d_k, d_v)
+
+  save: [q, k, v, out, softmax_lse]
+
+  impl:
+    forward: kernels.attention_forward_cudnn
+    backward: kernels.attention_backward_cudnn
+
+
+# =============================================================================
+# attention_scores - Manual Attention Score Computation
+# =============================================================================
+
+primitive attention_scores:
+  """
+  Compute raw attention scores: scores = Q @ K^T * scale
+
+  Used when manual control over attention computation is needed
+  (e.g., for custom masking or visualization).
+
+  Maps to: kernels.batched_matmul with scaling
+  """
+
+  params:
+    scale: float? = None           # Default: 1/sqrt(d_head)
+
+  forward:
+    in: (
+      q: [B, H, T, D],
+      k: [B, H, T, D]
+    )
+    out: scores: [B, H, T, T]
+
+  backward:
+    in: (d_scores, q, k)
+    out: (d_q, d_k)
+
+  save: [q, k]
+
+  impl:
+    forward: kernels.attention_scores_forward
+    backward: kernels.attention_scores_backward
+
+
+# =============================================================================
+# attention_output - Attention Output Computation
+# =============================================================================
+
+primitive attention_output:
+  """
+  Compute attention output: out = weights @ V
+
+  Used with attention_scores for manual attention control.
+
+  Maps to: kernels.batched_matmul
+  """
+
+  forward:
+    in: (
+      weights: [B, H, T, T],       # Attention weights (after softmax)
+      v: [B, H, T, D]              # Values
+    )
+    out: out: [B, H, T, D]
+
+  backward:
+    in: (d_out, weights, v)
+    out: (d_weights, d_v)
+
+  save: [weights, v]
+
+  impl:
+    forward: kernels.attention_output_forward
+    backward: kernels.attention_output_backward

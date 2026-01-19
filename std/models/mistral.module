@@ -1,0 +1,147 @@
+# Mistral Model Architecture
+# Maps to: csrc/src/models/ (similar to LLaMA with sliding window)
+
+"""
+Mistral AI model architectures.
+Features sliding window attention for efficient long-context processing.
+"""
+
+import std.primitives
+import std.modules.{Linear, SwiGLU_MLP}
+import std.modules.attention.gqa.{CausalSelfAttention}
+import std.blocks.dense.{DenseTransformerBlock}
+
+# =============================================================================
+# Mistral - Mistral Model with Sliding Window Attention
+# =============================================================================
+
+model Mistral(
+  vocab_size: int = 32000,
+  d_model: int = 4096,
+  n_layers: int = 32,
+  num_heads: int = 32,
+  num_kv_heads: int = 8,
+  d_ff: int = 14336,
+  max_seq: int = 32768,
+  eps: float = 1e-5,
+  rope_theta: float = 10000.0,
+  sliding_window: int = 4096,
+  tie_word_embeddings: bool = false
+):
+  """
+  Mistral model architecture.
+
+  Key features:
+  - Grouped Query Attention (GQA)
+  - Sliding Window Attention for efficient long contexts
+  - SwiGLU activation
+
+  Configurations:
+  - Mistral-7B: d_model=4096, n_layers=32, num_heads=32, num_kv_heads=8
+  - Mistral-8x7B: See Mixtral (MoE variant)
+
+  Maps to: models/mistral/ (similar structure to llama)
+  """
+
+  let:
+    d_head = d_model // num_heads
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+      num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+
+  params:
+    embedding: [vocab_size, d_model]
+    blocks: [n_layers] x DenseTransformerBlock(
+      d_model=d_model,
+      num_heads=num_heads,
+      num_kv_heads=num_kv_heads,
+      d_ff=d_ff,
+      max_seq=max_seq,
+      rope_theta=rope_theta,
+      eps=eps,
+      use_qk_norm=false
+    )
+    # Note: sliding_window is passed to attention primitive, not block
+    final_norm: [d_model]
+    lm_head: tied_to(embedding) if tie_word_embeddings else [vocab_size, d_model]
+
+  forward:
+    in: token_ids: [B, T, int32]
+    out: logits: [B, T, vocab_size]
+
+    graph:
+      token_ids -> embedding(embedding) -> x0
+      zeros([B, T, d_model]) -> residual0
+
+      # Forward with sliding window attention
+      (x0, residual0) -> StackedBlocks(blocks, n_layers,
+        attention_config={window_size: sliding_window}
+      ) -> (xN, residualN)
+
+      (residualN, xN, final_norm) -> fused_residual_rmsnorm(eps=eps) -> (_, xF, _)
+      (xF, lm_head) -> matmul(transpose=TN) -> logits
+
+  hf_config:
+    architecture: "MistralForCausalLM"
+    config_class: "MistralConfig"
+    param_mapping:
+      d_model: hidden_size
+      n_layers: num_hidden_layers
+      num_heads: num_attention_heads
+      num_kv_heads: num_key_value_heads
+      d_ff: intermediate_size
+      vocab_size: vocab_size
+      max_seq: max_position_embeddings
+      eps: rms_norm_eps
+      rope_theta: rope_theta
+      sliding_window: sliding_window
+
+  hf_mapping:
+    embedding: "model.embed_tokens.weight"
+    final_norm: "model.norm.weight"
+    lm_head: "lm_head.weight"
+    blocks[{i}].ln1_weight: "model.layers.{i}.input_layernorm.weight"
+    blocks[{i}].qkv_weight: fuse(
+      "model.layers.{i}.self_attn.q_proj.weight",
+      "model.layers.{i}.self_attn.k_proj.weight",
+      "model.layers.{i}.self_attn.v_proj.weight",
+      dim=0
+    )
+    blocks[{i}].out_weight: "model.layers.{i}.self_attn.o_proj.weight"
+    blocks[{i}].ln2_weight: "model.layers.{i}.post_attention_layernorm.weight"
+    blocks[{i}].gate_up_weight: fuse(
+      "model.layers.{i}.mlp.gate_proj.weight",
+      "model.layers.{i}.mlp.up_proj.weight",
+      dim=0
+    )
+    blocks[{i}].down_weight: "model.layers.{i}.mlp.down_proj.weight"
+
+
+# =============================================================================
+# Presets
+# =============================================================================
+
+preset Mistral_7B:
+  """Mistral-7B configuration."""
+  vocab_size: 32000
+  d_model: 4096
+  n_layers: 32
+  num_heads: 32
+  num_kv_heads: 8
+  d_ff: 14336
+  max_seq: 32768
+  sliding_window: 4096
+  rope_theta: 10000.0
+
+preset Mistral_7B_v0_3:
+  """Mistral-7B v0.3 configuration (no sliding window)."""
+  vocab_size: 32768
+  d_model: 4096
+  n_layers: 32
+  num_heads: 32
+  num_kv_heads: 8
+  d_ff: 14336
+  max_seq: 32768
+  sliding_window: None  # Disabled in v0.3
+  rope_theta: 1000000.0

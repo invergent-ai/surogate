@@ -1,0 +1,180 @@
+# MoE Router Modules
+# Maps to: csrc/src/modules/moe/router.h, switch_router.h, expert_choice_router.h
+
+"""
+Mixture-of-Experts routing modules.
+Handles token-to-expert assignment and load balancing.
+"""
+
+import std.primitives.{matmul, softmax, moe_router, moe_router_topk}
+
+# =============================================================================
+# SwitchRouter - Standard Top-K Routing (Mixtral, Qwen3-MoE)
+# =============================================================================
+
+module SwitchRouter(
+  d_model: int,
+  num_experts: int,
+  top_k: int = 2,
+  aux_loss_alpha: float = 0.01,
+  normalize: bool = true
+):
+  """
+  Switch/Top-K Router for Mixture-of-Experts.
+
+  Computes routing scores via linear projection, selects top-k experts
+  per token, and computes load balancing auxiliary loss.
+
+  Architecture:
+    scores = softmax(hidden @ router_weight^T)
+    weights, indices = topk(scores, k=top_k)
+    aux_loss = load_balancing_loss(scores, indices)
+
+  Used in: Mixtral, Qwen3-MoE, Switch Transformer
+
+  Maps to: modules/moe/SwitchRouter
+  """
+
+  params:
+    router_weight: [num_experts, d_model]
+
+  forward:
+    in: hidden: [B*T, d_model]
+    out: (
+      weights: [B*T, top_k],          # Normalized expert weights
+      indices: [B*T, top_k, int32],   # Selected expert indices
+      aux_loss: float                  # Load balancing loss
+    )
+
+    graph:
+      # Compute router logits
+      (hidden, router_weight) -> matmul(transpose=TN) -> router_logits
+
+      # Full routing with softmax normalization and top-k
+      if normalize:
+        (hidden, router_weight) -> moe_router(
+          top_k=top_k,
+          normalize=softmax,
+          capacity_factor=1.0
+        ) -> (weights, indices, aux_loss)
+      else:
+        router_logits -> moe_router_topk(top_k=top_k) -> (weights, indices)
+        zeros() -> aux_loss
+
+    save: [hidden, router_logits, indices]
+
+  backward:
+    d_weights: [B*T, top_k]
+    d_hidden: [B*T, d_model]
+
+    graph:
+      # Router backward through softmax and linear
+      (d_weights, saved.hidden, router_weight, saved.indices)
+        -> moe_router_backward() -> (d_hidden, d_router_weight)
+
+
+# =============================================================================
+# ExpertChoiceRouter - Expert-Choice Routing
+# =============================================================================
+
+module ExpertChoiceRouter(
+  d_model: int,
+  num_experts: int,
+  expert_capacity: int,
+  aux_loss_alpha: float = 0.01
+):
+  """
+  Expert-Choice Router for Mixture-of-Experts.
+
+  Instead of tokens choosing experts, experts choose their top tokens.
+  Ensures perfect load balancing across experts.
+
+  Architecture:
+    scores = hidden @ router_weight^T
+    For each expert e:
+      indices_e, weights_e = topk(scores[:, e], k=expert_capacity)
+
+  Used in: Expert Choice paper, some DeepSeek variants
+
+  Maps to: modules/moe/ExpertChoiceRouter
+  """
+
+  params:
+    router_weight: [num_experts, d_model]
+
+  forward:
+    in: hidden: [B*T, d_model]
+    out: (
+      weights: [num_experts, expert_capacity],        # Per-expert token weights
+      indices: [num_experts, expert_capacity, int32], # Per-expert token indices
+      aux_loss: float
+    )
+
+    graph:
+      # Compute router logits
+      (hidden, router_weight) -> matmul(transpose=TN) -> router_logits
+
+      # Expert-choice selection
+      router_logits -> expert_choice_routing(
+        expert_capacity=expert_capacity
+      ) -> (weights, indices, aux_loss)
+
+    save: [hidden, router_logits]
+
+  backward:
+    d_weights: [num_experts, expert_capacity]
+    d_hidden: [B*T, d_model]
+
+    graph:
+      (d_weights, saved.hidden, router_weight, indices)
+        -> expert_choice_router_backward() -> (d_hidden, d_router_weight)
+
+
+# =============================================================================
+# SigmoidRouter - Sigmoid Gating (DeepSeek style)
+# =============================================================================
+
+module SigmoidRouter(
+  d_model: int,
+  num_experts: int,
+  top_k: int = 2,
+  aux_loss_alpha: float = 0.01
+):
+  """
+  Sigmoid-based Router for Mixture-of-Experts.
+
+  Uses sigmoid instead of softmax for expert scoring.
+  Each expert score is independent (not normalized to sum to 1).
+
+  Used in: Some DeepSeek MoE variants
+
+  Maps to: modules/moe/SigmoidRouter
+  """
+
+  params:
+    router_weight: [num_experts, d_model]
+
+  forward:
+    in: hidden: [B*T, d_model]
+    out: (
+      weights: [B*T, top_k],
+      indices: [B*T, top_k, int32],
+      aux_loss: float
+    )
+
+    graph:
+      (hidden, router_weight) -> moe_router(
+        top_k=top_k,
+        normalize=sigmoid,
+        capacity_factor=1.0
+      ) -> (weights, indices, aux_loss)
+
+    save: [hidden, indices]
+
+  backward:
+    d_weights: [B*T, top_k]
+    d_hidden: [B*T, d_model]
+
+    graph:
+      (d_weights, saved.hidden, router_weight, saved.indices)
+        -> sigmoid_router_backward() -> (d_hidden, d_router_weight)

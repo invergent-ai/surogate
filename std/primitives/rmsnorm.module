@@ -1,0 +1,214 @@
+# RMSNorm and LayerNorm Primitives
+# Maps to: csrc/src/kernels/rmsnorm.cu
+
+"""
+Normalization primitives for transformer architectures.
+"""
+
+# =============================================================================
+# rmsnorm - Root Mean Square Normalization
+# =============================================================================
+
+primitive rmsnorm:
+  """
+  Root Mean Square Normalization.
+
+  RMS(x) = sqrt(mean(x²) + ε)
+  y = (x / RMS(x)) * weight
+
+  More efficient than LayerNorm as it skips mean computation.
+  Returns both normalized output and reciprocal std (rstd) for backward.
+
+  Maps to: kernels.rmsnorm_forward / kernels.rmsnorm_backward
+  """
+
+  params:
+    eps: float = 1e-6              # Epsilon for numerical stability
+
+  forward:
+    in: (x: [*, C], weight: [C])
+    out: (y: [*, C], rstd: [*])    # rstd shape is x.shape[:-1]
+
+  backward:
+    in: (d_y: [*, C], x: [*, C], weight: [C], rstd: [*])
+    out: (d_x: [*, C], d_weight: [C])
+
+    # d_x involves chain rule through normalization
+    # d_weight = sum(d_y * normalized_x, dim=batch)
+
+  save: [x, rstd]
+
+  impl:
+    forward: kernels.rmsnorm_forward
+    backward: kernels.rmsnorm_backward
+
+  memory:
+    # rstd is small (one float per token), always saved
+    # x may be recomputed if checkpointing
+    rstd_size: B * T * sizeof(float)
+
+
+# =============================================================================
+# fused_residual_rmsnorm - Fused Residual + RMSNorm
+# =============================================================================
+
+primitive fused_residual_rmsnorm:
+  """
+  Fused residual addition + RMSNorm in a single kernel.
+
+  Computes:
+    1. residual_out = residual + input  (residual connection)
+    2. y = rmsnorm(residual_out)        (normalization)
+
+  This fusion saves one full tensor read/write compared to separate ops.
+  Essential for memory-bound transformer training.
+
+  Maps to: kernels.fused_residual_rmsnorm_forward / _backward
+  """
+
+  params:
+    eps: float = 1e-6
+
+  forward:
+    in: (
+      residual: [*, C],     # Running residual stream
+      input: [*, C],        # Output from previous sublayer (attention/MLP)
+      weight: [C]           # RMSNorm weight
+    )
+    out: (
+      residual_out: [*, C], # Updated residual (residual + input)
+      y: [*, C],            # Normalized output
+      rstd: [*]             # Reciprocal std for backward
+    )
+
+  backward:
+    in: (
+      d_y: [*, C],              # Gradient from downstream
+      d_residual_next: [*, C],  # Gradient flowing through residual stream
+      residual_out: [*, C],
+      weight: [C],
+      rstd: [*]
+    )
+    out: (
+      d_residual: [*, C],   # Gradient to previous residual
+      d_input: [*, C],      # Gradient to sublayer output
+      d_weight: [C]
+    )
+
+    # Gradients split: both d_residual and d_input receive the combined gradient
+
+  save: [residual_out, rstd]
+
+  impl:
+    forward: kernels.fused_residual_rmsnorm_forward
+    backward: kernels.fused_residual_rmsnorm_backward
+
+
+# =============================================================================
+# qkv_head_rmsnorm - Per-Head Q/K Normalization
+# =============================================================================
+
+primitive qkv_head_rmsnorm:
+  """
+  Per-head RMSNorm for Q and K tensors (Qwen3 style).
+
+  Normalizes each attention head independently, which improves training
+  stability especially for large models.
+
+  Maps to: kernels.qkv_head_rmsnorm_forward
+  """
+
+  params:
+    eps: float = 1e-6
+
+  forward:
+    in: (
+      q: [B, H, T, D],           # Query tensor
+      k: [B, Hkv, T, D],         # Key tensor
+      q_norm_weight: [D],        # Per-head Q normalization weight
+      k_norm_weight: [D]         # Per-head K normalization weight
+    )
+    out: (
+      q_normed: [B, H, T, D],
+      k_normed: [B, Hkv, T, D],
+      q_rstd: [B, H, T],
+      k_rstd: [B, Hkv, T]
+    )
+
+  backward:
+    in: (d_q, d_k, q, k, q_norm_weight, k_norm_weight, q_rstd, k_rstd)
+    out: (d_q_in, d_k_in, d_q_norm_weight, d_k_norm_weight)
+
+  save: [q, k, q_rstd, k_rstd]
+
+  impl:
+    forward: kernels.qkv_head_rmsnorm_forward
+    backward: kernels.qkv_head_rmsnorm_backward
+
+
+# =============================================================================
+# layernorm - Standard Layer Normalization
+# =============================================================================
+
+primitive layernorm:
+  """
+  Standard Layer Normalization with centering.
+
+  μ = mean(x)
+  σ² = var(x)
+  y = (x - μ) / sqrt(σ² + ε) * weight + bias
+
+  Unlike RMSNorm, this subtracts the mean before normalization.
+  Includes optional bias parameter. Used in GPT-2, BERT.
+
+  Maps to: kernels.layernorm_forward / kernels.layernorm_backward
+  """
+
+  params:
+    eps: float = 1e-5
+
+  forward:
+    in: (x: [*, C], weight: [C], bias: [C]?)
+    out: (y: [*, C], mean: [*], rstd: [*])
+
+  backward:
+    in: (d_y, x, weight, mean, rstd)
+    out: (d_x, d_weight, d_bias?)
+
+  save: [x, mean, rstd]
+
+  impl:
+    forward: kernels.layernorm_forward
+    backward: kernels.layernorm_backward
+
+
+# =============================================================================
+# group_rmsnorm - Grouped RMSNorm (for Mamba)
+# =============================================================================
+
+primitive group_rmsnorm:
+  """
+  Grouped RMSNorm for Mamba SSM outputs.
+
+  Applies RMSNorm independently to each group of channels.
+
+  Maps to: kernels.group_rmsnorm_forward
+  """
+
+  params:
+    n_groups: int = 1
+    eps: float = 1e-6
+
+  forward:
+    in: (x: [B, T, D], weight: [D])
+    out: (y: [B, T, D], rstd: [B, T, n_groups])
+
+  backward:
+    in: (d_y, x, weight, rstd)
+    out: (d_x, d_weight)
+
+  save: [x, rstd]
+
+  impl:
+    forward: kernels.group_rmsnorm_forward
+    backward: kernels.group_rmsnorm_backward

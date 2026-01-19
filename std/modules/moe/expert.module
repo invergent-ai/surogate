@@ -1,0 +1,250 @@
+# MoE Expert Modules
+# Maps to: csrc/src/modules/moe/expert.h, moe_layer.h
+
+"""
+Mixture-of-Experts expert computation modules.
+Handles efficient parallel expert execution via grouped GEMM.
+"""
+
+import std.primitives.{grouped_gemm, moe_permute, moe_unpermute, moe_experts, swiglu}
+import std.modules.mlp.{ExpertMLP}
+
+# =============================================================================
+# MoEExperts - Grouped Expert Computation
+# =============================================================================
+
+module MoEExperts(
+  d_model: int,
+  d_ff: int,
+  num_experts: int,
+  activation: enum = swiglu
+):
+  """
+  Parallel expert computation using grouped GEMM.
+
+  All experts computed efficiently in parallel using grouped matrix
+  multiplication. Much faster than sequential expert computation.
+
+  Architecture:
+    1. Permute tokens to expert-contiguous order
+    2. Grouped GEMM for gate+up projection
+    3. Activation (SwiGLU)
+    4. Grouped GEMM for down projection
+    5. Unpermute and combine with routing weights
+
+  Maps to: modules/moe/MoEExperts with grouped_gemm
+  """
+
+  let:
+    gate_up_dim = 2 * d_ff if activation in [swiglu, geglu] else d_ff
+
+  params:
+    gate_up_weights: [num_experts, gate_up_dim, d_model]
+    down_weights: [num_experts, d_model, d_ff]
+
+  forward:
+    in: (
+      permuted_input: [total_tokens, d_model],
+      expert_offsets: [num_experts + 1, int32]
+    )
+    out: expert_outputs: [total_tokens, d_model]
+
+    graph:
+      # Up/gate projection for all experts
+      (permuted_input, gate_up_weights, expert_offsets)
+        -> grouped_gemm(transpose=TN) -> gate_up
+
+      # Activation
+      if activation == swiglu:
+        gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+        (gate, up) -> swiglu() -> hidden
+      else if activation == geglu:
+        gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+        (gate, up) -> geglu() -> hidden
+      else if activation == silu:
+        gate_up -> silu() -> hidden
+      else if activation == relu2:
+        gate_up -> relu2() -> hidden
+
+      # Down projection for all experts
+      (hidden, down_weights, expert_offsets)
+        -> grouped_gemm(transpose=TN) -> expert_outputs
+
+    save: [permuted_input, expert_offsets]
+    recompute: [gate_up, gate, up, hidden] if activation in [swiglu, geglu]
+    recompute: [gate_up, hidden] if activation not in [swiglu, geglu]
+
+  backward:
+    d_expert_outputs: [total_tokens, d_model]
+    d_permuted_input: [total_tokens, d_model]
+
+    graph:
+      # Recompute forward
+      recompute:
+        (saved.permuted_input, gate_up_weights, saved.expert_offsets)
+          -> grouped_gemm(transpose=TN) -> gate_up
+        if activation == swiglu:
+          gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+          (gate, up) -> swiglu() -> hidden
+
+      # Down projection backward
+      (d_expert_outputs, down_weights, saved.expert_offsets)
+        -> grouped_gemm(transpose=NN) -> d_hidden
+      (hidden, d_expert_outputs, saved.expert_offsets)
+        -> grouped_gemm_weight_grad(accumulate=true) -> d_down_weights
+
+      # Activation backward
+      if activation == swiglu:
+        (d_hidden, gate, up) -> swiglu_backward() -> (d_gate, d_up)
+        (d_gate, d_up) -> concat(dim=-1) -> d_gate_up
+      else if activation == silu:
+        (d_hidden, gate_up) -> silu_backward() -> d_gate_up
+
+      # Up projection backward
+      (d_gate_up, gate_up_weights, saved.expert_offsets)
+        -> grouped_gemm(transpose=NN) -> d_permuted_input
+      (saved.permuted_input, d_gate_up, saved.expert_offsets)
+        -> grouped_gemm_weight_grad(accumulate=true) -> d_gate_up_weights
+
+
+# =============================================================================
+# MoELayer - Complete MoE Layer
+# =============================================================================
+
+module MoELayer(
+  d_model: int,
+  d_ff: int,
+  num_experts: int,
+  top_k: int = 2,
+  activation: enum = swiglu,
+  aux_loss_alpha: float = 0.01
+):
+  """
+  Complete Mixture-of-Experts layer.
+
+  Combines routing, permutation, expert computation, and combination.
+
+  Architecture:
+    1. Route tokens to experts (SwitchRouter)
+    2. Permute tokens to expert order
+    3. Compute all experts (MoEExperts)
+    4. Unpermute and combine with routing weights
+
+  Maps to: modules/moe/MoELayer
+  """
+
+  let:
+    gate_up_dim = 2 * d_ff if activation in [swiglu, geglu] else d_ff
+
+  params:
+    router_weight: [num_experts, d_model]
+    gate_up_weights: [num_experts, gate_up_dim, d_model]
+    down_weights: [num_experts, d_model, d_ff]
+
+  forward:
+    in: hidden: [B, T, d_model]
+    out: (out: [B, T, d_model], aux_loss: float)
+
+    graph:
+      # Flatten for routing
+      hidden -> view([B*T, d_model]) -> flat_hidden
+
+      # Route
+      (flat_hidden, router_weight) -> moe_router(
+        top_k=top_k, normalize=softmax
+      ) -> (weights, indices, aux_loss)
+
+      # Permute to expert order
+      (flat_hidden, indices) -> moe_permute() -> (permuted, expert_offsets)
+
+      # Expert computation
+      (permuted, gate_up_weights, expert_offsets)
+        -> grouped_gemm(transpose=TN) -> gate_up
+
+      if activation == swiglu:
+        gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+        (gate, up) -> swiglu() -> expert_hidden
+      else:
+        gate_up -> silu() -> expert_hidden
+
+      (expert_hidden, down_weights, expert_offsets)
+        -> grouped_gemm(transpose=TN) -> expert_out
+
+      # Unpermute and combine
+      (expert_out, weights, indices, expert_offsets)
+        -> moe_unpermute() -> combined
+
+      # Reshape back
+      combined -> view([B, T, d_model]) -> out
+
+    save: [flat_hidden, weights, indices, permuted, expert_offsets]
+    recompute: [gate_up, gate, up, expert_hidden]
+
+  backward:
+    d_out: [B, T, d_model]
+    d_hidden: [B, T, d_model]
+
+    graph:
+      # Full backward through MoE layer
+      d_out -> view([B*T, d_model]) -> d_combined
+
+      # Unpermute backward
+      (d_combined, saved.weights, saved.indices, saved.expert_offsets)
+        -> moe_unpermute_backward() -> (d_expert_out, d_weights)
+
+      # Expert backward (similar to MoEExperts)
+      ...
+
+      # Permute backward
+      (d_permuted, saved.indices, saved.expert_offsets)
+        -> moe_permute_backward() -> d_flat_hidden_from_experts
+
+      # Router backward
+      (d_weights, saved.flat_hidden, router_weight, saved.indices)
+        -> moe_router_backward() -> (d_flat_hidden_from_router, d_router_weight)
+
+      # Combine gradients
+      (d_flat_hidden_from_experts, d_flat_hidden_from_router) -> add() -> d_flat_hidden
+
+      d_flat_hidden -> view([B, T, d_model]) -> d_hidden
+
+
+# =============================================================================
+# SharedExpert - Shared Expert (Nemotron/DeepSeek style)
+# =============================================================================
+
+module SharedExpert(d_model: int, d_ff: int, activation: enum = swiglu):
+  """
+  Shared expert that processes all tokens.
+
+  Some MoE architectures include one or more "shared" experts
+  that see all tokens regardless of routing decisions.
+
+  Maps to: modules/moe/SharedExpert
+  """
+
+  let:
+    gate_up_dim = 2 * d_ff if activation in [swiglu, geglu] else d_ff
+
+  params:
+    gate_up_weight: [gate_up_dim, d_model]
+    down_weight: [d_model, d_ff]
+
+  forward:
+    in: [B*T, d_model]
+    out: [B*T, d_model]
+
+    graph:
+      # Same as standard MLP
+      (in, gate_up_weight) -> matmul(transpose=TN) -> gate_up
+
+      if activation == swiglu:
+        gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+        (gate, up) -> swiglu() -> hidden
+      else:
+        gate_up -> silu() -> hidden
+
+      (hidden, down_weight) -> matmul(transpose=TN) -> out
+
+    save: [in]
+    recompute: [gate_up, gate, up, hidden]

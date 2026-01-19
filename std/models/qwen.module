@@ -1,0 +1,288 @@
+# Qwen Model Architectures
+# Maps to: csrc/src/models/qwen25/, csrc/src/models/qwen3/
+
+"""
+Qwen (Tongyi Qianwen) model architectures.
+Alibaba's family of large language models.
+"""
+
+import std.primitives
+import std.modules.{Linear, SwiGLU_MLP}
+import std.modules.attention.gqa.{CausalSelfAttention}
+import std.blocks.dense.{DenseTransformerBlock}
+
+# =============================================================================
+# Qwen2 - Qwen 2.5 Model
+# =============================================================================
+
+model Qwen2(
+  vocab_size: int = 151936,
+  d_model: int = 2048,
+  n_layers: int = 24,
+  num_heads: int = 16,
+  num_kv_heads: int = 16,
+  d_ff: int = 5504,
+  max_seq: int = 32768,
+  eps: float = 1e-6,
+  rope_theta: float = 1000000.0,
+  tie_word_embeddings: bool = true
+):
+  """
+  Qwen 2.5 model architecture.
+
+  Similar to LLaMA with some differences:
+  - Different vocabulary size and tokenizer
+  - Different default RoPE theta
+  - Weight tying by default
+
+  Configurations:
+  - Qwen2.5-0.5B: d_model=896, n_layers=24, num_heads=14, d_ff=4864
+  - Qwen2.5-1.5B: d_model=1536, n_layers=28, num_heads=12, d_ff=8960
+  - Qwen2.5-7B: d_model=3584, n_layers=28, num_heads=28, d_ff=18944
+  - Qwen2.5-72B: d_model=8192, n_layers=80, num_heads=64, num_kv_heads=8, d_ff=29696
+
+  Maps to: models/qwen25/
+  """
+
+  let:
+    d_head = d_model // num_heads
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+  params:
+    embedding: [vocab_size, d_model]
+    blocks: [n_layers] x DenseTransformerBlock(
+      d_model=d_model,
+      num_heads=num_heads,
+      num_kv_heads=num_kv_heads,
+      d_ff=d_ff,
+      max_seq=max_seq,
+      rope_theta=rope_theta,
+      eps=eps,
+      use_qk_norm=false
+    )
+    final_norm: [d_model]
+    lm_head: tied_to(embedding) if tie_word_embeddings else [vocab_size, d_model]
+
+  forward:
+    in: token_ids: [B, T, int32]
+    out: logits: [B, T, vocab_size]
+
+    graph:
+      token_ids -> embedding(embedding) -> x0
+      zeros([B, T, d_model]) -> residual0
+      (x0, residual0) -> StackedBlocks(blocks, n_layers) -> (xN, residualN)
+      (residualN, xN, final_norm) -> fused_residual_rmsnorm(eps=eps) -> (_, xF, _)
+      (xF, lm_head) -> matmul(transpose=TN) -> logits
+
+  hf_config:
+    architecture: "Qwen2ForCausalLM"
+    config_class: "Qwen2Config"
+    param_mapping:
+      d_model: hidden_size
+      n_layers: num_hidden_layers
+      num_heads: num_attention_heads
+      num_kv_heads: num_key_value_heads
+      d_ff: intermediate_size
+      vocab_size: vocab_size
+      max_seq: max_position_embeddings
+      eps: rms_norm_eps
+      rope_theta: rope_theta
+
+  hf_mapping:
+    embedding: "model.embed_tokens.weight"
+    final_norm: "model.norm.weight"
+    lm_head: "lm_head.weight"
+    blocks[{i}].ln1_weight: "model.layers.{i}.input_layernorm.weight"
+    blocks[{i}].qkv_weight: fuse(
+      "model.layers.{i}.self_attn.q_proj.weight",
+      "model.layers.{i}.self_attn.k_proj.weight",
+      "model.layers.{i}.self_attn.v_proj.weight",
+      dim=0
+    )
+    blocks[{i}].out_weight: "model.layers.{i}.self_attn.o_proj.weight"
+    blocks[{i}].ln2_weight: "model.layers.{i}.post_attention_layernorm.weight"
+    blocks[{i}].gate_up_weight: fuse(
+      "model.layers.{i}.mlp.gate_proj.weight",
+      "model.layers.{i}.mlp.up_proj.weight",
+      dim=0
+    )
+    blocks[{i}].down_weight: "model.layers.{i}.mlp.down_proj.weight"
+
+
+# =============================================================================
+# Qwen3 - Qwen 3 Model with QK-Norm
+# =============================================================================
+
+model Qwen3(
+  vocab_size: int = 151936,
+  d_model: int = 2048,
+  n_layers: int = 36,
+  num_heads: int = 16,
+  num_kv_heads: int = 8,
+  d_ff: int = 11008,
+  max_seq: int = 40960,
+  eps: float = 1e-6,
+  rope_theta: float = 1000000.0,
+  tie_word_embeddings: bool = true
+):
+  """
+  Qwen 3 model architecture.
+
+  Key differences from Qwen2:
+  - QK normalization (per-head RMSNorm on Q and K before RoPE)
+  - Different default configurations
+
+  Configurations:
+  - Qwen3-0.6B: d_model=1024, n_layers=28, num_heads=16, num_kv_heads=8
+  - Qwen3-1.7B: d_model=2048, n_layers=36, num_heads=16, num_kv_heads=8
+  - Qwen3-4B: d_model=2560, n_layers=36, num_heads=32, num_kv_heads=8
+  - Qwen3-8B: d_model=4096, n_layers=36, num_heads=32, num_kv_heads=8
+  - Qwen3-32B: d_model=5120, n_layers=64, num_heads=40, num_kv_heads=8
+
+  Maps to: models/qwen3/
+  """
+
+  let:
+    d_head = d_model // num_heads
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+  params:
+    embedding: [vocab_size, d_model]
+    blocks: [n_layers] x DenseTransformerBlock(
+      d_model=d_model,
+      num_heads=num_heads,
+      num_kv_heads=num_kv_heads,
+      d_ff=d_ff,
+      max_seq=max_seq,
+      rope_theta=rope_theta,
+      eps=eps,
+      use_qk_norm=true              # Key difference: QK normalization enabled
+    )
+    final_norm: [d_model]
+    lm_head: tied_to(embedding) if tie_word_embeddings else [vocab_size, d_model]
+
+  forward:
+    in: token_ids: [B, T, int32]
+    out: logits: [B, T, vocab_size]
+
+    graph:
+      token_ids -> embedding(embedding) -> x0
+      zeros([B, T, d_model]) -> residual0
+      (x0, residual0) -> StackedBlocks(blocks, n_layers) -> (xN, residualN)
+      (residualN, xN, final_norm) -> fused_residual_rmsnorm(eps=eps) -> (_, xF, _)
+      (xF, lm_head) -> matmul(transpose=TN) -> logits
+
+  hf_config:
+    architecture: "Qwen3ForCausalLM"
+    config_class: "Qwen3Config"
+    param_mapping:
+      d_model: hidden_size
+      n_layers: num_hidden_layers
+      num_heads: num_attention_heads
+      num_kv_heads: num_key_value_heads
+      d_ff: intermediate_size
+      vocab_size: vocab_size
+      max_seq: max_position_embeddings
+      eps: rms_norm_eps
+      rope_theta: rope_theta
+
+  hf_mapping:
+    embedding: "model.embed_tokens.weight"
+    final_norm: "model.norm.weight"
+    lm_head: "lm_head.weight"
+    blocks[{i}].ln1_weight: "model.layers.{i}.input_layernorm.weight"
+    blocks[{i}].qkv_weight: fuse(
+      "model.layers.{i}.self_attn.q_proj.weight",
+      "model.layers.{i}.self_attn.k_proj.weight",
+      "model.layers.{i}.self_attn.v_proj.weight",
+      dim=0
+    )
+    blocks[{i}].q_norm_weight: "model.layers.{i}.self_attn.q_norm.weight"
+    blocks[{i}].k_norm_weight: "model.layers.{i}.self_attn.k_norm.weight"
+    blocks[{i}].out_weight: "model.layers.{i}.self_attn.o_proj.weight"
+    blocks[{i}].ln2_weight: "model.layers.{i}.post_attention_layernorm.weight"
+    blocks[{i}].gate_up_weight: fuse(
+      "model.layers.{i}.mlp.gate_proj.weight",
+      "model.layers.{i}.mlp.up_proj.weight",
+      dim=0
+    )
+    blocks[{i}].down_weight: "model.layers.{i}.mlp.down_proj.weight"
+
+
+# =============================================================================
+# Presets
+# =============================================================================
+
+preset Qwen2_5_0_5B:
+  """Qwen2.5-0.5B configuration."""
+  vocab_size: 151936
+  d_model: 896
+  n_layers: 24
+  num_heads: 14
+  num_kv_heads: 2
+  d_ff: 4864
+  max_seq: 32768
+
+preset Qwen2_5_1_5B:
+  """Qwen2.5-1.5B configuration."""
+  vocab_size: 151936
+  d_model: 1536
+  n_layers: 28
+  num_heads: 12
+  num_kv_heads: 2
+  d_ff: 8960
+  max_seq: 32768
+
+preset Qwen2_5_7B:
+  """Qwen2.5-7B configuration."""
+  vocab_size: 152064
+  d_model: 3584
+  n_layers: 28
+  num_heads: 28
+  num_kv_heads: 4
+  d_ff: 18944
+  max_seq: 32768
+
+preset Qwen2_5_72B:
+  """Qwen2.5-72B configuration."""
+  vocab_size: 152064
+  d_model: 8192
+  n_layers: 80
+  num_heads: 64
+  num_kv_heads: 8
+  d_ff: 29696
+  max_seq: 32768
+
+preset Qwen3_0_6B:
+  """Qwen3-0.6B configuration."""
+  vocab_size: 151936
+  d_model: 1024
+  n_layers: 28
+  num_heads: 16
+  num_kv_heads: 8
+  d_ff: 3072
+  max_seq: 40960
+
+preset Qwen3_8B:
+  """Qwen3-8B configuration."""
+  vocab_size: 151936
+  d_model: 4096
+  n_layers: 36
+  num_heads: 32
+  num_kv_heads: 8
+  d_ff: 12288
+  max_seq: 40960
+
+preset Qwen3_32B:
+  """Qwen3-32B configuration."""
+  vocab_size: 151936
+  d_model: 5120
+  n_layers: 64
+  num_heads: 40
+  num_kv_heads: 8
+  d_ff: 25600
+  max_seq: 40960

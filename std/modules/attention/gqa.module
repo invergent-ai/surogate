@@ -1,0 +1,155 @@
+# Grouped Query Attention Module
+# Maps to: csrc/src/modules/primitives/attention.h
+
+"""
+Grouped Query Attention (GQA) module.
+Attention where num_kv_heads < num_heads (LLaMA-2 70B, Mistral, Qwen).
+"""
+
+import std.primitives.{flash_attention, rope, matmul, qkv_qk_norm_rope}
+import std.modules.linear.{Linear}
+
+# =============================================================================
+# GroupedQueryAttention - GQA
+# =============================================================================
+
+module GroupedQueryAttention(
+  d_model: int,
+  num_heads: int,
+  num_kv_heads: int,
+  max_seq: int,
+  rope_theta: float = 10000.0,
+  use_qk_norm: bool = false,
+  eps: float = 1e-6
+):
+  """
+  Grouped Query Attention (GQA).
+
+  Multiple query heads share the same key-value heads.
+  Reduces KV cache size and computation while maintaining quality.
+
+  - num_heads: Number of query heads
+  - num_kv_heads: Number of key-value heads (num_heads % num_kv_heads == 0)
+
+  Examples:
+  - LLaMA-2 70B: num_heads=64, num_kv_heads=8
+  - Mistral 7B: num_heads=32, num_kv_heads=8
+  - Qwen2.5: num_heads=num_kv_heads (MHA, not GQA)
+
+  Maps to: modules/primitives/AttentionModule (num_kv_heads < num_heads)
+  """
+
+  let:
+    d_head = d_model // num_heads
+    q_dim = num_heads * d_head
+    kv_dim = num_kv_heads * d_head
+    qkv_dim = q_dim + 2 * kv_dim
+    heads_per_kv = num_heads // num_kv_heads
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+      num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+      num_kv_heads <= num_heads, "num_kv_heads must be <= num_heads"
+
+  params:
+    qkv_weight: [qkv_dim, d_model]
+    out_weight: [d_model, q_dim]
+    q_norm_weight: [d_head] if use_qk_norm
+    k_norm_weight: [d_head] if use_qk_norm
+
+  forward:
+    in: [B, T, d_model]
+    out: [B, T, d_model]
+
+    graph:
+      # QKV projection
+      (in, qkv_weight) -> matmul(transpose=TN) -> qkv
+      qkv -> split([q_dim, kv_dim, kv_dim], dim=-1) -> (q_flat, k_flat, v_flat)
+
+      # Reshape Q to [B, num_heads, T, d_head]
+      q_flat -> view([B, T, num_heads, d_head])
+        -> transpose(1, 2) -> q  # [B, num_heads, T, d_head]
+
+      # Reshape K, V to [B, num_kv_heads, T, d_head]
+      k_flat -> view([B, T, num_kv_heads, d_head])
+        -> transpose(1, 2) -> k  # [B, num_kv_heads, T, d_head]
+      v_flat -> view([B, T, num_kv_heads, d_head])
+        -> transpose(1, 2) -> v  # [B, num_kv_heads, T, d_head]
+
+      # QK normalization + RoPE (or just RoPE)
+      if use_qk_norm:
+        (q, k, q_norm_weight, k_norm_weight) -> qkv_qk_norm_rope(
+          base=rope_theta, eps=eps
+        ) -> (q_rope, k_rope, q_rstd, k_rstd)
+      else:
+        (q, k) -> rope(base=rope_theta) -> (q_rope, k_rope)
+
+      # Flash Attention with GQA broadcasting
+      # FlashAttention handles Hq != Hkv internally
+      (q_rope, k_rope, v) -> flash_attention(causal=true) -> (attn_out, lse)
+
+      # Reshape and output projection
+      attn_out -> transpose(1, 2)  # [B, T, num_heads, d_head]
+        -> view([B, T, q_dim]) -> attn_flat
+      (attn_flat, out_weight) -> matmul(transpose=TN) -> out
+
+    save: [in, q, k, v, q_rope, k_rope, attn_out, lse]
+    save: [q_rstd, k_rstd] if use_qk_norm
+
+  backward:
+    d_out: [B, T, d_model]
+    d_in: [B, T, d_model]
+
+    graph:
+      # Output projection backward
+      (d_out, out_weight) -> matmul(transpose=NN) -> d_attn_flat
+      (saved.attn_flat, d_out) -> matmul(transpose=TN, accumulate=true) -> d_out_weight
+
+      # Reshape gradient
+      d_attn_flat -> view([B, T, num_heads, d_head])
+        -> transpose(1, 2) -> d_attn_out
+
+      # Flash attention backward
+      (d_attn_out, saved.q_rope, saved.k_rope, saved.v, saved.attn_out, saved.lse)
+        -> flash_attention_backward() -> (d_q_rope, d_k_rope, d_v)
+
+      # RoPE / QK-norm backward
+      if use_qk_norm:
+        (d_q_rope, d_k_rope, saved.q, saved.k, q_norm_weight, k_norm_weight,
+         saved.q_rstd, saved.k_rstd)
+          -> qkv_qk_norm_rope_backward() -> (d_q, d_k, d_q_norm_weight, d_k_norm_weight)
+      else:
+        (d_q_rope, d_k_rope) -> rope_backward(base=rope_theta) -> (d_q, d_k)
+
+      # Reshape gradients back
+      d_q -> transpose(1, 2) -> view([B, T, q_dim]) -> d_q_flat
+      d_k -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_k_flat
+      d_v -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_v_flat
+
+      # Concat and QKV projection backward
+      (d_q_flat, d_k_flat, d_v_flat) -> concat(dim=-1) -> d_qkv
+      (d_qkv, qkv_weight) -> matmul(transpose=NN) -> d_in
+      (saved.in, d_qkv) -> matmul(transpose=TN, accumulate=true) -> d_qkv_weight
+
+
+# =============================================================================
+# CausalSelfAttention - Alias for GQA (most common)
+# =============================================================================
+
+module CausalSelfAttention(
+  d_model: int,
+  num_heads: int,
+  num_kv_heads: int,
+  max_seq: int,
+  rope_theta: float = 10000.0,
+  use_qk_norm: bool = false,
+  eps: float = 1e-6
+) extends GroupedQueryAttention:
+  """
+  Alias for GroupedQueryAttention.
+
+  This is the default attention module for modern LLMs.
+  When num_heads == num_kv_heads, this is standard MHA.
+  When num_kv_heads < num_heads, this is GQA.
+  """
+  # Inherits everything from GroupedQueryAttention

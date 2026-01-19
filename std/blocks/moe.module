@@ -1,0 +1,278 @@
+# MoE Transformer Block
+# Maps to: csrc/src/modules/moe/moe_transformer_block.h
+
+"""
+Mixture-of-Experts transformer block.
+Replaces dense FFN with sparse expert routing (Mixtral, Qwen3-MoE).
+"""
+
+import std.primitives.{fused_residual_rmsnorm, matmul, grouped_gemm, moe_router, moe_permute, moe_unpermute, swiglu}
+import std.modules.attention.gqa.{CausalSelfAttention}
+import std.modules.moe.router.{SwitchRouter}
+import std.modules.moe.expert.{MoEExperts, SharedExpert}
+
+# =============================================================================
+# MoETransformerBlock - Mixture-of-Experts Block
+# =============================================================================
+
+block MoETransformerBlock(
+  d_model: int,
+  num_heads: int,
+  num_kv_heads: int,
+  d_ff: int,
+  num_experts: int,
+  top_k: int = 2,
+  max_seq: int,
+  rope_theta: float = 10000.0,
+  eps: float = 1e-6,
+  use_qk_norm: bool = false,
+  activation: enum = swiglu,
+  aux_loss_alpha: float = 0.01,
+  use_shared_expert: bool = false,
+  shared_expert_d_ff: int? = None
+):
+  """
+  Mixture-of-Experts transformer block.
+
+  Architecture:
+    # Attention sublayer (same as dense)
+    residual_mid = residual + prev_output
+    ln1_out = RMSNorm(residual_mid)
+    attn_out = Attention(ln1_out)
+
+    # MoE sublayer (replaces dense MLP)
+    residual_out = residual_mid + attn_out
+    ln2_out = RMSNorm(residual_out)
+    weights, indices = Router(ln2_out)
+    moe_out = MoEExperts(ln2_out, weights, indices)
+    if use_shared_expert:
+      shared_out = SharedExpert(ln2_out)
+      moe_out = moe_out + shared_out
+
+  Used in: Mixtral, Qwen3-MoE, DeepSeek MoE
+
+  Maps to: modules/moe/MoETransformerBlock
+  """
+
+  let:
+    d_head = d_model // num_heads
+    q_dim = num_heads * d_head
+    kv_dim = num_kv_heads * d_head
+    qkv_dim = q_dim + 2 * kv_dim
+    gate_up_dim = 2 * d_ff if activation in [swiglu, geglu] else d_ff
+    shared_d_ff = shared_expert_d_ff if shared_expert_d_ff else d_ff
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+      num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+      num_experts > 0, "num_experts must be positive"
+      top_k <= num_experts, "top_k must be <= num_experts"
+
+  params:
+    # Layer norm 1 (pre-attention)
+    ln1_weight: [d_model]
+
+    # Attention
+    qkv_weight: [qkv_dim, d_model]
+    out_weight: [d_model, q_dim]
+    q_norm_weight: [d_head] if use_qk_norm
+    k_norm_weight: [d_head] if use_qk_norm
+
+    # Layer norm 2 (pre-MoE)
+    ln2_weight: [d_model]
+
+    # Router
+    router_weight: [num_experts, d_model]
+
+    # Experts (per-expert weights)
+    expert_gate_up_weights: [num_experts, gate_up_dim, d_model]
+    expert_down_weights: [num_experts, d_model, d_ff]
+
+    # Optional shared expert
+    shared_gate_up_weight: [2 * shared_d_ff, d_model] if use_shared_expert
+    shared_down_weight: [d_model, shared_d_ff] if use_shared_expert
+
+  forward:
+    inputs:
+      x: [B, T, d_model]           # Previous layer's output
+      residual: [B, T, d_model]    # Running residual
+    outputs:
+      out: [B, T, d_model]         # This layer's MoE output
+      residual_out: [B, T, d_model] # Updated residual
+      aux_loss: float              # Load balancing auxiliary loss
+
+    graph:
+      # ===== Attention sublayer (same as dense) =====
+      (residual, x, ln1_weight) -> fused_residual_rmsnorm(eps=eps)
+        -> (residual_mid, ln1_out, ln1_rstd)
+
+      # Full attention computation
+      (ln1_out, qkv_weight) -> matmul(transpose=TN) -> qkv
+      qkv -> split([q_dim, kv_dim, kv_dim], dim=-1) -> (q_flat, k_flat, v_flat)
+
+      q_flat -> view([B, T, num_heads, d_head]) -> transpose(1, 2) -> q
+      k_flat -> view([B, T, num_kv_heads, d_head]) -> transpose(1, 2) -> k
+      v_flat -> view([B, T, num_kv_heads, d_head]) -> transpose(1, 2) -> v
+
+      if use_qk_norm:
+        (q, k, q_norm_weight, k_norm_weight) -> qkv_qk_norm_rope(base=rope_theta, eps=eps)
+          -> (q_rope, k_rope, q_rstd, k_rstd)
+      else:
+        (q, k) -> rope(base=rope_theta) -> (q_rope, k_rope)
+
+      (q_rope, k_rope, v) -> flash_attention(causal=true) -> (attn_out_heads, lse)
+
+      attn_out_heads -> transpose(1, 2) -> view([B, T, q_dim]) -> attn_flat
+      (attn_flat, out_weight) -> matmul(transpose=TN) -> attn_out
+        @hook(AfterAttnOutProjection)
+        @adapter(lora)
+
+      # ===== MoE sublayer =====
+      (residual_mid, attn_out, ln2_weight) -> fused_residual_rmsnorm(eps=eps)
+        -> (residual_out, ln2_out, ln2_rstd)
+
+      # Flatten for routing
+      ln2_out -> view([B*T, d_model]) -> flat_input
+
+      # Router: compute expert assignments
+      (flat_input, router_weight) -> moe_router(
+        top_k=top_k, normalize=softmax
+      ) -> (weights, indices, aux_loss)
+        @hook(AfterRouterProjection)
+
+      # Permute tokens to expert-contiguous order
+      (flat_input, indices) -> moe_permute() -> (permuted_input, expert_offsets)
+
+      # Expert computation via grouped GEMM
+      (permuted_input, expert_gate_up_weights, expert_offsets)
+        -> grouped_gemm(transpose=TN) -> expert_gate_up
+
+      if activation == swiglu:
+        expert_gate_up -> split([d_ff, d_ff], dim=-1) -> (expert_gate, expert_up)
+        (expert_gate, expert_up) -> swiglu() -> expert_hidden
+      else if activation == geglu:
+        expert_gate_up -> split([d_ff, d_ff], dim=-1) -> (expert_gate, expert_up)
+        (expert_gate, expert_up) -> geglu() -> expert_hidden
+      else:
+        expert_gate_up -> silu() -> expert_hidden
+
+      (expert_hidden, expert_down_weights, expert_offsets)
+        -> grouped_gemm(transpose=TN) -> expert_output
+
+      # Unpermute and combine with routing weights
+      (expert_output, weights, indices, expert_offsets)
+        -> moe_unpermute() -> combined_flat
+
+      # Optional shared expert
+      if use_shared_expert:
+        (flat_input, shared_gate_up_weight) -> matmul(transpose=TN) -> shared_gate_up
+        shared_gate_up -> split([shared_d_ff, shared_d_ff], dim=-1) -> (shared_gate, shared_up)
+        (shared_gate, shared_up) -> swiglu() -> shared_hidden
+        (shared_hidden, shared_down_weight) -> matmul(transpose=TN) -> shared_out
+
+        (combined_flat, shared_out) -> add() -> total_out
+        total_out -> view([B, T, d_model]) -> out
+      else:
+        combined_flat -> view([B, T, d_model]) -> out
+          @hook(AfterMoECombine)
+          @adapter(lora)
+
+    save: [
+      residual, ln1_out, ln1_rstd,
+      q, k, v, q_rope, k_rope, attn_out_heads, lse, attn_out,
+      residual_mid, ln2_out, ln2_rstd,
+      flat_input, weights, indices, permuted_input, expert_offsets
+    ]
+    save: [q_rstd, k_rstd] if use_qk_norm
+    recompute: [
+      qkv, q_flat, k_flat, v_flat, attn_flat,
+      expert_gate_up, expert_gate, expert_up, expert_hidden, expert_output
+    ]
+    recompute: [shared_gate_up, shared_gate, shared_up, shared_hidden] if use_shared_expert
+
+  backward:
+    inputs:
+      d_out: [B, T, d_model]
+      d_residual: [B, T, d_model]
+      d_aux_loss: float = 1.0      # Scale for auxiliary loss gradient
+    outputs:
+      d_x: [B, T, d_model]
+      d_residual_out: [B, T, d_model]
+
+    graph:
+      # MoE backward
+      d_out -> view([B*T, d_model]) -> d_combined_flat
+
+      # Shared expert backward (if present)
+      if use_shared_expert:
+        # Gradient flows to both MoE and shared paths
+        d_combined_flat -> copy() -> d_moe_out
+        d_combined_flat -> copy() -> d_shared_out
+
+        # Shared expert backward
+        recompute:
+          (saved.flat_input, shared_gate_up_weight) -> matmul(transpose=TN) -> shared_gate_up
+          shared_gate_up -> split([shared_d_ff, shared_d_ff], dim=-1) -> (shared_gate, shared_up)
+          (shared_gate, shared_up) -> swiglu() -> shared_hidden
+
+        (d_shared_out, shared_down_weight) -> matmul(transpose=NN) -> d_shared_hidden
+        (shared_hidden, d_shared_out) -> matmul(transpose=TN, accumulate=true) -> d_shared_down_weight
+
+        (d_shared_hidden, shared_gate, shared_up) -> swiglu_backward() -> (d_shared_gate, d_shared_up)
+        (d_shared_gate, d_shared_up) -> concat(dim=-1) -> d_shared_gate_up
+
+        (d_shared_gate_up, shared_gate_up_weight) -> matmul(transpose=NN) -> d_flat_from_shared
+        (saved.flat_input, d_shared_gate_up) -> matmul(transpose=TN, accumulate=true) -> d_shared_gate_up_weight
+      else:
+        d_combined_flat -> d_moe_out
+
+      # Unpermute backward
+      (d_moe_out, saved.weights, saved.indices, saved.expert_offsets)
+        -> moe_unpermute_backward() -> (d_expert_output, d_weights)
+
+      # Expert backward via grouped GEMM
+      recompute:
+        (saved.permuted_input, expert_gate_up_weights, saved.expert_offsets)
+          -> grouped_gemm(transpose=TN) -> expert_gate_up
+        if activation == swiglu:
+          expert_gate_up -> split([d_ff, d_ff], dim=-1) -> (expert_gate, expert_up)
+          (expert_gate, expert_up) -> swiglu() -> expert_hidden
+
+      (d_expert_output, expert_down_weights, saved.expert_offsets)
+        -> grouped_gemm(transpose=NN) -> d_expert_hidden
+      (expert_hidden, d_expert_output, saved.expert_offsets)
+        -> grouped_gemm_weight_grad(accumulate=true) -> d_expert_down_weights
+
+      if activation == swiglu:
+        (d_expert_hidden, expert_gate, expert_up) -> swiglu_backward()
+          -> (d_expert_gate, d_expert_up)
+        (d_expert_gate, d_expert_up) -> concat(dim=-1) -> d_expert_gate_up
+
+      (d_expert_gate_up, expert_gate_up_weights, saved.expert_offsets)
+        -> grouped_gemm(transpose=NN) -> d_permuted_input
+      (saved.permuted_input, d_expert_gate_up, saved.expert_offsets)
+        -> grouped_gemm_weight_grad(accumulate=true) -> d_expert_gate_up_weights
+
+      # Permute backward
+      (d_permuted_input, saved.indices, saved.expert_offsets)
+        -> moe_permute_backward() -> d_flat_from_experts
+
+      # Router backward
+      (d_weights, saved.flat_input, router_weight, saved.indices)
+        -> moe_router_backward() -> (d_flat_from_router, d_router_weight)
+
+      # Combine MoE input gradients
+      (d_flat_from_experts, d_flat_from_router) -> add() -> d_flat_combined
+      if use_shared_expert:
+        (d_flat_combined, d_flat_from_shared) -> add() -> d_ln2_out_flat
+      else:
+        d_flat_combined -> d_ln2_out_flat
+
+      d_ln2_out_flat -> view([B, T, d_model]) -> d_ln2_out
+
+      # Continue with attention backward (same as dense)
+      (d_ln2_out, d_residual, saved.residual_mid, ln2_weight, saved.ln2_rstd)
+        -> fused_residual_rmsnorm_backward()
+        -> (d_residual_mid, d_attn_out, d_ln2_weight)
+
+      # ... attention backward same as DenseTransformerBlock

@@ -1,0 +1,78 @@
+# Surogate Module DSL Standard Library
+# Version: 0.1.0
+
+"""
+Standard Library for the Module DSL.
+
+The standard library provides:
+1. Primitives - Low-level operations with CUDA kernel implementations
+2. Modules - Composable building blocks (Linear, MLP, Attention, etc.)
+3. Blocks - Complete transformer layers (Dense, MoE, Mamba)
+4. Models - Full model architectures (LLaMA, Qwen, Mistral, Mixtral, Nemotron)
+
+Organization:
+  std/
+  ├── primitives/          # Built-in operations (matmul, attention, etc.)
+  │   ├── matmul.module
+  │   ├── rmsnorm.module
+  │   ├── activations.module
+  │   ├── attention.module
+  │   ├── rope.module
+  │   ├── embedding.module
+  │   ├── tensor_ops.module
+  │   ├── bias.module
+  │   ├── moe.module
+  │   ├── quantization.module
+  │   └── mamba.module
+  ├── modules/             # Composable building blocks
+  │   ├── linear.module
+  │   ├── mlp.module
+  │   ├── rmsnorm.module
+  │   ├── attention/
+  │   │   ├── mha.module
+  │   │   ├── gqa.module
+  │   │   └── mqa.module
+  │   └── moe/
+  │       ├── router.module
+  │       └── expert.module
+  ├── blocks/              # Transformer blocks
+  │   ├── dense.module
+  │   ├── moe.module
+  │   ├── mamba.module
+  │   └── parallel.module
+  └── models/              # Complete architectures
+      ├── llama.module
+      ├── qwen.module
+      ├── mistral.module
+      ├── mixtral.module
+      └── nemotron.module
+
+Usage:
+  import std.primitives                 # All primitives
+  import std.modules.linear.Linear      # Specific module
+  import std.blocks.dense.DenseTransformerBlock
+  import std.models.llama.Llama
+
+C++ Mapping:
+  All primitives and modules map directly to implementations in csrc/src/:
+  - primitives/* → csrc/src/kernels/
+  - modules/*    → csrc/src/modules/
+  - blocks/*     → csrc/src/modules/composite/, csrc/src/modules/moe/
+  - models/*     → csrc/src/models/
+"""
+
+# =============================================================================
+# Re-export all components
+# =============================================================================
+
+# Primitives
+export * from std.primitives.index
+
+# Modules
+export * from std.modules.index
+
+# Blocks
+export * from std.blocks.index
+
+# Models
+export * from std.models.index

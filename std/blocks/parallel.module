@@ -1,0 +1,151 @@
+# Parallel Transformer Block
+# Maps to: csrc/src/modules/composite/ (parallel attention+MLP variant)
+
+"""
+Parallel transformer block where attention and MLP run concurrently.
+Used in GPT-J, GPT-NeoX, and some efficiency-focused architectures.
+"""
+
+import std.primitives.{rmsnorm, matmul, flash_attention, rope, swiglu}
+
+# =============================================================================
+# ParallelTransformerBlock - Parallel Attention + MLP
+# =============================================================================
+
+block ParallelTransformerBlock(
+  d_model: int,
+  num_heads: int,
+  num_kv_heads: int,
+  d_ff: int,
+  max_seq: int,
+  rope_theta: float = 10000.0,
+  eps: float = 1e-6
+):
+  """
+  Parallel transformer block where attention and MLP run concurrently.
+
+  Architecture:
+    ln_out = RMSNorm(x)
+    attn_out = Attention(ln_out)
+    mlp_out = MLP(ln_out)
+    out = x + attn_out + mlp_out   # Single residual connection
+
+  Benefits:
+  - Better hardware utilization (attention and MLP can overlap)
+  - Reduced sequential dependency
+
+  Used in: GPT-J, GPT-NeoX, Falcon (partially)
+
+  Maps to: modules/composite/ParallelTransformerBlock
+  """
+
+  let:
+    d_head = d_model // num_heads
+    q_dim = num_heads * d_head
+    kv_dim = num_kv_heads * d_head
+    qkv_dim = q_dim + 2 * kv_dim
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+  params:
+    # Single layer norm (shared by attention and MLP)
+    ln_weight: [d_model]
+
+    # Attention
+    qkv_weight: [qkv_dim, d_model]
+    out_weight: [d_model, q_dim]
+
+    # MLP (SwiGLU)
+    gate_up_weight: [2 * d_ff, d_model]
+    down_weight: [d_model, d_ff]
+
+  forward:
+    in: x: [B, T, d_model]
+    out: [B, T, d_model]
+
+    graph:
+      # Single layer norm for both paths
+      (x, ln_weight) -> rmsnorm(eps=eps) -> (ln_out, ln_rstd)
+
+      # ===== Attention path =====
+      (ln_out, qkv_weight) -> matmul(transpose=TN) -> qkv
+      qkv -> split([q_dim, kv_dim, kv_dim], dim=-1) -> (q_flat, k_flat, v_flat)
+
+      q_flat -> view([B, T, num_heads, d_head]) -> transpose(1, 2) -> q
+      k_flat -> view([B, T, num_kv_heads, d_head]) -> transpose(1, 2) -> k
+      v_flat -> view([B, T, num_kv_heads, d_head]) -> transpose(1, 2) -> v
+
+      (q, k) -> rope(base=rope_theta) -> (q_rope, k_rope)
+      (q_rope, k_rope, v) -> flash_attention(causal=true) -> (attn_out_heads, lse)
+
+      attn_out_heads -> transpose(1, 2) -> view([B, T, q_dim]) -> attn_flat
+      (attn_flat, out_weight) -> matmul(transpose=TN) -> attn_out
+
+      # ===== MLP path (runs in parallel with attention) =====
+      (ln_out, gate_up_weight) -> matmul(transpose=TN) -> gate_up
+      gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+      (gate, up) -> swiglu() -> mlp_hidden
+      (mlp_hidden, down_weight) -> matmul(transpose=TN) -> mlp_out
+
+      # ===== Combine: single residual =====
+      (x, attn_out) -> add() -> x_plus_attn
+      (x_plus_attn, mlp_out) -> add() -> out
+
+    save: [x, ln_out, ln_rstd, q, k, v, q_rope, k_rope, attn_out_heads, lse]
+    recompute: [qkv, q_flat, k_flat, v_flat, attn_flat, gate_up, gate, up, mlp_hidden]
+
+  backward:
+    d_out: [B, T, d_model]
+    d_x: [B, T, d_model]
+
+    graph:
+      # Gradient flows to both attention and MLP
+      d_out -> copy() -> d_attn_out
+      d_out -> copy() -> d_mlp_out
+
+      # ===== MLP backward =====
+      recompute:
+        (saved.ln_out, gate_up_weight) -> matmul(transpose=TN) -> gate_up
+        gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+        (gate, up) -> swiglu() -> mlp_hidden
+
+      (d_mlp_out, down_weight) -> matmul(transpose=NN) -> d_mlp_hidden
+      (mlp_hidden, d_mlp_out) -> matmul(transpose=TN, accumulate=true) -> d_down_weight
+
+      (d_mlp_hidden, gate, up) -> swiglu_backward() -> (d_gate, d_up)
+      (d_gate, d_up) -> concat(dim=-1) -> d_gate_up
+
+      (d_gate_up, gate_up_weight) -> matmul(transpose=NN) -> d_ln_out_from_mlp
+      (saved.ln_out, d_gate_up) -> matmul(transpose=TN, accumulate=true) -> d_gate_up_weight
+
+      # ===== Attention backward =====
+      (d_attn_out, out_weight) -> matmul(transpose=NN) -> d_attn_flat
+      (saved.attn_flat, d_attn_out) -> matmul(transpose=TN, accumulate=true) -> d_out_weight
+
+      d_attn_flat -> view([B, T, num_heads, d_head]) -> transpose(1, 2) -> d_attn_out_heads
+
+      (d_attn_out_heads, saved.q_rope, saved.k_rope, saved.v,
+       saved.attn_out_heads, saved.lse)
+        -> flash_attention_backward() -> (d_q_rope, d_k_rope, d_v)
+
+      (d_q_rope, d_k_rope) -> rope_backward(base=rope_theta) -> (d_q, d_k)
+
+      d_q -> transpose(1, 2) -> view([B, T, q_dim]) -> d_q_flat
+      d_k -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_k_flat
+      d_v -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_v_flat
+
+      (d_q_flat, d_k_flat, d_v_flat) -> concat(dim=-1) -> d_qkv
+
+      (d_qkv, qkv_weight) -> matmul(transpose=NN) -> d_ln_out_from_attn
+      (saved.ln_out, d_qkv) -> matmul(transpose=TN, accumulate=true) -> d_qkv_weight
+
+      # ===== Combine LN gradients =====
+      (d_ln_out_from_attn, d_ln_out_from_mlp) -> add() -> d_ln_out
+
+      # RMSNorm backward
+      (d_ln_out, saved.x, ln_weight, saved.ln_rstd)
+        -> rmsnorm_backward() -> (d_x_from_ln, d_ln_weight)
+
+      # Residual gradient
+      (d_out, d_x_from_ln) -> add() -> d_x

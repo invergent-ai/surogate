@@ -1,0 +1,753 @@
+"""
+Lowering Phase: AST to Graph IR
+
+Converts parsed AST nodes into Graph IR for execution.
+"""
+
+from typing import Dict, List, Optional, Any, Set, Tuple
+from dataclasses import dataclass, field
+
+from .ast_nodes import (
+    Program,
+    ModuleNode,
+    BlockNode,
+    ModelNode,
+    PrimitiveNode,
+    GraphStatement,
+    ConditionalGraph,
+    RecomputeBlock,
+    Operation,
+    TensorRef as ASTTensorRef,
+    TupleRef,
+    ForwardBlock,
+    BackwardBlock,
+    GraphBody,
+    TensorDecl,
+    LetBinding,
+    Expression,
+    Literal,
+    Identifier,
+    BinaryOp,
+    UnaryOp,
+    CallExpr,
+    Annotation,
+)
+from .types import (
+    Dtype,
+    Shape,
+    TensorTypeSpec,
+    SymbolicDim,
+    ConcreteDim,
+    MemoryMode,
+    HookPoint,
+    HookMode,
+    ShardStrategy,
+)
+from .ir import (
+    GraphIR,
+    OpNode,
+    TensorRef,
+    Edge,
+    ModuleIR,
+    KernelType,
+    CompilationContext,
+    PrimitiveSpec,
+)
+from .errors import (
+    DSLError,
+    DSLResolutionError,
+    DSLTypeError,
+    ErrorCode,
+    SourceLocation,
+    WarningCollector,
+    WarningCode,
+)
+
+
+# =============================================================================
+# Expression Evaluator (for compile-time constants)
+# =============================================================================
+
+
+class ExpressionEvaluator:
+    """Evaluates compile-time constant expressions."""
+
+    def __init__(self, env: Dict[str, Any]):
+        self.env = env
+
+    def evaluate(self, expr: Expression) -> Any:
+        """Evaluate an expression to a Python value."""
+        if isinstance(expr, Literal):
+            return expr.value
+
+        if isinstance(expr, Identifier):
+            if expr.name in self.env:
+                return self.env[expr.name]
+            raise DSLResolutionError(
+                ErrorCode.E002,
+                f"Undefined identifier: {expr.name}",
+            )
+
+        if isinstance(expr, BinaryOp):
+            left = self.evaluate(expr.left)
+            right = self.evaluate(expr.right)
+            return self._eval_binary(expr.op, left, right)
+
+        if isinstance(expr, UnaryOp):
+            operand = self.evaluate(expr.operand)
+            return self._eval_unary(expr.op, operand)
+
+        if isinstance(expr, CallExpr):
+            return self._eval_call(expr)
+
+        # For complex expressions, return as-is for later resolution
+        return expr
+
+    def _eval_binary(self, op: str, left: Any, right: Any) -> Any:
+        ops = {
+            "+": lambda a, b: a + b,
+            "-": lambda a, b: a - b,
+            "*": lambda a, b: a * b,
+            "/": lambda a, b: a / b,
+            "//": lambda a, b: a // b,
+            "%": lambda a, b: a % b,
+            "**": lambda a, b: a ** b,
+            "==": lambda a, b: a == b,
+            "!=": lambda a, b: a != b,
+            "<": lambda a, b: a < b,
+            ">": lambda a, b: a > b,
+            "<=": lambda a, b: a <= b,
+            ">=": lambda a, b: a >= b,
+            "and": lambda a, b: a and b,
+            "or": lambda a, b: a or b,
+        }
+        if op in ops:
+            return ops[op](left, right)
+        raise ValueError(f"Unknown operator: {op}")
+
+    def _eval_unary(self, op: str, operand: Any) -> Any:
+        if op == "-":
+            return -operand
+        if op == "not":
+            return not operand
+        if op == "+":
+            return +operand
+        raise ValueError(f"Unknown unary operator: {op}")
+
+    def _eval_call(self, expr: CallExpr) -> Any:
+        func = expr.func
+        args = [self.evaluate(arg) for arg in expr.args]
+
+        builtins = {
+            "sqrt": lambda x: x ** 0.5,
+            "ceil_div": lambda a, b: (a + b - 1) // b,
+            "min": min,
+            "max": max,
+            "abs": abs,
+        }
+
+        if func in builtins:
+            return builtins[func](*args)
+
+        raise ValueError(f"Unknown function: {func}")
+
+
+# =============================================================================
+# Kernel Type Mapping
+# =============================================================================
+
+
+def operation_to_kernel_type(op_name: str) -> KernelType:
+    """Map operation name to kernel type."""
+    mapping = {
+        # Linear algebra
+        "matmul": KernelType.MATMUL,
+        "Linear": KernelType.MATMUL,
+        "batched_matmul": KernelType.BATCHED_MATMUL,
+        "grouped_gemm": KernelType.GROUPED_GEMM,
+
+        # Normalization
+        "rmsnorm": KernelType.RMSNORM,
+        "RMSNorm": KernelType.RMSNORM,
+        "fused_residual_rmsnorm": KernelType.FUSED_RESIDUAL_RMSNORM,
+        "layernorm": KernelType.LAYERNORM,
+        "LayerNorm": KernelType.LAYERNORM,
+
+        # Activations
+        "swiglu": KernelType.SWIGLU,
+        "SwiGLU": KernelType.SWIGLU,
+        "geglu": KernelType.GEGLU,
+        "GeGLU": KernelType.GEGLU,
+        "silu": KernelType.SILU,
+        "relu": KernelType.RELU,
+        "relu2": KernelType.RELU2,
+        "gelu": KernelType.GELU,
+        "softmax": KernelType.SOFTMAX,
+
+        # Attention
+        "flash_attention": KernelType.FLASH_ATTENTION,
+        "FlashAttention": KernelType.FLASH_ATTENTION,
+        "rope": KernelType.ROPE,
+        "RoPE": KernelType.ROPE,
+        "qk_norm": KernelType.QK_NORM,
+
+        # Tensor manipulation
+        "split": KernelType.SPLIT,
+        "concat": KernelType.CONCAT,
+        "view": KernelType.VIEW,
+        "transpose": KernelType.TRANSPOSE,
+        "permute": KernelType.PERMUTE,
+        "contiguous": KernelType.CONTIGUOUS,
+        "copy": KernelType.COPY,
+
+        # Elementwise
+        "add": KernelType.ADD,
+        "Add": KernelType.ADD,
+        "mul": KernelType.MUL,
+        "scale": KernelType.SCALE,
+        "add3": KernelType.ADD3,
+
+        # Reduction
+        "reduce_sum": KernelType.REDUCE_SUM,
+        "reduce_mean": KernelType.REDUCE_MEAN,
+        "reduce_max": KernelType.REDUCE_MAX,
+
+        # Embedding
+        "embedding": KernelType.EMBEDDING,
+        "Embedding": KernelType.EMBEDDING,
+
+        # MoE
+        "moe_router": KernelType.MOE_ROUTER,
+        "moe_permute": KernelType.MOE_PERMUTE,
+        "moe_unpermute": KernelType.MOE_UNPERMUTE,
+
+        # Mamba
+        "mamba_conv1d": KernelType.MAMBA_CONV1D,
+        "mamba_selective_scan": KernelType.MAMBA_SELECTIVE_SCAN,
+
+        # Utility
+        "zeros": KernelType.ZEROS,
+        "ones": KernelType.ONES,
+        "fill": KernelType.FILL,
+    }
+
+    return mapping.get(op_name, KernelType.CUSTOM)
+
+
+# =============================================================================
+# Annotation Processing
+# =============================================================================
+
+
+def process_annotations(
+    annotations: List[Annotation],
+) -> Tuple[MemoryMode, Optional[HookPoint], Optional[HookMode], Optional[ShardStrategy], Dict[str, Any]]:
+    """Process annotations and extract relevant information."""
+    memory_mode = MemoryMode.TEMPORARY
+    hook_point = None
+    hook_mode = None
+    shard_strategy = None
+    extra_attrs = {}
+
+    for ann in annotations:
+        if ann.name == "memory":
+            if ann.args:
+                mode_str = str(ann.args[0])
+                if isinstance(ann.args[0], Identifier):
+                    mode_str = ann.args[0].name
+                try:
+                    memory_mode = MemoryMode(mode_str.lower())
+                except ValueError:
+                    pass
+
+        elif ann.name == "hook":
+            if ann.args:
+                point_str = str(ann.args[0])
+                if isinstance(ann.args[0], Identifier):
+                    point_str = ann.args[0].name
+                try:
+                    hook_point = HookPoint(point_str)
+                except ValueError:
+                    pass
+            if "mode" in ann.kwargs:
+                mode_val = ann.kwargs["mode"]
+                if isinstance(mode_val, Identifier):
+                    try:
+                        hook_mode = HookMode(mode_val.name.lower())
+                    except ValueError:
+                        pass
+
+        elif ann.name == "shard":
+            if ann.args:
+                strat_str = str(ann.args[0])
+                if isinstance(ann.args[0], Identifier):
+                    strat_str = ann.args[0].name
+                try:
+                    shard_strategy = ShardStrategy(strat_str.lower())
+                except ValueError:
+                    pass
+
+        elif ann.name == "dtype":
+            if ann.args:
+                dtype_str = str(ann.args[0])
+                if isinstance(ann.args[0], Identifier):
+                    dtype_str = ann.args[0].name
+                extra_attrs["dtype"] = dtype_str
+
+        elif ann.name == "checkpoint":
+            memory_mode = MemoryMode.RECOMPUTE
+
+        elif ann.name == "frozen":
+            extra_attrs["frozen"] = True
+
+        elif ann.name == "trainable":
+            extra_attrs["trainable"] = True
+
+    return memory_mode, hook_point, hook_mode, shard_strategy, extra_attrs
+
+
+# =============================================================================
+# Graph Builder
+# =============================================================================
+
+
+class GraphBuilder:
+    """Builds Graph IR from AST graph statements."""
+
+    def __init__(self, ctx: CompilationContext, warnings: WarningCollector):
+        self.ctx = ctx
+        self.warnings = warnings
+        self.current_graph: Optional[GraphIR] = None
+
+    def build_forward_graph(
+        self,
+        name: str,
+        forward: ForwardBlock,
+        params: List[TensorDecl],
+    ) -> GraphIR:
+        """Build Graph IR for forward pass."""
+        graph = GraphIR(name=f"{name}_forward")
+        self.current_graph = graph
+
+        # Add parameters
+        for param in params:
+            tensor_ref = TensorRef(
+                name=param.name,
+                dtype=Dtype.BF16,  # Default
+                is_param=True,
+            )
+            if param.tensor_type and param.tensor_type.dtype:
+                tensor_ref.dtype = Dtype.from_string(param.tensor_type.dtype)
+            graph.params[param.name] = tensor_ref
+
+        # Process input specification
+        if forward.input_type:
+            # Simple in: type
+            graph.inputs["in"] = TensorRef(
+                name="in",
+                is_input=True,
+            )
+        elif forward.inputs:
+            # Named inputs
+            for name, tensor_type in forward.inputs.items():
+                graph.inputs[name] = TensorRef(
+                    name=name,
+                    is_input=True,
+                )
+
+        # Process output specification
+        if forward.output_type:
+            graph.outputs["out"] = TensorRef(
+                name="out",
+                is_output=True,
+            )
+        elif forward.outputs:
+            for name, tensor_type in forward.outputs.items():
+                graph.outputs[name] = TensorRef(
+                    name=name,
+                    is_output=True,
+                )
+
+        # Process graph body
+        if forward.graph:
+            self._process_graph_body(forward.graph, graph)
+
+        # Process save/recompute lists
+        graph.save_list = forward.save.copy()
+        graph.recompute_list = forward.recompute.copy()
+
+        return graph
+
+    def build_backward_graph(
+        self,
+        name: str,
+        backward: BackwardBlock,
+        params: List[TensorDecl],
+        forward_graph: GraphIR,
+    ) -> GraphIR:
+        """Build Graph IR for backward pass."""
+        graph = GraphIR(name=f"{name}_backward")
+        self.current_graph = graph
+
+        # Add gradient inputs
+        for grad_name, tensor_type in backward.gradient_inputs.items():
+            graph.inputs[grad_name] = TensorRef(
+                name=grad_name,
+                is_input=True,
+            )
+
+        # Add gradient outputs
+        for grad_name, tensor_type in backward.gradient_outputs.items():
+            graph.outputs[grad_name] = TensorRef(
+                name=grad_name,
+                is_output=True,
+            )
+
+        # Add saved tensors from forward (accessible as saved.x)
+        for saved_name in forward_graph.save_list:
+            graph.params[f"saved.{saved_name}"] = TensorRef(
+                name=f"saved.{saved_name}",
+                is_param=True,  # Treat as param for access
+            )
+
+        # Add parameter gradients
+        for param in params:
+            d_name = f"d_{param.name}"
+            graph.outputs[d_name] = TensorRef(
+                name=d_name,
+                is_output=True,
+            )
+
+        # Process graph body
+        if backward.graph:
+            self._process_graph_body(backward.graph, graph)
+
+        return graph
+
+    def _process_graph_body(self, body: GraphBody, graph: GraphIR):
+        """Process graph body statements."""
+        for stmt in body.statements:
+            if isinstance(stmt, GraphStatement):
+                self._process_data_flow(stmt, graph)
+            elif isinstance(stmt, ConditionalGraph):
+                self._process_conditional(stmt, graph)
+            elif isinstance(stmt, RecomputeBlock):
+                self._process_recompute(stmt, graph)
+
+    def _process_data_flow(self, stmt: GraphStatement, graph: GraphIR):
+        """Process a data flow statement."""
+        # Get source tensor names
+        source_names = self._get_tensor_names(stmt.source)
+
+        # Get destination tensor names
+        dest_names = self._get_tensor_names(stmt.dest)
+
+        # Process annotations
+        memory_mode, hook_point, hook_mode, shard_strategy, extra_attrs = process_annotations(
+            stmt.annotations
+        )
+
+        # Process each operation in the chain
+        current_inputs = source_names
+
+        for i, op in enumerate(stmt.operations):
+            is_last = (i == len(stmt.operations) - 1)
+            outputs = dest_names if is_last else [f"_tmp_{self.ctx.new_node_id()}"]
+
+            # Create OpNode
+            node = OpNode(
+                id=self.ctx.new_node_id(),
+                kernel_type=operation_to_kernel_type(op.name),
+                name=op.name,
+                inputs=current_inputs.copy(),
+                outputs=outputs.copy(),
+                attrs=self._process_op_attrs(op),
+                memory_mode=memory_mode if is_last else MemoryMode.TEMPORARY,
+                hook_point=hook_point if is_last else None,
+                hook_mode=hook_mode if is_last else None,
+                shard_strategy=shard_strategy if is_last else None,
+                layer_idx=self.ctx.layer_idx,
+            )
+
+            graph.nodes.append(node)
+
+            # Add intermediate tensors
+            for out in outputs:
+                if out not in graph.inputs and out not in graph.params:
+                    if out not in graph.intermediates:
+                        graph.intermediates[out] = TensorRef(name=out)
+
+            current_inputs = outputs
+
+    def _process_conditional(self, cond: ConditionalGraph, graph: GraphIR):
+        """Process conditional graph."""
+        # Evaluate condition
+        evaluator = ExpressionEvaluator(self.ctx.module_params)
+        try:
+            condition_value = evaluator.evaluate(cond.condition)
+            is_const = True
+        except Exception:
+            # Non-constant condition - need to handle dynamically
+            is_const = False
+            condition_value = True  # Default to true branch for now
+
+        if is_const:
+            # Compile-time conditional: only include relevant branch
+            if condition_value:
+                for stmt in cond.true_branch:
+                    if isinstance(stmt, GraphStatement):
+                        self._process_data_flow(stmt, graph)
+            elif cond.false_branch:
+                for stmt in cond.false_branch:
+                    if isinstance(stmt, GraphStatement):
+                        self._process_data_flow(stmt, graph)
+        else:
+            # Runtime conditional not supported
+            self.warnings.warn(
+                WarningCode.W003,
+                f"Runtime conditional at {cond.location} - only true branch compiled",
+            )
+            for stmt in cond.true_branch:
+                if isinstance(stmt, GraphStatement):
+                    self._process_data_flow(stmt, graph)
+
+    def _process_recompute(self, recompute: RecomputeBlock, graph: GraphIR):
+        """Process recompute block."""
+        # Mark all operations in recompute block
+        for stmt in recompute.statements:
+            if isinstance(stmt, GraphStatement):
+                # Add recompute annotation
+                stmt.annotations.append(Annotation(name="memory", args=[Identifier(name="recompute")]))
+                self._process_data_flow(stmt, graph)
+
+    def _get_tensor_names(self, ref) -> List[str]:
+        """Get tensor names from a reference."""
+        if isinstance(ref, str):
+            return [ref]
+        if isinstance(ref, ASTTensorRef):
+            prefix = "saved." if ref.is_saved else ""
+            return [f"{prefix}{ref.name}"]
+        if isinstance(ref, TupleRef):
+            result = []
+            for elem in ref.elements:
+                result.extend(self._get_tensor_names(elem))
+            return result
+        return ["unknown"]
+
+    def _process_op_attrs(self, op: Operation) -> Dict[str, Any]:
+        """Process operation attributes."""
+        attrs = {}
+        evaluator = ExpressionEvaluator(self.ctx.module_params)
+
+        # Add positional args
+        for i, arg in enumerate(op.args):
+            try:
+                attrs[f"arg{i}"] = evaluator.evaluate(arg)
+            except Exception:
+                attrs[f"arg{i}"] = arg
+
+        # Add keyword args
+        for key, value in op.kwargs.items():
+            try:
+                attrs[key] = evaluator.evaluate(value)
+            except Exception:
+                attrs[key] = value
+
+        return attrs
+
+
+# =============================================================================
+# Module Lowerer
+# =============================================================================
+
+
+class ModuleLowerer:
+    """Lowers module AST nodes to Module IR."""
+
+    def __init__(self, warnings: Optional[WarningCollector] = None):
+        self.warnings = warnings or WarningCollector()
+        self.ctx = CompilationContext()
+
+    def lower_module(self, node: ModuleNode) -> ModuleIR:
+        """Lower a module AST node to Module IR."""
+        # Build compilation context
+        self._build_context(node)
+
+        # Create Module IR
+        module_ir = ModuleIR(
+            name=node.name,
+            config=self.ctx.module_params.copy(),
+            extends=node.extends,
+        )
+
+        # Add parameters
+        for param in node.param_decls:
+            tensor_ref = TensorRef(
+                name=param.name,
+                is_param=True,
+            )
+            module_ir.params.append(tensor_ref)
+
+        # Build forward graph
+        if node.forward:
+            builder = GraphBuilder(self.ctx, self.warnings)
+            module_ir.forward_graph = builder.build_forward_graph(
+                node.name,
+                node.forward,
+                node.param_decls,
+            )
+
+        # Build backward graph
+        if node.backward and module_ir.forward_graph:
+            builder = GraphBuilder(self.ctx, self.warnings)
+            module_ir.backward_graph = builder.build_backward_graph(
+                node.name,
+                node.backward,
+                node.param_decls,
+                module_ir.forward_graph,
+            )
+
+        return module_ir
+
+    def lower_block(self, node: BlockNode) -> ModuleIR:
+        """Lower a block AST node to Module IR."""
+        self._build_context(node)
+
+        module_ir = ModuleIR(
+            name=node.name,
+            config=self.ctx.module_params.copy(),
+            is_block=True,
+            extends=node.extends,
+        )
+
+        for param in node.param_decls:
+            tensor_ref = TensorRef(
+                name=param.name,
+                is_param=True,
+            )
+            module_ir.params.append(tensor_ref)
+
+        if node.forward:
+            builder = GraphBuilder(self.ctx, self.warnings)
+            module_ir.forward_graph = builder.build_forward_graph(
+                node.name,
+                node.forward,
+                node.param_decls,
+            )
+
+        if node.backward and module_ir.forward_graph:
+            builder = GraphBuilder(self.ctx, self.warnings)
+            module_ir.backward_graph = builder.build_backward_graph(
+                node.name,
+                node.backward,
+                node.param_decls,
+                module_ir.forward_graph,
+            )
+
+        return module_ir
+
+    def lower_model(self, node: ModelNode) -> ModuleIR:
+        """Lower a model AST node to Module IR."""
+        self._build_context(node)
+
+        module_ir = ModuleIR(
+            name=node.name,
+            config=self.ctx.module_params.copy(),
+            is_model=True,
+        )
+
+        for param in node.param_decls:
+            tensor_ref = TensorRef(
+                name=param.name,
+                is_param=True,
+            )
+            module_ir.params.append(tensor_ref)
+
+        if node.forward:
+            builder = GraphBuilder(self.ctx, self.warnings)
+            module_ir.forward_graph = builder.build_forward_graph(
+                node.name,
+                node.forward,
+                node.param_decls,
+            )
+
+        if node.backward and module_ir.forward_graph:
+            builder = GraphBuilder(self.ctx, self.warnings)
+            module_ir.backward_graph = builder.build_backward_graph(
+                node.name,
+                node.backward,
+                node.param_decls,
+                module_ir.forward_graph,
+            )
+
+        # Process HuggingFace mappings
+        if node.hf_config:
+            module_ir.hf_config_mapping = node.hf_config.param_mapping
+
+        if node.hf_mapping:
+            for mapping in node.hf_mapping.mappings:
+                if isinstance(mapping.external_spec, str):
+                    module_ir.hf_weight_mapping[mapping.internal_name] = mapping.external_spec
+
+        return module_ir
+
+    def _build_context(self, node):
+        """Build compilation context from node parameters."""
+        # Process module parameters
+        for param in node.params:
+            if param.default:
+                evaluator = ExpressionEvaluator(self.ctx.module_params)
+                try:
+                    value = evaluator.evaluate(param.default)
+                    self.ctx.module_params[param.name] = value
+                except Exception:
+                    self.ctx.module_params[param.name] = None
+            else:
+                self.ctx.module_params[param.name] = None
+
+        # Process let bindings
+        for binding in node.let_bindings:
+            evaluator = ExpressionEvaluator(self.ctx.module_params)
+            try:
+                value = evaluator.evaluate(binding.value)
+                self.ctx.module_params[binding.name] = value
+            except Exception:
+                pass
+
+        # Check constraints
+        for constraint in node.constraints:
+            evaluator = ExpressionEvaluator(self.ctx.module_params)
+            try:
+                result = evaluator.evaluate(constraint.condition)
+                if not result:
+                    raise DSLError(
+                        ErrorCode.E027,
+                        f"Constraint failed: {constraint.message}",
+                    )
+            except DSLError:
+                raise
+            except Exception:
+                # Constraint couldn't be evaluated - defer to runtime
+                pass
+
+
+def lower_program(program: Program, warnings: Optional[WarningCollector] = None) -> List[ModuleIR]:
+    """Lower an entire program to Module IRs."""
+    warnings = warnings or WarningCollector()
+    lowerer = ModuleLowerer(warnings)
+
+    results = []
+
+    # Lower all modules
+    for module in program.modules:
+        results.append(lowerer.lower_module(module))
+
+    # Lower all blocks
+    for block in program.blocks:
+        results.append(lowerer.lower_block(block))
+
+    # Lower all models
+    for model in program.models:
+        results.append(lowerer.lower_model(model))
+
+    return results

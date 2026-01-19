@@ -1,0 +1,34 @@
+# Standard Library Blocks Index
+# Version: 0.1.0
+
+"""
+Index of all transformer blocks in the standard library.
+
+Blocks are complete transformer layers that combine attention,
+normalization, and feed-forward components.
+"""
+
+# =============================================================================
+# Dense Blocks (dense.module)
+# =============================================================================
+
+export block DenseTransformerBlock    # Standard pre-norm dense block (LLaMA, Qwen)
+
+# =============================================================================
+# MoE Blocks (moe.module)
+# =============================================================================
+
+export block MoETransformerBlock      # Mixture-of-Experts block (Mixtral, Qwen3-MoE)
+
+# =============================================================================
+# Mamba Blocks (mamba.module)
+# =============================================================================
+
+export block MambaBlock               # Full Mamba SSM block with state caching
+export block MambaBlockSimple         # Simplified Mamba for training
+
+# =============================================================================
+# Parallel Blocks (parallel.module)
+# =============================================================================
+
+export block ParallelTransformerBlock # Parallel attention + MLP (GPT-J style)

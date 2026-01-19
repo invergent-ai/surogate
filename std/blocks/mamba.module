@@ -1,0 +1,263 @@
+# Mamba SSM Block
+# Maps to: csrc/third_party/mamba/, Mamba integration in models
+
+"""
+Mamba State Space Model block for hybrid architectures.
+Used in Nemotron-H and other Mamba-Transformer hybrids.
+"""
+
+import std.primitives.{fused_residual_rmsnorm, matmul, selective_scan, causal_conv1d, silu_mul, exp_neg}
+import std.modules.rmsnorm.{RMSNorm}
+
+# =============================================================================
+# MambaBlock - Mamba SSM Block
+# =============================================================================
+
+block MambaBlock(
+  d_model: int,
+  d_state: int = 16,
+  d_conv: int = 4,
+  expand: int = 2,
+  n_groups: int = 1,
+  eps: float = 1e-6,
+  bias: bool = false,
+  conv_bias: bool = true
+):
+  """
+  Mamba State Space Model block.
+
+  Architecture:
+    1. RMSNorm
+    2. Input projection to (gate, conv_input, delta)
+    3. Causal 1D convolution + SiLU
+    4. Selective scan (S6)
+    5. SiLU gating
+    6. Group RMSNorm
+    7. Output projection
+
+  The selective scan is the core operation:
+    h_t = A * h_{t-1} + B * x_t
+    y_t = C * h_t + D * x_t
+
+  Where A, B, C are input-dependent (selective).
+
+  Used in: Mamba, Nemotron-H (hybrid)
+
+  Maps to: third_party/mamba/ + modules integration
+  """
+
+  let:
+    d_inner = d_model * expand
+    d_conv_out = d_inner + 2 * n_groups * d_state
+    in_proj_dim = d_inner + d_conv_out + n_groups
+
+    constraint:
+      d_model > 0, "d_model must be positive"
+      d_state > 0, "d_state must be positive"
+      expand >= 1, "expand must be >= 1"
+
+  params:
+    # Normalization
+    ln_weight: [d_model]
+
+    # Input projection: projects to gate, conv_input, delta
+    in_proj_weight: [in_proj_dim, d_model]
+    in_proj_bias: [in_proj_dim] if bias
+
+    # Causal convolution
+    conv1d_weight: [d_conv_out, 1, d_conv]
+    conv1d_bias: [d_conv_out] if conv_bias
+
+    # SSM parameters
+    A_log: [d_inner, d_state]      # Log of state transition matrix
+    D: [d_inner]                    # Skip connection
+    dt_bias: [d_inner]              # Delta (time step) bias
+
+    # Output normalization and projection
+    norm_weight: [d_inner]
+    out_proj_weight: [d_model, d_inner]
+    out_proj_bias: [d_model] if bias
+
+  forward:
+    inputs:
+      x: [B, T, d_model]
+      residual: [B, T, d_model]
+      ssm_state: [B, d_inner, d_state]?    # Recurrent state (for generation)
+      conv_state: [B, d_conv_out, d_conv-1]?  # Conv state (for generation)
+    outputs:
+      out: [B, T, d_model]
+      residual_out: [B, T, d_model]
+      ssm_state_out: [B, d_inner, d_state]
+      conv_state_out: [B, d_conv_out, d_conv-1]
+
+    graph:
+      # Fused residual + RMSNorm
+      (residual, x, ln_weight) -> fused_residual_rmsnorm(eps=eps)
+        -> (residual_out, ln_out, ln_rstd)
+
+      # Input projection
+      if bias:
+        (ln_out, in_proj_weight) -> matmul(transpose=TN) -> proj_pre
+        (proj_pre, in_proj_bias) -> bias_add() -> proj
+      else:
+        (ln_out, in_proj_weight) -> matmul(transpose=TN) -> proj
+
+      # Split into gate, conv_input, delta
+      proj -> mamba_split_proj(d_inner, d_conv_out) -> (gate, conv_in, delta_raw)
+
+      # Transpose for conv: [B, T, D] -> [B, D, T]
+      conv_in -> transpose(1, 2) -> conv_in_t
+
+      # Causal conv1d + SiLU
+      if conv_bias:
+        (conv_in_t, conv1d_weight, conv1d_bias, conv_state)
+          -> causal_conv1d(activation=silu) -> (conv_out_t, conv_state_out)
+      else:
+        (conv_in_t, conv1d_weight, None, conv_state)
+          -> causal_conv1d(activation=silu) -> (conv_out_t, conv_state_out)
+
+      # Split conv output: [B, D, T] -> u, B_ssm, C_ssm
+      conv_out_t -> mamba_split_conv(d_inner, n_groups, d_state) -> (u, B_ssm, C_ssm)
+
+      # Compute A from A_log: A = -exp(A_log)
+      A_log -> exp_neg() -> A
+
+      # Selective scan
+      (u, delta_raw, A, B_ssm, C_ssm, D, dt_bias, ssm_state)
+        -> selective_scan(has_z=false, delta_softplus=true)
+        -> (scan_out, ssm_state_out)
+
+      # Transpose back: [B, D, T] -> [B, T, D]
+      scan_out -> transpose(1, 2) -> scan_out_t
+
+      # SiLU gating
+      gate -> transpose(1, 2) -> gate_t  # [B, D, T]
+      (gate_t, scan_out) -> silu_mul() -> gated  # [B, D, T]
+      gated -> transpose(1, 2) -> gated_t  # [B, T, D]
+
+      # Group RMSNorm
+      (gated_t, norm_weight) -> group_rmsnorm(n_groups=n_groups, eps=eps) -> normed
+
+      # Output projection
+      if bias:
+        (normed, out_proj_weight) -> matmul(transpose=TN) -> out_pre
+        (out_pre, out_proj_bias) -> bias_add() -> out
+      else:
+        (normed, out_proj_weight) -> matmul(transpose=TN) -> out
+
+    save: [
+      residual, ln_out, ln_rstd,
+      proj, gate, conv_in, conv_out_t, delta_raw,
+      u, B_ssm, C_ssm, A, scan_out, gated_t, normed
+    ]
+
+  backward:
+    inputs:
+      d_out: [B, T, d_model]
+      d_residual: [B, T, d_model]
+    outputs:
+      d_x: [B, T, d_model]
+      d_residual_out: [B, T, d_model]
+
+    graph:
+      # Output projection backward
+      if bias:
+        (d_out, out_proj_weight) -> matmul(transpose=NN) -> d_normed
+        d_out -> reduce_sum(dims=[0, 1]) -> d_out_proj_bias
+      else:
+        (d_out, out_proj_weight) -> matmul(transpose=NN) -> d_normed
+      (saved.normed, d_out) -> matmul(transpose=TN, accumulate=true) -> d_out_proj_weight
+
+      # Group RMSNorm backward
+      (d_normed, saved.gated_t, norm_weight) -> group_rmsnorm_backward()
+        -> (d_gated_t, d_norm_weight)
+
+      # SiLU gating backward
+      d_gated_t -> transpose(1, 2) -> d_gated  # [B, D, T]
+      (d_gated, saved.gate_t, saved.scan_out) -> silu_mul_backward()
+        -> (d_gate_t, d_scan_out)
+
+      d_gate_t -> transpose(1, 2) -> d_gate
+
+      # Selective scan backward
+      (d_scan_out, saved.u, saved.delta_raw, saved.A, saved.B_ssm, saved.C_ssm,
+       D, dt_bias, saved.scan_out)
+        -> selective_scan_backward()
+        -> (d_u, d_delta, d_A, d_B_ssm, d_C_ssm, d_D, d_dt_bias)
+
+      # A_log backward: d_A_log = d_A * A (chain rule through -exp)
+      (d_A, saved.A) -> mul() -> d_A_log_pos
+      d_A_log_pos -> scale(-1.0) -> d_A_log
+
+      # Combine conv output gradients
+      (d_u, d_B_ssm, d_C_ssm) -> mamba_concat_conv() -> d_conv_out_t
+
+      # Causal conv1d backward
+      (d_conv_out_t, saved.conv_in_t, conv1d_weight) -> causal_conv1d_backward()
+        -> (d_conv_in_t, d_conv1d_weight, d_conv1d_bias)
+
+      d_conv_in_t -> transpose(1, 2) -> d_conv_in
+
+      # Combine projection gradients
+      (d_gate, d_conv_in, d_delta) -> mamba_concat_proj() -> d_proj
+
+      # Input projection backward
+      if bias:
+        d_proj -> reduce_sum(dims=[0, 1]) -> d_in_proj_bias
+      (d_proj, in_proj_weight) -> matmul(transpose=NN) -> d_ln_out
+      (saved.ln_out, d_proj) -> matmul(transpose=TN, accumulate=true) -> d_in_proj_weight
+
+      # Fused residual+RMSNorm backward
+      (d_ln_out, d_residual, saved.residual, ln_weight, saved.ln_rstd)
+        -> fused_residual_rmsnorm_backward()
+        -> (d_residual_out, d_x, d_ln_weight)
+
+
+# =============================================================================
+# MambaBlockSimple - Simplified Mamba (no state passing)
+# =============================================================================
+
+block MambaBlockSimple(
+  d_model: int,
+  d_state: int = 16,
+  d_conv: int = 4,
+  expand: int = 2,
+  n_groups: int = 1,
+  eps: float = 1e-6
+):
+  """
+  Simplified Mamba block for training (no explicit state passing).
+
+  States are computed fresh for each sequence, no caching.
+  Use MambaBlock for generation with state caching.
+  """
+
+  # Same params and structure as MambaBlock but without state inputs/outputs
+  # Initializes ssm_state and conv_state to zeros internally
+
+  params:
+    ln_weight: [d_model]
+    in_proj_weight: [d_model * expand + (d_model * expand + 2 * n_groups * d_state) + n_groups, d_model]
+    conv1d_weight: [d_model * expand + 2 * n_groups * d_state, 1, d_conv]
+    conv1d_bias: [d_model * expand + 2 * n_groups * d_state]
+    A_log: [d_model * expand, d_state]
+    D: [d_model * expand]
+    dt_bias: [d_model * expand]
+    norm_weight: [d_model * expand]
+    out_proj_weight: [d_model, d_model * expand]
+
+  forward:
+    inputs:
+      x: [B, T, d_model]
+      residual: [B, T, d_model]
+    outputs:
+      out: [B, T, d_model]
+      residual_out: [B, T, d_model]
+
+    graph:
+      # Initialize states to zeros
+      zeros([B, d_model * expand, d_state]) -> ssm_state
+      zeros([B, d_model * expand + 2 * n_groups * d_state, d_conv - 1]) -> conv_state
+
+      # Same forward as MambaBlock
+      ...

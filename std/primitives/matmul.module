@@ -1,0 +1,145 @@
+# Matrix Multiplication Primitives
+# Maps to: csrc/src/kernels/matmul.cu (cuBLASLt/cuBLAS)
+
+"""
+Linear algebra primitives for matrix multiplication.
+These map directly to cuBLASLt GEMM kernels.
+"""
+
+# =============================================================================
+# matmul - General Matrix Multiplication
+# =============================================================================
+
+primitive matmul:
+  """
+  General matrix multiplication: C = α * op(A) @ op(B) + β * C
+
+  Transpose modes control how A and B are interpreted:
+  - NN: C[m,n] = Σ_k A[m,k] * B[k,n]     (standard)
+  - NT: C[m,n] = Σ_k A[m,k] * B[n,k]     (B transposed)
+  - TN: C[m,n] = Σ_k A[k,m] * B[k,n]     (A transposed)
+  - TT: C[m,n] = Σ_k A[k,m] * B[n,k]     (both transposed)
+
+  Maps to: kernels.matmul (cuBLASLt GEMM)
+  """
+
+  params:
+    transpose: enum(NN, NT, TN, TT) = NN   # Transpose mode for (A, B)
+    accumulate: bool = false                # If true, C += A@B; else C = A@B
+    alpha: float = 1.0                      # Scaling factor for A@B
+    beta: float = 0.0                       # Scaling factor for existing C
+
+  forward:
+    in: (A: [M, K], B: [K, N])
+    out: C: [M, N]
+
+  backward:
+    # d_A = d_C @ B^T  (gradient w.r.t. first input)
+    # d_B = A^T @ d_C  (gradient w.r.t. second input)
+    d_A = matmul(d_C, B, transpose=NT)
+    d_B = matmul(A, d_C, transpose=TN)
+
+  impl:
+    forward: kernels.matmul
+    backward: kernels.matmul
+
+  precision:
+    supported: [fp32, fp16, bf16, fp8_e4m3, fp8_e5m2, fp4_e2m1]
+    accumulation: fp32
+
+
+# =============================================================================
+# batched_matmul - Batched Matrix Multiplication
+# =============================================================================
+
+primitive batched_matmul:
+  """
+  Batched matrix multiplication across leading dimensions.
+
+  Supports broadcasting: if A has shape [B, M, K] and B has shape [K, N],
+  B is broadcast across the batch dimension.
+
+  Used for: attention score computation (Q @ K^T), attention output (weights @ V)
+
+  Maps to: kernels.batched_matmul (cuBLAS batched GEMM)
+  """
+
+  params:
+    transpose: enum(NN, NT, TN, TT) = NN
+    accumulate: bool = false
+
+  forward:
+    in: (A: [*, M, K], B: [*, K, N])    # * indicates batch dims
+    out: C: [*, M, N]
+
+  backward:
+    d_A = batched_matmul(d_C, B, transpose=NT)
+    d_B = batched_matmul(A, d_C, transpose=TN)
+
+  impl:
+    forward: kernels.batched_matmul
+    backward: kernels.batched_matmul
+
+
+# =============================================================================
+# grouped_gemm - Grouped GEMM for MoE
+# =============================================================================
+
+primitive grouped_gemm:
+  """
+  Grouped GEMM for variable-size batches (MoE experts).
+
+  Each group can have a different number of tokens but shares the same
+  K and N dimensions. Groups are defined by offsets array.
+
+  For each group g with n_g tokens:
+    C_g[n_g, N] = A_g[n_g, K] @ B_g[K, N]^T
+
+  Maps to: kernels.moe_grouped_gemm (moe_kernels.cu)
+  """
+
+  params:
+    transpose: enum(NN, NT, TN, TT) = TN
+
+  forward:
+    in: (
+      input: [total_tokens, K],           # Concatenated inputs for all groups
+      weights: [num_groups, N, K],        # Per-group weight matrices
+      offsets: [num_groups + 1]           # Group boundaries (int32)
+    )
+    out: output: [total_tokens, N]
+
+  backward:
+    d_input = grouped_gemm(d_output, weights, offsets, transpose=NN)
+    d_weights = grouped_gemm_weight_grad(input, d_output, offsets)
+
+  impl:
+    forward: kernels.moe_grouped_gemm
+    backward: kernels.moe_grouped_gemm_backward
+
+
+# =============================================================================
+# strided_matmul - Matmul with strided output
+# =============================================================================
+
+primitive strided_matmul:
+  """
+  Matrix multiplication with strided output for fused QKV/gate+up projections.
+
+  Writes output to a slice of a larger tensor, enabling efficient fused
+  projections without separate concatenation.
+
+  Maps to: kernels.matmul with output_stride parameter
+  """
+
+  params:
+    transpose: enum(NN, NT, TN, TT) = TN
+    output_offset: int = 0                  # Offset in output dim
+    output_stride: int                      # Stride between elements
+
+  forward:
+    in: (A: [M, K], B: [N, K])
+    out: C: [M, output_stride]              # Writes to [M, output_offset:output_offset+N]
+
+  impl:
+    forward: kernels.matmul_strided

@@ -1,0 +1,230 @@
+# LLaMA Model Architecture
+# Maps to: csrc/src/models/llama/
+
+"""
+LLaMA (Large Language Model Meta AI) architecture.
+Foundation for most modern open-source LLMs.
+"""
+
+import std.primitives
+import std.modules.{Linear, SwiGLU_MLP}
+import std.modules.attention.gqa.{CausalSelfAttention}
+import std.blocks.dense.{DenseTransformerBlock}
+
+# =============================================================================
+# Llama - Base LLaMA Model
+# =============================================================================
+
+model Llama(
+  vocab_size: int = 32000,
+  d_model: int = 4096,
+  n_layers: int = 32,
+  num_heads: int = 32,
+  num_kv_heads: int = 32,
+  d_ff: int = 11008,
+  max_seq: int = 4096,
+  eps: float = 1e-5,
+  rope_theta: float = 10000.0,
+  tie_word_embeddings: bool = false
+):
+  """
+  LLaMA language model architecture.
+
+  Features:
+  - Pre-norm residual connections (RMSNorm before each sublayer)
+  - RoPE position embeddings
+  - SwiGLU activation in MLP
+  - Optional weight tying (embedding = lm_head)
+  - Supports MHA (LLaMA-1) and GQA (LLaMA-2 70B)
+
+  Configurations:
+  - LLaMA-2 7B: d_model=4096, n_layers=32, num_heads=32, d_ff=11008
+  - LLaMA-2 13B: d_model=5120, n_layers=40, num_heads=40, d_ff=13824
+  - LLaMA-2 70B: d_model=8192, n_layers=80, num_heads=64, num_kv_heads=8, d_ff=28672
+
+  Maps to: models/llama/
+  """
+
+  let:
+    d_head = d_model // num_heads
+    q_dim = num_heads * d_head
+    kv_dim = num_kv_heads * d_head
+    qkv_dim = q_dim + 2 * kv_dim
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+      num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+
+  params:
+    # Embedding
+    embedding: [vocab_size, d_model]
+
+    # Transformer blocks
+    blocks: [n_layers] x DenseTransformerBlock(
+      d_model=d_model,
+      num_heads=num_heads,
+      num_kv_heads=num_kv_heads,
+      d_ff=d_ff,
+      max_seq=max_seq,
+      rope_theta=rope_theta,
+      eps=eps,
+      use_qk_norm=false
+    )
+
+    # Final norm
+    final_norm: [d_model]
+
+    # LM head
+    lm_head: tied_to(embedding) if tie_word_embeddings else [vocab_size, d_model]
+
+  forward:
+    in: token_ids: [B, T, int32]
+    out: logits: [B, T, vocab_size]
+
+    graph:
+      # Token embedding
+      token_ids -> embedding(embedding) -> x0
+
+      # Initialize residual to zeros
+      zeros([B, T, d_model]) -> residual0
+
+      # Stack all transformer blocks
+      (x0, residual0) -> StackedBlocks(blocks, n_layers) -> (xN, residualN)
+
+      # Final residual + norm
+      (residualN, xN, final_norm) -> fused_residual_rmsnorm(eps=eps) -> (_, xF, _)
+
+      # LM head
+      (xF, lm_head) -> matmul(transpose=TN) -> logits
+
+    save: [x0, per_layer_saves..., xF]
+
+  backward:
+    d_logits: [B, T, vocab_size]
+
+    graph:
+      # LM head backward
+      (d_logits, lm_head) -> matmul(transpose=NN) -> d_xF
+      (saved.xF, d_logits) -> matmul(transpose=TN, accumulate=true) -> d_lm_head
+
+      # Final norm backward
+      (d_xF, saved.residualN, final_norm) -> rmsnorm_backward()
+        -> (d_residualN, d_xN, d_final_norm)
+
+      # Backward through all blocks (reverse order)
+      (d_xN, d_residualN) -> StackedBlocksBackward(blocks, n_layers)
+        -> (d_x0, d_residual0)
+
+      # Embedding backward
+      (d_x0, saved.token_ids) -> embedding_backward() -> d_embedding
+
+  # HuggingFace compatibility
+  hf_config:
+    architecture: "LlamaForCausalLM"
+    config_class: "LlamaConfig"
+    param_mapping:
+      d_model: hidden_size
+      n_layers: num_hidden_layers
+      num_heads: num_attention_heads
+      num_kv_heads: num_key_value_heads
+      d_ff: intermediate_size
+      vocab_size: vocab_size
+      max_seq: max_position_embeddings
+      eps: rms_norm_eps
+      rope_theta: rope_theta
+
+  hf_mapping:
+    embedding: "model.embed_tokens.weight"
+    final_norm: "model.norm.weight"
+    lm_head: "lm_head.weight"
+
+    blocks[{i}].ln1_weight: "model.layers.{i}.input_layernorm.weight"
+    blocks[{i}].qkv_weight: fuse(
+      "model.layers.{i}.self_attn.q_proj.weight",
+      "model.layers.{i}.self_attn.k_proj.weight",
+      "model.layers.{i}.self_attn.v_proj.weight",
+      dim=0
+    )
+    blocks[{i}].out_weight: "model.layers.{i}.self_attn.o_proj.weight"
+    blocks[{i}].ln2_weight: "model.layers.{i}.post_attention_layernorm.weight"
+    blocks[{i}].gate_up_weight: fuse(
+      "model.layers.{i}.mlp.gate_proj.weight",
+      "model.layers.{i}.mlp.up_proj.weight",
+      dim=0
+    )
+    blocks[{i}].down_weight: "model.layers.{i}.mlp.down_proj.weight"
+
+
+# =============================================================================
+# LlamaForCausalLM - Alias with HF naming convention
+# =============================================================================
+
+model LlamaForCausalLM extends Llama:
+  """
+  Alias for Llama with HuggingFace naming convention.
+  """
+
+
+# =============================================================================
+# Presets
+# =============================================================================
+
+preset Llama2_7B:
+  """LLaMA-2 7B configuration."""
+  vocab_size: 32000
+  d_model: 4096
+  n_layers: 32
+  num_heads: 32
+  num_kv_heads: 32
+  d_ff: 11008
+  max_seq: 4096
+  eps: 1e-5
+  rope_theta: 10000.0
+
+preset Llama2_13B:
+  """LLaMA-2 13B configuration."""
+  vocab_size: 32000
+  d_model: 5120
+  n_layers: 40
+  num_heads: 40
+  num_kv_heads: 40
+  d_ff: 13824
+  max_seq: 4096
+  eps: 1e-5
+  rope_theta: 10000.0
+
+preset Llama2_70B:
+  """LLaMA-2 70B configuration with GQA."""
+  vocab_size: 32000
+  d_model: 8192
+  n_layers: 80
+  num_heads: 64
+  num_kv_heads: 8
+  d_ff: 28672
+  max_seq: 4096
+  eps: 1e-5
+  rope_theta: 10000.0
+
+preset Llama3_8B:
+  """LLaMA-3 8B configuration."""
+  vocab_size: 128256
+  d_model: 4096
+  n_layers: 32
+  num_heads: 32
+  num_kv_heads: 8
+  d_ff: 14336
+  max_seq: 8192
+  eps: 1e-5
+  rope_theta: 500000.0
+
+preset Llama3_70B:
+  """LLaMA-3 70B configuration."""
+  vocab_size: 128256
+  d_model: 8192
+  n_layers: 80
+  num_heads: 64
+  num_kv_heads: 8
+  d_ff: 28672
+  max_seq: 8192
+  eps: 1e-5
+  rope_theta: 500000.0

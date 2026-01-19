@@ -1,0 +1,276 @@
+# Nemotron Model Architecture
+# Maps to: csrc/src/models/nemotron_h/
+
+"""
+NVIDIA Nemotron model architectures.
+Includes Nemotron-H hybrid Mamba-Transformer architecture.
+"""
+
+import std.primitives
+import std.modules.{Linear, ReLU2_MLP}
+import std.modules.attention.gqa.{CausalSelfAttention}
+import std.blocks.dense.{DenseTransformerBlock}
+import std.blocks.mamba.{MambaBlock}
+import std.blocks.moe.{MoETransformerBlock}
+
+# =============================================================================
+# NemotronH - Hybrid Mamba-Transformer Model
+# =============================================================================
+
+model NemotronH(
+  vocab_size: int = 256000,
+  d_model: int = 4096,
+  n_layers: int = 52,
+  num_heads: int = 32,
+  num_kv_heads: int = 8,
+  d_ff: int = 16384,
+  max_seq: int = 8192,
+  eps: float = 1e-5,
+  rope_theta: float = 10000.0,
+  tie_word_embeddings: bool = false,
+
+  # Mamba configuration
+  d_state: int = 16,
+  d_conv: int = 4,
+  expand: int = 2,
+  n_groups: int = 1,
+
+  # Hybrid pattern: which layers use Mamba vs Attention
+  # Default: alternating pattern or explicit list
+  mamba_layers: [int]? = None,
+  attention_ratio: float = 0.5
+):
+  """
+  NVIDIA Nemotron-H hybrid architecture.
+
+  Key features:
+  - Hybrid Mamba-Transformer architecture
+  - ReLU² activation in MLP (when using dense MLP)
+  - Alternating or configurable layer types
+  - Efficient long-context processing via Mamba layers
+
+  The hybrid approach uses:
+  - Mamba blocks for efficient sequence modeling
+  - Attention blocks for complex reasoning and long-range dependencies
+
+  Maps to: models/nemotron_h/
+  """
+
+  let:
+    d_head = d_model // num_heads
+
+    # Determine which layers are Mamba vs Attention
+    # Default: alternating pattern based on attention_ratio
+    is_mamba_layer = [i for i in range(n_layers)
+      if (mamba_layers and i in mamba_layers)
+         or (not mamba_layers and (i % int(1.0 / (1.0 - attention_ratio))) != 0)]
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+  params:
+    embedding: [vocab_size, d_model]
+
+    # Hybrid blocks - some Mamba, some Attention
+    blocks: [n_layers] x HybridBlock(
+      d_model=d_model,
+      num_heads=num_heads,
+      num_kv_heads=num_kv_heads,
+      d_ff=d_ff,
+      max_seq=max_seq,
+      rope_theta=rope_theta,
+      eps=eps,
+      # Mamba params
+      d_state=d_state,
+      d_conv=d_conv,
+      expand=expand,
+      n_groups=n_groups,
+      # Per-layer type selection
+      use_mamba=is_mamba_layer
+    )
+
+    final_norm: [d_model]
+    lm_head: tied_to(embedding) if tie_word_embeddings else [vocab_size, d_model]
+
+  forward:
+    in: token_ids: [B, T, int32]
+    out: logits: [B, T, vocab_size]
+
+    graph:
+      token_ids -> embedding(embedding) -> x0
+      zeros([B, T, d_model]) -> residual0
+
+      # Initialize Mamba states
+      zeros([B, d_model * expand, d_state]) -> ssm_state0
+      zeros([B, d_model * expand + 2 * n_groups * d_state, d_conv - 1]) -> conv_state0
+
+      # Forward through hybrid blocks
+      (x0, residual0, ssm_state0, conv_state0) -> StackedHybridBlocks(blocks, n_layers)
+        -> (xN, residualN, ssm_stateN, conv_stateN)
+
+      (residualN, xN, final_norm) -> fused_residual_rmsnorm(eps=eps) -> (_, xF, _)
+      (xF, lm_head) -> matmul(transpose=TN) -> logits
+
+  hf_config:
+    architecture: "NemotronHForCausalLM"
+    config_class: "NemotronHConfig"
+
+
+# =============================================================================
+# HybridBlock - Mamba or Attention Block (per-layer selection)
+# =============================================================================
+
+block HybridBlock(
+  d_model: int,
+  num_heads: int,
+  num_kv_heads: int,
+  d_ff: int,
+  max_seq: int,
+  rope_theta: float,
+  eps: float,
+  d_state: int,
+  d_conv: int,
+  expand: int,
+  n_groups: int,
+  use_mamba: bool
+):
+  """
+  Hybrid block that can be either Mamba or Attention based on configuration.
+  """
+
+  # Conditionally instantiate based on use_mamba
+  if use_mamba:
+    # Mamba block structure
+    params:
+      ln_weight: [d_model]
+      in_proj_weight: [d_model * expand + (d_model * expand + 2 * n_groups * d_state) + n_groups, d_model]
+      conv1d_weight: [d_model * expand + 2 * n_groups * d_state, 1, d_conv]
+      conv1d_bias: [d_model * expand + 2 * n_groups * d_state]
+      A_log: [d_model * expand, d_state]
+      D: [d_model * expand]
+      dt_bias: [d_model * expand]
+      norm_weight: [d_model * expand]
+      out_proj_weight: [d_model, d_model * expand]
+
+    forward:
+      inputs:
+        x: [B, T, d_model]
+        residual: [B, T, d_model]
+        ssm_state: [B, d_model * expand, d_state]
+        conv_state: [B, d_model * expand + 2 * n_groups * d_state, d_conv - 1]
+      outputs:
+        out: [B, T, d_model]
+        residual_out: [B, T, d_model]
+        ssm_state_out: [B, d_model * expand, d_state]
+        conv_state_out: [B, d_model * expand + 2 * n_groups * d_state, d_conv - 1]
+
+      graph:
+        # Full Mamba block forward
+        ...
+
+  else:
+    # Attention block structure (similar to DenseTransformerBlock)
+    params:
+      ln1_weight: [d_model]
+      qkv_weight: [num_heads * (d_model // num_heads) + 2 * num_kv_heads * (d_model // num_heads), d_model]
+      out_weight: [d_model, num_heads * (d_model // num_heads)]
+      ln2_weight: [d_model]
+      gate_up_weight: [2 * d_ff, d_model]  # Or up_weight for ReLU²
+      down_weight: [d_model, d_ff]
+
+    forward:
+      inputs:
+        x: [B, T, d_model]
+        residual: [B, T, d_model]
+        ssm_state: [B, d_model * expand, d_state]?    # Passed through unchanged
+        conv_state: [B, d_model * expand + 2 * n_groups * d_state, d_conv - 1]?
+      outputs:
+        out: [B, T, d_model]
+        residual_out: [B, T, d_model]
+        ssm_state_out: [B, d_model * expand, d_state]?
+        conv_state_out: [B, d_model * expand + 2 * n_groups * d_state, d_conv - 1]?
+
+      graph:
+        # Full attention block forward
+        # Pass through Mamba states unchanged
+        ssm_state -> ssm_state_out
+        conv_state -> conv_state_out
+        ...
+
+
+# =============================================================================
+# NemotronH_MoE - Hybrid Mamba-Transformer with MoE
+# =============================================================================
+
+model NemotronH_MoE(
+  vocab_size: int = 256000,
+  d_model: int = 4096,
+  n_layers: int = 52,
+  num_heads: int = 32,
+  num_kv_heads: int = 8,
+  d_ff: int = 4096,
+  num_experts: int = 8,
+  top_k: int = 2,
+  max_seq: int = 8192,
+  eps: float = 1e-5,
+  rope_theta: float = 10000.0,
+
+  # Mamba configuration
+  d_state: int = 16,
+  d_conv: int = 4,
+  expand: int = 2,
+  n_groups: int = 1,
+
+  # Hybrid pattern
+  mamba_layers: [int]? = None,
+  attention_ratio: float = 0.5,
+
+  # MoE configuration
+  use_shared_expert: bool = true,
+  shared_expert_d_ff: int? = None
+):
+  """
+  Nemotron-H with Mixture-of-Experts MLP layers.
+
+  Combines:
+  - Hybrid Mamba-Transformer architecture
+  - Sparse MoE for efficient scaling
+
+  Maps to: models/nemotron_h/ (MoE variant)
+  """
+
+  # Similar structure to NemotronH but with MoE blocks
+  ...
+
+
+# =============================================================================
+# Presets
+# =============================================================================
+
+preset NemotronH_8B:
+  """Nemotron-H 8B configuration."""
+  vocab_size: 256000
+  d_model: 4096
+  n_layers: 52
+  num_heads: 32
+  num_kv_heads: 8
+  d_ff: 16384
+  max_seq: 8192
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  attention_ratio: 0.5
+
+preset NemotronH_47B:
+  """Nemotron-H 47B configuration."""
+  vocab_size: 256000
+  d_model: 8192
+  n_layers: 56
+  num_heads: 64
+  num_kv_heads: 8
+  d_ff: 28672
+  max_seq: 16384
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  attention_ratio: 0.5

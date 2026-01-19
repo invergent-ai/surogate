@@ -1,0 +1,172 @@
+# Standard Library Primitives Index
+# Version: 0.1.0
+
+"""
+Index of all primitive operations in the standard library.
+
+Primitives are the foundational operations of the DSL. Each primitive has:
+- A well-defined mathematical operation
+- Known forward and backward implementations
+- Direct mapping to CUDA kernels
+
+Primitives are NOT user-definable; they form the built-in operation set.
+"""
+
+# =============================================================================
+# Linear Algebra (matmul.module)
+# =============================================================================
+
+export primitive matmul             # General matrix multiplication
+export primitive batched_matmul     # Batched matrix multiplication
+export primitive grouped_gemm       # Grouped GEMM for MoE
+export primitive strided_matmul     # Matmul with strided output
+
+# =============================================================================
+# Normalization (rmsnorm.module)
+# =============================================================================
+
+export primitive rmsnorm            # Root Mean Square Normalization
+export primitive fused_residual_rmsnorm  # Fused residual + RMSNorm
+export primitive qkv_head_rmsnorm   # Per-head Q/K normalization (Qwen3)
+export primitive layernorm          # Standard Layer Normalization
+export primitive group_rmsnorm      # Grouped RMSNorm (Mamba)
+
+# =============================================================================
+# Activations (activations.module)
+# =============================================================================
+
+export primitive swiglu             # SiLU-Gated Linear Unit
+export primitive geglu              # GELU-Gated Linear Unit
+export primitive silu               # Sigmoid Linear Unit (Swish)
+export primitive relu               # Rectified Linear Unit
+export primitive relu2              # Squared ReLU (Nemotron)
+export primitive gelu               # Gaussian Error Linear Unit
+export primitive softmax            # Softmax normalization
+export primitive sigmoid            # Sigmoid activation
+
+# =============================================================================
+# Attention (attention.module)
+# =============================================================================
+
+export primitive flash_attention    # Memory-efficient fused attention
+export primitive flash_attention_varlen  # Variable-length FlashAttention
+export primitive attention_cudnn    # cuDNN-accelerated attention
+export primitive attention_scores   # Manual attention score computation
+export primitive attention_output   # Manual attention output computation
+
+# =============================================================================
+# Position Encoding (rope.module)
+# =============================================================================
+
+export primitive rope               # Rotary Position Embedding
+export primitive rope_fused         # Fused RoPE (on-the-fly sin/cos)
+export primitive rope_quant         # Quantized RoPE output
+export primitive qkv_qk_norm_rope   # Fused QK-Norm + RoPE (Qwen3)
+export primitive precompute_rope_freqs  # Precompute RoPE frequencies
+
+# =============================================================================
+# Embedding (embedding.module)
+# =============================================================================
+
+export primitive embedding          # Token embedding lookup
+export primitive embedding_with_position  # Fused token + position embedding
+export primitive lm_head            # Language model head
+export primitive fused_classifier   # Fused LM head + softmax + loss
+
+# =============================================================================
+# Tensor Operations (tensor_ops.module)
+# =============================================================================
+
+# Element-wise
+export primitive add                # Element-wise addition
+export primitive sub                # Element-wise subtraction
+export primitive mul                # Element-wise multiplication
+export primitive div                # Element-wise division
+export primitive scale              # Scale by constant
+
+# Reductions
+export primitive reduce_sum         # Sum reduction
+export primitive reduce_mean        # Mean reduction
+export primitive reduce_max         # Max reduction
+
+# Shape operations
+export primitive split              # Split tensor
+export primitive concat             # Concatenate tensors
+export primitive view               # Reshape tensor
+export primitive transpose          # Transpose dimensions
+export primitive contiguous         # Make contiguous
+export primitive copy               # Explicit copy
+
+# Initialization
+export primitive zeros              # Zero-filled tensor
+export primitive ones               # One-filled tensor
+export primitive fill_normal        # Normal distribution fill
+
+# Type conversion
+export primitive convert_dtype      # Convert data type
+
+# Gradient utilities
+export primitive global_norm        # Global gradient norm
+export primitive clip_grad_norm     # Gradient clipping
+
+# =============================================================================
+# Bias Operations (bias.module)
+# =============================================================================
+
+export primitive bias_add           # Add bias vector
+export primitive fused_bias_gelu    # Fused bias + GELU
+export primitive fused_bias_dropout # Fused bias + dropout
+
+# =============================================================================
+# MoE Operations (moe.module)
+# =============================================================================
+
+export primitive moe_router         # Expert routing
+export primitive moe_router_topk    # Top-K selection
+export primitive moe_permute        # Token-to-expert permutation
+export primitive moe_unpermute      # Expert-to-token unpermutation
+export primitive moe_experts        # Grouped expert computation
+export primitive moe_aux_loss       # Load balancing loss
+export primitive moe_shared_expert  # Shared expert computation
+
+# =============================================================================
+# Quantization (quantization.module)
+# =============================================================================
+
+# FP8 (SM89+)
+export primitive quantize_fp8       # Per-tensor FP8 quantization
+export primitive quantize_fp8_delayed  # Delayed scaling FP8
+export primitive dequantize_fp8     # FP8 dequantization
+export primitive quantize_fp8_per_block  # Per-block FP8 (QLoRA)
+export primitive dequantize_fp8_per_block  # Per-block FP8 dequant
+
+# FP4 (SM100+)
+export primitive quantize_fp4       # Two-level block FP4
+export primitive quantize_fp4_auto  # Auto-scale FP4
+export primitive quantize_fp4_stochastic  # Stochastic rounding FP4
+export primitive quantize_fp4_4o6   # Four-over-six adaptive FP4
+export primitive dequantize_fp4     # FP4 dequantization
+export primitive quantize_fp4_weight  # FP4 weight quantization
+export primitive quantize_fp4_weight_2d  # 2D block FP4 weights
+export primitive fp4_alpha_scale    # FP4 alpha correction
+export primitive compute_fp4_alpha  # Compute FP4 alpha
+
+# Hadamard
+export primitive hadamard_transform # Random Hadamard Transform
+
+# BitsAndBytes
+export primitive quantize_bnb_nf4   # NF4 quantization
+export primitive quantize_bnb_double_quant  # Double quantization
+export primitive dequantize_bnb_nf4 # NF4 dequantization
+
+# =============================================================================
+# Mamba SSM (mamba.module)
+# =============================================================================
+
+export primitive selective_scan     # Mamba selective scan (S6)
+export primitive causal_conv1d      # Causal 1D convolution
+export primitive causal_conv1d_update  # Single-step conv update
+export primitive mamba_split_proj   # Split Mamba projection
+export primitive mamba_split_conv   # Split conv output
+export primitive silu_mul           # SiLU gating
+export primitive exp_neg            # Negative exponential

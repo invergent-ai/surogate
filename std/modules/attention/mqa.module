@@ -1,0 +1,100 @@
+# Multi-Query Attention Module
+# Maps to: csrc/src/modules/primitives/attention.h
+
+"""
+Multi-Query Attention (MQA) module.
+Extreme GQA variant where num_kv_heads = 1.
+"""
+
+import std.primitives.{flash_attention, rope, matmul}
+
+# =============================================================================
+# MultiQueryAttention - MQA
+# =============================================================================
+
+module MultiQueryAttention(
+  d_model: int,
+  num_heads: int,
+  max_seq: int,
+  rope_theta: float = 10000.0
+):
+  """
+  Multi-Query Attention (MQA).
+
+  All query heads share a single key-value head.
+  Maximum KV cache compression but may reduce quality.
+
+  Equivalent to GQA with num_kv_heads = 1.
+
+  Used in: Falcon, PaLM (original)
+
+  Maps to: modules/primitives/AttentionModule (num_kv_heads=1)
+  """
+
+  let:
+    d_head = d_model // num_heads
+    q_dim = num_heads * d_head
+    kv_dim = d_head  # Single KV head
+    qkv_dim = q_dim + 2 * kv_dim
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+  params:
+    qkv_weight: [qkv_dim, d_model]
+    out_weight: [d_model, q_dim]
+
+  forward:
+    in: [B, T, d_model]
+    out: [B, T, d_model]
+
+    graph:
+      # QKV projection
+      (in, qkv_weight) -> matmul(transpose=TN) -> qkv
+      qkv -> split([q_dim, kv_dim, kv_dim], dim=-1) -> (q_flat, k_flat, v_flat)
+
+      # Reshape Q to [B, num_heads, T, d_head]
+      q_flat -> view([B, T, num_heads, d_head])
+        -> transpose(1, 2) -> q
+
+      # Reshape K, V to [B, 1, T, d_head] (single head)
+      k_flat -> view([B, T, 1, d_head])
+        -> transpose(1, 2) -> k
+      v_flat -> view([B, T, 1, d_head])
+        -> transpose(1, 2) -> v
+
+      # RoPE
+      (q, k) -> rope(base=rope_theta) -> (q_rope, k_rope)
+
+      # Flash Attention (broadcasts single K, V to all Q heads)
+      (q_rope, k_rope, v) -> flash_attention(causal=true) -> (attn_out, lse)
+
+      # Reshape and output projection
+      attn_out -> transpose(1, 2) -> view([B, T, q_dim]) -> attn_flat
+      (attn_flat, out_weight) -> matmul(transpose=TN) -> out
+
+    save: [in, q, k, v, q_rope, k_rope, attn_out, lse]
+
+  backward:
+    d_out: [B, T, d_model]
+    d_in: [B, T, d_model]
+
+    graph:
+      # Standard backward pass
+      (d_out, out_weight) -> matmul(transpose=NN) -> d_attn_flat
+      (saved.attn_flat, d_out) -> matmul(transpose=TN, accumulate=true) -> d_out_weight
+
+      d_attn_flat -> view([B, T, num_heads, d_head]) -> transpose(1, 2) -> d_attn_out
+
+      (d_attn_out, saved.q_rope, saved.k_rope, saved.v, saved.attn_out, saved.lse)
+        -> flash_attention_backward() -> (d_q_rope, d_k_rope, d_v)
+
+      (d_q_rope, d_k_rope) -> rope_backward(base=rope_theta) -> (d_q, d_k)
+
+      d_q -> transpose(1, 2) -> view([B, T, q_dim]) -> d_q_flat
+      d_k -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_k_flat
+      d_v -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_v_flat
+
+      (d_q_flat, d_k_flat, d_v_flat) -> concat(dim=-1) -> d_qkv
+      (d_qkv, qkv_weight) -> matmul(transpose=NN) -> d_in
+      (saved.in, d_qkv) -> matmul(transpose=TN, accumulate=true) -> d_qkv_weight

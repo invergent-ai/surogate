@@ -1,0 +1,201 @@
+# Dense Transformer Block
+# Maps to: csrc/src/modules/composite/dense_transformer_block.h
+
+"""
+Dense (non-MoE) transformer blocks.
+Standard pre-norm residual architecture used in LLaMA, Qwen, Mistral.
+"""
+
+import std.primitives.{fused_residual_rmsnorm, matmul}
+import std.modules.attention.gqa.{CausalSelfAttention}
+import std.modules.mlp.{SwiGLU_MLP}
+import std.modules.rmsnorm.{RMSNormParams}
+
+# =============================================================================
+# DenseTransformerBlock - Standard Pre-Norm Block
+# =============================================================================
+
+block DenseTransformerBlock(
+  d_model: int,
+  num_heads: int,
+  num_kv_heads: int,
+  d_ff: int,
+  max_seq: int,
+  rope_theta: float = 10000.0,
+  eps: float = 1e-6,
+  use_qk_norm: bool = false
+):
+  """
+  Standard dense transformer block with pre-norm residual connections.
+
+  Architecture:
+    residual_mid = residual + prev_output
+    ln1_out = RMSNorm(residual_mid)
+    attn_out = Attention(ln1_out)
+
+    residual_out = residual_mid + attn_out
+    ln2_out = RMSNorm(residual_out)
+    mlp_out = MLP(ln2_out)
+
+  Uses fused residual+RMSNorm kernels for memory efficiency.
+
+  Maps to: modules/composite/DenseTransformerBlock
+  """
+
+  let:
+    d_head = d_model // num_heads
+    q_dim = num_heads * d_head
+    kv_dim = num_kv_heads * d_head
+    qkv_dim = q_dim + 2 * kv_dim
+
+    constraint:
+      d_model % num_heads == 0, "d_model must be divisible by num_heads"
+      num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+
+  params:
+    # Layer norm 1 (pre-attention)
+    ln1_weight: [d_model]
+
+    # Attention
+    qkv_weight: [qkv_dim, d_model]
+    out_weight: [d_model, q_dim]
+    q_norm_weight: [d_head] if use_qk_norm
+    k_norm_weight: [d_head] if use_qk_norm
+
+    # Layer norm 2 (pre-MLP)
+    ln2_weight: [d_model]
+
+    # MLP (SwiGLU)
+    gate_up_weight: [2 * d_ff, d_model]
+    down_weight: [d_model, d_ff]
+
+  forward:
+    inputs:
+      x: [B, T, d_model]           # Previous layer's MLP output
+      residual: [B, T, d_model]    # Running residual stream
+    outputs:
+      out: [B, T, d_model]         # This layer's MLP output
+      residual_out: [B, T, d_model] # Updated residual
+
+    graph:
+      # ===== Attention sublayer =====
+      # Fused residual + RMSNorm
+      (residual, x, ln1_weight) -> fused_residual_rmsnorm(eps=eps)
+        -> (residual_mid, ln1_out, ln1_rstd)
+
+      # QKV projection
+      (ln1_out, qkv_weight) -> matmul(transpose=TN) -> qkv
+      qkv -> split([q_dim, kv_dim, kv_dim], dim=-1) -> (q_flat, k_flat, v_flat)
+
+      # Reshape to heads
+      q_flat -> view([B, T, num_heads, d_head]) -> transpose(1, 2) -> q
+      k_flat -> view([B, T, num_kv_heads, d_head]) -> transpose(1, 2) -> k
+      v_flat -> view([B, T, num_kv_heads, d_head]) -> transpose(1, 2) -> v
+
+      # Optional QK-norm + RoPE
+      if use_qk_norm:
+        (q, k, q_norm_weight, k_norm_weight) -> qkv_qk_norm_rope(
+          base=rope_theta, eps=eps
+        ) -> (q_rope, k_rope, q_rstd, k_rstd)
+      else:
+        (q, k) -> rope(base=rope_theta) -> (q_rope, k_rope)
+
+      # Flash Attention
+      (q_rope, k_rope, v) -> flash_attention(causal=true) -> (attn_out_heads, lse)
+
+      # Output projection
+      attn_out_heads -> transpose(1, 2) -> view([B, T, q_dim]) -> attn_flat
+      (attn_flat, out_weight) -> matmul(transpose=TN) -> attn_out
+        @hook(AfterAttnOutProjection)
+        @adapter(lora)
+
+      # ===== MLP sublayer =====
+      # Fused residual + RMSNorm
+      (residual_mid, attn_out, ln2_weight) -> fused_residual_rmsnorm(eps=eps)
+        -> (residual_out, ln2_out, ln2_rstd)
+
+      # MLP forward
+      (ln2_out, gate_up_weight) -> matmul(transpose=TN) -> gate_up
+      gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+      (gate, up) -> swiglu() -> mlp_hidden
+      (mlp_hidden, down_weight) -> matmul(transpose=TN) -> out
+        @hook(AfterMLPDownProjection)
+        @adapter(lora)
+
+    save: [
+      residual, ln1_out, ln1_rstd,
+      q, k, v, q_rope, k_rope, attn_out_heads, lse, attn_out,
+      residual_mid, ln2_out, ln2_rstd
+    ]
+    save: [q_rstd, k_rstd] if use_qk_norm
+    recompute: [qkv, q_flat, k_flat, v_flat, attn_flat, gate_up, gate, up, mlp_hidden]
+
+  backward:
+    inputs:
+      d_out: [B, T, d_model]
+      d_residual: [B, T, d_model]
+    outputs:
+      d_x: [B, T, d_model]
+      d_residual_out: [B, T, d_model]
+
+    graph:
+      # ===== MLP backward =====
+      # Recompute MLP activations
+      recompute:
+        (saved.ln2_out, gate_up_weight) -> matmul(transpose=TN) -> gate_up
+        gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
+        (gate, up) -> swiglu() -> mlp_hidden
+
+      # Down projection backward
+      (d_out, down_weight) -> matmul(transpose=NN) -> d_mlp_hidden
+      (mlp_hidden, d_out) -> matmul(transpose=TN, accumulate=true) -> d_down_weight
+
+      # SwiGLU backward
+      (d_mlp_hidden, gate, up) -> swiglu_backward() -> (d_gate, d_up)
+      (d_gate, d_up) -> concat(dim=-1) -> d_gate_up
+
+      # Up projection backward
+      (d_gate_up, gate_up_weight) -> matmul(transpose=NN) -> d_ln2_out
+      (saved.ln2_out, d_gate_up) -> matmul(transpose=TN, accumulate=true) -> d_gate_up_weight
+
+      # Fused residual+RMSNorm backward
+      (d_ln2_out, d_residual, saved.residual_mid, ln2_weight, saved.ln2_rstd)
+        -> fused_residual_rmsnorm_backward()
+        -> (d_residual_mid, d_attn_out, d_ln2_weight)
+
+      # ===== Attention backward =====
+      # Output projection backward
+      (d_attn_out, out_weight) -> matmul(transpose=NN) -> d_attn_flat
+      (saved.attn_flat, d_attn_out) -> matmul(transpose=TN, accumulate=true) -> d_out_weight
+
+      d_attn_flat -> view([B, T, num_heads, d_head]) -> transpose(1, 2) -> d_attn_out_heads
+
+      # Flash attention backward
+      (d_attn_out_heads, saved.q_rope, saved.k_rope, saved.v,
+       saved.attn_out_heads, saved.lse)
+        -> flash_attention_backward() -> (d_q_rope, d_k_rope, d_v)
+
+      # RoPE / QK-norm backward
+      if use_qk_norm:
+        (d_q_rope, d_k_rope, saved.q, saved.k, q_norm_weight, k_norm_weight,
+         saved.q_rstd, saved.k_rstd)
+          -> qkv_qk_norm_rope_backward()
+          -> (d_q, d_k, d_q_norm_weight, d_k_norm_weight)
+      else:
+        (d_q_rope, d_k_rope) -> rope_backward(base=rope_theta) -> (d_q, d_k)
+
+      # Reshape gradients
+      d_q -> transpose(1, 2) -> view([B, T, q_dim]) -> d_q_flat
+      d_k -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_k_flat
+      d_v -> transpose(1, 2) -> view([B, T, kv_dim]) -> d_v_flat
+
+      (d_q_flat, d_k_flat, d_v_flat) -> concat(dim=-1) -> d_qkv
+
+      # QKV projection backward
+      (d_qkv, qkv_weight) -> matmul(transpose=NN) -> d_ln1_out
+      (saved.ln1_out, d_qkv) -> matmul(transpose=TN, accumulate=true) -> d_qkv_weight
+
+      # First fused residual+RMSNorm backward
+      (d_ln1_out, d_residual_mid, saved.residual, ln1_weight, saved.ln1_rstd)
+        -> fused_residual_rmsnorm_backward()
+        -> (d_residual_out, d_x, d_ln1_weight)
