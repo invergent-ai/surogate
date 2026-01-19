@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_MODELS_QWEN2_TRANSFORMER_BLOCK_H
 
 #include "modules/composite/transformer_block.h"
+#include "modules/primitives/mlp.h"
 #include "models/qwen25/attention.h"
 #include "models/qwen25/rmsnorm.h"
 
@@ -17,14 +18,14 @@ namespace modules {
  *
  * Composes:
  * - Qwen2AttentionModule (GQA with RoPE, optional sliding window)
- * - SwiGLUModule (standard activation)
+ * - MLPModule<SwiGLUModule> (gate+up -> SwiGLU -> down)
  * - Qwen2FusedResidualRMSNormModule (fused residual + norm)
  *
  * Extends LlamaTransformerBlock with sliding window attention support.
  */
 using Qwen2TransformerBlock = DenseTransformerBlock<
     Qwen2AttentionModule,
-    SwiGLUModule,
+    MLPModule<SwiGLUModule>,
     Qwen2FusedResidualRMSNormModule
 >;
 

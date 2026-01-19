@@ -5,7 +5,10 @@
 #ifndef SUROGATE_SRC_MODULES_MODEL_CONFIG_H
 #define SUROGATE_SRC_MODULES_MODEL_CONFIG_H
 
+#include <algorithm>
+#include <cctype>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -13,6 +16,7 @@
 #include "fp8_scaling_config.h"
 #include "models/qwen25/config.h"
 #include "models/qwen3moe/config.h"
+#include "models/nemotron_h/config.h"
 #include "training/runtime_options.h"
 #include "utilities/dtype.h"
 
@@ -35,7 +39,8 @@ enum class ActivationType {
     GeGLU,      ///< GELU-gated linear unit
     ReLU,       ///< Rectified Linear Unit
     GeLU,       ///< Gaussian Error Linear Unit
-    SiLU        ///< Sigmoid Linear Unit (Swish)
+    SiLU,       ///< Sigmoid Linear Unit (Swish)
+    ReLU2       ///< ReLU^2 (Nemotron-H)
 };
 
 /**
@@ -56,6 +61,13 @@ enum class AttentionType {
 };
 
 /**
+ * @brief Helper to check if an activation uses gated (2x) MLP up projection.
+ */
+inline constexpr bool is_gated_activation(ActivationType type) {
+    return type == ActivationType::SwiGLU || type == ActivationType::GeGLU;
+}
+
+/**
  * @brief MoE configuration for MoE/Hybrid architectures
  */
 struct MoEConfig {
@@ -67,6 +79,12 @@ struct MoEConfig {
     float router_z_loss_coef = 0.001f;   ///< Router z-loss (logit regularization) coefficient
     bool router_jitter = false;     ///< Add noise during routing for training stability
     float capacity_factor = 1.25f;  ///< Expert capacity factor for load balancing
+
+    // Nemotron/DeepSeek-style router options
+    bool use_sigmoid = false;       ///< Use sigmoid scores (instead of softmax) before top-k
+    float routed_scaling_factor = 1.0f; ///< Scale factor for routed expert weights
+    int n_group = 1;                ///< Number of routing groups (Nemotron)
+    int topk_group = 1;             ///< Number of groups selected per token
 
     // Qwen3 MoE-style layer configuration
     int decoder_sparse_step = 1;    ///< MoE layer frequency: MoE every N layers (1 = all MoE)
@@ -80,6 +98,9 @@ struct MoEConfig {
  */
 enum class BlockType {
     Dense,       ///< Standard dense transformer block
+    Attention,   ///< Attention-only block (single norm + attention + residual)
+    MLP,         ///< MLP-only block (single norm + MLP + residual)
+    Mamba,       ///< Mamba/SSM block (single norm + SSM + residual)
     MoE,         ///< Mixture of Experts block
     Conv,        ///< Convolutional block (for LFM2)
     SwitchMoE    ///< Switch Transformer style (top-1 routing)
@@ -106,6 +127,18 @@ struct LayerOverride {
         override.num_experts = experts;
         override.top_k = k;
         return override;
+    }
+
+    static LayerOverride attention(int idx) {
+        return LayerOverride{idx, BlockType::Attention, false};
+    }
+
+    static LayerOverride mlp(int idx) {
+        return LayerOverride{idx, BlockType::MLP, false};
+    }
+
+    static LayerOverride mamba(int idx) {
+        return LayerOverride{idx, BlockType::Mamba, false};
     }
 
     static LayerOverride switch_moe(int idx, int experts = 128) {
@@ -149,6 +182,18 @@ struct ModelConfig : public PretrainedConfig {
     bool use_sliding_window = false;     ///< Sliding window attention (Mistral)
     int sliding_window_size = 4096;      ///< Size of sliding window
 
+    // Mamba / SSM configuration (Nemotron-H)
+    int MambaNumHeads = 0;
+    int MambaHeadDim = 0;
+    int MambaSsmStateSize = 0;
+    int MambaConvKernel = 0;
+    int MambaNGroups = 1;
+    int MambaChunkSize = 0;
+    int MambaIntermediateSize = 0; ///< Optional explicit Mamba intermediate size (0 = use IntermediateSize)
+    bool MambaUseBias = false;
+    bool MambaUseConvBias = false;
+    ActivationType MambaActivation = ActivationType::SiLU;
+
     // MoE convenience fields (copied from moe_config for direct access)
     // These are populated by from_pretrained_config when moe_config is set
     int NumExperts = 0;              ///< Number of experts (0 = dense model)
@@ -158,6 +203,40 @@ struct ModelConfig : public PretrainedConfig {
     // Extended RoPE configuration
     float rope_scaling_factor = 1.0f;    ///< RoPE scaling for longer contexts
     std::string rope_type = "default";   ///< RoPE type: "default", "linear", "dynamic", "yarn"
+
+    /**
+     * @brief MLP up-projection multiplier (2 for gated activations, 1 for standard)
+     */
+    [[nodiscard]] int mlp_up_factor() const {
+        return is_gated_activation(activation_type) ? 2 : 1;
+    }
+
+    /**
+     * @brief MLP up-projection row count (mlp_up_factor * IntermediateSize)
+     */
+    [[nodiscard]] int mlp_up_rows() const {
+        return mlp_up_factor() * IntermediateSize;
+    }
+
+    /**
+     * @brief Mamba intermediate dimension (can differ from MLP)
+     */
+    [[nodiscard]] int mamba_dim() const {
+        return (MambaIntermediateSize > 0) ? MambaIntermediateSize : IntermediateSize;
+    }
+
+    [[nodiscard]] int mamba_conv_dim() const {
+        return mamba_dim() + 2 * std::max(1, MambaNGroups) * MambaSsmStateSize;
+    }
+
+    [[nodiscard]] int mamba_proj_size() const {
+        return mamba_dim() + mamba_conv_dim() + MambaNumHeads;
+    }
+
+    [[nodiscard]] int mamba_group_size() const {
+        const int groups = std::max(1, MambaNGroups);
+        return mamba_dim() / groups;
+    }
 
     /**
      * @brief Construct from existing PretrainedConfig
@@ -232,6 +311,100 @@ struct ModelConfig : public PretrainedConfig {
                 config.NumExpertsPerTok = moe_cfg->NumExpertsPerTok;
                 config.MoeIntermediateSize = moe_cfg->MoeIntermediateSize;
             }
+        }
+
+        // Nemotron-H hybrid configuration (attention / MLP / Mamba)
+        if (const auto* nemo_cfg = dynamic_cast<const NemotronHConfig*>(&base)) {
+            auto normalize = [](std::string value) {
+                std::transform(value.begin(), value.end(), value.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return value;
+            };
+
+            auto parse_activation = [&](const std::string& name) -> ActivationType {
+                const std::string key = normalize(name);
+                if (key == "silu" || key == "swish") return ActivationType::SiLU;
+                if (key == "relu2") return ActivationType::ReLU2;
+                if (key == "relu") return ActivationType::ReLU;
+                if (key == "gelu") return ActivationType::GeLU;
+                if (key == "swiglu") return ActivationType::SwiGLU;
+                if (key == "geglu") return ActivationType::GeGLU;
+                throw std::runtime_error("Unknown activation '" + name + "' for Nemotron-H");
+            };
+
+            config.architecture = ArchitectureType::Hybrid;
+            config.activation_type = parse_activation(nemo_cfg->MlpHiddenAct);
+
+            if (!nemo_cfg->MambaHiddenAct.empty()) {
+                config.MambaActivation = parse_activation(nemo_cfg->MambaHiddenAct);
+            }
+            // Mamba kernels currently support SiLU/Swish activation only.
+            if (config.MambaActivation != ActivationType::SiLU) {
+                throw std::runtime_error("Nemotron-H: mamba_hidden_act must be silu/swish in current modular path");
+            }
+
+            // Store Mamba-specific hyperparameters for kernel/weight setup.
+            config.MambaNumHeads = nemo_cfg->MambaNumHeads;
+            config.MambaHeadDim = nemo_cfg->MambaHeadDim;
+            config.MambaSsmStateSize = nemo_cfg->SsmStateSize;
+            config.MambaConvKernel = nemo_cfg->ConvKernel;
+            config.MambaNGroups = std::max(1, nemo_cfg->NGroups);
+            config.MambaChunkSize = nemo_cfg->ChunkSize;
+            config.MambaUseBias = nemo_cfg->UseBias;
+            config.MambaUseConvBias = nemo_cfg->UseConvBias;
+            const int mamba_intermediate = nemo_cfg->MambaNumHeads * nemo_cfg->MambaHeadDim;
+            if (mamba_intermediate > 0) {
+                config.MambaIntermediateSize = mamba_intermediate;
+            }
+
+            config.UseQKVBias = nemo_cfg->AttentionBias;
+            config.use_qk_norm = false;
+            config.Rope = RoPEConfig::none();
+
+            // Nemotron-H MoE configuration (optional)
+            if (nemo_cfg->NRoutedExperts > 0) {
+                MoEConfig moe;
+                moe.num_experts = nemo_cfg->NRoutedExperts;
+                moe.top_k = nemo_cfg->NumExpertsPerTok > 0 ? nemo_cfg->NumExpertsPerTok : 1;
+                moe.moe_intermediate_size = nemo_cfg->MoeIntermediateSize;
+                moe.use_shared_expert = nemo_cfg->NSharedExperts > 0;
+                moe.shared_expert_size = nemo_cfg->MoeSharedExpertIntermediateSize;
+                moe.norm_topk_prob = nemo_cfg->NormTopkProb;
+                moe.router_aux_loss_coef = nemo_cfg->RouterAuxLossCoef;
+                moe.router_z_loss_coef = nemo_cfg->RouterZLossCoef;
+                moe.routed_scaling_factor = nemo_cfg->RoutedScalingFactor;
+                moe.n_group = std::max(1, nemo_cfg->NGroup);
+                moe.topk_group = std::max(1, nemo_cfg->TopkGroup);
+                moe.use_sigmoid = true;  // Nemotron-H uses sigmoid routing scores
+                config.moe_config = moe;
+
+                // Also populate convenience fields
+                config.NumExperts = moe.num_experts;
+                config.NumExpertsPerTok = moe.top_k;
+                config.MoeIntermediateSize = moe.moe_intermediate_size > 0 ? moe.moe_intermediate_size : config.IntermediateSize;
+            }
+
+            const auto& layers = nemo_cfg->LayersBlockType;
+            config.layer_overrides.clear();
+            config.layer_overrides.reserve(static_cast<size_t>(config.NumLayers));
+            bool has_mamba = false;
+            for (int i = 0; i < config.NumLayers; ++i) {
+                std::string type = (i < static_cast<int>(layers.size())) ? layers[i] : "attention";
+                type = normalize(type);
+                if (type == "mamba") {
+                    config.layer_overrides.push_back(LayerOverride::mamba(i));
+                    has_mamba = true;
+                } else if (type == "moe") {
+                    const int experts = config.NumExperts > 0 ? config.NumExperts : 8;
+                    const int top_k = config.NumExpertsPerTok > 0 ? config.NumExpertsPerTok : 2;
+                    config.layer_overrides.push_back(LayerOverride::moe(i, experts, top_k));
+                } else if (type == "mlp") {
+                    config.layer_overrides.push_back(LayerOverride::mlp(i));
+                } else {
+                    config.layer_overrides.push_back(LayerOverride::attention(i));
+                }
+            }
+            (void)has_mamba;
         }
 
         return config;

@@ -27,6 +27,7 @@
 #include "kernels/kernels.h"
 #include "models/llama/config.h"
 #include "models/registry.h"
+#include "modules/mlp_utils.h"
 #include "modules/weights/weight_manager_helpers.h"
 #include "modules/weights/weight_mapping.h"
 #include "utilities/comm.h"
@@ -43,11 +44,24 @@ void ModularWeightManager<Block>::iterate_tensors(
     const auto& cfg = mConfig.block_config;
     long C = cfg.hidden_size;
     long D = cfg.intermediate_size;
+    long M = mlp_up_rows(cfg);
     long HS = cfg.head_size;
     long HQ = cfg.num_query_heads;
     long HKV = cfg.num_kv_heads;
     long qkv_rows = HS * (HQ + 2 * HKV);
     long q_rows = HS * HQ;
+    long mamba_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_dim(); }) return cfg.mamba_dim();
+        return 0;
+    }();
+    long mamba_conv_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_conv_dim(); }) return cfg.mamba_conv_dim();
+        return 0;
+    }();
+    long mamba_proj = [&]() -> long {
+        if constexpr (requires { cfg.mamba_proj_size(); }) return cfg.mamba_proj_size();
+        return 0;
+    }();
 
     auto shard = [&](const Tensor& t, const std::vector<long>& global_shape) -> TensorShard {
         if (mConfig.num_shards == 1) return TensorShard(t);
@@ -97,38 +111,84 @@ void ModularWeightManager<Block>::iterate_tensors(
 
         // MLP weights - only for dense blocks
         if constexpr (has_mlp_weights<BlockWeights>::value) {
-            callback(prefix + ".mlp.up.weight", shard(block.mlp_up_weight, {2 * D, C}));
+            callback(prefix + ".mlp.up.weight", shard(block.mlp_up_weight, {M, C}));
             callback(prefix + ".mlp.down_proj.weight", shard(block.mlp_down_weight, {C, D}));
+        }
+
+        // Mamba weights (optional for hybrid blocks)
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (block.mamba.has_value()) {
+                const auto& mw = *block.mamba;
+                callback(prefix + ".mamba.in_proj.weight", shard(mw.in_proj_weight, {mamba_proj, C}));
+                if (mw.in_proj_bias.has_value()) {
+                    callback(prefix + ".mamba.in_proj.bias", shard(mw.in_proj_bias.value(), {mamba_proj}));
+                }
+                callback(prefix + ".mamba.out_proj.weight", shard(mw.out_proj_weight, {C, mamba_dim}));
+                if (mw.out_proj_bias.has_value()) {
+                    callback(prefix + ".mamba.out_proj.bias", shard(mw.out_proj_bias.value(), {C}));
+                }
+                callback(prefix + ".mamba.conv1d.weight", shard(mw.conv1d_weight, {mamba_conv_dim, 1, cfg.mamba_conv_kernel}));
+                if (mw.conv1d_bias.has_value()) {
+                    callback(prefix + ".mamba.conv1d.bias", shard(mw.conv1d_bias.value(), {mamba_conv_dim}));
+                }
+                callback(prefix + ".mamba.A_log", shard(mw.A_log, {cfg.mamba_num_heads}));
+                callback(prefix + ".mamba.D", shard(mw.D, {cfg.mamba_num_heads}));
+                callback(prefix + ".mamba.dt_bias", shard(mw.dt_bias, {cfg.mamba_num_heads}));
+                callback(prefix + ".mamba.norm.weight", shard(mw.norm_weight, {mamba_dim}));
+            }
         }
 
         // MoE-specific weights (router, experts) - only for MoE blocks
         if constexpr (has_moe_weights<BlockWeights>::value) {
+            if (!mConfig.is_layer_moe(i)) {
+                continue;
+            }
             const auto& bcfg = mConfig.block_config;
             int num_experts = bcfg.num_experts;
+            const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
+            const long moe_M = static_cast<long>(mlp_up_factor(bcfg)) * moe_D;
             callback(prefix + ".mlp.router.gate.weight", shard(block.router.gate, {num_experts, C}));
 
             if (block.experts.use_batched) {
                 callback(prefix + ".mlp.experts.gate_up_proj.weight",
-                         shard(block.experts.gate_up_proj, {num_experts, 2 * D, C}));
+                         shard(block.experts.gate_up_proj, {num_experts, moe_M, C}));
                 callback(prefix + ".mlp.experts.down_proj.weight",
-                         shard(block.experts.down_proj, {num_experts, C, D}));
+                         shard(block.experts.down_proj, {num_experts, C, moe_D}));
             } else {
                 for (int e = 0; e < static_cast<int>(block.experts.experts.size()); ++e) {
                     std::string exp_prefix = prefix + ".mlp.experts." + std::to_string(e);
                     auto& expert = block.experts.experts[e];
-                    callback(exp_prefix + ".gate_proj.weight", shard(expert.gate_proj, {D, C}));
-                    callback(exp_prefix + ".up_proj.weight", shard(expert.up_proj, {D, C}));
-                    callback(exp_prefix + ".down_proj.weight", shard(expert.down_proj, {C, D}));
+                    callback(exp_prefix + ".gate_proj.weight", shard(expert.gate_proj, {moe_D, C}));
+                    callback(exp_prefix + ".up_proj.weight", shard(expert.up_proj, {moe_D, C}));
+                    callback(exp_prefix + ".down_proj.weight", shard(expert.down_proj, {C, moe_D}));
                 }
             }
 
             if (block.shared_expert.has_value()) {
                 int shared_D = bcfg.shared_expert_intermediate > 0 ?
-                               bcfg.shared_expert_intermediate : static_cast<int>(D);
-                callback(prefix + ".mlp.shared_expert.gate_proj.weight",
-                         shard(block.shared_expert->gate_proj, {shared_D, C}));
-                callback(prefix + ".mlp.shared_expert.up_proj.weight",
-                         shard(block.shared_expert->up_proj, {shared_D, C}));
+                               bcfg.shared_expert_intermediate : static_cast<int>(moe_D);
+                const bool shared_gated = mlp_up_factor(bcfg) == 2;
+                const std::size_t elem_size = get_dtype_size(block.shared_expert->gate_proj.DType);
+                if (shared_gated) {
+                    Tensor up_slice = block.shared_expert->gate_proj;
+                    up_slice.Rank = 2;
+                    up_slice.Sizes[0] = shared_D;
+                    up_slice.Sizes[1] = C;
+                    callback(prefix + ".mlp.shared_expert.up_proj.weight",
+                             shard(up_slice, {shared_D, C}));
+
+                    Tensor gate_slice = block.shared_expert->gate_proj;
+                    gate_slice.Rank = 2;
+                    gate_slice.Sizes[0] = shared_D;
+                    gate_slice.Sizes[1] = C;
+                    gate_slice.Data = block.shared_expert->gate_proj.Data +
+                                      static_cast<std::size_t>(shared_D) * static_cast<std::size_t>(C) * elem_size;
+                    callback(prefix + ".mlp.shared_expert.gate_proj.weight",
+                             shard(gate_slice, {shared_D, C}));
+                } else {
+                    callback(prefix + ".mlp.shared_expert.up_proj.weight",
+                             shard(block.shared_expert->gate_proj, {shared_D, C}));
+                }
                 callback(prefix + ".mlp.shared_expert.down_proj.weight",
                          shard(block.shared_expert->down_proj, {C, shared_D}));
             }
@@ -146,9 +206,11 @@ void ModularWeightManager<Block>::random_init(int seed, NCCLCommunicator& comm) 
 
     float scale = 0.02f;
     float residual_scale = 1.0f / std::sqrt(2.0f * static_cast<float>(mConfig.num_layers));
+    const auto& cfg = mConfig.block_config;
 
     for (int l = 0; l < mConfig.num_layers; ++l) {
         auto local_seeds = rng.generate(comm.rank(), l);
+        auto mamba_seeds = rng.generate(comm.rank(), l + 7919);
         auto& layer = mMasterBlocks[l];
 
         fill_constant(layer.ln1.weight, 1.f, layer.ln1.weight.nelem(), nullptr);
@@ -171,15 +233,61 @@ void ModularWeightManager<Block>::random_init(int seed, NCCLCommunicator& comm) 
             fill_zero(layer.attention.qkv_bias.value(), nullptr);
         }
 
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (layer.mamba.has_value()) {
+                auto& mw = *layer.mamba;
+                fill_normal(mw.in_proj_weight, mw.in_proj_weight.nelem(), 0.f, scale, seed, mamba_seeds[0], nullptr);
+                if (mw.in_proj_bias.has_value()) {
+                    fill_zero(mw.in_proj_bias.value(), nullptr);
+                }
+                fill_normal(mw.conv1d_weight, mw.conv1d_weight.nelem(), 0.f, scale, seed, mamba_seeds[1], nullptr);
+                if (mw.conv1d_bias.has_value()) {
+                    fill_zero(mw.conv1d_bias.value(), nullptr);
+                }
+                fill_constant(mw.norm_weight, 1.f, mw.norm_weight.nelem(), nullptr);
+
+                // Initialize SSM parameters
+                if (mw.A_log.Data) {
+                    std::vector<float> h_A(cfg.mamba_num_heads);
+                    for (int i = 0; i < cfg.mamba_num_heads; ++i) {
+                        h_A[i] = std::log(static_cast<float>(i + 1));
+                    }
+                    CUDA_CHECK(cudaMemcpy(mw.A_log.Data, h_A.data(), h_A.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+                if (mw.D.Data) {
+                    fill_constant(mw.D, 1.f, mw.D.nelem(), nullptr);
+                }
+                if (mw.dt_bias.Data) {
+                    fill_constant(mw.dt_bias, 1.f, mw.dt_bias.nelem(), nullptr);
+                }
+            }
+        }
+
         if (mConfig.init_projections_to_zero) {
             fill_zero(layer.attention.out_weight, nullptr);
             if constexpr (has_mlp_weights<BlockWeights>::value) {
                 fill_zero(layer.mlp_down_weight, nullptr);
             }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (layer.mamba.has_value()) {
+                    fill_zero(layer.mamba->out_proj_weight, nullptr);
+                    if (layer.mamba->out_proj_bias.has_value()) {
+                        fill_zero(layer.mamba->out_proj_bias.value(), nullptr);
+                    }
+                }
+            }
         } else {
             fill_normal(layer.attention.out_weight, layer.attention.out_weight.nelem(), 0.f, scale * residual_scale, seed, local_seeds[3], nullptr);
             if constexpr (has_mlp_weights<BlockWeights>::value) {
                 fill_normal(layer.mlp_down_weight, layer.mlp_down_weight.nelem(), 0.f, scale * residual_scale, seed, local_seeds[2], nullptr);
+            }
+            if constexpr (has_mamba_weights<BlockWeights>::value) {
+                if (layer.mamba.has_value()) {
+                    fill_normal(layer.mamba->out_proj_weight, layer.mamba->out_proj_weight.nelem(), 0.f, scale * residual_scale, seed, mamba_seeds[2], nullptr);
+                    if (layer.mamba->out_proj_bias.has_value()) {
+                        fill_zero(layer.mamba->out_proj_bias.value(), nullptr);
+                    }
+                }
             }
         }
     }
@@ -240,12 +348,25 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
     const auto& cfg = mConfig.block_config;
     const long C = cfg.hidden_size;
     const long D = cfg.intermediate_size;
+    const long M = mlp_up_rows(cfg);
     const long HS = cfg.head_size;
     const long HQ = cfg.num_query_heads;
     const long HKV = cfg.num_kv_heads;
     const long q_rows = HS * HQ;
     const long kv_rows = HS * HKV;
     const long fused_rows = q_rows + 2 * kv_rows;
+    const long mamba_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_dim(); }) return cfg.mamba_dim();
+        return 0;
+    }();
+    const long mamba_conv_dim = [&]() -> long {
+        if constexpr (requires { cfg.mamba_conv_dim(); }) return cfg.mamba_conv_dim();
+        return 0;
+    }();
+    const long mamba_proj = [&]() -> long {
+        if constexpr (requires { cfg.mamba_proj_size(); }) return cfg.mamba_proj_size();
+        return 0;
+    }();
 
     const bool load_sharded =
         mStreamWeights ||
@@ -317,7 +438,7 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
                 return std::nullopt;
             case TensorTarget::MLPUpWeight:
                 if constexpr (has_mlp_weights<BlockWeights>::value) {
-                    return make_shard(block.mlp_up_weight, {2 * D, C});
+                    return make_shard(block.mlp_up_weight, {M, C});
                 }
                 return std::nullopt;
             case TensorTarget::MLPDownWeight:
@@ -325,15 +446,91 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
                     return make_shard(block.mlp_down_weight, {C, D});
                 }
                 return std::nullopt;
+            case TensorTarget::MambaInProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->in_proj_weight, {mamba_proj, C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaInProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->in_proj_bias.has_value()) {
+                        return make_shard(block.mamba->in_proj_bias.value(), {mamba_proj});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->out_proj_weight, {C, mamba_dim});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->out_proj_bias.has_value()) {
+                        return make_shard(block.mamba->out_proj_bias.value(), {C});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->conv1d_weight, {mamba_conv_dim, 1, cfg.mamba_conv_kernel});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->conv1d_bias.has_value()) {
+                        return make_shard(block.mamba->conv1d_bias.value(), {mamba_conv_dim});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaALog:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->A_log, {cfg.mamba_num_heads});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaD:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->D, {cfg.mamba_num_heads});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaDtBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->dt_bias, {cfg.mamba_num_heads});
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaNormWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return make_shard(block.mamba->norm_weight, {mamba_dim});
+                    }
+                }
+                return std::nullopt;
 
             // MoE targets
             case TensorTarget::RouterGate:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     return make_shard(block.router.gate, {cfg.num_experts, C});
                 }
                 return std::nullopt;
             case TensorTarget::RouterBias:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     // bias: (num_experts,)
                     if (!block.router.bias.has_value()) {
                          // Allocate if not already there but mapped
@@ -345,41 +542,79 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
                 return std::nullopt;
             case TensorTarget::ExpertsGateUp:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
+                    const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
+                    const long moe_M = static_cast<long>(mlp_up_factor(cfg)) * moe_D;
                     if (block.experts.use_batched) {
-                        return make_shard(block.experts.gate_up_proj, {cfg.num_experts, 2 * D, C});
+                        return make_shard(block.experts.gate_up_proj, {cfg.num_experts, moe_M, C});
                     }
                 }
                 return std::nullopt;
             case TensorTarget::ExpertsDown:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
+                    const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
                     if (block.experts.use_batched) {
-                        return make_shard(block.experts.down_proj, {cfg.num_experts, C, D});
+                        return make_shard(block.experts.down_proj, {cfg.num_experts, C, moe_D});
                     }
                 }
                 return std::nullopt;
             case TensorTarget::SharedExpertGate:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.shared_expert.has_value()) {
+                        const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
                         int shared_D = cfg.shared_expert_intermediate > 0 ?
-                                       cfg.shared_expert_intermediate : static_cast<int>(D);
-                        return make_shard(block.shared_expert->gate_proj, {shared_D, C});
+                                       cfg.shared_expert_intermediate : static_cast<int>(moe_D);
+                        if (mlp_up_factor(cfg) != 2) {
+                            return std::nullopt;
+                        }
+                        const std::size_t elem_size = get_dtype_size(block.shared_expert->gate_proj.DType);
+                        Tensor gate_slice = block.shared_expert->gate_proj;
+                        gate_slice.Rank = 2;
+                        gate_slice.Sizes[0] = shared_D;
+                        gate_slice.Sizes[1] = C;
+                        gate_slice.Data = block.shared_expert->gate_proj.Data +
+                                          static_cast<std::size_t>(shared_D) * static_cast<std::size_t>(C) * elem_size;
+                        return make_shard(gate_slice, {shared_D, C});
                     }
                 }
                 return std::nullopt;
             case TensorTarget::SharedExpertUp:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.shared_expert.has_value()) {
+                        const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
                         int shared_D = cfg.shared_expert_intermediate > 0 ?
-                                       cfg.shared_expert_intermediate : static_cast<int>(D);
-                        return make_shard(block.shared_expert->up_proj, {shared_D, C});
+                                       cfg.shared_expert_intermediate : static_cast<int>(moe_D);
+                        if (mlp_up_factor(cfg) == 2) {
+                            Tensor up_slice = block.shared_expert->gate_proj;
+                            up_slice.Rank = 2;
+                            up_slice.Sizes[0] = shared_D;
+                            up_slice.Sizes[1] = C;
+                            return make_shard(up_slice, {shared_D, C});
+                        }
+                        return make_shard(block.shared_expert->gate_proj, {shared_D, C});
                     }
                 }
                 return std::nullopt;
             case TensorTarget::SharedExpertDown:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.shared_expert.has_value()) {
+                        const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
                         int shared_D = cfg.shared_expert_intermediate > 0 ?
-                                       cfg.shared_expert_intermediate : static_cast<int>(D);
+                                       cfg.shared_expert_intermediate : static_cast<int>(moe_D);
                         return make_shard(block.shared_expert->down_proj, {C, shared_D});
                     }
                 }
@@ -394,7 +629,11 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
     auto resolve_expert = [&](TensorTarget target, int layer_idx, int expert_idx) -> std::optional<TensorShard> {
         if constexpr (has_moe_weights<BlockWeights>::value) {
             if (layer_idx < 0 || layer_idx >= mConfig.num_layers) return std::nullopt;
+            if (!mConfig.is_layer_moe(layer_idx)) return std::nullopt;
             auto& block = dst_blocks.at(layer_idx);
+            const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
+            const long moe_M = static_cast<long>(mlp_up_factor(cfg)) * moe_D;
+            const bool moe_gated = mlp_up_factor(cfg) == 2;
 
             // HF Qwen3-MoE checkpoints store experts as separate gate_proj/up_proj/down_proj tensors.
             // Internally we use a batched expert layout for grouped GEMM. When use_batched is enabled,
@@ -414,13 +653,14 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
 
                 const std::size_t elem_size = get_dtype_size(block.experts.gate_up_proj.DType);
                 if (target == TensorTarget::ExpertUp || target == TensorTarget::ExpertGate) {
-                    // Slice into (E_local, 2*D, C) -> (D, C)
-                    const long row_offset = (target == TensorTarget::ExpertUp) ? 0 : D;
+                    if (target == TensorTarget::ExpertGate && !moe_gated) return std::nullopt;
+                    // Slice into (E_local, M, C) -> (D, C)
+                    const long row_offset = (target == TensorTarget::ExpertUp) ? 0 : moe_D;
                     Tensor slice = block.experts.gate_up_proj;
                     slice.Rank = 2;
-                    slice.Sizes[0] = D;
+                    slice.Sizes[0] = moe_D;
                     slice.Sizes[1] = C;
-                    const std::size_t base_elems = (static_cast<std::size_t>(local_expert) * static_cast<std::size_t>(2 * D) + static_cast<std::size_t>(row_offset)) * static_cast<std::size_t>(C);
+                    const std::size_t base_elems = (static_cast<std::size_t>(local_expert) * static_cast<std::size_t>(moe_M) + static_cast<std::size_t>(row_offset)) * static_cast<std::size_t>(C);
                     slice.Data = block.experts.gate_up_proj.Data + base_elems * elem_size;
                     return TensorShard(slice);
                 }
@@ -429,8 +669,8 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
                     Tensor slice = block.experts.down_proj;
                     slice.Rank = 2;
                     slice.Sizes[0] = C;
-                    slice.Sizes[1] = D;
-                    const std::size_t base_elems = static_cast<std::size_t>(local_expert) * static_cast<std::size_t>(C) * static_cast<std::size_t>(D);
+                    slice.Sizes[1] = moe_D;
+                    const std::size_t base_elems = static_cast<std::size_t>(local_expert) * static_cast<std::size_t>(C) * static_cast<std::size_t>(moe_D);
                     slice.Data = block.experts.down_proj.Data + base_elems * elem_size;
                     return TensorShard(slice);
                 }
@@ -443,11 +683,12 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
             auto& expert = block.experts.experts[expert_idx];
             switch (target) {
                 case TensorTarget::ExpertGate:
-                    return make_shard(expert.gate_proj, {D, C});
+                    if (!moe_gated) return std::nullopt;
+                    return make_shard(expert.gate_proj, {moe_D, C});
                 case TensorTarget::ExpertUp:
-                    return make_shard(expert.up_proj, {D, C});
+                    return make_shard(expert.up_proj, {moe_D, C});
                 case TensorTarget::ExpertDown:
-                    return make_shard(expert.down_proj, {C, D});
+                    return make_shard(expert.down_proj, {C, moe_D});
                 default:
                     return std::nullopt;
             }
@@ -554,6 +795,7 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
     }
 
     [[maybe_unused]] const auto& cfg = mConfig.block_config;
+    const long C = cfg.hidden_size;
     const long D = cfg.intermediate_size;
     const long HS = cfg.head_size;
     const long HQ = cfg.num_query_heads;
@@ -655,15 +897,91 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
                     return block.mlp_down_weight;
                 }
                 return std::nullopt;
+            case TensorTarget::MambaInProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->in_proj_weight;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaInProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->in_proj_bias.has_value()) {
+                        return block.mamba->in_proj_bias.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->out_proj_weight;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaOutProjBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->out_proj_bias.has_value()) {
+                        return block.mamba->out_proj_bias.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->conv1d_weight;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaConv1dBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value() && block.mamba->conv1d_bias.has_value()) {
+                        return block.mamba->conv1d_bias.value();
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaALog:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->A_log;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaD:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->D;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaDtBias:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->dt_bias;
+                    }
+                }
+                return std::nullopt;
+            case TensorTarget::MambaNormWeight:
+                if constexpr (has_mamba_weights<BlockWeights>::value) {
+                    if (block.mamba.has_value()) {
+                        return block.mamba->norm_weight;
+                    }
+                }
+                return std::nullopt;
 
             // MoE targets
             case TensorTarget::RouterGate:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     return block.router.gate;
                 }
                 return std::nullopt;
             case TensorTarget::ExpertsGateUp:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.experts.use_batched) {
                         return block.experts.gate_up_proj;
                     }
@@ -671,6 +989,9 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
                 return std::nullopt;
             case TensorTarget::ExpertsDown:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.experts.use_batched) {
                         return block.experts.down_proj;
                     }
@@ -678,20 +999,52 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
                 return std::nullopt;
             case TensorTarget::SharedExpertGate:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.shared_expert.has_value()) {
-                        return block.shared_expert->gate_proj;
+                        if (mlp_up_factor(cfg) != 2) {
+                            return std::nullopt;
+                        }
+                        const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
+                        int shared_D = cfg.shared_expert_intermediate > 0 ?
+                                       cfg.shared_expert_intermediate : static_cast<int>(moe_D);
+                        const std::size_t elem_size = get_dtype_size(block.shared_expert->gate_proj.DType);
+                        Tensor gate_slice = block.shared_expert->gate_proj;
+                        gate_slice.Rank = 2;
+                        gate_slice.Sizes[0] = shared_D;
+                        gate_slice.Sizes[1] = C;
+                        gate_slice.Data = block.shared_expert->gate_proj.Data +
+                                          static_cast<std::size_t>(shared_D) * static_cast<std::size_t>(C) * elem_size;
+                        return gate_slice;
                     }
                 }
                 return std::nullopt;
             case TensorTarget::SharedExpertUp:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.shared_expert.has_value()) {
-                        return block.shared_expert->up_proj;
+                        if (mlp_up_factor(cfg) == 2) {
+                            const long moe_D = mConfig.MoeIntermediateSize > 0 ? mConfig.MoeIntermediateSize : D;
+                            int shared_D = cfg.shared_expert_intermediate > 0 ?
+                                           cfg.shared_expert_intermediate : static_cast<int>(moe_D);
+                            Tensor up_slice = block.shared_expert->gate_proj;
+                            up_slice.Rank = 2;
+                            up_slice.Sizes[0] = shared_D;
+                            up_slice.Sizes[1] = C;
+                            return up_slice;
+                        }
+                        return block.shared_expert->gate_proj;
                     }
                 }
                 return std::nullopt;
             case TensorTarget::SharedExpertDown:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
+                    if (!mConfig.is_layer_moe(layer_idx)) {
+                        return std::nullopt;
+                    }
                     if (block.shared_expert.has_value()) {
                         return block.shared_expert->down_proj;
                     }
@@ -730,12 +1083,15 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
         // Handle per-expert patterns for non-batched MoE
         if constexpr (has_moe_weights<BlockWeights>::value) {
             const auto& block = mWorkBlocks[layer_idx];
-            if (!block.experts.use_batched) {
+            if (!block.experts.use_batched && mConfig.is_layer_moe(layer_idx)) {
                 std::string prefix = "model.layers." + std::to_string(layer_idx);
+                const bool moe_gated = mlp_up_factor(cfg) == 2;
                 for (int e = 0; e < static_cast<int>(block.experts.experts.size()); ++e) {
                     std::string exp_prefix = prefix + ".mlp.experts." + std::to_string(e);
                     const auto& expert = block.experts.experts[e];
-                    writer.register_tensor(exp_prefix + ".gate_proj.weight", TensorShard(expert.gate_proj));
+                    if (moe_gated) {
+                        writer.register_tensor(exp_prefix + ".gate_proj.weight", TensorShard(expert.gate_proj));
+                    }
                     writer.register_tensor(exp_prefix + ".up_proj.weight", TensorShard(expert.up_proj));
                     writer.register_tensor(exp_prefix + ".down_proj.weight", TensorShard(expert.down_proj));
                 }

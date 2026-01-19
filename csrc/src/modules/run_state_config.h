@@ -5,6 +5,9 @@
 #ifndef SUROGATE_SRC_MODULES_RUN_STATE_CONFIG_H
 #define SUROGATE_SRC_MODULES_RUN_STATE_CONFIG_H
 
+#include <cstdint>
+#include <vector>
+
 #include "utilities/dtype.h"
 #include "config/pretrained_config.h"
 #include "fp8_scaling_config.h"
@@ -102,6 +105,10 @@ struct ModularRunStateConfig {
 
     // MoE-specific configuration (when is_moe=true)
     int num_experts = 0;
+
+    // Hybrid Mamba markers
+    bool has_mamba = false;
+    std::vector<std::uint8_t> layer_is_mamba;
 
     // PretrainedConfig for IRunState base class initialization (pointer, not owned)
     const PretrainedConfig* pretrained_config = nullptr;

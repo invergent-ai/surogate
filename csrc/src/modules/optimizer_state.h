@@ -17,6 +17,7 @@
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "utilities/tensor_container.h"
+#include "modules/mlp_utils.h"
 
 class NCCLCommunicator;
 
@@ -528,6 +529,7 @@ void ModularOptimizerStateManager<Block>::register_block_weights_lazy(
     const auto& cfg = mConfig.block_config;
     long C = cfg.hidden_size;
     long D = cfg.intermediate_size;
+    long M = mlp_up_rows(cfg);
     long HS = cfg.head_size;
     long HQ = cfg.num_query_heads;
     long HKV = cfg.num_kv_heads;
@@ -576,7 +578,7 @@ void ModularOptimizerStateManager<Block>::register_block_weights_lazy(
         }
     }
     if constexpr (requires { dst.mlp_up_weight; dst.mlp_down_weight; }) {
-        alloc.allocate(&dst.mlp_up_weight, dtype, local_shape({2 * D, C}));
+        alloc.allocate(&dst.mlp_up_weight, dtype, local_shape({M, C}));
         alloc.allocate(&dst.mlp_down_weight, dtype, local_shape({C, D}));
     }
 }
@@ -587,6 +589,7 @@ void ModularOptimizerStateManager<Block>::register_block_scales_lazy(
     const auto& cfg = mConfig.block_config;
     long C = cfg.hidden_size;
     long D = cfg.intermediate_size;
+    long M = mlp_up_rows(cfg);
     long HS = cfg.head_size;
     long HQ = cfg.num_query_heads;
     long HKV = cfg.num_kv_heads;
@@ -641,7 +644,7 @@ void ModularOptimizerStateManager<Block>::register_block_scales_lazy(
         }
     }
     if constexpr (requires { dst.mlp_up_weight; dst.mlp_down_weight; }) {
-        alloc.allocate(&dst.mlp_up_weight, ETensorDType::FP32, scale_shape(local_shape({2 * D, C})));
+        alloc.allocate(&dst.mlp_up_weight, ETensorDType::FP32, scale_shape(local_shape({M, C})));
         alloc.allocate(&dst.mlp_down_weight, ETensorDType::FP32, scale_shape(local_shape({C, D})));
     }
 }

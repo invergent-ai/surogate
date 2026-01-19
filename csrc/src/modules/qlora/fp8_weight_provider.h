@@ -5,8 +5,12 @@
 #ifndef SUROGATE_SRC_MODULES_QLORA_QLORA_WEIGHT_PROVIDER_H
 #define SUROGATE_SRC_MODULES_QLORA_QLORA_WEIGHT_PROVIDER_H
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
+#include <iostream>
 
 #include "qlora_config.h"
 #include "fp8_weights.h"
@@ -64,6 +68,7 @@ public:
         int num_kv_heads;
         int head_size;
         int vocab_size;
+        int mlp_up_factor = 2;      ///< 2 for gated (SwiGLU), 1 for non-gated (ReLU2)
         QLoRAConfig qlora_config;
         ModularLoRAConfig lora_config;
         ETensorDType model_dtype = ETensorDType::BF16;
@@ -73,6 +78,18 @@ public:
         int num_shards = 1;
         bool enable_fp8_forward = false;  ///< Use FP8 for forward pass (skip dequant)
         bool enable_fp8_hybrid = false;   ///< Use FP8 hybrid mode (skip dequant)
+
+        // Mamba / SSM config (optional; used by Nemotron-H hybrid blocks)
+        bool has_mamba = false;
+        std::vector<std::uint8_t> layer_is_mamba;
+        int mamba_num_heads = 0;
+        int mamba_head_dim = 0;
+        int mamba_ssm_state_size = 0;
+        int mamba_conv_kernel = 0;
+        int mamba_n_groups = 1;
+        int mamba_intermediate_size = 0;
+        bool mamba_use_bias = false;
+        bool mamba_use_conv_bias = false;
     };
 
     FP8WeightProvider(const Config& config, TensorAllocator& allocator,
@@ -283,6 +300,7 @@ private:
      * @param stream CUDA stream for dequantization
      */
     void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
+    void load_mamba_weights(const std::string& file_name);
 
     Config mConfig;
     TensorAllocator* mAllocator;
@@ -310,6 +328,14 @@ private:
     // Cached dequantized block weights (reused across layers)
     BlockWeights mDequantBlock;
 
+    template<bool HasMamba, typename Dummy = void>
+    struct MambaWeightsStorage {};
+    template<typename Dummy>
+    struct MambaWeightsStorage<true, Dummy> {
+        std::vector<std::optional<typename BlockWeights::MambaWeights>> weights;
+    };
+    MambaWeightsStorage<has_mamba_weights<BlockWeights>::value> mMambaWeights;
+
     // FP8 block weights (no dequantization, used when FP8 matmuls are enabled)
     BlockWeights mFP8Block;
 
@@ -334,10 +360,16 @@ private:
     // =========================================================================
 
     /// Batched expert dequantization buffers (all experts, for forward pass)
-    /// Shape: (num_experts, 2 * moe_intermediate, hidden_size)
+    /// Shape: (num_experts, mlp_up_factor * moe_intermediate, hidden_size)
     Tensor mBatchedExpertGateUp;
     /// Shape: (num_experts, hidden_size, moe_intermediate)
     Tensor mBatchedExpertDown;
+
+    /// Shared expert dequantization buffers (optional)
+    Tensor mSharedExpertGateUp;
+    Tensor mSharedExpertDown;
+    int mSharedExpertD = 0;
+    bool mHasSharedExpert = false;
 
     /// Number of experts in MoE model
     int mNumMoEExperts = 0;
@@ -385,6 +417,7 @@ FP8WeightProvider<Block>::FP8WeightProvider(
         .num_kv_heads = config.num_kv_heads,
         .head_size = config.head_size,
         .vocab_size = config.vocab_size,
+        .mlp_up_factor = config.mlp_up_factor,
         .qlora_config = config.qlora_config,
         .use_qk_norm = config.use_qk_norm,
         .tied_embeddings = config.tied_embeddings,
@@ -392,6 +425,12 @@ FP8WeightProvider<Block>::FP8WeightProvider(
         .num_shards = config.num_shards
     };
     mFP8Weights = std::make_unique<FP8WeightsManager>(qw_config, allocator, device_props);
+
+    if constexpr (has_mamba_weights<BlockWeights>::value) {
+        if (mConfig.has_mamba) {
+            mMambaWeights.weights.resize(mConfig.num_layers);
+        }
+    }
 
     // Allocate dequantization buffers
     allocate_dequant_buffers();
@@ -414,6 +453,7 @@ void FP8WeightProvider<Block>::allocate_dequant_buffers() {
 
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
+    const int mlp_M = mConfig.mlp_up_factor * intermediate;
     const int num_q_heads = mConfig.num_query_heads;
     const int num_kv_heads = mConfig.num_kv_heads;
     const int head_size = mConfig.head_size;
@@ -436,7 +476,7 @@ void FP8WeightProvider<Block>::allocate_dequant_buffers() {
 
     mDequantGateUp = mAllocator->allocate(dequant_dtype, "dequant_gate_up",
                                            EAllocationType::ON_DEVICE,
-                                           {(long)(2 * intermediate), (long)hidden});
+                                           {(long)mlp_M, (long)hidden});
 
     mDequantDown = mAllocator->allocate(dequant_dtype, "dequant_down",
                                          EAllocationType::ON_DEVICE,
@@ -483,6 +523,16 @@ void FP8WeightProvider<Block>::setup_block_weights_structure() {
             mDequantBlock.experts.use_batched = true;
             mDequantBlock.experts.gate_up_proj = mBatchedExpertGateUp;
             mDequantBlock.experts.down_proj = mBatchedExpertDown;
+            if (mHasSharedExpert) {
+                mDequantBlock.shared_expert.emplace();
+                mDequantBlock.shared_expert->gate_proj = mSharedExpertGateUp;
+                mDequantBlock.shared_expert->down_proj = mSharedExpertDown;
+                if (mConfig.mlp_up_factor == 1) {
+                    mDequantBlock.shared_expert->up_proj = mSharedExpertGateUp;
+                } else {
+                    mDequantBlock.shared_expert->up_proj = Tensor();
+                }
+            }
         }
     }
 }
@@ -525,6 +575,7 @@ void FP8WeightProvider<Block>::import_and_quantize(
 
     // Import and quantize base model weights
     mFP8Weights->import_and_quantize(file_name, comm, stream);
+    load_mamba_weights(file_name);
 
     // Note: LoRA adapters are managed by ModularLoRAModel's mLoRAWeights, not here.
     // The internal FP8WeightsManager's LoRA weights are not used.
@@ -533,6 +584,9 @@ void FP8WeightProvider<Block>::import_and_quantize(
     SafeTensorsReader reader(file_name);
     const std::vector<std::string> final_norm_names = {
         "model.norm.weight",
+        "model.norm_f.weight",
+        "backbone.norm.weight",
+        "backbone.norm_f.weight",
         "transformer.ln_f.weight",
         "model.final_layernorm.weight"
     };
@@ -550,11 +604,134 @@ void FP8WeightProvider<Block>::import_and_quantize(
 }
 
 template<typename Block>
+void FP8WeightProvider<Block>::load_mamba_weights(const std::string& file_name) {
+    if constexpr (!has_mamba_weights<BlockWeights>::value) {
+        (void)file_name;
+        return;
+    } else {
+        if (!mConfig.has_mamba) {
+            return;
+        }
+
+        auto ctx = mAllocator->with_context("FP8_Mamba_Weights");
+        SafeTensorsReader reader(file_name);
+
+        auto find_entry_opt = [&](std::string_view name) -> const SafeTensorEntry* {
+            for (const auto& entry : reader.entries()) {
+                if (entry.name() == name) {
+                    return &entry;
+                }
+            }
+            return nullptr;
+        };
+
+        const int hidden = mConfig.hidden_size;
+        const int mamba_dim = (mConfig.mamba_intermediate_size > 0)
+            ? mConfig.mamba_intermediate_size
+            : mConfig.intermediate_size;
+        const int groups = std::max(1, mConfig.mamba_n_groups);
+        const int conv_dim = mamba_dim + 2 * groups * mConfig.mamba_ssm_state_size;
+        const int proj_size = mamba_dim + conv_dim + mConfig.mamba_num_heads;
+
+        const auto load_tensor = [&](const std::string& name, Tensor& tensor, bool required) {
+            if (const auto* entry = find_entry_opt(name)) {
+                entry->read_tensor(tensor, /*allow_cast=*/true);
+            } else if (required) {
+                std::cerr << "[FP8 WARN] missing Mamba weight: " << name << "\n";
+            }
+        };
+
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            if (!mConfig.layer_is_mamba.empty() &&
+                mConfig.layer_is_mamba[static_cast<std::size_t>(layer)] == 0) {
+                continue;
+            }
+
+            const std::string model_prefix = "model.layers." + std::to_string(layer);
+            const std::string backbone_prefix = "backbone.layers." + std::to_string(layer);
+            const bool model_has = find_entry_opt(model_prefix + ".mixer.in_proj.weight") ||
+                                   find_entry_opt(model_prefix + ".mixer.conv1d.weight") ||
+                                   find_entry_opt(model_prefix + ".mixer.A_log");
+            const std::string prefix = model_has ? model_prefix : backbone_prefix;
+
+            auto& mw = mMambaWeights.weights[layer].emplace();
+
+            mw.in_proj_weight = mAllocator->allocate(mConfig.model_dtype,
+                                                     ("mamba_in_proj_w_l" + std::to_string(layer)).c_str(),
+                                                     EAllocationType::ON_DEVICE, {proj_size, hidden});
+            if (find_entry_opt(prefix + ".mixer.in_proj.bias")) {
+                mw.in_proj_bias = mAllocator->allocate(mConfig.model_dtype,
+                                                       ("mamba_in_proj_b_l" + std::to_string(layer)).c_str(),
+                                                       EAllocationType::ON_DEVICE, {proj_size});
+            }
+
+            mw.out_proj_weight = mAllocator->allocate(mConfig.model_dtype,
+                                                      ("mamba_out_proj_w_l" + std::to_string(layer)).c_str(),
+                                                      EAllocationType::ON_DEVICE, {hidden, mamba_dim});
+            if (find_entry_opt(prefix + ".mixer.out_proj.bias")) {
+                mw.out_proj_bias = mAllocator->allocate(mConfig.model_dtype,
+                                                        ("mamba_out_proj_b_l" + std::to_string(layer)).c_str(),
+                                                        EAllocationType::ON_DEVICE, {hidden});
+            }
+
+            mw.conv1d_weight = mAllocator->allocate(mConfig.model_dtype,
+                                                    ("mamba_conv_w_l" + std::to_string(layer)).c_str(),
+                                                    EAllocationType::ON_DEVICE, {conv_dim, 1, mConfig.mamba_conv_kernel});
+            if (find_entry_opt(prefix + ".mixer.conv1d.bias")) {
+                mw.conv1d_bias = mAllocator->allocate(mConfig.model_dtype,
+                                                      ("mamba_conv_b_l" + std::to_string(layer)).c_str(),
+                                                      EAllocationType::ON_DEVICE, {conv_dim});
+            }
+
+            mw.A_log = mAllocator->allocate(ETensorDType::FP32,
+                                            ("mamba_A_log_l" + std::to_string(layer)).c_str(),
+                                            EAllocationType::ON_DEVICE, {mConfig.mamba_num_heads});
+            mw.D = mAllocator->allocate(ETensorDType::FP32,
+                                        ("mamba_D_l" + std::to_string(layer)).c_str(),
+                                        EAllocationType::ON_DEVICE, {mConfig.mamba_num_heads});
+            mw.dt_bias = mAllocator->allocate(ETensorDType::FP32,
+                                              ("mamba_dt_bias_l" + std::to_string(layer)).c_str(),
+                                              EAllocationType::ON_DEVICE, {mConfig.mamba_num_heads});
+            mw.norm_weight = mAllocator->allocate(mConfig.model_dtype,
+                                                  ("mamba_norm_w_l" + std::to_string(layer)).c_str(),
+                                                  EAllocationType::ON_DEVICE, {mamba_dim});
+
+            load_tensor(prefix + ".mixer.in_proj.weight", mw.in_proj_weight, true);
+            if (mw.in_proj_bias.has_value()) {
+                load_tensor(prefix + ".mixer.in_proj.bias", mw.in_proj_bias.value(), false);
+            }
+            load_tensor(prefix + ".mixer.out_proj.weight", mw.out_proj_weight, true);
+            if (mw.out_proj_bias.has_value()) {
+                load_tensor(prefix + ".mixer.out_proj.bias", mw.out_proj_bias.value(), false);
+            }
+            load_tensor(prefix + ".mixer.conv1d.weight", mw.conv1d_weight, true);
+            if (mw.conv1d_bias.has_value()) {
+                load_tensor(prefix + ".mixer.conv1d.bias", mw.conv1d_bias.value(), false);
+            }
+            load_tensor(prefix + ".mixer.A_log", mw.A_log, true);
+            load_tensor(prefix + ".mixer.D", mw.D, true);
+            load_tensor(prefix + ".mixer.dt_bias", mw.dt_bias, true);
+            load_tensor(prefix + ".mixer.norm.weight", mw.norm_weight, true);
+        }
+    }
+}
+
+template<typename Block>
 typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_block(int layer_idx, cudaStream_t stream) {
     // For MoE models, use the MoE-specific path that only handles attention weights
     // MoE models don't have dense MLP weights - they have per-expert weights instead
     if (is_moe()) {
         get_moe_attention_weights(layer_idx, stream);
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (mConfig.has_mamba &&
+                layer_idx >= 0 &&
+                layer_idx < static_cast<int>(mMambaWeights.weights.size()) &&
+                mMambaWeights.weights[static_cast<std::size_t>(layer_idx)].has_value()) {
+                mDequantBlock.mamba = mMambaWeights.weights[static_cast<std::size_t>(layer_idx)];
+            } else {
+                mDequantBlock.mamba.reset();
+            }
+        }
         return mDequantBlock;
     }
 
@@ -665,6 +842,17 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
             }
         }
 
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (mConfig.has_mamba &&
+                layer_idx >= 0 &&
+                layer_idx < static_cast<int>(mMambaWeights.weights.size()) &&
+                mMambaWeights.weights[static_cast<std::size_t>(layer_idx)].has_value()) {
+                mFP8Block.mamba = mMambaWeights.weights[static_cast<std::size_t>(layer_idx)];
+            } else {
+                mFP8Block.mamba.reset();
+            }
+        }
+
         return mFP8Block;
     } else {
         mDequantBlock.ln1.weight = qblock.ln1_weight;
@@ -675,6 +863,17 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
             if (qblock.q_norm_weight.has_value() && qblock.k_norm_weight.has_value()) {
                 mDequantBlock.attention.q_norm_weight = qblock.q_norm_weight;
                 mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
+            }
+        }
+
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (mConfig.has_mamba &&
+                layer_idx >= 0 &&
+                layer_idx < static_cast<int>(mMambaWeights.weights.size()) &&
+                mMambaWeights.weights[static_cast<std::size_t>(layer_idx)].has_value()) {
+                mDequantBlock.mamba = mMambaWeights.weights[static_cast<std::size_t>(layer_idx)];
+            } else {
+                mDequantBlock.mamba.reset();
             }
         }
 
@@ -699,22 +898,41 @@ void FP8WeightProvider<Block>::allocate_moe_expert_buffers() {
     const int hidden = mConfig.hidden_size;
     const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
                           mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+    const int moe_M = mConfig.mlp_up_factor * moe_inter;
     const int num_experts = mConfig.qlora_config.num_experts;
+    const int shared_inter = (mConfig.qlora_config.moe_shared_expert_intermediate_size > 0)
+        ? mConfig.qlora_config.moe_shared_expert_intermediate_size
+        : moe_inter;
+    const int shared_M = mConfig.mlp_up_factor * shared_inter;
 
     mNumMoEExperts = num_experts;
+    mHasSharedExpert = mConfig.qlora_config.num_shared_experts > 0;
+    mSharedExpertD = shared_inter;
 
     // Allocate batched expert buffers (all experts for forward pass)
-    // gate_up_proj: (num_experts, 2 * moe_intermediate, hidden_size)
+    // gate_up_proj: (num_experts, mlp_up_factor * moe_intermediate, hidden_size)
     // down_proj: (num_experts, hidden_size, moe_intermediate)
     mBatchedExpertGateUp = mAllocator->allocate(ETensorDType::BF16,
         "batched_expert_gate_up",
         EAllocationType::ON_DEVICE,
-        {(long)num_experts, (long)(2 * moe_inter), (long)hidden});
+        {(long)num_experts, (long)moe_M, (long)hidden});
 
     mBatchedExpertDown = mAllocator->allocate(ETensorDType::BF16,
         "batched_expert_down",
         EAllocationType::ON_DEVICE,
         {(long)num_experts, (long)hidden, (long)moe_inter});
+
+    if (mHasSharedExpert) {
+        mSharedExpertGateUp = mAllocator->allocate(ETensorDType::BF16,
+            "shared_expert_gate_up",
+            EAllocationType::ON_DEVICE,
+            {(long)shared_M, (long)hidden});
+
+        mSharedExpertDown = mAllocator->allocate(ETensorDType::BF16,
+            "shared_expert_down",
+            EAllocationType::ON_DEVICE,
+            {(long)hidden, (long)shared_inter});
+    }
 }
 
 template<typename Block>
@@ -752,18 +970,19 @@ void FP8WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
         const int hidden = mConfig.hidden_size;
         const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
                               mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+        const int moe_M = mConfig.mlp_up_factor * moe_inter;
 
         for (int e = 0; e < mNumMoEExperts; ++e) {
             const auto& expert_weights = qblock.experts[e];
 
             // Create slice views into the batched buffers for this expert
-            // gate_up_proj slice: offset by e * (2 * moe_inter * hidden) bytes
+            // gate_up_proj slice: offset by e * (moe_M * hidden) bytes
             Tensor gate_up_slice = Tensor::from_pointer(
                 static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
-                    static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+                    static_cast<size_t>(e) * moe_M * hidden * sizeof(nv_bfloat16),
                 mBatchedExpertGateUp.Device,
                 ETensorDType::BF16,
-                std::array<long, 2>{2 * moe_inter, hidden}
+                std::array<long, 2>{moe_M, hidden}
             );
 
             // down_proj slice: offset by e * (hidden * moe_inter) bytes
@@ -791,6 +1010,23 @@ void FP8WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
                 block_size, mDeviceProps, stream);
         }
 
+        // Dequantize shared expert weights (optional)
+        if (mHasSharedExpert && qblock.shared_expert.has_value()) {
+            const auto& shared = qblock.shared_expert.value();
+            dequantize_per_block(
+                mSharedExpertGateUp.get<nv_bfloat16>(),
+                shared.gate_up_proj.data.get<__nv_fp8_e4m3>(),
+                shared.gate_up_proj.block_scales.get<float>(),
+                shared.gate_up_proj.M, shared.gate_up_proj.K,
+                block_size, mDeviceProps, stream);
+            dequantize_per_block(
+                mSharedExpertDown.get<nv_bfloat16>(),
+                shared.down_proj.data.get<__nv_fp8_e4m3>(),
+                shared.down_proj.block_scales.get<float>(),
+                shared.down_proj.M, shared.down_proj.K,
+                block_size, mDeviceProps, stream);
+        }
+
         mCurrentLayer = layer_idx;
         mBufferVersion = mStepVersion;
     }
@@ -811,6 +1047,10 @@ void FP8WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
             mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
         }
     }
+
+    if constexpr (has_mamba_weights<BlockWeights>::value) {
+        mDequantBlock.mamba.reset();
+    }
 }
 
 // ============================================================================
@@ -829,6 +1069,7 @@ void FP8WeightProvider<Block>::dequantize_selected_experts(
     const int hidden = mConfig.hidden_size;
     const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
                           mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+    const int moe_M = mConfig.mlp_up_factor * moe_inter;
 
     // Check if we can reuse the current buffers
     const bool same_layer_step = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
@@ -864,10 +1105,10 @@ void FP8WeightProvider<Block>::dequantize_selected_experts(
         // Create slice views at the COMPACT index position (i, not global_expert_idx)
         Tensor gate_up_slice = Tensor::from_pointer(
             static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
-                static_cast<size_t>(i) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+                static_cast<size_t>(i) * moe_M * hidden * sizeof(nv_bfloat16),
             mBatchedExpertGateUp.Device,
             ETensorDType::BF16,
-            std::array<long, 2>{2 * moe_inter, hidden}
+            std::array<long, 2>{moe_M, hidden}
         );
 
         Tensor down_slice = Tensor::from_pointer(
@@ -905,7 +1146,7 @@ void FP8WeightProvider<Block>::dequantize_selected_experts(
             mBatchedExpertGateUp.Data,
             mBatchedExpertGateUp.Device,
             ETensorDType::BF16,
-            std::array<long, 3>{(long)num_to_dequant, (long)(2 * moe_inter), (long)hidden}
+            std::array<long, 3>{(long)num_to_dequant, (long)moe_M, (long)hidden}
         );
         mDequantBlock.experts.down_proj = Tensor::from_pointer(
             mBatchedExpertDown.Data,

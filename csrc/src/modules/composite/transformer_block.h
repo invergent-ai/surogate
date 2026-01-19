@@ -5,14 +5,42 @@
 #ifndef SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H
 #define SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H
 
+#include <type_traits>
+
 #include "config/rope_config.h"
 #include "modules/module_base.h"
 #include "modules/primitives/attention.h"
 #include "modules/primitives/rmsnorm.h"
-#include "modules/primitives/linear.h"
-#include "modules/primitives/swiglu.h"
+#include "modules/primitives/mlp.h"
+#include "modules/moe/router.h"
+#include "modules/moe/expert.h"
+#include "modules/forward_hooks.h"
+#include "modules/backward_hooks.h"
+#include "modules/model_config.h"
+#include "kernels/kernels.h"
+
+// Forward declaration for recipe types (global ::recipes namespace)
+namespace recipes { class Recipe; }
 
 namespace modules {
+
+// Forward declarations for the modular execution context
+template<typename Block> class ModularRunState;
+template<typename Block> class ModularWeightManager;
+
+// Forward declarations for simplified activation/gradient types (from run_state_types.h)
+struct SimplifiedLayerActivations;
+struct SimplifiedLayerGradients;
+struct SimplifiedLayerQuantActivations;
+struct SimplifiedQuantGradients;
+
+// Forward declarations for quantization activation buffers
+struct FP8ForwardQuantActivations;
+struct FP4ForwardQuantActivations;
+
+// Forward declarations for model configuration (from model_config.h)
+struct ModelConfig;
+struct ModelOptions;
 
 /**
  * @brief Dense Transformer Block
@@ -23,18 +51,42 @@ namespace modules {
  *
  * Where MLP is: Linear (gate+up) -> SwiGLU -> Linear (down)
  *
+ * This block uses the modular architecture where each sub-component
+ * (attention, MLP, normalization) is a separate module following the
+ * ModuleBase CRTP pattern. This enables:
+ * - Zero-overhead static polymorphism via CRTP
+ * - Compile-time customization of components
+ * - Clean separation of concerns
+ * - Reusable primitive modules
+ *
  * Template parameters allow swapping components at compile time for
  * different architectures without runtime overhead:
  * - AttentionType: Different attention implementations (MHA, GQA, etc.)
- * - ActivationType: Different activations (SwiGLU, GeGLU, etc.)
+ * - MLPType: Different MLP implementations (SwiGLU, GeGLU, etc.)
  * - NormType: Different normalizations (RMSNorm, LayerNorm, etc.)
+ *
+ * Residual connections are handled by the fused residual+norm operations
+ * for efficiency. The pattern is:
+ * - Block receives input residual
+ * - LN1 normalizes the residual for attention
+ * - Attention output is added to residual via fused LN2 operation
+ * - MLP output is returned (caller handles next residual addition)
+ *
+ * == Modular Block Execution ==
+ *
+ * The model uses the static methods forward_block_modular(), backward_block_modular(),
+ * and recompute_block_modular() as the production execution path.
+ *
+ * These methods provide a clean, composable implementation that is fully
+ * compatible with the training infrastructure (recipes, FP8/FP4 quantization,
+ * hooks, CUDA graphs, etc.).
  */
 template<
     typename AttentionType = AttentionModule,
-    typename ActivationType = SwiGLUModule,
+    typename MLPType = SwiGLUMLP,
     typename NormType = FusedResidualRMSNormModule
 >
-class DenseTransformerBlock : public ModuleBase<DenseTransformerBlock<AttentionType, ActivationType, NormType>> {
+class DenseTransformerBlock : public ModuleBase<DenseTransformerBlock<AttentionType, MLPType, NormType>> {
 public:
     /**
      * @brief Configuration for transformer block
@@ -52,9 +104,28 @@ public:
 
         // MLP config
         int intermediate_size;
+        int mlp_up_factor = 2;     ///< 2 for gated (SwiGLU/GeGLU), 1 for standard MLP
+
+        // MoE config (optional)
+        int num_experts = 0;
+        int top_k = 0;
+        bool use_shared_expert = false;
+        int shared_expert_intermediate = 0;
 
         // Norm config
         float rms_norm_eps = 1e-5f;
+
+        // Mamba / SSM config (optional; used by Nemotron-H hybrid blocks)
+        int mamba_num_heads = 0;
+        int mamba_head_dim = 0;
+        int mamba_ssm_state_size = 0;
+        int mamba_conv_kernel = 0;
+        int mamba_n_groups = 1;
+        int mamba_chunk_size = 0;
+        int mamba_intermediate_size = 0; ///< Optional explicit Mamba intermediate size
+        bool mamba_use_bias = false;
+        bool mamba_use_conv_bias = false;
+        ActivationType mamba_activation = ActivationType::SiLU;
 
         // Derived configs for sub-modules
         [[nodiscard]] typename AttentionType::Config attention_config() const {
@@ -65,7 +136,7 @@ public:
             cfg.rope = rope;
             cfg.use_qkv_bias = use_qkv_bias;
             cfg.use_qk_norm = use_qk_norm;
-            cfg.qk_norm_eps = rms_norm_eps;  // Use same epsilon as layer norm
+            cfg.qk_norm_eps = rms_norm_eps;
             cfg.head_size = head_size;
             return cfg;
         }
@@ -77,8 +148,28 @@ public:
             };
         }
 
-        [[nodiscard]] typename ActivationType::Config activation_config() const {
-            return {.intermediate_size = intermediate_size};
+        [[nodiscard]] typename MLPType::Config mlp_config() const {
+            return {
+                .hidden_size = hidden_size,
+                .intermediate_size = intermediate_size
+            };
+        }
+
+        // Mamba helper dimensions
+        [[nodiscard]] int mamba_dim() const {
+            return (mamba_intermediate_size > 0) ? mamba_intermediate_size : intermediate_size;
+        }
+
+        [[nodiscard]] int mamba_conv_dim() const {
+            return mamba_dim() + 2 * mamba_n_groups * mamba_ssm_state_size;
+        }
+
+        [[nodiscard]] int mamba_proj_size() const {
+            return mamba_dim() + mamba_conv_dim() + mamba_num_heads;
+        }
+
+        [[nodiscard]] int mamba_group_size() const {
+            return (mamba_n_groups > 0) ? (mamba_dim() / mamba_n_groups) : mamba_dim();
         }
     };
 
@@ -95,34 +186,63 @@ public:
         // Pre-MLP norm
         typename NormType::Weights ln2;
 
-        // MLP
-        Tensor mlp_up_weight;       ///< (2 * intermediate_size, hidden_size) gate+up fused
-        Tensor mlp_down_weight;     ///< (hidden_size, intermediate_size)
+        // MLP weights - exposed directly for backward compatibility
+        // Legacy code expects flat members: mlp_up_weight, mlp_down_weight
+        Tensor mlp_up_weight;    ///< (2 * intermediate_size, hidden_size) fused gate+up
+        Tensor mlp_down_weight;  ///< (hidden_size, intermediate_size) down projection
+
+        // Accessor for new modular code that expects nested structure
+        struct MLPWeightsProxy {
+            Tensor& up_weight;
+            Tensor& down_weight;
+        };
+        MLPWeightsProxy mlp_weights() { return {mlp_up_weight, mlp_down_weight}; }
+
+        // MoE weights (optional for hybrid MoE layers)
+        RouterModule::Weights router;
+        ExpertGroupModule::Weights experts;
+        std::optional<ExpertModule::Weights> shared_expert;
+
+        // Mamba / SSM weights (optional for hybrid architectures)
+        struct MambaWeights {
+            Tensor in_proj_weight;             ///< (proj_size, hidden_size)
+            std::optional<Tensor> in_proj_bias;
+            Tensor out_proj_weight;            ///< (hidden_size, intermediate_size)
+            std::optional<Tensor> out_proj_bias;
+            Tensor conv1d_weight;              ///< (conv_dim, 1, kernel)
+            std::optional<Tensor> conv1d_bias;  ///< (conv_dim)
+            Tensor A_log;                      ///< (num_heads) FP32
+            Tensor D;                          ///< (num_heads) FP32
+            Tensor dt_bias;                    ///< (num_heads) FP32
+            Tensor norm_weight;                ///< (intermediate_size)
+        };
+        std::optional<MambaWeights> mamba;
     };
 
     /**
      * @brief Saved activations for backward pass
+     *
+     * Note: For production training, use SimplifiedLayerActivations from run_state_types.h
+     * which is optimized for the training infrastructure. This type is kept for
+     * API completeness and standalone module testing.
      */
     struct Activations {
         // Norm 1
         typename NormType::Activations ln1_acts;
+        Tensor ln1_output;              ///< Output of LN1 (input to attention)
 
         // Attention
         typename AttentionType::Activations attention_acts;
-        Tensor attention_output;    ///< Output of attention (before residual add)
+        Tensor attention_output;        ///< Output of attention (before residual add)
 
-        // Residual after attention
-        Tensor residual_att;        ///< residual + attention_output
+        // Residual after attention (for backward)
+        Tensor residual_att;            ///< residual + attention_output
 
         // Norm 2
         typename NormType::Activations ln2_acts;
 
         // MLP
-        QuantizableTensor mlp_up_input;     ///< LN2 output
-        Tensor mlp_up_output;               ///< Gate+up projection output
-        typename ActivationType::Activations activation_acts;
-        QuantizableTensor mlp_down_input;   ///< SwiGLU output
-        Tensor mlp_down_output;             ///< MLP output (before residual add)
+        typename MLPType::Activations mlp_acts;
     };
 
     /**
@@ -132,335 +252,219 @@ public:
         typename NormType::Gradients ln1_grads;
         typename AttentionType::Gradients attention_grads;
         typename NormType::Gradients ln2_grads;
-        Tensor d_mlp_up_weight;
-        Tensor d_mlp_down_weight;
+
+        // MLP gradients - exposed directly for backward compatibility
+        // Legacy code expects flat members: d_mlp_up_weight, d_mlp_down_weight
+        Tensor d_mlp_up_weight;   ///< (2 * intermediate_size, hidden_size)
+        Tensor d_mlp_down_weight; ///< (hidden_size, intermediate_size)
+
+        // Accessor for new modular code that expects nested structure
+        struct MLPGradientsProxy {
+            Tensor& d_up_weight;
+            Tensor& d_down_weight;
+        };
+        MLPGradientsProxy mlp_grads() { return {d_mlp_up_weight, d_mlp_down_weight}; }
+
+        // MoE gradients (optional for hybrid MoE layers)
+        RouterModule::Gradients router;
+        ExpertGroupModule::Gradients experts;
+        std::optional<ExpertModule::Gradients> shared_expert;
+
+        // Mamba / SSM gradients (optional for hybrid architectures)
+        struct MambaGradients {
+            Tensor d_in_proj_weight;
+            std::optional<Tensor> d_in_proj_bias;
+            Tensor d_out_proj_weight;
+            std::optional<Tensor> d_out_proj_bias;
+            Tensor d_conv1d_weight;
+            std::optional<Tensor> d_conv1d_bias;
+            Tensor d_A_log;
+            Tensor d_D;
+            Tensor d_dt_bias;
+            Tensor d_norm_weight;
+        };
+        std::optional<MambaGradients> mamba;
     };
 
     explicit DenseTransformerBlock(Config config)
         : mConfig(config),
-          mAttention(config.attention_config()),
-          mActivation(config.activation_config()) {}
-
-    /**
-     * @brief Forward pass through the transformer block
-     *
-     * @param ctx Module context
-     * @param w Block weights
-     * @param residual Input residual stream (modified in-place)
-     * @param acts Activation storage
-     * @return Updated residual stream
-     */
-    Tensor forward_impl(ModuleContext& ctx, Weights& w, Tensor& residual, Activations& acts);
-
-    /**
-     * @brief Backward pass through the transformer block
-     *
-     * @param ctx Module context
-     * @param w Block weights
-     * @param acts Saved activations
-     * @param grad_residual Gradient w.r.t. output residual
-     * @param grads Gradient storage
-     * @param accumulate If true, accumulate gradients
-     * @return Gradient w.r.t. input residual
-     */
-    Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
-                         Tensor& grad_residual, Gradients& grads, bool accumulate = false);
-
-    /**
-     * @brief Recompute activations for gradient checkpointing
-     */
-    void recompute_impl(ModuleContext& ctx, Weights& w, Tensor& residual, Activations& acts);
+          mAttention(config.attention_config()) {}
 
     // Accessors
     [[nodiscard]] const Config& config() const { return mConfig; }
+    [[nodiscard]] int hidden_size() const { return mConfig.hidden_size; }
+    [[nodiscard]] int intermediate_size() const { return mConfig.intermediate_size; }
+    [[nodiscard]] int num_query_heads() const { return mConfig.num_query_heads; }
+    [[nodiscard]] int num_kv_heads() const { return mConfig.num_kv_heads; }
+
+    // ========================================================================
+    // Modular Block Execution (Production)
+    //
+    // These static methods provide a fully-featured implementation that works
+    // with the training infrastructure. They use:
+    // - SimplifiedLayerActivations for activation storage
+    // - Recipe-driven matmul dispatch (BF16, FP8, FP4)
+    // - Full quantization support
+    // - Hook compatibility
+    //
+    // Usage: Default path for ModularTransformerModel
+    // ========================================================================
+
+    /**
+     * @brief Modular forward pass for a transformer block layer
+     *
+     * Fully compatible with the training infrastructure. Computes:
+     *   ln1 = RMSNorm(residual)
+     *   qkv = ln1 @ qkv_weight + optional QK-norm + RoPE
+     *   att = FlashAttention(qkv)
+     *   att_out = att @ out_weight
+     *   residual_att = residual + att_out
+     *   ln2 = RMSNorm(residual_att)
+     *   mlp_up = ln2 @ mlp_up_weight
+     *   swiglu = SwiGLU(mlp_up)
+     *   mlp_down = swiglu @ mlp_down_weight
+     *
+     * @tparam Block The transformer block type (for RunState/WeightManager templates)
+     * @param recipe Training recipe (handles matmul dispatch, quantization)
+     * @param rs ModularRunState with activation buffers
+     * @param weights Block weights
+     * @param acts SimplifiedLayerActivations for this layer
+     * @param quant_acts SimplifiedLayerQuantActivations for FP8/FP4 inputs
+     * @param residual Input residual tensor
+     * @param layer_idx Layer index (for recipe quantizer indices)
+     * @param config Model configuration
+     * @param options Model options (recompute flags, quantization settings)
+     * @param stream CUDA stream
+     * @param fp8_fwd_quants Optional FP8 forward quant buffers
+     * @param fp4_fwd_quants Optional FP4 forward quant buffers
+     * @param weight_manager Weight manager (for FP8/FP4 cached weights)
+     * @param allow_quant_layer Whether quantization is allowed for this layer
+     */
+    template<typename Block>
+    static void forward_block_modular(
+        const ::recipes::Recipe& recipe,
+        ModularRunState<Block>& rs,
+        Weights& weights,
+        SimplifiedLayerActivations& acts,
+        SimplifiedLayerQuantActivations& quant_acts,
+        Tensor& residual,
+        int layer_idx,
+        const ModelConfig& config,
+        const ModelOptions& options,
+        cudaStream_t stream,
+        FP8ForwardQuantActivations* fp8_fwd_quants,
+        FP4ForwardQuantActivations* fp4_fwd_quants,
+        ModularWeightManager<Block>* weight_manager,
+        bool allow_quant_layer,
+        const ForwardHook* hook = nullptr);
+
+    /**
+     * @brief Modular backward pass for a transformer block layer
+     *
+     * Computes gradients in reverse order through the block.
+     * Uses recipe-driven backward matmul for proper FP8/FP4 handling.
+     *
+     * @tparam Block The transformer block type
+     * @param recipe Training recipe
+     * @param rs ModularRunState
+     * @param weights Block weights
+     * @param grads Block gradients (output)
+     * @param acts SimplifiedLayerActivations from forward
+     * @param d_acts SimplifiedLayerGradients for this layer
+     * @param quant_acts SimplifiedLayerQuantActivations
+     * @param quant_grads SimplifiedQuantGradients
+     * @param layer_idx Layer index
+     * @param config Model configuration
+     * @param options Model options
+     * @param accumulate Whether to accumulate into existing gradients
+     * @param stream CUDA stream
+     * @param allow_quant_layer Whether quantization is allowed for this layer
+     */
+    template<typename Block>
+    static void backward_block_modular(
+        const ::recipes::Recipe& recipe,
+        ModularRunState<Block>& rs,
+        Weights& weights,
+        Gradients& grads,
+        SimplifiedLayerActivations& acts,
+        SimplifiedLayerGradients& d_acts,
+        SimplifiedLayerQuantActivations& quant_acts,
+        SimplifiedQuantGradients& quant_grads,
+        int layer_idx,
+        const ModelConfig& config,
+        const ModelOptions& options,
+        bool accumulate,
+        cudaStream_t stream,
+        bool allow_quant_layer,
+        const BackwardHook* hook = nullptr);
+
+    /**
+     * @brief Modular recomputation for gradient checkpointing
+     *
+     * Recomputes activations during backward pass when gradient checkpointing
+     * is enabled. Only recomputes what's needed based on options.
+     *
+     * @tparam Block The transformer block type
+     * @param recipe Training recipe
+     * @param rs ModularRunState
+     * @param weights Block weights
+     * @param acts SimplifiedLayerActivations to populate
+     * @param quant_acts SimplifiedLayerQuantActivations
+     * @param residual Input residual
+     * @param layer_idx Layer index
+     * @param config Model configuration
+     * @param options Model options (determines what to recompute)
+     * @param stream CUDA stream
+     * @param fp8_fwd_quants Optional FP8 forward quant buffers
+     * @param fp4_fwd_quants Optional FP4 forward quant buffers
+     * @param weight_manager Weight manager (for FP8/FP4 cached weights)
+     * @param allow_quant_layer Whether quantization is allowed for this layer
+     */
+    template<typename Block>
+    static void recompute_block_modular(
+        const ::recipes::Recipe& recipe,
+        ModularRunState<Block>& rs,
+        Weights& weights,
+        SimplifiedLayerActivations& acts,
+        SimplifiedLayerQuantActivations& quant_acts,
+        Tensor& residual,
+        int layer_idx,
+        const ModelConfig& config,
+        const ModelOptions& options,
+        cudaStream_t stream,
+        FP8ForwardQuantActivations* fp8_fwd_quants,
+        FP4ForwardQuantActivations* fp4_fwd_quants,
+        ModularWeightManager<Block>* weight_manager,
+        bool allow_quant_layer);
 
 private:
     Config mConfig;
     AttentionType mAttention;
-    ActivationType mActivation;
-
-    // Helper for MLP forward
-    void forward_mlp(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts);
-
-    // Helper for MLP backward
-    Tensor backward_mlp(ModuleContext& ctx, Weights& w, Activations& acts,
-                        Tensor& grad_output, Gradients& grads, bool accumulate);
 };
 
 // ============================================================================
-// Implementation
+// Type aliases for common configurations
 // ============================================================================
 
-template<typename Att, typename Act, typename Norm>
-Tensor DenseTransformerBlock<Att, Act, Norm>::forward_impl(
-    ModuleContext& ctx, Weights& w, Tensor& residual, Activations& acts) {
+/// Standard dense transformer block with SwiGLU activation
+using StandardDenseBlock = DenseTransformerBlock<AttentionModule, SwiGLUMLP, FusedResidualRMSNormModule>;
 
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
+/// Dense block with GeGLU activation (for models that use it)
+using GeGLUDenseBlock = DenseTransformerBlock<AttentionModule, GeGLUMLP, FusedResidualRMSNormModule>;
 
-    // ========== Attention Sub-Block ==========
-    // x = x + Attention(RMSNorm(x))
+// Trait: detect DenseTransformerBlock specializations for modular dispatch
+template<typename T>
+struct is_dense_transformer_block : std::false_type {};
 
-    // 1) Pre-attention LayerNorm (fused with residual for second block onwards)
-    //    For first application: just normalize the input
-    //    Output: acts.ln1_acts.output
-    Tensor ln1_output;
-    if constexpr (std::is_same_v<Norm, FusedResidualRMSNormModule>) {
-        // First block doesn't have previous residual to fuse
-        // Use standalone norm or handle in caller
-        RMSNormModule standalone_ln1({mConfig.hidden_size, mConfig.rms_norm_eps});
-        RMSNormModule::Activations standalone_acts;
-        RMSNormModule::Weights standalone_weights{w.ln1.weight};
-        ln1_output = standalone_ln1.forward(ctx, standalone_weights, residual, standalone_acts);
-        acts.ln1_acts.output.Value = ln1_output;
-        acts.ln1_acts.rstd = standalone_acts.rstd;
-    } else {
-        Norm norm_module(typename Norm::Config{mConfig.hidden_size, mConfig.rms_norm_eps});
-        ln1_output = norm_module.forward(ctx, w.ln1, residual, acts.ln1_acts);
-    }
+template<typename AttentionType, typename MLPType, typename NormType>
+struct is_dense_transformer_block<DenseTransformerBlock<AttentionType, MLPType, NormType>> : std::true_type {};
 
-    // 2) Attention
-    acts.attention_output = mAttention.forward(ctx, w.attention, ln1_output, acts.attention_acts);
-
-    // 3) Residual connection (residual = residual + attention_output)
-    //    This is handled by the fused norm in the next step
-
-    // ========== MLP Sub-Block ==========
-    // x = x + MLP(RMSNorm(x))
-
-    // 4) Pre-MLP LayerNorm with fused residual add
-    //    residual_att = residual + attention_output
-    //    ln2_output = RMSNorm(residual_att)
-    if constexpr (std::is_same_v<Norm, FusedResidualRMSNormModule>) {
-        FusedResidualRMSNormModule ln2({mConfig.hidden_size, mConfig.rms_norm_eps});
-        ln2.forward_with_residual(ctx, w.ln2, acts.attention_output, residual, acts.ln2_acts);
-        acts.residual_att = acts.ln2_acts.residual_out;
-    } else {
-        // Manual residual add + norm
-        // residual += attention_output
-        // ln2_output = norm(residual)
-        acts.residual_att = residual;  // Would need actual add kernel
-    }
-
-    // 5) MLP: gate+up -> activation -> down
-    forward_mlp(ctx, w, acts.ln2_acts.output.Value, acts);
-
-    // 6) Final residual connection
-    //    output_residual = residual_att + mlp_down_output
-    //    This will be fused with the next block's LN1
-    //    For the last block, it's done explicitly
-
-    return acts.mlp_down_output;  // Caller adds to residual
-}
-
-template<typename Att, typename Act, typename Norm>
-void DenseTransformerBlock<Att, Act, Norm>::forward_mlp(
-    ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts) {
-
-    const int BT = ctx.B * ctx.T;
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
-
-    // Save input for backward
-    acts.mlp_up_input.Value = input;
-
-    // Gate + Up projection (fused)
-    bool needs_quant = w.mlp_up_weight.DType != input.DType;
-    if (needs_quant && acts.mlp_up_input.Quant.has_value()) {
-        quantize_with_abs_max(
-            acts.mlp_up_input.Quant.value(),
-            acts.mlp_up_input.Quant->scale(),
-            input,
-            acts.mlp_up_input.Quant->abs_max(),
-            BT * C,
-            *ctx.device_prop,
-            ctx.stream
-        );
-    }
-
-    const Tensor& inp = acts.mlp_up_input.for_matmul();
-    matmul(
-        acts.mlp_up_output, w.mlp_up_weight, inp, std::nullopt,
-        w.mlp_up_weight.scale(), acts.mlp_up_input.scale(),
-        ctx.cublas_handle, *ctx.workspace,
-        2 * D, BT, C, EMMTranspose::TN, false,
-        ctx.stream
-    );
-
-    // SwiGLU activation
-    typename Act::Weights act_weights{};
-    mActivation.forward(ctx, act_weights, acts.mlp_up_output, acts.activation_acts);
-
-    // Save activation output for backward
-    acts.mlp_down_input.Value = acts.activation_acts.output.Value;
-
-    // Down projection
-    needs_quant = w.mlp_down_weight.DType != acts.mlp_down_input.Value.DType;
-    if (needs_quant && acts.mlp_down_input.Quant.has_value()) {
-        quantize_with_abs_max(
-            acts.mlp_down_input.Quant.value(),
-            acts.mlp_down_input.Quant->scale(),
-            acts.mlp_down_input.Value,
-            acts.mlp_down_input.Quant->abs_max(),
-            BT * D,
-            *ctx.device_prop,
-            ctx.stream
-        );
-    }
-
-    const Tensor& down_inp = acts.mlp_down_input.for_matmul();
-    matmul(
-        acts.mlp_down_output, w.mlp_down_weight, down_inp, std::nullopt,
-        w.mlp_down_weight.scale(), acts.mlp_down_input.scale(),
-        ctx.cublas_handle, *ctx.workspace,
-        C, BT, D, EMMTranspose::TN, false,
-        ctx.stream
-    );
-}
-
-template<typename Att, typename Act, typename Norm>
-Tensor DenseTransformerBlock<Att, Act, Norm>::backward_impl(
-    ModuleContext& ctx, Weights& w, Activations& acts,
-    Tensor& grad_residual, Gradients& grads, bool accumulate) {
-
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
-
-    // ========== MLP Backward ==========
-    // grad_residual contains gradient from next block
-
-    // Backward through MLP down projection
-    Tensor d_swiglu = backward_mlp(ctx, w, acts, grad_residual, grads, accumulate);
-
-    // Backward through LN2 (accumulates into grad_residual_att)
-    Tensor grad_residual_att;
-    if constexpr (std::is_same_v<Norm, FusedResidualRMSNormModule>) {
-        FusedResidualRMSNormModule ln2({mConfig.hidden_size, mConfig.rms_norm_eps});
-        // d_ln2_input is returned, grad_residual_att is accumulated
-        Tensor d_ln2_input = ln2.backward_with_residual(
-            ctx, w.ln2, acts.ln2_acts,
-            d_swiglu, grad_residual_att, grads.ln2_grads
-        );
-    }
-
-    // ========== Attention Backward ==========
-
-    // Backward through attention output projection and attention mechanism
-    Tensor d_ln1 = mAttention.backward(ctx, w.attention, acts.attention_acts,
-                                        grad_residual_att, grads.attention_grads, accumulate);
-
-    // Backward through LN1
-    // This produces gradient w.r.t. input residual
-    Tensor grad_input_residual;
-    if constexpr (std::is_same_v<Norm, FusedResidualRMSNormModule>) {
-        FusedResidualRMSNormModule ln1({mConfig.hidden_size, mConfig.rms_norm_eps});
-        grad_input_residual = ln1.backward_with_residual(
-            ctx, w.ln1, acts.ln1_acts,
-            d_ln1, grad_residual_att, grads.ln1_grads
-        );
-    } else {
-        RMSNormModule ln1({mConfig.hidden_size, mConfig.rms_norm_eps});
-        RMSNormModule::Activations ln1_acts_simple;
-        ln1_acts_simple.rstd = acts.ln1_acts.rstd;
-        ln1_acts_simple.input = acts.ln1_acts.residual_out;
-        ln1_acts_simple.output = acts.ln1_acts.output;
-        RMSNormModule::Weights ln1_weights{w.ln1.weight};
-        RMSNormModule::Gradients ln1_grads{grads.ln1_grads.d_weight, grads.ln1_grads.scratch};
-        grad_input_residual = ln1.backward(ctx, ln1_weights, ln1_acts_simple, d_ln1, ln1_grads, accumulate);
-    }
-
-    return grad_input_residual;
-}
-
-template<typename Att, typename Act, typename Norm>
-Tensor DenseTransformerBlock<Att, Act, Norm>::backward_mlp(
-    ModuleContext& ctx, Weights& w, Activations& acts,
-    Tensor& grad_output, Gradients& grads, bool accumulate) {
-
-    const int BT = ctx.B * ctx.T;
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
-
-    // Backward through down projection
-    Tensor d_swiglu;
-    d_swiglu.DType = acts.mlp_down_input.Value.DType;
-
-    // d_swiglu = grad_output @ mlp_down_weight (NN transpose)
-    matmul(
-        d_swiglu, w.mlp_down_weight, grad_output, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        D, BT, C, EMMTranspose::NN, false,
-        ctx.stream
-    );
-
-    // d_mlp_down_weight = swiglu_output^T @ grad_output (NT transpose)
-    matmul(
-        grads.d_mlp_down_weight, acts.mlp_down_input.Value, grad_output, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        D, C, BT, EMMTranspose::NT, accumulate,
-        ctx.stream
-    );
-
-    // Backward through SwiGLU
-    Tensor d_mlp_up;
-    d_mlp_up.DType = acts.mlp_up_output.DType;
-
-    typename Act::Weights act_weights{};
-    typename Act::Gradients act_grads{};
-    d_mlp_up = mActivation.backward(ctx, act_weights, acts.activation_acts,
-                                     d_swiglu, act_grads, false);
-
-    // Backward through up projection
-    Tensor d_ln2;
-    d_ln2.DType = acts.mlp_up_input.Value.DType;
-
-    // d_ln2 = d_mlp_up @ mlp_up_weight (NN transpose)
-    matmul(
-        d_ln2, w.mlp_up_weight, d_mlp_up, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        C, BT, 2 * D, EMMTranspose::NN, false,
-        ctx.stream
-    );
-
-    // d_mlp_up_weight = ln2_output^T @ d_mlp_up (NT transpose)
-    matmul(
-        grads.d_mlp_up_weight, acts.mlp_up_input.Value, d_mlp_up, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        C, 2 * D, BT, EMMTranspose::NT, accumulate,
-        ctx.stream
-    );
-
-    return d_ln2;
-}
-
-template<typename Att, typename Act, typename Norm>
-void DenseTransformerBlock<Att, Act, Norm>::recompute_impl(
-    ModuleContext& ctx, Weights& w, Tensor& residual, Activations& acts) {
-
-    // Recompute LN1
-    RMSNormModule ln1({mConfig.hidden_size, mConfig.rms_norm_eps});
-    RMSNormModule::Activations ln1_simple;
-    RMSNormModule::Weights ln1_weights{w.ln1.weight};
-    Tensor ln1_output = ln1.forward(ctx, ln1_weights, residual, ln1_simple);
-    acts.ln1_acts.rstd = ln1_simple.rstd;
-
-    // Recompute attention (preserves LSE from forward)
-    mAttention.recompute(ctx, w.attention, ln1_output, acts.attention_acts);
-
-    // Recompute LN2 with residual
-    if constexpr (std::is_same_v<Norm, FusedResidualRMSNormModule>) {
-        FusedResidualRMSNormModule ln2({mConfig.hidden_size, mConfig.rms_norm_eps});
-        ln2.forward_with_residual(ctx, w.ln2, acts.attention_output, residual, acts.ln2_acts);
-    }
-
-    // Recompute MLP (optional - depends on recomputation policy)
-    forward_mlp(ctx, w, acts.ln2_acts.output.Value, acts);
-}
+template<typename T>
+inline constexpr bool is_dense_transformer_block_v = is_dense_transformer_block<T>::value;
 
 } // namespace modules
+
+// Include the implementation
+#include "transformer_block_impl.h"
 
 #endif // SUROGATE_SRC_MODULES_COMPOSITE_TRANSFORMER_BLOCK_H

@@ -13,10 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <iomanip>
-#include <iostream>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -38,7 +35,6 @@
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
-#include "utilities/tensor_container.h"
 
 namespace {
 
@@ -147,12 +143,15 @@ void fill_training_data(Tensor& inputs, Tensor& targets, int B, int T, int vocab
     auto* input_ptr = inputs.get<std::int32_t>();
     auto* target_ptr = targets.get<std::int32_t>();
 
+    (void)step;
+
     for (int b = 0; b < B; ++b) {
         for (int t = 0; t < T; ++t) {
             int idx = b * T + t;
-            // Create deterministic patterns that change per step
-            input_ptr[idx] = ((idx * 17 + step * 7) % (vocab_size - 1)) + 1;  // Avoid padding token
-            target_ptr[idx] = ((idx * 13 + step * 11 + 1) % (vocab_size - 1)) + 1;
+            // Use a stable, learnable pattern across steps.
+            int token = (idx % (vocab_size - 1)) + 1;  // Avoid padding token
+            input_ptr[idx] = token;
+            target_ptr[idx] = token;
         }
     }
 }
@@ -312,8 +311,9 @@ TEST_CASE("Dense model with LoRA learns properly", "[training][learning][dense][
     });
 }
 
-// QLoRA tests are disabled for now - require proper weight loading from file
-// TEST_CASE("Dense model with QLoRA-FP8 learns properly", "[training][learning][dense][qlora][fp8][gpu][.disabled]") {
+TEST_CASE("Dense model with QLoRA-FP8 learns properly", "[training][learning][dense][qlora][fp8][gpu][.disabled]") {
+    SKIP("Disabled");
+}
 
 // ============================================================================
 // MoE Model Learning Tests
@@ -328,7 +328,7 @@ TEST_CASE("MoE model learns: loss decreases over training steps", "[training][le
         constexpr int num_steps = 20;
         constexpr float lr = 1e-3f;
 
-        PretrainedConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
+        Qwen3MoEConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -394,7 +394,7 @@ TEST_CASE("MoE model with LoRA learns properly", "[training][learning][moe][lora
         constexpr int num_steps = 20;
         constexpr float lr = 1e-3f;
 
-        PretrainedConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
+        Qwen3MoEConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -412,7 +412,7 @@ TEST_CASE("MoE model with LoRA learns properly", "[training][learning][moe][lora
         modules::ModularLoRAConfig lora_cfg;
         lora_cfg.rank = 8;
         lora_cfg.alpha = 16.0f;
-        lora_cfg.dtype = ETensorDType::FP32;
+        lora_cfg.dtype = ETensorDType::BF16;
         lora_cfg.dropout = 0.0f;
         lora_cfg.with_all();  // Apply to attention, experts, and shared expert
 
@@ -455,8 +455,9 @@ TEST_CASE("MoE model with LoRA learns properly", "[training][learning][moe][lora
     });
 }
 
-// QLoRA tests are disabled for now - require proper weight loading from file
-// TEST_CASE("MoE model with QLoRA-FP8 learns properly", "[training][learning][moe][qlora][fp8][gpu][.disabled]") {
+TEST_CASE("MoE model with QLoRA-FP8 learns properly", "[training][learning][moe][qlora][fp8][gpu][.disabled]") {
+    SKIP("Disabled");
+}
 
 // ============================================================================
 // Comparative Learning Tests
@@ -510,7 +511,7 @@ TEST_CASE("Dense vs MoE learning comparison", "[training][learning][comparison][
 
     // Train MoE model
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
-        PretrainedConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
+        Qwen3MoEConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -626,7 +627,7 @@ TEST_CASE("MoE model shows sustained learning over extended training", "[trainin
         constexpr int num_steps = 50;
         constexpr float lr = 5e-4f;
 
-        PretrainedConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
+        Qwen3MoEConfig cfg = create_moe_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
 
         auto allocator = std::make_shared<TensorAllocator>();

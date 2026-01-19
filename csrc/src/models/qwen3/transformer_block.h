@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_MODELS_QWEN3_TRANSFORMER_BLOCK_H
 
 #include "modules/composite/transformer_block.h"
+#include "modules/primitives/mlp.h"
 #include "models/qwen3/attention.h"
 #include "models/qwen3/rmsnorm.h"
 
@@ -17,7 +18,7 @@ namespace modules {
  *
  * Composes:
  * - Qwen3AttentionModule (GQA with QK normalization + RoPE)
- * - SwiGLUModule (standard activation)
+ * - MLPModule<SwiGLUModule> (gate+up -> SwiGLU -> down)
  * - Qwen3FusedResidualRMSNormModule (fused residual + norm)
  *
  * Extends Qwen2TransformerBlock with QK normalization for improved
@@ -25,7 +26,7 @@ namespace modules {
  */
 using Qwen3TransformerBlock = DenseTransformerBlock<
     Qwen3AttentionModule,
-    SwiGLUModule,
+    MLPModule<SwiGLUModule>,
     Qwen3FusedResidualRMSNormModule
 >;
 

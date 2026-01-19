@@ -252,9 +252,6 @@ protected:
     void backward_block(int layer_idx, bool accumulate, BlockWeights& weights, BlockGradients& grads,
                         BlockActivations& acts, typename ModularRunState<Block>::BlockGradients& d_acts,
                         const BackwardBlockHook* hook);
-    void backward_block_moe(int layer_idx, bool accumulate, BlockWeights& weights, BlockGradients& grads,
-                            BlockActivations& acts, typename ModularRunState<Block>::BlockGradients& d_acts,
-                            const BackwardBlockHook* hook);
 
     void backward_lmhead(long B, long T, int micro_step, int grad_accum_steps, NCCLCommunicator& comm);
     void reduce_loss(long B, long T, NCCLCommunicator& comm);

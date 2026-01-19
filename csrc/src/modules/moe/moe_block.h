@@ -13,8 +13,30 @@
 #include "modules/module_base.h"
 #include "modules/primitives/attention.h"
 #include "modules/primitives/rmsnorm.h"
+#include "modules/backward_hooks.h"
+
+// Forward declaration for recipe types (global ::recipes namespace)
+namespace recipes { class Recipe; }
 
 namespace modules {
+
+// Forward declarations for the modular execution context
+template<typename Block> class ModularRunState;
+template<typename Block> class ModularWeightManager;
+
+// Forward declarations for simplified activation/gradient types (from run_state_types.h)
+struct SimplifiedLayerActivations;
+struct SimplifiedLayerGradients;
+struct SimplifiedLayerQuantActivations;
+struct SimplifiedQuantGradients;
+
+// Forward declarations for quantization activation buffers
+struct FP8ForwardQuantActivations;
+struct FP4ForwardQuantActivations;
+
+// Forward declarations for model configuration (from model_config.h)
+struct ModelConfig;
+struct ModelOptions;
 
 /**
  * @brief Mixture of Experts Transformer Block
@@ -154,6 +176,63 @@ public:
      */
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
                          Tensor& grad_output, Gradients& grads, bool accumulate = false);
+
+    // ========================================================================
+    // Modular Block Execution (simplified path)
+    // ========================================================================
+
+    template<typename Block>
+    static void forward_block_modular(
+        const ::recipes::Recipe& recipe,
+        ModularRunState<Block>& rs,
+        Weights& weights,
+        SimplifiedLayerActivations& acts,
+        SimplifiedLayerQuantActivations& quant_acts,
+        Tensor& residual,
+        int layer_idx,
+        const ModelConfig& config,
+        const ModelOptions& options,
+        cudaStream_t stream,
+        FP8ForwardQuantActivations* fp8_fwd_quants,
+        FP4ForwardQuantActivations* fp4_fwd_quants,
+        ModularWeightManager<Block>* weight_manager,
+        bool allow_quant_layer,
+        const ForwardHook* hook);
+
+    template<typename Block>
+    static void backward_block_modular(
+        const ::recipes::Recipe& recipe,
+        ModularRunState<Block>& rs,
+        Weights& weights,
+        Gradients& grads,
+        SimplifiedLayerActivations& acts,
+        SimplifiedLayerGradients& d_acts,
+        SimplifiedLayerQuantActivations& quant_acts,
+        SimplifiedQuantGradients& quant_grads,
+        int layer_idx,
+        const ModelConfig& config,
+        const ModelOptions& options,
+        bool accumulate,
+        cudaStream_t stream,
+        bool allow_quant_layer,
+        const BackwardHook* hook);
+
+    template<typename Block>
+    static void recompute_block_modular(
+        const ::recipes::Recipe& recipe,
+        ModularRunState<Block>& rs,
+        Weights& weights,
+        SimplifiedLayerActivations& acts,
+        SimplifiedLayerQuantActivations& quant_acts,
+        Tensor& residual,
+        int layer_idx,
+        const ModelConfig& config,
+        const ModelOptions& options,
+        cudaStream_t stream,
+        FP8ForwardQuantActivations* fp8_fwd_quants,
+        FP4ForwardQuantActivations* fp4_fwd_quants,
+        ModularWeightManager<Block>* weight_manager,
+        bool allow_quant_layer);
 
     /**
      * @brief Get auxiliary loss from router (for training)
@@ -521,5 +600,7 @@ private:
 };
 
 } // namespace modules
+
+#include "moe_block_modular_impl.h"
 
 #endif // SUROGATE_SRC_MODULES_MOE_MOE_BLOCK_H

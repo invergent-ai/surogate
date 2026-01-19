@@ -243,7 +243,7 @@ private:
     void wait_for_buffer(GatherStatus& status, cudaStream_t stream) const;
 
     void allocate_block_weights(BlockWeights& block, ETensorDType matmul_dtype, ETensorDType other_dtype,
-                                bool on_host, bool sharded);
+                                bool on_host, bool sharded, int layer_idx = -1);
     void allocate_non_block_weights(NonBlockWeights& weights, ETensorDType dtype, bool on_host, bool sharded);
 
     // FP8 weight cache helpers

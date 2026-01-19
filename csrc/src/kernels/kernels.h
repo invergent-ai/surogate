@@ -147,6 +147,10 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
             cublasLtHandle_t handle, Tensor& workspace,
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
 
+// Initialize fallback cuBLAS handle used when cuBLASLt matmul fails.
+// Call once during startup (before CUDA graph capture) to avoid cublasCreate in capture.
+void init_cublas_fallback_handle();
+
 // Like `matmul`, but allows overriding the output leading dimension (stride between columns)
 // for the destination matrix in column-major cuBLASLt terms. Useful for writing into slices
 // of a larger fused output (e.g. QKV, gate+up).
@@ -207,6 +211,21 @@ void swiglu_forward_quant(Tensor& out, float* scale_ptr, const Tensor& inp, cons
 void swiglu_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16* inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
 void swiglu_backward(float* dinp, const float* dout, const float* inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
 void swiglu_backward(Tensor& dinp, const Tensor& dout, const Tensor& inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
+
+// Simple elementwise activations (non-gated MLPs)
+void silu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
+void silu_forward(float* out, const float* inp, long n, cudaStream_t stream);
+void silu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
+void silu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
+void silu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
+void silu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
+
+void relu2_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
+void relu2_forward(float* out, const float* inp, long n, cudaStream_t stream);
+void relu2_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
+void relu2_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
+void relu2_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
+void relu2_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
 
 // ============================================================================
 // Fast LoRA SiLU kernels for MoE expert optimization
@@ -1134,6 +1153,12 @@ void moe_softmax_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_token
 /// @param stream CUDA stream.
 void moe_sigmoid_forward(float* out, const float* inp, int num_elements, cudaStream_t stream);
 void moe_sigmoid_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_elements, cudaStream_t stream);
+void moe_sigmoid_backward(float* d_inp, const float* grad, const float* out, int num_elements, cudaStream_t stream);
+void moe_sigmoid_backward(nv_bfloat16* d_inp, const nv_bfloat16* grad, const nv_bfloat16* out, int num_elements, cudaStream_t stream);
+
+/// @brief Scale tensor elements by a scalar (in-place or out-of-place).
+void moe_scale_forward(float* out, const float* inp, float scale, int num_elements, cudaStream_t stream);
+void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, int num_elements, cudaStream_t stream);
 
 /// @brief Top-K expert selection per token.
 /// @param expert_indices Output expert indices (num_tokens, top_k).
@@ -1504,21 +1529,112 @@ void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_o
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
 void moe_grouped_gemm_gate_up_backward(float* d_input, const float* d_gate_up, const float* weights,
-                                        const int* expert_offsets, int num_experts,
-                                        int hidden_size, int intermediate_size,
-                                        cublasHandle_t cublas_handle, cudaStream_t stream,
-                                        const int* host_offsets = nullptr,
-                                        const int* active_expert_indices = nullptr,
-                                        bool weight_is_compact = true,
-                                        int num_active_experts = -1);
+                                       const int* expert_offsets, int num_experts,
+                                       int hidden_size, int intermediate_size,
+                                       cublasHandle_t cublas_handle, cudaStream_t stream,
+                                       const int* host_offsets = nullptr,
+                                       const int* active_expert_indices = nullptr,
+                                       bool weight_is_compact = true,
+                                       int num_active_experts = -1);
 void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_gate_up, const nv_bfloat16* weights,
-                                        const int* expert_offsets, int num_experts,
-                                        int hidden_size, int intermediate_size,
-                                        cublasHandle_t cublas_handle, cudaStream_t stream,
-                                        const int* host_offsets = nullptr,
-                                        const int* active_expert_indices = nullptr,
-                                        bool weight_is_compact = true,
-                                        int num_active_experts = -1);
+                                       const int* expert_offsets, int num_experts,
+                                       int hidden_size, int intermediate_size,
+                                       cublasHandle_t cublas_handle, cudaStream_t stream,
+                                       const int* host_offsets = nullptr,
+                                       const int* active_expert_indices = nullptr,
+                                       bool weight_is_compact = true,
+                                       int num_active_experts = -1);
+
+/// @brief Grouped GEMM backward for non-gated up projection across all experts.
+/// Computes d_input = d_up @ W_up where W_up has shape (D, C).
+void moe_grouped_gemm_up_backward(float* d_input, const float* d_up, const float* weights,
+                                  const int* expert_offsets, int num_experts,
+                                  int hidden_size, int intermediate_size,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
+void moe_grouped_gemm_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_up, const nv_bfloat16* weights,
+                                  const int* expert_offsets, int num_experts,
+                                  int hidden_size, int intermediate_size,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
+
+// ----------------------------------------------------------------------------
+// Mamba / SSM kernels
+// ----------------------------------------------------------------------------
+
+// Split fused projection into gate (B,T,D), conv_in (B,conv_dim,T), and delta (B,D,T).
+void mamba_split_proj(Tensor& gate, Tensor& conv_in, Tensor& delta, const Tensor& proj,
+                      int B, int T, int D, int conv_dim, int num_heads, int head_dim,
+                      cudaStream_t stream);
+
+// Split conv1d output into u (B,D,T), B (B,G,N,T), C (B,G,N,T).
+void mamba_split_conv_out(Tensor& u, Tensor& B, Tensor& C, const Tensor& conv_out,
+                          int Bsz, int T, int D, int groups, int dstate,
+                          cudaStream_t stream);
+
+// Pack conv1d gradient from d_u (B,D,T), d_B/d_C (B,G,N,T) into d_conv_out (B,conv_dim,T).
+void mamba_pack_conv_out(Tensor& d_conv_out, const Tensor& d_u, const Tensor& d_B, const Tensor& d_C,
+                         int Bsz, int T, int D, int groups, int dstate,
+                         cudaStream_t stream);
+
+// Transpose between (B,T,D) and (B,D,T).
+void mamba_transpose_btd_to_bdt(Tensor& out, const Tensor& inp, int B, int T, int D, cudaStream_t stream);
+void mamba_transpose_bdt_to_btd(Tensor& out, const Tensor& inp, int B, int T, int D, cudaStream_t stream);
+
+// Expand per-head parameters to per-dimension buffers.
+void mamba_expand_A(Tensor& A, const Tensor& A_log, int num_heads, int head_dim, int dstate, cudaStream_t stream);
+void mamba_expand_head_param(Tensor& out, const Tensor& param, int num_heads, int head_dim, cudaStream_t stream);
+
+// Reduce per-dimension gradients back to per-head (A_log, D, dt_bias).
+void mamba_reduce_dA_log(Tensor& dA_log, const Tensor& dA, const Tensor& A,
+                         int num_heads, int head_dim, int dstate, bool accumulate, cudaStream_t stream);
+void mamba_reduce_head_param(Tensor& d_param, const Tensor& d_param_exp,
+                             int num_heads, int head_dim, bool accumulate, cudaStream_t stream);
+
+// Reduce expanded delta gradient to per-head dt.
+void mamba_reduce_delta_to_dt(Tensor& d_dt, const Tensor& d_delta,
+                              int B, int T, int num_heads, int head_dim, cudaStream_t stream);
+
+// Pack d_proj from d_gate (B,T,D), d_conv_in (B,conv_dim,T), d_dt (B,T,H).
+void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv_in, const Tensor& d_dt,
+                      int B, int T, int D, int conv_dim, int num_heads, cudaStream_t stream);
+
+// Group RMSNorm (gated) helpers.
+void mamba_group_rmsnorm_forward(Tensor& out, Tensor& rstd, const Tensor& inp, const Tensor& weight,
+                                 float epsilon, int B, int T, int D, int groups, cudaStream_t stream);
+void mamba_group_rmsnorm_backward_dx(Tensor& dinp, const Tensor& dout, const Tensor& inp, const Tensor& weight,
+                                     const Tensor& rstd, int B, int T, int D, int groups, cudaStream_t stream);
+void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tensor& dout, const Tensor& inp,
+                                               const Tensor& rstd, int B, int T, int D, int groups,
+                                               cudaStream_t stream);
+
+// Causal conv1d wrappers (depthwise, optional SiLU).
+void mamba_causal_conv1d_forward(Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+                                 int B, int T, int conv_dim, int kernel, bool silu, cudaStream_t stream);
+void mamba_causal_conv1d_backward(Tensor& dx, Tensor& dweight_fp32, Tensor* dbias_fp32,
+                                  const Tensor& x, const Tensor& weight, const Tensor& dout,
+                                  int B, int T, int conv_dim, int kernel, bool silu, cudaStream_t stream);
+
+// Selective scan wrappers (Mamba2).
+void mamba_selective_scan_forward(Tensor& out, const Tensor& u, const Tensor& delta,
+                                  const Tensor& A, const Tensor& B, const Tensor& C,
+                                  const Tensor& D, const Tensor& delta_bias,
+                                  Tensor& x, int Bsz, int T, int Ddim, int dstate,
+                                  int groups, int n_chunks, cudaStream_t stream);
+void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tensor& dB, Tensor& dC,
+                                   Tensor* dD, Tensor* ddelta_bias,
+                                   const Tensor& u, const Tensor& delta,
+                                   const Tensor& A, const Tensor& B, const Tensor& C,
+                                   const Tensor& D, const Tensor& delta_bias,
+                                   const Tensor& dout, Tensor& x,
+                                   int Bsz, int T, int Ddim, int dstate,
+                                   int groups, int n_chunks, cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // LoRA Dropout

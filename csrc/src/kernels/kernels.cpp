@@ -222,6 +222,46 @@ void swiglu_backward(Tensor& dinp, const Tensor& dout, const Tensor& inp, float*
     }
 }
 
+void silu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        silu_forward(out.get<float>(), inp.get<float>(), n, stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        silu_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("silu_forward: unsupported dtype");
+    }
+}
+
+void silu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
+        silu_backward(dinp.get<float>(), inp.get<float>(), dout.get<float>(), n, stream);
+    } else if (dinp.DType == ETensorDType::BF16) {
+        silu_backward(dinp.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("silu_backward: unsupported dtype");
+    }
+}
+
+void relu2_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        relu2_forward(out.get<float>(), inp.get<float>(), n, stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        relu2_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("relu2_forward: unsupported dtype");
+    }
+}
+
+void relu2_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
+        relu2_backward(dinp.get<float>(), inp.get<float>(), dout.get<float>(), n, stream);
+    } else if (dinp.DType == ETensorDType::BF16) {
+        relu2_backward(dinp.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("relu2_backward: unsupported dtype");
+    }
+}
+
 /**
  * @brief Dispatches the Rotary Positional Embedding (RoPE) forward pass to the appropriate kernel based on tensor data type.
  *

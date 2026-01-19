@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_MODELS_LLAMA_TRANSFORMER_BLOCK_H
 
 #include "modules/composite/transformer_block.h"
+#include "modules/primitives/mlp.h"
 #include "models/llama/attention.h"
 #include "models/llama/rmsnorm.h"
 
@@ -17,7 +18,7 @@ namespace modules {
  *
  * Composes:
  * - LlamaAttentionModule (GQA with RoPE)
- * - SwiGLUModule (standard activation)
+ * - MLPModule<SwiGLUModule> (gate+up -> SwiGLU -> down)
  * - LlamaFusedResidualRMSNormModule (fused residual + norm)
  *
  * This is the standard pre-norm transformer block used by LLaMA models:
@@ -26,7 +27,7 @@ namespace modules {
  */
 using LlamaTransformerBlock = DenseTransformerBlock<
     LlamaAttentionModule,
-    SwiGLUModule,
+    MLPModule<SwiGLUModule>,
     LlamaFusedResidualRMSNormModule
 >;
 

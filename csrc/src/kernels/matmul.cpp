@@ -5,13 +5,34 @@
 // Based on llm.c https://github.com/karpathy/llm.c
 
 #include <cublasLt.h>
+#include <cublas_v2.h>
 #include <fmt/core.h>
+#include <mutex>
+#include <type_traits>
 
 #include "kernels.h"
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
 
+namespace {
+std::once_flag g_fallback_cublas_once;
+cublasHandle_t g_fallback_cublas_handle = nullptr;
+}  // namespace
+
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
+
+void init_cublas_fallback_handle() {
+    std::call_once(g_fallback_cublas_once, []() {
+        CUBLAS_CHECK(cublasCreate(&g_fallback_cublas_handle));
+        // Allow tensor cores for BF16/FP16.
+        (void)cublasSetMathMode(g_fallback_cublas_handle, CUBLAS_TENSOR_OP_MATH);
+    });
+}
+
+static cublasHandle_t get_fallback_cublas_handle() {
+    init_cublas_fallback_handle();
+    return g_fallback_cublas_handle;
+}
 
 // ----------------------------------------------------------------------------
 // Error checking
@@ -23,6 +44,9 @@ inline void cublasCheck(cublasStatus_t status, const char *file, int line)
         throw std::runtime_error(fmt::format("cuBLAS ERROR ({}) at {}:{}", (int)status, file, line));
     }
 }
+#ifdef CUBLAS_CHECK
+#undef CUBLAS_CHECK
+#endif
 #define CUBLAS_CHECK(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 // ----------------------------------------------------------------------------
@@ -178,30 +202,109 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
     float* alpha = &one;
     float* beta = accumulate ? &one : &zero;
 
-    // Try algorithms in order until one succeeds
-    // FP8 on Blackwell multi-GPU can have issues with certain algorithms
+    // Try algorithms in order until one succeeds.
+    // Some heuristics can be reported with non-success state; skip those.
     cublasStatus_t matmul_status = CUBLAS_STATUS_NOT_SUPPORTED;
-    int algo_tried = 0;
+    cublasStatus_t gemm_status = CUBLAS_STATUS_NOT_SUPPORTED;
+    bool fallback_tried = false;
+    int algos_tried = 0;
     for (int i = 0; i < returnedResults; ++i) {
+        if (heuristics[i].state != CUBLAS_STATUS_SUCCESS) {
+            continue;
+        }
         matmul_status = cublasLtMatmul(handle, operationDesc,
                                    alpha, a, ALayout, b, BLayout, beta, d, CLayout, d, DLayout,
                                    &heuristics[i].algo, workspace, workspace_size, stream);
-        algo_tried = i;
+        ++algos_tried;
         if (matmul_status == CUBLAS_STATUS_SUCCESS) {
             break;
         }
-        // Algorithm failed, try next one (only for FP8 where we see multi-GPU issues)
-        if constexpr (sizeof(FloatA) != 1 && sizeof(FloatB) != 1) {
-            break;  // For non-FP8, don't retry with other algorithms
-        }
     }
     if (matmul_status != CUBLAS_STATUS_SUCCESS) {
+        // Fallback to cuBLAS GEMM for non-FP8 types when cuBLASLt fails.
+        // This is slower but more robust for certain BF16 shapes.
+        if constexpr (sizeof(FloatA) != 1 && sizeof(FloatB) != 1) {
+            const bool has_bias = (bias != nullptr);
+            const int ldc_fallback = (ldc_override > 0) ? ldc_override : m;
+
+            // Strided output with bias isn't supported by the simple bias kernel.
+            if (!has_bias || ldc_fallback == m) {
+                fallback_tried = true;
+                cublasHandle_t fallback_handle = get_fallback_cublas_handle();
+                CUBLAS_CHECK(cublasSetStream(fallback_handle, stream));
+
+                const cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+                const cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+                const int lda = transA ? k : m;
+                const int ldb = transB ? n : k;
+
+                float one = 1.0f;
+                float zero = 0.0f;
+                float* alpha = &one;
+                float* beta = accumulate ? &one : &zero;
+
+                gemm_status = cublasGemmEx(
+                    fallback_handle,
+                    opA, opB,
+                    m, n, k,
+                    alpha,
+                    a, to_cuda_lib_type_enum<FloatA>, lda,
+                    b, to_cuda_lib_type_enum<FloatB>, ldb,
+                    beta,
+                    d, to_cuda_lib_type_enum<FloatC>, ldc_fallback,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+                if (gemm_status != CUBLAS_STATUS_SUCCESS) {
+                    // Retry without tensor ops for maximum compatibility.
+                    gemm_status = cublasGemmEx(
+                        fallback_handle,
+                        opA, opB,
+                        m, n, k,
+                        alpha,
+                        a, to_cuda_lib_type_enum<FloatA>, lda,
+                        b, to_cuda_lib_type_enum<FloatB>, ldb,
+                        beta,
+                        d, to_cuda_lib_type_enum<FloatC>, ldc_fallback,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                }
+
+                if (gemm_status == CUBLAS_STATUS_SUCCESS) {
+                    if (has_bias) {
+                        if constexpr (std::is_same_v<FloatC, float> && std::is_same_v<FloatBias, float>) {
+                            // Treat output as row-major (n x m) for bias add; only product matters.
+                            add_bias(d, bias, /*B=*/1, /*T=*/n, /*OC=*/m, stream);
+                        } else if constexpr (std::is_same_v<FloatC, nv_bfloat16> &&
+                                             std::is_same_v<FloatBias, nv_bfloat16>) {
+                            add_bias(d, bias, /*B=*/1, /*T=*/n, /*OC=*/m, stream);
+                        } else {
+                            throw std::runtime_error("cuBLASLt failed and fallback bias add has incompatible dtype");
+                        }
+                    }
+                    // Success via fallback.
+                    CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
+                    CUBLAS_CHECK(cublasLtMatmulDescDestroy(operationDesc));
+                    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(ALayout));
+                    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(BLayout));
+                    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(CLayout));
+                    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(DLayout));
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
+            }
+        }
         int device_id = -1;
         cudaGetDevice(&device_id);
+        if (fallback_tried) {
+            throw std::runtime_error(fmt::format(
+                "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, ws_size: {}, A_type: {}, B_type: {}, algos_tried: {}/{}, gemm_status: {}",
+                (int)matmul_status, __FILE__, __LINE__, device_id, m, n, k, workspace_size,
+                (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, algos_tried, returnedResults,
+                (int)gemm_status));
+        }
         throw std::runtime_error(fmt::format(
             "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, ws_size: {}, A_type: {}, B_type: {}, algos_tried: {}/{}",
             (int)matmul_status, __FILE__, __LINE__, device_id, m, n, k, workspace_size,
-            (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, algo_tried + 1, returnedResults));
+            (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, algos_tried, returnedResults));
     }
     CUDA_CHECK(cudaGetLastError());
 

@@ -36,7 +36,6 @@ class LLMModelType:
     qwen3_thinking = 'qwen3_thinking'
     qwen3_nothinking = 'qwen3_nothinking'
     qwen3_moe = 'qwen3_moe'
-    qwen3_moe_thinking = 'qwen3_moe_thinking'
 
     llama3 = 'llama3'
     llama3_1 = 'llama3_1'

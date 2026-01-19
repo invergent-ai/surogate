@@ -13,6 +13,7 @@
 #include "models/qwen25/qwen25.h"
 #include "models/qwen3/qwen3.h"
 #include "models/qwen3moe/qwen3_moe.h"
+#include "models/nemotron_h/nemotron_h.h"
 
 namespace models {
 
@@ -22,6 +23,7 @@ static const std::vector<ArchitectureOps>& registry() {
         Qwen25Architecture::ops(),
         Qwen3Architecture::ops(),
         Qwen3MoEArchitecture::ops(),
+        NemotronHArchitecture::ops(),
     };
     return kRegistry;
 }
@@ -113,4 +115,3 @@ std::unique_ptr<modules::BaseWeightMapping> create_weight_mapping(PretrainedConf
 }
 
 } // namespace models
-

@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <fmt/format.h>
 
+#include "modules/mlp_utils.h"
+
 namespace modules {
 
 template<typename Block>
@@ -238,7 +240,7 @@ Tensor ModularRunState<Block>::acquire_mlp_up(int layer_idx) {
     // This shouldn't happen with proper recomputation scheduling
     long B = mConfig.batch_size;
     long T = mConfig.seq_length;
-    long intermediate_size = static_cast<long>(mConfig.block_config.intermediate_size) * 2;  // For gate + up
+    long intermediate_size = mlp_up_rows(mConfig.block_config);
 
     Tensor new_buffer = mAllocator->allocate(
         mConfig.activation_dtype, "mlp_up_pool",
@@ -278,11 +280,50 @@ void ModularRunState<Block>::allocate_simplified_activations() {
     long T = mConfig.seq_length;
     long C = mConfig.hidden_size;
     long D = mConfig.block_config.intermediate_size;
+    long M = mlp_up_rows(mConfig.block_config);
     int Hq = mConfig.block_config.num_query_heads;
     int Hkv = mConfig.block_config.num_kv_heads;
     int HS = mConfig.block_config.head_size;
     long AttC = static_cast<long>(HS) * static_cast<long>(Hq);
     long qkv_channels = HS * (Hq + 2 * Hkv);
+    const bool has_mamba = mConfig.has_mamba;
+    const int mamba_dim = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_dim(); }) {
+            return mConfig.block_config.mamba_dim();
+        }
+        return 0;
+    }();
+    const int mamba_heads = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_num_heads; }) {
+            return mConfig.block_config.mamba_num_heads;
+        }
+        return 0;
+    }();
+    const int mamba_state = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_ssm_state_size; }) {
+            return mConfig.block_config.mamba_ssm_state_size;
+        }
+        return 0;
+    }();
+    const int mamba_groups = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_n_groups; }) {
+            return mConfig.block_config.mamba_n_groups;
+        }
+        return 0;
+    }();
+    const int mamba_conv_dim = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_conv_dim(); }) {
+            return mConfig.block_config.mamba_conv_dim();
+        }
+        return 0;
+    }();
+    const int mamba_chunk_size = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_chunk_size; }) {
+            return mConfig.block_config.mamba_chunk_size > 0 ? mConfig.block_config.mamba_chunk_size : 2048;
+        }
+        return 2048;
+    }();
+    const int mamba_chunks = (has_mamba && mamba_chunk_size > 0) ? (T + mamba_chunk_size - 1) / mamba_chunk_size : 0;
     const bool use_qk_norm = [&]() -> bool {
         if constexpr (requires { mConfig.block_config.use_qk_norm; }) return mConfig.block_config.use_qk_norm;
         return false;
@@ -333,7 +374,7 @@ void ModularRunState<Block>::allocate_simplified_activations() {
         mSharedAttOut = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
     }
     if (share_mlp_up && !ffn_temps_on_stack && !mSharedMlpUp.Data) {
-        mSharedMlpUp = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, 2 * D});
+        mSharedMlpUp = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, M});
     }
     if (share_swiglu && !ffn_temps_on_stack && !mSharedSwiGlu.Data) {
         mSharedSwiGlu = mAllocator->allocate(dtype, "swiglu_shared", kind, {B, T, D});
@@ -426,13 +467,13 @@ void ModularRunState<Block>::allocate_simplified_activations() {
 
         // mlp_up is needed for SwiGLU backward
         if (ffn_temps_on_stack) {
-            const std::array<long, 3> mlp_up_shape_arr{B, T, 2 * D};
+            const std::array<long, 3> mlp_up_shape_arr{B, T, M};
             const std::array<long, 3> swiglu_shape_arr{B, T, D};
             acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, mlp_up_shape_arr);
             acts.swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, swiglu_shape_arr);
         } else {
             acts.mlp_up = share_mlp_up ? mSharedMlpUp : mAllocator->allocate(
-                dtype, "mlp_up", kind, {B, T, 2 * D});
+                dtype, "mlp_up", kind, {B, T, M});
             // swiglu is needed - it's the input X for LoRA down backward
             acts.swiglu = share_swiglu ? mSharedSwiGlu : mAllocator->allocate(
                 dtype, "swiglu", kind, {B, T, D});
@@ -448,6 +489,36 @@ void ModularRunState<Block>::allocate_simplified_activations() {
             acts.mlp_down = share_residual_intermediates ? mSharedMlpDown : mAllocator->allocate(
                 dtype, "mlp_down", kind, {B, T, C});
         }
+
+        // Mamba / SSM activations (only for Mamba layers)
+        const bool is_mamba_layer = has_mamba && (i < static_cast<int>(mConfig.layer_is_mamba.size()))
+            && (mConfig.layer_is_mamba[static_cast<std::size_t>(i)] != 0);
+        if (is_mamba_layer) {
+            acts.mamba_gate = mAllocator->allocate(dtype, "mamba_gate", kind, {B, T, (long)mamba_dim});
+            acts.mamba_conv_in = mAllocator->allocate(dtype, "mamba_conv_in", kind, {B, (long)mamba_conv_dim, T});
+            acts.mamba_u = mAllocator->allocate(dtype, "mamba_u", kind, {B, (long)mamba_dim, T});
+            acts.mamba_delta = mAllocator->allocate(dtype, "mamba_delta", kind, {B, (long)mamba_dim, T});
+            acts.mamba_B = mAllocator->allocate(dtype, "mamba_B", kind, {B, (long)mamba_groups, (long)mamba_state, T});
+            acts.mamba_C = mAllocator->allocate(dtype, "mamba_C", kind, {B, (long)mamba_groups, (long)mamba_state, T});
+            acts.mamba_scan_out = mAllocator->allocate(dtype, "mamba_scan_out", kind, {B, T, (long)mamba_dim});
+            acts.mamba_gated = mAllocator->allocate(dtype, "mamba_gated", kind, {B, T, (long)mamba_dim});
+            acts.mamba_normed = mAllocator->allocate(dtype, "mamba_normed", kind, {B, T, (long)mamba_dim});
+            acts.mamba_rstd = mAllocator->allocate(ETensorDType::FP32, "mamba_rstd", kind, {B, T, (long)mamba_groups});
+            acts.mamba_x = mAllocator->allocate(ETensorDType::FP32, "mamba_x", kind,
+                                                {B, (long)mamba_dim, (long)mamba_chunks, (long)mamba_state * 2});
+        } else {
+            acts.mamba_gate = {};
+            acts.mamba_conv_in = {};
+            acts.mamba_u = {};
+            acts.mamba_delta = {};
+            acts.mamba_B = {};
+            acts.mamba_C = {};
+            acts.mamba_scan_out = {};
+            acts.mamba_gated = {};
+            acts.mamba_normed = {};
+            acts.mamba_rstd = {};
+            acts.mamba_x = {};
+        }
     }
 }
 
@@ -457,11 +528,37 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
     long T = mConfig.seq_length;
     long C = mConfig.hidden_size;
     long D = mConfig.block_config.intermediate_size;
+    long M = mlp_up_rows(mConfig.block_config);
     int Hq = mConfig.block_config.num_query_heads;
     int Hkv = mConfig.block_config.num_kv_heads;
     int HS = mConfig.block_config.head_size;
     long AttC = static_cast<long>(HS) * static_cast<long>(Hq);
     long qkv_channels = HS * (Hq + 2 * Hkv);
+    const bool has_mamba = mConfig.has_mamba;
+    const int mamba_dim = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_dim(); }) {
+            return mConfig.block_config.mamba_dim();
+        }
+        return 0;
+    }();
+    const int mamba_state = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_ssm_state_size; }) {
+            return mConfig.block_config.mamba_ssm_state_size;
+        }
+        return 0;
+    }();
+    const int mamba_groups = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_n_groups; }) {
+            return mConfig.block_config.mamba_n_groups;
+        }
+        return 0;
+    }();
+    const int mamba_conv_dim = [&]() -> int {
+        if constexpr (requires { mConfig.block_config.mamba_conv_dim(); }) {
+            return mConfig.block_config.mamba_conv_dim();
+        }
+        return 0;
+    }();
 
     auto dtype = mConfig.grad_dtype;
     auto kind = EAllocationType::ON_DEVICE;
@@ -482,7 +579,7 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
         mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttC});
         mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
         if (!large_temps_on_stack) {
-            mSharedDMlpUp = mAllocator->allocate(dtype, "d_mlp_up_shared", kind, {B, T, 2 * D});
+            mSharedDMlpUp = mAllocator->allocate(dtype, "d_mlp_up_shared", kind, {B, T, M});
             mSharedDSwiGlu = mAllocator->allocate(dtype, "d_swiglu_shared", kind, {B, T, D});
             mSharedDQKV = mAllocator->allocate(dtype, "d_qkv_shared", kind, {B, T, qkv_channels});
         }
@@ -497,7 +594,7 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
         g.d_att = share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, AttC});
         g.d_ln1 = share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
         if (large_temps_on_stack) {
-            const std::array<long, 3> d_mlp_up_shape_arr{B, T, 2 * D};
+            const std::array<long, 3> d_mlp_up_shape_arr{B, T, M};
             const std::array<long, 3> d_swiglu_shape_arr{B, T, D};
             const std::array<long, 3> d_qkv_shape_arr{B, T, qkv_channels};
             g.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, d_mlp_up_shape_arr);
@@ -510,6 +607,29 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
             g.d_swiglu = share_grads ? mSharedDSwiGlu : mAllocator->allocate(dtype, "d_swiglu", kind, {B, T, D});
             g.d_qkv = share_grads ? mSharedDQKV : mAllocator->allocate(dtype, "d_qkv", kind, {B, T, qkv_channels});
         }
+
+        // Mamba gradients (only for Mamba layers)
+        const bool is_mamba_layer = has_mamba && (i < static_cast<int>(mConfig.layer_is_mamba.size()))
+            && (mConfig.layer_is_mamba[static_cast<std::size_t>(i)] != 0);
+        if (is_mamba_layer) {
+            g.d_mamba_normed = mAllocator->allocate(dtype, "d_mamba_normed", kind, {B, T, (long)mamba_dim});
+            g.d_mamba_gated = mAllocator->allocate(dtype, "d_mamba_gated", kind, {B, T, (long)mamba_dim});
+            g.d_mamba_scan_out = mAllocator->allocate(dtype, "d_mamba_scan_out", kind, {B, T, (long)mamba_dim});
+            g.d_mamba_u = mAllocator->allocate(dtype, "d_mamba_u", kind, {B, (long)mamba_dim, T});
+            g.d_mamba_delta = mAllocator->allocate(dtype, "d_mamba_delta", kind, {B, (long)mamba_dim, T});
+            g.d_mamba_B = mAllocator->allocate(ETensorDType::FP32, "d_mamba_B", kind, {B, (long)mamba_groups, (long)mamba_state, T});
+            g.d_mamba_C = mAllocator->allocate(ETensorDType::FP32, "d_mamba_C", kind, {B, (long)mamba_groups, (long)mamba_state, T});
+            g.d_mamba_conv_out = mAllocator->allocate(dtype, "d_mamba_conv_out", kind, {B, (long)mamba_conv_dim, T});
+        } else {
+            g.d_mamba_normed = {};
+            g.d_mamba_gated = {};
+            g.d_mamba_scan_out = {};
+            g.d_mamba_u = {};
+            g.d_mamba_delta = {};
+            g.d_mamba_B = {};
+            g.d_mamba_C = {};
+            g.d_mamba_conv_out = {};
+        }
     }
 }
 
@@ -519,6 +639,7 @@ void ModularRunState<Block>::allocate_simplified_quant_buffers() {
     long T = mConfig.seq_length;
     long C = mConfig.hidden_size;
     long D = mConfig.block_config.intermediate_size;
+    long M = mlp_up_rows(mConfig.block_config);
     int Hq = mConfig.block_config.num_query_heads;
     int Hkv = mConfig.block_config.num_kv_heads;
     int HS = mConfig.block_config.head_size;
@@ -552,7 +673,7 @@ void ModularRunState<Block>::allocate_simplified_quant_buffers() {
         const std::array<long, 3> att_shape{B, T, AttC};
         const std::array<long, 3> swiglu_shape{B, T, D};
         const std::array<long, 3> qkv_shape{B, T, qkv_channels};
-        const std::array<long, 3> mlp_up_shape{B, T, 2 * D};
+        const std::array<long, 3> mlp_up_shape{B, T, M};
         for (int i = 0; i < mConfig.num_layers; ++i) {
             auto& q = mSimplifiedQuantActivations[i];
             q.ln1 = Tensor::from_pointer(nullptr, DeviceId, mConfig.matmul_dtype, ln_shape);
@@ -638,14 +759,14 @@ void ModularRunState<Block>::allocate_simplified_quant_buffers() {
         mSimplifiedQuantGrads.d_res_ffn.Stats = gstats + 0;
         mSimplifiedQuantGrads.d_res_att = alloc(mConfig.grad_quant_dtype, "d_res_att_q", {B, T, C});
         mSimplifiedQuantGrads.d_res_att.Stats = gstats + 2;
-        mSimplifiedQuantGrads.d_mlp_up = alloc(mConfig.grad_quant_dtype, "d_mlp_up_q", {B, T, 2 * D});
+        mSimplifiedQuantGrads.d_mlp_up = alloc(mConfig.grad_quant_dtype, "d_mlp_up_q", {B, T, M});
         mSimplifiedQuantGrads.d_mlp_up.Stats = gstats + 4;
         mSimplifiedQuantGrads.d_qkv = alloc(mConfig.grad_quant_dtype, "d_qkv_q", {B, T, qkv_channels});
         mSimplifiedQuantGrads.d_qkv.Stats = gstats + 6;
     } else {
         const std::array<long, 3> ln_shape{B, T, C};
         const std::array<long, 3> qkv_shape{B, T, qkv_channels};
-        const std::array<long, 3> mlp_up_shape{B, T, 2 * D};
+        const std::array<long, 3> mlp_up_shape{B, T, M};
         mSimplifiedQuantGrads.d_res_ffn = Tensor::from_pointer(nullptr, DeviceId, mConfig.grad_quant_dtype, ln_shape);
         mSimplifiedQuantGrads.d_res_att = Tensor::from_pointer(nullptr, DeviceId, mConfig.grad_quant_dtype, ln_shape);
         mSimplifiedQuantGrads.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, mConfig.grad_quant_dtype, mlp_up_shape);
@@ -777,7 +898,8 @@ void ModularRunState<Block>::allocate_scratch_buffers(DeviceMemoryStack& stack) 
 
     if (mConfig.recompute_block) {
         long D = mConfig.block_config.intermediate_size;
-        long mlp_up_bytes = B * T * 2 * D * get_dtype_size(mConfig.activation_dtype);
+        long M = mlp_up_rows(mConfig.block_config);
+        long mlp_up_bytes = B * T * M * get_dtype_size(mConfig.activation_dtype);
         long swiglu_bytes = B * T * D * get_dtype_size(mConfig.activation_dtype);
         long d_swiglu_bytes = B * T * D * get_dtype_size(mConfig.grad_dtype);
         std::byte* simulated_mlp_up = stack.allocate(mlp_up_bytes, "mlp_up_simulate");
@@ -813,10 +935,10 @@ void ModularRunState<Block>::allocate_scratch_buffers(DeviceMemoryStack& stack) 
             stack.free(simulated_d_swiglu);
             stack.free(simulated_swiglu);
 
-            long up_weight_e4m3_bytes = 2 * D * C * sizeof(__nv_fp8_e4m3);
-            long up_weight_tp_bytes = C * 2 * D * sizeof(__nv_fp8_e4m3);
+            long up_weight_e4m3_bytes = M * C * sizeof(__nv_fp8_e4m3);
+            long up_weight_tp_bytes = C * M * sizeof(__nv_fp8_e4m3);
             long up_act_tp_bytes = C * B * T * sizeof(__nv_fp8_e4m3);
-            long up_grad_tp_bytes = 2 * D * B * T * sizeof(__nv_fp8_e5m2);
+            long up_grad_tp_bytes = M * B * T * sizeof(__nv_fp8_e5m2);
 
             std::byte* sim_up_weight_e4m3 = stack.allocate(up_weight_e4m3_bytes, "fp8_up_weight_e4m3");
             std::byte* sim_up_weight_e4m3_stats = stack.allocate(stats_bytes, "fp8_up_weight_e4m3_stats");

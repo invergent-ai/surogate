@@ -6,6 +6,7 @@
 #define LLMQ_SRC_MODULES_WEIGHTS_WEIGHT_MANAGER_TYPES_H
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <type_traits>
 #include <utility>
@@ -27,6 +28,13 @@ struct has_mlp_weights : std::false_type {};
 
 template<typename T>
 struct has_mlp_weights<T, std::void_t<decltype(std::declval<T>().mlp_up_weight)>> : std::true_type {};
+
+// Helper type trait to detect if a block has Mamba weights
+template<typename T, typename = void>
+struct has_mamba_weights : std::false_type {};
+
+template<typename T>
+struct has_mamba_weights<T, std::void_t<decltype(std::declval<T>().mamba)>> : std::true_type {};
 
 // Helper type trait to detect if a block has MoE-specific weights (router, experts)
 template<typename T, typename = void>
@@ -128,6 +136,12 @@ struct ModularWeightManagerConfig {
     // Architecture ID for weight mapping lookup
     PretrainedConfig::ArchitectureId architecture_id = PretrainedConfig::LLAMA;
 
+    // Hybrid layer markers (optional)
+    bool has_mamba = false;
+    std::vector<std::uint8_t> layer_is_mamba;  ///< 1 if layer uses Mamba block
+    bool has_moe = false;
+    std::vector<std::uint8_t> layer_is_moe;    ///< 1 if layer uses MoE block
+
     // QLoRA: skip block weight allocation (weights provided externally via set_weight_provider)
     bool skip_block_allocation = false;
 
@@ -140,6 +154,21 @@ struct ModularWeightManagerConfig {
     // Four Over Six (4/6) adaptive block scaling for FP4 quantization.
     bool enable_four_over_six = false;
     recipes::FourOverSixErrorMetric four_over_six_metric = recipes::FourOverSixErrorMetric::MSE;
+
+    // MoE convenience fields (mirroring ModelConfig)
+    int NumExperts = 0;
+    int NumExpertsPerTok = 0;
+    int MoeIntermediateSize = 0;
+
+    [[nodiscard]] bool is_layer_moe(int layer_idx) const {
+        if (layer_idx < 0) {
+            return NumExperts > 0;
+        }
+        if (layer_idx >= static_cast<int>(layer_is_moe.size())) {
+            return NumExperts > 0;
+        }
+        return layer_is_moe[static_cast<std::size_t>(layer_idx)] != 0;
+    }
 };
 
 } // namespace modules

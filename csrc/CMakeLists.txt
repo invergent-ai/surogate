@@ -249,6 +249,7 @@ target_sources(surogate-common PRIVATE
     src/models/qwen3/qwen3.cpp
     src/models/qwen3moe/qwen3_moe.cpp
     src/models/llama/llama.cpp
+    src/models/nemotron_h/nemotron_h.cpp
 
     src/modules/qlora/fp8_weights.cpp
     src/modules/qlora/fp4_weights.cpp
@@ -270,8 +271,10 @@ target_sources(surogate-common PRIVATE
     src/kernels/encoder.cu
     src/kernels/matmul.cpp
     src/kernels/swiglu.cu
+    src/kernels/activation.cu
     src/kernels/fast_lora_silu.cu
     src/kernels/moe_kernels.cu
+    src/kernels/mamba_kernels.cu
     src/kernels/rope.cu
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
@@ -292,6 +295,17 @@ target_sources(surogate-common PRIVATE
     src/kernels/fill.cu
     src/kernels/convert.cu
     src/kernels/lora_dropout.cu
+
+    # Vendored Mamba2 kernels (selective scan + causal conv1d)
+    src/third_party/mamba/selective_scan/selective_scan_fwd_bf16.cu
+    src/third_party/mamba/selective_scan/selective_scan_fwd_fp16.cu
+    src/third_party/mamba/selective_scan/selective_scan_fwd_fp32.cu
+    src/third_party/mamba/selective_scan/selective_scan_bwd_bf16_real.cu
+    src/third_party/mamba/selective_scan/selective_scan_bwd_fp16_real.cu
+    src/third_party/mamba/selective_scan/selective_scan_bwd_fp32_real.cu
+    src/third_party/causal_conv1d/causal_conv1d_fwd.cu
+    src/third_party/causal_conv1d/causal_conv1d_bwd.cu
+    src/third_party/causal_conv1d/causal_conv1d_update.cu
 
     # FP8 Hybrid recipe kernels
     src/recipes/fp8_hybrid/kernels/quant.cu
@@ -315,7 +329,7 @@ target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
 target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
-target_include_directories(surogate-common PUBLIC src ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
+target_include_directories(surogate-common PUBLIC src src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
 
 # backward-cpp for stack traces
 if(BACKWARD_HAS_DW)
@@ -415,7 +429,6 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/moe/test_moe.cpp
 
             # Models
-            src/testing/models/test-heterogeneous.cu
             src/testing/models/test_pretrained_config.cpp
 
             # Utilities
