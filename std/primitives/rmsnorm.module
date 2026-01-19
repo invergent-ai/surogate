@@ -59,3 +59,26 @@ primitive fused_residual_rmsnorm:
   impl:
     forward: kernels.fused_residual_rmsnorm_forward
     backward: kernels.fused_residual_rmsnorm_backward
+
+
+primitive fused_residual_rmsnorm_backward:
+  """
+  Backward pass for fused residual add + RMSNorm.
+  """
+
+  params:
+    eps: float = 1e-6
+
+  forward:
+    in: (
+      d_y: [*, C],
+      d_residual_next: [*, C],
+      residual_out: [*, C],
+      weight: [C],
+      rstd: [*]
+    )
+    out: (d_residual: [*, C], d_input: [*, C], d_weight: [C])
+    _
+
+  impl:
+    forward: kernels.fused_residual_rmsnorm_backward

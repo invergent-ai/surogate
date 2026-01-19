@@ -14,3 +14,20 @@ abstract module StackedBlocks(
     outputs:
       out: [B, T, C]
       residual_out: [B, T, C]
+
+
+abstract module StackedBlocksBackward(
+  blocks,
+  n_layers: int
+):
+  """
+  Placeholder for runtime block backward stacking.
+  The DSL compiler treats this as a custom op; execution is handled by the runtime.
+  """
+  forward:
+    inputs:
+      d_x: [B, T, C]
+      d_residual: [B, T, C]
+    outputs:
+      d_x0: [B, T, C]
+      d_residual0: [B, T, C]

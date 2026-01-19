@@ -523,6 +523,8 @@ class DSLTransformer(Transformer):
             if isinstance(item, dict):
                 result.gradient_inputs.update(item.get("gradient_inputs", {}))
                 result.gradient_outputs.update(item.get("gradient_outputs", {}))
+                if "graph" in item:
+                    result.graph = item["graph"]
             elif isinstance(item, GraphBody):
                 result.graph = item
         return result

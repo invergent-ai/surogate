@@ -216,9 +216,9 @@ recompute_block: "recompute:" _NL _INDENT graph_body _DEDENT
 // =============================================================================
 
 hf_config_section: "hf_config:" _NL _INDENT hf_config_body _DEDENT
-hf_config_body: (hf_config_item _NL)*
+hf_config_body: (hf_config_item _NL*)*
 hf_config_item: NAME ":" (STRING | hf_param_mapping)
-hf_param_mapping: _NL _INDENT (NAME ":" NAME _NL)* _DEDENT
+hf_param_mapping: _NL _INDENT (NAME ":" NAME _NL)* _NL* _DEDENT
 
 hf_mapping_section: "hf_mapping:" _NL _INDENT (hf_weight_mapping _NL)* _DEDENT
 hf_export_section: "hf_export:" _NL _INDENT (hf_weight_mapping _NL)* _DEDENT

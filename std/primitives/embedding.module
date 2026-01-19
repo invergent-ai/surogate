@@ -26,6 +26,23 @@ primitive embedding:
     backward: kernels.encoder_backward
 
 
+primitive embedding_backward:
+  """
+  Backward pass for embedding lookup.
+  """
+
+  forward:
+    in: (
+      d_out: [B, T, C],
+      token_ids: [B, T, int32]
+    )
+    out: d_token_embed: [V, C]
+    _
+
+  impl:
+    forward: kernels.encoder_backward
+
+
 primitive embedding_with_position:
   """
   Fused token + position embedding (forward only).

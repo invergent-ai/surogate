@@ -862,6 +862,8 @@ class ModuleResolver:
 
     def _resolve_forward(self, forward: ForwardBlock, resolved: ResolvedModule):
         """Resolve forward block."""
+        # Reset local scope for forward graph
+        self.ctx.local_symbols.clear()
         # Resolve input types
         if forward.input_type:
             type_spec = self.type_resolver.resolve_tensor_type(forward.input_type)
@@ -896,6 +898,8 @@ class ModuleResolver:
 
     def _resolve_backward(self, backward: BackwardBlock, resolved: ResolvedModule):
         """Resolve backward block."""
+        # Reset local scope for backward graph
+        self.ctx.local_symbols.clear()
         # Add gradient inputs to scope
         for name, tt in backward.gradient_inputs.items():
             type_spec = self.type_resolver.resolve_tensor_type(tt)
