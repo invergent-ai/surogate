@@ -1,155 +1,44 @@
 # Embedding Primitives
-# Maps to: csrc/src/kernels/encoder.cu
-
-"""
-Embedding and encoding primitives.
-"""
-
-# =============================================================================
-# embedding - Token Embedding Lookup
-# =============================================================================
+# Native implementations: csrc/src/kernels/encoder.cu
 
 primitive embedding:
   """
-  Token embedding lookup with optional positional encoding fusion.
-
-  Maps token IDs to dense vectors from embedding table.
-
-  For token IDs x and embedding table E:
-    output[b, t] = E[x[b, t]]
-
-  Maps to: kernels.encoder_forward / kernels.encoder_backward
-  """
-
-  forward:
-    in: (
-      token_ids: [B, T, int32],       # Input token IDs
-      weight: [vocab_size, d_model]   # Embedding table
-    )
-    out: embeddings: [B, T, d_model]
-
-  backward:
-    in: (d_embeddings, token_ids)
-    out: d_weight: [vocab_size, d_model]
-
-    # Gradient is scattered: d_weight[token_ids[b,t]] += d_embeddings[b,t]
-    # Uses deterministic bucketing for reproducibility
-
-  impl:
-    forward: kernels.encoder_forward
-    backward: kernels.encoder_backward
-
-  precision:
-    supported: [fp32, bf16]
-
-
-# =============================================================================
-# embedding_with_position - Fused Token + Position Embedding
-# =============================================================================
-
-primitive embedding_with_position:
-  """
-  Fused token and positional embedding lookup.
-
-  Combines:
-  1. Token embedding lookup
-  2. Learned positional embedding addition
-
-  output[b, t] = token_embed[x[b, t]] + pos_embed[t]
-
-  Maps to: kernels.encoder_forward (with position embedding)
+  Token embedding lookup.
   """
 
   forward:
     in: (
       token_ids: [B, T, int32],
-      token_weight: [vocab_size, d_model],
-      position_weight: [max_seq, d_model]
+      token_embed: [V, C]
     )
-    out: embeddings: [B, T, d_model]
+    out: [B, T, C]
+    _
 
   backward:
-    in: (d_embeddings, token_ids)
-    out: (d_token_weight, d_position_weight)
+    in: (d_out: [B, T, C], token_ids: [B, T, int32])
+    out: d_token_embed: [V, C]
+    _
+
+  save: [token_ids]
 
   impl:
-    forward: kernels.encoder_forward_with_position
-    backward: kernels.encoder_backward_with_position
+    forward: kernels.encoder_forward
+    backward: kernels.encoder_backward
 
 
-# =============================================================================
-# lm_head - Language Model Head (Output Projection)
-# =============================================================================
-
-primitive lm_head:
+primitive embedding_with_position:
   """
-  Language model head for next-token prediction.
-
-  Projects hidden states to vocabulary logits.
-  Can be tied with embedding weights (lm_head.weight = embedding.weight.T).
-
-  logits = hidden @ weight.T
-
-  Maps to: kernels.matmul (same as Linear)
+  Fused token + position embedding (forward only).
   """
 
   forward:
     in: (
-      hidden: [B, T, d_model],
-      weight: [vocab_size, d_model]    # May be tied to embedding
+      token_ids: [B, T, int32],
+      token_embed: [V, C],
+      pos_embed: [T, C]
     )
-    out: logits: [B, T, vocab_size]
-
-  backward:
-    in: (d_logits, hidden, weight)
-    out: (d_hidden, d_weight)
+    out: [B, T, C]
+    _
 
   impl:
-    forward: kernels.matmul
-    backward: kernels.matmul
-
-
-# =============================================================================
-# fused_classifier - Fused LM Head + Softmax + Loss
-# =============================================================================
-
-primitive fused_classifier:
-  """
-  Fused language model classification with loss computation.
-
-  Combines:
-  1. LM head projection (hidden @ weight.T)
-  2. Softmax computation
-  3. Cross-entropy loss
-  4. Accuracy tracking
-
-  Returns loss and gradient w.r.t. logits in single kernel.
-  Avoids materializing full [B, T, vocab_size] logits tensor.
-
-  Maps to: kernels.fused_classifier
-  """
-
-  params:
-    pad_token_id: int = -1         # Token ID to skip in loss
-    reduction: enum(mean, sum, none) = mean
-
-  forward:
-    in: (
-      hidden: [B, T, d_model],
-      weight: [vocab_size, d_model],
-      targets: [B, T, int32]       # Ground truth token IDs
-    )
-    out: (
-      loss: float,                 # Cross-entropy loss
-      num_valid: int,              # Number of non-padding tokens
-      accuracy: float,             # Top-1 accuracy
-      d_hidden: [B, T, d_model]    # Gradient w.r.t. hidden (for backward)
-    )
-
-  impl:
-    forward: kernels.fused_classifier
-
-  optimization:
-    # Avoids materializing [B, T, vocab_size] tensor
-    # Memory: O(B * T * d_model) instead of O(B * T * vocab_size)
-    memory_efficient: true
+    forward: kernels.encoder_forward

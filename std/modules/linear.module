@@ -1,220 +1,29 @@
-# Linear Module
-# Maps to: csrc/src/modules/primitives/linear.h
-
-"""
-Linear projection modules.
-Basic building blocks for all neural network layers.
-"""
-
-import std.primitives.{matmul, bias_add}
-
-# =============================================================================
-# Linear - Basic Linear Projection
-# =============================================================================
-
-module Linear(in_dim: int, out_dim: int, bias: bool = false):
-  """
-  Linear projection: y = x @ W^T + b
-
-  The fundamental building block for neural networks.
-  Weight shape is [out_dim, in_dim] for efficient matmul.
-
-  Maps to: modules/primitives/LinearModule
-  """
-
-  params:
-    weight: [out_dim, in_dim]
-    bias: [out_dim] if bias
-
-  forward:
-    in: [*, in_dim]
-    out: [*, out_dim]
-
-    graph:
-      # TN transpose: weight is [out_dim, in_dim], treat as transposed
-      # So effectively: in @ weight^T = in @ [in_dim, out_dim]
-      (in, weight) -> matmul(transpose=TN) -> y
-      if bias:
-        (y, bias) -> bias_add() -> out
-      else:
-        y -> out
-
-    save: [in]
-
-  backward:
-    d_out: [*, out_dim]
-    d_in: [*, in_dim]
-
-    graph:
-      # Gradient w.r.t. input: d_in = d_out @ weight
-      (d_out, weight) -> matmul(transpose=NN) -> d_in
-
-      # Gradient w.r.t. weight: d_weight = d_out^T @ in (accumulated)
-      (d_out, saved.in) -> matmul(transpose=TN, accumulate=true) -> d_weight
-
-      if bias:
-        d_out -> reduce_sum(dims=[0, ..., -2]) -> d_bias
-
-
-# =============================================================================
-# FusedLinear - Linear with Strided Output
-# =============================================================================
-
-module FusedLinear(in_dim: int, out_dim: int, output_offset: int, output_stride: int):
-  """
-  Linear projection that writes to a slice of a larger output tensor.
-
-  Used for fused QKV or gate+up projections where multiple linear
-  layers write to different parts of the same output buffer.
-
-  Maps to: modules/primitives/LinearModule with strided output
-  """
-
-  params:
-    weight: [out_dim, in_dim]
-
-  forward:
-    in: [*, in_dim]
-    out: [*, output_stride]        # Writes to [*, output_offset:output_offset+out_dim]
-
-    graph:
-      (in, weight) -> strided_matmul(
-        transpose=TN,
-        output_offset=output_offset,
-        output_stride=output_stride
-      ) -> out
-
-    save: [in]
-
-  backward:
-    # Extract gradient slice and compute standard backward
-    graph:
-      d_out[*, output_offset:output_offset+out_dim] -> d_slice
-      (d_slice, weight) -> matmul(transpose=NN) -> d_in
-      (d_slice, saved.in) -> matmul(transpose=TN, accumulate=true) -> d_weight
-
-
-# =============================================================================
-# QKVProjection - Fused Query/Key/Value Projection
-# =============================================================================
-
-module QKVProjection(
-  d_model: int,
-  num_heads: int,
-  num_kv_heads: int,
-  d_head: int? = None
+import std.primitives.matmul
+import std.primitives.bias
+module Linear(
+  in_dim: int,
+  out_dim: int,
+  use_bias: bool = false
 ):
   """
-  Fused Q, K, V projection for multi-head attention.
-
-  Projects input to query, key, and value tensors in a single matmul.
-  Supports Grouped Query Attention (GQA) where num_kv_heads < num_heads.
-
-  Maps to: modules/primitives/LinearModule with fused QKV
+  Linear projection: y = x @ W^T (+ bias).
   """
-
   let:
-    D = d_head if d_head else d_model // num_heads
-    q_dim = num_heads * D
-    kv_dim = num_kv_heads * D
-    total_dim = q_dim + 2 * kv_dim
-
+    C = in_dim
+    O = out_dim
   params:
-    qkv_weight: [total_dim, d_model]
-
+    weight: [O, C]
+    bias: [O] if use_bias
   forward:
-    in: [B, T, d_model]
-    out: (q: [B, T, q_dim], k: [B, T, kv_dim], v: [B, T, kv_dim])
-
+    inputs:
+      x: [B, T, C]
+    outputs:
+      y: [B, T, O]
     graph:
-      (in, qkv_weight) -> matmul(transpose=TN) -> qkv
-      qkv -> split([q_dim, kv_dim, kv_dim], dim=-1) -> (q, k, v)
-
-    save: [in]
-
-  backward:
-    d_q: [B, T, q_dim]
-    d_k: [B, T, kv_dim]
-    d_v: [B, T, kv_dim]
-    d_in: [B, T, d_model]
-
-    graph:
-      (d_q, d_k, d_v) -> concat(dim=-1) -> d_qkv
-      (d_qkv, qkv_weight) -> matmul(transpose=NN) -> d_in
-      (d_qkv, saved.in) -> matmul(transpose=TN, accumulate=true) -> d_qkv_weight
-
-
-# =============================================================================
-# GateUpProjection - Fused Gate/Up Projection for SwiGLU MLP
-# =============================================================================
-
-module GateUpProjection(d_model: int, d_ff: int):
-  """
-  Fused gate and up projection for SwiGLU MLP.
-
-  Projects input to gate and up tensors in a single matmul.
-  Output is [*, 2 * d_ff] which is split into gate and up paths.
-
-  Maps to: modules/primitives/LinearModule with fused gate+up
-  """
-
-  params:
-    gate_up_weight: [2 * d_ff, d_model]
-
-  forward:
-    in: [B, T, d_model]
-    out: (gate: [B, T, d_ff], up: [B, T, d_ff])
-
-    graph:
-      (in, gate_up_weight) -> matmul(transpose=TN) -> gate_up
-      gate_up -> split([d_ff, d_ff], dim=-1) -> (gate, up)
-
-    save: [in]
-
-  backward:
-    d_gate: [B, T, d_ff]
-    d_up: [B, T, d_ff]
-    d_in: [B, T, d_model]
-
-    graph:
-      (d_gate, d_up) -> concat(dim=-1) -> d_gate_up
-      (d_gate_up, gate_up_weight) -> matmul(transpose=NN) -> d_in
-      (d_gate_up, saved.in) -> matmul(transpose=TN, accumulate=true) -> d_gate_up_weight
-
-
-# =============================================================================
-# OutputProjection - Attention Output Projection
-# =============================================================================
-
-module OutputProjection(d_model: int, num_heads: int, d_head: int? = None):
-  """
-  Output projection for attention.
-
-  Projects concatenated multi-head output back to model dimension.
-
-  Maps to: modules/primitives/LinearModule
-  """
-
-  let:
-    D = d_head if d_head else d_model // num_heads
-    head_dim = num_heads * D
-
-  params:
-    out_weight: [d_model, head_dim]
-
-  forward:
-    in: [B, T, head_dim]
-    out: [B, T, d_model]
-
-    graph:
-      (in, out_weight) -> matmul(transpose=TN) -> out
-
-    save: [in]
-
-  backward:
-    d_out: [B, T, d_model]
-    d_in: [B, T, head_dim]
-
-    graph:
-      (d_out, out_weight) -> matmul(transpose=NN) -> d_in
-      (d_out, saved.in) -> matmul(transpose=TN, accumulate=true) -> d_out_weight
+      x -> view(shape=[B * T, C]) -> x_flat
+      (x_flat, weight) -> matmul(transpose=NT) -> y_flat
+      y_flat -> view(shape=[B, T, O]) -> y_tmp
+      if use_bias:
+        (y_tmp, bias) -> bias_add() -> y
+      else:
+        y_tmp -> y

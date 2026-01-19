@@ -265,10 +265,15 @@ class Compiler:
 
         source = path.read_text()
 
-        # Add file's directory to search paths
+        # Add file's directory and current working directory to search paths
         search_paths = self.options.search_paths.copy()
-        if path.parent not in [Path(p) for p in search_paths]:
+        existing_paths = [Path(p) for p in search_paths]
+        if path.parent not in existing_paths:
             search_paths.append(str(path.parent))
+            existing_paths.append(path.parent)
+        cwd = Path.cwd()
+        if cwd not in existing_paths:
+            search_paths.append(str(cwd))
 
         old_paths = self.options.search_paths
         self.options.search_paths = search_paths

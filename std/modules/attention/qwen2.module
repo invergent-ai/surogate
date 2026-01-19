@@ -2,16 +2,17 @@ import std.primitives.matmul
 import std.primitives.rope
 import std.primitives.attention
 import std.primitives.bias
-module GQAAttention(
+module Qwen2Attention(
   d_model: int,
   num_query_heads: int,
   num_kv_heads: int,
   head_size: int,
   max_seq: int,
+  sliding_window: int = 0,
   use_qkv_bias: bool = false
 ):
   """
-  Grouped-query attention with RoPE and FlashAttention (Llama-style).
+  Qwen2 attention: GQA + RoPE + FlashAttention with optional sliding window.
   """
   let:
     C = d_model
@@ -41,7 +42,10 @@ module GQAAttention(
       else:
         qkv_flat -> view(shape=[B, T, Hq + 2 * Hkv, D]) -> qkv_packed
       (qkv_packed, rope_freqs, position_ids) -> rope(rotary_dim=D) -> qkv_rope
-      qkv_rope -> flash_attention(causal=true) -> (att, _)
+      if sliding_window > 0:
+        qkv_rope -> flash_attention(causal=true, window_size=sliding_window) -> (att, _)
+      else:
+        qkv_rope -> flash_attention(causal=true) -> (att, _)
       att -> view(shape=[B * T, AttnDim]) -> att_flat
       (att_flat, out_weight) -> matmul(transpose=NT) -> out_flat
       out_flat -> view(shape=[B, T, C]) -> out

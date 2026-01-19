@@ -1,0 +1,16 @@
+abstract module StackedBlocks(
+  blocks,
+  n_layers: int
+):
+  """
+  Placeholder for runtime block stacking.
+  The DSL compiler treats this as a custom op; execution is handled by the runtime.
+  """
+  forward:
+    inputs:
+      x: [B, T, C]
+      residual: [B, T, C]
+      position_ids: [T, int32]
+    outputs:
+      out: [B, T, C]
+      residual_out: [B, T, C]

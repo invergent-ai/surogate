@@ -2,16 +2,17 @@ import std.primitives.matmul
 import std.primitives.rope
 import std.primitives.attention
 import std.primitives.bias
-module GQAAttention(
+module Qwen3Attention(
   d_model: int,
   num_query_heads: int,
   num_kv_heads: int,
   head_size: int,
   max_seq: int,
-  use_qkv_bias: bool = false
+  use_qkv_bias: bool = false,
+  use_qk_norm: bool = true
 ):
   """
-  Grouped-query attention with RoPE and FlashAttention (Llama-style).
+  Qwen3 attention: GQA + QK-Norm + RoPE + FlashAttention.
   """
   let:
     C = d_model
@@ -24,6 +25,8 @@ module GQAAttention(
     qkv_weight: [QKV, C]
     qkv_bias: [QKV] if use_qkv_bias
     out_weight: [C, AttnDim]
+    q_norm_weight: [D] if use_qk_norm
+    k_norm_weight: [D] if use_qk_norm
     rope_freqs: [max_seq, D // 2, 2, fp32] @frozen
   forward:
     inputs:
@@ -40,7 +43,10 @@ module GQAAttention(
         qkv_biased -> view(shape=[B, T, Hq + 2 * Hkv, D]) -> qkv_packed
       else:
         qkv_flat -> view(shape=[B, T, Hq + 2 * Hkv, D]) -> qkv_packed
-      (qkv_packed, rope_freqs, position_ids) -> rope(rotary_dim=D) -> qkv_rope
+      if use_qk_norm:
+        (qkv_packed, q_norm_weight, k_norm_weight, rope_freqs, position_ids) -> qkv_qk_norm_rope() -> (qkv_rope, _, _)
+      else:
+        (qkv_packed, rope_freqs, position_ids) -> rope(rotary_dim=D) -> qkv_rope
       qkv_rope -> flash_attention(causal=true) -> (att, _)
       att -> view(shape=[B * T, AttnDim]) -> att_flat
       (att_flat, out_weight) -> matmul(transpose=NT) -> out_flat

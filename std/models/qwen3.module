@@ -1,0 +1,45 @@
+import std.primitives.embedding
+import std.primitives.tensor_ops
+import std.primitives.matmul
+import std.primitives.rmsnorm
+import std.blocks.qwen3
+import std.modules.stacked_blocks
+model Qwen3Model(
+  vocab_size: int,
+  d_model: int,
+  n_layers: int,
+  num_query_heads: int,
+  num_kv_heads: int,
+  d_ff: int,
+  max_seq: int,
+  head_size: int = 0,
+  eps: float = 1e-6,
+  use_qkv_bias: bool = false,
+  use_qk_norm: bool = true
+):
+  """
+  Minimal Qwen3 model wiring using Qwen3Block.
+  """
+  let:
+    D = head_size if head_size > 0 else d_model // num_query_heads
+  params:
+    embedding: [vocab_size, d_model]
+    blocks: [n_layers] x Qwen3Block(
+      d_model, num_query_heads, num_kv_heads, D, d_ff, max_seq, eps, use_qkv_bias, use_qk_norm
+    )
+    final_norm: [d_model]
+    lm_head: [vocab_size, d_model]
+  forward:
+    inputs:
+      token_ids: [B, T, int32]
+      position_ids: [T, int32]
+    outputs:
+      logits: [B, T, vocab_size]
+    graph:
+      (token_ids, embedding) -> embedding() -> x0
+      zeros(shape=[B, T, d_model], dtype=bf16) -> residual0
+      (x0, residual0, position_ids) -> StackedBlocks(blocks, n_layers) -> (xN, residualN)
+      (residualN, xN, final_norm) -> fused_residual_rmsnorm(eps=eps) -> (_, xF)
+      xF -> view(shape=[B * T, d_model]) -> xF_flat
+      (xF_flat, lm_head) -> matmul(transpose=NT) -> logits_flat
+      logits_flat -> view(shape=[B, T, vocab_size]) -> logits

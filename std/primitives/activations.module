@@ -1,118 +1,43 @@
-# Activation Function Primitives
-# Maps to: csrc/src/kernels/activations.cu, csrc/src/kernels/silu.cu
-
-"""
-Activation function primitives for neural networks.
-Includes both simple activations and gated variants.
-"""
-
-# =============================================================================
-# swiglu - SiLU-Gated Linear Unit
-# =============================================================================
+# Activation Primitives
+# Native implementations: csrc/src/kernels/swiglu.cu, activation.cu
 
 primitive swiglu:
   """
-  SiLU-Gated Linear Unit activation.
-
-  SwiGLU(gate, up) = SiLU(gate) * up
-                   = (gate * sigmoid(gate)) * up
-
-  Takes two inputs of the same shape:
-  - gate: passed through SiLU activation
-  - up: multiplied element-wise with activated gate
-
-  This is the activation function used between up and down projections
-  in LLaMA-style MLP blocks.
-
-  Maps to: kernels.silu_mul_forward / kernels.silu_mul_backward
+  SwiGLU activation on concatenated gate/up tensor.
+  Input x is [up, gate] concatenated on the last dimension.
   """
 
   forward:
-    in: (gate: [*, D], up: [*, D])
+    in: x: [*, 2 * D]
     out: [*, D]
-
-    # Mathematically: silu(gate) * up
-    # where silu(x) = x * sigmoid(x)
+    _
 
   backward:
-    in: (d_out: [*, D], gate: [*, D], up: [*, D])
-    out: (d_gate: [*, D], d_up: [*, D])
+    in: (d_out: [*, D], x: [*, 2 * D])
+    out: d_x: [*, 2 * D]
+    _
 
-    # d_up = d_out * silu(gate)
-    # d_gate = d_out * up * d_silu(gate)
-    # where d_silu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-
-  save: [gate, up]   # Both needed for backward
+  save: [x]
 
   impl:
-    forward: kernels.silu_mul_forward
-    backward: kernels.silu_mul_backward
+    forward: kernels.swiglu_forward
+    backward: kernels.swiglu_backward
 
-  fusion:
-    # Can be fused with preceding split and following matmul
-    patterns:
-      - [split, swiglu] -> fused_split_swiglu
-      - [swiglu, matmul] -> fused_swiglu_matmul
-
-
-# =============================================================================
-# geglu - GELU-Gated Linear Unit
-# =============================================================================
-
-primitive geglu:
-  """
-  GELU-Gated Linear Unit activation.
-
-  GeGLU(gate, up) = GELU(gate) * up
-                  = gate * Φ(gate) * up
-
-  Similar to SwiGLU but uses GELU instead of SiLU for gating.
-  Used in some GPT variants and PaLM.
-
-  Maps to: kernels.gelu_mul_forward / kernels.gelu_mul_backward
-  """
-
-  forward:
-    in: (gate: [*, D], up: [*, D])
-    out: [*, D]
-
-  backward:
-    in: (d_out, gate, up)
-    out: (d_gate, d_up)
-
-  save: [gate, up]
-
-  impl:
-    forward: kernels.gelu_mul_forward
-    backward: kernels.gelu_mul_backward
-
-
-# =============================================================================
-# silu - Sigmoid Linear Unit (Swish)
-# =============================================================================
 
 primitive silu:
   """
-  Sigmoid Linear Unit (Swish) activation.
-
-  SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-
-  Smooth, non-monotonic activation that often outperforms ReLU.
-  Self-gated: the input gates itself through sigmoid.
-
-  Maps to: kernels.silu_forward / kernels.silu_backward
+  SiLU (Swish) activation.
   """
 
   forward:
     in: x: [*]
     out: [*]
+    _
 
   backward:
     in: (d_out: [*], x: [*])
     out: d_x: [*]
-
-    # d_x = d_out * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))
-    #     = d_out * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+    _
 
   save: [x]
 
@@ -121,65 +46,20 @@ primitive silu:
     backward: kernels.silu_backward
 
 
-# =============================================================================
-# relu - Rectified Linear Unit
-# =============================================================================
-
-primitive relu:
-  """
-  Rectified Linear Unit activation.
-
-  ReLU(x) = max(0, x)
-
-  Simple thresholding at zero. Gradient is 1 for positive inputs, 0 otherwise.
-  Memory-efficient: only need to store sign mask for backward.
-
-  Maps to: kernels.relu_forward / kernels.relu_backward
-  """
-
-  forward:
-    in: x: [*]
-    out: [*]
-
-  backward:
-    in: (d_out: [*], x: [*])
-    out: d_x: [*]
-
-    # d_x = d_out * (x > 0)
-
-  save: [x]    # Or just the sign mask for memory efficiency
-
-  impl:
-    forward: kernels.relu_forward
-    backward: kernels.relu_backward
-
-
-# =============================================================================
-# relu2 - Squared ReLU
-# =============================================================================
-
 primitive relu2:
   """
-  Squared ReLU activation: ReLU(x)².
-
-  ReLU²(x) = max(0, x)² = ReLU(x)²
-
-  Stronger activation than standard ReLU, with quadratic growth
-  for positive inputs. Used in Nemotron-H architecture.
-
-  Maps to: kernels.relu2_forward / kernels.relu2_backward
+  Squared ReLU activation.
   """
 
   forward:
     in: x: [*]
     out: [*]
+    _
 
   backward:
     in: (d_out: [*], x: [*])
     out: d_x: [*]
-
-    # d_x = d_out * 2 * relu(x) * (x > 0)
-    #     = d_out * 2 * max(0, x)
+    _
 
   save: [x]
 
@@ -188,103 +68,24 @@ primitive relu2:
     backward: kernels.relu2_backward
 
 
-# =============================================================================
-# gelu - Gaussian Error Linear Unit
-# =============================================================================
-
-primitive gelu:
+primitive silu_mul:
   """
-  Gaussian Error Linear Unit activation.
-
-  GELU(x) = x * Φ(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-
-  Smooth activation that multiplies input by its Gaussian CDF value.
-  Two variants: exact (using erf) and approximate (using tanh).
-
-  Maps to: kernels.gelu_forward / kernels.gelu_backward
-  """
-
-  params:
-    approximate: bool = true    # Use tanh approximation (faster)
-
-  forward:
-    in: x: [*]
-    out: [*]
-
-  backward:
-    in: (d_out: [*], x: [*])
-    out: d_x: [*]
-
-  save: [x]
-
-  impl:
-    forward: kernels.gelu_forward
-    backward: kernels.gelu_backward
-
-
-# =============================================================================
-# softmax - Softmax Normalization
-# =============================================================================
-
-primitive softmax:
-  """
-  Softmax normalization along specified dimension.
-
-  softmax(x)_i = exp(x_i - max(x)) / Σ_j exp(x_j - max(x))
-
-  Numerically stable implementation using max subtraction.
-  Returns probability distribution that sums to 1.
-
-  Maps to: kernels.softmax_forward / kernels.softmax_backward
-  """
-
-  params:
-    dim: int = -1              # Dimension to normalize over
-
-  forward:
-    in: x: [*]
-    out: [*]
-
-  backward:
-    in: (d_out: [*], out: [*])     # Note: uses output, not input
-    out: d_x: [*]
-
-    # d_x = out * (d_out - sum(d_out * out, dim))
-
-  save: [out]    # Save output, not input (more efficient for backward)
-
-  impl:
-    forward: kernels.softmax_forward
-    backward: kernels.softmax_backward
-
-
-# =============================================================================
-# sigmoid - Sigmoid Activation
-# =============================================================================
-
-primitive sigmoid:
-  """
-  Sigmoid activation function.
-
-  sigmoid(x) = 1 / (1 + exp(-x))
-
-  Maps input to (0, 1) range. Used in gating mechanisms.
-
-  Maps to: kernels.sigmoid_forward / kernels.sigmoid_backward
+  Elementwise SiLU(gate) * up.
+  Used by fast LoRA kernels.
   """
 
   forward:
-    in: x: [*]
-    out: [*]
+    in: (gate: [*, D], up: [*, D])
+    out: [*, D]
+    _
 
   backward:
-    in: (d_out: [*], out: [*])
-    out: d_x: [*]
+    in: (d_out: [*, D], gate: [*, D], up: [*, D])
+    out: (d_gate: [*, D], d_up: [*, D])
+    _
 
-    # d_x = d_out * out * (1 - out)
-
-  save: [out]
+  save: [gate, up]
 
   impl:
-    forward: kernels.sigmoid_forward
-    backward: kernels.sigmoid_backward
+    forward: kernels.silu_mul_forward
+    backward: kernels.silu_mul_backward_inplace

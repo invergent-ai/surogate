@@ -1,100 +1,41 @@
-# RMSNorm Module
-# Maps to: csrc/src/modules/primitives/rmsnorm.h
-
-"""
-RMSNorm module wrapper for primitives.
-"""
-
-import std.primitives.{rmsnorm, fused_residual_rmsnorm}
-
-# =============================================================================
-# RMSNorm - Root Mean Square Normalization Layer
-# =============================================================================
-
-module RMSNorm(d_model: int, eps: float = 1e-6):
+import std.primitives.rmsnorm
+module RMSNorm(
+  d_model: int,
+  eps: float = 1e-6
+):
   """
-  Root Mean Square Layer Normalization.
-
-  RMS(x) = sqrt(mean(x²) + ε)
-  y = (x / RMS(x)) * weight
-
-  Standard normalization for LLaMA-family models.
-
-  Maps to: modules/primitives/RMSNormModule
+  RMSNorm over the last dimension.
   """
-
+  let:
+    C = d_model
   params:
-    weight: [d_model]
-
+    weight: [C]
   forward:
-    in: [*, d_model]
-    out: [*, d_model]
-
+    inputs:
+      x: [B, T, C]
+    outputs:
+      y: [B, T, C]
     graph:
-      (in, weight) -> rmsnorm(eps=eps) -> (out, rstd)
-
-    save: [in, rstd]
-
-  backward:
-    d_out: [*, d_model]
-    d_in: [*, d_model]
-
-    graph:
-      (d_out, saved.in, weight, saved.rstd) -> rmsnorm_backward() -> (d_in, d_weight)
+      (x, weight) -> rmsnorm(eps=eps) -> (y, _)
 
 
-# =============================================================================
-# FusedResidualRMSNorm - Fused Residual + RMSNorm
-# =============================================================================
-
-module FusedResidualRMSNorm(d_model: int, eps: float = 1e-6):
+module FusedResidualRMSNorm(
+  d_model: int,
+  eps: float = 1e-6
+):
   """
-  Fused residual addition and RMSNorm.
-
-  Computes:
-    residual_out = residual + input
-    y = RMSNorm(residual_out)
-
-  More memory-efficient than separate operations.
-
-  Maps to: modules/primitives/FusedResidualRMSNormModule
+  Fused residual add + RMSNorm: residual_out = residual + x; y = RMSNorm(residual_out).
   """
-
+  let:
+    C = d_model
   params:
-    weight: [d_model]
-
+    weight: [C]
   forward:
-    in: (residual: [*, d_model], input: [*, d_model])
-    out: (residual_out: [*, d_model], y: [*, d_model])
-
+    inputs:
+      residual: [B, T, C]
+      x: [B, T, C]
+    outputs:
+      residual_out: [B, T, C]
+      y: [B, T, C]
     graph:
-      (residual, input, weight) -> fused_residual_rmsnorm(eps=eps)
-        -> (residual_out, y, rstd)
-
-    save: [residual_out, rstd]
-
-  backward:
-    d_y: [*, d_model]
-    d_residual_next: [*, d_model]  # From downstream residual path
-    d_residual: [*, d_model]
-    d_input: [*, d_model]
-
-    graph:
-      (d_y, d_residual_next, saved.residual_out, weight, saved.rstd)
-        -> fused_residual_rmsnorm_backward()
-        -> (d_residual, d_input, d_weight)
-
-
-# =============================================================================
-# RMSNormParams - Parameter-only structure for block composition
-# =============================================================================
-
-module RMSNormParams(d_model: int):
-  """
-  RMSNorm parameters without forward logic.
-
-  Used in block declarations where the forward is defined at block level.
-  """
-
-  params:
-    weight: [d_model]
+      (residual, x, weight) -> fused_residual_rmsnorm(eps=eps) -> (residual_out, y, _)

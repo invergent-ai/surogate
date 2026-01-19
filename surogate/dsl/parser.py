@@ -145,9 +145,11 @@ class DSLTransformer(Transformer):
         return ImportDecl(module_path=path, items=import_items)
 
     def module_path(self, items):
-        parts = [str(item) for item in items if not str(item).startswith("v")]
+        parts = [str(item) for item in items if item is not None and not str(item).startswith("v")]
         version = None
         for item in items:
+            if item is None:
+                continue
             if str(item).startswith("v"):
                 version = str(item)
         return ".".join(parts) + (f".{version}" if version else "")
@@ -430,6 +432,13 @@ class DSLTransformer(Transformer):
             )
         return TensorDecl(name=name, tensor_type=type_spec, annotations=annotations)
 
+    def tensor_or_array(self, items):
+        # Params primarily expect tensor types; ignore optional array suffix for now.
+        return items[0] if items else None
+
+    def condition_clause(self, items):
+        return items[0] if items else None
+
     def tensor_type_or_module(self, items):
         # Return the first item (TensorType, ModuleInstantiation, or tied_to)
         return items[0] if items else None
@@ -483,6 +492,23 @@ class DSLTransformer(Transformer):
     def output_spec(self, items):
         return {"output_type": items[0] if items else None}
 
+    def named_io(self, items):
+        return (str(items[0]), items[1])
+
+    def inputs_spec(self, items):
+        inputs = {}
+        for item in items:
+            if isinstance(item, tuple) and len(item) == 2:
+                inputs[item[0]] = item[1]
+        return {"inputs": inputs}
+
+    def outputs_spec(self, items):
+        outputs = {}
+        for item in items:
+            if isinstance(item, tuple) and len(item) == 2:
+                outputs[item[0]] = item[1]
+        return {"outputs": outputs}
+
     def io_type(self, items):
         # Return the tensor type or tuple of types
         if len(items) == 1:
@@ -533,8 +559,18 @@ class DSLTransformer(Transformer):
         return (name, tensor_type)
 
     def graph_section(self, items):
-        statements = [item for item in items if item is not None]
+        statements = []
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, list):
+                statements.extend(item)
+            else:
+                statements.append(item)
         return GraphBody(statements=statements)
+
+    def graph_body(self, items):
+        return [item for item in items if isinstance(item, (GraphStatement, ConditionalGraph, RecomputeBlock))]
 
     def save_list(self, items):
         return {"save": items[0] if items else []}
@@ -562,6 +598,16 @@ class DSLTransformer(Transformer):
         for item in items:
             if item is None:
                 continue
+            if isinstance(item, CallExpr):
+                # Source-less call (e.g., zeros(...)) becomes the first op.
+                operations.append(Operation(
+                    name=item.func,
+                    args=item.args,
+                    kwargs=item.kwargs,
+                ))
+                if source is None:
+                    source = TupleRef(elements=[])
+                continue
             if isinstance(item, (TensorRef, TupleRef)):
                 if source is None:
                     source = item
@@ -586,6 +632,9 @@ class DSLTransformer(Transformer):
         )
 
     def source(self, items):
+        return items[0] if items else None
+
+    def call_source(self, items):
         return items[0] if items else None
 
     def tuple_source(self, items):
@@ -668,7 +717,12 @@ class DSLTransformer(Transformer):
 
     @v_args(meta=True)
     def recompute_block(self, meta, items):
-        statements = [item for item in items if isinstance(item, (GraphStatement, ConditionalGraph))]
+        statements = []
+        for item in items:
+            if isinstance(item, list):
+                statements.extend(item)
+            elif isinstance(item, (GraphStatement, ConditionalGraph)):
+                statements.append(item)
         return RecomputeBlock(statements=statements, location=self._loc(meta))
 
     # =========================================================================
@@ -771,6 +825,18 @@ class DSLTransformer(Transformer):
         element = items[1]
         return ArrayTypeNode(size=size, element_type=element)
 
+    def type_annotation(self, items):
+        # Tensor types are already parsed into AST nodes.
+        if len(items) == 1 and isinstance(items[0], TensorType):
+            return items[0]
+        # Strip optional markers and keep raw names.
+        values = [str(item) for item in items if item is not None and str(item) != "?"]
+        if not values:
+            return None
+        if len(values) > 1:
+            return ("enum", values)
+        return values[0]
+
     # =========================================================================
     # Parameters
     # =========================================================================
@@ -783,16 +849,15 @@ class DSLTransformer(Transformer):
         name = str(items[0])
         type_ann = None
         default = None
+        expr_nodes = (Literal, Identifier, BinaryOp, UnaryOp, CallExpr, IndexExpr, AttributeExpr, TernaryExpr)
 
         for item in items[1:]:
             if item is None:
                 continue
-            if isinstance(item, Token) and item.type == "NAME":
-                type_ann = str(item)
-            elif isinstance(item, str) and item in ("int", "float", "bool", "string"):
-                type_ann = item
-            else:
+            if isinstance(item, expr_nodes):
                 default = item
+            else:
+                type_ann = item
 
         return ParamDecl(
             name=name,
@@ -855,6 +920,11 @@ class DSLTransformer(Transformer):
             result = BinaryOp(left=result, op=op, right=right)
             i += 2
         return result
+
+    def comp_op(self, items):
+        if not items:
+            return None
+        return str(items[0])
 
     def arith_expr(self, items):
         if len(items) == 1:
@@ -1111,7 +1181,7 @@ def parse_source(source: str, source_file: Optional[str] = None) -> Program:
     Returns:
         Program AST node
     """
-    parser = ModuleDSLParser(use_indentation=False)
+    parser = ModuleDSLParser(use_indentation=True)
     return parser.parse(source, source_file)
 
 
@@ -1124,5 +1194,5 @@ def parse_file(path: Union[str, Path]) -> Program:
     Returns:
         Program AST node
     """
-    parser = ModuleDSLParser(use_indentation=False)
+    parser = ModuleDSLParser(use_indentation=True)
     return parser.parse_file(path)

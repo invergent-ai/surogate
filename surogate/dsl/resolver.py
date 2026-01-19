@@ -500,6 +500,18 @@ class ImportResolver:
                         kind="import",
                         source=module_path,
                     )
+            else:
+                for name, mod in resolved.items():
+                    if name in symbols:
+                        raise DSLError(
+                            ErrorCode.E023,
+                            f"Import name conflict: '{name}'",
+                        )
+                    symbols[name] = SymbolInfo(
+                        name=name,
+                        kind=getattr(mod, "kind", "import"),
+                        source=module_path,
+                    )
 
         return symbols
 
@@ -608,6 +620,10 @@ class ModuleResolver:
             self._register_model(model)
 
         # Third pass: fully resolve each definition
+        for prim in program.primitives:
+            resolved = self._resolve_primitive(prim)
+            results.append(resolved)
+
         for module in program.modules:
             resolved = self._resolve_module(module)
             results.append(resolved)
@@ -621,6 +637,14 @@ class ModuleResolver:
             results.append(resolved)
 
         return results
+
+    def _resolve_primitive(self, prim: PrimitiveNode) -> ResolvedModule:
+        """Resolve a primitive declaration to a minimal module record."""
+        return ResolvedModule(
+            name=prim.name,
+            kind="primitive",
+            ast_node=prim,
+        )
 
     def _register_primitive(self, prim: PrimitiveNode):
         """Register a primitive definition."""
@@ -784,6 +808,15 @@ class ModuleResolver:
             value=default_value,
         ))
 
+        if isinstance(param.type_annotation, tuple) and param.type_annotation and param.type_annotation[0] == "enum":
+            enum_values = param.type_annotation[1]
+            for value in enum_values:
+                self.ctx.define_module(value, SymbolInfo(
+                    name=value,
+                    kind="enum",
+                    value=value,
+                ))
+
     def _resolve_let_binding(self, binding: LetBinding, resolved: ResolvedModule):
         """Resolve a let binding."""
         value = self._evaluate_expr(binding.value)
@@ -919,15 +952,27 @@ class ModuleResolver:
         # Resolve condition
         self._resolve_expr(cond.condition)
 
-        # Resolve branches
-        for stmt in cond.true_branch:
-            if isinstance(stmt, GraphStatement):
-                self._resolve_graph_statement(stmt)
+        # Resolve branches (compile-time if possible)
+        branch = None
+        try:
+            value = self._evaluate_expr(cond.condition)
+            if isinstance(value, bool):
+                branch = cond.true_branch if value else (cond.false_branch or [])
+        except Exception:
+            branch = None
 
-        if cond.false_branch:
-            for stmt in cond.false_branch:
+        if branch is not None:
+            for stmt in branch:
                 if isinstance(stmt, GraphStatement):
                     self._resolve_graph_statement(stmt)
+        else:
+            for stmt in cond.true_branch:
+                if isinstance(stmt, GraphStatement):
+                    self._resolve_graph_statement(stmt)
+            if cond.false_branch:
+                for stmt in cond.false_branch:
+                    if isinstance(stmt, GraphStatement):
+                        self._resolve_graph_statement(stmt)
 
     def _resolve_recompute(self, recompute):
         """Resolve recompute block."""
@@ -956,11 +1001,15 @@ class ModuleResolver:
         from .ast_nodes import TensorRef as ASTTensorRef, TupleRef
 
         if isinstance(ref, str):
+            if ref == "_":
+                return
             self.ctx.define_local(ref, SymbolInfo(
                 name=ref,
                 kind="tensor",
             ))
         elif isinstance(ref, ASTTensorRef):
+            if ref.name == "_":
+                return
             self.ctx.define_local(ref.name, SymbolInfo(
                 name=ref.name,
                 kind="tensor",
@@ -974,6 +1023,9 @@ class ModuleResolver:
         if isinstance(expr, Identifier):
             info = self.ctx.lookup(expr.name)
             if info is None:
+                # Allow dtype literals (bf16, fp32, int32, etc.) as built-ins.
+                if expr.name in {dtype.value for dtype in Dtype}:
+                    return
                 raise DSLUndefinedError(expr.name)
         elif isinstance(expr, BinaryOp):
             self._resolve_expr(expr.left)
@@ -1002,6 +1054,8 @@ class ModuleResolver:
             info = self.ctx.lookup(expr.name)
             if info and info.value is not None:
                 return info.value
+            if expr.name in {dtype.value for dtype in Dtype}:
+                return Dtype.from_string(expr.name)
             return None
 
         if isinstance(expr, BinaryOp):

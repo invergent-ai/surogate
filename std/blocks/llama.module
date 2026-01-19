@@ -3,22 +3,17 @@ import std.primitives.rmsnorm
 import std.primitives.rope
 import std.primitives.attention
 import std.primitives.activations
-import std.primitives.bias
-import std.primitives.tensor_ops
-block ParallelTransformerBlock(
+block LlamaBlock(
   d_model: int,
   num_query_heads: int,
   num_kv_heads: int,
   head_size: int,
   d_ff: int,
   max_seq: int,
-  eps: float = 1e-6,
-  use_qkv_bias: bool = false,
-  use_qk_norm: bool = false,
-  activation: enum(SwiGLU, SiLU, ReLU2) = SwiGLU
+  eps: float = 1e-6
 ):
   """
-  Parallel residual block: attention and MLP read from the same residual stream.
+  LLaMA-style dense transformer block (pre-norm, SwiGLU MLP, RoPE GQA attention).
   """
   let:
     C = d_model
@@ -28,15 +23,12 @@ block ParallelTransformerBlock(
     QKV = (Hq + 2 * Hkv) * D
     AttnDim = Hq * D
     M = d_ff
-    MUp = 2 * M if activation == SwiGLU else M
+    MUp = 2 * M
   params:
     ln1_weight: [C]
     ln2_weight: [C]
     qkv_weight: [QKV, C]
-    qkv_bias: [QKV] if use_qkv_bias
     out_weight: [C, AttnDim]
-    q_norm_weight: [D] if use_qk_norm
-    k_norm_weight: [D] if use_qk_norm
     rope_freqs: [max_seq, D // 2, 2, fp32] @frozen
     mlp_up_weight: [MUp, C]
     mlp_down_weight: [C, M]
@@ -52,32 +44,17 @@ block ParallelTransformerBlock(
       (residual, x, ln1_weight) -> fused_residual_rmsnorm(eps=eps) -> (residual_mid, ln1_out, _)
       ln1_out -> view(shape=[B * T, C]) -> ln1_flat
       (ln1_flat, qkv_weight) -> matmul(transpose=NT) -> qkv_flat
-      if use_qkv_bias:
-        qkv_flat -> view(shape=[B, T, QKV]) -> qkv_tmp
-        (qkv_tmp, qkv_bias) -> bias_add() -> qkv_biased
-        qkv_biased -> view(shape=[B, T, Hq + 2 * Hkv, D]) -> qkv_packed
-      else:
-        qkv_flat -> view(shape=[B, T, Hq + 2 * Hkv, D]) -> qkv_packed
-      if use_qk_norm:
-        (qkv_packed, q_norm_weight, k_norm_weight, rope_freqs, position_ids) -> qkv_qk_norm_rope(eps=eps) -> (qkv_rope, _, _)
-      else:
-        (qkv_packed, rope_freqs, position_ids) -> rope(rotary_dim=D) -> qkv_rope
+      qkv_flat -> view(shape=[B, T, Hq + 2 * Hkv, D]) -> qkv_packed
+      (qkv_packed, rope_freqs, position_ids) -> rope(rotary_dim=D) -> qkv_rope
       qkv_rope -> flash_attention(causal=true) -> (att, _)
       att -> view(shape=[B * T, AttnDim]) -> att_flat
       (att_flat, out_weight) -> matmul(transpose=NT) -> att_out_flat
       att_out_flat -> view(shape=[B, T, C]) -> att_out
-      (residual_mid, att_out) -> vector_add_sr(scale=1.0) -> residual_out
-      (residual_mid, ln2_weight) -> rmsnorm(eps=eps) -> (ln2_out, _)
+      (residual_mid, att_out, ln2_weight) -> fused_residual_rmsnorm(eps=eps) -> (residual_out, ln2_out, _)
       ln2_out -> view(shape=[B * T, C]) -> ln2_flat
       (ln2_flat, mlp_up_weight) -> matmul(transpose=NT) -> mlp_up_flat
       mlp_up_flat -> view(shape=[B, T, MUp]) -> mlp_up
-      if activation == SwiGLU:
-        mlp_up -> swiglu() -> mlp_act
-      else:
-        if activation == SiLU:
-          mlp_up -> silu() -> mlp_act
-        else:
-          mlp_up -> relu2() -> mlp_act
+      mlp_up -> swiglu() -> mlp_act
       mlp_act -> view(shape=[B * T, M]) -> mlp_act_flat
       (mlp_act_flat, mlp_down_weight) -> matmul(transpose=NT) -> out_flat
       out_flat -> view(shape=[B, T, C]) -> out

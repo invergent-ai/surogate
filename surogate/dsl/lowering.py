@@ -83,6 +83,8 @@ class ExpressionEvaluator:
         if isinstance(expr, Identifier):
             if expr.name in self.env:
                 return self.env[expr.name]
+            if expr.name in {dtype.value for dtype in Dtype}:
+                return Dtype.from_string(expr.name)
             raise DSLResolutionError(
                 ErrorCode.E002,
                 f"Undefined identifier: {expr.name}",

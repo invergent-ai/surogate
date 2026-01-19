@@ -1,392 +1,51 @@
-# Tensor Operation Primitives
-# Maps to: csrc/src/kernels/utilities.cu and various kernel files
-
-"""
-Basic tensor manipulation and element-wise operation primitives.
-"""
-
-# =============================================================================
-# Element-wise Operations
-# =============================================================================
-
-primitive add:
-  """
-  Element-wise addition: C = A + B
-
-  Supports broadcasting.
-
-  Maps to: kernels.add
-  """
-
-  forward:
-    in: (a: [*], b: [*])
-    out: [*]
-
-  backward:
-    d_a = d_out
-    d_b = d_out  # Broadcast reduction if shapes differ
-
-  impl:
-    forward: kernels.add
-
-
-primitive sub:
-  """
-  Element-wise subtraction: C = A - B
-
-  Maps to: kernels.sub
-  """
-
-  forward:
-    in: (a: [*], b: [*])
-    out: [*]
-
-  backward:
-    d_a = d_out
-    d_b = -d_out
-
-  impl:
-    forward: kernels.sub
-
-
-primitive mul:
-  """
-  Element-wise multiplication: C = A * B
-
-  Maps to: kernels.mul
-  """
-
-  forward:
-    in: (a: [*], b: [*])
-    out: [*]
-
-  backward:
-    in: (d_out, a, b)
-    out: (d_a, d_b)
-
-    d_a = d_out * b
-    d_b = d_out * a
-
-  save: [a, b]
-
-  impl:
-    forward: kernels.mul
-    backward: kernels.mul_backward
-
-
-primitive div:
-  """
-  Element-wise division: C = A / B
-
-  Maps to: kernels.div
-  """
-
-  forward:
-    in: (a: [*], b: [*])
-    out: [*]
-
-  backward:
-    in: (d_out, a, b)
-    out: (d_a, d_b)
-
-    d_a = d_out / b
-    d_b = -d_out * a / (b * b)
-
-  save: [a, b]
-
-  impl:
-    forward: kernels.div
-    backward: kernels.div_backward
-
-
-primitive scale:
-  """
-  Scale tensor by constant: y = x * scalar
-
-  Maps to: kernels.scale
-  """
-
-  params:
-    scalar: float
-
-  forward:
-    in: x: [*]
-    out: [*]
-
-  backward:
-    d_x = d_out * scalar
-
-  impl:
-    forward: kernels.scale
-
-
-# =============================================================================
-# Reduction Operations
-# =============================================================================
-
-primitive reduce_sum:
-  """
-  Sum reduction along specified dimensions.
-
-  Maps to: kernels.reduce_sum
-  """
-
-  params:
-    dims: [int]                    # Dimensions to reduce
-    keepdim: bool = false
-
-  forward:
-    in: x: [*]
-    out: [reduced_shape]
-
-  backward:
-    d_x = broadcast(d_out, original_shape)
-
-  impl:
-    forward: kernels.reduce_sum
-    backward: kernels.reduce_sum_backward
-
-
-primitive reduce_mean:
-  """
-  Mean reduction along specified dimensions.
-
-  Maps to: kernels.reduce_mean
-  """
-
-  params:
-    dims: [int]
-    keepdim: bool = false
-
-  forward:
-    in: x: [*]
-    out: [reduced_shape]
-
-  backward:
-    d_x = broadcast(d_out / num_elements, original_shape)
-
-  impl:
-    forward: kernels.reduce_mean
-    backward: kernels.reduce_mean_backward
-
-
-primitive reduce_max:
-  """
-  Max reduction along specified dimensions.
-
-  Maps to: kernels.reduce_max
-  """
-
-  params:
-    dims: [int]
-    keepdim: bool = false
-
-  forward:
-    in: x: [*]
-    out: (values: [reduced_shape], indices: [reduced_shape, int32])
-
-  impl:
-    forward: kernels.reduce_max
-
-
-# =============================================================================
-# Shape Operations
-# =============================================================================
-
-primitive split:
-  """
-  Split tensor along dimension into multiple parts.
-
-  Maps to: kernels.split (or view-based, no copy)
-  """
-
-  params:
-    sizes: [int]                   # Size of each split
-    dim: int = -1
-
-  forward:
-    in: x: [*]
-    out: tuple<[split_shapes]>
-
-  backward:
-    d_x = concat(d_outs, dim=dim)
-
-  impl:
-    forward: kernels.split
-
-
-primitive concat:
-  """
-  Concatenate tensors along dimension.
-
-  Maps to: kernels.concat
-  """
-
-  params:
-    dim: int = -1
-
-  forward:
-    in: tensors: tuple<[*]>
-    out: [concatenated_shape]
-
-  backward:
-    d_tensors = split(d_out, original_sizes, dim=dim)
-
-  impl:
-    forward: kernels.concat
-
-
-primitive view:
-  """
-  Reshape tensor (view, no copy if contiguous).
-
-  Maps to: kernels.view (metadata only)
-  """
-
-  params:
-    shape: [int]                   # New shape (-1 for inferred dimension)
-
-  forward:
-    in: x: [*]
-    out: [shape]
-
-  backward:
-    d_x = view(d_out, original_shape)
-
-  impl:
-    forward: kernels.view  # Typically zero-copy
-
+# Tensor Utility Primitives
+# Native implementations: csrc/src/kernels/kernels.cpp, transpose.cu, convert.cu, fill.cu
 
 primitive transpose:
   """
-  Transpose tensor dimensions.
-
-  Maps to: kernels.transpose
+  Transpose a 2D tensor.
   """
 
   params:
-    dim0: int
-    dim1: int
+    dim0: int = 0
+    dim1: int = 1
 
   forward:
-    in: x: [*]
-    out: [transposed_shape]
+    in: x: [D0, D1]
+    out: [D1, D0]
+    _
 
   backward:
-    d_x = transpose(d_out, dim0, dim1)
+    in: d_out: [D1, D0]
+    out: d_x: [D0, D1]
+    _
 
   impl:
     forward: kernels.transpose
+    backward: kernels.transpose
 
 
-primitive contiguous:
+primitive vector_add_sr:
   """
-  Make tensor contiguous in memory (copy if needed).
-
-  Maps to: kernels.contiguous
+  Element-wise add with stochastic rounding: out = scale * (left + right).
   """
+
+  params:
+    scale: float = 1.0
+    seed: int = 0
 
   forward:
-    in: x: [*]
+    in: (left: [*], right: [*])
     out: [*]
-
-  backward:
-    d_x = d_out
+    _
 
   impl:
-    forward: kernels.contiguous
+    forward: kernels.vector_add_sr
 
-
-primitive copy:
-  """
-  Explicit tensor copy.
-
-  Maps to: kernels.copy
-  """
-
-  forward:
-    in: x: [*]
-    out: [*]
-
-  backward:
-    d_x = d_out
-
-  impl:
-    forward: kernels.copy
-
-
-# =============================================================================
-# Initialization Operations
-# =============================================================================
-
-primitive zeros:
-  """
-  Create tensor filled with zeros.
-
-  Maps to: kernels.fill_constant
-  """
-
-  params:
-    shape: [int]
-    dtype: dtype = bf16
-
-  forward:
-    in: ()
-    out: [shape]
-
-  impl:
-    forward: kernels.fill_constant(0.0)
-
-
-primitive ones:
-  """
-  Create tensor filled with ones.
-
-  Maps to: kernels.fill_constant
-  """
-
-  params:
-    shape: [int]
-    dtype: dtype = bf16
-
-  forward:
-    in: ()
-    out: [shape]
-
-  impl:
-    forward: kernels.fill_constant(1.0)
-
-
-primitive fill_normal:
-  """
-  Fill tensor with normal distribution.
-
-  Maps to: kernels.fill_normal
-  """
-
-  params:
-    shape: [int]
-    mean: float = 0.0
-    std: float = 1.0
-    dtype: dtype = bf16
-
-  forward:
-    in: ()
-    out: [shape]
-
-  impl:
-    forward: kernels.fill_normal
-
-
-# =============================================================================
-# Type Conversion
-# =============================================================================
 
 primitive convert_dtype:
   """
-  Convert tensor to different dtype.
-
-  Maps to: kernels.convert_dtype
+  Convert tensor dtype.
   """
 
   params:
@@ -395,51 +54,90 @@ primitive convert_dtype:
   forward:
     in: x: [*]
     out: [*, target_dtype]
+    _
 
   backward:
-    d_x = convert_dtype(d_out, original_dtype)
+    in: d_out: [*, target_dtype]
+    out: d_x: [*]
+    _
 
   impl:
     forward: kernels.convert_dtype
+    backward: kernels.convert_dtype
 
 
-# =============================================================================
-# Gradient Utilities
-# =============================================================================
-
-primitive global_norm:
+primitive fill_constant:
   """
-  Compute global gradient norm for gradient clipping.
-
-  norm = sqrt(Σ ||grad_i||²)
-
-  Maps to: kernels.global_norm_squared + kernels.global_norm_sqrt
-  """
-
-  forward:
-    in: grads: tuple<[*]>          # List of gradient tensors
-    out: norm: float
-
-  impl:
-    forward: kernels.global_norm
-
-
-primitive clip_grad_norm:
-  """
-  Clip gradients by global norm.
-
-  If ||grads|| > max_norm:
-    grads = grads * max_norm / ||grads||
-
-  Maps to: kernels.clip_grad_norm
+  Fill tensor with a constant value.
   """
 
   params:
-    max_norm: float
+    shape: [int]
+    value: float = 0.0
+    dtype: dtype = bf16
 
   forward:
-    in: grads: tuple<[*]>
-    out: (clipped_grads: tuple<[*]>, grad_norm: float)
+    in: ()
+    out: [shape]
+    _
 
   impl:
-    forward: kernels.clip_grad_norm
+    forward: kernels.fill_constant(value)
+
+
+primitive fill_normal:
+  """
+  Fill tensor with a normal distribution.
+  """
+
+  params:
+    shape: [int]
+    mean: float = 0.0
+    std: float = 1.0
+    seed: int = 0
+    subsequence: int = 0
+    dtype: dtype = bf16
+
+  forward:
+    in: ()
+    out: [shape]
+    _
+
+  impl:
+    forward: kernels.fill_normal
+
+
+primitive zeros:
+  """
+  Create a zero-filled tensor.
+  """
+
+  params:
+    shape: [int]
+    dtype: dtype = bf16
+
+  forward:
+    in: ()
+    out: [shape]
+    _
+
+  impl:
+    forward: cudaMemset
+
+
+primitive ones:
+  """
+  Create a one-filled tensor.
+  """
+
+  params:
+    shape: [int]
+    dtype: dtype = bf16
+
+  forward:
+    in: ()
+    out: [shape]
+    _
+
+  impl:
+    forward: kernels.fill_constant(1.0)

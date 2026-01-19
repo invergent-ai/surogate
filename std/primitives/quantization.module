@@ -1,96 +1,93 @@
 # Quantization Primitives
-# Maps to: csrc/src/kernels/quantize.cu, csrc/src/modules/qlora/
+# Native implementations: csrc/src/kernels/block_quant.cu, bnb_quant.cu, kernels.cpp
 
-"""
-Quantization primitives for mixed-precision and QLoRA training.
-Supports FP8, FP4, and BitsAndBytes NF4 formats.
-"""
-
-# =============================================================================
-# FP8 Quantization (SM89+ / Ada/Hopper)
-# =============================================================================
-
-primitive quantize_fp8:
+primitive quantize_fp8_e4m3:
   """
-  Quantize tensor to FP8 format with per-tensor scaling.
-
-  FP8 E4M3: 4-bit exponent, 3-bit mantissa (forward activations)
-  FP8 E5M2: 5-bit exponent, 2-bit mantissa (backward gradients)
-
-  Maps to: kernels.quantize_with_abs_max
+  Per-tensor FP8 E4M3 quantization using abs-max scaling.
   """
-
-  params:
-    format: enum(e4m3, e5m2) = e4m3
 
   forward:
     in: x: [*, bf16]
     out: (
-      x_quant: [*, fp8],
-      scale: float                 # Scale factor for dequantization
+      x_quant: [*, fp8_e4m3],
+      scale: float
     )
+    _
 
   impl:
     forward: kernels.quantize_with_abs_max
 
 
-primitive quantize_fp8_delayed:
+primitive quantize_fp8_e5m2:
   """
-  FP8 quantization with delayed scaling (TransformerEngine style).
+  Per-tensor FP8 E5M2 quantization using abs-max scaling.
+  """
 
-  Uses previous iteration's scale and records current amax for next iteration.
-  Improves training stability compared to immediate scaling.
+  forward:
+    in: x: [*, bf16]
+    out: (
+      x_quant: [*, fp8_e5m2],
+      scale: float
+    )
+    _
 
-  Maps to: kernels.quantize_with_delayed_scale
+  impl:
+    forward: kernels.quantize_with_abs_max
+
+
+primitive quantize_fp8_delayed_e4m3:
+  """
+  Delayed-scale FP8 E4M3 quantization.
   """
 
   params:
-    format: enum(e4m3, e5m2) = e4m3
-    amax_history_len: int = 16     # Number of iterations for amax history
+    amax_history_len: int = 16
 
   forward:
     in: (
       x: [*, bf16],
-      amax_history: [amax_history_len],  # Historical amax values
-      scale: float                        # Previous scale
+      amax_history: [amax_history_len],
+      scale: float
     )
     out: (
-      x_quant: [*, fp8],
-      new_amax: float,             # Current amax (for next iteration)
-      new_scale: float             # Updated scale
+      x_quant: [*, fp8_e4m3],
+      new_amax: float,
+      new_scale: float
     )
+    _
 
   impl:
     forward: kernels.quantize_with_delayed_scale
 
 
-primitive dequantize_fp8:
+primitive quantize_fp8_delayed_e5m2:
   """
-  Dequantize FP8 tensor back to BF16.
+  Delayed-scale FP8 E5M2 quantization.
+  """
 
-  Maps to: kernels.dequantize
-  """
+  params:
+    amax_history_len: int = 16
 
   forward:
-    in: (x_quant: [*, fp8], scale: float)
-    out: x: [*, bf16]
+    in: (
+      x: [*, bf16],
+      amax_history: [amax_history_len],
+      scale: float
+    )
+    out: (
+      x_quant: [*, fp8_e5m2],
+      new_amax: float,
+      new_scale: float
+    )
+    _
 
   impl:
-    forward: kernels.dequantize_fp8
+    forward: kernels.quantize_with_delayed_scale
 
-
-# =============================================================================
-# FP8 Per-Block Quantization (QLoRA)
-# =============================================================================
 
 primitive quantize_fp8_per_block:
   """
-  Per-block FP8 quantization for QLoRA weights.
-
-  Quantizes weights in blocks (e.g., 64 elements) with per-block scales.
-  More accurate than per-tensor quantization for weight compression.
-
-  Maps to: kernels.quantize_per_block
+  Per-block FP8 E4M3 quantization for weights.
   """
 
   params:
@@ -102,6 +99,7 @@ primitive quantize_fp8_per_block:
       weight_quant: [*, fp8_e4m3],
       block_scales: [num_blocks, fp32]
     )
+    _
 
   impl:
     forward: kernels.quantize_per_block
@@ -109,38 +107,28 @@ primitive quantize_fp8_per_block:
 
 primitive dequantize_fp8_per_block:
   """
-  Dequantize per-block FP8 weights to BF16.
-
-  Maps to: kernels.dequantize_per_block
+  Dequantize per-block FP8 E4M3 weights.
   """
 
-  params:
-    block_size: int = 64
-
   forward:
-    in: (weight_quant: [*, fp8_e4m3], block_scales: [num_blocks, fp32])
+    in: (
+      weight_quant: [*, fp8_e4m3],
+      block_scales: [num_blocks, fp32]
+    )
     out: weight: [*, bf16]
+    _
 
   impl:
     forward: kernels.dequantize_per_block
 
 
-# =============================================================================
-# FP4 Quantization (SM100+ / Blackwell)
-# =============================================================================
-
 primitive quantize_fp4:
   """
-  FP4 E2M1 quantization with two-level block scaling.
-
-  FP4 format: 2-bit exponent, 1-bit mantissa
-  Uses hierarchical scaling: global scale + per-block scales.
-
-  Maps to: kernels.quantize_fp4_block
+  FP4 E2M1 quantization with block scaling.
   """
 
   params:
-    block_size: int = 16           # Block size for fine-grained scaling
+    block_size: int = 16
 
   forward:
     in: x: [*, bf16]
@@ -149,6 +137,7 @@ primitive quantize_fp4:
       block_scales: [num_blocks, fp8_e4m3],
       global_scale: float
     )
+    _
 
   impl:
     forward: kernels.quantize_fp4_block
@@ -157,10 +146,6 @@ primitive quantize_fp4:
 primitive quantize_fp4_auto:
   """
   FP4 quantization with automatic scale computation.
-
-  Automatically computes optimal global and block scales.
-
-  Maps to: kernels.quantize_fp4_block_auto_scale
   """
 
   params:
@@ -173,6 +158,7 @@ primitive quantize_fp4_auto:
       block_scales: [num_blocks, fp8_e4m3],
       global_scale: float
     )
+    _
 
   impl:
     forward: kernels.quantize_fp4_block_auto_scale
@@ -181,40 +167,10 @@ primitive quantize_fp4_auto:
 primitive quantize_fp4_stochastic:
   """
   FP4 quantization with stochastic rounding.
-
-  Uses stochastic rounding for gradients to reduce quantization bias.
-
-  Maps to: kernels.quantize_fp4_block_stochastic
   """
 
   params:
     block_size: int = 16
-
-  forward:
-    in: (x: [*, bf16], rng_state: int64)
-    out: (
-      x_quant: [*, fp4_e2m1],
-      block_scales: [num_blocks, fp8_e4m3],
-      global_scale: float
-    )
-
-  impl:
-    forward: kernels.quantize_fp4_block_stochastic
-
-
-primitive quantize_fp4_4o6:
-  """
-  Four-over-six adaptive FP4 quantization.
-
-  Selects 4 values out of 6 candidates per block for better accuracy.
-  Uses MSE, L1, or AbsMax metrics for selection.
-
-  Maps to: kernels.quantize_fp4_block_4o6_auto_scale
-  """
-
-  params:
-    block_size: int = 16
-    metric: enum(mse, l1, absmax) = mse
 
   forward:
     in: x: [*, bf16]
@@ -223,41 +179,36 @@ primitive quantize_fp4_4o6:
       block_scales: [num_blocks, fp8_e4m3],
       global_scale: float
     )
+    _
+
+  impl:
+    forward: kernels.quantize_fp4_block_stochastic
+
+
+primitive quantize_fp4_4o6:
+  """
+  Four-over-six adaptive FP4 quantization.
+  """
+
+  params:
+    block_size: int = 16
+
+  forward:
+    in: x: [*, bf16]
+    out: (
+      x_quant: [*, fp4_e2m1],
+      block_scales: [num_blocks, fp8_e4m3],
+      global_scale: float
+    )
+    _
 
   impl:
     forward: kernels.quantize_fp4_block_4o6_auto_scale
 
 
-primitive dequantize_fp4:
-  """
-  Dequantize FP4 tensor back to BF16.
-
-  Maps to: kernels.dequantize_fp4_block
-  """
-
-  forward:
-    in: (
-      x_quant: [*, fp4_e2m1],
-      block_scales: [num_blocks, fp8_e4m3],
-      global_scale: float
-    )
-    out: x: [*, bf16]
-
-  impl:
-    forward: kernels.dequantize_fp4_block
-
-
-# =============================================================================
-# FP4 Weight Quantization (cuDNN-compatible)
-# =============================================================================
-
 primitive quantize_fp4_weight:
   """
-  FP4 weight quantization for cuDNN matmul B operand.
-
-  Column-major layout optimized for cuDNN FP4 GEMM.
-
-  Maps to: kernels.quantize_fp4_weight
+  FP4 weight quantization for matmul B operand.
   """
 
   params:
@@ -270,6 +221,7 @@ primitive quantize_fp4_weight:
       block_scales: [num_blocks, fp8_e4m3],
       global_scale: float
     )
+    _
 
   impl:
     forward: kernels.quantize_fp4_weight
@@ -277,44 +229,52 @@ primitive quantize_fp4_weight:
 
 primitive quantize_fp4_weight_2d:
   """
-  FP4 weight quantization with 2D block scaling.
-
-  16x16 block scaling for better accuracy.
-
-  Maps to: kernels.quantize_fp4_weight_2d
+  FP4 weight quantization with 2D block scales.
   """
 
   forward:
     in: weight: [N, K, bf16]
     out: (
       weight_quant: [N, K, fp4_e2m1],
-      block_scales_2d: [N//16, K//16, fp8_e4m3],
+      block_scales_2d: [N // 16, K // 16, fp8_e4m3],
       global_scale: float
     )
+    _
 
   impl:
     forward: kernels.quantize_fp4_weight_2d
 
 
-# =============================================================================
-# FP4 Alpha Scaling (Post-matmul Correction)
-# =============================================================================
+primitive dequantize_fp4:
+  """
+  Dequantize FP4 E2M1 tensor to BF16.
+  """
+
+  forward:
+    in: (
+      x_quant: [*, fp4_e2m1],
+      block_scales: [num_blocks, fp8_e4m3]
+    )
+    out: x: [*, bf16]
+    _
+
+  impl:
+    forward: kernels.dequantize_fp4_block
+
 
 primitive fp4_alpha_scale:
   """
-  Apply FP4 alpha correction factor after matmul.
-
-  Corrects for quantization approximation errors.
-
-  Maps to: kernels.fp4_alpha_scale
+  Apply FP4 alpha correction after matmul.
   """
 
   forward:
     in: (
       matmul_output: [*, fp32],
-      alpha: float
+      amax_a: float,
+      amax_b: float
     )
     out: corrected: [*, bf16]
+    _
 
   impl:
     forward: kernels.fp4_alpha_scale
@@ -323,119 +283,35 @@ primitive fp4_alpha_scale:
 primitive compute_fp4_alpha:
   """
   Compute FP4 alpha correction factor.
-
-  Based on global amax values from forward pass.
-
-  Maps to: kernels.compute_fp4_alpha
   """
 
   forward:
     in: (
-      input_amax: float,
-      weight_amax: float
+      amax_a: float,
+      amax_b: float
     )
     out: alpha: float
+    _
 
   impl:
     forward: kernels.compute_fp4_alpha
 
 
-# =============================================================================
-# Random Hadamard Transform (RHT)
-# =============================================================================
-
 primitive hadamard_transform:
   """
-  Random Hadamard Transform for distribution smoothing.
-
-  Decorrelates tensor values before quantization to reduce outlier impact.
-  Applied before FP4 quantization for better accuracy.
-
-  Maps to: kernels.hadamard_transform_forward
+  Random Hadamard transform for distribution smoothing.
   """
 
-  params:
-    inverse: bool = false          # Forward or inverse transform
-
   forward:
-    in: x: [*, D]
-    out: [*, D]
+    in: x: [*]
+    out: [*]
+    _
 
   backward:
-    # Hadamard is self-inverse: H^T = H, H^{-1} = H/n
-    d_x = hadamard_transform(d_out, inverse=not inverse)
+    in: d_out: [*]
+    out: d_x: [*]
+    _
 
   impl:
     forward: kernels.hadamard_transform_forward
     backward: kernels.hadamard_transform_inverse
-
-
-# =============================================================================
-# BitsAndBytes NF4 Quantization
-# =============================================================================
-
-primitive quantize_bnb_nf4:
-  """
-  BitsAndBytes NF4 quantization.
-
-  Normal Float 4-bit format with non-uniform quantization levels
-  optimized for normally-distributed weights.
-
-  Maps to: kernels.quantize_bnb_nf4
-  """
-
-  params:
-    block_size: int = 64
-
-  forward:
-    in: weight: [*, bf16]
-    out: (
-      weight_quant: [*, nf4],      # Packed 4-bit
-      absmax: [num_blocks, fp32]   # Per-block absmax
-    )
-
-  impl:
-    forward: kernels.quantize_bnb_nf4
-
-
-primitive quantize_bnb_double_quant:
-  """
-  BitsAndBytes double quantization.
-
-  Quantizes the absmax scales themselves for additional compression.
-
-  Maps to: kernels.quantize_bnb_double_quant
-  """
-
-  params:
-    block_size: int = 64
-    nested_block_size: int = 256
-
-  forward:
-    in: weight: [*, bf16]
-    out: (
-      weight_quant: [*, nf4],
-      absmax_quant: [num_blocks, int8],
-      absmax_absmax: [num_nested_blocks, fp32]
-    )
-
-  impl:
-    forward: kernels.quantize_bnb_double_quant
-
-
-primitive dequantize_bnb_nf4:
-  """
-  Dequantize BitsAndBytes NF4 weights.
-
-  Maps to: kernels.dequantize_bnb_nf4
-  """
-
-  params:
-    block_size: int = 64
-
-  forward:
-    in: (weight_quant: [*, nf4], absmax: [num_blocks, fp32])
-    out: weight: [*, bf16]
-
-  impl:
-    forward: kernels.dequantize_bnb_nf4

@@ -1,246 +1,295 @@
-# Mixture-of-Experts Primitives
-# Maps to: csrc/src/kernels/moe_kernels.cu
+# Mixture-of-Experts (MoE) Primitives
+# Native implementations: csrc/src/kernels/moe_kernels.cu
 
-"""
-Mixture-of-Experts (MoE) primitives for sparse expert computation.
-Used in Mixtral, Qwen3-MoE, DeepSeek, and other MoE architectures.
-"""
-
-# =============================================================================
-# moe_router - Expert Routing
-# =============================================================================
-
-primitive moe_router:
+primitive moe_softmax:
   """
-  Compute expert routing scores and select top-k experts per token.
+  Row-wise softmax for MoE routing logits.
+  """
 
-  For each token, computes affinity scores with all experts,
-  applies normalization (softmax or sigmoid), and selects top-k.
+  forward:
+    in: logits: [BT, E]
+    out: probs: [BT, E]
+    _
 
-  Maps to: kernels.moe_softmax_forward_kernel + kernels.moe_topk_forward_kernel
+  backward:
+    in: (d_probs: [BT, E], probs: [BT, E])
+    out: d_logits: [BT, E]
+    _
+
+  save: [probs]
+
+  impl:
+    forward: kernels.moe_softmax_forward
+    backward: kernels.moe_softmax_backward
+
+
+primitive moe_sigmoid:
+  """
+  Element-wise sigmoid for routing (DeepSeek-style).
+  """
+
+  forward:
+    in: logits: [*]
+    out: scores: [*]
+    _
+
+  backward:
+    in: (d_scores: [*], scores: [*])
+    out: d_logits: [*]
+    _
+
+  save: [scores]
+
+  impl:
+    forward: kernels.moe_sigmoid_forward
+    backward: kernels.moe_sigmoid_backward
+
+
+primitive moe_scale:
+  """
+  Scale routing scores by a scalar.
   """
 
   params:
-    top_k: int                     # Number of experts per token
-    normalize: enum(softmax, sigmoid, none) = softmax
-    capacity_factor: float = 1.0   # Expert capacity multiplier
+    scale: float
+
+  forward:
+    in: x: [*]
+    out: [*]
+    _
+
+  impl:
+    forward: kernels.moe_scale_forward
+
+
+primitive moe_topk:
+  """
+  Top-K expert selection.
+  """
+
+  params:
+    top_k: int
+    normalize: bool = true
+
+  forward:
+    in: probs: [BT, E]
+    out: (
+      weights: [BT, top_k],
+      indices: [BT, top_k, int32]
+    )
+    _
+
+  backward:
+    in: (
+      d_weights: [BT, top_k],
+      probs: [BT, E],
+      indices: [BT, top_k, int32]
+    )
+    out: d_probs: [BT, E]
+    _
+
+  save: [probs, indices]
+
+  impl:
+    forward: kernels.moe_topk_forward
+    backward: kernels.moe_topk_backward
+
+
+primitive moe_compute_expert_counts:
+  """
+  Histogram of tokens per expert.
+  """
+
+  params:
+    num_experts: int
+    top_k: int
+
+  forward:
+    in: indices: [BT, top_k, int32]
+    out: expert_counts: [num_experts, int32]
+    _
+
+  impl:
+    forward: kernels.moe_compute_expert_counts
+
+
+primitive moe_compute_expert_offsets:
+  """
+  Exclusive prefix sum over expert counts.
+  """
+
+  params:
+    num_experts: int
+
+  forward:
+    in: expert_counts: [num_experts, int32]
+    out: expert_offsets: [num_experts + 1, int32]
+    _
+
+  impl:
+    forward: kernels.moe_compute_expert_offsets
+
+
+primitive moe_build_indices:
+  """
+  Build gather/scatter indices for token permutation.
+  """
+
+  params:
+    num_experts: int
+    top_k: int
 
   forward:
     in: (
-      hidden: [B*T, d_model],      # Flattened hidden states
-      router_weight: [num_experts, d_model]  # Router projection
+      indices: [BT, top_k, int32],
+      expert_offsets: [num_experts + 1, int32],
+      expert_positions: [num_experts, int32]
     )
     out: (
-      weights: [B*T, top_k],       # Selected expert weights (normalized)
-      indices: [B*T, top_k, int32],  # Selected expert indices
-      aux_loss: float              # Load balancing auxiliary loss
+      gather_indices: [BT * top_k, int32],
+      scatter_indices: [BT * top_k, int32]
     )
-
-  backward:
-    in: (d_weights, hidden, router_weight, indices)
-    out: (d_hidden, d_router_weight)
-
-  save: [hidden, indices]
+    _
 
   impl:
-    forward: kernels.moe_router_forward
-    backward: kernels.moe_router_backward
+    forward: kernels.moe_build_indices
 
 
-# =============================================================================
-# moe_router_topk - Top-K Selection Only
-# =============================================================================
-
-primitive moe_router_topk:
+primitive moe_remap_expert_indices:
   """
-  Select top-k experts from pre-computed scores.
-
-  Used when router scores are computed separately (e.g., with custom gating).
-
-  Maps to: kernels.moe_topk_forward_kernel
+  Remap expert indices to a compact range.
   """
 
   params:
     top_k: int
 
   forward:
-    in: scores: [B*T, num_experts]
-    out: (
-      weights: [B*T, top_k],
-      indices: [B*T, top_k, int32]
+    in: (
+      indices: [BT, top_k, int32],
+      expert_to_compact: [E_total, int32]
     )
+    out: remapped_indices: [BT, top_k, int32]
+    _
 
   impl:
-    forward: kernels.moe_topk_forward
+    forward: kernels.moe_remap_expert_indices
 
-
-# =============================================================================
-# moe_permute - Token-to-Expert Permutation
-# =============================================================================
 
 primitive moe_permute:
   """
-  Permute tokens to expert order for grouped computation.
-
-  Reorders tokens so all tokens assigned to the same expert are contiguous.
-  Required for efficient grouped GEMM.
-
-  Maps to: kernels.moe_permute_forward
+  Permute tokens to expert-grouped order.
   """
+
+  params:
+    top_k: int
 
   forward:
     in: (
-      input: [B*T, d_model],       # Original token order
-      indices: [B*T, top_k, int32] # Expert assignments
+      x: [BT, C],
+      gather_indices: [BT * top_k, int32]
     )
-    out: (
-      permuted: [B*T*top_k, d_model],  # Expert-ordered tokens
-      expert_offsets: [num_experts + 1, int32]  # Expert boundaries
-    )
-
-  backward:
-    in: (d_permuted, indices, expert_offsets)
-    out: d_input: [B*T, d_model]
+    out: permuted: [BT * top_k, C]
+    _
 
   impl:
-    forward: kernels.moe_permute_forward
-    backward: kernels.moe_permute_backward
+    forward: kernels.moe_permute_tokens
 
-
-# =============================================================================
-# moe_unpermute - Expert-to-Token Unpermutation
-# =============================================================================
 
 primitive moe_unpermute:
   """
-  Unpermute expert outputs back to token order and combine.
-
-  Reverses moe_permute and applies weighted combination of expert outputs.
-
-  Maps to: kernels.moe_unpermute_forward
-  """
-
-  forward:
-    in: (
-      expert_outputs: [B*T*top_k, d_model],  # Expert-ordered outputs
-      weights: [B*T, top_k],                  # Expert weights for combination
-      indices: [B*T, top_k, int32],          # Expert assignments
-      expert_offsets: [num_experts + 1, int32]
-    )
-    out: combined: [B*T, d_model]            # Combined output in token order
-
-  backward:
-    in: (d_combined, weights, indices, expert_offsets)
-    out: (d_expert_outputs, d_weights)
-
-  impl:
-    forward: kernels.moe_unpermute_forward
-    backward: kernels.moe_unpermute_backward
-
-
-# =============================================================================
-# moe_experts - Grouped Expert Computation
-# =============================================================================
-
-primitive moe_experts:
-  """
-  Compute all expert FFNs efficiently using grouped GEMM.
-
-  Applies per-expert gate+up projection, activation, and down projection.
-  Uses grouped GEMM for efficient batched computation.
-
-  Maps to: grouped_gemm + swiglu + grouped_gemm (fused)
+  Unpermute and combine expert outputs back to token order.
   """
 
   params:
-    activation: enum(swiglu, geglu, silu, relu2) = swiglu
+    top_k: int
 
   forward:
     in: (
-      permuted_input: [total_tokens, d_model],
-      expert_offsets: [num_experts + 1, int32],
-      gate_up_weights: [num_experts, 2 * d_ff, d_model],
-      down_weights: [num_experts, d_model, d_ff]
+      expert_out: [BT * top_k, C],
+      weights: [BT, top_k],
+      scatter_indices: [BT * top_k, int32]
     )
-    out: expert_outputs: [total_tokens, d_model]
-
-  backward:
-    in: (d_expert_outputs, permuted_input, expert_offsets, gate_up_weights, down_weights)
-    out: (d_permuted_input, d_gate_up_weights, d_down_weights)
-
-  save: [permuted_input, expert_offsets]
-  recompute: [gate_up, hidden]  # Recompute activations for memory efficiency
+    out: combined: [BT, C]
+    _
 
   impl:
-    forward: kernels.moe_experts_forward
-    backward: kernels.moe_experts_backward
+    forward: kernels.moe_unpermute_and_combine
 
-
-# =============================================================================
-# moe_aux_loss - Load Balancing Loss
-# =============================================================================
 
 primitive moe_aux_loss:
   """
-  Compute MoE load balancing auxiliary loss.
-
-  Encourages uniform expert utilization:
-  aux_loss = α * Σ_e (fraction_tokens_e * mean_prob_e)
-
-  Maps to: kernels.moe_aux_loss
+  Auxiliary load-balancing loss for MoE routing.
   """
 
   params:
-    alpha: float = 0.01            # Auxiliary loss coefficient
+    num_experts: int
+    top_k: int
+    aux_loss_coef: float = 0.01
 
   forward:
     in: (
-      router_probs: [B*T, num_experts],  # Router probabilities
-      expert_mask: [B*T, num_experts]    # One-hot expert assignments
+      probs: [BT, num_experts],
+      indices: [BT, top_k, int32]
     )
     out: aux_loss: float
-
-  backward:
-    in: (d_aux_loss, router_probs, expert_mask)
-    out: d_router_probs: [B*T, num_experts]
+    _
 
   impl:
-    forward: kernels.moe_aux_loss
-    backward: kernels.moe_aux_loss_backward
+    forward: kernels.moe_compute_aux_loss
 
 
-# =============================================================================
-# moe_shared_expert - Shared Expert Computation
-# =============================================================================
-
-primitive moe_shared_expert:
+primitive moe_grouped_gemm:
   """
-  Shared expert that processes all tokens (Nemotron/DeepSeek style).
-
-  Some architectures have one or more "shared" experts that see all tokens,
-  combined with sparse routing to additional experts.
-
-  Maps to: standard MLP kernels (Linear + activation + Linear)
+  Grouped GEMM for non-gated MoE experts.
   """
 
   params:
-    activation: enum(swiglu, geglu, silu, relu2) = swiglu
+    transpose: enum(NN, NT, TN, TT) = TN
 
   forward:
     in: (
-      hidden: [B*T, d_model],
-      gate_up_weight: [2 * d_ff, d_model],
-      down_weight: [d_model, d_ff]
+      input: [BT, K],
+      weights: [E, M, K],
+      offsets: [E + 1, int32]
     )
-    out: shared_output: [B*T, d_model]
-
-  backward:
-    in: (d_shared_output, hidden, gate_up_weight, down_weight)
-    out: (d_hidden, d_gate_up_weight, d_down_weight)
-
-  save: [hidden]
-  recompute: [gate_up, activation_out]
+    out: output: [BT, M]
+    _
 
   impl:
-    forward: kernels.mlp_forward  # Same as dense MLP
-    backward: kernels.mlp_backward
+    forward: kernels.moe_grouped_gemm
+
+
+primitive moe_grouped_gemm_gate_up:
+  """
+  Grouped GEMM for fused gate+up projection across experts.
+  """
+
+  forward:
+    in: (
+      input: [BT, C],
+      weights: [E, 2 * D, C],
+      offsets: [E + 1, int32]
+    )
+    out: gate_up: [BT, 2 * D]
+    _
+
+  impl:
+    forward: kernels.moe_grouped_gemm_gate_up
+
+
+primitive moe_grouped_gemm_down:
+  """
+  Grouped GEMM for expert down projection across experts.
+  """
+
+  forward:
+    in: (
+      input: [BT, D],
+      weights: [E, C, D],
+      offsets: [E + 1, int32]
+    )
+    out: output: [BT, C]
+    _
+
+  impl:
+    forward: kernels.moe_grouped_gemm_down
