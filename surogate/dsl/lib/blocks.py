@@ -1,7 +1,5 @@
 """
 Transformer Blocks for Python DSL
-
-Ports the blocks from std/blocks/*.module to Python decorator syntax.
 """
 
 from __future__ import annotations

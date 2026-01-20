@@ -19,7 +19,6 @@ COMMAND_MAPPING: Dict[str, str] = {
     'serve': 'surogate.cli.serve',
     'eval': 'surogate.cli.eval',
     'ptq': 'surogate.cli.ptq',
-    'compile': 'surogate.cli.dsl_compile',
 }
 
 def parse_args():
@@ -40,10 +39,6 @@ def parse_args():
     # tokenize command
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser
     tokenize_prepare_command_parser(subparsers.add_parser('tokenize', help="Tokenize datasets for training"))
-
-    # compile command (DSL)
-    from surogate.cli.dsl_compile import prepare_command_parser as compile_prepare_command_parser
-    compile_prepare_command_parser(subparsers.add_parser('compile', help="Compile Module DSL files"))
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:

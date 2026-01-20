@@ -1,7 +1,5 @@
 """
 Primitive Operations for Python DSL
-
-Ports the primitives from std/primitives/*.module to Python decorator syntax.
 """
 
 from __future__ import annotations

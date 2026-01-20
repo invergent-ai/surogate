@@ -2,7 +2,6 @@
 Graph Builder for Python DSL
 
 Provides a context manager and fluent API for building computation graphs.
-Replaces the arrow syntax (x -> op() -> y) from the Lark DSL with method calls.
 
 Example:
     @forward
@@ -775,11 +774,9 @@ class GraphBuilder:
         This generates an operation with:
         - op (name): the module name directly (e.g., "StackedBlocks")
         - kernel_type set to "custom" (handled in attrs via _kernel_type)
-
-        This matches the Lark DSL output format.
         """
         outputs = [self._fresh_name(module_name) for _ in range(num_outputs)]
-        # Set _kernel_type to "custom" to match Lark DSL output
+        # Set _kernel_type to "custom" for module calls
         attrs = dict(kwargs)
         attrs["_kernel_type"] = "custom"
         self._add_node(GraphNode(

@@ -2,10 +2,7 @@
 Python DSL Compiler
 
 Compiles Python DSL model/block/module classes to IR JSON format compatible
-with the C++ runtime. This replaces the Lark-based compiler for Python DSL.
-
-The output format matches exactly what `ir_builder.py` and `dsl_compile.py`
-produce from .module files, ensuring seamless integration with the C++ runtime.
+with the C++ runtime.
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# IR Dataclasses (match the Lark compiler output)
+# IR Dataclasses
 # =============================================================================
 
 
@@ -400,7 +397,7 @@ def compile_model_spec(
         config=config,
     )
 
-    # HF config mapping - use nested structure to match Lark output
+    # HF config mapping
     if spec.hf_config:
         ir.hf_config = {
             "architecture": spec.hf_config.architecture,

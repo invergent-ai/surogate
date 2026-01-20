@@ -1,36 +1,10 @@
 """
 DSL Model Registry
 
-Maps HuggingFace architectures to DSL implementations (Python DSL or .module files).
+Maps HuggingFace architectures to Python DSL model implementations.
 """
 
-from pathlib import Path
 from typing import Optional
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-# =============================================================================
-# Lark DSL Registry (.module files)
-# =============================================================================
-
-DSL_MODEL_REGISTRY = {
-    # HF architecture -> DSL module path (relative to repo root)
-    "Qwen3ForCausalLM": "std/models/qwen3.module"
-}
-
-
-def resolve_dsl_module_path(architecture: str) -> Path:
-    if architecture not in DSL_MODEL_REGISTRY:
-        raise ValueError(f"Unsupported architecture for DSL IR: {architecture}")
-    path = REPO_ROOT / DSL_MODEL_REGISTRY[architecture]
-    if not path.exists():
-        raise FileNotFoundError(f"DSL module not found: {path}")
-    return path
-
-
-# =============================================================================
-# Python DSL Registry
-# =============================================================================
 
 # Maps HF architecture -> Python DSL model class name
 PYTHON_DSL_MODEL_REGISTRY = {
@@ -48,8 +22,8 @@ def has_python_dsl_model(architecture: str) -> bool:
         try:
             from surogate.dsl.decorators import _model_registry
             model_name = PYTHON_DSL_MODEL_REGISTRY[architecture]
-            # Import stdlib models to ensure they're registered
-            from surogate.dsl.stdlib import models  # noqa: F401
+            # Import lib models to ensure they're registered
+            from surogate.dsl.lib import models  # noqa: F401
             return model_name in _model_registry
         except ImportError:
             return False

@@ -1,7 +1,5 @@
 """
 Model Definitions for Python DSL
-
-Ports the models from std/models/*.module to Python decorator syntax.
 """
 
 from __future__ import annotations
@@ -135,7 +133,7 @@ class Qwen3Model:
                 residualN, xN, "final_norm", eps=self.eps
             )
 
-            # LM head - use named outputs to match Lark DSL
+            # LM head
             xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
             logits_flat = g.matmul(xF_flat, "lm_head", transpose="NT", out_name="logits_flat")
             logits = g.view(logits_flat, shape=["B", "T", "vocab_size"], out_name="logits")
@@ -241,7 +239,7 @@ class LlamaModel:
                 residualN, xN, "final_norm", eps=self.eps
             )
 
-            # LM head - use named outputs to match Lark DSL
+            # LM head
             xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
             logits_flat = g.matmul(xF_flat, "lm_head", transpose="NT", out_name="logits_flat")
             logits = g.view(logits_flat, shape=["B", "T", "vocab_size"], out_name="logits")

@@ -1,7 +1,5 @@
 """
 Standard Modules for Python DSL
-
-Ports the modules from std/modules/*.module to Python decorator syntax.
 """
 
 from __future__ import annotations
