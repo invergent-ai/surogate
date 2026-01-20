@@ -43,20 +43,6 @@ model Qwen3Model(
       xF -> view(shape=[B * T, d_model]) -> xF_flat
       (xF_flat, lm_head) -> matmul(transpose=NT) -> logits_flat
       logits_flat -> view(shape=[B, T, vocab_size]) -> logits
-    save: [token_ids, xF, residual_final, rstd_final]
-  backward:
-    receives:
-      d_logits: [B, T, vocab_size]
-    graph:
-      d_logits -> view(shape=[B * T, vocab_size]) -> d_logits_flat
-      saved.xF -> view(shape=[B * T, d_model]) -> xF_flat
-      (d_logits_flat, lm_head) -> matmul(transpose=NN) -> d_xF_flat
-      (d_logits_flat, xF_flat) -> matmul(transpose=TN) -> d_lm_head
-      d_xF_flat -> view(shape=[B, T, d_model]) -> d_xF
-      zeros(shape=[B, T, d_model], dtype=bf16) -> d_residual_next
-      (d_xF, d_residual_next, saved.residual_final, final_norm, saved.rstd_final) -> fused_residual_rmsnorm_backward(eps=eps) -> (d_residualN, d_xN, d_final_norm)
-      (d_xN, d_residualN) -> StackedBlocksBackward(blocks, n_layers) -> (d_x0, d_residual0)
-      (d_x0, saved.token_ids) -> embedding_backward() -> d_embedding
 
   hf_config:
     architecture: "Qwen3ForCausalLM"

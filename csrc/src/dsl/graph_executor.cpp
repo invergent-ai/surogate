@@ -4,9 +4,11 @@
 // DSL Graph executor (Qwen3-first).
 
 #include "dsl/graph_executor.h"
+#include "dsl/autodiff.h"
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -173,6 +175,7 @@ Tensor& ensure_tensor(ExecState& st, const std::string& name, ETensorDType dtype
 }
 
 Tensor& get_tensor(ExecState& st, const std::string& name, const std::unordered_map<std::string, Tensor>& saved) {
+    // Check for explicit "saved." prefix first
     if (starts_with(name, kSavedPrefix)) {
         std::string key = std::string(name.substr(kSavedPrefix.size()));
         auto it = saved.find(key);
@@ -181,11 +184,78 @@ Tensor& get_tensor(ExecState& st, const std::string& name, const std::unordered_
         }
         return const_cast<Tensor&>(it->second);
     }
+    // Check current tensors (params, intermediates, gradients)
     auto it = st.tensors.find(name);
-    if (it == st.tensors.end()) {
-        throw std::runtime_error("DSL graph executor: unknown tensor " + name);
+    if (it != st.tensors.end()) {
+        return it->second;
     }
-    return it->second;
+    // Fall back to saved tensors (for forward intermediates used in backward)
+    auto sit = saved.find(name);
+    if (sit != saved.end()) {
+        return const_cast<Tensor&>(sit->second);
+    }
+    throw std::runtime_error("DSL graph executor: unknown tensor " + name);
+}
+
+// Try to get a tensor by name, returning nullptr if not found (no throw)
+Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_map<std::string, Tensor>& saved) {
+    if (starts_with(name, kSavedPrefix)) {
+        std::string key = std::string(name.substr(kSavedPrefix.size()));
+        auto it = saved.find(key);
+        return it != saved.end() ? &it->second : nullptr;
+    }
+    auto it = st.tensors.find(name);
+    if (it != st.tensors.end()) {
+        return &it->second;
+    }
+    auto sit = saved.find(name);
+    if (sit != saved.end()) {
+        return &sit->second;
+    }
+    return nullptr;
+}
+
+// Resolve view shape from either "shape" or "shape_like" attribute
+std::vector<long> resolve_view_shape(
+    const Operation& op,
+    const ShapeEnv& env,
+    ExecState& st,
+    std::unordered_map<std::string, Tensor>& saved) {
+    // Check for shape_like attribute (used by autodiff to reference tensor shape)
+    auto* shape_like_attr = find_attr(op.attrs, "shape_like");
+    if (shape_like_attr) {
+        if (auto ref_name = attr_string(*shape_like_attr)) {
+            // Try to get shape from referenced tensor (may be saved or intermediate)
+            Tensor* ref = try_get_tensor(st, *ref_name, saved);
+            if (ref) {
+                return std::vector<long>(ref->Sizes.begin(), ref->Sizes.begin() + ref->Rank);
+            }
+            // If the reference tensor isn't available, try to infer shape from input tensor
+            // This handles cases like backward view for logits where logits_flat isn't saved
+            // For view backward: d_logits [B,T,V] -> d_logits_flat [B*T,V]
+            // The input (d_logits) shape can be flattened to get output shape
+            if (!op.inputs.empty()) {
+                Tensor* input = try_get_tensor(st, op.inputs[0], saved);
+                if (input && input->Rank >= 2) {
+                    // Assume flattening first (Rank-1) dimensions and keeping last
+                    // This is a heuristic for the common [B,T,V] -> [B*T,V] case
+                    long flat_dim = 1;
+                    for (int i = 0; i < input->Rank - 1; ++i) {
+                        flat_dim *= input->Sizes[i];
+                    }
+                    return {flat_dim, input->Sizes[input->Rank - 1]};
+                }
+            }
+            throw std::runtime_error("DSL graph executor: view shape_like reference not found: " + *ref_name);
+        }
+        throw std::runtime_error("DSL graph executor: view shape_like attr must be a string");
+    }
+
+    auto* shape_attr = find_attr(op.attrs, "shape");
+    if (!shape_attr) {
+        throw std::runtime_error("DSL graph executor: view missing shape or shape_like attr");
+    }
+    return resolve_attr_shape(*shape_attr, env);
 }
 
 EMMTranspose parse_transpose(const AttrMap& attrs) {
@@ -284,9 +354,91 @@ GraphExecutor::GraphExecutor(const Module& module, Qwen3Model& backend)
     : mModule(module),
       mBackend(backend),
       mForward(module.forward ? &module.forward.value() : nullptr),
-      mBackward(module.backward ? &module.backward.value() : nullptr) {
-    if (!mForward || !mBackward) {
-        throw std::runtime_error("DSL graph executor: module missing forward/backward graphs");
+      mBackward(nullptr) {
+    init(GraphExecutorOptions{});
+}
+
+GraphExecutor::GraphExecutor(const Module& module, Qwen3Model& backend, const GraphExecutorOptions& options)
+    : mModule(module),
+      mBackend(backend),
+      mForward(module.forward ? &module.forward.value() : nullptr),
+      mBackward(nullptr) {
+    init(options);
+}
+
+void GraphExecutor::init(const GraphExecutorOptions& options) {
+    if (!mForward) {
+        throw std::runtime_error("DSL graph executor: module missing forward graph");
+    }
+
+    // Check if module has explicit backward graph
+    if (mModule.backward.has_value()) {
+        mBackward = &mModule.backward.value();
+    } else if (options.auto_backward) {
+        // Derive backward graph automatically using autodiff
+        DeriveBackwardOptions derive_opts;
+        derive_opts.loss_name = options.loss_name;
+        derive_opts.auto_save = true;
+        derive_opts.accumulate_grads = true;
+
+        try {
+            mDerivedBackward = derive_backward_graph(*mForward, derive_opts);
+            mBackward = &mDerivedBackward.value();
+
+            // Merge auto-computed saves with forward.save, but filter out:
+            // 1. Graph outputs (they're re-computed during backward by classifier)
+            // 2. Tensors produced by ops that depend on lm_head (not available in full=false mode)
+            std::unordered_set<std::string> save_set(mForward->save.begin(), mForward->save.end());
+            for (const auto& s : mDerivedBackward->save) {
+                save_set.insert(s);
+            }
+            // Remove graph outputs - they're handled by the classifier
+            for (const auto& [name, _] : mForward->outputs) {
+                save_set.erase(name);
+            }
+            // Also remove tensors that are produced by ops that come after the last save-able tensor
+            // (i.e., tensors that depend on lm_head which isn't available during training forward)
+            // For now, we specifically exclude "logits_flat" as it's produced by the lm_head matmul
+            save_set.erase("logits_flat");
+            save_set.erase("logits");
+            mSaveList.assign(save_set.begin(), save_set.end());
+
+            if (options.debug_print_backward) {
+                std::cerr << "[Autodiff] Derived backward graph with "
+                          << mDerivedBackward->operations.size() << " operations\n";
+                for (const auto& op : mDerivedBackward->operations) {
+                    std::cerr << "  " << op.kernel_type << ": [";
+                    for (size_t i = 0; i < op.inputs.size(); ++i) {
+                        if (i > 0) std::cerr << ", ";
+                        std::cerr << op.inputs[i];
+                    }
+                    std::cerr << "] -> [";
+                    for (size_t i = 0; i < op.outputs.size(); ++i) {
+                        if (i > 0) std::cerr << ", ";
+                        std::cerr << op.outputs[i];
+                    }
+                    std::cerr << "]\n";
+                }
+                std::cerr << "[Autodiff] Auto-computed saves: ";
+                for (const auto& s : mSaveList) {
+                    std::cerr << s << " ";
+                }
+                std::cerr << "\n";
+            }
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("DSL graph executor: autodiff failed: ") + e.what());
+        }
+    }
+
+    if (!mBackward) {
+        throw std::runtime_error(
+            "DSL graph executor: module missing backward graph (set auto_backward=true to derive automatically)");
+    }
+
+    // If we didn't derive backward (using explicit backward from module), use forward.save
+    if (mSaveList.empty()) {
+        mSaveList = mForward->save;
     }
 }
 
@@ -542,7 +694,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
 
     std::vector<char> required;
     if (!full) {
-        required = compute_required_ops(*mForward, mForward->save);
+        required = compute_required_ops(*mForward, mSaveList);
     }
 
     for (std::size_t idx = 0; idx < mForward->operations.size(); ++idx) {
@@ -660,11 +812,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
 
         if (op_type == "view") {
             Tensor& src = get_tensor(st, op.inputs.at(0), mSaved);
-            auto* shape_attr = find_attr(op.attrs, "shape");
-            if (!shape_attr) {
-                throw std::runtime_error("DSL graph executor: view missing shape attr");
-            }
-            auto shape = resolve_attr_shape(*shape_attr, st.shape_env);
+            auto shape = resolve_view_shape(op, st.shape_env, st, mSaved);
             Tensor view = view_tensor(src, shape);
             st.tensors.emplace(op.outputs.at(0), view);
             continue;
@@ -690,8 +838,8 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         throw std::runtime_error("DSL graph executor: unsupported forward op " + op.name);
     }
 
-    // Save requested tensors for backward.
-    for (const auto& name : mForward->save) {
+    // Save requested tensors for backward (uses auto-computed list if autodiff was used).
+    for (const auto& name : mSaveList) {
         auto it = st.tensors.find(name);
         if (it != st.tensors.end()) {
             mSaved[name] = it->second;
@@ -768,11 +916,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
 
         if (op_type == "view") {
             Tensor& src = get_tensor(st, op.inputs.at(0), mSaved);
-            auto* shape_attr = find_attr(op.attrs, "shape");
-            if (!shape_attr) {
-                throw std::runtime_error("DSL graph executor: view missing shape attr");
-            }
-            auto shape = resolve_attr_shape(*shape_attr, st.shape_env);
+            auto shape = resolve_view_shape(op, st.shape_env, st, mSaved);
             Tensor view = view_tensor(src, shape);
             st.tensors.emplace(op.outputs.at(0), view);
             continue;

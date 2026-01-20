@@ -97,7 +97,10 @@ DslModel::DslModel(const PretrainedConfig& config,
 
     if (mBackend) {
         if (auto* qwen3 = dynamic_cast<modules::Qwen3Model*>(mBackend.get())) {
-            mExecutor = std::make_unique<GraphExecutor>(*mModule, *qwen3);
+            GraphExecutorOptions opts;
+            opts.auto_backward = true;  // Derive backward graph if not provided
+            opts.debug_print_backward = false;  // Set to true to debug derived backward graph
+            mExecutor = std::make_unique<GraphExecutor>(*mModule, *qwen3, opts);
         } else {
             throw std::runtime_error("DSL model: no executor available for backend model type " +
                                      std::string(mBackend->model_type()));
