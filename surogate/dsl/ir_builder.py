@@ -29,7 +29,7 @@ def resolve_architecture(config_json: Dict[str, Any]) -> str:
 def build_dsl_ir_from_python(architecture: str, config_json: Dict[str, Any]) -> str:
     """Build IR JSON using Python DSL models."""
     # Import here to avoid circular imports and ensure models are registered
-    from surogate.dsl.lib import models  # noqa: F401 - registers models
+    from surogate.dsl import models  # noqa: F401 - registers models
     from surogate.dsl.py_compiler import compile_model_for_hf
 
     return compile_model_for_hf(architecture, config_json)

@@ -119,6 +119,12 @@ from .py_compiler import (
     list_registered_modules,
 )
 
+# Import subpackages to ensure registration
+from . import primitives
+from . import modules
+from . import blocks
+from . import models
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -206,4 +212,9 @@ __all__ = [
     "list_registered_models",
     "list_registered_blocks",
     "list_registered_modules",
+    # Subpackages
+    "primitives",
+    "modules",
+    "blocks",
+    "models",
 ]

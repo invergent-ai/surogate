@@ -22,8 +22,8 @@ def has_python_dsl_model(architecture: str) -> bool:
         try:
             from surogate.dsl.decorators import _model_registry
             model_name = PYTHON_DSL_MODEL_REGISTRY[architecture]
-            # Import lib models to ensure they're registered
-            from surogate.dsl.lib import models  # noqa: F401
+            # Import models to ensure they're registered
+            from surogate.dsl import models  # noqa: F401
             return model_name in _model_registry
         except ImportError:
             return False
