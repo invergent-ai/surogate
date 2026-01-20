@@ -14,7 +14,6 @@ from surogate.train.training_plot import generate_training_plot
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.system_info import get_system_info, print_system_diagnostics
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()

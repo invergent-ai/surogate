@@ -38,16 +38,10 @@ void cuda_throw_on_error(cudaError_t status, const char* statement, const char* 
 
 #define CUDA_CHECK(status) cuda_throw_on_error(status, #status, __FILE__, __LINE__)
 
-/// Check cuBLAS status; throws on error
-#ifndef CUBLAS_CHECK
-#define CUBLAS_CHECK(status)                                                      \
-    do {                                                                          \
-        cublasStatus_t _status = (status);                                        \
-        if (_status != CUBLAS_STATUS_SUCCESS) {                                   \
-            throw std::runtime_error("cuBLAS error: " + std::to_string(_status)); \
-        }                                                                         \
-    } while (0)
-#endif
+/// Check cuBLAS status; throws on error with stack trace
+void cublas_throw_on_error(cublasStatus_t status, const char* statement, const char* file, int line);
+
+#define CUBLAS_CHECK(status) cublas_throw_on_error(status, #status, __FILE__, __LINE__)
 
 template<std::integral T>
 constexpr T HOST_DEVICE div_ceil(T dividend, T divisor) {

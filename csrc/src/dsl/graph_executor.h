@@ -10,9 +10,9 @@
 #include <vector>
 
 #include "dsl/ir.h"
+#include "utilities/tensor.h"
 
 class NCCLCommunicator;
-struct Tensor;
 
 namespace modules {
 class Qwen3Model;

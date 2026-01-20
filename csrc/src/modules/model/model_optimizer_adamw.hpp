@@ -193,10 +193,18 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
     
     // Helper lambda for 8-bit update of a single tensor
     auto run_8bit_update = [&](const char* name, Tensor& val, const Tensor& grad, float wd) {
+        (void)name;
         // Align each tensor start to a block boundary. The single-tensor kernel assumes block 0
         // corresponds to the first element of the passed-in pointers.
         state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         size_t n = val.nelem();
+        if (val.Data == nullptr || grad.Data == nullptr) {
+            state_offset += n;
+            if (state_offset > state.total_state_elems) {
+                throw std::runtime_error("adamw8bit: state buffer overflow (layout mismatch).");
+            }
+            return;
+        }
         size_t block_offset = state_offset / BLOCK_SIZE;
 
         unsigned char* s1 = reinterpret_cast<unsigned char*>(state.state1.template get<std::byte>()) + state_offset;

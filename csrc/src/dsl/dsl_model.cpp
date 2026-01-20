@@ -186,6 +186,20 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
     throw_unimplemented("export_weights");
 }
 
+float DslModel::get_loss() const {
+    if (mBackend) {
+        return mBackend->get_loss();
+    }
+    return IModel::get_loss();
+}
+
+float DslModel::get_accuracy() const {
+    if (mBackend) {
+        return mBackend->get_accuracy();
+    }
+    return IModel::get_accuracy();
+}
+
 void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicator& comm, int B, int T,
                                   bool allocate_optimizer) {
     if (mBackend) {

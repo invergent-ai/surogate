@@ -225,67 +225,73 @@ void ModularTransformerModel<Block>::calculate_gradient_norm_impl(NCCLCommunicat
 
     fill_zero(rs.scratch().norm_buffer, stream);
 
-    auto norm_squared = [&](const TensorShard& grad) {
-        global_norm_squared(rs.scratch().norm_buffer, grad, grad.nelem(), rs.DeviceProp, stream);
+    auto norm_squared = [&](const TensorShard& grad, const char* name, int layer = -1) {
+        (void)name;
+        (void)layer;
+        const size_t count = grad.nelem();
+        if (grad.Data == nullptr || count == 0) {
+            return;
+        }
+        global_norm_squared(rs.scratch().norm_buffer, grad, count, rs.DeviceProp, stream);
     };
 
     auto& emb_grad = mGrads->get_embeddings_shard(stream);
-    norm_squared(emb_grad);
+    norm_squared(emb_grad, "embeddings");
     auto& head_grad = mGrads->get_lm_head_shard(stream);
     if (head_grad.Data != emb_grad.Data) {
-        norm_squared(head_grad);
+        norm_squared(head_grad, "lm_head");
     }
-    norm_squared(mGrads->get_final_norm_shard(stream));
+    norm_squared(mGrads->get_final_norm_shard(stream), "final_norm");
 
     for (int i = 0; i < mConfig.NumLayers; ++i) {
         auto& g = mGrads->get_block_shard(i, stream);
-        if constexpr (requires { g.ln1_grads.d_weight; }) norm_squared(TensorShard(g.ln1_grads.d_weight));
-        if constexpr (requires { g.ln2_grads.d_weight; }) norm_squared(TensorShard(g.ln2_grads.d_weight));
-        if constexpr (requires { g.ln1.d_weight; }) norm_squared(TensorShard(g.ln1.d_weight));
-        if constexpr (requires { g.ln2.d_weight; }) norm_squared(TensorShard(g.ln2.d_weight));
+        if constexpr (requires { g.ln1_grads.d_weight; }) norm_squared(TensorShard(g.ln1_grads.d_weight), "ln1_grads.d_weight", i);
+        if constexpr (requires { g.ln2_grads.d_weight; }) norm_squared(TensorShard(g.ln2_grads.d_weight), "ln2_grads.d_weight", i);
+        if constexpr (requires { g.ln1.d_weight; }) norm_squared(TensorShard(g.ln1.d_weight), "ln1.d_weight", i);
+        if constexpr (requires { g.ln2.d_weight; }) norm_squared(TensorShard(g.ln2.d_weight), "ln2.d_weight", i);
 
-        if constexpr (requires { g.attention_grads.d_qkv_weight; }) norm_squared(TensorShard(g.attention_grads.d_qkv_weight));
+        if constexpr (requires { g.attention_grads.d_qkv_weight; }) norm_squared(TensorShard(g.attention_grads.d_qkv_weight), "attn_grads.d_qkv_weight", i);
         if constexpr (requires { g.attention_grads.d_qkv_bias; }) {
             if (g.attention_grads.d_qkv_bias.has_value()) {
-                norm_squared(TensorShard(g.attention_grads.d_qkv_bias.value()));
+                norm_squared(TensorShard(g.attention_grads.d_qkv_bias.value()), "attn_grads.d_qkv_bias", i);
             }
         }
-        if constexpr (requires { g.attention_grads.d_out_weight; }) norm_squared(TensorShard(g.attention_grads.d_out_weight));
+        if constexpr (requires { g.attention_grads.d_out_weight; }) norm_squared(TensorShard(g.attention_grads.d_out_weight), "attn_grads.d_out_weight", i);
         if constexpr (requires { g.attention_grads.d_q_norm_weight; }) {
             if (g.attention_grads.d_q_norm_weight.has_value()) {
-                norm_squared(TensorShard(g.attention_grads.d_q_norm_weight.value()));
+                norm_squared(TensorShard(g.attention_grads.d_q_norm_weight.value()), "attn_grads.d_q_norm_weight", i);
             }
         }
         if constexpr (requires { g.attention_grads.d_k_norm_weight; }) {
             if (g.attention_grads.d_k_norm_weight.has_value()) {
-                norm_squared(TensorShard(g.attention_grads.d_k_norm_weight.value()));
+                norm_squared(TensorShard(g.attention_grads.d_k_norm_weight.value()), "attn_grads.d_k_norm_weight", i);
             }
         }
 
-        if constexpr (requires { g.attention.d_qkv_weight; }) norm_squared(TensorShard(g.attention.d_qkv_weight));
+        if constexpr (requires { g.attention.d_qkv_weight; }) norm_squared(TensorShard(g.attention.d_qkv_weight), "attn.d_qkv_weight", i);
         if constexpr (requires { g.attention.d_qkv_bias; }) {
             if (g.attention.d_qkv_bias.has_value()) {
-                norm_squared(TensorShard(g.attention.d_qkv_bias.value()));
+                norm_squared(TensorShard(g.attention.d_qkv_bias.value()), "attn.d_qkv_bias", i);
             }
         }
-        if constexpr (requires { g.attention.d_out_weight; }) norm_squared(TensorShard(g.attention.d_out_weight));
+        if constexpr (requires { g.attention.d_out_weight; }) norm_squared(TensorShard(g.attention.d_out_weight), "attn.d_out_weight", i);
         if constexpr (requires { g.attention.d_q_norm_weight; }) {
             if (g.attention.d_q_norm_weight.has_value()) {
-                norm_squared(TensorShard(g.attention.d_q_norm_weight.value()));
+                norm_squared(TensorShard(g.attention.d_q_norm_weight.value()), "attn.d_q_norm_weight", i);
             }
         }
         if constexpr (requires { g.attention.d_k_norm_weight; }) {
             if (g.attention.d_k_norm_weight.has_value()) {
-                norm_squared(TensorShard(g.attention.d_k_norm_weight.value()));
+                norm_squared(TensorShard(g.attention.d_k_norm_weight.value()), "attn.d_k_norm_weight", i);
             }
         }
 
-        if constexpr (requires { g.d_mlp_up_weight; }) norm_squared(TensorShard(g.d_mlp_up_weight));
-        if constexpr (requires { g.d_mlp_down_weight; }) norm_squared(TensorShard(g.d_mlp_down_weight));
+        if constexpr (requires { g.d_mlp_up_weight; }) norm_squared(TensorShard(g.d_mlp_up_weight), "mlp_up_weight", i);
+        if constexpr (requires { g.d_mlp_down_weight; }) norm_squared(TensorShard(g.d_mlp_down_weight), "mlp_down_weight", i);
 
-        if constexpr (requires { g.router.d_gate; }) norm_squared(TensorShard(g.router.d_gate));
-        if constexpr (requires { g.experts.d_gate_up_proj; }) norm_squared(TensorShard(g.experts.d_gate_up_proj));
-        if constexpr (requires { g.experts.d_down_proj; }) norm_squared(TensorShard(g.experts.d_down_proj));
+        if constexpr (requires { g.router.d_gate; }) norm_squared(TensorShard(g.router.d_gate), "router.d_gate", i);
+        if constexpr (requires { g.experts.d_gate_up_proj; }) norm_squared(TensorShard(g.experts.d_gate_up_proj), "experts.d_gate_up_proj", i);
+        if constexpr (requires { g.experts.d_down_proj; }) norm_squared(TensorShard(g.experts.d_down_proj), "experts.d_down_proj", i);
     }
 
     // Reduce partial sums to a single scalar on-device.

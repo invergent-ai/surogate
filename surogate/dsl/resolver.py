@@ -518,6 +518,11 @@ class ImportResolver:
 
     def _load_module(self, module_path: str) -> Optional[Dict[str, Any]]:
         """Load a module from file system."""
+        # Return cached resolution if available.
+        if module_path in self.ctx.resolved_modules:
+            cached = self.ctx.resolved_modules[module_path]
+            return {mod.name: mod for mod in cached}
+
         # Try to find the module file
         for search_path in self.ctx.search_paths:
             module_file = search_path / f"{module_path.replace('.', '/')}.module"

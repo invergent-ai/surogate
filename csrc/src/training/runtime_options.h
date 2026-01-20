@@ -72,7 +72,7 @@ struct RuntimeOptions {
     bool UseFusedRope = false;
 
     // DSL IR execution (placeholder backend).
-    bool UseDslIr = false;
+    bool UseDslIr = true;
     std::string DslIrJson;
 
     // Matmul backend selection

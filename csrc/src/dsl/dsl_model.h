@@ -56,6 +56,9 @@ public:
     void allocate_run_state(const RuntimeOptions& options, NCCLCommunicator& comm,
                             int B, int T, bool allocate_optimizer) override;
 
+    float get_loss() const override;
+    float get_accuracy() const override;
+
     std::string_view model_type() const override;
     IRunState& get_run_state() const override;
 

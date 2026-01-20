@@ -135,10 +135,14 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
     mIsRunning = false;
 
     // make sure all work has finished
+    // Use local_rank() for cudaSetDevice, and don't throw from destructor
     for(auto& ctx : mContexts) {
         if(ctx.Communicator) {
-            CUDA_CHECK(cudaSetDevice(ctx.Communicator->rank()));
-            CUDA_CHECK(cudaDeviceSynchronize());
+            cudaError_t err = cudaSetDevice(ctx.Communicator->local_rank());
+            if (err == cudaSuccess) {
+                cudaDeviceSynchronize();
+            }
+            // Ignore errors - we're in destructor, possibly after a crash
         }
     }
 

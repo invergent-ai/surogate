@@ -56,6 +56,17 @@ struct ExecState {
     bool lm_head_accumulate = false;
 };
 
+template<typename Gradients>
+Tensor* get_ln1_weight_grad(Gradients& grads) {
+    if constexpr (requires(Gradients g) { g.ln1_grads.d_weight; }) {
+        return &grads.ln1_grads.d_weight;
+    } else if constexpr (requires(Gradients g) { g.ln1.d_weight; }) {
+        return &grads.ln1.d_weight;
+    } else {
+        return nullptr;
+    }
+}
+
 bool starts_with(std::string_view value, std::string_view prefix) {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
 }
@@ -191,6 +202,22 @@ EMMTranspose parse_transpose(const AttrMap& attrs) {
     throw std::runtime_error("DSL graph executor: invalid transpose attr");
 }
 
+EMMTranspose swap_transpose(EMMTranspose mode) {
+    // Row-major GEMM mapping to column-major: swap A/B, swap M/N, and swap transpose flags.
+    // NN -> NN, NT -> TN, TN -> NT, TT -> TT.
+    switch (mode) {
+        case EMMTranspose::NN:
+            return EMMTranspose::NN;
+        case EMMTranspose::NT:
+            return EMMTranspose::TN;
+        case EMMTranspose::TN:
+            return EMMTranspose::NT;
+        case EMMTranspose::TT:
+            return EMMTranspose::TT;
+    }
+    return EMMTranspose::NN;
+}
+
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K) {
     if (a.Rank != 2 || b.Rank != 2) {
         throw std::runtime_error("DSL graph executor: matmul expects rank-2 tensors");
@@ -245,6 +272,12 @@ void free_temps(ExecState& st) {
     st.temps.clear();
 }
 
+void reduce_loss(RunState& rs, long B, long T, NCCLCommunicator& comm) {
+    deterministic_sum(rs.Losses.template get<float>(), rs.Losses.template get<float>(), B * T, rs.MainStream);
+    comm.reduce_loss(rs.Losses.template get<float>(), rs.MainStream);
+    CUDA_CHECK(cudaMemcpyAsync(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+}
+
 }  // namespace
 
 GraphExecutor::GraphExecutor(const Module& module, Qwen3Model& backend)
@@ -279,8 +312,6 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     auto& model = mBackend;
     auto& rs = model.run_state();
     auto& weights = model.weights_manager();
-    const auto& config = model.config();
-    const auto& options = model.options();
     mSaved.clear();
 
     if (micro_step == 0) {
@@ -322,8 +353,6 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
 float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
     auto& model = mBackend;
     auto& rs = model.run_state();
-    const auto& options = model.options();
-    const auto& config = model.config();
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
 
@@ -342,7 +371,7 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
 
     run_classifier(B, T, comm, /*grad_accum_steps=*/1, micro_step, /*compute_accuracy=*/true);
 
-    model.reduce_loss(B, T, comm);
+    reduce_loss(rs, B, T, comm);
     comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     comm.all_reduce_sum_int(rs.CorrectCount.template get<int>(), /*n=*/1, rs.MainStream);
 
@@ -374,6 +403,7 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     auto& model = mBackend;
     auto& rs = model.run_state();
     auto& grads = model.grads();
+    const auto& config = model.config();
     rs.GradAccumSteps = std::max(1, grad_accum_steps);
     rs.WorldSize = std::max(1, comm.world_size());
 
@@ -407,7 +437,7 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
 
     const bool last_step = micro_step == grad_accum_steps - 1;
     if (last_step) {
-        model.reduce_loss(B, T, comm);
+        reduce_loss(rs, B, T, comm);
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     }
 
@@ -447,10 +477,12 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
     Tensor lnf_flat = view_tensor(rs.non_block_activations().ln_final, {B * T, config.HiddenSize});
     Tensor logits = rs.non_block_activations().output;
 
-    matmul(logits, lnf_flat, weights.get_lm_head(rs.MainStream),
+    // Row-major logits = lnf @ lm_head.T -> map to column-major backend by swapping A/B,
+    // swapping M/N, and swapping transpose flags.
+    matmul(logits, weights.get_lm_head(rs.MainStream), lnf_flat,
            std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-           static_cast<int>(B * T), static_cast<int>(V), static_cast<int>(config.HiddenSize),
-           EMMTranspose::NT, false, rs.MainStream);
+           static_cast<int>(V), static_cast<int>(B * T), static_cast<int>(config.HiddenSize),
+           swap_transpose(EMMTranspose::NT), false, rs.MainStream);
 
     Tensor tgt = rs.Targets;
     tgt.Sizes[0] = static_cast<long>(B * T);
@@ -483,7 +515,6 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
     auto& recipe = *model.recipe();
     const auto& config = model.config();
     const auto& options = model.options();
-    const bool lora_only = rs.is_lora_only_mode();
 
     ExecState st{
         .model = model,
@@ -647,9 +678,12 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             matmul_dims(a, b, mode, M, N, K);
             std::vector<long> shape{M, N};
             Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
-            matmul(out, a, b, std::nullopt, nullptr, nullptr,
+            // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
+            // swapping M/N, and swapping transpose flags.
+            EMMTranspose mode_col = swap_transpose(mode);
+            matmul(out, b, a, std::nullopt, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   M, N, K, mode, false, rs.MainStream);
+                   N, M, K, mode_col, false, rs.MainStream);
             continue;
         }
 
@@ -686,6 +720,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     auto& recipe = *model.recipe();
     const auto& config = model.config();
     const auto& options = model.options();
+    const bool lora_only = rs.is_lora_only_mode();
 
     ExecState st{
         .model = model,
@@ -758,9 +793,12 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             if (op.outputs.at(0) == "d_lm_head") {
                 do_accumulate = st.lm_head_accumulate;
             }
-            matmul(out, a, b, std::nullopt, nullptr, nullptr,
+            // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
+            // swapping M/N, and swapping transpose flags.
+            EMMTranspose mode_col = swap_transpose(mode);
+            matmul(out, b, a, std::nullopt, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   M, N, K, mode, do_accumulate, rs.MainStream);
+                   N, M, K, mode_col, do_accumulate, rs.MainStream);
             if (op.outputs.at(0) == "d_lm_head") {
                 grads.notify_lm_head(rs.MainStream, comm);
             }
@@ -785,7 +823,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             continue;
         }
 
-        if (op_type == "fused_residual_rmsnorm_backward") {
+        if (op_type == "fused_residual_rmsnorm_backward" || op.name == "fused_residual_rmsnorm_backward") {
             Tensor& d_y = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& d_residual_next = get_tensor(st, op.inputs.at(1), mSaved);
             Tensor& residual_out = get_tensor(st, op.inputs.at(2), mSaved);
@@ -816,7 +854,8 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             // Initialize last layer gradient with d_xN (d_residualN should match for final norm).
             Tensor& d_res_ffn = rs.simplified_grads(config.NumLayers - 1).d_res_ffn;
             const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(config.HiddenSize);
-            vector_add_sr(d_res_ffn, d_xN, d_xN, 0.0f, N, /*seed=*/0, rs.MainStream);
+            // vector_add_sr computes scale * (left + right); scale=0.5 copies when left==right.
+            vector_add_sr(d_res_ffn, d_xN, d_xN, 0.5f, N, /*seed=*/0, rs.MainStream);
             (void)d_residualN;
 
             if (options.use_cuda_graphs) {
@@ -870,12 +909,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 {
                     auto& a = rs.simplified_acts(l);
                     auto& da = rs.simplified_grads(l);
-                    Tensor* d_ln1_w = nullptr;
-                    if constexpr (requires { block_grads.ln1_grads.d_weight; }) {
-                        d_ln1_w = &block_grads.ln1_grads.d_weight;
-                    } else if constexpr (requires { block_grads.ln1.d_weight; }) {
-                        d_ln1_w = &block_grads.ln1.d_weight;
-                    }
+                    Tensor* d_ln1_w = get_ln1_weight_grad(block_grads);
                     if (!d_ln1_w) {
                         throw std::logic_error("DSL graph executor: LN1 weight gradients unavailable");
                     }
@@ -924,7 +958,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             continue;
         }
 
-        if (op_type == "embedding_backward") {
+        if (op_type == "embedding_backward" || op.name == "embedding_backward") {
             if (lora_only) {
                 continue;
             }
