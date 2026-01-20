@@ -110,7 +110,11 @@ public:
             if (options.DslIrJson.empty()) {
                 throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
             }
-            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc);
+            RuntimeOptions backend_options = options;
+            backend_options.UseDslIr = false;
+            backend_options.DslIrJson.clear();
+            auto backend = create_from_pretrained_config(config, backend_options, rank, world, alloc);
+            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc, std::move(backend));
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);

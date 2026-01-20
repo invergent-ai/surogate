@@ -30,6 +30,7 @@
 #include "modules/mlp_utils.h"
 #include "modules/weights/weight_manager_helpers.h"
 #include "modules/weights/weight_mapping.h"
+#include "modules/weights/weight_mapping_override.h"
 #include "utilities/comm.h"
 #include "utilities/philox.h"
 #include "utilities/safetensors.h"
@@ -711,8 +712,17 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
     proxy_cfg.IntermediateSize = static_cast<int>(D);
     proxy_cfg.HeadDim = static_cast<int>(HS);
 
-    // Get weight mapping from the registry using architecture ID
-    auto mapping = models::create_weight_mapping(mConfig.architecture_id);
+    // Get weight mapping from the registry using architecture ID,
+    // unless an override is provided (DSL-driven mapping).
+    std::unique_ptr<BaseWeightMapping> owned_mapping;
+    BaseWeightMapping* mapping = get_weight_mapping_override();
+    if (!mapping) {
+        owned_mapping = models::create_weight_mapping(mConfig.architecture_id);
+        mapping = owned_mapping.get();
+    }
+    if (mapping->patterns().empty()) {
+        mapping->register_patterns();
+    }
 
     // ========================================================================
     // Process each tensor using the registry

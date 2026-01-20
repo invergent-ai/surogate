@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placeholder DSL model wrapper (validation-only).
+// DSL model wrapper (IR validation + execution).
 
 #include "dsl/dsl_model.h"
 
@@ -12,6 +12,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include "dsl/graph_executor.h"
+#include "dsl/weight_mapping.h"
+#include "models/qwen3/qwen3_model.h"
+#include "modules/weights/weight_mapping_override.h"
 #include "utilities/comm.h"
 
 namespace dsl {
@@ -76,8 +80,9 @@ bool values_match(const HfValue& expected, const HfValue& actual) {
 DslModel::DslModel(const PretrainedConfig& config,
                    const RuntimeOptions& /*options*/,
                    const std::string& ir_json,
-                   const std::shared_ptr<TensorAllocator>& allocator)
-    : mConfig(config.clone()), mAllocator(allocator) {
+                   const std::shared_ptr<TensorAllocator>& allocator,
+                   std::unique_ptr<IModel> backend)
+    : mConfig(config.clone()), mAllocator(allocator), mBackend(std::move(backend)) {
     if (ir_json.empty()) {
         throw std::runtime_error("DSL model placeholder: IR JSON is empty");
     }
@@ -87,42 +92,106 @@ DslModel::DslModel(const PretrainedConfig& config,
         throw std::runtime_error("DSL model placeholder: IR JSON indicates compilation failure");
     }
     mModule = &pick_model_module(mIr);
+    mWeightMapping = build_weight_mapping(*mModule);
     validate_ir();
+
+    if (mBackend) {
+        if (auto* qwen3 = dynamic_cast<modules::Qwen3Model*>(mBackend.get())) {
+            mExecutor = std::make_unique<GraphExecutor>(*mModule, *qwen3);
+        } else {
+            throw std::runtime_error("DSL model: no executor available for backend model type " +
+                                     std::string(mBackend->model_type()));
+        }
+    }
 }
 
-void DslModel::forward(Tensor, Tensor, NCCLCommunicator&, int) {
+DslModel::~DslModel() = default;
+
+void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
+    if (mExecutor) {
+        mExecutor->forward(inputs, position_ids, comm, micro_step);
+        return;
+    }
+    if (mBackend) {
+        mBackend->forward(inputs, position_ids, comm, micro_step);
+        return;
+    }
     throw_unimplemented("forward");
 }
 
-float DslModel::validate(Tensor, Tensor, Tensor, NCCLCommunicator&, int) {
+float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
+    if (mExecutor) {
+        return mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+    }
+    if (mBackend) {
+        return mBackend->validate(inputs, position_ids, targets, comm, micro_step);
+    }
     throw_unimplemented("validate");
 }
 
-void DslModel::backward(Tensor, Tensor, NCCLCommunicator&, int, int) {
+void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
+    if (mExecutor) {
+        mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+        return;
+    }
+    if (mBackend) {
+        mBackend->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+        return;
+    }
     throw_unimplemented("backward");
 }
 
-void DslModel::update(NCCLCommunicator&, float, float, float, int, float, float, float) {
+void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon,
+                      float weight_decay, float grad_clip) {
+    if (mBackend) {
+        mBackend->update(comm, learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_clip);
+        return;
+    }
     throw_unimplemented("update");
 }
 
-void DslModel::init_weights(NCCLCommunicator&) {
+void DslModel::init_weights(NCCLCommunicator& comm) {
+    if (mBackend) {
+        mBackend->init_weights(comm);
+        return;
+    }
     throw_unimplemented("init_weights");
 }
 
-void DslModel::import_weights(const std::string&, bool, NCCLCommunicator&) {
-    throw_unimplemented("import_weights");
+void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) {
+    if (!mBackend) {
+        throw_unimplemented("import_weights");
+    }
+    if (mWeightMapping) {
+        modules::WeightMappingOverrideGuard guard(mWeightMapping.get());
+        mBackend->import_weights(file_name, allow_cast, comm);
+        return;
+    }
+    mBackend->import_weights(file_name, allow_cast, comm);
 }
 
-void DslModel::on_restore_checkpoint(NCCLCommunicator&) {
+void DslModel::on_restore_checkpoint(NCCLCommunicator& comm) {
+    if (mBackend) {
+        mBackend->on_restore_checkpoint(comm);
+        return;
+    }
     throw_unimplemented("on_restore_checkpoint");
 }
 
-void DslModel::export_weights(const std::string&, NCCLCommunicator&) {
+void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& comm) {
+    if (mBackend) {
+        mBackend->export_weights(file_name, comm);
+        return;
+    }
     throw_unimplemented("export_weights");
 }
 
-void DslModel::allocate_run_state(const RuntimeOptions&, NCCLCommunicator& comm, int B, int T, bool) {
+void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicator& comm, int B, int T,
+                                  bool allocate_optimizer) {
+    if (mBackend) {
+        mBackend->allocate_run_state(options, comm, B, T, allocate_optimizer);
+        return;
+    }
     if (!mAllocator) {
         mAllocator = std::make_shared<TensorAllocator>();
     }
@@ -131,10 +200,16 @@ void DslModel::allocate_run_state(const RuntimeOptions&, NCCLCommunicator& comm,
 }
 
 std::string_view DslModel::model_type() const {
+    if (mBackend) {
+        return mBackend->model_type();
+    }
     return mConfig ? mConfig->model_name() : "DSL";
 }
 
 IRunState& DslModel::get_run_state() const {
+    if (mBackend) {
+        return mBackend->get_run_state();
+    }
     if (!mRunState) {
         throw std::logic_error("DslModel::get_run_state() called before allocate_run_state()");
     }

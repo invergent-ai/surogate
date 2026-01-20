@@ -245,6 +245,8 @@ target_sources(surogate-common PRIVATE
 
     src/dsl/ir.cpp
     src/dsl/dsl_model.cpp
+    src/dsl/graph_executor.cpp
+    src/dsl/weight_mapping.cpp
 
     src/config/pretrained_config.cpp
     src/models/registry.cpp
@@ -262,6 +264,7 @@ target_sources(surogate-common PRIVATE
     src/modules/lora/lora_grads_manager.cpp
     src/modules/lora/lora_optimizer_state.cpp
     src/modules/lora/lora_utils.cpp
+    src/modules/weights/weight_mapping_override.cpp
 
     # Recipe system
     src/recipes/recipe.cpp

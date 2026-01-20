@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placeholder DSL model wrapper (validation-only).
+// DSL model wrapper (IR validation + execution).
 
 #ifndef SUROGATE_SRC_DSL_DSL_MODEL_H
 #define SUROGATE_SRC_DSL_DSL_MODEL_H
@@ -14,7 +14,11 @@
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
 
+namespace modules { class BaseWeightMapping; }
+
 namespace dsl {
+
+class GraphExecutor;
 
 class EmptyTensorContainer final : public ITensorContainer {
 public:
@@ -26,21 +30,23 @@ public:
     DslModel(const PretrainedConfig& config,
              const RuntimeOptions& options,
              const std::string& ir_json,
-             const std::shared_ptr<TensorAllocator>& allocator);
+             const std::shared_ptr<TensorAllocator>& allocator,
+             std::unique_ptr<IModel> backend = nullptr);
+    ~DslModel() override;
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
     void update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon, float weight_decay, float grad_clip) override;
 
-    ITensorContainer& weights() override { return mEmpty; }
-    ITensorContainer& opt_momentum() override { return mEmpty; }
-    ITensorContainer& opt_momentum_scales() override { return mEmpty; }
-    ITensorContainer& opt_variance() override { return mEmpty; }
-    ITensorContainer& opt_variance_scales() override { return mEmpty; }
+    ITensorContainer& weights() override { return mBackend ? mBackend->weights() : mEmpty; }
+    ITensorContainer& opt_momentum() override { return mBackend ? mBackend->opt_momentum() : mEmpty; }
+    ITensorContainer& opt_momentum_scales() override { return mBackend ? mBackend->opt_momentum_scales() : mEmpty; }
+    ITensorContainer& opt_variance() override { return mBackend ? mBackend->opt_variance() : mEmpty; }
+    ITensorContainer& opt_variance_scales() override { return mBackend ? mBackend->opt_variance_scales() : mEmpty; }
 
-    std::vector<std::byte> rng_state() const override { return {}; }
-    void set_rng_state(const std::vector<std::byte>&) override {}
+    std::vector<std::byte> rng_state() const override { return mBackend ? mBackend->rng_state() : std::vector<std::byte>{}; }
+    void set_rng_state(const std::vector<std::byte>& state) override { if (mBackend) mBackend->set_rng_state(state); }
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
@@ -65,6 +71,9 @@ private:
     IRFile mIr;
     const Module* mModule = nullptr;
     EmptyTensorContainer mEmpty;
+    std::unique_ptr<IModel> mBackend;
+    std::unique_ptr<modules::BaseWeightMapping> mWeightMapping;
+    std::unique_ptr<GraphExecutor> mExecutor;
 };
 
 } // namespace dsl
