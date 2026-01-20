@@ -251,6 +251,14 @@ public:
      */
     template<typename Callback>
     static bool try_lora_model(IModel* model, Callback&& callback) {
+        // If this is a DslModel wrapper, unwrap to get the backend
+        if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(model)) {
+            if (auto* backend = dsl_model->get_backend()) {
+                return try_lora_model(backend, std::forward<Callback>(callback));
+            }
+            return false;
+        }
+
         // Try dense block types (most specific first)
         if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen3TransformerBlock>*>(model)) {
             callback(lora);

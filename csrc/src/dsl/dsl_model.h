@@ -62,6 +62,9 @@ public:
     std::string_view model_type() const override;
     IRunState& get_run_state() const override;
 
+    /// @brief Get the underlying backend model (for LoRA export, etc.)
+    IModel* get_backend() const { return mBackend.get(); }
+
 private:
     void validate_ir();
     const Module& pick_model_module(const IRFile& ir) const;
