@@ -317,7 +317,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
-    use_dsl_ir: Optional[bool] = False
+    use_dsl_ir: Optional[bool] = True
 
     optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
