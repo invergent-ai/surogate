@@ -12,12 +12,16 @@
 #include <vector>
 
 #include "dsl/ir.h"
+#include "models/qwen3/transformer_block.h"
+#include "modules/backward_hooks.h"
+#include "modules/forward_hooks.h"
 #include "utilities/tensor.h"
 
 class NCCLCommunicator;
 
 namespace modules {
-class Qwen3Model;
+template<typename Block> class ModularTransformerModel;
+template<typename Block> class ModularLoRAModel;
 }  // namespace modules
 
 namespace dsl {
@@ -37,10 +41,15 @@ struct GraphExecutorOptions {
 class GraphExecutor {
 public:
     // Constructor with explicit forward/backward graphs from module
-    GraphExecutor(const Module& module, modules::Qwen3Model& backend);
+    GraphExecutor(const Module& module,
+                  modules::ModularTransformerModel<modules::Qwen3TransformerBlock>& backend);
 
     // Constructor with options (enables autodiff)
-    GraphExecutor(const Module& module, modules::Qwen3Model& backend, const GraphExecutorOptions& options);
+    GraphExecutor(const Module& module,
+                  modules::ModularTransformerModel<modules::Qwen3TransformerBlock>& backend,
+                  const GraphExecutorOptions& options);
+
+    void set_lora_model(modules::ModularLoRAModel<modules::Qwen3TransformerBlock>* lora_model);
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step);
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step);
@@ -56,7 +65,8 @@ private:
     void init(const GraphExecutorOptions& options);
 
     const Module& mModule;
-    modules::Qwen3Model& mBackend;
+    modules::ModularTransformerModel<modules::Qwen3TransformerBlock>& mBackend;
+    modules::ModularLoRAModel<modules::Qwen3TransformerBlock>* mLoRA = nullptr;
     const Graph* mForward;
     const Graph* mBackward;
 
@@ -71,8 +81,10 @@ private:
     bool mFP8ScalingInitialized = false;
     bool mLmHeadCached = false;
 
-    void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full);
-    void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step);
+    void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full,
+                               const modules::ForwardHook* hook);
+    void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step,
+                                const modules::BackwardHook* hook);
 
     void run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy);
 

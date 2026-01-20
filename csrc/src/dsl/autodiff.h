@@ -19,6 +19,7 @@ namespace dsl {
 // and what gradients are needed.
 struct BackwardRuleContext {
     const Operation& fwd_op;                    // The forward operation
+    const std::vector<std::string>& d_outputs;  // Gradients for each forward output (empty = not needed)
     const std::string& d_output;                // Name of output gradient (cotangent)
     const std::vector<std::string>& d_inputs;   // Names for input gradients to produce (empty = not needed)
     const ShapeEnv& shape_env;                  // Shape environment for resolving dimensions

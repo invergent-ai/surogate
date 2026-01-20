@@ -267,10 +267,15 @@ std::vector<Operation> fused_residual_rmsnorm_backward(const BackwardRuleContext
 
     AttrMap attrs = copy_attrs(fwd.attrs, {"eps"});
 
-    // The backward kernel computes gradients for residual and input
+    // The backward kernel consumes gradients for both outputs:
+    //  - d_y: gradient of normalized output (y)
+    //  - d_residual_next: gradient flowing from residual_out
+    std::string d_residual_next = ctx.d_outputs.size() > 0 ? ctx.d_outputs[0] : "";
+    std::string d_y = ctx.d_outputs.size() > 1 ? ctx.d_outputs[1] : ctx.d_output;
+
     std::vector<std::string> inputs = {
-        ctx.d_output,           // dy
-        ctx.d_output,           // d_residual_next (same as dy for final norm)
+        d_y,
+        d_residual_next,
         saved_ref(residual_out),
         weight,
         saved_ref(rstd)

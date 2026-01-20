@@ -170,7 +170,15 @@ public:
         const QLoRAConfig& qlora_config = QLoRAConfig{}) {
 
         if (options.UseDslIr) {
-            throw std::runtime_error("DSL IR path does not support LoRA/QLoRA yet");
+            if (options.DslIrJson.empty()) {
+                throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
+            }
+            RuntimeOptions backend_options = options;
+            backend_options.UseDslIr = false;
+            backend_options.DslIrJson.clear();
+            auto backend = create_lora_from_pretrained_config(config, lora_config, backend_options,
+                                                              comm, alloc, qlora_config);
+            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc, std::move(backend));
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);

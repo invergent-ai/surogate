@@ -201,13 +201,17 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
                 "Autodiff: no backward rule registered for operation '" + op_type + "'");
         }
 
-        // Determine output gradient name (handle first output for now)
-        // TODO: support multi-output ops properly
+        // Determine output gradient names (one per forward output)
+        std::vector<std::string> d_outputs(fwd_op.outputs.size());
         std::string d_output;
-        for (const auto& out : fwd_op.outputs) {
-            if (grad_map.count(out)) {
-                d_output = grad_map[out];
-                break;
+        for (size_t i = 0; i < fwd_op.outputs.size(); ++i) {
+            const auto& out = fwd_op.outputs[i];
+            auto it_grad = grad_map.find(out);
+            if (it_grad != grad_map.end()) {
+                d_outputs[i] = it_grad->second;
+                if (d_output.empty()) {
+                    d_output = d_outputs[i];
+                }
             }
         }
         if (d_output.empty()) {
@@ -234,7 +238,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         }
 
         // Create context and call backward rule
-        BackwardRuleContext ctx{fwd_op, d_output, d_inputs, shape_env, op_counter, &forward};
+        BackwardRuleContext ctx{fwd_op, d_outputs, d_output, d_inputs, shape_env, op_counter, &forward};
         std::vector<Operation> bwd_ops = (*rule)(ctx);
 
         // Add generated operations to backward graph

@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 #include <optional>
+#include <stdexcept>
 
 #include "lora_config.h"
 #include "lora_weights.h"
@@ -76,10 +77,29 @@ public:
     [[nodiscard]] std::size_t lora_num_parameters() const { return mLoRAWeights ? mLoRAWeights->num_parameters() : 0; }
 
     ModularTransformerModel<Block>& base_model() { return *mBaseModel; }
+    void ensure_lora_state(NCCLCommunicator& comm, int B, int T) { ensure_lora_run_state(comm, B, T); }
+    LoRARunState& lora_run_state() {
+        if (!mLoRARunState) {
+            throw std::runtime_error("LoRA run state not initialized");
+        }
+        return *mLoRARunState;
+    }
+    const LoRARunState& lora_run_state() const {
+        if (!mLoRARunState) {
+            throw std::runtime_error("LoRA run state not initialized");
+        }
+        return *mLoRARunState;
+    }
     const ModularLoRAConfig& lora_config() const { return mLoRAConfig; }
     const QLoRAConfig& qlora_config() const { return mQLoRAConfig; }
     ModularLoRAWeightsManager& lora_weights() { return *mLoRAWeights; }
     ModularLoRAGradsManager& lora_grads() { return *mLoRAGrads; }
+    void invalidate_qlora_cache() {
+        if (!qlora_enabled()) return;
+        if (mFP8WeightProvider) mFP8WeightProvider->invalidate_cache();
+        if (mFP4WeightProvider) mFP4WeightProvider->invalidate_cache();
+        if (mBnBWeightProvider) mBnBWeightProvider->invalidate_cache();
+    }
 
     // QLoRA memory stats
     [[nodiscard]] std::size_t qlora_quantized_weights_bytes() const;
