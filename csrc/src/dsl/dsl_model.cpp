@@ -97,18 +97,22 @@ DslModel::DslModel(const PretrainedConfig& config,
     validate_ir();
 
     if (mBackend) {
-        GraphExecutorOptions opts;
-        opts.auto_backward = true;  // Derive backward graph if not provided
-        opts.debug_print_backward = false;  // Set to true to debug derived backward graph
+        // For dense models, use the GraphExecutor to interpret the DSL graph
+        // For MoE models, use the backend directly (GraphExecutor doesn't support MoE yet)
         if (auto* lora = dynamic_cast<modules::ModularLoRAModel<modules::Qwen3TransformerBlock>*>(mBackend.get())) {
+            GraphExecutorOptions opts;
+            opts.auto_backward = true;
+            opts.debug_print_backward = false;
             mExecutor = std::make_unique<GraphExecutor>(*mModule, lora->base_model(), opts);
             mExecutor->set_lora_model(lora);
         } else if (auto* base = dynamic_cast<modules::ModularTransformerModel<modules::Qwen3TransformerBlock>*>(mBackend.get())) {
+            GraphExecutorOptions opts;
+            opts.auto_backward = true;
+            opts.debug_print_backward = false;
             mExecutor = std::make_unique<GraphExecutor>(*mModule, *base, opts);
-        } else {
-            throw std::runtime_error("DSL model: no executor available for backend model type " +
-                                     std::string(mBackend->model_type()));
         }
+        // MoE models: mExecutor stays null, forward/backward/etc use mBackend directly
+        // This is the fallback path when no GraphExecutor is available
     }
 }
 

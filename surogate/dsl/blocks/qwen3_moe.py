@@ -1,0 +1,264 @@
+"""Qwen3 MoE Transformer Block."""
+
+from __future__ import annotations
+
+from ..tensor_type import Tensor
+from ..decorators import block, param, forward
+from ..graph_builder import graph
+
+
+@block
+class Qwen3MoEBlock:
+    """Qwen3 MoE transformer block with QK-Norm and Mixture of Experts.
+
+    Structure:
+        residual, x = fused_residual_rmsnorm(residual, x)
+        x = attention(x) + residual
+        residual, x = fused_residual_rmsnorm(residual, x)
+        x = moe(x) + residual  (router -> experts -> combine)
+
+    Features:
+        - QK normalization in attention
+        - Top-k expert routing with norm_topk_prob
+        - Optional shared expert
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        d_ff: int,  # Per-expert intermediate size
+        max_seq: int,
+        num_experts: int,
+        num_experts_per_tok: int,  # top_k
+        eps: float = 1e-6,
+        use_qkv_bias: bool = False,
+        use_qk_norm: bool = True,
+        norm_topk_prob: bool = True,
+        use_shared_expert: bool = False,
+        shared_expert_intermediate: int = 0,
+    ):
+        self.d_model = d_model
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.d_ff = d_ff
+        self.max_seq = max_seq
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.eps = eps
+        self.use_qkv_bias = use_qkv_bias
+        self.use_qk_norm = use_qk_norm
+        self.norm_topk_prob = norm_topk_prob
+        self.use_shared_expert = use_shared_expert
+        self.shared_expert_intermediate = shared_expert_intermediate if shared_expert_intermediate > 0 else d_ff
+
+        # Derived constants
+        self.C = d_model
+        self.Hq = num_query_heads
+        self.Hkv = num_kv_heads
+        self.D = head_size
+        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
+        self.AttnDim = num_query_heads * head_size
+        self.M = d_ff
+        self.MUp = 2 * d_ff  # gate + up fused
+        self.E = num_experts
+        self.K = num_experts_per_tok
+        self.SharedM = self.shared_expert_intermediate
+        self.SharedMUp = 2 * self.shared_expert_intermediate
+
+    # LayerNorm weights
+    @param
+    def ln1_weight(self) -> Tensor["C"]:
+        """Pre-attention layer norm weight."""
+        ...
+
+    @param
+    def ln2_weight(self) -> Tensor["C"]:
+        """Pre-MoE layer norm weight."""
+        ...
+
+    # Attention weights
+    @param
+    def qkv_weight(self) -> Tensor["QKV", "C"]:
+        """Combined QKV projection."""
+        ...
+
+    @param(condition=lambda self: self.use_qkv_bias)
+    def qkv_bias(self) -> Tensor["QKV"]:
+        """QKV projection bias."""
+        ...
+
+    @param
+    def out_weight(self) -> Tensor["C", "AttnDim"]:
+        """Attention output projection."""
+        ...
+
+    @param(condition=lambda self: self.use_qk_norm)
+    def q_norm_weight(self) -> Tensor["D"]:
+        """Query norm weight for QK-Norm."""
+        ...
+
+    @param(condition=lambda self: self.use_qk_norm)
+    def k_norm_weight(self) -> Tensor["D"]:
+        """Key norm weight for QK-Norm."""
+        ...
+
+    @param(frozen=True)
+    def rope_freqs(self) -> Tensor["max_seq", "D // 2", 2, "fp32"]:
+        """Precomputed RoPE frequencies."""
+        ...
+
+    # Router weight
+    @param
+    def router_weight(self) -> Tensor["E", "C"]:
+        """Router gate weight [num_experts, hidden_size]."""
+        ...
+
+    # Expert weights (batched format: [num_experts, ...])
+    # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
+    @param
+    def experts_gate_up(self) -> Tensor["E", "MUp", "C"]:
+        """Batched expert gate+up weights [num_experts, 2*d_ff, hidden_size]."""
+        ...
+
+    @param
+    def experts_down(self) -> Tensor["E", "C", "M"]:
+        """Batched expert down weights [num_experts, hidden_size, d_ff]."""
+        ...
+
+    # Shared expert weights (optional)
+    # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
+    @param(condition=lambda self: self.use_shared_expert)
+    def shared_expert_gate(self) -> Tensor["SharedM", "C"]:
+        """Shared expert gate projection."""
+        ...
+
+    @param(condition=lambda self: self.use_shared_expert)
+    def shared_expert_up(self) -> Tensor["SharedM", "C"]:
+        """Shared expert up projection."""
+        ...
+
+    @param(condition=lambda self: self.use_shared_expert)
+    def shared_expert_down(self) -> Tensor["C", "SharedM"]:
+        """Shared expert down projection."""
+        ...
+
+    @forward
+    def forward(
+        self,
+        x: Tensor["B", "T", "C"],
+        residual: Tensor["B", "T", "C"],
+        position_ids: Tensor["T", "int32"],
+    ) -> tuple[Tensor["B", "T", "C"], Tensor["B", "T", "C"]]:
+        """Returns (out, residual_out)."""
+        with graph() as g:
+            # ================================================================
+            # Pre-attention norm
+            # ================================================================
+            residual_mid, ln1_out, _ = g.fused_residual_rmsnorm(
+                residual, x, "ln1_weight", eps=self.eps
+            )
+
+            # ================================================================
+            # Attention
+            # ================================================================
+            ln1_flat = g.view(ln1_out, shape=["B * T", "C"])
+            qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
+
+            if self.use_qkv_bias:
+                qkv_tmp = g.view(qkv_flat, shape=["B", "T", "QKV"])
+                qkv_biased = g.bias_add(qkv_tmp, "qkv_bias")
+                qkv_packed = g.view(qkv_biased, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+            else:
+                qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+
+            # QK-Norm + RoPE (fused)
+            if self.use_qk_norm:
+                qkv_rope, _, _ = g.qkv_qk_norm_rope(
+                    qkv_packed,
+                    "q_norm_weight",
+                    "k_norm_weight",
+                    "rope_freqs",
+                    position_ids,
+                    eps=self.eps,
+                )
+            else:
+                qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids)
+
+            # FlashAttention
+            attn_out, _ = g.flash_attention(qkv_rope, causal=True)
+
+            # Output projection
+            attn_flat = g.view(attn_out, shape=["B * T", "AttnDim"])
+            att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
+            att_out = g.view(att_out_flat, shape=["B", "T", "C"])
+
+            # ================================================================
+            # Pre-MoE norm
+            # ================================================================
+            residual_out, ln2_out, _ = g.fused_residual_rmsnorm(
+                residual_mid, att_out, "ln2_weight", eps=self.eps
+            )
+
+            # ================================================================
+            # MoE: Router -> Experts -> Combine
+            # ================================================================
+            ln2_flat = g.view(ln2_out, shape=["B * T", "C"])
+
+            # Router: compute routing logits and select top-k experts
+            router_logits = g.matmul(ln2_flat, "router_weight", transpose="NT")
+
+            # Softmax or sigmoid for routing probabilities
+            if self.norm_topk_prob:
+                router_probs = g.moe_sigmoid(router_logits)
+            else:
+                router_probs = g.moe_softmax(router_logits)
+
+            # Top-k selection
+            routing_weights, routing_indices = g.moe_topk(
+                router_probs, top_k=self.num_experts_per_tok, normalize=self.norm_topk_prob
+            )
+
+            # Permute inputs for grouped expert computation
+            permuted_input, scatter_indices = g.moe_permute(
+                ln2_flat, routing_indices, top_k=self.num_experts_per_tok
+            )
+
+            # Grouped GEMM for gate+up projection
+            expert_gate_up = g.moe_grouped_gemm_gate_up(
+                permuted_input, "experts_gate_up", scatter_indices
+            )
+
+            # SwiGLU activation
+            expert_act = g.swiglu(expert_gate_up)
+
+            # Grouped GEMM for down projection
+            expert_down = g.moe_grouped_gemm_down(
+                expert_act, "experts_down", scatter_indices
+            )
+
+            # Unpermute and combine with routing weights
+            moe_out = g.moe_unpermute(
+                expert_down, routing_weights, scatter_indices, top_k=self.num_experts_per_tok
+            )
+
+            # ================================================================
+            # Shared expert (optional)
+            # ================================================================
+            if self.use_shared_expert:
+                # Shared expert forward pass
+                shared_gate = g.matmul(ln2_flat, "shared_expert_gate", transpose="NT")
+                shared_up = g.matmul(ln2_flat, "shared_expert_up", transpose="NT")
+                shared_gate_act = g.silu(shared_gate)
+                shared_hidden = g.mul(shared_gate_act, shared_up)
+                shared_out = g.matmul(shared_hidden, "shared_expert_down", transpose="NT")
+                # Add shared expert output to MoE output
+                moe_out = g.add(moe_out, shared_out)
+
+            # Reshape back to (B, T, C)
+            out = g.view(moe_out, shape=["B", "T", "C"])
+
+            return out, residual_out

@@ -9,9 +9,8 @@ from typing import Optional
 # Maps HF architecture -> Python DSL model class name
 PYTHON_DSL_MODEL_REGISTRY = {
     "Qwen3ForCausalLM": "Qwen3Model",
-    "qwen3": "Qwen3Model",
+    "Qwen3MoeForCausalLM": "Qwen3MoEModel",
     "LlamaForCausalLM": "LlamaModel",
-    "llama": "LlamaModel",
 }
 
 
