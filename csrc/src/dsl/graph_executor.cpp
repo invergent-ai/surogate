@@ -1001,22 +1001,6 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     if (last_step) {
         reduce_loss(rs, B, T, comm);
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
-        if (grad_accum_steps > 1) {
-            int h_valid = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&h_valid, rs.ValidTokenCount.Data, sizeof(int),
-                                       cudaMemcpyDeviceToHost, rs.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-            const int per_rank_tokens = static_cast<int>(B * T);
-            const int reduced_tokens = per_rank_tokens * std::max(1, comm.world_size());
-            // If valid_token_count looks like a single micro-step (local or reduced),
-            // scale it to the full accumulation window to keep grad-norm token scaling consistent.
-            if (h_valid > 0 && h_valid <= reduced_tokens + 1) {
-                const int scaled = h_valid * grad_accum_steps;
-                CUDA_CHECK(cudaMemcpyAsync(rs.ValidTokenCount.Data, &scaled, sizeof(int),
-                                           cudaMemcpyHostToDevice, rs.MainStream));
-                CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-            }
-        }
     }
 
     execute_backward_graph(B, T, comm, grad_accum_steps, micro_step, hook_ptr);

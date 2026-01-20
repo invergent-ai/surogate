@@ -1,8 +1,15 @@
+"""
+DSL IR Builder
+
+Builds IR JSON for models from either Python DSL classes or .module files.
+Python DSL is preferred when available.
+"""
+
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
-from surogate.dsl.registry import resolve_dsl_module_path
+from surogate.dsl.registry import resolve_dsl_module_path, has_python_dsl_model
 
 
 def load_hf_config(model_dir: str) -> Dict[str, Any]:
@@ -20,6 +27,25 @@ def resolve_architecture(config_json: Dict[str, Any]) -> str:
     if model_type:
         return model_type
     raise ValueError("Could not resolve architecture from config.json")
+
+
+# =============================================================================
+# Python DSL (preferred)
+# =============================================================================
+
+
+def build_dsl_ir_from_python(architecture: str, config_json: Dict[str, Any]) -> str:
+    """Build IR JSON using Python DSL models."""
+    # Import here to avoid circular imports and ensure models are registered
+    from surogate.dsl.stdlib import models  # noqa: F401 - registers models
+    from surogate.dsl.py_compiler import compile_model_for_hf
+
+    return compile_model_for_hf(architecture, config_json)
+
+
+# =============================================================================
+# Lark DSL (fallback for .module files)
+# =============================================================================
 
 
 def parse_hf_param_mapping(module_path: Path, architecture: str) -> Tuple[Dict[str, str], Optional[str]]:
@@ -79,10 +105,43 @@ def compile_dsl_ir(module_path: Path, params: Dict[str, Any], module_name: Optio
     return json.dumps(ir_dict)
 
 
-def build_dsl_ir_for_model(model_dir: str) -> str:
-    config_json = load_hf_config(model_dir)
-    architecture = resolve_architecture(config_json)
+def build_dsl_ir_from_lark(architecture: str, config_json: Dict[str, Any]) -> str:
+    """Build IR JSON using Lark-based .module files."""
     module_path = resolve_dsl_module_path(architecture)
     mapping, module_name = parse_hf_param_mapping(module_path, architecture)
     params = build_param_overrides(mapping, config_json)
     return compile_dsl_ir(module_path, params, module_name)
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+
+def build_dsl_ir_for_model(model_dir: str, use_python_dsl: bool = True) -> str:
+    """
+    Build DSL IR JSON for a model.
+
+    Args:
+        model_dir: Path to the HuggingFace model directory
+        use_python_dsl: If True, prefer Python DSL; if False, use Lark .module files
+
+    Returns:
+        JSON string with the compiled IR
+    """
+    config_json = load_hf_config(model_dir)
+    architecture = resolve_architecture(config_json)
+
+    # Try Python DSL first if requested
+    if use_python_dsl:
+        try:
+            # Check if Python DSL model is available for this architecture
+            if has_python_dsl_model(architecture):
+                return build_dsl_ir_from_python(architecture, config_json)
+        except Exception as e:
+            # Fall back to Lark DSL if Python DSL fails
+            import warnings
+            warnings.warn(f"Python DSL failed for {architecture}, falling back to Lark: {e}")
+
+    # Use Lark-based .module files
+    return build_dsl_ir_from_lark(architecture, config_json)
