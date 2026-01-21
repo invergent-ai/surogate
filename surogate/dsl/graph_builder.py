@@ -193,11 +193,14 @@ class GraphBuilder:
         weight: str | GraphRef,
         *,
         eps: float = 1e-6,
+        res_out_name: str | None = None,
+        y_name: str | None = None,
+        rstd_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef, GraphRef]:
         """Fused residual add + RMS norm. Returns (residual_out, y, rstd)."""
-        res_out = self._fresh_name("res")
-        y = self._fresh_name("rms")
-        rstd = self._fresh_name("rstd")
+        res_out = res_out_name if res_out_name else self._fresh_name("res")
+        y = y_name if y_name else self._fresh_name("rms")
+        rstd = rstd_name if rstd_name else self._fresh_name("rstd")
         self._add_node(GraphNode(
             op="fused_residual_rmsnorm",
             inputs=[
@@ -237,9 +240,9 @@ class GraphBuilder:
     # Activations
     # =========================================================================
 
-    def swiglu(self, x: str | GraphRef) -> GraphRef:
+    def swiglu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """SwiGLU activation: silu(gate) * up"""
-        out = self._fresh_name("swiglu")
+        out = out_name if out_name else self._fresh_name("swiglu")
         self._add_node(GraphNode(
             op="swiglu",
             inputs=[self._resolve_input(x)],
@@ -247,9 +250,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def silu(self, x: str | GraphRef) -> GraphRef:
+    def silu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """SiLU (Swish) activation."""
-        out = self._fresh_name("silu")
+        out = out_name if out_name else self._fresh_name("silu")
         self._add_node(GraphNode(
             op="silu",
             inputs=[self._resolve_input(x)],
@@ -257,9 +260,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def relu(self, x: str | GraphRef) -> GraphRef:
+    def relu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """ReLU activation."""
-        out = self._fresh_name("relu")
+        out = out_name if out_name else self._fresh_name("relu")
         self._add_node(GraphNode(
             op="relu",
             inputs=[self._resolve_input(x)],
@@ -267,9 +270,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def relu2(self, x: str | GraphRef) -> GraphRef:
+    def relu2(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """ReLU squared activation."""
-        out = self._fresh_name("relu2")
+        out = out_name if out_name else self._fresh_name("relu2")
         self._add_node(GraphNode(
             op="relu2",
             inputs=[self._resolve_input(x)],
@@ -277,9 +280,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def gelu(self, x: str | GraphRef) -> GraphRef:
+    def gelu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """GELU activation."""
-        out = self._fresh_name("gelu")
+        out = out_name if out_name else self._fresh_name("gelu")
         self._add_node(GraphNode(
             op="gelu",
             inputs=[self._resolve_input(x)],
@@ -298,9 +301,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def silu_mul(self, gate: str | GraphRef, up: str | GraphRef) -> GraphRef:
+    def silu_mul(self, gate: str | GraphRef, up: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """SiLU(gate) * up activation."""
-        out = self._fresh_name("silu_mul")
+        out = out_name if out_name else self._fresh_name("silu_mul")
         self._add_node(GraphNode(
             op="silu_mul",
             inputs=[self._resolve_input(gate), self._resolve_input(up)],
@@ -319,10 +322,12 @@ class GraphBuilder:
         causal: bool = True,
         softmax_scale: float | None = None,
         window_size: int | None = None,
+        out_name: str | None = None,
+        lse_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
         """FlashAttention. Returns (out, lse)."""
-        out = self._fresh_name("attn")
-        lse = self._fresh_name("lse")
+        out = out_name if out_name else self._fresh_name("attn")
+        lse = lse_name if lse_name else self._fresh_name("lse")
         attrs = {"causal": causal}
         if softmax_scale is not None:
             attrs["softmax_scale"] = softmax_scale
@@ -344,10 +349,12 @@ class GraphBuilder:
         *,
         causal: bool = True,
         softmax_scale: float | None = None,
+        out_name: str | None = None,
+        lse_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
         """FlashAttention with separate Q, K, V. Returns (out, lse)."""
-        out = self._fresh_name("attn")
-        lse = self._fresh_name("lse")
+        out = out_name if out_name else self._fresh_name("attn")
+        lse = lse_name if lse_name else self._fresh_name("lse")
         attrs = {"causal": causal}
         if softmax_scale is not None:
             attrs["softmax_scale"] = softmax_scale
@@ -370,9 +377,10 @@ class GraphBuilder:
         position_ids: str | GraphRef,
         *,
         rotary_dim: int | str | None = None,
+        out_name: str | None = None,
     ) -> GraphRef:
         """Apply rotary position embedding."""
-        out = self._fresh_name("rope")
+        out = out_name if out_name else self._fresh_name("rope")
         attrs = {}
         if rotary_dim is not None:
             attrs["rotary_dim"] = rotary_dim
@@ -397,11 +405,14 @@ class GraphBuilder:
         position_ids: str | GraphRef,
         *,
         eps: float = 1e-6,
+        out_name: str | None = None,
+        q_rstd_name: str | None = None,
+        k_rstd_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef, GraphRef]:
         """Fused QK norm + RoPE. Returns (qkv_out, q_rstd, k_rstd)."""
-        qkv_out = self._fresh_name("qkv_rope")
-        q_rstd = self._fresh_name("q_rstd")
-        k_rstd = self._fresh_name("k_rstd")
+        qkv_out = out_name if out_name else self._fresh_name("qkv_rope")
+        q_rstd = q_rstd_name if q_rstd_name else self._fresh_name("q_rstd")
+        k_rstd = k_rstd_name if k_rstd_name else self._fresh_name("k_rstd")
         self._add_node(GraphNode(
             op="qkv_qk_norm_rope",
             inputs=[
@@ -558,9 +569,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def bias_add(self, x: str | GraphRef, bias: str | GraphRef) -> GraphRef:
+    def bias_add(self, x: str | GraphRef, bias: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """Add bias to tensor."""
-        out = self._fresh_name("bias")
+        out = out_name if out_name else self._fresh_name("bias")
         self._add_node(GraphNode(
             op="bias_add",
             inputs=[self._resolve_input(x), self._resolve_input(bias)],

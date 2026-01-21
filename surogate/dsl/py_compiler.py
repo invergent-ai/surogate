@@ -222,10 +222,20 @@ def _compile_graph_builder(
             out_name = io_spec.name if io_spec.name else f"out_{i}"
         graph.outputs[out_name] = _tensor_annotation_to_ref(ann, is_output=True)
 
-    # Add params (both tensors and arrays)
+    # Add params (tensor weights only; arrays are expanded separately)
     for name, param_spec in params.items():
-        if param_spec.kind in (ParamKind.TENSOR, ParamKind.ARRAY):
-            graph.params[name] = _param_spec_to_ref(param_spec, config)
+        if param_spec.kind != ParamKind.TENSOR:
+            continue
+        if param_spec.condition:
+            try:
+                mock = type("ConfigView", (), {})()
+                for key, value in config.items():
+                    setattr(mock, key, value)
+                if not param_spec.condition(mock):
+                    continue
+            except Exception:
+                pass
+        graph.params[name] = _param_spec_to_ref(param_spec, config)
 
     # Convert nodes
     for i, node in enumerate(builder.nodes):
@@ -256,6 +266,151 @@ def _compile_graph_builder(
     graph.save_list = builder._save_list
     graph.recompute_list = builder._recompute_list
 
+    return graph
+
+
+def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any]) -> None:
+    """Initialize instance with config keys accepted by __init__."""
+    import inspect
+
+    if not hasattr(cls, "__init__"):
+        return
+    try:
+        sig = inspect.signature(cls.__init__)
+    except (TypeError, ValueError):
+        return
+
+    kwargs: Dict[str, Any] = {}
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        if name in config:
+            kwargs[name] = config[name]
+    try:
+        cls.__init__(instance, **kwargs)
+    except Exception:
+        pass
+
+
+def _inline_stacked_blocks(
+    graph: GraphIR,
+    model_spec: ModelSpec,
+    config: Dict[str, Any],
+) -> GraphIR:
+    """Inline StackedBlocks calls into per-layer block graphs."""
+    # Quick check: if no StackedBlocks present, return as-is
+    if not any(node.name == "StackedBlocks" for node in graph.nodes):
+        return graph
+
+    # Resolve block param spec from model
+    def _resolve_block_spec(blocks_param: str) -> BlockSpec:
+        param_spec = model_spec.params.get(blocks_param)
+        if not param_spec or param_spec.kind != ParamKind.ARRAY or not param_spec.element_type:
+            raise ValueError(f"StackedBlocks expects array param '{blocks_param}' with element_type")
+        block_spec = get_block_spec(param_spec.element_type)
+        if block_spec is None:
+            raise ValueError(f"Block not found: {param_spec.element_type}")
+        return block_spec
+
+    # Cache compiled block graphs by block name
+    block_cache: Dict[str, ModuleIR] = {}
+
+    def _get_block_ir(block_spec: BlockSpec) -> ModuleIR:
+        cached = block_cache.get(block_spec.name)
+        if cached is not None:
+            return cached
+        ir = compile_block_spec(block_spec, config)
+        block_cache[block_spec.name] = ir
+        return ir
+
+    new_nodes: List[OpIR] = []
+    new_params: Dict[str, TensorRef] = dict(graph.params)
+    op_id = 0
+
+    for node in graph.nodes:
+        if node.name != "StackedBlocks":
+            op_id += 1
+            new_nodes.append(OpIR(
+                id=op_id,
+                name=node.name,
+                kernel_type=node.kernel_type,
+                inputs=list(node.inputs),
+                outputs=list(node.outputs),
+                attrs=dict(node.attrs),
+            ))
+            continue
+
+        blocks_param = node.attrs.get("blocks", "blocks")
+        n_layers = node.attrs.get("n_layers") or config.get("n_layers")
+        if n_layers is None:
+            raise ValueError("StackedBlocks missing n_layers")
+
+        block_spec = _resolve_block_spec(blocks_param)
+        block_ir = _get_block_ir(block_spec)
+        if not block_ir.forward_graph or not block_ir.forward_graph.nodes:
+            raise ValueError(f"Block graph missing for {block_spec.name}")
+
+        block_graph = block_ir.forward_graph
+        block_inputs = list(block_graph.inputs.keys())
+        block_outputs = list(block_graph.outputs.keys())
+        block_params = list(block_graph.params.keys())
+
+        # StackedBlocks inputs are (x, residual, position_ids)
+        cur_inputs = list(node.inputs)
+        if len(cur_inputs) != len(block_inputs):
+            raise ValueError(
+                f"StackedBlocks input mismatch: expected {len(block_inputs)}, got {len(cur_inputs)}"
+            )
+
+        for layer_idx in range(int(n_layers)):
+            # Outputs for this layer
+            if layer_idx == int(n_layers) - 1:
+                layer_outputs = list(node.outputs)
+            else:
+                layer_outputs = [f"{blocks_param}[{layer_idx}].{name}" for name in block_outputs]
+
+            # Build name mapping
+            prefix = f"{blocks_param}[{layer_idx}]."
+            mapping: Dict[str, str] = {}
+            for b_in, c_in in zip(block_inputs, cur_inputs):
+                mapping[b_in] = c_in
+            for b_out, c_out in zip(block_outputs, layer_outputs):
+                mapping[b_out] = c_out
+            for p in block_params:
+                mapping[p] = f"{prefix}{p}"
+                if mapping[p] not in new_params:
+                    new_params[mapping[p]] = block_graph.params[p]
+
+            # Inline block nodes
+            for bnode in block_graph.nodes:
+                op_id += 1
+                mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
+                mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]
+                new_nodes.append(OpIR(
+                    id=op_id,
+                    name=bnode.name,
+                    kernel_type=bnode.kernel_type,
+                    inputs=mapped_inputs,
+                    outputs=mapped_outputs,
+                    attrs=dict(bnode.attrs),
+                ))
+
+            # Next layer inputs
+            cur_inputs = list(layer_outputs[:len(block_inputs) - 1])
+            cur_inputs.append(node.inputs[-1])  # position_ids stays constant
+
+    # Rebuild intermediates
+    new_intermediates: Dict[str, TensorRef] = {}
+    for op in new_nodes:
+        for out in op.outputs:
+            if out in graph.inputs or out in new_params or out in graph.outputs:
+                continue
+            if out not in new_intermediates:
+                new_intermediates[out] = TensorRef(shape=[], is_param=False, is_input=False, is_output=False)
+
+    graph.nodes = new_nodes
+    graph.params = new_params
+    graph.intermediates = new_intermediates
     return graph
 
 
@@ -453,18 +608,17 @@ def compile_model_spec(
                 for key, value in config.items():
                     setattr(instance, key, value)
 
-                # Initialize derived values
-                if hasattr(spec.python_class, "__init__"):
-                    try:
-                        spec.python_class.__init__(instance, **config)
-                    except Exception:
-                        pass
+                # Initialize derived values (ignore extra config keys)
+                _init_instance_from_config(instance, spec.python_class, config)
 
                 # Capture the graph by patching graph()
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
 
                 if builder:
-                    ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params)
+                    graph = _compile_graph_builder(builder, spec.forward, config, spec.params)
+                    # Expand StackedBlocks into per-layer block graphs
+                    graph = _inline_stacked_blocks(graph, spec, config)
+                    ir.forward_graph = graph
                 else:
                     ir.forward_graph = GraphIR()
 
@@ -517,11 +671,7 @@ def compile_block_spec(
                 for key, value in config.items():
                     setattr(instance, key, value)
 
-                if hasattr(spec.python_class, "__init__"):
-                    try:
-                        spec.python_class.__init__(instance, **config)
-                    except Exception:
-                        pass
+                _init_instance_from_config(instance, spec.python_class, config)
 
                 # Capture the graph by patching graph()
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
@@ -572,11 +722,7 @@ def compile_module_spec(
                 for key, value in config.items():
                     setattr(instance, key, value)
 
-                if hasattr(spec.python_class, "__init__"):
-                    try:
-                        spec.python_class.__init__(instance, **config)
-                    except Exception:
-                        pass
+                _init_instance_from_config(instance, spec.python_class, config)
 
                 # Capture the graph by patching graph()
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)

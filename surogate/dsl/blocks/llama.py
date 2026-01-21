@@ -74,31 +74,37 @@ class LlamaBlock:
         position_ids: Tensor["T", "int32"],
     ) -> tuple[Tensor["B", "T", "C"], Tensor["B", "T", "C"]]:
         with graph() as g:
-            residual_mid, ln1_out, _ = g.fused_residual_rmsnorm(
-                residual, x, "ln1_weight", eps=self.eps
+            res_ffn, ln1_out, ln1_rstd = g.fused_residual_rmsnorm(
+                residual, x, "ln1_weight", eps=self.eps,
+                res_out_name="res_ffn",
+                y_name="ln1",
+                rstd_name="ln1_rstd",
             )
 
             ln1_flat = g.view(ln1_out, shape=["B * T", "C"])
-            qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
-            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+            qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT", out_name="qkv_flat")
+            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"], out_name="qkv")
 
-            qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, rotary_dim="D")
-            attn_out, _ = g.flash_attention(qkv_rope, causal=True)
+            qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, rotary_dim="D", out_name="qkv_rope")
+            attn_out, lse = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")
 
             attn_flat = g.view(attn_out, shape=["B * T", "AttnDim"])
-            att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
-            att_out = g.view(att_out_flat, shape=["B", "T", "C"])
+            att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT", out_name="att_out_flat")
+            att_out = g.view(att_out_flat, shape=["B", "T", "C"], out_name="att_out")
 
-            residual_out, ln2_out, _ = g.fused_residual_rmsnorm(
-                residual_mid, att_out, "ln2_weight", eps=self.eps
+            res_att, ln2_out, ln2_rstd = g.fused_residual_rmsnorm(
+                res_ffn, att_out, "ln2_weight", eps=self.eps,
+                res_out_name="res_att",
+                y_name="ln2",
+                rstd_name="ln2_rstd",
             )
 
             ln2_flat = g.view(ln2_out, shape=["B * T", "C"])
-            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT")
-            mlp_up = g.view(mlp_up_flat, shape=["B", "T", "MUp"])
-            mlp_act = g.swiglu(mlp_up)
+            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", out_name="mlp_up_flat")
+            mlp_up = g.view(mlp_up_flat, shape=["B", "T", "MUp"], out_name="mlp_up")
+            mlp_act = g.swiglu(mlp_up, out_name="swiglu")
             mlp_act_flat = g.view(mlp_act, shape=["B * T", "M"])
-            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT")
-            out = g.view(out_flat, shape=["B", "T", "C"])
+            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", out_name="mlp_down_flat")
+            out = g.view(out_flat, shape=["B", "T", "C"], out_name="mlp_down")
 
-            return out, residual_out
+            return out, res_att

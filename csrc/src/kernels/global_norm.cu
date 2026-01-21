@@ -164,7 +164,8 @@ __global__ void global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_c
         total_scale = grad_clip / norm;
     }
     out[1] = total_scale;
-    *out_cpu = scaled_norm;
+    // Log the raw (unscaled) norm so masks don't create large log spikes.
+    *out_cpu = norm;
 }
 
 

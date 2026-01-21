@@ -352,20 +352,27 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
                                      std::to_string(mTokenFile.gcount()));
         }
 
-        if(file_info->Version >= 3 && position_ids != nullptr) {
+        if (position_ids != nullptr) {
             assert(position_ids->Device == -1);
-            if(position_ids->nelem() != mSeqLen) {
+            if (position_ids->nelem() != mSeqLen) {
                 throw std::runtime_error(fmt::format("Expected position_ids tensor of {} elements, got {}", mSeqLen, position_ids->nelem()));
             }
 
-            const long pos_ids_start = element_size * file_info->NumTokens + header_offset;
-            const long read_offset = pos_ids_start + element_size * chunk_pos;
-            
-            mTokenFile.seekg(read_offset, std::ios::beg);
-            mTokenFile.read(reinterpret_cast<char*>(position_ids->Data), position_ids->bytes());
-            
-            if (mTokenFile.gcount() != static_cast<std::streamsize>(position_ids->bytes())) {
-                 throw std::runtime_error("Incomplete read of position_ids data");
+            if (file_info->Version >= 3) {
+                const long pos_ids_start = element_size * file_info->NumTokens + header_offset;
+                const long read_offset = pos_ids_start + element_size * chunk_pos;
+
+                mTokenFile.seekg(read_offset, std::ios::beg);
+                mTokenFile.read(reinterpret_cast<char*>(position_ids->Data), position_ids->bytes());
+
+                if (mTokenFile.gcount() != static_cast<std::streamsize>(position_ids->bytes())) {
+                    throw std::runtime_error("Incomplete read of position_ids data");
+                }
+            } else {
+                int* pos_ptr = position_ids->get<int>();
+                for (int i = 0; i < mSeqLen; ++i) {
+                    pos_ptr[i] = i;
+                }
             }
         }
 

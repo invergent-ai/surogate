@@ -342,7 +342,7 @@ void global_norm_squared(Tensor& out, const Tensor& values, size_t count, const 
 //
 // Writes:
 // - out[1] := total multiplier to apply to gradients (may be > 1 when many tokens are masked)
-// - out_cpu := scaled gradient norm (norm * token_scale), for logging
+// - out_cpu := raw gradient norm (before token scaling), for logging
 void global_norm_sqrt(float* out, float* out_cpu, float grad_clip,
                       const int* valid_token_count, float total_tokens,
                       const cudaDeviceProp& dp, cudaStream_t stream);

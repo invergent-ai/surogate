@@ -840,6 +840,19 @@ NB_MODULE(_surogate, m) {
              "Parameters:\n"
              "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].")
+        .def("step", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
+            // Use local_world_size (GPUs on this node) not global world_size
+            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+
+            trainer->step(inputs.data(), targets.data(), position_ids.data());
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Perform one training step (forward + backward) with explicit position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].")
         .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
             // Use local_world_size (GPUs on this node) not global world_size
             CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
@@ -851,6 +864,20 @@ NB_MODULE(_surogate, m) {
              "Parameters:\n"
              "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n\n"
+             "Returns: loss (float).")
+        .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
+            // Use local_world_size (GPUs on this node) not global world_size
+            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+
+            return trainer->validate(inputs.data(), targets.data(), position_ids.data());
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Compute validation loss for one batch (forward only) with explicit position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].\n\n"
              "Returns: loss (float).")
         .def("update_with_config", [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& config, int step){
             auto [loss, norm] = trainer->update_with_config(config, step);
@@ -1011,6 +1038,21 @@ NB_MODULE(_surogate, m) {
              "Parameters:\n"
              "- inputs: Preallocated int32 array [batch, seq_len].\n"
              "- targets: Preallocated int32 array [batch, seq_len].")
+        .def("load_batch", [](DataLoader* d, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
+            CHECK_SHAPE(position_ids, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)));
+            Tensor inp_t{ETensorDType::INT32, {static_cast<long>(inputs.shape(0)), static_cast<long>(inputs.shape(1))},
+                        reinterpret_cast<std::byte*>(inputs.data()), nullptr, 2, inputs.device_id()};
+            Tensor tgt_t{ETensorDType::INT32, {static_cast<long>(targets.shape(0)), static_cast<long>(targets.shape(1))},
+                        reinterpret_cast<std::byte*>(targets.data()), nullptr, 2, inputs.device_id()};
+            Tensor pos_t{ETensorDType::INT32, {static_cast<long>(position_ids.shape(0)), static_cast<long>(position_ids.shape(1))},
+                        reinterpret_cast<std::byte*>(position_ids.data()), nullptr, 2, position_ids.device_id()};
+            d->load_batch(inp_t, tgt_t, &pos_t);
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Fill `inputs`, `targets`, and `position_ids` with the next batch.\n\n"
+             "Parameters:\n"
+             "- inputs: Preallocated int32 array [batch, seq_len].\n"
+             "- targets: Preallocated int32 array [batch, seq_len].\n"
+             "- position_ids: Preallocated int32 array [batch, seq_len].")
         .def("epoch", &DataLoader::epoch, "Return the current epoch number (0-based).")
         .def("progress", &DataLoader::progress, "Return progress within the current epoch (percent).")
         .def("advance_epoch", &DataLoader::advance_epoch, "Advance to the next epoch and reshuffle chunk order.")

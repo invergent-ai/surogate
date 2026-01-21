@@ -261,9 +261,11 @@ class SurogateTrainerWrapper():
                              dtype=np.int32)
         out_tokens = np.empty((self.config.gpus * self.config.per_device_train_batch_size, self.config.sequence_len),
                               dtype=np.int32)
+        pos_ids = np.empty((self.config.gpus * self.config.per_device_train_batch_size, self.config.sequence_len),
+                           dtype=np.int32)
 
         # Preload first batch
-        self.train_loader.load_batch(in_tokens, out_tokens)
+        self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
@@ -271,19 +273,19 @@ class SurogateTrainerWrapper():
             # Check if we need to advance epoch
             if not self.train_loader.has_next(self.config.gradient_accumulation_steps):
                 self.train_loader.advance_epoch()
-                self.train_loader.load_batch(in_tokens, out_tokens)
+                self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic evaluation (before training step)
             if self.eval_loader and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
                 # Limit periodic eval to 100 batches for speed; full eval runs at end of training
-                val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, max_steps=100)
+                val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, pos_ids, max_steps=100)
                 epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
                 # Calculate actual tokens processed based on batches run
                 # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
                 eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
                 # Reload training batch after evaluation (eval leaves its last batch in the buffers)
-                self.train_loader.load_batch(in_tokens, out_tokens)
+                self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic checkpointing (before training step)
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
@@ -314,9 +316,9 @@ class SurogateTrainerWrapper():
             step_start = time.time()
 
             for micro_step in range(self.config.gradient_accumulation_steps):
-                self.trainer.step(in_tokens, out_tokens)
+                self.trainer.step(in_tokens, out_tokens, pos_ids)
                 if self.train_loader.has_next():
-                    self.train_loader.load_batch(in_tokens, out_tokens)
+                    self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Log GPU utilization
             if self.config.log_gpu_util > 0 and step % self.config.log_gpu_util == 0:
@@ -365,12 +367,13 @@ class SurogateTrainerWrapper():
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
-    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
+    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
         """
         Run evaluation on test set.
         Args:
             in_tokens (np.ndarray): Input token buffer.
             out_tokens (np.ndarray): Output token buffer.
+            pos_ids (np.ndarray): Position id buffer.
             max_steps (int): Maximum number of eval batches to process. Pass -1 to process all available batches.
         Returns:
             Tuple of (mean_loss, elapsed_ms, batches_processed)
@@ -386,8 +389,8 @@ class SurogateTrainerWrapper():
         # Use has_next() to check data availability (matches C++ implementation)
         # max_steps < 0 means process all available batches
         while self.eval_loader.has_next() and (max_steps < 0 or batches < max_steps):
-            self.eval_loader.load_batch(in_tokens, out_tokens)
-            loss = self.trainer.validate(in_tokens, out_tokens)
+            self.eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
+            loss = self.trainer.validate(in_tokens, out_tokens, pos_ids)
             total_loss += loss
             batches += 1
 

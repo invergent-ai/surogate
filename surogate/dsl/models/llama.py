@@ -74,9 +74,10 @@ class LlamaModel:
             dim=0,
         ),
         "out_weight": "model.layers.{layer}.self_attn.o_proj.weight",
+        # swiglu expects [up, gate] concatenation
         "mlp_up_weight": fuse(
-            "model.layers.{layer}.mlp.gate_proj.weight",
             "model.layers.{layer}.mlp.up_proj.weight",
+            "model.layers.{layer}.mlp.gate_proj.weight",
             dim=0,
         ),
         "mlp_down_weight": "model.layers.{layer}.mlp.down_proj.weight",

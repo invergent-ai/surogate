@@ -68,8 +68,8 @@ public:
     void init_weights();
     void load_checkpoint(std::string directory, int step);
     void save_checkpoint(std::string directory, int step);
-    void step(const std::int32_t* inputs, const std::int32_t* targets);
-    float validate(const std::int32_t* inputs, const std::int32_t* targets);
+    void step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
+    float validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
     std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
     void stop();
 

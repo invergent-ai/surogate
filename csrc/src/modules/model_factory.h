@@ -110,11 +110,7 @@ public:
             if (options.DslIrJson.empty()) {
                 throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
             }
-            RuntimeOptions backend_options = options;
-            backend_options.UseDslIr = false;
-            backend_options.DslIrJson.clear();
-            auto backend = create_from_pretrained_config(config, backend_options, rank, world, alloc);
-            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc, std::move(backend));
+            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc);
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
@@ -173,12 +169,7 @@ public:
             if (options.DslIrJson.empty()) {
                 throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
             }
-            RuntimeOptions backend_options = options;
-            backend_options.UseDslIr = false;
-            backend_options.DslIrJson.clear();
-            auto backend = create_lora_from_pretrained_config(config, lora_config, backend_options,
-                                                              comm, alloc, qlora_config);
-            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc, std::move(backend));
+            throw std::runtime_error("DSL IR LoRA path is not supported yet");
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
@@ -251,11 +242,7 @@ public:
      */
     template<typename Callback>
     static bool try_lora_model(IModel* model, Callback&& callback) {
-        // If this is a DslModel wrapper, unwrap to get the backend
-        if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(model)) {
-            if (auto* backend = dsl_model->get_backend()) {
-                return try_lora_model(backend, std::forward<Callback>(callback));
-            }
+        if (dynamic_cast<dsl::DslModel*>(model)) {
             return false;
         }
 

@@ -271,7 +271,12 @@ std::vector<Operation> fused_residual_rmsnorm_backward(const BackwardRuleContext
     //  - d_y: gradient of normalized output (y)
     //  - d_residual_next: gradient flowing from residual_out
     std::string d_residual_next = ctx.d_outputs.size() > 0 ? ctx.d_outputs[0] : "";
-    std::string d_y = ctx.d_outputs.size() > 1 ? ctx.d_outputs[1] : ctx.d_output;
+    std::string d_y;
+    if (ctx.d_outputs.size() > 1 && !ctx.d_outputs[1].empty()) {
+        d_y = ctx.d_outputs[1];
+    } else {
+        d_y = ctx.d_output;
+    }
 
     std::vector<std::string> inputs = {
         d_y,
@@ -380,6 +385,21 @@ std::vector<Operation> swiglu_backward(const BackwardRuleContext& ctx) {
     std::vector<Operation> ops;
 
     const auto& fwd = ctx.fwd_op;
+    // DSL swiglu takes a single gate_up input (packed) -> output
+    if (fwd.inputs.size() == 1) {
+        std::string gate_up = fwd.inputs[0];
+        std::vector<std::string> outputs;
+        outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+        ops.push_back(make_operation(
+            "swiglu_backward_" + std::to_string(ctx.op_counter++),
+            "swiglu_backward",
+            "swiglu_backward",
+            {ctx.d_output, saved_ref(gate_up)},
+            outputs));
+        return ops;
+    }
+
+    // Legacy form: swiglu(gate, up)
     std::string gate = fwd.inputs[0];
     std::string up = fwd.inputs[1];
 
@@ -398,6 +418,35 @@ std::vector<Operation> swiglu_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// BiasAdd backward rule
+// Forward: y = bias_add(x, bias)
+// Backward: dx = dy, d_bias = sum(dy)
+// -----------------------------------------------------------------------------
+std::vector<Operation> bias_add_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+
+    std::vector<std::string> inputs;
+    inputs.push_back(ctx.d_output);
+    if (fwd.inputs.size() > 1) {
+        inputs.push_back(fwd.inputs[1]);
+    }
+
+    ops.push_back(make_operation(
+        "bias_add_backward_" + std::to_string(ctx.op_counter++),
+        "bias_add_backward",
+        "bias_add_backward",
+        inputs,
+        outputs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // RoPE backward rule
 // Forward: q_out, k_out = rope(q, k, cos, sin, position_ids)
 // Backward: dq, dk = rope_backward(dq_out, dk_out, cos, sin, position_ids)
@@ -406,9 +455,26 @@ std::vector<Operation> rope_backward(const BackwardRuleContext& ctx) {
     std::vector<Operation> ops;
 
     const auto& fwd = ctx.fwd_op;
+    // DSL rope: out = rope(qkv, freqs, position_ids)
+    if (fwd.inputs.size() >= 3) {
+        std::string freqs = fwd.inputs[1];
+        std::string pos_ids = fwd.inputs[2];
+        std::vector<std::string> outputs;
+        outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
 
-    // Forward typically has: q, k, cos, sin, position_ids
-    // We need cos, sin, position_ids for backward
+        AttrMap attrs = copy_attrs(fwd.attrs, {"rotary_dim"});
+
+        ops.push_back(make_operation(
+            "rope_backward_" + std::to_string(ctx.op_counter++),
+            "rope_backward",
+            "rope_backward",
+            {ctx.d_output, freqs, pos_ids},
+            outputs,
+            attrs));
+        return ops;
+    }
+
+    // Legacy form: q, k, cos, sin, position_ids
     std::string cos_cache = fwd.inputs.size() > 2 ? fwd.inputs[2] : "cos_cache";
     std::string sin_cache = fwd.inputs.size() > 3 ? fwd.inputs[3] : "sin_cache";
     std::string pos_ids = fwd.inputs.size() > 4 ? fwd.inputs[4] : "position_ids";
@@ -430,6 +496,67 @@ std::vector<Operation> rope_backward(const BackwardRuleContext& ctx) {
     return ops;
 }
 
+// -----------------------------------------------------------------------------
+// FlashAttention backward rule
+// Forward: out, lse = flash_attention(qkv)
+// Backward: d_qkv = flash_attention_backward(d_out, out, lse, qkv)
+// -----------------------------------------------------------------------------
+std::vector<Operation> flash_attention_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string out = fwd.outputs.empty() ? "out" : fwd.outputs[0];
+    std::string lse = fwd.outputs.size() > 1 ? fwd.outputs[1] : out + "_lse";
+    std::string qkv = fwd.inputs.empty() ? "qkv" : fwd.inputs[0];
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"causal", "softmax_scale", "window_size"});
+
+    ops.push_back(make_operation(
+        "flash_attention_backward_" + std::to_string(ctx.op_counter++),
+        "flash_attention_backward",
+        "flash_attention_backward",
+        {ctx.d_output, saved_ref(out), saved_ref(lse), saved_ref(qkv)},
+        {ctx.needs_grad(0) ? ctx.d_inputs[0] : ""},
+        attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// QK-Norm + RoPE backward rule
+// Forward: qkv_out, q_rstd, k_rstd = qkv_qk_norm_rope(qkv, q_norm_w, k_norm_w, freqs, pos_ids)
+// Backward: d_qkv, d_q_norm_w, d_k_norm_w = qkv_qk_norm_rope_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> qkv_qk_norm_rope_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 5 || fwd.outputs.size() < 3) {
+        return ops;
+    }
+
+    std::string qkv_out = fwd.outputs[0];
+    std::string q_rstd = fwd.outputs[1];
+    std::string k_rstd = fwd.outputs[2];
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");
+
+    ops.push_back(make_operation(
+        "qkv_qk_norm_rope_backward_" + std::to_string(ctx.op_counter++),
+        "qkv_qk_norm_rope_backward",
+        "qkv_qk_norm_rope_backward",
+        {ctx.d_output,
+         saved_ref(qkv_out),
+         fwd.inputs[1], fwd.inputs[2],
+         saved_ref(q_rstd), saved_ref(k_rstd),
+         fwd.inputs[3], fwd.inputs[4]},
+        outputs));
+
+    return ops;
+}
 // -----------------------------------------------------------------------------
 // Attention backward rule
 // Forward: out = attention(q, k, v, mask?)
@@ -634,9 +761,13 @@ void register_builtin_backward_rules() {
     reg.register_rule("silu", silu_backward);
     reg.register_rule("gelu", gelu_backward);
     reg.register_rule("swiglu", swiglu_backward);
+    reg.register_rule("bias_add", bias_add_backward);
 
     // Attention
     reg.register_rule("rope", rope_backward);
+    reg.register_rule("qkv_qk_norm_rope", qkv_qk_norm_rope_backward);
+    reg.register_rule("flash_attention", flash_attention_backward);
+    reg.register_rule("flash_attention_qkv", flash_attention_backward);
     reg.register_rule("attention", attention_backward);
     reg.register_rule("scaled_dot_product_attention", attention_backward);
     reg.register_rule("softmax", softmax_backward);

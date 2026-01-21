@@ -22,6 +22,15 @@
 #include "modules/moe/moe_block.h"
 #include "modules/lora/lora_model.h"
 
+static void fill_sequential_position_ids(std::int32_t* dst, int B, int T) {
+    for (int b = 0; b < B; ++b) {
+        std::int32_t* row = dst + b * T;
+        for (int t = 0; t < T; ++t) {
+            row[t] = t;
+        }
+    }
+}
+
 /**
  * @brief Construct a multi-GPU trainer and launch one worker thread per GPU.
  *
@@ -296,14 +305,20 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
  *
  * @throws std::runtime_error If called more than `grad_accum` times without an update().
  */
-void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets) {
+void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            std::memcpy(pb, position_ids + i * B * T, B * T * sizeof(std::int32_t));
+        } else {
+            fill_sequential_position_ids(pb, B, T);
+        }
     }
 
     if(mTrainMicroStep >= mGradAccumulation) {
@@ -335,14 +350,20 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
  * @param targets Pointer to host int32 target token IDs for all ranks.
  * @return Loss value computed on rank 0 for this validation micro-step.
  */
-float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t* targets) {
+float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            std::memcpy(pb, position_ids + i * B * T, B * T * sizeof(std::int32_t));
+        } else {
+            fill_sequential_position_ids(pb, B, T);
+        }
     }
 
     float loss;

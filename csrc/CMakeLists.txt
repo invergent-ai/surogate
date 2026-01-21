@@ -245,6 +245,7 @@ target_sources(surogate-common PRIVATE
 
     src/dsl/ir.cpp
     src/dsl/dsl_model.cpp
+    src/dsl/dsl_runtime.cpp
     src/dsl/graph_executor.cpp
     src/dsl/weight_mapping.cpp
     src/dsl/autodiff.cpp

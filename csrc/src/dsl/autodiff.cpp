@@ -102,6 +102,36 @@ bool starts_with(const std::string& str, const std::string& prefix) {
     return str.size() >= prefix.size() && str.compare(0, prefix.size(), prefix) == 0;
 }
 
+bool is_non_diff_dtype(ETensorDType dtype) {
+    switch (dtype) {
+        case ETensorDType::INT32:
+        case ETensorDType::INT8:
+        case ETensorDType::BYTE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool is_non_differentiable(const Graph& forward, const std::string& name) {
+    auto it_input = forward.inputs.find(name);
+    if (it_input != forward.inputs.end()) {
+        if (it_input->second.dtype && is_non_diff_dtype(*it_input->second.dtype)) {
+            return true;
+        }
+    }
+    auto it_param = forward.params.find(name);
+    if (it_param != forward.params.end()) {
+        if (it_param->second.dtype && is_non_diff_dtype(*it_param->second.dtype)) {
+            return true;
+        }
+        if (name.find("rope_freqs") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& options) {
@@ -156,6 +186,9 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 
         const auto& op = forward.operations[it->second];
         for (const auto& inp : op.inputs) {
+            if (is_non_differentiable(forward, inp)) {
+                continue;
+            }
             if (needs_grad.insert(inp).second) {
                 worklist.push(inp);
             }
@@ -223,7 +256,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         d_inputs.reserve(fwd_op.inputs.size());
         for (size_t i = 0; i < fwd_op.inputs.size(); ++i) {
             const auto& inp = fwd_op.inputs[i];
-            if (needs_grad.count(inp)) {
+            if (needs_grad.count(inp) && !is_non_differentiable(forward, inp)) {
                 // Use simple name if first gradient for this tensor, else unique name
                 std::string d_inp;
                 if (!grad_map.count(inp)) {
