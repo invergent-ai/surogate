@@ -74,13 +74,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Whether to enable recompute for Feed-Forward Network (FFN) activations during the backward pass to save memory during training.
             Implies --recompute-swiglu.
             This reduces GPU memory usage but slows down training.
+        recompute_mlp_down (Optional[bool], defaults to False):
+            Recompute MLP down projection in backward pass. Rarely needed as output is saved anyway.
         recompute_qkv (Optional[bool], defaults to True):
             Whether to enable recompute for QKV projections during the backward pass to save memory during training.
             This reduces GPU memory usage but slows down training.
+        recompute_qk_norm (Optional[bool], defaults to False):
+            Recompute QK head normalization (Qwen3-style) in backward pass.
+        recompute_rope (Optional[bool], defaults to False):
+            Recompute RoPE rotation in backward pass. Cheap operation, usually saved for QK-norm backward.
         recompute_att (Optional[bool], defaults to True):
             Whether to enable recompute for the attention block to save memory during training.
             Implies --recompute-qkv.
             This reduces GPU memory usage but slows down training.
+        recompute_out_proj (Optional[bool], defaults to False):
+            Recompute attention output projection in backward pass.
         recompute_block (Optional[bool], defaults to True):
             Whether to enable recompute for entire Transformer block to save memory during training.
             This reduces GPU memory usage but slows down training.
@@ -283,8 +291,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     recompute_swiglu: Optional[bool] = True
     recompute_rmsnorm: Optional[bool] = True
     recompute_ffn: Optional[bool] = True
+    recompute_mlp_down: Optional[bool] = False
     recompute_qkv: Optional[bool] = True
+    recompute_qk_norm: Optional[bool] = False
+    recompute_rope: Optional[bool] = False
     recompute_att: Optional[bool] = True
+    recompute_out_proj: Optional[bool] = False
     recompute_block: Optional[bool] = True
     recompute_lora: Optional[bool] = False
 
@@ -391,8 +403,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.recompute_swiglu = cfg.get('recompute_swiglu', self.recompute_swiglu)
         self.recompute_rmsnorm = cfg.get('recompute_rmsnorm', self.recompute_rmsnorm)
         self.recompute_ffn = cfg.get('recompute_ffn', self.recompute_ffn)
+        self.recompute_mlp_down = cfg.get('recompute_mlp_down', self.recompute_mlp_down)
         self.recompute_qkv = cfg.get('recompute_qkv', self.recompute_qkv)
+        self.recompute_qk_norm = cfg.get('recompute_qk_norm', self.recompute_qk_norm)
+        self.recompute_rope = cfg.get('recompute_rope', self.recompute_rope)
         self.recompute_att = cfg.get('recompute_att', self.recompute_att)
+        self.recompute_out_proj = cfg.get('recompute_out_proj', self.recompute_out_proj)
         self.recompute_block = cfg.get('recompute_block', self.recompute_block)
         self.recompute_lora = cfg.get('recompute_lora', self.recompute_lora)
 
@@ -618,6 +634,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         recompute_att = self.recompute_att or recompute_block
         recompute_ffn = self.recompute_ffn or recompute_block
         recompute_qkv = self.recompute_qkv or recompute_att
+        recompute_qk_norm = self.recompute_qk_norm or recompute_qkv
+        recompute_rope = self.recompute_rope or recompute_qkv
+        recompute_out_proj = self.recompute_out_proj or recompute_block
+        recompute_mlp_down = self.recompute_mlp_down or recompute_block
         recompute_swiglu = self.recompute_swiglu or recompute_ffn
         recompute_rmsnorm = self.recompute_rmsnorm or recompute_block
         
@@ -634,8 +654,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             recompute_swiglu=recompute_swiglu,
             recompute_rmsnorm=recompute_rmsnorm,
             recompute_ffn=recompute_ffn,
+            recompute_mlp_down=recompute_mlp_down,
             recompute_qkv=recompute_qkv,
+            recompute_qk_norm=recompute_qk_norm,
+            recompute_rope=recompute_rope,
             recompute_att=recompute_att,
+            recompute_out_proj=recompute_out_proj,
             recompute_block=recompute_block,
             recompute_lora=self.recompute_lora,
             offload_residual=self.offload_residual,

@@ -20,13 +20,41 @@
 // The modular system consumes these via modules::ModelOptions::from_runtime_options().
 struct RuntimeOptions {
     bool KeepAllActivations = false;
-    bool RecomputeSwiGLu = false;
-    bool RecomputeRMSNorm = false;
-    bool RecomputeFFN = false;
-    bool RecomputeQKV = false;
-    bool RecomputeAtt = false;
-    bool RecomputeBlock = true;
-    bool RecomputeLoRA = false;  // Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models)
+
+    // ========================================================================
+    // Fine-grained recomputation flags (per-component instead of per-layer)
+    // ========================================================================
+    // These provide memory-compute tradeoffs at different granularities.
+    // When RecomputeBlock=true (default), all component flags are effectively enabled.
+    //
+    // Memory savings per component (approximate for 7B model, B=4, T=2048):
+    //   - swiglu:    ~200MB  (B*T*2*D tensor saved)
+    //   - mlp_up:    ~400MB  (B*T*2*D tensor saved)
+    //   - qkv:       ~200MB  (B*T*QKV_C tensor saved)
+    //   - att:       ~150MB  (B*T*Hq*Hs tensor saved)
+    //   - att_out:   ~100MB  (B*T*C tensor saved)
+    //   - ln1/ln2:    ~50MB each (B*T*C tensors + rstd)
+    //
+    // Compute cost per recompute (relative):
+    //   - swiglu:    ~0.5%   (elementwise, very cheap)
+    //   - rmsnorm:   ~1%     (reduction, cheap)
+    //   - qkv:       ~15%    (large matmul)
+    //   - att:       ~30%    (flash attention)
+    //   - att_out:   ~10%    (matmul)
+    //   - mlp_up:    ~15%    (large matmul)
+    //   - mlp_down:  ~15%    (large matmul)
+    //
+    bool RecomputeSwiGLu = false;    ///< Recompute SwiGLU activation in FFN backward
+    bool RecomputeRMSNorm = false;   ///< Recompute RMSNorm (LN1/LN2) forward
+    bool RecomputeFFN = false;       ///< Recompute FFN/MLP up projection (implies RecomputeSwiGLu)
+    bool RecomputeMLPDown = false;   ///< Recompute MLP down projection (rarely needed, output saved anyway)
+    bool RecomputeQKV = false;       ///< Recompute QKV projection
+    bool RecomputeQKNorm = false;    ///< Recompute QK head normalization (Qwen3-style)
+    bool RecomputeRoPE = false;      ///< Recompute RoPE rotation (cheap, usually saved for QK-norm backward)
+    bool RecomputeAtt = false;       ///< Recompute attention (flash attention forward) (implies RecomputeQKV)
+    bool RecomputeOutProj = false;   ///< Recompute attention output projection
+    bool RecomputeBlock = true;      ///< Recompute entire layer (enables all component flags)
+    bool RecomputeLoRA = false;      ///< Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models)
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;

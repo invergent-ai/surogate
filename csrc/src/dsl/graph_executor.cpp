@@ -2925,16 +2925,32 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     };
     augment_shape_env(st.shape_env, mModule.config);
 
+    // Fine-grained recomputation flags
+    // When RecomputeBlock is true, it acts as a master switch enabling all components.
+    // Individual flags can be set independently for fine-grained control.
     const bool disable_recompute_block = rs.is_lora_only_mode() && !mOptions.RecomputeLoRA;
     const bool recompute_block = mOptions.RecomputeBlock && !disable_recompute_block;
+
+    // Attention path recomputation
     const bool recompute_att = mOptions.RecomputeAtt || recompute_block;
     const bool recompute_qkv = mOptions.RecomputeQKV || recompute_att;
+    const bool recompute_qk_norm = mOptions.RecomputeQKNorm || recompute_qkv;
+    const bool recompute_rope = mOptions.RecomputeRoPE || recompute_qkv;
+    const bool recompute_out_proj = mOptions.RecomputeOutProj || recompute_block;
+
+    // FFN/MLP path recomputation
     const bool recompute_ffn = mOptions.RecomputeFFN || recompute_block;
     const bool recompute_swiglu = mOptions.RecomputeSwiGLu || recompute_ffn;
+    const bool recompute_mlp_down = mOptions.RecomputeMLPDown || recompute_block;
+
+    // Normalization recomputation
     const bool recompute_rmsnorm = mOptions.RecomputeRMSNorm || recompute_block;
-    const bool recompute_ln1 = recompute_rmsnorm || recompute_att || recompute_block;
-    const bool recompute_ln2 = recompute_rmsnorm || recompute_ffn || recompute_block;
-    const bool recompute_any = recompute_ln1 || recompute_qkv || recompute_att || recompute_ln2 || recompute_ffn || recompute_swiglu;
+    const bool recompute_ln1 = recompute_rmsnorm || recompute_qkv || recompute_block;
+    const bool recompute_ln2 = recompute_rmsnorm || recompute_out_proj || recompute_ffn || recompute_block;
+
+    // Overall flag for any recomputation
+    const bool recompute_any = recompute_ln1 || recompute_qkv || recompute_att || recompute_ln2 ||
+                               recompute_ffn || recompute_swiglu || recompute_out_proj || recompute_mlp_down;
     const bool recompute_lora = mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRARunState;
     const bool debug_recompute_compare = env_enabled("SUROGATE_DEBUG_RECOMPUTE_COMPARE");
     const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0;
@@ -3264,7 +3280,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             attention_forward_cudnn(att_out, lse_view, qkv_view, rs.scratch().cudnn_workspace,
                                     rs.CudnnHandle, Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
 
-            if (recompute_block) {
+            if (recompute_out_proj) {
                 ensure_act(acts.att_out);
                 Tensor& out_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].out_weight");
                 Tensor att_flat = view_tensor(acts.att, {B * T, att_dim});

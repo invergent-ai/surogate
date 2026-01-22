@@ -297,7 +297,8 @@ NB_MODULE(_surogate, m) {
         "Many flags trade compute for memory (recompute) or host/device transfers (offload).\n\n"
         "Backwards-compatibility: `LLamaOptions` is an alias of this class.")
         .def("__init__", [](RuntimeOptions *t, bool recompute_swiglu, bool recompute_rmsnorm,
-            bool recompute_ffn, bool recompute_qkv, bool recompute_att, bool recompute_block, bool recompute_lora, bool offload_residual,
+            bool recompute_ffn, bool recompute_mlp_down, bool recompute_qkv, bool recompute_qk_norm,
+            bool recompute_rope, bool recompute_att, bool recompute_out_proj, bool recompute_block, bool recompute_lora, bool offload_residual,
             bool use_cuda_graphs, bool trigger_timing_events,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
@@ -326,8 +327,12 @@ NB_MODULE(_surogate, m) {
                 .RecomputeSwiGLu = recompute_swiglu,
                 .RecomputeRMSNorm = recompute_rmsnorm,
                 .RecomputeFFN = recompute_ffn,
+                .RecomputeMLPDown = recompute_mlp_down,
                 .RecomputeQKV = recompute_qkv,
+                .RecomputeQKNorm = recompute_qk_norm,
+                .RecomputeRoPE = recompute_rope,
                 .RecomputeAtt = recompute_att,
+                .RecomputeOutProj = recompute_out_proj,
                 .RecomputeBlock = recompute_block,
                 .RecomputeLoRA = recompute_lora,
                 .OffloadResidual = offload_residual,
@@ -360,8 +365,12 @@ NB_MODULE(_surogate, m) {
              nb::arg("recompute_swiglu") = false,
              nb::arg("recompute_rmsnorm") = false,
              nb::arg("recompute_ffn") = false,
+             nb::arg("recompute_mlp_down") = false,
              nb::arg("recompute_qkv") = false,
+             nb::arg("recompute_qk_norm") = false,
+             nb::arg("recompute_rope") = false,
              nb::arg("recompute_att") = false,
+             nb::arg("recompute_out_proj") = false,
              nb::arg("recompute_block") = false,
              nb::arg("recompute_lora") = false,
              nb::arg("offload_residual") = false,
@@ -412,8 +421,12 @@ NB_MODULE(_surogate, m) {
         .def_rw("recompute_swiglu", &RuntimeOptions::RecomputeSwiGLu, "Recompute SwiGLU activations in backward.")
         .def_rw("recompute_rms_norm", &RuntimeOptions::RecomputeRMSNorm, "Recompute RMSNorm in backward.")
         .def_rw("recompute_ffn", &RuntimeOptions::RecomputeFFN, "Recompute FFN in backward.")
+        .def_rw("recompute_mlp_down", &RuntimeOptions::RecomputeMLPDown, "Recompute MLP down projection in backward.")
         .def_rw("recompute_qkv", &RuntimeOptions::RecomputeQKV, "Recompute QKV projections in backward.")
+        .def_rw("recompute_qk_norm", &RuntimeOptions::RecomputeQKNorm, "Recompute QK head normalization (Qwen3-style) in backward.")
+        .def_rw("recompute_rope", &RuntimeOptions::RecomputeRoPE, "Recompute RoPE rotation in backward.")
         .def_rw("recompute_att", &RuntimeOptions::RecomputeAtt, "Recompute attention in backward.")
+        .def_rw("recompute_out_proj", &RuntimeOptions::RecomputeOutProj, "Recompute attention output projection in backward.")
         .def_rw("recompute_block", &RuntimeOptions::RecomputeBlock, "Recompute the whole block (coarse-grained).")
         .def_rw("recompute_lora", &RuntimeOptions::RecomputeLoRA, "Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models).")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
