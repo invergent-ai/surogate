@@ -241,10 +241,13 @@ void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
 DslRunState::DslRunState(const PretrainedConfig& config,
                          const RuntimeOptions& options,
                          int B, int T,
-                         const std::shared_ptr<TensorAllocator>& allocator)
+                         const std::shared_ptr<TensorAllocator>& allocator,
+                         bool lora_only_mode)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
-      mRecomputeBlock(options.RecomputeBlock) {
+      mRecomputeBlock(options.RecomputeBlock),
+      mRecomputeLoRA(options.RecomputeLoRA),
+      mLoraOnlyMode(lora_only_mode) {
     if (!mAllocator) {
         throw std::runtime_error("DslRunState: allocator is null");
     }
@@ -355,15 +358,22 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const auto dtype = mActivationDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    const bool share_ln1 = mRecomputeBlock || false;
-    const bool share_ln2 = mRecomputeBlock || false;
-    const bool share_qkv = mRecomputeBlock || false;
-    const bool share_att = mRecomputeBlock || false;
-    const bool share_mlp_up = mRecomputeBlock || false;
-    const bool share_swiglu = mRecomputeBlock || false;
+    const bool lora_only = mLoraOnlyMode;
+    const bool lora_can_share_ln = !lora_only || mRecomputeLoRA;
+    const bool lora_can_share_att = !lora_only;
+    const bool lora_can_share_qkv = !lora_only;
+    const bool lora_can_share_mlp_up = !lora_only;
+    const bool lora_can_share_swiglu = !lora_only || mRecomputeLoRA;
+    const bool share_ln1 = mRecomputeBlock && lora_can_share_ln;
+    const bool share_ln2 = mRecomputeBlock && lora_can_share_ln;
+    const bool share_qkv = mRecomputeBlock && lora_can_share_qkv;
+    const bool share_att = mRecomputeBlock && lora_can_share_att;
+    const bool share_mlp_up = mRecomputeBlock && lora_can_share_mlp_up;
+    const bool share_swiglu = mRecomputeBlock && lora_can_share_swiglu;
     // Keep per-layer residual_att and mlp_down to preserve per-layer inputs for recompute.
     const bool share_residual = false;
-    const bool ffn_temps_on_stack = mRecomputeBlock;
+    const bool ffn_temps_on_stack = mRecomputeBlock && lora_can_share_mlp_up && lora_can_share_swiglu;
+    mFfnTempsOnStack = ffn_temps_on_stack;
 
     Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_att{}, shared_att_out{};
     Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};

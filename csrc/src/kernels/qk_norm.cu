@@ -14,6 +14,7 @@
  * by RoPE and cuDNN FlashAttention.
  */
 
+#include <algorithm>
 #include <cassert>
 
 #include "kernels.h"
@@ -362,81 +363,117 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(
     const floatX* freqs_cis,
     const int* position_ids,
     int tokens, int T, int qkv_channels,
-    int num_heads, int head_size, int channel_offset
+    int num_heads, int head_size, int channel_offset,
+    float* abs_max_ptr
 ) {
     constexpr int WARP = 32;
     static_assert(WARP_SIZE == WARP);
     const int vecs_per_block = static_cast<int>(blockDim.y);
     const int vec_idx = static_cast<int>(blockIdx.x) * vecs_per_block + static_cast<int>(threadIdx.y);
     const int total_vecs = tokens * num_heads;
-    if (vec_idx >= total_vecs) return;
+    const bool record_abs = abs_max_ptr != nullptr;
+    const bool active = vec_idx < total_vecs;
+    if (!record_abs) {
+        if (!active) return;
+    }
 
-    const int token_idx = vec_idx / num_heads;
-    const int head_idx = vec_idx - token_idx * num_heads;
-    const int b = token_idx / T;
-    const int t = token_idx - b * T;
-    const int pos = position_ids ? position_ids[token_idx] : t;
+    const int token_idx = active ? (vec_idx / num_heads) : 0;
+    const int head_idx = active ? (vec_idx - token_idx * num_heads) : 0;
+    const int b = active ? (token_idx / T) : 0;
+    const int t = active ? (token_idx - b * T) : 0;
+    const int pos = active ? (position_ids ? position_ids[token_idx] : t) : 0;
 
-    const floatX* outp = qkv_rope + token_idx * qkv_channels + channel_offset + head_idx * head_size;
-    floatX* dptr = d_qkv + token_idx * qkv_channels + channel_offset + head_idx * head_size;
+    const floatX* outp = (!active)
+        ? nullptr
+        : qkv_rope + token_idx * qkv_channels + channel_offset + head_idx * head_size;
+    floatX* dptr = (!active)
+        ? nullptr
+        : d_qkv + token_idx * qkv_channels + channel_offset + head_idx * head_size;
 
     const int half = head_size / 2;
     if ((half % WARP) != 0) return;
 
     // dot = sum(dy_pre * out_pre) over head_size.
     float dot = 0.0f;
-    for (int i = threadIdx.x; i < half; i += WARP) {
-        const float o0 = to_float(outp[i]);
-        const float o1 = to_float(outp[i + half]);
-        const float dy0 = to_float(dptr[i]);
-        const float dy1 = to_float(dptr[i + half]);
+    if (!active) {
+        dot = 0.0f;
+    } else {
+        for (int i = threadIdx.x; i < half; i += WARP) {
+            const float o0 = to_float(outp[i]);
+            const float o1 = to_float(outp[i + half]);
+            const float dy0 = to_float(dptr[i]);
+            const float dy1 = to_float(dptr[i + half]);
 
-        float c, sin;
-        load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
+            float c, sin;
+            load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
 
-        // Inverse RoPE: a0 = b0*c + b1*s; a1 = b1*c - b0*s
-        const float out0 = o0 * c + o1 * sin;
-        const float out1 = o1 * c - o0 * sin;
-        const float d0 = dy0 * c + dy1 * sin;
-        const float d1 = dy1 * c - dy0 * sin;
+            // Inverse RoPE: a0 = b0*c + b1*s; a1 = b1*c - b0*s
+            const float out0 = o0 * c + o1 * sin;
+            const float out1 = o1 * c - o0 * sin;
+            const float d0 = dy0 * c + dy1 * sin;
+            const float d1 = dy1 * c - dy0 * sin;
 
-        dot += d0 * out0 + d1 * out1;
+            dot += d0 * out0 + d1 * out1;
+        }
     }
     dot = warpReduceSum(dot);
 
-    const float s = rstd[token_idx * num_heads + head_idx];
+    float s = 0.0f;
+    if (!active) {
+        s = 0.0f;
+    } else {
+        s = rstd[token_idx * num_heads + head_idx];
+    }
     const float coeff = s / static_cast<float>(head_size);
 
     // Transform dy_post -> dx_pre in-place for Q/K channels.
-    for (int i = threadIdx.x; i < half; i += WARP) {
-        const float o0 = to_float(outp[i]);
-        const float o1 = to_float(outp[i + half]);
-        const float dy0 = to_float(dptr[i]);
-        const float dy1 = to_float(dptr[i + half]);
+    float thread_abs_max = 0.f;
+    if (!active) {
+        thread_abs_max = 0.f;
+    } else {
+        for (int i = threadIdx.x; i < half; i += WARP) {
+            const float o0 = to_float(outp[i]);
+            const float o1 = to_float(outp[i + half]);
+            const float dy0 = to_float(dptr[i]);
+            const float dy1 = to_float(dptr[i + half]);
 
-        float c, sin;
-        load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
+            float c, sin;
+            load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
 
-        const float out0 = o0 * c + o1 * sin;
-        const float out1 = o1 * c - o0 * sin;
-        const float d0 = dy0 * c + dy1 * sin;
-        const float d1 = dy1 * c - dy0 * sin;
+            const float out0 = o0 * c + o1 * sin;
+            const float out1 = o1 * c - o0 * sin;
+            const float d0 = dy0 * c + dy1 * sin;
+            const float d1 = dy1 * c - dy0 * sin;
 
-        const float w0 = to_float(weight[i]);
-        const float w1 = to_float(weight[i + half]);
-        const float inv_w0 = (w0 != 0.f) ? (1.0f / w0) : 0.0f;
-        const float inv_w1 = (w1 != 0.f) ? (1.0f / w1) : 0.0f;
+            const float w0 = to_float(weight[i]);
+            const float w1 = to_float(weight[i + half]);
+            const float inv_w0 = (w0 != 0.f) ? (1.0f / w0) : 0.0f;
+            const float inv_w1 = (w1 != 0.f) ? (1.0f / w1) : 0.0f;
 
-        const float xhat0 = out0 * inv_w0;
-        const float xhat1 = out1 * inv_w1;
-        const float wdy0 = d0 * w0;
-        const float wdy1 = d1 * w1;
+            const float xhat0 = out0 * inv_w0;
+            const float xhat1 = out1 * inv_w1;
+            const float wdy0 = d0 * w0;
+            const float wdy1 = d1 * w1;
 
-        const float dx0 = wdy0 * s - xhat0 * coeff * dot;
-        const float dx1 = wdy1 * s - xhat1 * coeff * dot;
+            const float dx0 = wdy0 * s - xhat0 * coeff * dot;
+            const float dx1 = wdy1 * s - xhat1 * coeff * dot;
 
-        dptr[i] = from_float<floatX>(dx0);
-        dptr[i + half] = from_float<floatX>(dx1);
+            dptr[i] = from_float<floatX>(dx0);
+            dptr[i + half] = from_float<floatX>(dx1);
+            if (record_abs) {
+                thread_abs_max = fmaxf(thread_abs_max, fabsf(dx0));
+                thread_abs_max = fmaxf(thread_abs_max, fabsf(dx1));
+            }
+        }
+    }
+
+    if (record_abs) {
+        __shared__ float block_abs_max;
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            block_abs_max = 0.f;
+        }
+        __syncthreads();
+        handle_absmax_reduction(abs_max_ptr, &block_abs_max, thread_abs_max);
     }
 }
 
@@ -515,6 +552,33 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(
 }
 
 template<typename floatX>
+__global__ void qkv_abs_max_slice_kernel(
+    const floatX* qkv,
+    int tokens, int qkv_channels,
+    int channel_offset, int channel_count,
+    float* abs_max_ptr
+) {
+    float thread_max = 0.f;
+    const int total = tokens * channel_count;
+    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+         idx < total;
+         idx += static_cast<int>(blockDim.x) * static_cast<int>(gridDim.x)) {
+        const int token_idx = idx / channel_count;
+        const int channel_idx = idx - token_idx * channel_count;
+        const int offset = token_idx * qkv_channels + channel_offset + channel_idx;
+        const float v = to_float(qkv[offset]);
+        thread_max = fmaxf(thread_max, fabsf(v));
+    }
+
+    __shared__ float block_abs_max;
+    if (threadIdx.x == 0) {
+        block_abs_max = 0.f;
+    }
+    __syncthreads();
+    handle_absmax_reduction(abs_max_ptr, &block_abs_max, thread_max);
+}
+
+template<typename floatX>
 void launch_qk_norm_rope_forward(floatX* qkv, float* q_rstd, float* k_rstd,
                                  const floatX* q_weight, const floatX* k_weight,
                                  const floatX* freqs_cis, const int* position_ids,
@@ -534,13 +598,13 @@ void launch_rmsnorm_rope_backward_dx(floatX* d_qkv, const floatX* qkv_rope, cons
                                     const floatX* freqs_cis, const int* position_ids,
                                     int tokens, int T, int qkv_channels,
                                     int num_heads, int head_size, int channel_offset,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, float* abs_max_ptr) {
     constexpr int block_y = 4;
     dim3 block(WARP_SIZE, block_y);
     dim3 grid(div_ceil(tokens * num_heads, block_y));
     qkv_head_rmsnorm_rope_backward_dx_kernel<floatX><<<grid, block, 0, stream>>>(
         d_qkv, qkv_rope, weight, rstd, freqs_cis, position_ids,
-        tokens, T, qkv_channels, num_heads, head_size, channel_offset);
+        tokens, T, qkv_channels, num_heads, head_size, channel_offset, abs_max_ptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -556,6 +620,20 @@ void launch_rmsnorm_rope_backward_dweight(floatX* d_weight, const floatX* d_qkv,
     qkv_head_rmsnorm_rope_backward_dweight_kernel<floatX><<<grid, block, 0, stream>>>(
         d_weight, d_qkv, qkv_rope, weight, freqs_cis, position_ids,
         tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename floatX>
+void launch_qkv_abs_max_slice(const floatX* qkv, int tokens, int qkv_channels,
+                              int channel_offset, int channel_count,
+                              float* abs_max_ptr, cudaStream_t stream) {
+    if (!abs_max_ptr) return;
+    constexpr int block = 256;
+    const int total = tokens * channel_count;
+    if (total <= 0) return;
+    const int grid = std::min(1024, div_ceil(total, block));
+    qkv_abs_max_slice_kernel<floatX><<<grid, block, 0, stream>>>(
+        qkv, tokens, qkv_channels, channel_offset, channel_count, abs_max_ptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -697,7 +775,7 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv, const Tensor& qkv_rope, co
                                        const Tensor& freqs_cis, const int* position_ids,
                                        int B, int T, int qkv_channels,
                                        int num_heads, int head_size, int channel_offset,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, float* abs_max_ptr) {
     if (rstd.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: rstd must be FP32");
     }
@@ -715,11 +793,11 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv, const Tensor& qkv_rope, co
     if (d_qkv.DType == ETensorDType::BF16) {
         launch_rmsnorm_rope_backward_dx(d_qkv.get<nv_bfloat16>(), qkv_rope.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(),
                                         freqs_cis.get<nv_bfloat16>(), position_ids,
-                                        tokens, T, qkv_channels, num_heads, head_size, channel_offset, stream);
+                                        tokens, T, qkv_channels, num_heads, head_size, channel_offset, stream, abs_max_ptr);
     } else if (d_qkv.DType == ETensorDType::FP32) {
         launch_rmsnorm_rope_backward_dx(d_qkv.get<float>(), qkv_rope.get<float>(), weight.get<float>(), rstd.get<float>(),
                                         freqs_cis.get<float>(), position_ids,
-                                        tokens, T, qkv_channels, num_heads, head_size, channel_offset, stream);
+                                        tokens, T, qkv_channels, num_heads, head_size, channel_offset, stream, abs_max_ptr);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: unsupported dtype");
     }
@@ -754,5 +832,29 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qk
                                              tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight: unsupported dtype");
+    }
+}
+
+void qkv_abs_max_slice(const Tensor& qkv, int B, int T, int qkv_channels,
+                       int channel_offset, int channel_count,
+                       float* abs_max_ptr, cudaStream_t stream) {
+    if (!abs_max_ptr) return;
+    if (qkv.DType != ETensorDType::BF16 && qkv.DType != ETensorDType::FP32) {
+        throw std::logic_error("qkv_abs_max_slice: unsupported dtype");
+    }
+    const int tokens = B * T;
+    if (qkv.Rank != 3 || qkv.Sizes[0] != B || qkv.Sizes[1] != T || qkv.Sizes[2] != qkv_channels) {
+        throw std::logic_error("qkv_abs_max_slice: unexpected qkv shape");
+    }
+    if (channel_offset < 0 || channel_count < 0 || channel_offset + channel_count > qkv_channels) {
+        throw std::logic_error("qkv_abs_max_slice: invalid channel slice");
+    }
+
+    if (qkv.DType == ETensorDType::BF16) {
+        launch_qkv_abs_max_slice(qkv.get<nv_bfloat16>(), tokens, qkv_channels,
+                                 channel_offset, channel_count, abs_max_ptr, stream);
+    } else {
+        launch_qkv_abs_max_slice(qkv.get<float>(), tokens, qkv_channels,
+                                 channel_offset, channel_count, abs_max_ptr, stream);
     }
 }

@@ -95,13 +95,17 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv, const Tensor& qkv_rope, co
                                        const Tensor& freqs_cis, const int* position_ids,
                                        int B, int T, int qkv_channels,
                                        int num_heads, int head_size, int channel_offset,
-                                       cudaStream_t stream);
+                                       cudaStream_t stream, float* abs_max_ptr = nullptr);
 
 void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qkv, const Tensor& qkv_rope, const Tensor& weight,
                                             const Tensor& freqs_cis, const int* position_ids,
                                             int B, int T, int qkv_channels,
                                             int num_heads, int head_size, int channel_offset,
                                             bool accumulate, cudaStream_t stream);
+
+void qkv_abs_max_slice(const Tensor& qkv, int B, int T, int qkv_channels,
+                       int channel_offset, int channel_count,
+                       float* abs_max_ptr, cudaStream_t stream);
 
 void matmul(float* c, const float* a, const float* b, const float* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,

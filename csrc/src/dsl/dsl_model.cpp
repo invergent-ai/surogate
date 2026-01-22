@@ -1301,7 +1301,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mAllocator = std::make_shared<TensorAllocator>();
     }
     mOptions = options;
-    mRunState = std::make_unique<DslRunState>(*mConfig, options, B, T, mAllocator);
+    mRunState = std::make_unique<DslRunState>(*mConfig, options, B, T, mAllocator, lora_enabled());
     mRunState->WorldSize = comm.world_size();
 
     GraphExecutorOptions exec_opts;

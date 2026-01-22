@@ -84,7 +84,8 @@ public:
     DslRunState(const PretrainedConfig& config,
                 const RuntimeOptions& options,
                 int B, int T,
-                const std::shared_ptr<TensorAllocator>& allocator);
+                const std::shared_ptr<TensorAllocator>& allocator,
+                bool lora_only_mode = false);
     ~DslRunState();
 
     modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) { return mSimplifiedActivations[layer_idx]; }
@@ -99,9 +100,9 @@ public:
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();
 
-    bool ffn_temps_on_stack() const { return mRecomputeBlock; }
+    bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
     bool large_bwd_temps_on_stack() const { return mRecomputeBlock; }
-    bool is_lora_only_mode() const { return false; }
+    bool is_lora_only_mode() const { return mLoraOnlyMode; }
 
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
@@ -133,6 +134,9 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     Tensor mStackBuffer{};
     bool mRecomputeBlock = false;
+    bool mRecomputeLoRA = false;
+    bool mLoraOnlyMode = false;
+    bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;
     ETensorDType mMatmulDtype = ETensorDType::BF16;
