@@ -13,13 +13,22 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "dsl/ir.h"
+#include "utilities/stack.h"
 #include "utilities/tensor.h"
 
 class NCCLCommunicator;
 struct RuntimeOptions;
 
-namespace modules { struct ModelConfig; }
+namespace modules {
+struct ModelConfig;
+struct ModularLoRAConfig;
+class ModularLoRAWeightsManager;
+class ModularLoRAGradsManager;
+struct LoRARunState;
+}
 namespace dsl { class DslRunState; class DslParamStore; class DslGradStore; }
 
 namespace dsl {
@@ -53,6 +62,12 @@ public:
     // RNG state helpers (for checkpointing/repro)
     virtual std::vector<std::byte> rng_state() const = 0;
     virtual void set_rng_state(const std::vector<std::byte>& state) = 0;
+
+    // Optional LoRA state wiring (no-op for implementations that don't support it).
+    virtual void set_lora_state(const modules::ModularLoRAConfig*,
+                                modules::ModularLoRAWeightsManager*,
+                                modules::ModularLoRAGradsManager*,
+                                modules::LoRARunState*) {}
 };
 
 class GraphExecutor final : public IGraphExecutor {
@@ -64,6 +79,11 @@ public:
                   const modules::ModelConfig& config,
                   const RuntimeOptions& options,
                   const GraphExecutorOptions& exec_options = {});
+
+    void set_lora_state(const modules::ModularLoRAConfig* config,
+                        modules::ModularLoRAWeightsManager* weights,
+                        modules::ModularLoRAGradsManager* grads,
+                        modules::LoRARunState* run_state);
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
@@ -77,6 +97,7 @@ public:
 
 private:
     void init(const GraphExecutorOptions& options);
+    void reset_cuda_graphs();
 
     const Module& mModule;
     DslRunState& mRunState;
@@ -84,6 +105,12 @@ private:
     DslGradStore& mGrads;
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
+
+    // Optional LoRA state (owned by DslModel)
+    const modules::ModularLoRAConfig* mLoRAConfig = nullptr;
+    modules::ModularLoRAWeightsManager* mLoRAWeights = nullptr;
+    modules::ModularLoRAGradsManager* mLoRAGrads = nullptr;
+    modules::LoRARunState* mLoRARunState = nullptr;
 
     const Graph* mForward;
     const Graph* mBackward;
@@ -93,8 +120,11 @@ private:
 
     // Combined save list (forward.save + autodiff-computed saves)
     std::vector<std::string> mSaveList;
+    std::vector<std::string> mEmbeddingOutputs;
 
     std::unordered_map<std::string, Tensor> mSaved;
+    std::unordered_map<std::string, std::string> mViewSources;
+    std::unordered_map<std::string, std::string> mViewSourcesReverse;
     Tensor mLastInputsCpu{};
     bool mFP8ScalingInitialized = false;
 
@@ -106,6 +136,18 @@ private:
     unsigned int next_rng_seed();
 
     std::minstd_rand mRng{42};
+
+    // CUDA graph capture (optional)
+    bool mGraphsEnabled = false; // Forward graphs
+    bool mBackwardGraphsEnabled = false;
+    bool mBackwardGraphCapturable = true;
+    std::size_t mBackwardGraphCut = 0;
+    long mGraphB = 0;
+    long mGraphT = 0;
+    cudaGraphExec_t mForwardGraph = nullptr;
+    cudaGraphExec_t mBackwardGraph[2]{nullptr, nullptr}; // [0]=accumulate false, [1]=true
+    DeviceMemoryStack::Checkpoint mForwardCheckpoint{};
+    DeviceMemoryStack::Checkpoint mBackwardCheckpoint[2]{};
 };
 
 }  // namespace dsl

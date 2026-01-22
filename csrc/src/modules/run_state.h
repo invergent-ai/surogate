@@ -401,6 +401,7 @@ private:
     Tensor mSharedAttQuant;
     Tensor mSharedSwiGluQuant;
     std::array<Tensor, 2> mSharedDResFFN{};
+    std::array<Tensor, 2> mSharedDMlpDown{};
     Tensor mSharedDResAtt;
     Tensor mSharedDLn2;
     Tensor mSharedDMlpUp;

@@ -7,12 +7,18 @@
 #define SUROGATE_SRC_DSL_DSL_MODEL_H
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "dsl/ir.h"
 #include "modules/model_config.h"
+#include "modules/lora/lora_config.h"
+#include "modules/lora/lora_grads_manager.h"
+#include "modules/lora/lora_optimizer_state.h"
+#include "modules/lora/lora_run_state.h"
+#include "modules/lora/lora_weights_manager.h"
 #include "training/model.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
@@ -84,7 +90,8 @@ public:
     DslModel(const PretrainedConfig& config,
              const RuntimeOptions& options,
              const std::string& ir_json,
-             const std::shared_ptr<TensorAllocator>& allocator);
+             const std::shared_ptr<TensorAllocator>& allocator,
+             const std::optional<modules::ModularLoRAConfig>& lora_config = std::nullopt);
     ~DslModel() override;
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
@@ -94,10 +101,32 @@ public:
     void update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) override;
 
     ITensorContainer& weights() override;
-    ITensorContainer& opt_momentum() override { return mAdamWMomentumContainer; }
-    ITensorContainer& opt_momentum_scales() override { return mEmpty; }
-    ITensorContainer& opt_variance() override { return mAdamWVarianceContainer; }
-    ITensorContainer& opt_variance_scales() override { return mEmpty; }
+    ITensorContainer& opt_momentum() override;
+    ITensorContainer& opt_momentum_scales() override;
+    ITensorContainer& opt_variance() override;
+    ITensorContainer& opt_variance_scales() override;
+
+    // LoRA adapter API (no-op for non-LoRA models).
+    void export_adapter(const std::string& directory, NCCLCommunicator& comm, const std::string& base_model_path = "");
+    void import_adapter(const std::string& file_name, NCCLCommunicator& comm);
+    void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
+    void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
+
+    [[nodiscard]] bool lora_enabled() const { return mLoRAConfig.has_value() && mLoRAConfig->enabled(); }
+    [[nodiscard]] bool qlora_enabled() const { return false; }
+    [[nodiscard]] bool is_moe_model() const { return mIsMoEModel; }
+    [[nodiscard]] std::size_t lora_num_parameters() const {
+        return mLoRAWeights ? mLoRAWeights->num_parameters() : 0;
+    }
+    [[nodiscard]] std::size_t qlora_quantized_weights_bytes() const { return 0; }
+    [[nodiscard]] float qlora_memory_savings_ratio() const { return 0.f; }
+    DslModel& base_model() { return *this; }
+    [[nodiscard]] const modules::ModelConfig& config() const { return mModelConfig; }
+
+    modules::ModularLoRAWeightsManager& lora_weights();
+    modules::ModularLoRAGradsManager& lora_grads();
+    modules::LoRARunState& lora_run_state();
+    [[nodiscard]] const modules::ModularLoRAConfig& lora_config() const { return *mLoRAConfig; }
 
     std::vector<std::byte> rng_state() const override;
     void set_rng_state(const std::vector<std::byte>& state) override;
@@ -136,6 +165,14 @@ private:
     void validate_param_shapes(const Module& module) const;
     void init_optimizer_state(cudaStream_t stream);
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
+    void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
+    void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T);
+    void update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
+                               int t, float epsilon, float weight_decay, float grad_clip);
+    void update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
+    void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
+    void initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);
+    void update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
 
     std::unique_ptr<PretrainedConfig> mConfig;
     modules::ModelConfig mModelConfig;
@@ -151,6 +188,15 @@ private:
     detail::AdamW8BitVarianceContainer mAdamWVarianceContainer;
     std::unique_ptr<IGraphExecutor> mExecutor;
     std::vector<std::byte> mRngState;
+
+    // LoRA state (optional)
+    std::optional<modules::ModularLoRAConfig> mLoRAConfig;
+    std::unique_ptr<modules::ModularLoRAWeightsManager> mLoRAWeights;
+    std::unique_ptr<modules::ModularLoRAGradsManager> mLoRAGrads;
+    std::unique_ptr<modules::LoRARunState> mLoRARunState;
+    std::unique_ptr<modules::LoRAAdamW8BitState> mLoRAAdamW8BitState;
+    std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
+    bool mIsMoEModel = false;
 
     struct AdamW8BitState {
         bool initialized = false;

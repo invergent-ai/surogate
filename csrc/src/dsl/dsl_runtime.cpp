@@ -229,7 +229,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          const std::shared_ptr<TensorAllocator>& allocator)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
-      mRecomputeBlock(false) {
+      mRecomputeBlock(options.RecomputeBlock) {
     if (!mAllocator) {
         throw std::runtime_error("DslRunState: allocator is null");
     }
@@ -335,7 +335,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const bool share_att = mRecomputeBlock || false;
     const bool share_mlp_up = mRecomputeBlock || false;
     const bool share_swiglu = mRecomputeBlock || false;
-    const bool share_residual = mRecomputeBlock;
+    // Keep per-layer residual_att and mlp_down to preserve per-layer inputs for recompute.
+    const bool share_residual = false;
     const bool ffn_temps_on_stack = mRecomputeBlock;
 
     Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_att{}, shared_att_out{};
@@ -434,6 +435,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             g.d_qkv = mAllocator->allocate(dtype, "d_qkv", kind, {B, T, QKV});
         }
 
+        g.d_mlp_down = mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
         g.d_att = mAllocator->allocate(dtype, "d_att", kind, {B, T, Hq * D});
         g.d_ln1 = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }

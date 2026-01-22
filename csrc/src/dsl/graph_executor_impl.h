@@ -374,6 +374,9 @@ Tensor* resolve_block_gradient_tensor(ExecState<Block>& st, const std::string& n
     if (field == "mlp_up") {
         return map_tensor(grads.d_mlp_up);
     }
+    if (field == "mlp_down" || field == "mlp_down_flat") {
+        return map_tensor(grads.d_mlp_down);
+    }
     if (field == "ln2") return map_tensor(grads.d_ln2);
     if (field == "res_att") return map_tensor(grads.d_res_att);
     if (field == "res_ffn") return map_tensor(grads.d_res_ffn);
@@ -1485,7 +1488,11 @@ void GraphExecutorImpl<Block>::execute_forward_graph(long B, long T, NCCLCommuni
 
     std::vector<char> required;
     if (!full) {
-        required = compute_required_ops(*mForward, mSaveList);
+        std::vector<std::string> needed = mSaveList;
+        for (const auto& kv : mForward->outputs) {
+            needed.push_back(kv.first);
+        }
+        required = compute_required_ops(*mForward, needed);
     }
 
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;

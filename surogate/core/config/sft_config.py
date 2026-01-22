@@ -478,7 +478,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.aim_experiment = cfg.get('aim_experiment', self.aim_experiment)
         self.aim_repo = cfg.get('aim_repo', self.aim_repo)
         self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
-
+        
+        if self.recompute_block:
+            self.recompute_att = True
+            self.recompute_ffn = True
+            self.recompute_rmsnorm = True
+        
+        if self.recompute_att:
+            self.recompute_qkv = True
+        
+        if self.recompute_ffn:
+            self.recompute_swiglu = True
+            
         # Parse distributed config
         distributed_cfg = cfg.get('distributed', None)
         if distributed_cfg:

@@ -18,6 +18,8 @@
 #include <unordered_set>
 
 #include "modules/fp8_scaling_state.h"
+#include "modules/lora/lora_model_utils.h"
+#include "modules/lora/lora_run_state.h"
 #include "modules/model_config.h"
 #include "training/runtime_options.h"
 #include "utilities/comm.h"
@@ -39,6 +41,8 @@ struct ExecState {
     long B = 0;
     long T = 0;
     ShapeEnv shape_env{};
+    const std::unordered_map<std::string, std::string>* view_sources = nullptr;
+    const std::unordered_map<std::string, std::string>* view_sources_rev = nullptr;
 
     std::unordered_map<std::string, Tensor> tensors;
     std::unordered_set<std::string> zero_tensors;
@@ -48,6 +52,65 @@ struct ExecState {
 
 bool starts_with(std::string_view value, std::string_view prefix) {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ends_with(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name);
+
+bool infer_block_tensor_shape(const ExecState& st, std::string_view name, std::vector<long>& shape) {
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(name, layer_idx, field)) {
+        return false;
+    }
+    const long B = st.B;
+    const long T = st.T;
+    const long C = st.config.HiddenSize;
+    const long D = st.config.IntermediateSize;
+    const long Hq = st.config.NumQueryHeads;
+    const long Hkv = st.config.NumKeyValHeads;
+    const long Hs = st.config.head_size();
+    const long QKV = Hs * (Hq + 2 * Hkv);
+    const long AttnDim = Hq * Hs;
+    const long MUp = 2 * D;
+
+    if (field == "ln1" || field == "ln2" || field == "res_att" || field == "res_ffn" || field == "att_out" || field == "mlp_down") {
+        shape = {B, T, C};
+        return true;
+    }
+    if (field == "mlp_up") {
+        shape = {B, T, MUp};
+        return true;
+    }
+    if (field == "swiglu") {
+        shape = {B, T, D};
+        return true;
+    }
+    if (field == "qkv" || field == "qkv_rope" || field == "qkv_flat" || field == "qkv_biased") {
+        shape = {B, T, QKV};
+        return true;
+    }
+    if (field == "att") {
+        shape = {B, T, AttnDim};
+        return true;
+    }
+    if (field == "q_rstd") {
+        shape = {B, T, Hq};
+        return true;
+    }
+    if (field == "k_rstd") {
+        shape = {B, T, Hkv};
+        return true;
+    }
+    if (field == "lse") {
+        shape = {B, Hq, T};
+        return true;
+    }
+    return false;
 }
 
 const AttrValue* find_attr(const AttrMap& attrs, std::string_view key) {
@@ -214,6 +277,28 @@ Tensor view_tensor(const Tensor& src, const std::vector<long>& shape) {
 
 bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name);
 
+std::string tensor_shape_str(const Tensor& t) {
+    std::string out = "[";
+    for (int i = 0; i < t.Rank; ++i) {
+        if (i > 0) out += ", ";
+        out += std::to_string(t.Sizes[i]);
+    }
+    out += "]";
+    return out;
+}
+
+bool tensor_shape_matches(const Tensor& t, const std::vector<long>& shape) {
+    if (t.Rank != static_cast<int>(shape.size())) {
+        return false;
+    }
+    for (int i = 0; i < t.Rank; ++i) {
+        if (t.Sizes[i] != shape[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::size_t shape_nelem(const std::vector<long>& shape) {
     std::size_t total = 1;
     for (long dim : shape) {
@@ -252,6 +337,56 @@ Tensor* resolve_block_activation_tensor(ExecState& st, const std::string& name, 
         auto [it, inserted] = st.tensors.emplace(name, view);
         if (!inserted) {
             it->second = view;
+        }
+        return &it->second;
+    };
+
+    auto& acts = st.rs.simplified_acts(layer_idx);
+    if (field == "ln1") return map_tensor(acts.ln1);
+    if (field == "ln1_rstd") return map_tensor(acts.ln1_rstd);
+    if (field == "ln2") return map_tensor(acts.ln2);
+    if (field == "ln2_rstd") return map_tensor(acts.ln2_rstd);
+    if (field == "q_rstd") return map_tensor(acts.q_rstd);
+    if (field == "k_rstd") return map_tensor(acts.k_rstd);
+    if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased") {
+        return map_tensor(acts.qkv);
+    }
+    if (field == "qkv_rope") {
+        if (acts.qkv_rope.Data) {
+            return map_tensor(acts.qkv_rope);
+        }
+        return map_tensor(acts.qkv);
+    }
+    if (field == "lse") return map_tensor(acts.lse);
+    if (field == "att") return map_tensor(acts.att);
+    if (field == "att_out" || field == "att_out_flat") return map_tensor(acts.att_out);
+    if (field == "res_att") return map_tensor(acts.residual_att);
+    if (field == "mlp_up" || field == "mlp_up_flat") return map_tensor(acts.mlp_up);
+    if (field == "swiglu") return map_tensor(acts.swiglu);
+    if (field == "mlp_down" || field == "mlp_down_flat") return map_tensor(acts.mlp_down);
+    if (field == "res_ffn") {
+        Tensor& res = st.rs.get_residual(layer_idx, st.rs.MainStream);
+        return map_tensor(res);
+    }
+
+    return nullptr;
+}
+
+Tensor* resolve_block_activation_base(ExecState& st, const std::string& name) {
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(name, layer_idx, field)) {
+        return nullptr;
+    }
+
+    auto map_tensor = [&](Tensor& base) -> Tensor* {
+        if (!base.Data) {
+            st.rs.temp_acquire(base);
+            st.temps.push_back(base);
+        }
+        auto [it, inserted] = st.tensors.emplace(name, base);
+        if (!inserted) {
+            it->second = base;
         }
         return &it->second;
     };
@@ -327,11 +462,62 @@ Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ET
     if (field == "mlp_up") {
         return map_tensor(grads.d_mlp_up);
     }
+    if (field == "mlp_down" || field == "mlp_down_flat") {
+        return map_tensor(grads.d_mlp_down);
+    }
     if (field == "ln2") return map_tensor(grads.d_ln2);
     if (field == "res_att") return map_tensor(grads.d_res_att);
     if (field == "res_ffn") return map_tensor(grads.d_res_ffn);
 
     return nullptr;
+}
+
+Tensor* resolve_gradient_view_tensor(ExecState& st,
+                                     const std::string& name,
+                                     const std::unordered_map<std::string, Tensor>& saved) {
+    if (!starts_with(name, "d_")) {
+        return nullptr;
+    }
+    if (!st.view_sources_rev) {
+        return nullptr;
+    }
+    const std::string base_in = name.substr(2);
+    auto it_rev = st.view_sources_rev->find(base_in);
+    if (it_rev == st.view_sources_rev->end()) {
+        return nullptr;
+    }
+    const std::string base_out = it_rev->second;
+    const std::string base_grad = "d_" + base_out;
+
+    Tensor* base = nullptr;
+    if (auto it = st.tensors.find(base_grad); it != st.tensors.end()) {
+        base = &it->second;
+    }
+    if (!base) {
+        return nullptr;
+    }
+
+    auto it_shape = saved.find(base_in);
+    std::vector<long> shape;
+    if (it_shape == saved.end()) {
+        if (ends_with(base_in, "_flat") && base->Rank >= 2) {
+            const long first = base->Sizes[0];
+            const long second = base->Sizes[1];
+            const long rest = static_cast<long>(base->nelem() / static_cast<std::size_t>(first * second));
+            shape = {first * second, rest};
+        } else {
+            return nullptr;
+        }
+    } else {
+        shape.assign(it_shape->second.Sizes.begin(),
+                     it_shape->second.Sizes.begin() + it_shape->second.Rank);
+    }
+    Tensor view = view_for_shape(*base, shape, name);
+    auto [ins_it, inserted] = st.tensors.emplace(name, view);
+    if (!inserted) {
+        ins_it->second = view;
+    }
+    return &ins_it->second;
 }
 
 Tensor& ensure_tensor(ExecState& st, const std::string& name, ETensorDType dtype, const std::vector<long>& shape) {
@@ -362,12 +548,74 @@ Tensor& get_tensor(ExecState& st, const std::string& name, const std::unordered_
         if (it == saved.end()) {
             throw std::runtime_error("DSL graph executor: missing saved tensor " + key);
         }
+        std::vector<long> shape(it->second.Sizes.begin(), it->second.Sizes.begin() + it->second.Rank);
+        // Prefer a live tensor if it exists (e.g., recomputed activations), but validate shape.
+        if (auto live_it = st.tensors.find(key); live_it != st.tensors.end()) {
+            if (tensor_shape_matches(live_it->second, shape)) {
+                return live_it->second;
+            }
+        }
+        if (st.view_sources) {
+            auto vs_it = st.view_sources->find(key);
+            if (vs_it != st.view_sources->end()) {
+                const std::string& src_name = vs_it->second;
+                Tensor* base = nullptr;
+                if (auto it_src = st.tensors.find(src_name); it_src != st.tensors.end()) {
+                    base = &it_src->second;
+                }
+                if (!base) {
+                    base = resolve_block_activation_base(st, src_name);
+                }
+                if (!base) {
+                    auto it_src_saved = saved.find(src_name);
+                    if (it_src_saved != saved.end()) {
+                        base = const_cast<Tensor*>(&it_src_saved->second);
+                    } else {
+                        try {
+                            base = &resolve_param_tensor(st, src_name);
+                        } catch (...) {
+                            base = nullptr;
+                        }
+                    }
+                }
+                if (base) {
+                    Tensor view = view_for_shape(*base, shape, key);
+                    auto [ins_it, inserted] = st.tensors.emplace(key, view);
+                    if (!inserted) {
+                        ins_it->second = view;
+                    }
+                    return ins_it->second;
+                }
+            }
+        }
+        if (Tensor* mapped = resolve_block_activation_tensor(st, key, it->second.DType, shape)) {
+            return *mapped;
+        }
+        if (Tensor* mapped = resolve_block_gradient_tensor(st, key, it->second.DType, shape)) {
+            return *mapped;
+        }
+        if (st.rs.ffn_temps_on_stack()) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(key, layer_idx, field)) {
+                throw std::runtime_error(
+                    "DSL graph executor: recompute_block active but saved tensor not mappable: " + key);
+            }
+        }
         return const_cast<Tensor&>(it->second);
     }
     // Check current tensors (params, intermediates, gradients)
     auto it = st.tensors.find(name);
     if (it != st.tensors.end()) {
+        if (starts_with(name, "d_") && ends_with(name, "_flat") && it->second.Rank != 2) {
+            if (Tensor* mapped = resolve_gradient_view_tensor(st, name, saved)) {
+                return *mapped;
+            }
+        }
         return it->second;
+    }
+    if (Tensor* mapped = resolve_gradient_view_tensor(st, name, saved)) {
+        return *mapped;
     }
     // Fall back to saved tensors (for forward intermediates used in backward)
     auto sit = saved.find(name);
@@ -383,11 +631,90 @@ Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_ma
     if (starts_with(name, kSavedPrefix)) {
         std::string key = std::string(name.substr(kSavedPrefix.size()));
         auto it = saved.find(key);
-        return it != saved.end() ? &it->second : nullptr;
+        if (it == saved.end()) {
+            return nullptr;
+        }
+        std::vector<long> shape(it->second.Sizes.begin(), it->second.Sizes.begin() + it->second.Rank);
+        if (auto it_live = st.tensors.find(key); it_live != st.tensors.end()) {
+            if (tensor_shape_matches(it_live->second, shape)) {
+                return &it_live->second;
+            }
+        }
+        if (st.view_sources) {
+            auto vs_it = st.view_sources->find(key);
+            if (vs_it != st.view_sources->end()) {
+                const std::string& src_name = vs_it->second;
+                Tensor* base = nullptr;
+                if (auto it_src = st.tensors.find(src_name); it_src != st.tensors.end()) {
+                    base = &it_src->second;
+                }
+                if (!base) {
+                    base = resolve_block_activation_base(st, src_name);
+                }
+                if (!base) {
+                    auto it_src_saved = saved.find(src_name);
+                    if (it_src_saved != saved.end()) {
+                        base = &it_src_saved->second;
+                    } else {
+                        try {
+                            base = &resolve_param_tensor(st, src_name);
+                        } catch (...) {
+                            base = nullptr;
+                        }
+                    }
+                }
+                if (base) {
+                    Tensor view = view_for_shape(*base, shape, key);
+                    auto [ins_it, inserted] = st.tensors.emplace(key, view);
+                    if (!inserted) {
+                        ins_it->second = view;
+                    }
+                    return &ins_it->second;
+                }
+            }
+        }
+        if (Tensor* mapped = resolve_block_activation_tensor(st, key, it->second.DType, shape)) {
+            return mapped;
+        }
+        if (Tensor* mapped = resolve_block_gradient_tensor(st, key, it->second.DType, shape)) {
+            return mapped;
+        }
+        if (st.rs.ffn_temps_on_stack()) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(key, layer_idx, field)) {
+                return nullptr;
+            }
+        }
+        return &it->second;
     }
     auto it = st.tensors.find(name);
     if (it != st.tensors.end()) {
+        if (starts_with(name, "d_") && ends_with(name, "_flat") && it->second.Rank != 2) {
+            if (Tensor* mapped = resolve_gradient_view_tensor(st, name, saved)) {
+                return mapped;
+            }
+        }
+        if (starts_with(name, "d_") && st.view_sources_rev) {
+            const std::string base_in = name.substr(2);
+            auto it_rev = st.view_sources_rev->find(base_in);
+            if (it_rev != st.view_sources_rev->end()) {
+                auto it_shape = saved.find(base_in);
+                if (it_shape != saved.end()) {
+                    std::vector<long> shape(it_shape->second.Sizes.begin(),
+                                            it_shape->second.Sizes.begin() + it_shape->second.Rank);
+                    if (!tensor_shape_matches(it->second, shape)) {
+                        if (Tensor* mapped = resolve_gradient_view_tensor(st, name, saved)) {
+                            return mapped;
+                        }
+                    }
+                }
+            }
+        }
         return &it->second;
+    }
+    if (Tensor* mapped = resolve_gradient_view_tensor(st, name, saved)) {
+        return mapped;
     }
     auto sit = saved.find(name);
     if (sit != saved.end()) {
@@ -611,6 +938,47 @@ void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cuda
     throw std::runtime_error("DSL graph executor: bias_add unsupported dtype");
 }
 
+template<typename Function>
+void trace_or_execute_cuda_graph_with_stack(Function&& function,
+                                            cudaStream_t stream,
+                                            cudaGraphExec_t& instance,
+                                            bool enabled,
+                                            DeviceMemoryStack& stack,
+                                            DeviceMemoryStack::Checkpoint& checkpoint) {
+    if (!enabled) {
+        function();
+        return;
+    }
+
+    if (instance != nullptr) {
+        stack.restore(checkpoint);
+        CUDA_CHECK(cudaGraphLaunch(instance, stream));
+        return;
+    }
+
+    checkpoint = stack.checkpoint();
+
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    function();
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+
+    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
+
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaGraphLaunch(instance, stream));
+}
+
+Tensor recompute_lora_rmsnorm(modules::LoRARunState& lora_rs, const Tensor& residual, const Tensor& weight,
+                              float eps, int B, int T, int C, cudaStream_t stream) {
+    if (!lora_rs.recompute_ln.Data || !lora_rs.recompute_rstd.Data) {
+        throw std::runtime_error("DSL graph executor: LoRA recompute buffers not allocated");
+    }
+    rmsnorm_forward(lora_rs.recompute_ln, lora_rs.recompute_rstd,
+                    residual, weight, nullptr, eps, B, T, C, stream);
+    return lora_rs.recompute_ln;
+}
+
 }  // namespace
 
 GraphExecutor::GraphExecutor(const Module& module,
@@ -628,7 +996,32 @@ GraphExecutor::GraphExecutor(const Module& module,
       mOptions(options),
       mForward(module.forward ? &module.forward.value() : nullptr),
       mBackward(nullptr) {
+    mGraphsEnabled = options.UseCudaGraphs;
+    mBackwardGraphsEnabled = mGraphsEnabled;
     init(exec_options);
+}
+
+void GraphExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
+                                   modules::ModularLoRAWeightsManager* weights,
+                                   modules::ModularLoRAGradsManager* grads,
+                                   modules::LoRARunState* run_state) {
+    mLoRAConfig = config;
+    mLoRAWeights = weights;
+    mLoRAGrads = grads;
+    mLoRARunState = run_state;
+}
+
+void GraphExecutor::reset_cuda_graphs() {
+    if (mForwardGraph) {
+        (void)cudaGraphExecDestroy(mForwardGraph);
+        mForwardGraph = nullptr;
+    }
+    for (auto& g : mBackwardGraph) {
+        if (g) {
+            (void)cudaGraphExecDestroy(g);
+            g = nullptr;
+        }
+    }
 }
 
 void GraphExecutor::init(const GraphExecutorOptions& options) {
@@ -696,10 +1089,48 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
         }
     }
 
+    mViewSources.clear();
+    mViewSourcesReverse.clear();
+    mEmbeddingOutputs.clear();
+    if (mForward) {
+        for (const auto& op : mForward->operations) {
+            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            if ((op_type == "view" || op_type == "reshape") && !op.outputs.empty() && !op.inputs.empty()) {
+                const std::string& out = op.outputs.at(0);
+                const std::string& in = op.inputs.at(0);
+                mViewSources.emplace(out, in);
+                mViewSourcesReverse.emplace(in, out);
+            }
+            if (op_type == "embedding" && !op.outputs.empty()) {
+                mEmbeddingOutputs.push_back(op.outputs.at(0));
+            }
+        }
+    }
+
     if (!mBackward) {
         throw std::runtime_error(
             "DSL graph executor: module missing backward graph (set auto_backward=true to derive automatically)");
     }
+
+    // Backward CUDA graphs are not compatible with ops that sync on other streams.
+    // If we encounter such ops, capture only the prefix and run the tail uncaptured.
+    mBackwardGraphCapturable = true;
+    mBackwardGraphCut = mBackward ? mBackward->operations.size() : 0;
+    if (mBackward) {
+        for (std::size_t idx = 0; idx < mBackward->operations.size(); ++idx) {
+            const auto& op = mBackward->operations[idx];
+            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            const bool has_embedding = op_type.find("embedding") != std::string::npos
+                || op.name.find("embedding") != std::string::npos
+                || op.kernel_type.find("embedding") != std::string::npos;
+            if (has_embedding || op_type == "encoder_backward") {
+                mBackwardGraphCapturable = false;
+                mBackwardGraphCut = idx;
+                break;
+            }
+        }
+    }
+    mBackwardGraphsEnabled = mGraphsEnabled && mBackwardGraphCut > 0;
 
     // If we didn't derive backward (using explicit backward from module), use forward.save
     if (mSaveList.empty()) {
@@ -730,7 +1161,11 @@ void GraphExecutor::set_rng_state(const std::vector<std::byte>& state) {
 
 void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
     auto& rs = mRunState;
-    mSaved.clear();
+
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
 
     if (micro_step == 0) {
         CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
@@ -770,7 +1205,11 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
 
 float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
     auto& rs = mRunState;
-    mSaved.clear();
+
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = false;
+    }
 
     if (micro_step == 0) {
         CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
@@ -874,6 +1313,15 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
 
     // Zero d_ln_final.
     fill_zero(rs.non_block_gradients().d_ln_final, rs.MainStream);
+    if (config.NumLayers > 0) {
+        fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
+    }
+
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads && mLoRARunState) {
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+        mLoRAGrads->start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
+    }
 
     run_classifier(B, T, comm, grad_accum_steps, micro_step, /*compute_accuracy=*/false);
 
@@ -886,6 +1334,9 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     execute_backward_graph(B, T, comm, grad_accum_steps, micro_step);
 
     grads.end_micro_step(rs.MainStream, comm);
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
+        mLoRAGrads->end_micro_step(rs.MainStream, comm);
+    }
     CUDA_CHECK(cudaEventRecord(rs.BackwardDone, rs.MainStream));
     CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
 }
@@ -961,6 +1412,8 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         .B = B,
         .T = T,
         .shape_env = make_shape_env(mModule, B, T),
+        .view_sources = &mViewSources,
+        .view_sources_rev = &mViewSourcesReverse,
     };
     augment_shape_env(st.shape_env, mModule.config);
 
@@ -969,11 +1422,27 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
     st.tensors.emplace("position_ids", rs.PositionIDs);
     st.tensors.emplace("x0", rs.non_block_activations().encoded);
 
-    std::vector<char> required;
-    if (!full) {
-        required = compute_required_ops(*mForward, mSaveList);
+    const bool use_graphs = mGraphsEnabled;
+    if (use_graphs && (mGraphB != B || mGraphT != T)) {
+        reset_cuda_graphs();
+        mGraphB = B;
+        mGraphT = T;
+    }
+    const bool capturing = use_graphs && mForwardGraph == nullptr;
+    if (!use_graphs || capturing) {
+        mSaved.clear();
     }
 
+    std::vector<char> required;
+    if (!full) {
+        std::vector<std::string> needed = mSaveList;
+        for (const auto& kv : mForward->outputs) {
+            needed.push_back(kv.first);
+        }
+        required = compute_required_ops(*mForward, needed);
+    }
+
+    auto run_ops = [&]() {
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
     auto maybe_start_layer = [&](const Operation& op) {
@@ -1125,6 +1594,15 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         if (op_type == "matmul") {
             Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
+            if (a.Rank != 2 || b.Rank != 2) {
+                throw std::runtime_error(
+                    "DSL graph executor: matmul expects rank-2 tensors (op=" + op.id +
+                    ", a=" + op.inputs.at(0) + " rank=" + std::to_string(a.Rank) +
+                    " shape=" + tensor_shape_str(a) +
+                    ", b=" + op.inputs.at(1) + " rank=" + std::to_string(b.Rank) +
+                    " shape=" + tensor_shape_str(b) + ")"
+                );
+            }
             EMMTranspose mode = parse_transpose(op.attrs);
             int M = 0, N = 0, K = 0;
             matmul_dims(a, b, mode, M, N, K);
@@ -1136,6 +1614,97 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             matmul(out, b, a, std::nullopt, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
                    N, M, K, mode_col, false, rs.MainStream);
+
+            if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRARunState) {
+                int layer_idx = -1;
+                std::string field;
+                if (parse_block_param(op.inputs.at(1), layer_idx, field)) {
+                    auto& acts = rs.simplified_acts(layer_idx);
+                    auto& lora_rs = *mLoRARunState;
+                    auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
+                    const int Bv = static_cast<int>(B);
+                    const int Tv = static_cast<int>(T);
+                    const int C = static_cast<int>(config.HiddenSize);
+                    const int D = static_cast<int>(config.IntermediateSize);
+                    const int Hq = static_cast<int>(config.NumQueryHeads);
+                    const int Hkv = static_cast<int>(config.NumKeyValHeads);
+                    const int Hs = static_cast<int>(config.head_size());
+                    const int rank = mLoRAConfig->rank;
+                    const int BT = Bv * Tv;
+                    const float scaling = mLoRAConfig->scaling();
+                    const float dropout = mLoRAConfig->dropout;
+                    const bool training = lora_rs.is_training;
+
+                    auto dropout_seed = [&](int proj_type) -> unsigned int {
+                        return lora_rs.dropout_base_seed
+                               + static_cast<unsigned int>(layer_idx) * 1000000u
+                               + static_cast<unsigned int>(proj_type) * 100000u
+                               + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
+                    };
+
+                    if (field == "qkv_weight") {
+                        if (lora_block.attention.q.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(0), training,
+                                BT, C, Hq * Hs, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                        if (lora_block.attention.k.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(1), training,
+                                BT, C, Hkv * Hs, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                        if (lora_block.attention.v.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(2), training,
+                                BT, C, Hkv * Hs, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                    } else if (field == "out_weight") {
+                        if (lora_block.attention.o.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.att_out, 0, acts.att, lora_block.attention.o.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(3), training,
+                                BT, Hq * Hs, C, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                    } else if (field == "mlp_up_weight") {
+                        if (lora_block.mlp.up.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(4), training,
+                                BT, C, D, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                        if (lora_block.mlp.gate.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(5), training,
+                                BT, C, D, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                    } else if (field == "mlp_down_weight") {
+                        if (lora_block.mlp.down.has_value()) {
+                            modules::detail::apply_lora_contribution(
+                                acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
+                                lora_rs.intermediate, lora_rs.slice,
+                                scaling, dropout, dropout_seed(6), training,
+                                BT, D, C, rank,
+                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -1275,6 +1844,9 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
     }
 
     free_temps(st);
+    };
+
+    trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mForwardGraph, use_graphs, rs.Stack, mForwardCheckpoint);
 }
 
 void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
@@ -1296,8 +1868,188 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         .B = B,
         .T = T,
         .shape_env = make_shape_env(mModule, B, T),
+        .view_sources = &mViewSources,
+        .view_sources_rev = &mViewSourcesReverse,
     };
     augment_shape_env(st.shape_env, mModule.config);
+
+    const bool recompute_block = mOptions.RecomputeBlock;
+    const bool recompute_att = mOptions.RecomputeAtt || recompute_block;
+    const bool recompute_qkv = mOptions.RecomputeQKV || recompute_att;
+    const bool recompute_ffn = mOptions.RecomputeFFN || recompute_block;
+    const bool recompute_swiglu = mOptions.RecomputeSwiGLu || recompute_ffn;
+    const bool recompute_rmsnorm = mOptions.RecomputeRMSNorm || recompute_block;
+    const bool recompute_ln1 = recompute_rmsnorm || recompute_att || recompute_block;
+    const bool recompute_ln2 = recompute_rmsnorm || recompute_ffn || recompute_block;
+    const bool recompute_any = recompute_ln1 || recompute_qkv || recompute_att || recompute_ln2 || recompute_ffn || recompute_swiglu;
+
+    std::vector<char> recomputed;
+    if (recompute_any && !recompute_block && config.NumLayers > 0) {
+        recomputed.assign(static_cast<size_t>(config.NumLayers), 0);
+    }
+    int last_recompute_layer = -1;
+
+    auto recompute_layer = [&](int layer_idx) {
+        if (!recompute_any) return;
+        if (layer_idx < 0 || layer_idx >= config.NumLayers) return;
+        if (recompute_block) {
+            if (layer_idx == last_recompute_layer) {
+                return;
+            }
+            last_recompute_layer = layer_idx;
+        } else {
+            if (recomputed.empty() || recomputed[layer_idx]) return;
+            recomputed[layer_idx] = 1;
+        }
+
+        const int Bv = static_cast<int>(B);
+        const int Tv = static_cast<int>(T);
+        const int C = static_cast<int>(config.HiddenSize);
+        const int D = static_cast<int>(config.IntermediateSize);
+        const int Hq = static_cast<int>(config.NumQueryHeads);
+        const int Hkv = static_cast<int>(config.NumKeyValHeads);
+        const int Hs = static_cast<int>(config.head_size());
+        const int qkv_channels = Hs * (Hq + 2 * Hkv);
+        const int att_dim = Hq * Hs;
+        const int MUp = 2 * D;
+
+        auto& acts = rs.simplified_acts(layer_idx);
+        auto ensure_act = [&](Tensor& t) {
+            if (!t.Data) {
+                rs.temp_acquire(t);
+                st.temps.push_back(t);
+            }
+        };
+
+        Tensor& res_ffn = rs.get_residual(layer_idx, rs.MainStream);
+        if (recompute_ln1) {
+            ensure_act(acts.ln1);
+            ensure_act(acts.ln1_rstd);
+            Tensor& ln1_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln1_weight");
+            if (recompute_block) {
+                // res_ffn already holds the residual stream for this layer in the DSL path.
+                rmsnorm_forward(acts.ln1, acts.ln1_rstd, res_ffn, ln1_weight, nullptr,
+                                config.RmsNormEps, Bv, Tv, C, rs.MainStream);
+            } else {
+                Tensor residual_in;
+                Tensor x_in;
+                if (layer_idx == 0) {
+                    Tensor zero = rs.temp_alloc(acts.ln1.DType, {B, T, C});
+                    st.temps.push_back(zero);
+                    fill_zero(zero, rs.MainStream);
+                    residual_in = zero;
+                    x_in = rs.non_block_activations().encoded;
+                } else {
+                    residual_in = rs.simplified_acts(layer_idx - 1).residual_att;
+                    x_in = rs.simplified_acts(layer_idx - 1).mlp_down;
+                }
+                fused_residual_rmsnorm_forward(
+                    res_ffn, acts.ln1, acts.ln1_rstd,
+                    residual_in, x_in, ln1_weight, nullptr,
+                    config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
+            }
+        }
+
+        auto dsl_matmul = [&](Tensor& out, const Tensor& a_in, const Tensor& b_in, EMMTranspose mode) {
+            int M = 0, N = 0, K = 0;
+            matmul_dims(a_in, b_in, mode, M, N, K);
+            EMMTranspose mode_col = swap_transpose(mode);
+            matmul(out, b_in, a_in, std::nullopt, nullptr, nullptr,
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K, mode_col, false, rs.MainStream);
+        };
+
+        if (recompute_qkv) {
+            ensure_act(acts.qkv);
+            Tensor& qkv_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].qkv_weight");
+            Tensor ln1_flat = view_tensor(acts.ln1, {B * T, C});
+            Tensor qkv_flat = view_tensor(acts.qkv, {B * T, qkv_channels});
+            dsl_matmul(qkv_flat, ln1_flat, qkv_weight, EMMTranspose::NT);
+
+            std::string bias_name = "blocks[" + std::to_string(layer_idx) + "].qkv_bias";
+            if (mWeights.has(bias_name)) {
+                Tensor& bias = resolve_param_tensor(st, bias_name);
+                Tensor qkv_view = view_tensor(acts.qkv, {B, T, qkv_channels});
+                add_bias_tensor(qkv_view, bias, Bv, Tv, qkv_channels, rs.MainStream);
+            }
+
+            if (config.UseQKNorm) {
+                ensure_act(acts.q_rstd);
+                ensure_act(acts.k_rstd);
+                Tensor qkv_view = view_tensor(acts.qkv, {B, T, qkv_channels});
+                qkv_head_rmsnorm_forward(qkv_view, acts.q_rstd, resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
+                                         static_cast<float>(config.RmsNormEps),
+                                         Bv, Tv, qkv_channels, Hq, Hs, 0, rs.MainStream);
+                qkv_head_rmsnorm_forward(qkv_view, acts.k_rstd, resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
+                                         static_cast<float>(config.RmsNormEps),
+                                         Bv, Tv, qkv_channels, Hkv, Hs, Hq * Hs, rs.MainStream);
+            }
+
+            int rotary_dim = Hs;
+            Tensor qkv_rope = (acts.qkv.Rank == 4)
+                ? acts.qkv
+                : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+            rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
+                         reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
+                         Bv, Tv, Hq, Hkv, Hs, rotary_dim, rs.MainStream);
+        }
+
+        if (recompute_att) {
+            ensure_act(acts.att);
+            ensure_act(acts.lse);
+            Tensor qkv_view = (acts.qkv.Rank == 4)
+                ? acts.qkv
+                : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+            if (!rs.scratch().cudnn_workspace.Data) {
+                rs.temp_acquire(rs.scratch().cudnn_workspace);
+                st.temps.push_back(rs.scratch().cudnn_workspace);
+            }
+            Tensor att_out = view_tensor(acts.att, {B, T, Hq, Hs});
+            Tensor lse_view = view_tensor(acts.lse, {B, Hq, T});
+            attention_forward_cudnn(att_out, lse_view, qkv_view, rs.scratch().cudnn_workspace,
+                                    rs.CudnnHandle, Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
+
+            if (recompute_block || recompute_ln2) {
+                ensure_act(acts.att_out);
+                Tensor& out_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].out_weight");
+                Tensor att_flat = view_tensor(acts.att, {B * T, att_dim});
+                Tensor att_out_flat = view_tensor(acts.att_out, {B * T, C});
+                dsl_matmul(att_out_flat, att_flat, out_weight, EMMTranspose::NT);
+            }
+        }
+
+        if (recompute_ln2) {
+            ensure_act(acts.ln2);
+            ensure_act(acts.ln2_rstd);
+            Tensor& ln2_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln2_weight");
+            fused_residual_rmsnorm_forward(
+                acts.residual_att, acts.ln2, acts.ln2_rstd,
+                res_ffn, acts.att_out, ln2_weight, nullptr,
+                config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
+        }
+
+        if (recompute_ffn) {
+            ensure_act(acts.mlp_up);
+            Tensor& mlp_up_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].mlp_up_weight");
+            Tensor ln2_flat = view_tensor(acts.ln2, {B * T, C});
+            Tensor mlp_up_flat = view_tensor(acts.mlp_up, {B * T, MUp});
+            dsl_matmul(mlp_up_flat, ln2_flat, mlp_up_weight, EMMTranspose::NT);
+        }
+
+        if (recompute_swiglu) {
+            ensure_act(acts.swiglu);
+            swiglu_forward(acts.swiglu, acts.mlp_up, nullptr,
+                           Bv, Tv, D, rs.MainStream);
+        }
+
+        if (recompute_ffn) {
+            ensure_act(acts.mlp_down);
+            Tensor& mlp_down_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].mlp_down_weight");
+            Tensor swiglu_flat = view_tensor(acts.swiglu, {B * T, D});
+            Tensor mlp_down_flat = view_tensor(acts.mlp_down, {B * T, C});
+            dsl_matmul(mlp_down_flat, swiglu_flat, mlp_down_weight, EMMTranspose::NT);
+        }
+    };
 
     // Bind forward inputs needed by backward ops (e.g., rope uses position_ids).
     st.tensors.emplace("token_ids", rs.Inputs);
@@ -1311,6 +2063,11 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     Tensor d_ln_final_flat = view_tensor(rs.non_block_gradients().d_ln_final, {B * T, config.HiddenSize});
     st.tensors.emplace("d_xF_flat", d_ln_final_flat);
     st.tensors.emplace("d_xF", rs.non_block_gradients().d_ln_final);
+
+    // Bind embedding output gradients to the non-block d_embeddings buffer.
+    for (const auto& name : mEmbeddingOutputs) {
+        st.tensors.emplace("d_" + name, rs.non_block_gradients().d_embeddings);
+    }
 
     // Bind gradient outputs for parameters.
     std::unordered_set<std::string> accumulate_tensors;
@@ -1341,6 +2098,9 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         std::string_view view{name};
         if (starts_with(view, "d_")) {
             view = view.substr(2);
+        }
+        if (starts_with(view, kSavedPrefix)) {
+            view = view.substr(kSavedPrefix.size());
         }
         std::string field;
         return parse_block_param(view, layer_idx, field);
@@ -1390,55 +2150,264 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         layer_temp_marks.erase(layer_idx);
     };
 
-    for (const auto& op : mBackward->operations) {
-        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
-        maybe_start_layer(op);
+    const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCut > 0;
+    if (use_graphs && (mGraphB != B || mGraphT != T)) {
+        reset_cuda_graphs();
+        mGraphB = B;
+        mGraphT = T;
+    }
+    const int graph_idx = (micro_step > 0) ? 1 : 0;
+    const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
 
-        if (op_type == "view") {
-            Tensor& src = get_tensor(st, op.inputs.at(0), mSaved);
-            auto shape = resolve_view_shape(op, st.shape_env, st, mSaved);
-            Tensor view = view_tensor(src, shape);
-            auto it = st.tensors.find(op.outputs.at(0));
-            if (it != st.tensors.end()) {
-                it->second = view;
-            } else {
-                st.tensors.emplace(op.outputs.at(0), view);
+    auto run_ops_range = [&](std::size_t begin, std::size_t end) {
+        end = std::min(end, mBackward->operations.size());
+        for (std::size_t op_idx = begin; op_idx < end; ++op_idx) {
+            const auto& op = mBackward->operations[op_idx];
+            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            maybe_start_layer(op);
+            if (recompute_any) {
+                int layer_idx = -1;
+                bool found = false;
+                for (const auto& name : op.inputs) {
+                    if (extract_layer(name, layer_idx)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    for (const auto& name : op.outputs) {
+                        if (extract_layer(name, layer_idx)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) {
+                    recompute_layer(layer_idx);
+                }
             }
-            continue;
-        }
 
-        if (op_type == "add") {
-            Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
-            Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
-            if (a.DType != b.DType || a.nelem() != b.nelem()) {
-                throw std::runtime_error("DSL graph executor: add op shape or dtype mismatch");
-            }
-            std::vector<long> shape(a.Sizes.begin(), a.Sizes.begin() + a.Rank);
-            Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
-            vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, rs.MainStream);
-            continue;
-        }
-
-        if (op_type == "matmul") {
-            if (op.outputs.at(0).empty()) {
+            if (op_type == "view") {
+                Tensor& src = get_tensor(st, op.inputs.at(0), mSaved);
+                auto shape = resolve_view_shape(op, st.shape_env, st, mSaved);
+                Tensor view = view_tensor(src, shape);
+                auto it = st.tensors.find(op.outputs.at(0));
+                if (it != st.tensors.end()) {
+                    it->second = view;
+                } else {
+                    st.tensors.emplace(op.outputs.at(0), view);
+                }
                 continue;
             }
-            Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
-            Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
-            EMMTranspose mode = parse_transpose(op.attrs);
-            int M = 0, N = 0, K = 0;
-            matmul_dims(a, b, mode, M, N, K);
-            std::vector<long> shape{M, N};
-            Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
-            bool do_accumulate = accumulate_tensors.count(op.outputs.at(0)) > 0;
-            // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
-            // swapping M/N, and swapping transpose flags.
-            EMMTranspose mode_col = swap_transpose(mode);
-            matmul(out, b, a, std::nullopt, nullptr, nullptr,
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   N, M, K, mode_col, do_accumulate, rs.MainStream);
-            continue;
-        }
+
+            if (op_type == "add") {
+                Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
+                Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
+                if (a.DType != b.DType || a.nelem() != b.nelem()) {
+                    throw std::runtime_error("DSL graph executor: add op shape or dtype mismatch");
+                }
+                std::vector<long> shape(a.Sizes.begin(), a.Sizes.begin() + a.Rank);
+                Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
+                vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, rs.MainStream);
+                continue;
+            }
+
+            if (op_type == "matmul") {
+                if (op.outputs.at(0).empty()) {
+                    continue;
+                }
+                Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
+                Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
+                if (a.Rank != 2 || b.Rank != 2) {
+                    throw std::runtime_error(
+                        "DSL graph executor: matmul expects rank-2 tensors (op=" + op.id +
+                        ", a=" + op.inputs.at(0) + " rank=" + std::to_string(a.Rank) +
+                        " shape=" + tensor_shape_str(a) +
+                        ", b=" + op.inputs.at(1) + " rank=" + std::to_string(b.Rank) +
+                        " shape=" + tensor_shape_str(b) + ")"
+                    );
+                }
+                EMMTranspose mode = parse_transpose(op.attrs);
+                int M = 0, N = 0, K = 0;
+                matmul_dims(a, b, mode, M, N, K);
+                std::vector<long> shape{M, N};
+                Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
+                bool do_accumulate = accumulate_tensors.count(op.outputs.at(0)) > 0;
+                // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
+                // swapping M/N, and swapping transpose flags.
+                EMMTranspose mode_col = swap_transpose(mode);
+                matmul(out, b, a, std::nullopt, nullptr, nullptr,
+                       rs.CublasLtHandle, rs.CuBlasWorkspace,
+                       N, M, K, mode_col, do_accumulate, rs.MainStream);
+
+                if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRAGrads && mLoRARunState) {
+                    const std::string& out_name = op.outputs.at(0);
+                    if (starts_with(out_name, "d_")) {
+                        std::string base_name = out_name.substr(2);
+                        int layer_idx = -1;
+                        std::string field;
+                        if (parse_block_param(base_name, layer_idx, field)) {
+                            auto& acts = rs.simplified_acts(layer_idx);
+                            auto& grads_layer = rs.simplified_grads(layer_idx);
+                            auto& lora_rs = *mLoRARunState;
+                            auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
+                            bool lora_accum = false;
+                            auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, rs.MainStream, comm, lora_accum);
+                            lora_accum = lora_accum || do_accumulate;
+
+                            const int Bv = static_cast<int>(B);
+                            const int Tv = static_cast<int>(T);
+                            const int C = static_cast<int>(config.HiddenSize);
+                            const int D = static_cast<int>(config.IntermediateSize);
+                            const int Hq = static_cast<int>(config.NumQueryHeads);
+                            const int Hkv = static_cast<int>(config.NumKeyValHeads);
+                            const int Hs = static_cast<int>(config.head_size());
+                            const int rank = mLoRAConfig->rank;
+                            const float scaling = mLoRAConfig->scaling();
+                            const float dropout = mLoRAConfig->dropout;
+                            const bool training = lora_rs.is_training;
+                            const int BT = Bv * Tv;
+
+                            auto dropout_seed = [&](int proj_type) -> unsigned int {
+                                return lora_rs.dropout_base_seed
+                                       + static_cast<unsigned int>(layer_idx) * 1000000u
+                                       + static_cast<unsigned int>(proj_type) * 100000u
+                                       + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
+                            };
+
+                            if (field == "qkv_weight") {
+                                Tensor ln1_input;
+                                if (mOptions.RecomputeLoRA) {
+                                    Tensor& res_ffn = rs.get_residual(layer_idx, rs.MainStream);
+                                    Tensor& ln1_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln1_weight");
+                                    ln1_input = recompute_lora_rmsnorm(lora_rs, res_ffn, ln1_weight,
+                                                                       config.RmsNormEps, Bv, Tv, C, rs.MainStream);
+                                } else {
+                                    ln1_input = acts.ln1;
+                                }
+
+                                Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
+                                modules::LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
+
+                                if (lora_block.attention.q.has_value() && lora_grads.attention.q.has_value()) {
+                                    dA_q = lora_grads.attention.q->A;
+                                    dB_q = lora_grads.attention.q->B;
+                                    lora_q = *lora_block.attention.q;
+                                }
+                                if (lora_block.attention.k.has_value() && lora_grads.attention.k.has_value()) {
+                                    dA_k = lora_grads.attention.k->A;
+                                    dB_k = lora_grads.attention.k->B;
+                                    lora_k = *lora_block.attention.k;
+                                }
+                                if (lora_block.attention.v.has_value() && lora_grads.attention.v.has_value()) {
+                                    dA_v = lora_grads.attention.v->A;
+                                    dB_v = lora_grads.attention.v->B;
+                                    lora_v = *lora_block.attention.v;
+                                }
+
+                                modules::detail::backward_lora_qkv_fused(
+                                    dA_q, dB_q,
+                                    dA_k, dB_k,
+                                    dA_v, dB_v,
+                                    grads_layer.d_ln1,
+                                    grads_layer.d_qkv,
+                                    ln1_input,
+                                    lora_q, lora_k, lora_v,
+                                    scaling,
+                                    dropout,
+                                    dropout_seed(0), dropout_seed(1), dropout_seed(2),
+                                    training,
+                                    BT,
+                                    C,
+                                    Hq * Hs,
+                                    Hkv * Hs,
+                                    rank,
+                                    lora_accum,
+                                    lora_rs.intermediate,
+                                    lora_rs.intermediate2,
+                                    lora_rs.slice,
+                                    rs.CublasLtHandle,
+                                    rs.CuBlasWorkspace,
+                                    rs.MainStream);
+                            } else if (field == "out_weight") {
+                                if (lora_block.attention.o.has_value() && lora_grads.attention.o.has_value()) {
+                                    modules::detail::backward_lora_layer(
+                                        lora_grads.attention.o->A, lora_grads.attention.o->B,
+                                        grads_layer.d_att,
+                                        grads_layer.d_res_att, 0,
+                                        acts.att,
+                                        lora_block.attention.o->A, lora_block.attention.o->B,
+                                        scaling,
+                                        dropout, dropout_seed(3), training,
+                                        lora_rs.intermediate, lora_rs.slice,
+                                        BT, Hq * Hs, C, rank, lora_accum,
+                                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                                }
+                            } else if (field == "mlp_up_weight") {
+                                Tensor ln2_input;
+                                if (mOptions.RecomputeLoRA) {
+                                    Tensor& ln2_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln2_weight");
+                                    ln2_input = recompute_lora_rmsnorm(lora_rs, acts.residual_att, ln2_weight,
+                                                                       config.RmsNormEps, Bv, Tv, C, rs.MainStream);
+                                } else {
+                                    ln2_input = acts.ln2;
+                                }
+
+                                Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
+                                modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
+
+                                if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
+                                    dA_up = lora_grads.mlp.up->A;
+                                    dB_up = lora_grads.mlp.up->B;
+                                    lora_up = *lora_block.mlp.up;
+                                }
+                                if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
+                                    dA_gate = lora_grads.mlp.gate->A;
+                                    dB_gate = lora_grads.mlp.gate->B;
+                                    lora_gate = *lora_block.mlp.gate;
+                                }
+
+                                modules::detail::backward_lora_mlp_up_gate_fused(
+                                    dA_up, dB_up,
+                                    dA_gate, dB_gate,
+                                    grads_layer.d_ln2,
+                                    grads_layer.d_mlp_up,
+                                    ln2_input,
+                                    lora_up, lora_gate,
+                                    scaling,
+                                    dropout,
+                                    dropout_seed(4), dropout_seed(5), training,
+                                    BT,
+                                    C,
+                                    D,
+                                    rank,
+                                    lora_accum,
+                                    lora_rs.intermediate,
+                                    lora_rs.intermediate2,
+                                    lora_rs.slice,
+                                    rs.CublasLtHandle,
+                                    rs.CuBlasWorkspace,
+                                    rs.MainStream);
+                            } else if (field == "mlp_down_weight") {
+                                if (lora_block.mlp.down.has_value() && lora_grads.mlp.down.has_value()) {
+                                    modules::detail::backward_lora_layer(
+                                        lora_grads.mlp.down->A, lora_grads.mlp.down->B,
+                                        grads_layer.d_swiglu,
+                                        grads_layer.d_res_ffn, 0,
+                                        acts.swiglu,
+                                        lora_block.mlp.down->A, lora_block.mlp.down->B,
+                                        scaling,
+                                        dropout, dropout_seed(6), training,
+                                        lora_rs.intermediate, lora_rs.slice,
+                                        BT, D, C, rank, lora_accum,
+                                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
 
         if (op_type == "bias_add_backward") {
             Tensor& d_out = get_tensor(st, op.inputs.at(0), mSaved);
@@ -1629,8 +2598,9 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             Tensor& weight = resolve_param_tensor(st, op.inputs.at(3));
 
             Tensor& d_input = ensure_tensor(st, op.outputs.at(1), d_y.DType, {B, T, config.HiddenSize});
+            Tensor* d_residual_out = nullptr;
             if (!op.outputs.at(0).empty()) {
-                st.tensors[op.outputs.at(0)] = d_input;
+                d_residual_out = &ensure_tensor(st, op.outputs.at(0), d_y.DType, {B, T, config.HiddenSize});
             }
 
             Tensor* d_residual = d_residual_next;
@@ -1662,6 +2632,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                              static_cast<int>(B), static_cast<int>(T), config.HiddenSize,
                              rs.DeviceProp, rs.MainStream,
                              skip_weight);
+            if (d_residual_out && op.outputs.at(0) != op.outputs.at(1)) {
+                CUDA_CHECK(cudaMemcpyAsync(d_residual_out->Data, d_input.Data, d_input.bytes(),
+                                           cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
             int layer_idx = -1;
             std::string field;
             if (parse_block_param(op.inputs.at(3), layer_idx, field) && field == "ln1_weight") {
@@ -1696,10 +2670,23 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         }
 
         throw std::runtime_error("DSL graph executor: unsupported backward op " + op.name);
+        }
+    };
+
+    if (use_graphs) {
+        auto run_graph_ops = [&]() { run_ops_range(0, mBackwardGraphCut); };
+        trace_or_execute_cuda_graph_with_stack(run_graph_ops, rs.MainStream, mBackwardGraph[graph_idx], use_graphs, rs.Stack, mBackwardCheckpoint[graph_idx]);
+        if (mBackwardGraphCut < mBackward->operations.size()) {
+            run_ops_range(mBackwardGraphCut, mBackward->operations.size());
+        }
+    } else {
+        run_ops_range(0, mBackward->operations.size());
     }
 
-    free_temps(st);
-    rs.temp_free(rs.non_block_activations().output);
+    if (!use_graphs || capturing) {
+        free_temps(st);
+        rs.temp_free(rs.non_block_activations().output);
+    }
 }
 
 }  // namespace dsl

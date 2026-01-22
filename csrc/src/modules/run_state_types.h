@@ -74,6 +74,7 @@ struct SimplifiedLayerGradients {
     Tensor d_ln2;       ///< (B, T, C) gradient w.r.t. LN2 output
     Tensor d_mlp_up;    ///< (B, T, 2*D) gradient w.r.t. MLP up (gate+up) output
     Tensor d_swiglu;    ///< (B, T, D) gradient w.r.t. SwiGLU output
+    Tensor d_mlp_down;  ///< (B, T, C) gradient w.r.t. MLP down output (block output)
     Tensor d_att;       ///< (B, T, Hq*Hs) gradient w.r.t. attention output (pre out-proj)
     Tensor d_qkv;       ///< (B, T, QKV_C) gradient w.r.t. QKV (post RoPE)
     Tensor d_ln1;       ///< (B, T, C) gradient w.r.t. LN1 output

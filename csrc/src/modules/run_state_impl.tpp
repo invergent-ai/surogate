@@ -96,6 +96,7 @@ ModularRunState<Block>::ModularRunState(ModularRunState&& other) noexcept
     , mSharedAttQuant(std::move(other.mSharedAttQuant))
     , mSharedSwiGluQuant(std::move(other.mSharedSwiGluQuant))
     , mSharedDResFFN(std::move(other.mSharedDResFFN))
+    , mSharedDMlpDown(std::move(other.mSharedDMlpDown))
     , mSharedDResAtt(std::move(other.mSharedDResAtt))
     , mSharedDLn2(std::move(other.mSharedDLn2))
     , mSharedDMlpUp(std::move(other.mSharedDMlpUp))
@@ -166,6 +167,7 @@ ModularRunState<Block>& ModularRunState<Block>::operator=(ModularRunState&& othe
         mSharedAttQuant = std::move(other.mSharedAttQuant);
         mSharedSwiGluQuant = std::move(other.mSharedSwiGluQuant);
         mSharedDResFFN = std::move(other.mSharedDResFFN);
+        mSharedDMlpDown = std::move(other.mSharedDMlpDown);
         mSharedDResAtt = std::move(other.mSharedDResAtt);
         mSharedDLn2 = std::move(other.mSharedDLn2);
         mSharedDMlpUp = std::move(other.mSharedDMlpUp);
@@ -566,6 +568,7 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
     const bool share_grads =
         mConfig.recompute_attention || mConfig.recompute_ffn || mConfig.recompute_block;
     const bool share_res_ffn = mConfig.recompute_block;
+    const bool share_mlp_down = mConfig.recompute_block;
     const bool large_temps_on_stack = mConfig.recompute_block;
 
     // Allocate shared gradient intermediates if we're in a recompute mode.
@@ -573,6 +576,10 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
         if (share_res_ffn) {
             mSharedDResFFN[0] = mAllocator->allocate(dtype, "d_res_ffn_a", kind, {B, T, C});
             mSharedDResFFN[1] = mAllocator->allocate(dtype, "d_res_ffn_b", kind, {B, T, C});
+        }
+        if (share_mlp_down) {
+            mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
+            mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
         }
         mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
         mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
@@ -607,6 +614,7 @@ void ModularRunState<Block>::allocate_simplified_gradients() {
             g.d_swiglu = share_grads ? mSharedDSwiGlu : mAllocator->allocate(dtype, "d_swiglu", kind, {B, T, D});
             g.d_qkv = share_grads ? mSharedDQKV : mAllocator->allocate(dtype, "d_qkv", kind, {B, T, qkv_channels});
         }
+        g.d_mlp_down = share_mlp_down ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)] : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
 
         // Mamba gradients (only for Mamba layers)
         const bool is_mamba_layer = has_mamba && (i < static_cast<int>(mConfig.layer_is_mamba.size()))

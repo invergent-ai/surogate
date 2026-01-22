@@ -351,6 +351,12 @@ if(BACKWARD_LIBS)
 endif()
 # -rdynamic exports symbols to the dynamic symbol table, enabling backtrace_symbols to resolve names
 target_link_options(surogate-common PUBLIC "-rdynamic")
+
+set(SUROGATE_NVCC_THREADS $ENV{NVCC_THREADS})
+if(NOT SUROGATE_NVCC_THREADS)
+    set(SUROGATE_NVCC_THREADS 8)
+endif()
+
 # Always include debug info for stack traces (even in Release builds)
 # -g adds debug symbols, -lineinfo adds CUDA line info for GPU crashes
 # -fno-omit-frame-pointer preserves frame pointers for stack unwinding
@@ -361,7 +367,8 @@ target_compile_options(surogate-common PUBLIC
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     $<$<COMPILE_LANGUAGE:CUDA>:-g>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-omit-frame-pointer>
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>)
 
 if (NOT SKBUILD)
     install(TARGETS surogate-common
