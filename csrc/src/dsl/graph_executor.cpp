@@ -2267,6 +2267,11 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                             const float dropout = mLoRAConfig->dropout;
                             const bool training = lora_rs.is_training;
                             const int BT = Bv * Tv;
+                            const std::string block_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+
+                            auto grad_tensor = [&](const std::string& field) -> Tensor& {
+                                return get_tensor(st, "d_" + block_prefix + field, mSaved);
+                            };
 
                             auto dropout_seed = [&](int proj_type) -> unsigned int {
                                 return lora_rs.dropout_base_seed
@@ -2367,11 +2372,13 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                                     lora_gate = *lora_block.mlp.gate;
                                 }
 
+                                Tensor& d_mlp_up = grad_tensor("mlp_up");
+
                                 modules::detail::backward_lora_mlp_up_gate_fused(
                                     dA_up, dB_up,
                                     dA_gate, dB_gate,
                                     grads_layer.d_ln2,
-                                    grads_layer.d_mlp_up,
+                                    d_mlp_up,
                                     ln2_input,
                                     lora_up, lora_gate,
                                     scaling,
@@ -2390,9 +2397,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                                     rs.MainStream);
                             } else if (field == "mlp_down_weight") {
                                 if (lora_block.mlp.down.has_value() && lora_grads.mlp.down.has_value()) {
+                                    Tensor& d_swiglu = grad_tensor("swiglu");
                                     modules::detail::backward_lora_layer(
                                         lora_grads.mlp.down->A, lora_grads.mlp.down->B,
-                                        grads_layer.d_swiglu,
+                                        d_swiglu,
                                         grads_layer.d_res_ffn, 0,
                                         acts.swiglu,
                                         lora_block.mlp.down->A, lora_block.mlp.down->B,
