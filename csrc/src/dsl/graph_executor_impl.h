@@ -2037,6 +2037,68 @@ void GraphExecutorImpl<Block>::execute_backward_graph(long B, long T, NCCLCommun
             continue;
         }
 
+        if (op_type == "matmul_backward") {
+            Tensor& d_out = get_tensor(st, op.inputs.at(0), mSaved);
+            Tensor& a = get_tensor(st, op.inputs.at(1), mSaved);
+            Tensor& b = get_tensor(st, op.inputs.at(2), mSaved);
+
+            const std::string& dA_name = (op.outputs.size() > 0) ? op.outputs.at(0) : "";
+            const std::string& dB_name = (op.outputs.size() > 1) ? op.outputs.at(1) : "";
+
+            Tensor* dA_ptr = nullptr;
+            Tensor* dB_ptr = nullptr;
+            if (!dA_name.empty()) {
+                dA_ptr = &ensure_tensor(st, dA_name, a.DType, {a.Sizes[0], a.Sizes[1]});
+            }
+            if (!dB_name.empty()) {
+                dB_ptr = &ensure_tensor(st, dB_name, b.DType, {b.Sizes[0], b.Sizes[1]});
+            }
+            if (!dA_ptr && !dB_ptr) {
+                continue;
+            }
+
+            EMMTranspose mode = parse_transpose(op.attrs);
+            EMMTranspose mode_dA = EMMTranspose::NN;
+            EMMTranspose mode_dB = EMMTranspose::NN;
+            switch (mode) {
+                case EMMTranspose::NN:
+                    mode_dA = EMMTranspose::NT;
+                    mode_dB = EMMTranspose::TN;
+                    break;
+                case EMMTranspose::NT:
+                    mode_dA = EMMTranspose::NN;
+                    mode_dB = EMMTranspose::TN;
+                    break;
+                case EMMTranspose::TN:
+                    mode_dA = EMMTranspose::NT;
+                    mode_dB = EMMTranspose::NN;
+                    break;
+                case EMMTranspose::TT:
+                    mode_dA = EMMTranspose::TT;
+                    mode_dB = EMMTranspose::TT;
+                    break;
+            }
+
+            if (dA_ptr) {
+                int M = 0, N = 0, K = 0;
+                matmul_dims(d_out, b, mode_dA, M, N, K);
+                EMMTranspose mode_col = swap_transpose(mode_dA);
+                matmul(*dA_ptr, b, d_out, std::nullopt, nullptr, nullptr,
+                       rs.CublasLtHandle, rs.CuBlasWorkspace,
+                       N, M, K, mode_col, false, rs.MainStream);
+            }
+            if (dB_ptr) {
+                bool do_accumulate = accumulate_tensors.count(dB_name) > 0;
+                int M = 0, N = 0, K = 0;
+                matmul_dims(d_out, a, mode_dB, M, N, K);
+                EMMTranspose mode_col = swap_transpose(mode_dB);
+                matmul(*dB_ptr, a, d_out, std::nullopt, nullptr, nullptr,
+                       rs.CublasLtHandle, rs.CuBlasWorkspace,
+                       N, M, K, mode_col, do_accumulate, rs.MainStream);
+            }
+            continue;
+        }
+
         if (op_type == "matmul" || op_type == "matmul_bias") {
             if (op.outputs.at(0).empty()) {
                 continue;

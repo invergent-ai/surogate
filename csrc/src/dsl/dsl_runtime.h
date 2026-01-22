@@ -20,7 +20,7 @@
 
 struct RuntimeOptions;
 class NCCLCommunicator;
-namespace modules { struct ModularLoRAConfig; }
+namespace modules { struct ModularLoRAConfig; class FP8ScalingState; }
 
 namespace dsl {
 
@@ -90,6 +90,7 @@ public:
     modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) { return mSimplifiedActivations[layer_idx]; }
     modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) { return mSimplifiedGradients[layer_idx]; }
     modules::SimplifiedQuantGradients& simplified_quant_grads() { return mSimplifiedQuantGrads; }
+    modules::FP8ForwardQuantActivations& fp8_forward_quants() { return mFP8ForwardQuants; }
 
     modules::NonBlockActivations& non_block_activations() { return mNonBlockActivations; }
     modules::NonBlockGradientBuffers& non_block_gradients() { return mNonBlockGradients; }
@@ -106,18 +107,24 @@ public:
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
 
     // IRunState overrides (quantization unsupported in DSL runtime for now).
-    [[nodiscard]] bool has_activation_quants() const override { return false; }
-    [[nodiscard]] bool has_grad_quants() const override { return false; }
-    [[nodiscard]] bool has_fp8_forward() const override { return false; }
-    [[nodiscard]] bool has_fp8_hybrid_backward() const override { return false; }
-    [[nodiscard]] bool has_fp8_delayed_scaling() const override { return false; }
+    [[nodiscard]] bool has_activation_quants() const override { return mMatmulDtype != mActivationDtype; }
+    [[nodiscard]] bool has_grad_quants() const override { return mGradQuantDtype != mGradDtype; }
+    [[nodiscard]] bool has_fp8_forward() const override { return mEnableFp8Forward; }
+    [[nodiscard]] bool has_fp8_hybrid_backward() const override {
+        return mEnableFp8Forward && mGradQuantDtype == ETensorDType::FP8_E5M2;
+    }
+    [[nodiscard]] bool has_fp8_delayed_scaling() const override { return mFP8ScalingState != nullptr; }
     [[nodiscard]] bool has_fp4_forward() const override { return false; }
     [[nodiscard]] bool has_fp4_backward() const override { return false; }
+    [[nodiscard]] Tensor* get_fp8_forward_buffer(int op) override;
+    [[nodiscard]] Tensor* get_gradient_quant_buffer(int op) override;
+    [[nodiscard]] modules::FP8ScalingState* get_fp8_scaling_state() override { return mFP8ScalingState.get(); }
 
 private:
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_activations(const PretrainedConfig& cfg);
     void allocate_simplified_gradients(const PretrainedConfig& cfg);
+    void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
     void allocate_scratch_buffers(const PretrainedConfig& cfg);
     void allocate_residual_buffers(const PretrainedConfig& cfg);
     void create_cuda_resources();
@@ -128,6 +135,9 @@ private:
     bool mRecomputeBlock = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;
+    ETensorDType mMatmulDtype = ETensorDType::BF16;
+    ETensorDType mGradQuantDtype = ETensorDType::BF16;
+    bool mEnableFp8Forward = false;
 
     modules::NonBlockActivations mNonBlockActivations;
     modules::NonBlockGradientBuffers mNonBlockGradients;
@@ -136,6 +146,10 @@ private:
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
+    modules::FP8ForwardQuantActivations mFP8ForwardQuants;
+    Tensor mFP8ForwardStats{};
+    Tensor mGradQuantStats{};
+    std::unique_ptr<modules::FP8ScalingState> mFP8ScalingState;
 
     std::unique_ptr<modules::ResidualManager> mResidualManager;
 

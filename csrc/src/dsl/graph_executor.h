@@ -129,6 +129,12 @@ private:
     std::unordered_map<std::string, std::string> mViewSourcesReverse;
     Tensor mLastInputsCpu{};
     bool mFP8ScalingInitialized = false;
+    struct FP8WeightCacheEntry {
+        Tensor weight;
+        Tensor stats;
+        bool initialized = false;
+    };
+    std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
 
     void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full);
     void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step);
@@ -136,6 +142,9 @@ private:
     void run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy);
 
     unsigned int next_rng_seed();
+
+    void prime_fp8_weight_cache(const std::vector<char>& required);
+    const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
 
     std::minstd_rand mRng{42};
 

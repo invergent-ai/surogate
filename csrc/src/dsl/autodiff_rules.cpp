@@ -61,79 +61,26 @@ std::vector<Operation> matmul_backward(const BackwardRuleContext& ctx) {
     // For TN: C = A.T @ B     -> dA = B @ dC.T (NT), dB = A @ dC (NN)
     // For TT: C = A.T @ B.T   -> dA = B.T @ dC.T,    dB = dC.T @ A.T
 
-    std::string trans_dA, trans_dB;
-
     // Determine references for A and B in backward pass:
     // - Parameters are available at backward time (gathered from weight manager)
     // - Activations must be saved from forward pass (use saved_ref)
     std::string A_for_dB = ctx.is_param(A) ? A : saved_ref(A);
     std::string B_for_dA = ctx.is_param(B) ? B : saved_ref(B);
 
-    if (trans == "NN") {
-        // C = A @ B
-        // dA = dC @ B.T
-        // dB = A.T @ dC
-        trans_dA = "NT";
-        trans_dB = "TN";
-    } else if (trans == "NT") {
-        // C = A @ B.T
-        // dA = dC @ B
-        // dB = dC.T @ A = (A.T @ dC).T -> we compute A.T @ dC then it's already correct shape
-        trans_dA = "NN";
-        trans_dB = "TN";
-    } else if (trans == "TN") {
-        // C = A.T @ B
-        // dA = B @ dC.T
-        // dB = A @ dC
-        trans_dA = "NT";  // dC @ B.T with swapped args = B @ dC.T ... need to think carefully
-        trans_dB = "NN";
-        // Actually for TN: dA = B @ dC.T, dB = A @ dC
-        // But our matmul is row-major, so we express as:
-        // dA = (dC.T @ B.T).T = B @ dC.T -> matmul(B, dC, NT)? Let's use: matmul(dC, B, TN)
-    } else if (trans == "TT") {
-        // C = A.T @ B.T
-        trans_dA = "TT";
-        trans_dB = "TT";
-    }
 
-    // Generate dA if needed
-    if (ctx.needs_grad(0)) {
-        AttrMap attrs;
-        attrs["transpose"] = AttrValue(trans_dA);
+    AttrMap attrs;
+    attrs["transpose"] = AttrValue(trans);
 
-        ops.push_back(make_operation(
-            "matmul_dA_" + std::to_string(ctx.op_counter++),
-            "matmul",
-            "matmul",
-            {dC, B_for_dA},
-            {ctx.d_inputs[0]},
-            attrs));
-    }
+    std::vector<std::string> inputs = {dC, A_for_dB, B_for_dA};
+    std::vector<std::string> outputs = {ctx.d_inputs[0], ctx.d_inputs[1]};
 
-    // Generate dB if needed
-    if (ctx.needs_grad(1)) {
-        AttrMap attrs;
-        attrs["transpose"] = AttrValue(trans_dB);
-
-        // For NT mode: dB = dC.T @ A, so inputs are {dC, A} with TN transpose
-        // For NN mode: dB = A.T @ dC, so inputs are {A, dC} with TN transpose
-        // For TN mode: dB = A @ dC, so inputs are {A, dC} with NN transpose
-        // For TT mode: dB = dC.T @ A.T, so inputs are {dC, A} with TT transpose
-        std::vector<std::string> dB_inputs;
-        if (trans == "NT" || trans == "TT") {
-            dB_inputs = {dC, A_for_dB};  // dC first for NT/TT
-        } else {
-            dB_inputs = {A_for_dB, dC};  // A first for NN/TN
-        }
-
-        ops.push_back(make_operation(
-            "matmul_dB_" + std::to_string(ctx.op_counter++),
-            "matmul",
-            "matmul",
-            dB_inputs,
-            {ctx.d_inputs[1]},
-            attrs));
-    }
+    ops.push_back(make_operation(
+        "matmul_backward_" + std::to_string(ctx.op_counter++),
+        "matmul_backward",
+        "matmul_backward",
+        inputs,
+        outputs,
+        attrs));
 
     return ops;
 }
@@ -154,55 +101,20 @@ std::vector<Operation> matmul_bias_backward(const BackwardRuleContext& ctx) {
 
     std::string trans = get_string_attr(fwd.attrs, "transpose", "NN");
 
-    std::string trans_dA, trans_dB;
     std::string A_for_dB = ctx.is_param(A) ? A : saved_ref(A);
     std::string B_for_dA = ctx.is_param(B) ? B : saved_ref(B);
 
-    if (trans == "NN") {
-        trans_dA = "NT";
-        trans_dB = "TN";
-    } else if (trans == "NT") {
-        trans_dA = "NN";
-        trans_dB = "TN";
-    } else if (trans == "TN") {
-        trans_dA = "NT";
-        trans_dB = "NN";
-    } else if (trans == "TT") {
-        trans_dA = "TT";
-        trans_dB = "TT";
-    }
-
-    if (ctx.needs_grad(0)) {
-        AttrMap attrs;
-        attrs["transpose"] = AttrValue(trans_dA);
-        ops.push_back(make_operation(
-            "matmul_bias_dA_" + std::to_string(ctx.op_counter++),
-            "matmul",
-            "matmul",
-            {dC, B_for_dA},
-            {ctx.d_inputs[0]},
-            attrs));
-    }
-
-    if (ctx.needs_grad(1)) {
-        AttrMap attrs;
-        attrs["transpose"] = AttrValue(trans_dB);
-
-        std::vector<std::string> dB_inputs;
-        if (trans == "NT" || trans == "TT") {
-            dB_inputs = {dC, A_for_dB};
-        } else {
-            dB_inputs = {A_for_dB, dC};
-        }
-
-        ops.push_back(make_operation(
-            "matmul_bias_dB_" + std::to_string(ctx.op_counter++),
-            "matmul",
-            "matmul",
-            dB_inputs,
-            {ctx.d_inputs[1]},
-            attrs));
-    }
+    AttrMap attrs;
+    attrs["transpose"] = AttrValue(trans);
+    std::vector<std::string> inputs = {dC, A_for_dB, B_for_dA};
+    std::vector<std::string> outputs = {ctx.d_inputs[0], ctx.d_inputs[1]};
+    ops.push_back(make_operation(
+        "matmul_bias_backward_" + std::to_string(ctx.op_counter++),
+        "matmul_backward",
+        "matmul_backward",
+        inputs,
+        outputs,
+        attrs));
 
     if (ctx.needs_grad(2) && !bias.empty()) {
         std::vector<std::string> outputs;

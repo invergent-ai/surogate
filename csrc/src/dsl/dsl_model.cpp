@@ -27,6 +27,7 @@
 #include "modules/model_config.h"
 #include "modules/optimizers/adamw_8bit.h"
 #include "modules/optimizers/normuon.h"
+#include "modules/fp8_scaling_state.h"
 #include "utilities/comm.h"
 #include "utilities/safetensors.h"
 
@@ -728,6 +729,12 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         state_offset += n;
         if (state_offset > state.total_state_elems) {
             throw std::runtime_error("DslModel::update: state buffer overflow");
+        }
+    }
+
+    if (rs.has_fp8_delayed_scaling()) {
+        if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+            delayed_scaling_update(*fp8_state, stream);
         }
     }
 
@@ -1853,6 +1860,12 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
 
+    if (rs.has_fp8_delayed_scaling()) {
+        if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+            delayed_scaling_update(*fp8_state, stream);
+        }
+    }
+
     CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, stream));
 }
 
@@ -2052,6 +2065,12 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         if (lora_w.router.has_value() && lora_g.router.has_value()) {
             update_param(lora_w.router->A, lora_g.router->A);
             update_param(lora_w.router->B, lora_g.router->B);
+        }
+    }
+
+    if (rs.has_fp8_delayed_scaling()) {
+        if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+            delayed_scaling_update(*fp8_state, main_stream);
         }
     }
 

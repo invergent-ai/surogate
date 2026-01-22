@@ -11,6 +11,10 @@
 #include "kernels/kernels.h"
 #include "training/runtime_options.h"
 #include "modules/lora/lora_config.h"
+#include "modules/fp8_run_state.h"
+#include "modules/fp8_scaling_config.h"
+#include "modules/fp8_scaling_state.h"
+#include "modules/matmul_context.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
@@ -246,7 +250,17 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     }
 
     mActivationDtype = options.ModelType.value_or(config.DType);
+    if (is_fp8_dtype(mActivationDtype)) {
+        mActivationDtype = ETensorDType::BF16;
+    }
     mGradDtype = mActivationDtype;
+    mMatmulDtype = options.MatmulType.value_or(options.ModelType.value_or(config.DType));
+    if (options.TrainingRecipe && options.TrainingRecipe->is_fp8_hybrid()) {
+        mGradQuantDtype = ETensorDType::FP8_E5M2;
+    } else {
+        mGradQuantDtype = options.GradientType.value_or(mMatmulDtype);
+    }
+    mEnableFp8Forward = options.fp8_forward_enabled();
 
     // Allocate stack memory (heuristic size).
     mStackBuffer = mAllocator->allocate(
@@ -258,6 +272,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     allocate_non_block_state(config);
     allocate_simplified_activations(config);
     allocate_simplified_gradients(config);
+    allocate_simplified_quant_buffers(config, options);
     allocate_residual_buffers(config);
     allocate_scratch_buffers(config);
 }
@@ -452,6 +467,61 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     }
 }
 
+void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {
+    const long B = this->B;
+    const long T = this->T;
+    const long C = cfg.HiddenSize;
+    const long D = cfg.head_size();
+    const long Hq = cfg.NumQueryHeads;
+    const long Hkv = cfg.NumKeyValHeads;
+    const long AttnDim = Hq * D;
+    const long QKV = D * (Hq + 2 * Hkv);
+    const long M = cfg.IntermediateSize;
+    const long MUp = 2 * M;
+
+    if (mEnableFp8Forward) {
+        modules::allocate_fp8_forward_buffers(
+            mFP8ForwardQuants, mFP8ForwardStats, *mAllocator,
+            B, T, C, M, AttnDim, options.forward_matmul_dtype());
+    }
+
+    if (options.fp8_hybrid_enabled()) {
+        modules::FP8ScalingConfig fp8_cfg{};
+        fp8_cfg.amax_history_len = options.RecipeOptions.fp8_amax_history_len;
+        fp8_cfg.margin = static_cast<float>(options.RecipeOptions.fp8_margin);
+        mFP8ScalingState = std::make_unique<modules::FP8ScalingState>(
+            fp8_cfg, mAllocator, DeviceId, cfg.NumLayers);
+    }
+
+    if (mGradQuantDtype == mGradDtype) {
+        const std::array<long, 3> ln_shape{B, T, C};
+        const std::array<long, 3> mlp_up_shape{B, T, MUp};
+        const std::array<long, 3> qkv_shape{B, T, QKV};
+        mSimplifiedQuantGrads.d_res_ffn = Tensor::from_pointer(nullptr, DeviceId, mGradQuantDtype, ln_shape);
+        mSimplifiedQuantGrads.d_res_att = Tensor::from_pointer(nullptr, DeviceId, mGradQuantDtype, ln_shape);
+        mSimplifiedQuantGrads.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, mGradQuantDtype, mlp_up_shape);
+        mSimplifiedQuantGrads.d_qkv = Tensor::from_pointer(nullptr, DeviceId, mGradQuantDtype, qkv_shape);
+        return;
+    }
+
+    mGradQuantStats = mAllocator->allocate(ETensorDType::FP32, "dsl_grad_quant_stats",
+                                           EAllocationType::ON_DEVICE, {8L});
+    float* stats = mGradQuantStats.get<float>();
+
+    auto alloc = [&](ETensorDType dtype, const std::string& name, const std::vector<long>& shape) -> Tensor {
+        return mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
+    };
+
+    mSimplifiedQuantGrads.d_res_ffn = alloc(mGradQuantDtype, "dsl_d_res_ffn_q", {B, T, C});
+    mSimplifiedQuantGrads.d_res_ffn.Stats = stats + 0;
+    mSimplifiedQuantGrads.d_res_att = alloc(mGradQuantDtype, "dsl_d_res_att_q", {B, T, C});
+    mSimplifiedQuantGrads.d_res_att.Stats = stats + 2;
+    mSimplifiedQuantGrads.d_mlp_up = alloc(mGradQuantDtype, "dsl_d_mlp_up_q", {B, T, MUp});
+    mSimplifiedQuantGrads.d_mlp_up.Stats = stats + 4;
+    mSimplifiedQuantGrads.d_qkv = alloc(mGradQuantDtype, "dsl_d_qkv_q", {B, T, QKV});
+    mSimplifiedQuantGrads.d_qkv.Stats = stats + 6;
+}
+
 void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long B = this->B;
     const long T = this->T;
@@ -490,6 +560,40 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         cudnn_get_workspace_size(static_cast<int>(B), static_cast<int>(T), static_cast<int>(Hq),
                                  static_cast<int>(Hkv), static_cast<int>(D), CudnnHandle));
     mScratch.cudnn_workspace = Tensor{ETensorDType::BYTE, {cudnn_ws_size}, nullptr, nullptr, 1, DeviceId};
+}
+
+Tensor* DslRunState::get_fp8_forward_buffer(int op) {
+    if (!has_fp8_forward()) return nullptr;
+    auto matmul_op = static_cast<modules::MatmulOp>(op);
+    switch (matmul_op) {
+        case modules::MatmulOp::QKV:
+            return &mFP8ForwardQuants.ln1;
+        case modules::MatmulOp::MLPUp:
+            return &mFP8ForwardQuants.ln2;
+        case modules::MatmulOp::AttnOut:
+            return &mFP8ForwardQuants.att;
+        case modules::MatmulOp::MLPDown:
+            return &mFP8ForwardQuants.swiglu;
+        default:
+            return nullptr;
+    }
+}
+
+Tensor* DslRunState::get_gradient_quant_buffer(int op) {
+    if (!has_grad_quants()) return nullptr;
+    auto matmul_op = static_cast<modules::MatmulOp>(op);
+    switch (matmul_op) {
+        case modules::MatmulOp::QKV:
+            return &mSimplifiedQuantGrads.d_qkv;
+        case modules::MatmulOp::MLPUp:
+            return &mSimplifiedQuantGrads.d_mlp_up;
+        case modules::MatmulOp::AttnOut:
+            return &mSimplifiedQuantGrads.d_res_att;
+        case modules::MatmulOp::MLPDown:
+            return &mSimplifiedQuantGrads.d_res_ffn;
+        default:
+            return nullptr;
+    }
 }
 
 void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg) {
