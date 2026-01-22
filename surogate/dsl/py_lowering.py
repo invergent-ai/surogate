@@ -66,6 +66,7 @@ def _kernel_type_from_op(op_name: str) -> KernelType:
     """Map operation name to KernelType enum."""
     op_map = {
         "matmul": KernelType.MATMUL,
+        "matmul_bias": KernelType.MATMUL_BIAS,
         "batched_matmul": KernelType.BATCHED_MATMUL,
         "rmsnorm": KernelType.RMSNORM,
         "fused_residual_rmsnorm": KernelType.FUSED_RESIDUAL_RMSNORM,

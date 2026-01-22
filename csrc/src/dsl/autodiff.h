@@ -86,6 +86,10 @@ struct DeriveBackwardOptions {
 
     // Prefix for generated gradient tensor names
     std::string grad_prefix = "d_";
+
+    // Tensors to treat as non-differentiable (stop-gradient).
+    // Useful for freezing parameters (e.g., LoRA base weights).
+    std::vector<std::string> stop_gradients;
 };
 
 // Derive a backward graph from a forward graph using registered backward rules.

@@ -466,7 +466,8 @@ DslModel::DslModel(const PretrainedConfig& config,
     }
 
     mParams = std::make_unique<DslParamStore>(*mModule, mModule->forward.value(),
-                                              options, *mConfig, mAllocator);
+                                              options, *mConfig, mAllocator,
+                                              lora_config ? &*lora_config : nullptr);
     mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator);
 
     if (lora_config.has_value() && lora_config->enabled()) {

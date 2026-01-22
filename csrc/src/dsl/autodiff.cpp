@@ -138,6 +138,12 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
     Graph backward;
     backward.name = forward.name + "_backward";
 
+    const std::unordered_set<std::string> stop_set(
+        options.stop_gradients.begin(), options.stop_gradients.end());
+    auto is_stopped = [&](const std::string& name) -> bool {
+        return stop_set.find(name) != stop_set.end();
+    };
+
     auto& registry = BackwardRuleRegistry::instance();
     int op_counter = 0;
 
@@ -186,7 +192,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 
         const auto& op = forward.operations[it->second];
         for (const auto& inp : op.inputs) {
-            if (is_non_differentiable(forward, inp)) {
+            if (is_non_differentiable(forward, inp) || is_stopped(inp)) {
                 continue;
             }
             if (needs_grad.insert(inp).second) {
@@ -256,7 +262,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         d_inputs.reserve(fwd_op.inputs.size());
         for (size_t i = 0; i < fwd_op.inputs.size(); ++i) {
             const auto& inp = fwd_op.inputs[i];
-            if (needs_grad.count(inp) && !is_non_differentiable(forward, inp)) {
+            if (needs_grad.count(inp) && !is_non_differentiable(forward, inp) && !is_stopped(inp)) {
                 // Use simple name if first gradient for this tensor, else unique name
                 std::string d_inp;
                 if (!grad_map.count(inp)) {
@@ -319,7 +325,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         }
     }
     for (const auto& [name, info] : forward.params) {
-        if (grad_map.count(name)) {
+        if (grad_map.count(name) && !is_stopped(name)) {
             backward.outputs[grad_map[name]] = info;
         }
     }

@@ -1643,7 +1643,7 @@ void GraphExecutorImpl<Block>::execute_forward_graph(long B, long T, NCCLCommuni
             continue;
         }
 
-        if (op_type == "matmul") {
+        if (op_type == "matmul" || op_type == "matmul_bias") {
             Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
             EMMTranspose mode = parse_transpose(op.attrs);
@@ -1651,10 +1651,14 @@ void GraphExecutorImpl<Block>::execute_forward_graph(long B, long T, NCCLCommuni
             matmul_dims(a, b, mode, M, N, K);
             std::vector<long> shape{M, N};
             Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
+            std::optional<Tensor> bias;
+            if (op_type == "matmul_bias" && op.inputs.size() > 2 && !op.inputs.at(2).empty()) {
+                bias = get_tensor(st, op.inputs.at(2), mSaved);
+            }
             // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
             // swapping M/N, and swapping transpose flags.
             EMMTranspose mode_col = swap_transpose(mode);
-            matmul(out, b, a, std::nullopt, nullptr, nullptr,
+            matmul(out, b, a, bias, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
                    N, M, K, mode_col, false, rs.MainStream);
             continue;
@@ -2033,7 +2037,7 @@ void GraphExecutorImpl<Block>::execute_backward_graph(long B, long T, NCCLCommun
             continue;
         }
 
-        if (op_type == "matmul") {
+        if (op_type == "matmul" || op_type == "matmul_bias") {
             if (op.outputs.at(0).empty()) {
                 continue;
             }
@@ -2045,10 +2049,14 @@ void GraphExecutorImpl<Block>::execute_backward_graph(long B, long T, NCCLCommun
             std::vector<long> shape{M, N};
             Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
             bool do_accumulate = accumulate_tensors.count(op.outputs.at(0)) > 0;
+            std::optional<Tensor> bias;
+            if (op_type == "matmul_bias" && op.inputs.size() > 2 && !op.inputs.at(2).empty()) {
+                bias = get_tensor(st, op.inputs.at(2), mSaved);
+            }
             // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
             // swapping M/N, and swapping transpose flags.
             EMMTranspose mode_col = swap_transpose(mode);
-            matmul(out, b, a, std::nullopt, nullptr, nullptr,
+            matmul(out, b, a, bias, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
                    N, M, K, mode_col, do_accumulate, rs.MainStream);
             continue;
@@ -2060,13 +2068,24 @@ void GraphExecutorImpl<Block>::execute_backward_graph(long B, long T, NCCLCommun
                 st.tensors.emplace(op.outputs.at(0), d_out);
             }
             if (op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
-                Tensor& d_bias = ensure_tensor(st, op.outputs.at(1), d_out.DType, {d_out.Sizes[2]});
-                const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, static_cast<int>(d_out.Sizes[2]), rs.DeviceProp);
+                int Bv = 1;
+                int Tv = 1;
+                int OC = 1;
+                if (d_out.Rank == 2) {
+                    Bv = static_cast<int>(d_out.Sizes[0]);
+                    Tv = 1;
+                    OC = static_cast<int>(d_out.Sizes[1]);
+                } else {
+                    Bv = static_cast<int>(d_out.Sizes[0]);
+                    Tv = static_cast<int>(d_out.Sizes[1]);
+                    OC = static_cast<int>(d_out.Sizes[2]);
+                }
+                Tensor& d_bias = ensure_tensor(st, op.outputs.at(1), d_out.DType, {static_cast<long>(OC)});
+                const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, OC, rs.DeviceProp);
                 Tensor scratch = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(scratch_bytes / sizeof(float))});
                 st.temps.push_back(scratch);
                 backward_bias(d_bias, d_out, nullptr, nullptr, scratch,
-                              static_cast<int>(d_out.Sizes[0]), static_cast<int>(d_out.Sizes[1]),
-                              static_cast<int>(d_out.Sizes[2]), rs.DeviceProp, rs.MainStream);
+                              Bv, Tv, OC, rs.DeviceProp, rs.MainStream);
             }
             continue;
         }

@@ -20,6 +20,7 @@
 
 struct RuntimeOptions;
 class NCCLCommunicator;
+namespace modules { struct ModularLoRAConfig; }
 
 namespace dsl {
 
@@ -35,7 +36,8 @@ public:
                   const Graph& graph,
                   const RuntimeOptions& options,
                   const PretrainedConfig& config,
-                  const std::shared_ptr<TensorAllocator>& allocator);
+                  const std::shared_ptr<TensorAllocator>& allocator,
+                  const modules::ModularLoRAConfig* lora_config = nullptr);
 
     Tensor& get(const std::string& name);
     const Tensor& get(const std::string& name) const;

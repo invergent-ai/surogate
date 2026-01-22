@@ -36,16 +36,13 @@ class Linear:
             # Flatten batch dimensions
             x_flat = g.view(x, shape=["B * T", "C"])
 
-            # Matrix multiply
-            y_flat = g.matmul(x_flat, "weight", transpose="NT")
+            # Matrix multiply (optionally fused with bias)
+            if self.use_bias:
+                y_flat = g.matmul_bias(x_flat, "weight", "bias", transpose="NT")
+            else:
+                y_flat = g.matmul(x_flat, "weight", transpose="NT")
 
             # Reshape back
-            y_tmp = g.view(y_flat, shape=["B", "T", "O"])
-
-            # Optional bias
-            if self.use_bias:
-                y = g.bias_add(y_tmp, "bias")
-            else:
-                y = y_tmp
+            y = g.view(y_flat, shape=["B", "T", "O"])
 
             return y

@@ -139,6 +139,87 @@ std::vector<Operation> matmul_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// Matmul + Bias backward rule
+// Forward: C = A @ B (+ bias), with optional transpose modes
+// Backward: dA = dC @ B.T, dB = A.T @ dC (adjusted for transpose modes), dBias = sum(dC)
+// -----------------------------------------------------------------------------
+std::vector<Operation> matmul_bias_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    const std::string& A = fwd.inputs[0];
+    const std::string& B = fwd.inputs[1];
+    const std::string& dC = ctx.d_output;
+    const std::string bias = (fwd.inputs.size() > 2) ? fwd.inputs[2] : "";
+
+    std::string trans = get_string_attr(fwd.attrs, "transpose", "NN");
+
+    std::string trans_dA, trans_dB;
+    std::string A_for_dB = ctx.is_param(A) ? A : saved_ref(A);
+    std::string B_for_dA = ctx.is_param(B) ? B : saved_ref(B);
+
+    if (trans == "NN") {
+        trans_dA = "NT";
+        trans_dB = "TN";
+    } else if (trans == "NT") {
+        trans_dA = "NN";
+        trans_dB = "TN";
+    } else if (trans == "TN") {
+        trans_dA = "NT";
+        trans_dB = "NN";
+    } else if (trans == "TT") {
+        trans_dA = "TT";
+        trans_dB = "TT";
+    }
+
+    if (ctx.needs_grad(0)) {
+        AttrMap attrs;
+        attrs["transpose"] = AttrValue(trans_dA);
+        ops.push_back(make_operation(
+            "matmul_bias_dA_" + std::to_string(ctx.op_counter++),
+            "matmul",
+            "matmul",
+            {dC, B_for_dA},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    if (ctx.needs_grad(1)) {
+        AttrMap attrs;
+        attrs["transpose"] = AttrValue(trans_dB);
+
+        std::vector<std::string> dB_inputs;
+        if (trans == "NT" || trans == "TT") {
+            dB_inputs = {dC, A_for_dB};
+        } else {
+            dB_inputs = {A_for_dB, dC};
+        }
+
+        ops.push_back(make_operation(
+            "matmul_bias_dB_" + std::to_string(ctx.op_counter++),
+            "matmul",
+            "matmul",
+            dB_inputs,
+            {ctx.d_inputs[1]},
+            attrs));
+    }
+
+    if (ctx.needs_grad(2) && !bias.empty()) {
+        std::vector<std::string> outputs;
+        outputs.push_back("");
+        outputs.push_back(ctx.d_inputs[2]);
+        ops.push_back(make_operation(
+            "matmul_bias_dBias_" + std::to_string(ctx.op_counter++),
+            "bias_add_backward",
+            "bias_add_backward",
+            {dC, bias},
+            outputs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // Add backward rule
 // Forward: C = A + B
 // Backward: dA = dC, dB = dC (with broadcast reduction if needed)
@@ -746,6 +827,7 @@ void register_builtin_backward_rules() {
 
     // Core ops
     reg.register_rule("matmul", matmul_backward);
+    reg.register_rule("matmul_bias", matmul_bias_backward);
     reg.register_rule("add", add_backward);
     reg.register_rule("multiply", multiply_backward);
     reg.register_rule("mul", multiply_backward);

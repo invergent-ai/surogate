@@ -166,14 +166,11 @@ class Qwen3MoEBlock:
             # Attention
             # ================================================================
             ln1_flat = g.view(ln1_out, shape=["B * T", "C"])
-            qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
-
             if self.use_qkv_bias:
-                qkv_tmp = g.view(qkv_flat, shape=["B", "T", "QKV"])
-                qkv_biased = g.bias_add(qkv_tmp, "qkv_bias")
-                qkv_packed = g.view(qkv_biased, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+                qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
-                qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+                qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
+            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
 
             # QK-Norm + RoPE (fused)
             if self.use_qk_norm:

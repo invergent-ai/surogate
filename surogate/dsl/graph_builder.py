@@ -147,6 +147,33 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
+    def matmul_bias(
+        self,
+        a: str | GraphRef,
+        b: str | GraphRef,
+        bias: str | GraphRef,
+        *,
+        transpose: str | TransposeMode = "NN",
+        accumulate: bool = False,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Matrix multiplication with fused bias: C = alpha * op(A) @ op(B) + bias (+ beta * C)."""
+        out = out_name if out_name else self._fresh_name("mm")
+        self._add_node(GraphNode(
+            op="matmul_bias",
+            inputs=[self._resolve_input(a), self._resolve_input(b), self._resolve_input(bias)],
+            outputs=[out],
+            attrs={
+                "transpose": str(transpose),
+                "accumulate": accumulate,
+                "alpha": alpha,
+                "beta": beta,
+            },
+        ))
+        return self._make_output(out)
+
     def batched_matmul(
         self,
         a: str | GraphRef,

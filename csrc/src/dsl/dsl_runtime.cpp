@@ -10,6 +10,7 @@
 
 #include "kernels/kernels.h"
 #include "training/runtime_options.h"
+#include "modules/lora/lora_config.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
@@ -102,7 +103,8 @@ DslParamStore::DslParamStore(const Module& module,
                              const Graph& graph,
                              const RuntimeOptions& options,
                              const PretrainedConfig& config,
-                             const std::shared_ptr<TensorAllocator>& allocator)
+                             const std::shared_ptr<TensorAllocator>& allocator,
+                             const modules::ModularLoRAConfig* lora_config)
     : mAllocator(allocator) {
     if (!mAllocator) {
         throw std::runtime_error("DslParamStore: allocator is null");
@@ -110,6 +112,12 @@ DslParamStore::DslParamStore(const Module& module,
 
     ShapeEnv env = make_shape_env(module, /*B=*/1, /*T=*/1);
     augment_shape_env(env, module.config);
+
+    const bool freeze_base = lora_config && lora_config->enabled();
+    const bool train_router = freeze_base && lora_config->train_router;
+    auto is_router_param = [&](const std::string& name) -> bool {
+        return name.find("router") != std::string::npos;
+    };
 
     for (const auto& kv : graph.params) {
         const std::string& name = kv.first;
@@ -126,6 +134,9 @@ DslParamStore::DslParamStore(const Module& module,
         Entry entry;
         entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
         entry.trainable = !is_rope_param(name);
+        if (freeze_base) {
+            entry.trainable = train_router && is_router_param(name);
+        }
 
         mParams.emplace(name, entry);
         mParamOrder.push_back(name);

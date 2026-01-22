@@ -117,6 +117,8 @@ private:
 
     // Holds derived backward graph if autodiff was used
     std::optional<Graph> mDerivedBackward;
+    // Holds a reordered backward graph when we need a mutable copy
+    std::optional<Graph> mReorderedBackward;
 
     // Combined save list (forward.save + autodiff-computed saves)
     std::vector<std::string> mSaveList;

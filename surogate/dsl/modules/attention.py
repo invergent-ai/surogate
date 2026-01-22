@@ -65,14 +65,11 @@ class GQAAttention:
         with graph() as g:
             # QKV projection
             x_flat = g.view(x, shape=["B * T", "C"])
-            qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
-
             if self.use_qkv_bias:
-                qkv_tmp = g.view(qkv_flat, shape=["B", "T", "QKV"])
-                qkv_biased = g.bias_add(qkv_tmp, "qkv_bias")
-                qkv_packed = g.view(qkv_biased, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+                qkv_flat = g.matmul_bias(x_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
-                qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+                qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
+            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
 
             # Apply RoPE
             qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, rotary_dim="D")
@@ -152,14 +149,11 @@ class Qwen3Attention:
     ) -> Tensor["B", "T", "C"]:
         with graph() as g:
             x_flat = g.view(x, shape=["B * T", "C"])
-            qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
-
             if self.use_qkv_bias:
-                qkv_tmp = g.view(qkv_flat, shape=["B", "T", "QKV"])
-                qkv_biased = g.bias_add(qkv_tmp, "qkv_bias")
-                qkv_packed = g.view(qkv_biased, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+                qkv_flat = g.matmul_bias(x_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
-                qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+                qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
+            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
 
             if self.use_qk_norm:
                 qkv_rope, _, _ = g.qkv_qk_norm_rope(

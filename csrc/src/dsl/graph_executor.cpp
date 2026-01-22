@@ -59,6 +59,30 @@ bool ends_with(std::string_view value, std::string_view suffix) {
         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+std::optional<std::string> base_param_from_grad(std::string_view name) {
+    if (!starts_with(name, "d_")) {
+        return std::nullopt;
+    }
+    std::string base(name.substr(2));
+    const std::string_view accum_tag = "_accum_";
+    const std::string_view from_tag = "_from_";
+    std::size_t pos = std::string::npos;
+    std::size_t pos_accum = base.find(accum_tag);
+    std::size_t pos_from = base.find(from_tag);
+    if (pos_accum != std::string::npos) {
+        pos = pos_accum;
+    }
+    if (pos_from != std::string::npos) {
+        if (pos == std::string::npos || pos_from < pos) {
+            pos = pos_from;
+        }
+    }
+    if (pos != std::string::npos) {
+        base = base.substr(0, pos);
+    }
+    return base;
+}
+
 bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name);
 
 bool infer_block_tensor_shape(const ExecState& st, std::string_view name, std::vector<long>& shape) {
@@ -1112,18 +1136,113 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
             "DSL graph executor: module missing backward graph (set auto_backward=true to derive automatically)");
     }
 
+    auto is_noncapturable_op = [&](const Operation& op) {
+        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        const bool is_embedding_bwd = (op_type == "embedding_backward" || op_type == "encoder_backward"
+                                       || op.name == "embedding_backward" || op.name == "encoder_backward");
+        if (!is_embedding_bwd) {
+            return false;
+        }
+        for (const auto& out : op.outputs) {
+            if (out.empty()) {
+                continue;
+            }
+            if (auto param_name = base_param_from_grad(out)) {
+                if (mWeights.has(*param_name) && mWeights.is_trainable(*param_name)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (mBackward) {
+        const auto& ops = mBackward->operations;
+        const std::size_t op_count = ops.size();
+        std::vector<char> noncapturable(op_count, 0);
+        bool has_noncapturable = false;
+
+        for (std::size_t idx = 0; idx < op_count; ++idx) {
+            if (is_noncapturable_op(ops[idx])) {
+                noncapturable[idx] = 1;
+                has_noncapturable = true;
+            }
+        }
+
+        if (has_noncapturable && op_count > 1) {
+            std::unordered_map<std::string, std::vector<std::size_t>> consumers;
+            consumers.reserve(op_count * 2);
+            for (std::size_t idx = 0; idx < op_count; ++idx) {
+                for (const auto& inp : ops[idx].inputs) {
+                    if (!inp.empty()) {
+                        consumers[inp].push_back(idx);
+                    }
+                }
+            }
+
+            std::vector<char> movable(op_count, 0);
+            std::size_t movable_count = 0;
+            for (std::size_t idx = 0; idx < op_count; ++idx) {
+                if (!noncapturable[idx]) {
+                    continue;
+                }
+                bool can_move = true;
+                for (const auto& out : ops[idx].outputs) {
+                    if (out.empty()) {
+                        continue;
+                    }
+                    auto it = consumers.find(out);
+                    if (it == consumers.end()) {
+                        continue;
+                    }
+                    for (std::size_t user_idx : it->second) {
+                        if (!noncapturable[user_idx]) {
+                            can_move = false;
+                            break;
+                        }
+                    }
+                    if (!can_move) {
+                        break;
+                    }
+                }
+                if (can_move) {
+                    movable[idx] = 1;
+                    ++movable_count;
+                }
+            }
+
+            if (movable_count > 0 && movable_count < op_count) {
+                Graph* mutable_backward = mDerivedBackward ? &mDerivedBackward.value() : nullptr;
+                if (!mutable_backward) {
+                    mReorderedBackward = *mBackward;
+                    mutable_backward = &mReorderedBackward.value();
+                    mBackward = mutable_backward;
+                }
+                auto& mutable_ops = mutable_backward->operations;
+                std::vector<Operation> reordered;
+                reordered.reserve(op_count);
+                for (std::size_t idx = 0; idx < op_count; ++idx) {
+                    if (!movable[idx]) {
+                        reordered.push_back(mutable_ops[idx]);
+                    }
+                }
+                for (std::size_t idx = 0; idx < op_count; ++idx) {
+                    if (movable[idx]) {
+                        reordered.push_back(mutable_ops[idx]);
+                    }
+                }
+                mutable_ops.swap(reordered);
+            }
+        }
+    }
+
     // Backward CUDA graphs are not compatible with ops that sync on other streams.
     // If we encounter such ops, capture only the prefix and run the tail uncaptured.
     mBackwardGraphCapturable = true;
     mBackwardGraphCut = mBackward ? mBackward->operations.size() : 0;
     if (mBackward) {
         for (std::size_t idx = 0; idx < mBackward->operations.size(); ++idx) {
-            const auto& op = mBackward->operations[idx];
-            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
-            const bool has_embedding = op_type.find("embedding") != std::string::npos
-                || op.name.find("embedding") != std::string::npos
-                || op.kernel_type.find("embedding") != std::string::npos;
-            if (has_embedding || op_type == "encoder_backward") {
+            if (is_noncapturable_op(mBackward->operations[idx])) {
                 mBackwardGraphCapturable = false;
                 mBackwardGraphCut = idx;
                 break;
@@ -1591,7 +1710,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             continue;
         }
 
-        if (op_type == "matmul") {
+        if (op_type == "matmul" || op_type == "matmul_bias") {
             Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
             if (a.Rank != 2 || b.Rank != 2) {
@@ -1608,10 +1727,14 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             matmul_dims(a, b, mode, M, N, K);
             std::vector<long> shape{M, N};
             Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
+            std::optional<Tensor> bias;
+            if (op_type == "matmul_bias" && op.inputs.size() > 2 && !op.inputs.at(2).empty()) {
+                bias = get_tensor(st, op.inputs.at(2), mSaved);
+            }
             // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
             // swapping M/N, and swapping transpose flags.
             EMMTranspose mode_col = swap_transpose(mode);
-            matmul(out, b, a, std::nullopt, nullptr, nullptr,
+            matmul(out, b, a, bias, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
                    N, M, K, mode_col, false, rs.MainStream);
 
@@ -1752,22 +1875,10 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 }
             }
 
-            // Match modular path: Q/K RMSNorm then RoPE (both in-place on qkv).
-            // This avoids relying on the fused kernel, which can be unstable on some configs.
+            // Match modular path: fused QK norm + RoPE when supported, otherwise fall back to separate ops.
             Tensor qkv_view = (qkv.Rank == 4)
                 ? view_tensor(qkv, {B, T, qkv_channels})
                 : qkv;
-            const int q_rows = Hq * Hs;
-
-            qkv_head_rmsnorm_forward(qkv_view, q_rstd, q_norm,
-                                     static_cast<float>(eps),
-                                     static_cast<int>(B), static_cast<int>(T),
-                                     qkv_channels, Hq, Hs, 0, rs.MainStream);
-            qkv_head_rmsnorm_forward(qkv_view, k_rstd, k_norm,
-                                     static_cast<float>(eps),
-                                     static_cast<int>(B), static_cast<int>(T),
-                                     qkv_channels, Hkv, Hs, q_rows, rs.MainStream);
-
             int rotary_dim = Hs;
             if (auto* rd_attr = find_attr(op.attrs, "rotary_dim")) {
                 if (auto v = attr_int(*rd_attr)) {
@@ -1776,8 +1887,31 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                     rotary_dim = static_cast<int>(resolve_dim(Dim::symbolic(*s), st.shape_env));
                 }
             }
-            rope_forward(qkv, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
-                         static_cast<int>(B), static_cast<int>(T), Hq, Hkv, Hs, rotary_dim, rs.MainStream);
+            const bool rope_fusable = (rotary_dim > 0)
+                && ((Hs % 2) == 0)
+                && (((Hs / 2) % 32) == 0)
+                && (freqs.Rank >= 2)
+                && (freqs.Sizes[1] >= Hs)
+                && (qkv_view.Rank == 3);
+            if (rope_fusable) {
+                qkv_qk_norm_rope_forward(qkv_view, q_rstd, k_rstd, q_norm, k_norm,
+                                         freqs, reinterpret_cast<int*>(pos_ids.Data),
+                                         static_cast<float>(eps),
+                                         static_cast<int>(B), static_cast<int>(T),
+                                         Hq, Hkv, Hs, rs.MainStream);
+            } else {
+                const int q_rows = Hq * Hs;
+                qkv_head_rmsnorm_forward(qkv_view, q_rstd, q_norm,
+                                         static_cast<float>(eps),
+                                         static_cast<int>(B), static_cast<int>(T),
+                                         qkv_channels, Hq, Hs, 0, rs.MainStream);
+                qkv_head_rmsnorm_forward(qkv_view, k_rstd, k_norm,
+                                         static_cast<float>(eps),
+                                         static_cast<int>(B), static_cast<int>(T),
+                                         qkv_channels, Hkv, Hs, q_rows, rs.MainStream);
+                rope_forward(qkv, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+                             static_cast<int>(B), static_cast<int>(T), Hq, Hkv, Hs, rotary_dim, rs.MainStream);
+            }
             st.tensors.emplace(op.outputs.at(0), qkv);
             st.tensors.emplace(op.outputs.at(1), q_rstd);
             st.tensors.emplace(op.outputs.at(2), k_rstd);
@@ -1950,11 +2084,12 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             }
         }
 
-        auto dsl_matmul = [&](Tensor& out, const Tensor& a_in, const Tensor& b_in, EMMTranspose mode) {
+        auto dsl_matmul = [&](Tensor& out, const Tensor& a_in, const Tensor& b_in, EMMTranspose mode,
+                              std::optional<Tensor> bias = std::nullopt) {
             int M = 0, N = 0, K = 0;
             matmul_dims(a_in, b_in, mode, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode);
-            matmul(out, b_in, a_in, std::nullopt, nullptr, nullptr,
+            matmul(out, b_in, a_in, bias, nullptr, nullptr,
                    rs.CublasLtHandle, rs.CuBlasWorkspace,
                    N, M, K, mode_col, false, rs.MainStream);
         };
@@ -1964,34 +2099,53 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             Tensor& qkv_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].qkv_weight");
             Tensor ln1_flat = view_tensor(acts.ln1, {B * T, C});
             Tensor qkv_flat = view_tensor(acts.qkv, {B * T, qkv_channels});
-            dsl_matmul(qkv_flat, ln1_flat, qkv_weight, EMMTranspose::NT);
-
             std::string bias_name = "blocks[" + std::to_string(layer_idx) + "].qkv_bias";
+            std::optional<Tensor> qkv_bias;
             if (mWeights.has(bias_name)) {
-                Tensor& bias = resolve_param_tensor(st, bias_name);
-                Tensor qkv_view = view_tensor(acts.qkv, {B, T, qkv_channels});
-                add_bias_tensor(qkv_view, bias, Bv, Tv, qkv_channels, rs.MainStream);
+                qkv_bias = resolve_param_tensor(st, bias_name);
             }
+            dsl_matmul(qkv_flat, ln1_flat, qkv_weight, EMMTranspose::NT, qkv_bias);
 
             if (config.UseQKNorm) {
                 ensure_act(acts.q_rstd);
                 ensure_act(acts.k_rstd);
                 Tensor qkv_view = view_tensor(acts.qkv, {B, T, qkv_channels});
-                qkv_head_rmsnorm_forward(qkv_view, acts.q_rstd, resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
-                                         static_cast<float>(config.RmsNormEps),
-                                         Bv, Tv, qkv_channels, Hq, Hs, 0, rs.MainStream);
-                qkv_head_rmsnorm_forward(qkv_view, acts.k_rstd, resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
-                                         static_cast<float>(config.RmsNormEps),
-                                         Bv, Tv, qkv_channels, Hkv, Hs, Hq * Hs, rs.MainStream);
+                const bool rope_fusable = ((Hs % 2) == 0)
+                    && (((Hs / 2) % 32) == 0)
+                    && (rs.non_block_activations().freq_cis.Rank >= 2)
+                    && (rs.non_block_activations().freq_cis.Sizes[1] >= Hs);
+                if (rope_fusable) {
+                    qkv_qk_norm_rope_forward(qkv_view, acts.q_rstd, acts.k_rstd,
+                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
+                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
+                                             rs.non_block_activations().freq_cis,
+                                             reinterpret_cast<int*>(rs.PositionIDs.Data),
+                                             static_cast<float>(config.RmsNormEps),
+                                             Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
+                } else {
+                    qkv_head_rmsnorm_forward(qkv_view, acts.q_rstd,
+                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
+                                             static_cast<float>(config.RmsNormEps),
+                                             Bv, Tv, qkv_channels, Hq, Hs, 0, rs.MainStream);
+                    qkv_head_rmsnorm_forward(qkv_view, acts.k_rstd,
+                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
+                                             static_cast<float>(config.RmsNormEps),
+                                             Bv, Tv, qkv_channels, Hkv, Hs, Hq * Hs, rs.MainStream);
+                    Tensor qkv_rope = (acts.qkv.Rank == 4)
+                        ? acts.qkv
+                        : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+                    rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
+                                 reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
+                                 Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
+                }
+            } else {
+                Tensor qkv_rope = (acts.qkv.Rank == 4)
+                    ? acts.qkv
+                    : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+                rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
+                             reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
+                             Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
             }
-
-            int rotary_dim = Hs;
-            Tensor qkv_rope = (acts.qkv.Rank == 4)
-                ? acts.qkv
-                : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
-            rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
-                         reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
-                         Bv, Tv, Hq, Hkv, Hs, rotary_dim, rs.MainStream);
         }
 
         if (recompute_att) {
@@ -2042,13 +2196,8 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                            Bv, Tv, D, rs.MainStream);
         }
 
-        if (recompute_ffn) {
-            ensure_act(acts.mlp_down);
-            Tensor& mlp_down_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].mlp_down_weight");
-            Tensor swiglu_flat = view_tensor(acts.swiglu, {B * T, D});
-            Tensor mlp_down_flat = view_tensor(acts.mlp_down, {B * T, C});
-            dsl_matmul(mlp_down_flat, swiglu_flat, mlp_down_weight, EMMTranspose::NT);
-        }
+        // NOTE: mlp_down output is not required for backward (only swiglu + weights are needed),
+        // so skip recomputing it to save a large matmul in recompute_block mode.
     };
 
     // Bind forward inputs needed by backward ops (e.g., rope uses position_ids).
@@ -2212,7 +2361,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 continue;
             }
 
-            if (op_type == "matmul") {
+            if (op_type == "matmul" || op_type == "matmul_bias") {
                 if (op.outputs.at(0).empty()) {
                     continue;
                 }
@@ -2230,30 +2379,45 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 EMMTranspose mode = parse_transpose(op.attrs);
                 int M = 0, N = 0, K = 0;
                 matmul_dims(a, b, mode, M, N, K);
-                std::vector<long> shape{M, N};
-                Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, shape);
+                const std::string& out_name = op.outputs.at(0);
                 bool do_accumulate = accumulate_tensors.count(op.outputs.at(0)) > 0;
+                std::optional<Tensor> bias;
+                if (op_type == "matmul_bias" && op.inputs.size() > 2 && !op.inputs.at(2).empty()) {
+                    bias = get_tensor(st, op.inputs.at(2), mSaved);
+                }
+                bool skip_weight_grad = false;
+                bool is_param_grad = false;
+                if (auto param_name = base_param_from_grad(out_name)) {
+                    if (mWeights.has(*param_name)) {
+                        is_param_grad = true;
+                        if (!mWeights.is_trainable(*param_name)) {
+                            skip_weight_grad = true;
+                        }
+                    }
+                }
                 // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
                 // swapping M/N, and swapping transpose flags.
                 EMMTranspose mode_col = swap_transpose(mode);
-                matmul(out, b, a, std::nullopt, nullptr, nullptr,
-                       rs.CublasLtHandle, rs.CuBlasWorkspace,
-                       N, M, K, mode_col, do_accumulate, rs.MainStream);
+                if (!skip_weight_grad) {
+                    std::vector<long> shape{M, N};
+                    Tensor& out = ensure_tensor(st, out_name, a.DType, shape);
+                    matmul(out, b, a, bias, nullptr, nullptr,
+                           rs.CublasLtHandle, rs.CuBlasWorkspace,
+                           N, M, K, mode_col, do_accumulate, rs.MainStream);
+                }
 
                 if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRAGrads && mLoRARunState) {
-                    const std::string& out_name = op.outputs.at(0);
-                    if (starts_with(out_name, "d_")) {
-                        std::string base_name = out_name.substr(2);
+                    if (auto base_name = base_param_from_grad(out_name)) {
                         int layer_idx = -1;
                         std::string field;
-                        if (parse_block_param(base_name, layer_idx, field)) {
+                        if (parse_block_param(*base_name, layer_idx, field)) {
                             auto& acts = rs.simplified_acts(layer_idx);
                             auto& grads_layer = rs.simplified_grads(layer_idx);
                             auto& lora_rs = *mLoRARunState;
                             auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
                             bool lora_accum = false;
                             auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, rs.MainStream, comm, lora_accum);
-                            lora_accum = lora_accum || do_accumulate;
+                            lora_accum = lora_accum || (do_accumulate && !skip_weight_grad && is_param_grad);
 
                             const int Bv = static_cast<int>(B);
                             const int Tv = static_cast<int>(T);
@@ -2422,23 +2586,35 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             if (!op.outputs.at(0).empty()) {
                 st.tensors.emplace(op.outputs.at(0), d_out);
             }
-            if (op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
-                Tensor& d_bias = ensure_tensor(st, op.outputs.at(1), d_out.DType, {d_out.Sizes[2]});
+            int Bv = 1;
+            int Tv = 1;
+            int OC = 1;
+            if (d_out.Rank == 2) {
+                Bv = static_cast<int>(d_out.Sizes[0]);
+                Tv = 1;
+                OC = static_cast<int>(d_out.Sizes[1]);
+            } else {
+                Bv = static_cast<int>(d_out.Sizes[0]);
+                Tv = static_cast<int>(d_out.Sizes[1]);
+                OC = static_cast<int>(d_out.Sizes[2]);
+            }
+            const bool bias_trainable = mWeights.has(op.inputs.at(1)) && mWeights.is_trainable(op.inputs.at(1));
+            if (bias_trainable && op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
+                Tensor& d_bias = ensure_tensor(st, op.outputs.at(1), d_out.DType, {static_cast<long>(OC)});
                 const bool do_accumulate = accumulate_tensors.count(op.outputs.at(1)) > 0;
-                const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, static_cast<int>(d_out.Sizes[2]), rs.DeviceProp);
+                const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, OC, rs.DeviceProp);
                 Tensor scratch = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(scratch_bytes / sizeof(float))});
                 st.temps.push_back(scratch);
                 if (do_accumulate) {
-                    Tensor tmp = rs.temp_alloc(d_out.DType, {d_out.Sizes[2]});
+                    Tensor tmp = rs.temp_alloc(d_out.DType, {static_cast<long>(OC)});
                     st.temps.push_back(tmp);
                     backward_bias(tmp, d_out, nullptr, nullptr, scratch,
-                                  static_cast<int>(d_out.Sizes[0]), static_cast<int>(d_out.Sizes[1]),
-                                  static_cast<int>(d_out.Sizes[2]), rs.DeviceProp, rs.MainStream);
-                    vector_add_sr(d_bias, d_bias, tmp, 1.0f, static_cast<long>(d_bias.nelem()), 0, rs.MainStream);
+                                  Bv, Tv, OC, rs.DeviceProp, rs.MainStream);
+                    vector_add_sr(d_bias, d_bias, tmp, 1.0f, static_cast<long>(d_bias.nelem()), 0,
+                                  rs.MainStream);
                 } else {
                     backward_bias(d_bias, d_out, nullptr, nullptr, scratch,
-                                  static_cast<int>(d_out.Sizes[0]), static_cast<int>(d_out.Sizes[1]),
-                                  static_cast<int>(d_out.Sizes[2]), rs.DeviceProp, rs.MainStream);
+                                  Bv, Tv, OC, rs.DeviceProp, rs.MainStream);
                 }
             }
             continue;
@@ -2514,39 +2690,78 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 }
             }
 
-            // Undo RoPE on gradients and activations (in-place) before QK RMSNorm backward.
-            rope_backward(d_qkv, d_qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
-                          static_cast<int>(B), static_cast<int>(T), Hq, Hkv, Hs, rotary_dim, rs.MainStream);
-            rope_backward(qkv, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
-                          static_cast<int>(B), static_cast<int>(T), Hq, Hkv, Hs, rotary_dim, rs.MainStream);
+            const bool q_norm_trainable = mWeights.has(op.inputs.at(2)) && mWeights.is_trainable(op.inputs.at(2));
+            const bool k_norm_trainable = mWeights.has(op.inputs.at(3)) && mWeights.is_trainable(op.inputs.at(3));
+            const bool rope_fusable = (rotary_dim > 0)
+                && ((Hs % 2) == 0)
+                && (((Hs / 2) % 32) == 0)
+                && (freqs.Rank >= 2)
+                && (freqs.Sizes[1] >= Hs);
 
-            // Weight grads
-            if (op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
-                Tensor& d_q_norm = ensure_tensor(st, op.outputs.at(1), q_norm.DType, {Hs});
-                const bool acc = accumulate_tensors.count(op.outputs.at(1)) > 0;
-                qkv_head_rmsnorm_backward_dweight(
-                    d_q_norm, d_qkv_view, qkv_view, q_norm,
+            if (rope_fusable) {
+                // Fused QK norm + RoPE backward (matches modular path).
+                qkv_head_rmsnorm_rope_backward_dx(
+                    d_qkv_view, qkv_view, q_norm, q_rstd,
+                    freqs, reinterpret_cast<int*>(pos_ids.Data),
                     static_cast<int>(B), static_cast<int>(T), qkv_channels, Hq, Hs, 0,
-                    acc, rs.MainStream);
-            }
-            if (op.outputs.size() > 2 && !op.outputs.at(2).empty()) {
-                Tensor& d_k_norm = ensure_tensor(st, op.outputs.at(2), k_norm.DType, {Hs});
-                const bool acc = accumulate_tensors.count(op.outputs.at(2)) > 0;
-                qkv_head_rmsnorm_backward_dweight(
-                    d_k_norm, d_qkv_view, qkv_view, k_norm,
+                    rs.MainStream);
+                qkv_head_rmsnorm_rope_backward_dx(
+                    d_qkv_view, qkv_view, k_norm, k_rstd,
+                    freqs, reinterpret_cast<int*>(pos_ids.Data),
                     static_cast<int>(B), static_cast<int>(T), qkv_channels, Hkv, Hs, Hq * Hs,
-                    acc, rs.MainStream);
-            }
+                    rs.MainStream);
+                if (q_norm_trainable && op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
+                    Tensor& d_q_norm = ensure_tensor(st, op.outputs.at(1), q_norm.DType, {Hs});
+                    const bool acc = accumulate_tensors.count(op.outputs.at(1)) > 0;
+                    qkv_head_rmsnorm_rope_backward_dweight(
+                        d_q_norm, d_qkv_view, qkv_view, q_norm,
+                        freqs, reinterpret_cast<int*>(pos_ids.Data),
+                        static_cast<int>(B), static_cast<int>(T), qkv_channels, Hq, Hs, 0,
+                        acc, rs.MainStream);
+                }
+                if (k_norm_trainable && op.outputs.size() > 2 && !op.outputs.at(2).empty()) {
+                    Tensor& d_k_norm = ensure_tensor(st, op.outputs.at(2), k_norm.DType, {Hs});
+                    const bool acc = accumulate_tensors.count(op.outputs.at(2)) > 0;
+                    qkv_head_rmsnorm_rope_backward_dweight(
+                        d_k_norm, d_qkv_view, qkv_view, k_norm,
+                        freqs, reinterpret_cast<int*>(pos_ids.Data),
+                        static_cast<int>(B), static_cast<int>(T), qkv_channels, Hkv, Hs, Hq * Hs,
+                        acc, rs.MainStream);
+                }
+            } else {
+                // Undo RoPE on gradients and activations (in-place) before QK RMSNorm backward.
+                rope_backward(d_qkv, d_qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+                              static_cast<int>(B), static_cast<int>(T), Hq, Hkv, Hs, rotary_dim, rs.MainStream);
+                rope_backward(qkv, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+                              static_cast<int>(B), static_cast<int>(T), Hq, Hkv, Hs, rotary_dim, rs.MainStream);
 
-            // Backward dx for Q/K RMSNorm (in-place on d_qkv_view).
-            qkv_head_rmsnorm_backward_dx(
-                d_qkv_view, qkv_view, q_norm, q_rstd,
-                static_cast<int>(B), static_cast<int>(T), qkv_channels, Hq, Hs, 0,
-                rs.MainStream);
-            qkv_head_rmsnorm_backward_dx(
-                d_qkv_view, qkv_view, k_norm, k_rstd,
-                static_cast<int>(B), static_cast<int>(T), qkv_channels, Hkv, Hs, Hq * Hs,
-                rs.MainStream);
+                if (q_norm_trainable && op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
+                    Tensor& d_q_norm = ensure_tensor(st, op.outputs.at(1), q_norm.DType, {Hs});
+                    const bool acc = accumulate_tensors.count(op.outputs.at(1)) > 0;
+                    qkv_head_rmsnorm_backward_dweight(
+                        d_q_norm, d_qkv_view, qkv_view, q_norm,
+                        static_cast<int>(B), static_cast<int>(T), qkv_channels, Hq, Hs, 0,
+                        acc, rs.MainStream);
+                }
+                if (k_norm_trainable && op.outputs.size() > 2 && !op.outputs.at(2).empty()) {
+                    Tensor& d_k_norm = ensure_tensor(st, op.outputs.at(2), k_norm.DType, {Hs});
+                    const bool acc = accumulate_tensors.count(op.outputs.at(2)) > 0;
+                    qkv_head_rmsnorm_backward_dweight(
+                        d_k_norm, d_qkv_view, qkv_view, k_norm,
+                        static_cast<int>(B), static_cast<int>(T), qkv_channels, Hkv, Hs, Hq * Hs,
+                        acc, rs.MainStream);
+                }
+
+                // Backward dx for Q/K RMSNorm (in-place on d_qkv_view).
+                qkv_head_rmsnorm_backward_dx(
+                    d_qkv_view, qkv_view, q_norm, q_rstd,
+                    static_cast<int>(B), static_cast<int>(T), qkv_channels, Hq, Hs, 0,
+                    rs.MainStream);
+                qkv_head_rmsnorm_backward_dx(
+                    d_qkv_view, qkv_view, k_norm, k_rstd,
+                    static_cast<int>(B), static_cast<int>(T), qkv_channels, Hkv, Hs, Hq * Hs,
+                    rs.MainStream);
+            }
             if (!op.outputs.at(0).empty()) {
                 st.tensors.emplace(op.outputs.at(0), d_qkv);
             }
@@ -2619,9 +2834,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 d_residual = &d_residual_zero;
             }
 
+            const bool weight_trainable = mWeights.has(op.inputs.at(3)) && mWeights.is_trainable(op.inputs.at(3));
             Tensor* d_weight = nullptr;
             bool skip_weight_grad = true;
-            if (op.outputs.size() > 2 && !op.outputs.at(2).empty()) {
+            if (weight_trainable && op.outputs.size() > 2 && !op.outputs.at(2).empty()) {
                 d_weight = &ensure_tensor(st, op.outputs.at(2), weight.DType, {config.HiddenSize});
                 skip_weight_grad = false;
             }
