@@ -574,9 +574,17 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     cudaStream_t stream = rs.MainStream;
     CUDA_CHECK(cudaStreamWaitEvent(stream, rs.BackwardDone, 0));
 
+    // Check if async all-reduce was already started in backward()
     const bool grads_reduced = comm.world_size() > 1;
     if (grads_reduced) {
-        mGrads->reduce_all(comm, stream);
+        if (mGrads->is_reduce_pending()) {
+            // Async reduce was started - wait for completion
+            CUDA_CHECK(cudaStreamWaitEvent(stream, rs.all_reduce_done_event(), 0));
+            mGrads->clear_reduce_pending();
+        } else {
+            // Fallback: sync reduce if async wasn't started (e.g., non-last micro-step called update)
+            mGrads->reduce_all(comm, stream);
+        }
     }
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);

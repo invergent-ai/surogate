@@ -1885,6 +1885,13 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
         mLoRAGrads->end_micro_step(rs.MainStream, comm);
     }
+
+    // Start async all-reduce on last micro-step (overlaps with CPU work and optimizer prep)
+    // Note: LoRA gradients are already reduced in end_micro_step() above
+    if (last_step && comm.world_size() > 1) {
+        grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
+    }
+
     CUDA_CHECK(cudaEventRecord(rs.BackwardDone, rs.MainStream));
     CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
 }

@@ -236,6 +236,19 @@ void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
     for (auto& kv : mGrads) {
         comm.all_reduce_avg(kv.second, stream);
     }
+    mReducePending = false;
+}
+
+void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream, cudaEvent_t done_event) {
+    // Start all-reduce operations (NCCL is async by default)
+    for (auto& kv : mGrads) {
+        comm.all_reduce_avg(kv.second, stream);
+    }
+    // Record completion event so optimizer can wait on it
+    if (done_event) {
+        CUDA_CHECK(cudaEventRecord(done_event, stream));
+    }
+    mReducePending = true;
 }
 
 DslRunState::DslRunState(const PretrainedConfig& config,
@@ -622,9 +635,14 @@ void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg) {
 void DslRunState::create_cuda_resources() {
     CUDA_CHECK(cudaStreamCreate(&mSideStream));
     CUDA_CHECK(cudaEventCreate(&mSideStreamEvent));
+    CUDA_CHECK(cudaEventCreate(&mAllReduceDone));
 }
 
 void DslRunState::release_cuda_resources() noexcept {
+    if (mAllReduceDone) {
+        cudaEventDestroy(mAllReduceDone);
+        mAllReduceDone = nullptr;
+    }
     if (mSideStreamEvent) {
         cudaEventDestroy(mSideStreamEvent);
         mSideStreamEvent = nullptr;

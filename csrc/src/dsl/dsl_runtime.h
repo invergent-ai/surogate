@@ -68,6 +68,14 @@ public:
     void zero_all(cudaStream_t stream);
     void reduce_all(NCCLCommunicator& comm, cudaStream_t stream);
 
+    /// Start async all-reduce on all gradients (non-blocking).
+    /// Call wait_for_reduce() or synchronize on AllReduceDone event before using gradients.
+    void reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream, cudaEvent_t done_event);
+
+    /// Check if async reduce has been started (for avoiding redundant reduce in update)
+    bool is_reduce_pending() const { return mReducePending; }
+    void clear_reduce_pending() { mReducePending = false; }
+
     const std::vector<std::string>& param_names() const { return mParamOrder; }
     const std::unordered_map<std::string, Tensor>& grads() const { return mGrads; }
 
@@ -76,6 +84,7 @@ private:
     std::unordered_map<std::string, Tensor> mGrads;
     std::vector<std::string> mParamOrder;
     bool mAccumulate = false;
+    bool mReducePending = false;  ///< True if async reduce has been started
 };
 
 // DSL run state for graph execution (activation buffers, scratch, etc).
@@ -106,6 +115,7 @@ public:
 
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
+    cudaEvent_t all_reduce_done_event() const { return mAllReduceDone; }
 
     // IRunState overrides (quantization unsupported in DSL runtime for now).
     [[nodiscard]] bool has_activation_quants() const override { return mMatmulDtype != mActivationDtype; }
@@ -160,6 +170,7 @@ private:
     // CUDA resources
     cudaStream_t mSideStream = nullptr;
     cudaEvent_t mSideStreamEvent = nullptr;
+    cudaEvent_t mAllReduceDone = nullptr;  ///< Recorded after async all-reduce completes
 };
 
 } // namespace dsl
