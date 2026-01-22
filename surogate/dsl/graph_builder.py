@@ -339,6 +339,36 @@ class GraphBuilder:
         return self._make_output(out)
 
     # =========================================================================
+    # Fused Operations
+    # =========================================================================
+
+    def matmul_swiglu(
+        self,
+        a: str | GraphRef,
+        b: str | GraphRef,
+        *,
+        transpose: str | TransposeMode = "NT",
+        out_name: str | None = None,
+        up_out_name: str | None = None,
+    ) -> tuple[GraphRef, GraphRef]:
+        """Fused matmul + SwiGLU activation.
+
+        Computes: swiglu(A @ B^T) where B contains fused [up, gate] weights.
+        Returns (activation_output, matmul_output_for_backward).
+
+        The matmul output (up_out) is saved for backward pass computation.
+        """
+        out = out_name if out_name else self._fresh_name("mlp_act")
+        up_out = up_out_name if up_out_name else self._fresh_name("mlp_up")
+        self._add_node(GraphNode(
+            op="matmul_swiglu",
+            inputs=[self._resolve_input(a), self._resolve_input(b)],
+            outputs=[out, up_out],
+            attrs={"transpose": str(transpose)},
+        ))
+        return self._make_outputs([out, up_out])
+
+    # =========================================================================
     # Attention
     # =========================================================================
 

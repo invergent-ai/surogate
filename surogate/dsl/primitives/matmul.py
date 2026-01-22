@@ -48,3 +48,39 @@ def batched_matmul(
 ) -> Tensor["B", "M", "N"]:
     """Batched matrix multiplication."""
     ...
+
+
+@primitive(impl="kernels.matmul_swiglu")
+def matmul_swiglu(
+    A: Tensor["*", "K"],
+    B: Tensor["2*M", "K"],
+    *,
+    transpose: TransposeMode = TransposeMode.NT,
+) -> Tensor["*", "M"]:
+    """Fused matmul + SwiGLU activation.
+
+    Computes: swiglu(A @ B^T) where B contains fused [up, gate] weights.
+
+    Output shape is half the matmul output (SwiGLU halves the last dimension).
+    This is the common MLP up projection pattern in LLaMA/Qwen models.
+
+    Note: The executor may decompose this into separate matmul + swiglu
+    operations if a fused kernel is not available.
+    """
+    ...
+
+
+@matmul_swiglu.backward
+@save("A", "B")
+def matmul_swiglu_backward(
+    d_out: Tensor["*", "M"],
+    A: Tensor["*", "K"],
+    B: Tensor["2*M", "K"],
+    up_output: Tensor["*", "2*M"],
+) -> tuple[Tensor["*", "K"], Tensor["2*M", "K"]]:
+    """Backward pass for fused matmul + swiglu.
+
+    Note: up_output is the intermediate matmul result needed for swiglu backward.
+    The executor must save this during forward pass.
+    """
+    ...

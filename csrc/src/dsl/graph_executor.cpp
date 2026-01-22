@@ -2733,6 +2733,43 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             continue;
         }
 
+        // Fused matmul + swiglu for MLP up projection
+        // Decomposes into: matmul -> swiglu, but saves intermediate for backward
+        if (op_type == "matmul_swiglu") {
+            Tensor& a = get_tensor(st, op.inputs.at(0), mSaved);
+            Tensor& b = get_tensor(st, op.inputs.at(1), mSaved);
+            if (a.Rank != 2 || b.Rank != 2) {
+                throw std::runtime_error(
+                    "DSL graph executor: matmul_swiglu expects rank-2 tensors (op=" + op.id + ")"
+                );
+            }
+            EMMTranspose mode = parse_transpose(op.attrs);
+            int M = 0, N = 0, K = 0;
+            matmul_dims(a, b, mode, M, N, K);
+            // N = 2*D (fused up+gate), output D = N/2
+            const long D = N / 2;
+
+            // First output: swiglu result (M, D)
+            Tensor& out = ensure_tensor(st, op.outputs.at(0), a.DType, {static_cast<long>(M), D});
+            // Second output: matmul intermediate for backward (M, N=2*D)
+            Tensor& up_out = ensure_tensor(st, op.outputs.at(1), a.DType, {static_cast<long>(M), static_cast<long>(N)});
+
+            // Step 1: matmul
+            matmul(up_out, b, a, std::nullopt, nullptr, nullptr,
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K, swap_transpose(mode), false, rs.MainStream);
+
+            // Step 2: swiglu
+            // up_out is (M, 2*D), we need to reshape it to (B*T, 2*D) for swiglu
+            // swiglu expects (B, T, 2*D) -> (B, T, D), but we have (B*T, 2*D)
+            // Reshape to 3D for swiglu kernel
+            Tensor up_3d = view_tensor(up_out, {B, T, static_cast<long>(N)});
+            Tensor out_3d = view_tensor(out, {B, T, D});
+            swiglu_forward(out_3d, up_3d, nullptr, static_cast<int>(B),
+                           static_cast<int>(T), static_cast<int>(D), rs.MainStream);
+            continue;
+        }
+
         if (op_type == "qkv_qk_norm_rope") {
             Tensor& qkv = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& q_norm = get_tensor(st, op.inputs.at(1), mSaved);
@@ -4278,6 +4315,81 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             swiglu_backward(d_inp, d_out, inp, abs_max_ptr,
                             static_cast<int>(inp.Sizes[0]), static_cast<int>(inp.Sizes[1]),
                             static_cast<int>(D), rs.MainStream);
+            continue;
+        }
+
+        // Fused matmul + swiglu backward
+        // d_out: gradient w.r.t. swiglu output (M, D)
+        // up_output: saved matmul output (M, 2*D) from forward
+        // a: input to matmul from forward (M, K)
+        // b: weight matrix (2*D, K) for NT mode
+        // Outputs: d_a (M, K), d_b (2*D, K)
+        if (op_type == "matmul_swiglu_backward") {
+            Tensor& d_out = get_tensor(st, op.inputs.at(0), mSaved);
+            Tensor& a = get_tensor(st, op.inputs.at(1), mSaved);
+            Tensor& b = get_tensor(st, op.inputs.at(2), mSaved);
+            Tensor& up_output = get_tensor(st, op.inputs.at(3), mSaved);
+
+            const std::string& d_a_name = (op.outputs.size() > 0) ? op.outputs.at(0) : "";
+            const std::string& d_b_name = (op.outputs.size() > 1) ? op.outputs.at(1) : "";
+
+            if (d_a_name.empty() && d_b_name.empty()) {
+                continue;
+            }
+
+            EMMTranspose mode = parse_transpose(op.attrs);
+            int M = 0, N = 0, K = 0;
+            matmul_dims(a, b, mode, M, N, K);
+            const long D = N / 2;
+
+            // Step 1: swiglu backward to get d_up (M, 2*D)
+            // d_out is (M, D), up_output is (M, 2*D)
+            Tensor d_up = rs.temp_alloc(d_out.DType, {static_cast<long>(M), static_cast<long>(N)});
+            st.temps.push_back(d_up);
+
+            // Reshape for swiglu_backward which expects (B, T, 2*D)
+            Tensor d_out_3d = view_tensor(d_out, {B, T, D});
+            Tensor up_3d = view_tensor(up_output, {B, T, static_cast<long>(N)});
+            Tensor d_up_3d = view_tensor(d_up, {B, T, static_cast<long>(N)});
+
+            float* abs_max_ptr = rs.has_grad_quants()
+                ? rs.simplified_quant_grads().d_mlp_up.abs_max()
+                : nullptr;
+            swiglu_backward(d_up_3d, d_out_3d, up_3d, abs_max_ptr,
+                            static_cast<int>(B), static_cast<int>(T),
+                            static_cast<int>(D), rs.MainStream);
+
+            // Step 2: matmul backward
+            // d_a = d_up @ b (if needed)
+            // d_b = d_up^T @ a (if needed)
+            bool do_accumulate = accumulate_tensors.count(d_b_name) > 0;
+
+            if (!d_a_name.empty()) {
+                Tensor& d_a = ensure_tensor(st, d_a_name, a.DType, {static_cast<long>(M), static_cast<long>(K)});
+                // For NT mode: d_a = d_up @ b (no transpose on either)
+                EMMTranspose mode_da = EMMTranspose::NN;
+                matmul(d_a, b, d_up, std::nullopt, nullptr, nullptr,
+                       rs.CublasLtHandle, rs.CuBlasWorkspace,
+                       K, M, N, swap_transpose(mode_da), false, rs.MainStream);
+            }
+
+            if (!d_b_name.empty()) {
+                // Check if weight is trainable
+                bool skip_weight_grad = false;
+                if (auto param_name = base_param_from_grad(d_b_name)) {
+                    if (mWeights.has(*param_name) && !mWeights.is_trainable(*param_name)) {
+                        skip_weight_grad = true;
+                    }
+                }
+                if (!skip_weight_grad) {
+                    Tensor& d_b = ensure_tensor(st, d_b_name, b.DType, {static_cast<long>(N), static_cast<long>(K)});
+                    // For NT mode: d_b = d_up^T @ a -> (N, M) @ (M, K) = (N, K)
+                    EMMTranspose mode_db = EMMTranspose::TN;
+                    matmul(d_b, a, d_up, std::nullopt, nullptr, nullptr,
+                           rs.CublasLtHandle, rs.CuBlasWorkspace,
+                           K, N, M, swap_transpose(mode_db), do_accumulate, rs.MainStream);
+                }
+            }
             continue;
         }
 

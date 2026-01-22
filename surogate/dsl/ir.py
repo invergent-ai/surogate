@@ -36,6 +36,7 @@ class KernelType(str, Enum):
     # Linear algebra
     MATMUL = "matmul"
     MATMUL_BIAS = "matmul_bias"
+    MATMUL_SWIGLU = "matmul_swiglu"
     BATCHED_MATMUL = "batched_matmul"
     GROUPED_GEMM = "grouped_gemm"
 
