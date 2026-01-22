@@ -6,6 +6,7 @@
 #include "dsl/graph_executor.h"
 #include "dsl/autodiff.h"
 #include "dsl/dsl_runtime.h"
+#include "dsl/dsl_weight_manager.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1208,6 +1209,25 @@ GraphExecutor::GraphExecutor(const Module& module,
     init(exec_options);
 }
 
+GraphExecutor::~GraphExecutor() {
+    // Clean up CUDA graphs
+    if (mForwardGraph) {
+        cudaGraphExecDestroy(mForwardGraph);
+        mForwardGraph = nullptr;
+    }
+    for (auto& graph : mBackwardGraph) {
+        if (graph) {
+            cudaGraphExecDestroy(graph);
+            graph = nullptr;
+        }
+    }
+    // Clean up prefetch event
+    if (mPrefetchEvent) {
+        cudaEventDestroy(mPrefetchEvent);
+        mPrefetchEvent = nullptr;
+    }
+}
+
 void GraphExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
                                    modules::ModularLoRAWeightsManager* weights,
                                    modules::ModularLoRAGradsManager* grads,
@@ -1556,6 +1576,120 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
     return &it->second.weight;
 }
 
+void GraphExecutor::build_layer_weight_map() {
+    if (!mForward || !mLayerWeightNames.empty()) {
+        return;
+    }
+
+    const int num_layers = mConfig.NumLayers;
+    mLayerWeightNames.resize(num_layers);
+
+    // Scan forward graph for matmul operations and map weight names to layers
+    for (const auto& op : mForward->operations) {
+        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        if (op_type != "matmul" && op_type != "matmul_bias") {
+            continue;
+        }
+        if (op.inputs.size() < 2) {
+            continue;
+        }
+
+        const std::string& weight_name = op.inputs.at(1);
+        int layer_idx = -1;
+        std::string param_name;
+        if (!parse_block_param(weight_name, layer_idx, param_name)) {
+            continue;
+        }
+        if (layer_idx < 0 || layer_idx >= num_layers) {
+            continue;
+        }
+
+        // Check if this weight is a candidate for FP8 caching
+        if (!mWeights.has(weight_name) || mWeights.is_trainable(weight_name)) {
+            continue;
+        }
+
+        // Avoid duplicates
+        auto& names = mLayerWeightNames[layer_idx];
+        if (std::find(names.begin(), names.end(), weight_name) == names.end()) {
+            names.push_back(weight_name);
+        }
+    }
+
+    // Enable prefetching if we have FP8 forward and layers with weights
+    mPrefetchEnabled = mRunState.has_fp8_forward() && num_layers > 1;
+    if (mPrefetchEnabled && !mPrefetchEvent) {
+        CUDA_CHECK(cudaEventCreate(&mPrefetchEvent));
+    }
+}
+
+void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
+    if (!mPrefetchEnabled || layer_idx < 0 || layer_idx >= static_cast<int>(mLayerWeightNames.size())) {
+        return;
+    }
+
+    // Use weight manager for streaming/sharding if available
+    // Note: comm is not available here, so we use a dummy reference for now
+    // In a real implementation, comm would be passed through or stored
+    (void)stream;  // Silence unused warning when weight manager not used
+
+    // FP8 weight prefetching
+    if (mRunState.has_fp8_forward()) {
+        const auto& weight_names = mLayerWeightNames[layer_idx];
+        for (const auto& name : weight_names) {
+            if (!mWeights.has(name)) {
+                continue;
+            }
+            Tensor& weight = mWeights.get(name);
+            if (weight.DType == ETensorDType::FP8_E4M3) {
+                continue;  // Already quantized
+            }
+
+            // Ensure cache entry exists
+            auto it = mFP8WeightCache.find(name);
+            if (it == mFP8WeightCache.end()) {
+                FP8WeightCacheEntry entry{};
+                std::vector<long> shape(weight.Sizes.begin(), weight.Sizes.begin() + weight.Rank);
+                entry.weight = mRunState.Allocator->allocate(ETensorDType::FP8_E4M3,
+                                                             ("fp8_cache_" + name).c_str(),
+                                                             EAllocationType::ON_DEVICE,
+                                                             shape);
+                entry.stats = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                            ("fp8_cache_" + name + "_stats").c_str(),
+                                                            EAllocationType::ON_DEVICE,
+                                                            {2L});
+                entry.weight.Stats = entry.stats.get<float>();
+                auto [insert_it, _] = mFP8WeightCache.emplace(name, std::move(entry));
+                it = insert_it;
+            }
+
+            // Quantize on the prefetch stream if not already done
+            if (!it->second.initialized) {
+                const long N = static_cast<long>(weight.nelem());
+                if (N > 0) {
+                    abs_max(it->second.weight.abs_max(), weight, N, mRunState.DeviceProp, stream);
+                    quantize_with_abs_max(it->second.weight, it->second.weight.scale(),
+                                          weight, it->second.weight.abs_max(),
+                                          N, mRunState.DeviceProp, stream);
+                }
+                it->second.initialized = true;
+            }
+        }
+    }
+
+    mPrefetchedLayer = layer_idx;
+    if (mPrefetchEvent) {
+        CUDA_CHECK(cudaEventRecord(mPrefetchEvent, stream));
+    }
+}
+
+void GraphExecutor::wait_for_prefetch(int layer_idx, cudaStream_t stream) {
+    if (!mPrefetchEnabled || mPrefetchedLayer != layer_idx || !mPrefetchEvent) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(stream, mPrefetchEvent, 0));
+}
+
 std::vector<std::byte> GraphExecutor::rng_state() const {
     std::stringstream tmp;
     static_cast<std::ostream&>(tmp) << mRng;
@@ -1861,6 +1995,24 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         prime_fp8_weight_cache(required);
     }
 
+    // Build layer-to-weight map for prefetching (once)
+    build_layer_weight_map();
+
+    // Track current layer for prefetching
+    int current_layer = -1;
+    int last_prefetched = -1;
+
+    // Prefetch first layer's weights before starting the loop
+    if (mPrefetchEnabled && config.NumLayers > 0 && !capturing) {
+        prefetch_layer_weights(0, rs.side_stream());
+        last_prefetched = 0;
+    }
+
+    // If using weight manager for streaming, gather first layer's weights
+    if (mWeightManager && mWeightManager->is_streaming_enabled() && config.NumLayers > 0 && !capturing) {
+        mWeightManager->gather_block(0, comm, rs.side_stream());
+    }
+
     auto run_ops = [&]() {
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
@@ -1872,6 +2024,36 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 if (layer_checkpoints.find(layer_idx) == layer_checkpoints.end()) {
                     layer_checkpoints[layer_idx] = rs.Stack.checkpoint();
                     layer_temp_marks[layer_idx] = st.temps.size();
+
+                    // New layer started - wait for any pending prefetch and start next prefetch
+                    if (layer_idx != current_layer) {
+                        // Wait for prefetch of current layer if needed
+                        if (current_layer >= 0) {
+                            wait_for_prefetch(current_layer, rs.MainStream);
+                            // Release previous layer's weights if using weight manager
+                            if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+                                mWeightManager->release_block(current_layer, rs.MainStream);
+                            }
+                        }
+
+                        // Wait for current layer's weights to be ready
+                        if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+                            mWeightManager->wait_for_gather(layer_idx, rs.MainStream);
+                        }
+
+                        current_layer = layer_idx;
+
+                        // Prefetch next layer's weights on side stream
+                        const int next_layer = layer_idx + 1;
+                        if (next_layer < config.NumLayers && next_layer != last_prefetched) {
+                            prefetch_layer_weights(next_layer, rs.side_stream());
+                            // Also start gathering next layer's weights if using weight manager
+                            if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+                                mWeightManager->gather_block(next_layer, comm, rs.side_stream());
+                            }
+                            last_prefetched = next_layer;
+                        }
+                    }
                 }
                 break;
             }
@@ -2565,11 +2747,17 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 ctx.stream = rs.MainStream;
                 ctx.layer_idx = layer_idx_local;
                 ctx.op = matmul_op;
-                // Disable FP8/FP4 for recompute to avoid numerical mismatch with forward pass.
-                // Forward pass uses delayed scaling, but recompute would use JIT scaling which
-                // produces different results and causes gradient explosion.
+                // Disable FP8 for recompute to avoid numerical mismatch with forward pass.
+                // FP8 forward pass uses delayed scaling, but recompute would use JIT scaling
+                // which produces different results and causes gradient explosion.
+                // FP4 is fine because it uses per-block auto-scaling in both forward and recompute.
                 ctx.allow_fp8 = false;
-                ctx.allow_fp4 = false;
+                ctx.allow_fp4 = allow_quant;
+                if (allow_quant) {
+                    ctx.cached_fp4_data = nullptr;  // Don't use cached FP4 weights for recompute
+                    ctx.cached_fp4_scales = nullptr;
+                    ctx.cached_fp4_amax = nullptr;
+                }
                 recipe.forward_matmul(ctx);
                 used_recipe = true;
             }
@@ -2839,6 +3027,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         bind_param_grad(kv.first);
     }
 
+    // Track current layer for backward prefetching (need to declare before lambdas)
+    int bwd_current_layer = -1;
+    int bwd_last_prefetched = -1;
+
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
     auto extract_layer = [&](const std::string& name, int& layer_idx) -> bool {
@@ -2859,6 +3051,20 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 if (layer_checkpoints.find(layer_idx) == layer_checkpoints.end()) {
                     layer_checkpoints[layer_idx] = rs.Stack.checkpoint();
                     layer_temp_marks[layer_idx] = st.temps.size();
+
+                    // Backward goes from last to first layer, so prefetch l-1 while processing l
+                    if (layer_idx != bwd_current_layer) {
+                        if (bwd_current_layer >= 0) {
+                            wait_for_prefetch(bwd_current_layer, rs.MainStream);
+                        }
+                        bwd_current_layer = layer_idx;
+
+                        const int prev_layer = layer_idx - 1;
+                        if (prev_layer >= 0 && prev_layer != bwd_last_prefetched) {
+                            prefetch_layer_weights(prev_layer, rs.side_stream());
+                            bwd_last_prefetched = prev_layer;
+                        }
+                    }
                 }
                 return;
             }
@@ -2869,6 +3075,20 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 if (layer_checkpoints.find(layer_idx) == layer_checkpoints.end()) {
                     layer_checkpoints[layer_idx] = rs.Stack.checkpoint();
                     layer_temp_marks[layer_idx] = st.temps.size();
+
+                    // Backward goes from last to first layer, so prefetch l-1 while processing l
+                    if (layer_idx != bwd_current_layer) {
+                        if (bwd_current_layer >= 0) {
+                            wait_for_prefetch(bwd_current_layer, rs.MainStream);
+                        }
+                        bwd_current_layer = layer_idx;
+
+                        const int prev_layer = layer_idx - 1;
+                        if (prev_layer >= 0 && prev_layer != bwd_last_prefetched) {
+                            prefetch_layer_weights(prev_layer, rs.side_stream());
+                            bwd_last_prefetched = prev_layer;
+                        }
+                    }
                 }
                 return;
             }
@@ -2910,6 +3130,12 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     }
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
+
+    // Prefetch last layer's weights for backward
+    if (mPrefetchEnabled && config.NumLayers > 0 && !capturing) {
+        prefetch_layer_weights(config.NumLayers - 1, rs.side_stream());
+        bwd_last_prefetched = config.NumLayers - 1;
+    }
 
     auto run_ops_range = [&](std::size_t begin, std::size_t end) {
         end = std::min(end, mBackward->operations.size());

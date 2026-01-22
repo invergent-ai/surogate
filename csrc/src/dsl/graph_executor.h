@@ -29,7 +29,7 @@ class ModularLoRAWeightsManager;
 class ModularLoRAGradsManager;
 struct LoRARunState;
 }
-namespace dsl { class DslRunState; class DslParamStore; class DslGradStore; }
+namespace dsl { class DslRunState; class DslParamStore; class DslGradStore; class DslWeightManager; }
 
 namespace dsl {
 
@@ -79,11 +79,15 @@ public:
                   const modules::ModelConfig& config,
                   const RuntimeOptions& options,
                   const GraphExecutorOptions& exec_options = {});
+    ~GraphExecutor() override;
 
     void set_lora_state(const modules::ModularLoRAConfig* config,
                         modules::ModularLoRAWeightsManager* weights,
                         modules::ModularLoRAGradsManager* grads,
                         modules::LoRARunState* run_state);
+
+    // Set optional weight manager for streaming/sharding
+    void set_weight_manager(DslWeightManager* weight_manager) { mWeightManager = weight_manager; }
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
@@ -111,6 +115,9 @@ private:
     modules::ModularLoRAWeightsManager* mLoRAWeights = nullptr;
     modules::ModularLoRAGradsManager* mLoRAGrads = nullptr;
     modules::LoRARunState* mLoRARunState = nullptr;
+
+    // Optional weight manager for streaming/sharding (owned by DslModel)
+    DslWeightManager* mWeightManager = nullptr;
 
     const Graph* mForward;
     const Graph* mBackward;
@@ -146,7 +153,18 @@ private:
     void prime_fp8_weight_cache(const std::vector<char>& required);
     const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
 
+    // Weight prefetching for layer-by-layer execution
+    void prefetch_layer_weights(int layer_idx, cudaStream_t stream);
+    void wait_for_prefetch(int layer_idx, cudaStream_t stream);
+    void build_layer_weight_map();
+
     std::minstd_rand mRng{42};
+
+    // Layer-to-weight-names map for prefetching
+    std::vector<std::vector<std::string>> mLayerWeightNames;
+    int mPrefetchedLayer = -1;
+    cudaEvent_t mPrefetchEvent = nullptr;
+    bool mPrefetchEnabled = false;
 
     // CUDA graph capture (optional)
     bool mGraphsEnabled = false; // Forward graphs

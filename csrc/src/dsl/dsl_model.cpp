@@ -22,6 +22,7 @@
 
 #include "dsl/graph_executor.h"
 #include "dsl/dsl_runtime.h"
+#include "dsl/dsl_weight_manager.h"
 #include "kernels/kernels.h"
 #include "modules/lora/lora_utils.h"
 #include "modules/model_config.h"
@@ -470,6 +471,13 @@ DslModel::DslModel(const PretrainedConfig& config,
                                               options, *mConfig, mAllocator,
                                               lora_config ? &*lora_config : nullptr);
     mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator);
+
+    // Create weight manager for streaming/sharding if enabled
+    if (options.ShardWeights || options.OffloadMaster) {
+        mWeightManager = std::make_unique<DslWeightManager>(
+            *mModule, mModule->forward.value(), options, *mConfig, mAllocator,
+            lora_config ? &*lora_config : nullptr);
+    }
 
     if (lora_config.has_value() && lora_config->enabled()) {
         mLoRAConfig = lora_config;
@@ -1312,6 +1320,13 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mExecutor->set_rng_state(mRngState);
     }
 
+    // Wire weight manager for streaming/sharding
+    if (mWeightManager) {
+        if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+            exec->set_weight_manager(mWeightManager.get());
+        }
+    }
+
     if (lora_enabled()) {
         ensure_lora_run_state(comm, B, T);
         mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
@@ -1358,6 +1373,10 @@ IRunState& DslModel::get_run_state() const {
         throw std::logic_error("DslModel::get_run_state() called before allocate_run_state()");
     }
     return *mRunState;
+}
+
+bool DslModel::is_weight_streaming_enabled() const {
+    return mWeightManager && mWeightManager->is_streaming_enabled();
 }
 
 void DslModel::init_optimizer_state(cudaStream_t stream) {

@@ -29,6 +29,7 @@ class IGraphExecutor;
 class DslParamStore;
 class DslGradStore;
 class DslRunState;
+class DslWeightManager;
 
 class EmptyTensorContainer final : public ITensorContainer {
 public:
@@ -123,6 +124,10 @@ public:
     DslModel& base_model() { return *this; }
     [[nodiscard]] const modules::ModelConfig& config() const { return mModelConfig; }
 
+    // Weight streaming/sharding support
+    [[nodiscard]] bool is_weight_streaming_enabled() const;
+    [[nodiscard]] DslWeightManager* weight_manager() { return mWeightManager.get(); }
+
     modules::ModularLoRAWeightsManager& lora_weights();
     modules::ModularLoRAGradsManager& lora_grads();
     modules::LoRARunState& lora_run_state();
@@ -183,6 +188,7 @@ private:
     const Module* mModule = nullptr;
     std::unique_ptr<DslParamStore> mParams;
     std::unique_ptr<DslGradStore> mGrads;
+    std::unique_ptr<DslWeightManager> mWeightManager;  // Optional - for streaming/sharding
     EmptyTensorContainer mEmpty;
     detail::AdamW8BitMomentumContainer mAdamWMomentumContainer;
     detail::AdamW8BitVarianceContainer mAdamWVarianceContainer;
