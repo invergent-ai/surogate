@@ -177,6 +177,9 @@ private:
     cudaGraphExec_t mBackwardGraph[2]{nullptr, nullptr}; // [0]=accumulate false, [1]=true
     DeviceMemoryStack::Checkpoint mForwardCheckpoint{};
     DeviceMemoryStack::Checkpoint mBackwardCheckpoint[2]{};
+
+    // Per-layer CUDA graph execution (more granular than whole-graph capture)
+    bool mPerLayerGraphsEnabled = false;
 };
 
 }  // namespace dsl

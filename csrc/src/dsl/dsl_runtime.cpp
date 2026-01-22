@@ -260,7 +260,9 @@ DslRunState::DslRunState(const PretrainedConfig& config,
       mAllocator(allocator),
       mRecomputeBlock(options.RecomputeBlock),
       mRecomputeLoRA(options.RecomputeLoRA),
-      mLoraOnlyMode(lora_only_mode) {
+      mLoraOnlyMode(lora_only_mode),
+      mNumLayers(config.NumLayers),
+      mPerLayerGraphsEnabled(options.UseCudaGraphs) {
     if (!mAllocator) {
         throw std::runtime_error("DslRunState: allocator is null");
     }
@@ -289,11 +291,15 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     allocate_simplified_activations(config);
     allocate_simplified_gradients(config);
     allocate_simplified_quant_buffers(config, options);
-    allocate_residual_buffers(config);
+    allocate_residual_buffers(config, options.OffloadResidual);
     allocate_scratch_buffers(config);
+
+    // Allocate per-layer CUDA graph arrays
+    allocate_graph_arrays(config.NumLayers);
 }
 
 DslRunState::~DslRunState() {
+    destroy_cuda_graphs();
     release_cuda_resources();
 }
 
@@ -619,7 +625,8 @@ Tensor* DslRunState::get_gradient_quant_buffer(int op) {
     }
 }
 
-void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg) {
+void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals) {
+    mOffloadResiduals = offload_residuals;
     mResidualManager = std::make_unique<modules::ResidualManager>(
         mAllocator,
         cfg.NumLayers,
@@ -627,9 +634,33 @@ void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg) {
         static_cast<int>(T),
         cfg.HiddenSize,
         cfg.DType,
-        /*offload_residuals=*/false,
+        offload_residuals,
         /*num_residual_buffers=*/2,
         MainStream);
+}
+
+void DslRunState::fetch_residual(int layer_idx, cudaStream_t stream) {
+    if (mResidualManager) {
+        mResidualManager->fetch_residual(layer_idx, stream);
+    }
+}
+
+void DslRunState::put_residual(int layer_idx, cudaStream_t stream) {
+    if (mResidualManager) {
+        mResidualManager->put_residual(layer_idx, stream);
+    }
+}
+
+void DslRunState::mark_residual_ready(int layer_idx, cudaStream_t stream) {
+    if (mResidualManager) {
+        mResidualManager->mark_residual_ready(layer_idx, stream);
+    }
+}
+
+void DslRunState::release_residual(int layer_idx, cudaStream_t stream) {
+    if (mResidualManager) {
+        mResidualManager->release_residual(layer_idx, stream);
+    }
 }
 
 void DslRunState::create_cuda_resources() {
@@ -651,6 +682,72 @@ void DslRunState::release_cuda_resources() noexcept {
         cudaStreamDestroy(mSideStream);
         mSideStream = nullptr;
     }
+}
+
+void DslRunState::allocate_graph_arrays(int num_layers) {
+    mForwardBlockGraphs.resize(static_cast<std::size_t>(num_layers), nullptr);
+    mBackwardBlockGraphs.resize(static_cast<std::size_t>(num_layers), {nullptr, nullptr});
+    mForwardBlockStackCheckpoints.resize(static_cast<std::size_t>(num_layers));
+    mBackwardBlockStackCheckpoints.resize(static_cast<std::size_t>(num_layers));
+}
+
+void DslRunState::destroy_cuda_graphs() noexcept {
+    for (auto& g : mForwardBlockGraphs) {
+        if (g) {
+            (void)cudaGraphExecDestroy(g);
+            g = nullptr;
+        }
+    }
+    for (auto& arr : mBackwardBlockGraphs) {
+        for (auto& g : arr) {
+            if (g) {
+                (void)cudaGraphExecDestroy(g);
+                g = nullptr;
+            }
+        }
+    }
+}
+
+void DslRunState::reset_cuda_graphs() {
+    destroy_cuda_graphs();
+    // Reset checkpoints to default
+    for (auto& cp : mForwardBlockStackCheckpoints) {
+        cp = DeviceMemoryStack::Checkpoint{};
+    }
+    for (auto& arr : mBackwardBlockStackCheckpoints) {
+        arr[0] = DeviceMemoryStack::Checkpoint{};
+        arr[1] = DeviceMemoryStack::Checkpoint{};
+    }
+}
+
+void DslRunState::configure_forward_graphs(bool hooked) {
+    if (mForwardGraphsHooked == hooked) {
+        return;
+    }
+    // Graph topology changes when hooks are added/removed - must re-capture
+    for (auto& g : mForwardBlockGraphs) {
+        if (g) {
+            (void)cudaGraphExecDestroy(g);
+            g = nullptr;
+        }
+    }
+    mForwardGraphsHooked = hooked;
+}
+
+void DslRunState::configure_backward_graphs(bool hooked) {
+    if (mBackwardGraphsHooked == hooked) {
+        return;
+    }
+    // Graph topology changes when hooks are added/removed - must re-capture
+    for (auto& arr : mBackwardBlockGraphs) {
+        for (auto& g : arr) {
+            if (g) {
+                (void)cudaGraphExecDestroy(g);
+                g = nullptr;
+            }
+        }
+    }
+    mBackwardGraphsHooked = hooked;
 }
 
 } // namespace dsl

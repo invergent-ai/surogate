@@ -6,12 +6,14 @@
 #ifndef SUROGATE_SRC_DSL_DSL_RUNTIME_H
 #define SUROGATE_SRC_DSL_DSL_RUNTIME_H
 
+#include <array>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "dsl/ir.h"
+#include "utilities/stack.h"
 #include "modules/run_state_types.h"
 #include "modules/residual_manager.h"
 #include "training/model.h"
@@ -109,6 +111,13 @@ public:
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();
 
+    // Residual offloading support (for large model training)
+    void fetch_residual(int layer_idx, cudaStream_t stream);
+    void put_residual(int layer_idx, cudaStream_t stream);
+    void mark_residual_ready(int layer_idx, cudaStream_t stream);
+    void release_residual(int layer_idx, cudaStream_t stream);
+    bool has_residual_offloading() const { return mOffloadResiduals; }
+
     bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
     bool large_bwd_temps_on_stack() const { return mRecomputeBlock; }
     bool is_lora_only_mode() const { return mLoraOnlyMode; }
@@ -116,6 +125,51 @@ public:
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
     cudaEvent_t all_reduce_done_event() const { return mAllReduceDone; }
+
+    // ========================================================================
+    // Per-layer CUDA graphs (for efficient layer-by-layer execution)
+    // ========================================================================
+
+    /// @brief Get forward CUDA graph exec for a layer (nullptr if not captured)
+    cudaGraphExec_t& forward_block_graph(int layer_idx) {
+        return mForwardBlockGraphs.at(static_cast<std::size_t>(layer_idx));
+    }
+
+    /// @brief Get backward CUDA graph exec for a layer
+    /// @param layer_idx Layer index
+    /// @param accumulate If true, returns graph for gradient accumulation mode
+    cudaGraphExec_t& backward_block_graph(int layer_idx, bool accumulate) {
+        return mBackwardBlockGraphs.at(static_cast<std::size_t>(layer_idx))[accumulate ? 1 : 0];
+    }
+
+    /// @brief Get stack checkpoint for forward graph replay (ensures consistent temp addresses)
+    DeviceMemoryStack::Checkpoint& forward_block_stack_checkpoint(int layer_idx) {
+        return mForwardBlockStackCheckpoints.at(static_cast<std::size_t>(layer_idx));
+    }
+
+    /// @brief Get stack checkpoint for backward graph replay
+    DeviceMemoryStack::Checkpoint& backward_block_stack_checkpoint(int layer_idx, bool accumulate) {
+        return mBackwardBlockStackCheckpoints.at(static_cast<std::size_t>(layer_idx))[accumulate ? 1 : 0];
+    }
+
+    /// @brief Reconfigure forward graphs when hook presence changes
+    /// Destroys existing graphs to force re-capture with new topology
+    void configure_forward_graphs(bool hooked);
+
+    /// @brief Reconfigure backward graphs when hook presence changes
+    void configure_backward_graphs(bool hooked);
+
+    /// @brief Reset all CUDA graphs (call when batch/sequence dimensions change)
+    void reset_cuda_graphs();
+
+    /// @brief Check if per-layer CUDA graphs are enabled
+    bool per_layer_graphs_enabled() const { return mPerLayerGraphsEnabled; }
+
+    /// @brief Enable/disable per-layer CUDA graphs
+    void set_per_layer_graphs_enabled(bool enabled) { mPerLayerGraphsEnabled = enabled; }
+
+    /// @brief Get number of layers (for graph array sizing)
+    int num_layers() const { return mNumLayers; }
 
     // IRunState overrides (quantization unsupported in DSL runtime for now).
     [[nodiscard]] bool has_activation_quants() const override { return mMatmulDtype != mActivationDtype; }
@@ -137,7 +191,7 @@ private:
     void allocate_simplified_gradients(const PretrainedConfig& cfg);
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
     void allocate_scratch_buffers(const PretrainedConfig& cfg);
-    void allocate_residual_buffers(const PretrainedConfig& cfg);
+    void allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals);
     void create_cuda_resources();
     void release_cuda_resources() noexcept;
 
@@ -152,6 +206,7 @@ private:
     ETensorDType mMatmulDtype = ETensorDType::BF16;
     ETensorDType mGradQuantDtype = ETensorDType::BF16;
     bool mEnableFp8Forward = false;
+    bool mOffloadResiduals = false;
 
     modules::NonBlockActivations mNonBlockActivations;
     modules::NonBlockGradientBuffers mNonBlockGradients;
@@ -171,6 +226,28 @@ private:
     cudaStream_t mSideStream = nullptr;
     cudaEvent_t mSideStreamEvent = nullptr;
     cudaEvent_t mAllReduceDone = nullptr;  ///< Recorded after async all-reduce completes
+
+    // Per-layer CUDA graph support
+    int mNumLayers = 0;
+    bool mPerLayerGraphsEnabled = false;
+    bool mForwardGraphsHooked = false;
+    bool mBackwardGraphsHooked = false;
+
+    // Per-layer CUDA graph executables
+    std::vector<cudaGraphExec_t> mForwardBlockGraphs;
+    // Two backward graphs per layer: [0] for accumulate=false (first micro-step),
+    // [1] for accumulate=true (subsequent micro-steps with gradient accumulation)
+    std::vector<std::array<cudaGraphExec_t, 2>> mBackwardBlockGraphs;
+
+    // Stack checkpoints for CUDA graph compatibility
+    // When graphs use temp_alloc, we must restore the stack to the same state
+    // before each graph replay so allocations return consistent addresses
+    std::vector<DeviceMemoryStack::Checkpoint> mForwardBlockStackCheckpoints;
+    std::vector<std::array<DeviceMemoryStack::Checkpoint, 2>> mBackwardBlockStackCheckpoints;
+
+    // Helper to destroy graph arrays
+    void destroy_cuda_graphs() noexcept;
+    void allocate_graph_arrays(int num_layers);
 };
 
 } // namespace dsl

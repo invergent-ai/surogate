@@ -38,6 +38,48 @@ namespace {
 
 constexpr std::string_view kSavedPrefix = "saved.";
 
+/**
+ * @brief Execute a callable with stack checkpoint/restore for CUDA graph compatibility.
+ *
+ * When graphs are enabled and use temp_alloc() inside the captured function, we must
+ * ensure the stack is in the same state before each graph replay. This function:
+ * - On first capture: saves a checkpoint after the function runs
+ * - On replay: restores the stack to the checkpoint before launching the graph
+ *
+ * This ensures temp_alloc returns the same memory addresses that were captured in the graph.
+ * (Same pattern as modules::detail::trace_or_execute_cuda_graph_with_stack)
+ */
+template<typename Function>
+inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStream_t stream,
+                                                    cudaGraphExec_t& instance, bool enabled,
+                                                    DeviceMemoryStack& stack,
+                                                    DeviceMemoryStack::Checkpoint& checkpoint) {
+    if (!enabled) {
+        function();
+        return;
+    }
+
+    // Fast path: restore stack state and replay existing executable.
+    if (instance != nullptr) {
+        stack.restore(checkpoint);
+        CUDA_CHECK(cudaGraphLaunch(instance, stream));
+        return;
+    }
+
+    // Capture path: save checkpoint before capture so we know where to restore to.
+    checkpoint = stack.checkpoint();
+
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    function();
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+
+    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
+
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaGraphLaunch(instance, stream));
+}
+
 bool env_enabled(const char* name) {
     if (!name || !*name) {
         return false;
@@ -1146,37 +1188,6 @@ void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cuda
     throw std::runtime_error("DSL graph executor: bias_add unsupported dtype");
 }
 
-template<typename Function>
-void trace_or_execute_cuda_graph_with_stack(Function&& function,
-                                            cudaStream_t stream,
-                                            cudaGraphExec_t& instance,
-                                            bool enabled,
-                                            DeviceMemoryStack& stack,
-                                            DeviceMemoryStack::Checkpoint& checkpoint) {
-    if (!enabled) {
-        function();
-        return;
-    }
-
-    if (instance != nullptr) {
-        stack.restore(checkpoint);
-        CUDA_CHECK(cudaGraphLaunch(instance, stream));
-        return;
-    }
-
-    checkpoint = stack.checkpoint();
-
-    cudaGraph_t graph = nullptr;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    function();
-    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-
-    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
-
-    CUDA_CHECK(cudaGraphDestroy(graph));
-    CUDA_CHECK(cudaGraphLaunch(instance, stream));
-}
-
 Tensor recompute_lora_rmsnorm(modules::LoRARunState& lora_rs, const Tensor& residual, const Tensor& weight,
                               float eps, int B, int T, int C, cudaStream_t stream) {
     if (!lora_rs.recompute_ln.Data || !lora_rs.recompute_rstd.Data) {
@@ -1206,6 +1217,8 @@ GraphExecutor::GraphExecutor(const Module& module,
       mBackward(nullptr) {
     mGraphsEnabled = options.UseCudaGraphs;
     mBackwardGraphsEnabled = mGraphsEnabled;
+    // Enable per-layer CUDA graphs (more fine-grained than whole-graph capture)
+    mPerLayerGraphsEnabled = options.UseCudaGraphs && run_state.per_layer_graphs_enabled();
     init(exec_options);
 }
 
@@ -1239,6 +1252,7 @@ void GraphExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
 }
 
 void GraphExecutor::reset_cuda_graphs() {
+    // Reset whole-graph captures
     if (mForwardGraph) {
         (void)cudaGraphExecDestroy(mForwardGraph);
         mForwardGraph = nullptr;
@@ -1249,6 +1263,8 @@ void GraphExecutor::reset_cuda_graphs() {
             g = nullptr;
         }
     }
+    // Reset per-layer graphs in run state
+    mRunState.reset_cuda_graphs();
 }
 
 void GraphExecutor::init(const GraphExecutorOptions& options) {
@@ -2084,6 +2100,13 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             acts.swiglu.Data = nullptr;
         }
         rs.scratch().cudnn_workspace.Data = nullptr;
+
+        // Offload residual to CPU if enabled (for backward pass later)
+        if (rs.has_residual_offloading() && !capturing) {
+            rs.mark_residual_ready(layer_idx, rs.MainStream);
+            rs.put_residual(layer_idx, rs.side_stream());
+        }
+
         layer_checkpoints.erase(layer_idx);
         layer_temp_marks.erase(layer_idx);
     };
@@ -3038,6 +3061,9 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     int bwd_current_layer = -1;
     int bwd_last_prefetched = -1;
 
+    // Track whether we're in CUDA graph capture mode (set after lambdas are defined)
+    bool bwd_capturing = false;
+
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
     auto extract_layer = [&](const std::string& name, int& layer_idx) -> bool {
@@ -3071,6 +3097,15 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                             prefetch_layer_weights(prev_layer, rs.side_stream());
                             bwd_last_prefetched = prev_layer;
                         }
+
+                        // Prefetch residual from CPU if offloading is enabled
+                        if (rs.has_residual_offloading() && !bwd_capturing) {
+                            rs.fetch_residual(layer_idx, rs.side_stream());
+                            // Also prefetch previous layer's residual for recompute
+                            if (prev_layer >= 0) {
+                                rs.fetch_residual(prev_layer, rs.side_stream());
+                            }
+                        }
                     }
                 }
                 return;
@@ -3094,6 +3129,15 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                         if (prev_layer >= 0 && prev_layer != bwd_last_prefetched) {
                             prefetch_layer_weights(prev_layer, rs.side_stream());
                             bwd_last_prefetched = prev_layer;
+                        }
+
+                        // Prefetch residual from CPU if offloading is enabled
+                        if (rs.has_residual_offloading() && !bwd_capturing) {
+                            rs.fetch_residual(layer_idx, rs.side_stream());
+                            // Also prefetch previous layer's residual for recompute
+                            if (prev_layer >= 0) {
+                                rs.fetch_residual(prev_layer, rs.side_stream());
+                            }
                         }
                     }
                 }
@@ -3125,6 +3169,12 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             acts.swiglu.Data = nullptr;
         }
         rs.scratch().cudnn_workspace.Data = nullptr;
+
+        // Release residual buffer after backward pass is done with this layer
+        if (rs.has_residual_offloading() && !bwd_capturing) {
+            rs.release_residual(layer_idx, rs.MainStream);
+        }
+
         layer_checkpoints.erase(layer_idx);
         layer_temp_marks.erase(layer_idx);
     };
@@ -3137,11 +3187,17 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     }
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
+    bwd_capturing = capturing;  // Set the shared flag for lambdas
 
     // Prefetch last layer's weights for backward
     if (mPrefetchEnabled && config.NumLayers > 0 && !capturing) {
         prefetch_layer_weights(config.NumLayers - 1, rs.side_stream());
         bwd_last_prefetched = config.NumLayers - 1;
+    }
+
+    // Prefetch last layer's residual from CPU for backward pass
+    if (rs.has_residual_offloading() && config.NumLayers > 0 && !capturing) {
+        rs.fetch_residual(config.NumLayers - 1, rs.side_stream());
     }
 
     auto run_ops_range = [&](std::size_t begin, std::size_t end) {
