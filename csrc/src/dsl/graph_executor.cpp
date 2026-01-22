@@ -32,6 +32,7 @@
 #include "utilities/tensor.h"
 #include "utilities/utils.h"
 #include "kernels/kernels.h"
+#include "recipes/nvfp4/nvfp4_recipe.h"
 
 namespace dsl {
 namespace {
@@ -1592,6 +1593,307 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
     return &it->second.weight;
 }
 
+// ============================================================================
+// FP4 Weight Caching (for NVFP4 recipe on Blackwell+)
+// ============================================================================
+
+void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
+    if (!mOptions.TrainingRecipe || !mOptions.fp4_enabled()) {
+        return;
+    }
+    if (!mForward) {
+        return;
+    }
+
+    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP4_CACHE");
+
+    // Pre-quantize static weights for all matmul operations that allow FP4 (forward pass)
+    for (std::size_t i = 0; i < mForward->operations.size(); ++i) {
+        if (!required.empty() && required[i] == 0) {
+            continue;
+        }
+        const auto& op = mForward->operations[i];
+        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        if (op_type != "matmul" && op_type != "matmul_bias") {
+            continue;
+        }
+        if (op.inputs.size() < 2) {
+            continue;
+        }
+
+        const std::string& weight_name = op.inputs.at(1);
+        if (!mWeights.has(weight_name)) {
+            continue;
+        }
+
+        // Check if this layer allows FP4 quantization
+        int layer_idx = -1;
+        auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
+        if (!op_kind.has_value() || !allow_quant_layer(mOptions, mConfig, layer_idx)) {
+            continue;
+        }
+
+        Tensor& weight = mWeights.get(weight_name);
+        (void)get_fp4_cached_weight(weight_name, weight, mRunState.MainStream);
+
+        if (debug_cache) {
+            fprintf(stderr, "[DSL TRACE] fp4_cache primed name=%s layer=%d\n",
+                    weight_name.c_str(), layer_idx);
+            fflush(stderr);
+        }
+    }
+
+    // Also prime transposed FP4 cache for backward pass (matmul_backward dgrad)
+    if (mBackward) {
+        for (const auto& op : mBackward->operations) {
+            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            if (op_type != "matmul_backward") {
+                continue;
+            }
+            if (op.inputs.size() < 3) {
+                continue;
+            }
+
+            // Weight is the third input for matmul_backward
+            const std::string& weight_name = op.inputs.at(2);
+            if (!mWeights.has(weight_name)) {
+                continue;
+            }
+
+            // Check if this layer allows FP4 quantization
+            int layer_idx = -1;
+            auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
+            if (!op_kind.has_value() || !allow_quant_layer(mOptions, mConfig, layer_idx)) {
+                continue;
+            }
+
+            Tensor& weight = mWeights.get(weight_name);
+            (void)get_fp4_cached_weight_transposed(weight_name, weight, mRunState.MainStream);
+
+            if (debug_cache) {
+                fprintf(stderr, "[DSL TRACE] fp4_cacheT primed name=%s layer=%d\n",
+                        weight_name.c_str(), layer_idx);
+                fflush(stderr);
+            }
+        }
+    }
+}
+
+const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
+    const std::string& name, Tensor& weight, cudaStream_t stream) {
+    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP4_CACHE");
+
+    // Check if FP4 is enabled
+    if (!mOptions.fp4_enabled()) {
+        return nullptr;
+    }
+
+    // Only cache static (non-trainable) weights
+    if (!mWeights.has(name) || mWeights.is_trainable(name)) {
+        return nullptr;
+    }
+
+    // Only support BF16 weights for now
+    if (weight.DType != ETensorDType::BF16) {
+        return nullptr;
+    }
+
+    auto it = mFP4WeightCache.find(name);
+    if (it == mFP4WeightCache.end()) {
+        // Weight shape: (N, K) = (C_out, C_in)
+        if (weight.Rank != 2) {
+            return nullptr;
+        }
+
+        const int N = static_cast<int>(weight.Sizes[0]);
+        const int K = static_cast<int>(weight.Sizes[1]);
+
+        // K must be even for FP4 packing
+        if (K % 2 != 0) {
+            return nullptr;
+        }
+
+        FP4WeightCacheEntry entry{};
+
+        // Allocate FP4 data: (N, K/2) bytes
+        entry.data = mRunState.Allocator->allocate(ETensorDType::BYTE,
+                                                   ("fp4_cache_" + name + "_data").c_str(),
+                                                   EAllocationType::ON_DEVICE,
+                                                   {static_cast<long>(N), static_cast<long>(K / 2)});
+
+        // Allocate FP4 scales in CUTLASS layout
+        const std::size_t scale_size = compute_nvfp4_cutlass_scale_size(N, K);
+        entry.scales = mRunState.Allocator->allocate(ETensorDType::BYTE,
+                                                     ("fp4_cache_" + name + "_scales").c_str(),
+                                                     EAllocationType::ON_DEVICE,
+                                                     {static_cast<long>(scale_size)});
+
+        // Allocate global amax (single FP32 value)
+        entry.amax = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                   ("fp4_cache_" + name + "_amax").c_str(),
+                                                   EAllocationType::ON_DEVICE,
+                                                   {1L});
+
+        if (debug_cache) {
+            fprintf(stderr, "[DSL TRACE] fp4_cache alloc name=%s N=%d K=%d scale_size=%zu\n",
+                    name.c_str(), N, K, scale_size);
+            fflush(stderr);
+        }
+
+        auto [insert_it, _] = mFP4WeightCache.emplace(name, std::move(entry));
+        it = insert_it;
+    }
+
+    // Quantize weight to FP4 cache once (static weights only)
+    if (!it->second.initialized) {
+        const int N = static_cast<int>(weight.Sizes[0]);
+        const int K = static_cast<int>(weight.Sizes[1]);
+
+        if (debug_cache) {
+            fprintf(stderr, "[DSL TRACE] fp4_cache quant name=%s N=%d K=%d\n", name.c_str(), N, K);
+            fflush(stderr);
+        }
+
+        // Use 4/6 quantization if enabled in recipe config
+        // Check if recipe is NVFP4 and get 4/6 config from it
+        bool use_4o6 = false;
+        recipes::FourOverSixErrorMetric four_over_six_metric = recipes::FourOverSixErrorMetric::MSE;
+        if (mOptions.TrainingRecipe) {
+            if (auto* nvfp4 = dynamic_cast<const recipes::NVFP4Recipe*>(mOptions.TrainingRecipe.get())) {
+                use_4o6 = nvfp4->uses_four_over_six();
+                four_over_six_metric = nvfp4->four_over_six_metric();
+            }
+        }
+
+        if (use_4o6) {
+            quantize_nvfp4_4o6_cutlass_auto_scale(
+                it->second.data.get<uint8_t>(),
+                it->second.scales.get<uint8_t>(),
+                it->second.amax.get<float>(),
+                weight.get<nv_bfloat16>(),
+                N, K,
+                four_over_six_metric,
+                mRunState.DeviceProp, stream);
+        } else {
+            quantize_nvfp4_weight_cutlass_auto_scale(
+                it->second.data.get<uint8_t>(),
+                it->second.scales.get<uint8_t>(),
+                it->second.amax.get<float>(),
+                weight.get<nv_bfloat16>(),
+                N, K,
+                mRunState.DeviceProp, stream);
+        }
+
+        it->second.initialized = true;
+
+        if (debug_cache) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            fprintf(stderr, "[DSL TRACE] fp4_cache quant done name=%s\n", name.c_str());
+            fflush(stderr);
+        }
+    }
+
+    return &it->second;
+}
+
+const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_transposed(
+    const std::string& name, Tensor& weight, cudaStream_t stream) {
+    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP4_CACHE");
+
+    // Check if FP4 is enabled
+    if (!mOptions.fp4_enabled()) {
+        return nullptr;
+    }
+
+    // Only cache static (non-trainable) weights
+    if (!mWeights.has(name) || mWeights.is_trainable(name)) {
+        return nullptr;
+    }
+
+    // Only support BF16 weights for now
+    if (weight.DType != ETensorDType::BF16) {
+        return nullptr;
+    }
+
+    auto it = mFP4WeightCacheT.find(name);
+    if (it == mFP4WeightCacheT.end()) {
+        // Original weight shape: (N, K) = (C_out, C_in)
+        // Transposed shape for dgrad: (K, N) = (C_in, C_out)
+        if (weight.Rank != 2) {
+            return nullptr;
+        }
+
+        const int N = static_cast<int>(weight.Sizes[0]);  // C_out
+        const int K = static_cast<int>(weight.Sizes[1]);  // C_in
+
+        // N must be even for FP4 packing of transposed weight (K, N/2)
+        if (N % 2 != 0) {
+            return nullptr;
+        }
+
+        FP4WeightCacheEntry entry{};
+
+        // Allocate transposed FP4 data: (K, N/2) bytes
+        entry.data = mRunState.Allocator->allocate(ETensorDType::BYTE,
+                                                   ("fp4_cacheT_" + name + "_data").c_str(),
+                                                   EAllocationType::ON_DEVICE,
+                                                   {static_cast<long>(K), static_cast<long>(N / 2)});
+
+        // Allocate FP4 scales in CUTLASS layout for transposed shape
+        const std::size_t scale_size = compute_nvfp4_cutlass_scale_size(K, N);
+        entry.scales = mRunState.Allocator->allocate(ETensorDType::BYTE,
+                                                     ("fp4_cacheT_" + name + "_scales").c_str(),
+                                                     EAllocationType::ON_DEVICE,
+                                                     {static_cast<long>(scale_size)});
+
+        // Allocate global amax (single FP32 value)
+        entry.amax = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                   ("fp4_cacheT_" + name + "_amax").c_str(),
+                                                   EAllocationType::ON_DEVICE,
+                                                   {1L});
+
+        if (debug_cache) {
+            fprintf(stderr, "[DSL TRACE] fp4_cacheT alloc name=%s K=%d N=%d scale_size=%zu\n",
+                    name.c_str(), K, N, scale_size);
+            fflush(stderr);
+        }
+
+        auto [insert_it, _] = mFP4WeightCacheT.emplace(name, std::move(entry));
+        it = insert_it;
+    }
+
+    // Quantize weight to transposed FP4 cache once (static weights only)
+    if (!it->second.initialized) {
+        const int N = static_cast<int>(weight.Sizes[0]);
+        const int K = static_cast<int>(weight.Sizes[1]);
+
+        if (debug_cache) {
+            fprintf(stderr, "[DSL TRACE] fp4_cacheT quant name=%s N=%d K=%d (transpose)\n", name.c_str(), N, K);
+            fflush(stderr);
+        }
+
+        // Use transpose quantization for dgrad
+        // Note: No 4/6 variant for weight transpose quantization yet
+        quantize_nvfp4_weight_cutlass_transpose_auto_scale(
+            it->second.data.get<uint8_t>(),
+            it->second.scales.get<uint8_t>(),
+            it->second.amax.get<float>(),
+            weight.get<nv_bfloat16>(),
+            N, K,
+            mRunState.DeviceProp, stream);
+
+        it->second.initialized = true;
+
+        if (debug_cache) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            fprintf(stderr, "[DSL TRACE] fp4_cacheT quant done name=%s\n", name.c_str());
+            fflush(stderr);
+        }
+    }
+
+    return &it->second;
+}
+
 void GraphExecutor::build_layer_weight_map() {
     if (!mForward || !mLayerWeightNames.empty()) {
         return;
@@ -2016,6 +2318,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
 
     if (capturing) {
         prime_fp8_weight_cache(required);
+        prime_fp4_weight_cache(required);
     }
 
     // Build layer-to-weight map for prefetching (once)
@@ -2280,15 +2583,25 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 ctx.allow_fp8 = allow_quant;
                 ctx.allow_fp4 = allow_quant;
                 if (allow_quant) {
+                    // FP8 buffers
                     ctx.inp_quant = fp8_forward_buffer(rs, matmul_op);
                     ctx.cached_weight = get_fp8_cached_weight(op.inputs.at(1), b, rs.MainStream);
                     ctx.delayed_quantizer_idx = fp8_quantizer_index(rs, matmul_op, layer_idx);
+
+                    // FP4 cached weights (for NVFP4 recipe on Blackwell+)
+                    if (const auto* fp4_cache = get_fp4_cached_weight(op.inputs.at(1), b, rs.MainStream)) {
+                        ctx.cached_fp4_data = &fp4_cache->data;
+                        ctx.cached_fp4_scales = &fp4_cache->scales;
+                        ctx.cached_fp4_amax = fp4_cache->amax.get<float>();
+                    }
+
                     if (env_enabled("SUROGATE_DEBUG_DSL_MATMUL")) {
                         fprintf(stderr,
-                                "[DSL TRACE] fwd matmul quant inp_q=%p weight_q=%p dq_idx=%d\n",
+                                "[DSL TRACE] fwd matmul quant inp_q=%p weight_q=%p dq_idx=%d fp4=%p\n",
                                 ctx.inp_quant ? ctx.inp_quant->Data : nullptr,
                                 ctx.cached_weight ? ctx.cached_weight->Data : nullptr,
-                                ctx.delayed_quantizer_idx);
+                                ctx.delayed_quantizer_idx,
+                                ctx.cached_fp4_data ? ctx.cached_fp4_data->Data : nullptr);
                         fflush(stderr);
                     }
                 }
@@ -3347,6 +3660,13 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                         ctx.dout_quant = fp8_grad_buffer(rs, matmul_op);
                         if (!ctx.dout_quant || !ctx.dout_quant->Data) {
                             ctx.allow_fp8 = false;
+                        }
+
+                        // FP4 cached transposed weights for dgrad (for NVFP4 recipe on Blackwell+)
+                        if (const auto* fp4_cache = get_fp4_cached_weight_transposed(op.inputs.at(2), b, rs.MainStream)) {
+                            ctx.cached_fp4_data = &fp4_cache->data;
+                            ctx.cached_fp4_scales = &fp4_cache->scales;
+                            ctx.cached_fp4_amax = fp4_cache->amax.get<float>();
                         }
                     }
 

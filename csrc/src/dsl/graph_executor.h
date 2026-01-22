@@ -143,6 +143,16 @@ private:
     };
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
 
+    // FP4 weight cache for NVFP4 recipe (Blackwell+)
+    struct FP4WeightCacheEntry {
+        Tensor data;      ///< FP4 packed data (N, K/2) for forward; (K, N/2) for transposed
+        Tensor scales;    ///< Block scales (FP8 E4M3, CUTLASS layout)
+        Tensor amax;      ///< Global amax (FP32, single element)
+        bool initialized = false;
+    };
+    std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
+    std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
+
     void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full);
     void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step);
 
@@ -152,6 +162,11 @@ private:
 
     void prime_fp8_weight_cache(const std::vector<char>& required);
     const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
+
+    // FP4 weight cache helpers (for NVFP4 recipe on Blackwell+)
+    void prime_fp4_weight_cache(const std::vector<char>& required);
+    const FP4WeightCacheEntry* get_fp4_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
+    const FP4WeightCacheEntry* get_fp4_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
 
     // Weight prefetching for layer-by-layer execution
     void prefetch_layer_weights(int layer_idx, cudaStream_t stream);
