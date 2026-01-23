@@ -470,6 +470,60 @@ void GraphExecutor::build_layer_weight_map() {
     }
 }
 
+void GraphExecutor::build_layer_boundaries() {
+    if (!mForward || !mLayerBoundaries.empty()) {
+        return;
+    }
+
+    const int num_layers = mConfig.NumLayers;
+    if (num_layers <= 0) {
+        return;
+    }
+
+    // Temporary map: layer_idx -> [start_idx, end_idx]
+    std::unordered_map<int, std::pair<std::size_t, std::size_t>> layer_ranges;
+
+    // Scan all operations to find layer boundaries
+    for (std::size_t i = 0; i < mForward->operations.size(); ++i) {
+        const auto& op = mForward->operations[i];
+
+        // Check all outputs for layer indices
+        for (const auto& out_name : op.outputs) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(out_name, layer_idx, field)) {
+                if (layer_idx >= 0 && layer_idx < num_layers) {
+                    auto it = layer_ranges.find(layer_idx);
+                    if (it == layer_ranges.end()) {
+                        // First operation for this layer
+                        layer_ranges[layer_idx] = {i, i + 1};
+                    } else {
+                        // Update end index
+                        it->second.second = i + 1;
+                    }
+                }
+                break;  // Only need one match per operation
+            }
+        }
+    }
+
+    // Convert to sorted vector
+    mLayerBoundaries.reserve(layer_ranges.size());
+    for (const auto& [layer_idx, range] : layer_ranges) {
+        LayerBoundary boundary;
+        boundary.layer_idx = layer_idx;
+        boundary.start_op_idx = range.first;
+        boundary.end_op_idx = range.second;
+        mLayerBoundaries.push_back(boundary);
+    }
+
+    // Sort by start_op_idx for O(1) lookup during execution
+    std::sort(mLayerBoundaries.begin(), mLayerBoundaries.end(),
+              [](const LayerBoundary& a, const LayerBoundary& b) {
+                  return a.start_op_idx < b.start_op_idx;
+              });
+}
+
 void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
     if (!mPrefetchEnabled || layer_idx < 0 || layer_idx >= static_cast<int>(mLayerWeightNames.size())) {
         return;

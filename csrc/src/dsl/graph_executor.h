@@ -226,6 +226,7 @@ private:
     void prefetch_layer_weights(int layer_idx, cudaStream_t stream);
     void wait_for_prefetch(int layer_idx, cudaStream_t stream);
     void build_layer_weight_map();
+    void build_layer_boundaries();  // Pre-compute layer start/end operation indices
 
     std::minstd_rand mRng{42};
 
@@ -234,6 +235,14 @@ private:
     int mPrefetchedLayer = -1;
     cudaEvent_t mPrefetchEvent = nullptr;
     bool mPrefetchEnabled = false;
+
+    // Pre-computed layer boundaries for predictable prefetch
+    struct LayerBoundary {
+        int layer_idx = -1;
+        std::size_t start_op_idx = 0;  // First operation for this layer
+        std::size_t end_op_idx = 0;    // One past last operation for this layer
+    };
+    std::vector<LayerBoundary> mLayerBoundaries;  // Sorted by start_op_idx
 
     // CUDA graph capture (optional)
     bool mGraphsEnabled = false; // Forward graphs

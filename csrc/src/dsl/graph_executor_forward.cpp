@@ -136,70 +136,119 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         prime_fp4_weight_cache(required);
     }
 
-    // Build layer-to-weight map for prefetching (once)
+    // Build layer-to-weight map and boundaries for prefetching (once)
     build_layer_weight_map();
+    build_layer_boundaries();
 
-    // Track current layer for prefetching
+    // Track current layer for predictable prefetch pattern (matches modular path)
     int current_layer = -1;
-    int last_prefetched = -1;
+    std::size_t next_boundary_idx = 0;  // Index into mLayerBoundaries
 
-    // Prefetch first layer's weights before starting the loop
-    if (mPrefetchEnabled && config.NumLayers > 0 && !capturing) {
-        prefetch_layer_weights(0, rs.side_stream());
-        last_prefetched = 0;
-    }
-
-    // If using weight manager for streaming, gather first layer's weights
-    if (mWeightManager && mWeightManager->is_streaming_enabled() && config.NumLayers > 0 && !capturing) {
-        mWeightManager->gather_block(0, comm, rs.side_stream());
+    // Predictable prefetch: Start gathering layer 0 BEFORE execution loop (like modular path)
+    if (config.NumLayers > 0 && !capturing) {
+        if (mPrefetchEnabled) {
+            prefetch_layer_weights(0, rs.side_stream());
+        }
+        if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+            mWeightManager->gather_block(0, comm, rs.side_stream());
+        }
     }
 
     auto run_ops = [&]() {
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
-    auto maybe_start_layer = [&](const Operation& op) {
-        for (const auto& out_name : op.outputs) {
-            int layer_idx = -1;
-            std::string field;
-            if (parse_block_param(out_name, layer_idx, field)) {
-                if (layer_checkpoints.find(layer_idx) == layer_checkpoints.end()) {
-                    layer_checkpoints[layer_idx] = rs.Stack.checkpoint();
-                    layer_temp_marks[layer_idx] = st.temps.size();
+    std::size_t current_boundary_end_idx = 0;  // Track current layer's end for O(1) finish detection
 
-                    // New layer started - wait for any pending prefetch and start next prefetch
-                    if (layer_idx != current_layer) {
-                        // Wait for prefetch of current layer if needed
-                        if (current_layer >= 0) {
-                            wait_for_prefetch(current_layer, rs.MainStream);
-                            // Release previous layer's weights if using weight manager
-                            if (mWeightManager && mWeightManager->is_streaming_enabled()) {
-                                mWeightManager->release_block(current_layer, rs.MainStream);
-                            }
-                        }
+    // Optimized layer boundary tracking: O(1) lookup instead of parsing every operation
+    auto handle_layer_transition = [&](std::size_t op_idx) {
+        // Check if we're at a layer boundary using pre-computed boundaries
+        if (next_boundary_idx >= mLayerBoundaries.size()) {
+            return;
+        }
 
-                        // Wait for current layer's weights to be ready
-                        if (mWeightManager && mWeightManager->is_streaming_enabled()) {
-                            mWeightManager->wait_for_gather(layer_idx, rs.MainStream);
-                        }
+        const auto& boundary = mLayerBoundaries[next_boundary_idx];
+        if (op_idx != boundary.start_op_idx) {
+            return;
+        }
 
-                        current_layer = layer_idx;
+        const int layer_idx = boundary.layer_idx;
 
-                        // Prefetch next layer's weights on side stream
-                        const int next_layer = layer_idx + 1;
-                        if (next_layer < config.NumLayers && next_layer != last_prefetched) {
-                            prefetch_layer_weights(next_layer, rs.side_stream());
-                            // Also start gathering next layer's weights if using weight manager
-                            if (mWeightManager && mWeightManager->is_streaming_enabled()) {
-                                mWeightManager->gather_block(next_layer, comm, rs.side_stream());
-                            }
-                            last_prefetched = next_layer;
-                        }
+        // Save checkpoint for this layer (first operation only)
+        if (layer_checkpoints.find(layer_idx) == layer_checkpoints.end()) {
+            layer_checkpoints[layer_idx] = rs.Stack.checkpoint();
+            layer_temp_marks[layer_idx] = st.temps.size();
+        }
+
+        // Predictable prefetch pattern (matches modular path):
+        // 1. FIRST prefetch next layer (L+1) on side stream
+        // 2. THEN wait for current layer (L) on main stream
+        // This creates perfect overlap: next layer loads while current layer computes
+
+        const int next_layer = layer_idx + 1;
+        if (next_layer < config.NumLayers && !capturing) {
+            if (mPrefetchEnabled) {
+                prefetch_layer_weights(next_layer, rs.side_stream());
+            }
+            if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+                mWeightManager->gather_block(next_layer, comm, rs.side_stream());
+            }
+        }
+
+        // Wait for current layer's weights (queued before this layer started)
+        if (mWeightManager && mWeightManager->is_streaming_enabled() && !capturing) {
+            mWeightManager->wait_for_gather(layer_idx, rs.MainStream);
+        }
+        if (mPrefetchEnabled && !capturing) {
+            wait_for_prefetch(layer_idx, rs.MainStream);
+        }
+
+        // Release previous layer's weights now that current layer is ready
+        if (current_layer >= 0 && mWeightManager && mWeightManager->is_streaming_enabled() && !capturing) {
+            mWeightManager->release_block(current_layer, rs.MainStream);
+        }
+
+        current_layer = layer_idx;
+        current_boundary_end_idx = boundary.end_op_idx;
+        next_boundary_idx++;
+    };
+
+    // Optimized layer finish detection: O(1) check instead of parsing
+    auto maybe_finish_layer = [&](std::size_t op_idx) {
+        if (current_layer < 0 || current_boundary_end_idx == 0) {
+            return;
+        }
+        // Check if we just finished the last operation of current layer
+        if (op_idx + 1 == current_boundary_end_idx) {
+            const int layer_idx = current_layer;
+            auto cp_it = layer_checkpoints.find(layer_idx);
+            if (cp_it != layer_checkpoints.end()) {
+                rs.Stack.restore(cp_it->second);
+                auto mark_it = layer_temp_marks.find(layer_idx);
+                if (mark_it != layer_temp_marks.end()) {
+                    if (st.temps.size() > mark_it->second) {
+                        st.temps.resize(mark_it->second);
                     }
                 }
-                break;
+                if (rs.ffn_temps_on_stack()) {
+                    auto& acts = rs.simplified_acts(layer_idx);
+                    acts.mlp_up.Data = nullptr;
+                    acts.swiglu.Data = nullptr;
+                }
+                rs.scratch().cudnn_workspace.Data = nullptr;
+
+                // Offload residual to CPU if enabled (for backward pass later)
+                if (rs.has_residual_offloading() && !capturing) {
+                    rs.mark_residual_ready(layer_idx, rs.MainStream);
+                    rs.put_residual(layer_idx, rs.side_stream());
+                }
+
+                layer_checkpoints.erase(layer_idx);
+                layer_temp_marks.erase(layer_idx);
             }
         }
     };
+
+    // Legacy finish_layer for compatibility (now just a wrapper)
     auto finish_layer = [&](int layer_idx) {
         auto cp_it = layer_checkpoints.find(layer_idx);
         if (cp_it == layer_checkpoints.end()) {
@@ -231,6 +280,10 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
 
     for (std::size_t idx = 0; idx < mForward->operations.size(); ++idx) {
         if (!full && !required[idx]) {
+            // Still need to check for layer finish even if op is skipped
+            if (idx > 0) {
+                maybe_finish_layer(idx - 1);
+            }
             continue;
         }
         const auto& op = mForward->operations[idx];
@@ -240,7 +293,14 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                     idx, mForward->operations.size(), op.id.c_str(), op_type.c_str());
             fflush(stderr);
         }
-        maybe_start_layer(op);
+
+        // Check if we finished the previous layer (O(1) boundary check)
+        if (idx > 0) {
+            maybe_finish_layer(idx - 1);
+        }
+
+        // O(1) layer boundary check using pre-computed boundaries (no parsing!)
+        handle_layer_transition(idx);
 
         if (op_type == "embedding") {
             Tensor& token_ids = get_tensor(st, op.inputs.at(0), mSaved);
@@ -325,11 +385,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             } else {
                 st.tensors.emplace(op.outputs.at(0), view);
             }
-            int layer_idx = -1;
-            std::string field;
-            if (parse_block_param(op.outputs.at(0), layer_idx, field) && field == "mlp_down") {
-                finish_layer(layer_idx);
-            }
+            // Layer finish is now handled by maybe_finish_layer() using pre-computed boundaries
             continue;
         }
 
@@ -613,6 +669,11 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         }
 
         throw std::runtime_error("DSL graph executor: unsupported forward op " + op.name);
+    }
+
+    // Finish the last layer if there is one
+    if (!mForward->operations.empty()) {
+        maybe_finish_layer(mForward->operations.size() - 1);
     }
 
     // Save requested tensors for backward (uses auto-computed list if autodiff was used).
