@@ -24,7 +24,10 @@
 #include "dsl/dsl_runtime.h"
 #include "dsl/dsl_weight_manager.h"
 #include "kernels/kernels.h"
+#include "modules/forward_hooks.h"
+#include "modules/backward_hooks.h"
 #include "modules/lora/lora_utils.h"
+#include "modules/lora/lora_model_utils.h"
 #include "modules/model_config.h"
 #include "modules/optimizers/adamw_8bit.h"
 #include "modules/optimizers/normuon.h"
@@ -540,21 +543,436 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
     if (!mExecutor) {
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
     }
-    mExecutor->forward(inputs, position_ids, comm, micro_step);
+
+    if (!lora_enabled()) {
+        mExecutor->forward(inputs, position_ids, comm, micro_step);
+        return;
+    }
+
+    ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+
+    // Store micro_step for dropout seed computation (needed by backward pass)
+    mLoRARunState->micro_step = micro_step;
+    mLoRARunState->is_training = true;
+
+    auto hook = [this, micro_step](int layer_idx, cudaStream_t stream, modules::ForwardHookPoint point, void* context) {
+        (void)context;
+        const auto& cfg = mModelConfig;
+        auto& rs = *mRunState;
+        const int B = (int)rs.B;
+        const int T = (int)rs.T;
+        const int C = (int)cfg.HiddenSize;
+        const int D = (int)cfg.IntermediateSize;
+        const int Hq = (int)cfg.NumQueryHeads;
+        const int Hkv = (int)cfg.NumKeyValHeads;
+        const int Hs = (int)cfg.head_size();
+        const int rank = mLoRAConfig->rank;
+        const float scaling = mLoRAConfig->scaling();
+        const float dropout = mLoRAConfig->dropout;
+        const bool is_training = mLoRARunState->is_training;
+
+        // Helper to compute unique dropout seed per layer and projection type
+        auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+            // seed = base_seed + layer_idx * 1000000 + proj_type * 100000 + micro_step * 10000
+            return mLoRARunState->dropout_base_seed
+                   + static_cast<unsigned int>(layer_idx) * 1000000u
+                   + static_cast<unsigned int>(proj_type) * 100000u
+                   + static_cast<unsigned int>(micro_step) * 10000u;
+        };
+
+        auto& acts = rs.simplified_acts(layer_idx);
+        auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
+        switch (point) {
+            case modules::ForwardHookPoint::AfterQKVProjection: {
+                // Projection types: 0=Q, 1=K, 2=V, 3=O, 4=Up, 5=Gate, 6=Down
+                if (lora_block.attention.q.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(0), is_training,
+                                                    B * T, C, Hq * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.attention.k.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(1), is_training,
+                                                    B * T, C, Hkv * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.attention.v.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(2), is_training,
+                                                    B * T, C, Hkv * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                if (lora_block.attention.o.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(3), is_training,
+                                                    B * T, Hq * Hs, C, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterMLPUpProjection: {
+                if (lora_block.mlp.up.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(4), is_training,
+                                                    B * T, C, D, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.mlp.gate.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(5), is_training,
+                                                    B * T, C, D, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterMLPDownProjection: {
+                if (lora_block.mlp.down.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, dropout, get_dropout_seed(6), is_training,
+                                                    B * T, D, C, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            default:
+                break;
+        }
+    };
+
+    mExecutor->forward_with_hook(inputs, position_ids, comm, micro_step, hook);
 }
 
 float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::validate called before allocate_run_state()");
     }
-    return mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+
+    if (!lora_enabled()) {
+        return mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+    }
+
+    ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+
+    auto hook = [this](int layer_idx, cudaStream_t stream, modules::ForwardHookPoint point, void* context) {
+        (void)context;
+        const auto& cfg = mModelConfig;
+        auto& rs = *mRunState;
+        const int B = (int)rs.B;
+        const int T = (int)rs.T;
+        const int C = (int)cfg.HiddenSize;
+        const int D = (int)cfg.IntermediateSize;
+        const int Hq = (int)cfg.NumQueryHeads;
+        const int Hkv = (int)cfg.NumKeyValHeads;
+        const int Hs = (int)cfg.head_size();
+        const int rank = mLoRAConfig->rank;
+        const float scaling = mLoRAConfig->scaling();
+
+        auto& acts = rs.simplified_acts(layer_idx);
+        auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
+        switch (point) {
+            case modules::ForwardHookPoint::AfterQKVProjection: {
+                // Validation: no dropout (is_training=false)
+                if (lora_block.attention.q.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, Hq * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.attention.k.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, Hkv * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.attention.v.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, Hkv * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                if (lora_block.attention.o.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, Hq * Hs, C, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterMLPUpProjection: {
+                if (lora_block.mlp.up.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, D, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.mlp.gate.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, D, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterMLPDownProjection: {
+                if (lora_block.mlp.down.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, D, C, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            default:
+                break;
+        }
+    };
+
+    return mExecutor->validate_with_hook(inputs, position_ids, targets, comm, micro_step, hook);
 }
 
 void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::backward called before allocate_run_state()");
     }
-    mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+
+    if (!lora_enabled()) {
+        mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+        return;
+    }
+
+    ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+
+    auto hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream, modules::BackwardHookPoint point, void* context) {
+        (void)context;
+        const auto& cfg = mModelConfig;
+        auto& rs = *mRunState;
+        const int B = (int)rs.B;
+        const int T = (int)rs.T;
+        const int C = (int)cfg.HiddenSize;
+        const int D = (int)cfg.IntermediateSize;
+        const int Hq = (int)cfg.NumQueryHeads;
+        const int Hkv = (int)cfg.NumKeyValHeads;
+        const int Hs = (int)cfg.head_size();
+        const int rank = mLoRAConfig->rank;
+        const float dropout = mLoRAConfig->dropout;
+        const bool is_training = mLoRARunState->is_training;
+        const int micro_step = mLoRARunState->micro_step;
+
+        // Helper to compute unique dropout seed per layer and projection type
+        auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+            return mLoRARunState->dropout_base_seed
+                   + static_cast<unsigned int>(layer_idx) * 1000000u
+                   + static_cast<unsigned int>(proj_type) * 100000u
+                   + static_cast<unsigned int>(micro_step) * 10000u;
+        };
+
+        auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
+        switch (point) {
+            case modules::BackwardHookPoint::AfterMLPDownBackward: {
+                if (!lora_block.mlp.down.has_value()) break;
+
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+                if (!lora_grads.mlp.down.has_value()) break;
+
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+
+                // Projection type 6 = Down
+                const unsigned int dropout_seed = get_dropout_seed(6);
+
+                modules::detail::backward_lora_layer(
+                    lora_grads.mlp.down->A, lora_grads.mlp.down->B,
+                    da.d_swiglu,
+                    da.d_res_ffn, 0,
+                    a.swiglu,
+                    lora_block.mlp.down->A, lora_block.mlp.down->B,
+                    mLoRAConfig->scaling(),
+                    dropout, dropout_seed, is_training,
+                    mLoRARunState->intermediate, mLoRARunState->slice,
+                    B * T, D, C, rank, lora_accum,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+            } break;
+            case modules::BackwardHookPoint::AfterMLPUpBackward: {
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+
+                // Get ln2 input: either from stored activation or recompute from residual_att
+                Tensor ln2_input;
+                if (mOptions.RecomputeLoRA) {
+                    // Recompute ln2 from residual_att
+                    // TODO: Implement recomputation for DSL path
+                    ln2_input = a.ln2;
+                } else {
+                    ln2_input = a.ln2;
+                }
+
+                // Prepare gradient tensors (use empty tensor if projection not enabled)
+                Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
+                modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
+
+                if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
+                    dA_up = lora_grads.mlp.up->A;
+                    dB_up = lora_grads.mlp.up->B;
+                    lora_up = *lora_block.mlp.up;
+                }
+                if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
+                    dA_gate = lora_grads.mlp.gate->A;
+                    dB_gate = lora_grads.mlp.gate->B;
+                    lora_gate = *lora_block.mlp.gate;
+                }
+
+                if (!dA_up.Data && !dA_gate.Data) break;
+
+                // Projection types: 4=Up, 5=Gate
+                modules::detail::backward_lora_mlp_up_gate_fused(
+                    dA_up, dB_up,
+                    dA_gate, dB_gate,
+                    da.d_ln2,
+                    da.d_mlp_up,
+                    ln2_input,
+                    lora_up, lora_gate,
+                    mLoRAConfig->scaling(),
+                    dropout, get_dropout_seed(4), get_dropout_seed(5), is_training,
+                    B * T,
+                    C,
+                    D,
+                    rank,
+                    lora_accum,
+                    mLoRARunState->intermediate,
+                    mLoRARunState->intermediate2,
+                    mLoRARunState->slice,
+                    rs.CublasLtHandle,
+                    rs.CuBlasWorkspace,
+                    stream);
+            } break;
+            case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                if (!lora_block.attention.o.has_value()) break;
+
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+                if (!lora_grads.attention.o.has_value()) break;
+
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+
+                // Projection type 3 = O
+                const unsigned int dropout_seed = get_dropout_seed(3);
+
+                modules::detail::backward_lora_layer(
+                    lora_grads.attention.o->A, lora_grads.attention.o->B,
+                    da.d_att,
+                    da.d_res_att, 0,
+                    a.att,
+                    lora_block.attention.o->A, lora_block.attention.o->B,
+                    mLoRAConfig->scaling(),
+                    dropout, dropout_seed, is_training,
+                    mLoRARunState->intermediate, mLoRARunState->slice,
+                    B * T, Hq * Hs, C, rank, lora_accum,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+            } break;
+            case modules::BackwardHookPoint::AfterQKVBackward: {
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+
+                // Get ln1 input: either from stored activation or recompute from residual
+                Tensor ln1_input;
+                if (mOptions.RecomputeLoRA) {
+                    // Recompute ln1 from the residual input
+                    // TODO: Implement recomputation for DSL path
+                    ln1_input = a.ln1;
+                } else {
+                    ln1_input = a.ln1;
+                }
+
+                // Prepare gradient tensors (use empty tensor if projection not enabled)
+                Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
+                modules::LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
+
+                if (lora_block.attention.q.has_value() && lora_grads.attention.q.has_value()) {
+                    dA_q = lora_grads.attention.q->A;
+                    dB_q = lora_grads.attention.q->B;
+                    lora_q = *lora_block.attention.q;
+                }
+                if (lora_block.attention.k.has_value() && lora_grads.attention.k.has_value()) {
+                    dA_k = lora_grads.attention.k->A;
+                    dB_k = lora_grads.attention.k->B;
+                    lora_k = *lora_block.attention.k;
+                }
+                if (lora_block.attention.v.has_value() && lora_grads.attention.v.has_value()) {
+                    dA_v = lora_grads.attention.v->A;
+                    dB_v = lora_grads.attention.v->B;
+                    lora_v = *lora_block.attention.v;
+                }
+
+                if (!dA_q.Data && !dA_k.Data && !dA_v.Data) break;
+
+                // Projection types: 0=Q, 1=K, 2=V
+                modules::detail::backward_lora_qkv_fused(
+                    dA_q, dB_q,
+                    dA_k, dB_k,
+                    dA_v, dB_v,
+                    da.d_ln1,
+                    da.d_qkv,
+                    ln1_input,
+                    lora_q, lora_k, lora_v,
+                    mLoRAConfig->scaling(),
+                    dropout, get_dropout_seed(0), get_dropout_seed(1), get_dropout_seed(2), is_training,
+                    B * T,
+                    C,
+                    Hq * Hs,
+                    Hkv * Hs,
+                    rank,
+                    lora_accum,
+                    mLoRARunState->intermediate,
+                    mLoRARunState->intermediate2,
+                    mLoRARunState->slice,
+                    rs.CublasLtHandle,
+                    rs.CuBlasWorkspace,
+                    stream);
+
+                mLoRAGrads->notify_block(layer_idx, stream, comm);
+            } break;
+            default:
+                break;
+        }
+    };
+
+    mExecutor->backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, hook);
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    // Extend the base-model BackwardDone event to include LoRA gradient reductions.
+    CUDA_CHECK(cudaEventRecord(rs.BackwardDone, main_stream));
 }
 
 void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon,
@@ -589,86 +1007,6 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
-
-    if (std::getenv("SUROGATE_DEBUG_NAN")) {
-        Tensor tmp = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(rs.scratch().norm_buffer.nelem())});
-        for (const auto& name : mGrads->param_names()) {
-            bool accumulate = false;
-            Tensor* grad = mGrads->get_param_grad(name, accumulate);
-            if (!grad || !grad->Data || grad->nelem() == 0) {
-                continue;
-            }
-            fill_zero(tmp, stream);
-            global_norm_squared(tmp, *grad, grad->nelem(), rs.DeviceProp, stream);
-            deterministic_sum(tmp.template get<float>(), tmp.template get<float>(), tmp.nelem(), stream);
-            CUDA_CHECK(cudaMemcpyAsync(rs.NormHost, tmp.Data, sizeof(float), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            float gnorm = *rs.NormHost;
-            if (!std::isfinite(gnorm)) {
-                fprintf(stderr, "[DSL DEBUG] Non-finite grad norm for %s (norm=%f)\n",
-                        name.c_str(), gnorm);
-                break;
-            }
-        }
-        rs.temp_free(tmp);
-    }
-
-    if (env_enabled("SUROGATE_DEBUG_NORM")) {
-        const float threshold = env_float("SUROGATE_DEBUG_NORM_THRESHOLD", 0.0f);
-        const int topk = std::max(1, env_int("SUROGATE_DEBUG_NORM_TOPK", 8));
-
-        int valid_tokens = -1;
-        float grad_scale_host = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&valid_tokens, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        const float norm = rs.NormHost ? rs.NormHost[0] : 0.0f;
-        const bool trigger = (!std::isfinite(norm) || threshold <= 0.0f || norm >= threshold);
-        if (trigger) {
-            const float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
-                                     * static_cast<float>(std::max(1, rs.GradAccumSteps))
-                                     * static_cast<float>(std::max(1, comm.world_size()));
-            fprintf(stderr,
-                    "[DSL DEBUG] grad_norm=%.6f grad_scale=%.6f valid_tokens=%d total_tokens=%.1f "
-                    "grad_clip=%.6f B=%d T=%d accum=%d world=%d\n",
-                    norm, grad_scale_host, valid_tokens, total_tokens, grad_clip,
-                    rs.B, rs.T, rs.GradAccumSteps, comm.world_size());
-
-            Tensor tmp = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(rs.scratch().norm_buffer.nelem())});
-            std::vector<std::pair<std::string, float>> per_param;
-            per_param.reserve(mGrads->param_names().size());
-
-            for (const auto& name : mGrads->param_names()) {
-                bool accumulate = false;
-                Tensor* grad = mGrads->get_param_grad(name, accumulate);
-                (void)accumulate;
-                if (!grad || !grad->Data || grad->nelem() == 0) {
-                    continue;
-                }
-                fill_zero(tmp, stream);
-                global_norm_squared(tmp, *grad, grad->nelem(), rs.DeviceProp, stream);
-                deterministic_sum(tmp.template get<float>(), tmp.template get<float>(), tmp.nelem(), stream);
-                float gnorm2 = 0.0f;
-                CUDA_CHECK(cudaMemcpyAsync(&gnorm2, tmp.Data, sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                const float gnorm = std::sqrt(gnorm2);
-                per_param.emplace_back(name, gnorm);
-            }
-
-            rs.temp_free(tmp);
-
-            if (!per_param.empty()) {
-                const int k = std::min<int>(topk, static_cast<int>(per_param.size()));
-                std::partial_sort(per_param.begin(), per_param.begin() + k, per_param.end(),
-                                  [](const auto& a, const auto& b) { return a.second > b.second; });
-                fprintf(stderr, "[DSL DEBUG] top %d grad norms:\n", k);
-                for (int i = 0; i < k; ++i) {
-                    fprintf(stderr, "  %2d) %s: %.6f\n", i + 1, per_param[i].first.c_str(), per_param[i].second);
-                }
-            }
-        }
-    }
 
     if (!mAdamW8BitState->initialized) {
         init_optimizer_state(stream);
@@ -1596,126 +1934,6 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
     CUDA_CHECK(cudaEventRecord(rs.NormDone, stream));
-
-    if (env_enabled("SUROGATE_DEBUG_NORM")) {
-        const float threshold = env_float("SUROGATE_DEBUG_NORM_THRESHOLD", 0.0f);
-        const int topk = std::max(1, env_int("SUROGATE_DEBUG_NORM_TOPK", 8));
-
-        int valid_tokens = -1;
-        float grad_scale_host = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&valid_tokens, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, buf.template get<float>() + 1, sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        const float norm = rs.NormHost ? rs.NormHost[0] : 0.0f;
-        const bool trigger = (!std::isfinite(norm) || threshold <= 0.0f || norm >= threshold);
-        if (trigger) {
-            fprintf(stderr,
-                    "[DSL DEBUG][LoRA] grad_norm=%.6f grad_scale=%.6f valid_tokens=%d total_tokens=%.1f "
-                    "grad_clip=%.6f B=%d T=%d accum=%d world=%d\n",
-                    norm, grad_scale_host, valid_tokens, total_tokens, grad_clip,
-                    rs.B, rs.T, rs.GradAccumSteps, comm.world_size());
-
-            Tensor tmp = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(buf.nelem())});
-            std::vector<std::pair<std::string, float>> per_param;
-            per_param.reserve(static_cast<size_t>(mModelConfig.NumLayers) * 32);
-
-            auto add_norm = [&](const std::string& name, const Tensor& grad) {
-                if (!grad.Data || grad.nelem() == 0) return;
-                fill_zero(tmp, stream);
-                global_norm_squared(tmp, grad, grad.nelem(), rs.DeviceProp, stream);
-                deterministic_sum(tmp.template get<float>(), tmp.template get<float>(), tmp.nelem(), stream);
-                float gnorm2 = 0.0f;
-                CUDA_CHECK(cudaMemcpyAsync(&gnorm2, tmp.Data, sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                const float gnorm = std::sqrt(gnorm2);
-                per_param.emplace_back(name, gnorm);
-            };
-
-            for (int l = 0; l < mModelConfig.NumLayers; ++l) {
-                bool unused_acc = false;
-                auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-                const std::string layer = fmt::format("lora.layers.{}", l);
-
-                if (g.attention.q.has_value()) {
-                    add_norm(layer + ".attn.q.A", g.attention.q->A);
-                    add_norm(layer + ".attn.q.B", g.attention.q->B);
-                }
-                if (g.attention.k.has_value()) {
-                    add_norm(layer + ".attn.k.A", g.attention.k->A);
-                    add_norm(layer + ".attn.k.B", g.attention.k->B);
-                }
-                if (g.attention.v.has_value()) {
-                    add_norm(layer + ".attn.v.A", g.attention.v->A);
-                    add_norm(layer + ".attn.v.B", g.attention.v->B);
-                }
-                if (g.attention.o.has_value()) {
-                    add_norm(layer + ".attn.o.A", g.attention.o->A);
-                    add_norm(layer + ".attn.o.B", g.attention.o->B);
-                }
-                if (g.mlp.gate.has_value()) {
-                    add_norm(layer + ".mlp.gate.A", g.mlp.gate->A);
-                    add_norm(layer + ".mlp.gate.B", g.mlp.gate->B);
-                }
-                if (g.mlp.up.has_value()) {
-                    add_norm(layer + ".mlp.up.A", g.mlp.up->A);
-                    add_norm(layer + ".mlp.up.B", g.mlp.up->B);
-                }
-                if (g.mlp.down.has_value()) {
-                    add_norm(layer + ".mlp.down.A", g.mlp.down->A);
-                    add_norm(layer + ".mlp.down.B", g.mlp.down->B);
-                }
-
-                if (g.moe.use_grouped) {
-                    if (g.moe.grouped.gate.has_value()) {
-                        add_norm(layer + ".moe.grouped.gate.A", g.moe.grouped.gate->A);
-                        add_norm(layer + ".moe.grouped.gate.B", g.moe.grouped.gate->B);
-                    }
-                    if (g.moe.grouped.up.has_value()) {
-                        add_norm(layer + ".moe.grouped.up.A", g.moe.grouped.up->A);
-                        add_norm(layer + ".moe.grouped.up.B", g.moe.grouped.up->B);
-                    }
-                    if (g.moe.grouped.down.has_value()) {
-                        add_norm(layer + ".moe.grouped.down.A", g.moe.grouped.down->A);
-                        add_norm(layer + ".moe.grouped.down.B", g.moe.grouped.down->B);
-                    }
-                } else {
-                    for (size_t e = 0; e < g.moe.experts.size(); ++e) {
-                        const std::string expert = fmt::format("{}.moe.experts.{}", layer, e);
-                        if (g.moe.experts[e].gate.has_value()) {
-                            add_norm(expert + ".gate.A", g.moe.experts[e].gate->A);
-                            add_norm(expert + ".gate.B", g.moe.experts[e].gate->B);
-                        }
-                        if (g.moe.experts[e].up.has_value()) {
-                            add_norm(expert + ".up.A", g.moe.experts[e].up->A);
-                            add_norm(expert + ".up.B", g.moe.experts[e].up->B);
-                        }
-                        if (g.moe.experts[e].down.has_value()) {
-                            add_norm(expert + ".down.A", g.moe.experts[e].down->A);
-                            add_norm(expert + ".down.B", g.moe.experts[e].down->B);
-                        }
-                    }
-                }
-
-                if (g.router.has_value()) {
-                    add_norm(layer + ".router.A", g.router->A);
-                    add_norm(layer + ".router.B", g.router->B);
-                }
-            }
-
-            rs.temp_free(tmp);
-
-            if (!per_param.empty()) {
-                const int k = std::min<int>(topk, static_cast<int>(per_param.size()));
-                std::partial_sort(per_param.begin(), per_param.begin() + k, per_param.end(),
-                                  [](const auto& a, const auto& b) { return a.second > b.second; });
-                fprintf(stderr, "[DSL DEBUG][LoRA] top %d grad norms:\n", k);
-                for (int i = 0; i < k; ++i) {
-                    fprintf(stderr, "  %2d) %s: %.6f\n", i + 1, per_param[i].first.c_str(), per_param[i].second);
-                }
-            }
-        }
-    }
 }
 
 void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream) {

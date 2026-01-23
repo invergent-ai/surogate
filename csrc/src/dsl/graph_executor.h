@@ -16,6 +16,8 @@
 #include <cuda_runtime.h>
 
 #include "dsl/ir.h"
+#include "modules/forward_hooks.h"
+#include "modules/backward_hooks.h"
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 
@@ -53,6 +55,25 @@ public:
     virtual float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) = 0;
     virtual void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
 
+    // Hook-enabled forward/backward methods (matching ModularModel interface)
+    virtual void forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
+                                   const modules::ForwardHook& hook) {
+        // Default: forward without hooks
+        forward(inputs, position_ids, comm, micro_step);
+    }
+
+    virtual float validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
+                                     int micro_step, const modules::ForwardHook& hook) {
+        // Default: validate without hooks
+        return validate(inputs, position_ids, targets, comm, micro_step);
+    }
+
+    virtual void backward_with_hook(Tensor inputs, Tensor targets, NCCLCommunicator& comm,
+                                    int grad_accum_steps, int micro_step, const modules::BackwardHook& hook) {
+        // Default: backward without hooks
+        backward(inputs, targets, comm, grad_accum_steps, micro_step);
+    }
+
     // Check if backward graph was auto-derived
     virtual bool has_derived_backward() const = 0;
 
@@ -68,6 +89,9 @@ public:
                                 modules::ModularLoRAWeightsManager*,
                                 modules::ModularLoRAGradsManager*,
                                 modules::LoRARunState*) {}
+
+    // Set optional hook context (opaque pointer passed to hooks)
+    virtual void set_hook_context(void* context) { (void)context; }
 };
 
 class GraphExecutor final : public IGraphExecutor {
@@ -93,6 +117,16 @@ public:
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
 
+    // Hook-enabled methods (matching ModularModel interface for LoRA integration)
+    void forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
+                           const modules::ForwardHook& hook) override;
+    float validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
+                             int micro_step, const modules::ForwardHook& hook) override;
+    void backward_with_hook(Tensor inputs, Tensor targets, NCCLCommunicator& comm,
+                            int grad_accum_steps, int micro_step, const modules::BackwardHook& hook) override;
+
+    void set_hook_context(void* context) override { mHookContext = context; }
+
     bool has_derived_backward() const override { return mDerivedBackward.has_value(); }
     const Graph* backward_graph() const override { return mBackward; }
 
@@ -102,6 +136,21 @@ public:
 private:
     void init(const GraphExecutorOptions& options);
     void reset_cuda_graphs();
+
+    // Internal hook invocation helpers
+    void invoke_forward_hook(int layer_idx, modules::ForwardHookPoint point, cudaStream_t stream,
+                             const modules::ForwardHook* hook) {
+        if (hook && *hook) {
+            (*hook)(layer_idx, stream, point, mHookContext);
+        }
+    }
+
+    void invoke_backward_hook(int layer_idx, bool accumulate, modules::BackwardHookPoint point,
+                              cudaStream_t stream, const modules::BackwardHook* hook) {
+        if (hook && *hook) {
+            (*hook)(layer_idx, accumulate, stream, point, mHookContext);
+        }
+    }
 
     const Module& mModule;
     DslRunState& mRunState;
@@ -115,6 +164,9 @@ private:
     modules::ModularLoRAWeightsManager* mLoRAWeights = nullptr;
     modules::ModularLoRAGradsManager* mLoRAGrads = nullptr;
     modules::LoRARunState* mLoRARunState = nullptr;
+
+    // Hook context (opaque pointer passed to hook callbacks)
+    void* mHookContext = nullptr;
 
     // Optional weight manager for streaming/sharding (owned by DslModel)
     DslWeightManager* mWeightManager = nullptr;
@@ -153,8 +205,10 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
 
-    void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full);
-    void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step);
+    void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full,
+                               const modules::ForwardHook* hook = nullptr);
+    void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step,
+                                const modules::BackwardHook* hook = nullptr);
 
     void run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy);
 

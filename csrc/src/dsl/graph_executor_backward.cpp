@@ -71,7 +71,8 @@ inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStre
 }  // namespace
 
 
-void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
+void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step,
+                                           const modules::BackwardHook* hook) {
     if (!mBackward) {
         throw std::runtime_error("DSL graph executor: missing backward graph");
     }
@@ -123,16 +124,8 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     const bool recompute_any = recompute_ln1 || recompute_qkv || recompute_att || recompute_ln2 ||
                                recompute_ffn || recompute_swiglu || recompute_out_proj || recompute_mlp_down;
     const bool recompute_lora = mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRARunState;
-    const bool debug_recompute_compare = env_enabled("SUROGATE_DEBUG_RECOMPUTE_COMPARE");
     const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0;
-    const bool debug_compare_allowed = debug_recompute_compare;
-    int debug_recompute_layer = -1;
-    if (debug_recompute_compare) {
-        if (const char* v = std::getenv("SUROGATE_DEBUG_RECOMPUTE_LAYER")) {
-            debug_recompute_layer = std::atoi(v);
-        }
-    }
-
+    
     std::vector<char> recomputed;
     if (recompute_any && config.NumLayers > 0) {
         recomputed.assign(static_cast<size_t>(config.NumLayers), 0);
@@ -215,48 +208,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             }
             return -1.0f;
         };
-        auto debug_compare = [&](const std::string& name, const Tensor& recomputed_tensor) {
-            if (!debug_compare_allowed) return;
-            if (debug_recompute_layer >= 0 && layer_idx != debug_recompute_layer) return;
-            auto it = mSaved.find(name);
-            if (it == mSaved.end()) return;
-            const Tensor& saved_tensor = it->second;
-            std::vector<long> saved_shape(saved_tensor.Sizes.begin(),
-                                          saved_tensor.Sizes.begin() + saved_tensor.Rank);
-            if (saved_tensor.DType != recomputed_tensor.DType) {
-                fprintf(stderr,
-                        "[DSL DEBUG] recompute cmp layer=%d name=%s dtype mismatch saved=%s recomputed=%s\n",
-                        layer_idx,
-                        name.c_str(),
-                        dtype_to_str(saved_tensor.DType),
-                        dtype_to_str(recomputed_tensor.DType));
-                fflush(stderr);
-                return;
-            }
-            Tensor recomputed_view = recomputed_tensor;
-            if (!tensor_shape_matches(recomputed_tensor, saved_shape)) {
-                if (saved_tensor.nelem() != recomputed_tensor.nelem()) {
-                    fprintf(stderr,
-                            "[DSL DEBUG] recompute cmp layer=%d name=%s shape mismatch saved=%s recomputed=%s\n",
-                            layer_idx,
-                            name.c_str(),
-                            tensor_shape_str(saved_tensor).c_str(),
-                            tensor_shape_str(recomputed_tensor).c_str());
-                    fflush(stderr);
-                    return;
-                }
-                recomputed_view = view_for_shape(const_cast<Tensor&>(recomputed_tensor), saved_shape, name + "_dbg");
-            }
-            const float saved_max = abs_max_host(saved_tensor);
-            const float recomputed_max = abs_max_host(recomputed_view);
-            const float denom = saved_max > 0.0f ? saved_max : 1.0f;
-            const float sample_diff = sample_max_diff(saved_tensor, recomputed_view);
-            fprintf(stderr,
-                    "[DSL DEBUG] recompute cmp layer=%d name=%s max_saved=%.6g max_recomputed=%.6g ratio=%.6g sample_max_diff=%.6g\n",
-                    layer_idx, name.c_str(), saved_max, recomputed_max, recomputed_max / denom, sample_diff);
-            fflush(stderr);
-        };
-
+       
         Tensor& res_ffn = rs.get_residual(layer_idx, rs.MainStream);
         if (recompute_ln1) {
             ensure_act(acts.ln1);
@@ -284,8 +236,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                     residual_in, x_in, ln1_weight, nullptr,
                     config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
             }
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].ln1", acts.ln1);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].ln1_rstd", acts.ln1_rstd);
         }
 
         auto dsl_matmul = [&](Tensor& out, const Tensor& a_in, const Tensor& b_in, EMMTranspose mode,
@@ -430,10 +380,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                              reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
                              Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
             }
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].qkv", acts.qkv);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].qkv_rope", acts.qkv);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].q_rstd", acts.q_rstd);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].k_rstd", acts.k_rstd);
         }
 
         if (recompute_att) {
@@ -484,9 +430,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                         }
                 }
             }
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].att", acts.att);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].lse", acts.lse);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].att_out", acts.att_out);
         }
 
         if (recompute_ln2) {
@@ -497,8 +440,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 acts.residual_att, acts.ln2, acts.ln2_rstd,
                 res_ffn, acts.att_out, ln2_weight, nullptr,
                 config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].ln2", acts.ln2);
-            debug_compare("blocks[" + std::to_string(layer_idx) + "].ln2_rstd", acts.ln2_rstd);
         }
 
         if (recompute_ffn) {
@@ -726,7 +667,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         layer_temp_marks.erase(layer_idx);
     };
 
-    const bool use_graphs = use_graphs_enabled && !debug_recompute_compare;
+    const bool use_graphs = use_graphs_enabled;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
@@ -949,233 +890,63 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                     }
                 }
 
-                if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRAGrads && mLoRARunState) {
+                // Map dA output to simplified_grads for LoRA hooks
+                // The DSL autodiff generates generic names like "d_blocks[N].view_X" but the
+                // LoRA backward hooks expect the tensors to be in simplified_grads.
+                if (dA_ptr && op_kind.has_value() && layer_idx >= 0) {
+                    auto& grads = rs.simplified_grads(layer_idx);
+                    switch (*op_kind) {
+                        case modules::MatmulOp::MLPDown:
+                            // d_swiglu = dA from MLP down backward
+                            if (!grads.d_swiglu.Data) {
+                                // Tensor was allocated on stack, update the Data pointer
+                                grads.d_swiglu.Data = dA_ptr->Data;
+                            }
+                            break;
+                        case modules::MatmulOp::MLPUp:
+                            // d_ln2 = dA from MLP up backward (though this goes through swiglu_backward first)
+                            break;
+                        case modules::MatmulOp::AttnOut:
+                            // d_att = dA from attention out backward
+                            if (!grads.d_att.Data) {
+                                grads.d_att.Data = dA_ptr->Data;
+                            }
+                            break;
+                        case modules::MatmulOp::QKV:
+                            // d_ln1 = dA from QKV backward
+                            if (!grads.d_ln1.Data) {
+                                grads.d_ln1.Data = dA_ptr->Data;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                }
+
+                // Hook invocation for backward (LoRA is now handled via hooks from DslModel)
+                if (hook && *hook) {
                     int lora_layer_idx = -1;
                     std::string field;
                     if (parse_block_param(op.inputs.at(2), lora_layer_idx, field)) {
-                        if (field == "qkv_weight" || field == "out_weight" ||
-                            field == "mlp_up_weight" || field == "mlp_down_weight") {
-                            auto& acts = rs.simplified_acts(lora_layer_idx);
-                            auto& grads_layer = rs.simplified_grads(lora_layer_idx);
-                            auto& lora_rs = *mLoRARunState;
-                            auto& lora_block = mLoRAWeights->get_block(lora_layer_idx, rs.MainStream);
-                            bool lora_accum = false;
-                            auto& lora_grads = mLoRAGrads->get_block_full(lora_layer_idx, rs.MainStream, comm, lora_accum);
-                            lora_accum = lora_accum || (do_accumulate && !skip_weight_grad);
-
-                            const int Bv = static_cast<int>(B);
-                            const int Tv = static_cast<int>(T);
-                            const int C = static_cast<int>(config.HiddenSize);
-                            const int D = static_cast<int>(config.IntermediateSize);
-                            const int Hq = static_cast<int>(config.NumQueryHeads);
-                            const int Hkv = static_cast<int>(config.NumKeyValHeads);
-                            const int Hs = static_cast<int>(config.head_size());
-                            const int rank = mLoRAConfig->rank;
-                            const float scaling = mLoRAConfig->scaling();
-                            const float dropout = mLoRAConfig->dropout;
-                            const bool training = lora_rs.is_training;
-                            const int BT = Bv * Tv;
-                            const int QKV = (Hq + 2 * Hkv) * Hs;
-                            const std::string block_prefix = "blocks[" + std::to_string(lora_layer_idx) + "].";
-
-                            auto grad_tensor_or = [&](const std::string& field, Tensor& fallback) -> Tensor& {
-                                if (Tensor* mapped = try_get_tensor(st, "d_" + block_prefix + field, mSaved)) {
-                                    return *mapped;
-                                }
-                                return fallback;
-                            };
-
-                            auto dropout_seed = [&](int proj_type) -> unsigned int {
-                                return lora_rs.dropout_base_seed
-                                       + static_cast<unsigned int>(lora_layer_idx) * 1000000u
-                                       + static_cast<unsigned int>(proj_type) * 100000u
-                                       + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
-                            };
-
-                            if (field == "qkv_weight") {
-                                Tensor ln1_input;
-                                if (mOptions.RecomputeLoRA) {
-                                    Tensor& res_ffn = rs.get_residual(lora_layer_idx, rs.MainStream);
-                                    Tensor& ln1_weight = resolve_param_tensor(st, "blocks[" + std::to_string(lora_layer_idx) + "].ln1_weight");
-                                    ln1_input = recompute_lora_rmsnorm(lora_rs, res_ffn, ln1_weight,
-                                                                       config.RmsNormEps, Bv, Tv, C, rs.MainStream);
-                                } else {
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "ln1";
-                                    if (Tensor* saved_ln1 = try_get_tensor(st, saved_name, mSaved)) {
-                                        ln1_input = *saved_ln1;
-                                    } else {
-                                        ln1_input = acts.ln1;
-                                    }
-                                }
-
-                                Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
-                                modules::LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
-
-                                if (lora_block.attention.q.has_value() && lora_grads.attention.q.has_value()) {
-                                    dA_q = lora_grads.attention.q->A;
-                                    dB_q = lora_grads.attention.q->B;
-                                    lora_q = *lora_block.attention.q;
-                                }
-                                if (lora_block.attention.k.has_value() && lora_grads.attention.k.has_value()) {
-                                    dA_k = lora_grads.attention.k->A;
-                                    dB_k = lora_grads.attention.k->B;
-                                    lora_k = *lora_block.attention.k;
-                                }
-                                if (lora_block.attention.v.has_value() && lora_grads.attention.v.has_value()) {
-                                    dA_v = lora_grads.attention.v->A;
-                                    dB_v = lora_grads.attention.v->B;
-                                    lora_v = *lora_block.attention.v;
-                                }
-
-                                Tensor& d_ln1 = grad_tensor_or("ln1", grads_layer.d_ln1);
-                                Tensor* mapped_qkv = nullptr;
-                                if (Tensor* t = try_get_tensor(st, "d_" + block_prefix + "qkv", mSaved)) {
-                                    mapped_qkv = t;
-                                } else if (Tensor* t = try_get_tensor(st, "d_" + block_prefix + "qkv_flat", mSaved)) {
-                                    mapped_qkv = t;
-                                } else if (Tensor* t = try_get_tensor(st, "d_" + block_prefix + "qkv_rope", mSaved)) {
-                                    mapped_qkv = t;
-                                }
-                                Tensor* d_qkv_src = &grads_layer.d_qkv;
-                                if (mapped_qkv && mapped_qkv->Data) {
-                                    if (!d_qkv_src->Data || mapped_qkv->Data == d_qkv_src->Data) {
-                                        d_qkv_src = mapped_qkv;
-                                    }
-                                }
-                                if (env_enabled("SUROGATE_DEBUG_LORA_TENSORS") && lora_layer_idx == 0) {
-                                    fprintf(stderr,
-                                            "[DSL DEBUG][LoRA] qkv grad src=%s ptr=%p base_ptr=%p rank=%d shape=%s\n",
-                                            (d_qkv_src == &grads_layer.d_qkv) ? "grads_layer.d_qkv" : "mapped",
-                                            d_qkv_src->Data, grads_layer.d_qkv.Data, d_qkv_src->Rank,
-                                            tensor_shape_str(*d_qkv_src).c_str());
-                                }
-                                Tensor d_qkv = *d_qkv_src;
-                                if (d_qkv.Sizes[d_qkv.Rank - 1] != QKV) {
-                                    const std::size_t expected = static_cast<std::size_t>(BT) * static_cast<std::size_t>(QKV);
-                                    if (d_qkv.nelem() == expected) {
-                                        d_qkv = view_tensor(d_qkv, {static_cast<long>(BT), static_cast<long>(QKV)});
-                                    }
-                                }
-                                modules::detail::backward_lora_qkv_fused(
-                                    dA_q, dB_q,
-                                    dA_k, dB_k,
-                                    dA_v, dB_v,
-                                    d_ln1,
-                                    d_qkv,
-                                    ln1_input,
-                                    lora_q, lora_k, lora_v,
-                                    scaling,
-                                    dropout,
-                                    dropout_seed(0), dropout_seed(1), dropout_seed(2),
-                                    training,
-                                    BT,
-                                    C,
-                                    Hq * Hs,
-                                    Hkv * Hs,
-                                    rank,
-                                    lora_accum,
-                                    lora_rs.intermediate,
-                                    lora_rs.intermediate2,
-                                    lora_rs.slice,
-                                    rs.CublasLtHandle,
-                                    rs.CuBlasWorkspace,
-                                    rs.MainStream);
-                            } else if (field == "out_weight") {
-                                if (lora_block.attention.o.has_value() && lora_grads.attention.o.has_value()) {
-                                    Tensor att_input = acts.att;
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "att";
-                                    if (Tensor* saved_att = try_get_tensor(st, saved_name, mSaved)) {
-                                        att_input = *saved_att;
-                                    }
-                                    Tensor& d_att = grad_tensor_or("att", grads_layer.d_att);
-                                    Tensor& d_att_out = grad_tensor_or("att_out", grads_layer.d_res_att);
-                                    modules::detail::backward_lora_layer(
-                                        lora_grads.attention.o->A, lora_grads.attention.o->B,
-                                        d_att,
-                                        d_att_out, 0,
-                                        att_input,
-                                        lora_block.attention.o->A, lora_block.attention.o->B,
-                                        scaling,
-                                        dropout, dropout_seed(3), training,
-                                        lora_rs.intermediate, lora_rs.slice,
-                                        BT, Hq * Hs, C, rank, lora_accum,
-                                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                                }
-                            } else if (field == "mlp_up_weight") {
-                                Tensor ln2_input;
-                                if (mOptions.RecomputeLoRA) {
-                                    Tensor& ln2_weight = resolve_param_tensor(st, "blocks[" + std::to_string(lora_layer_idx) + "].ln2_weight");
-                                    ln2_input = recompute_lora_rmsnorm(lora_rs, acts.residual_att, ln2_weight,
-                                                                       config.RmsNormEps, Bv, Tv, C, rs.MainStream);
-                                } else {
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "ln2";
-                                    if (Tensor* saved_ln2 = try_get_tensor(st, saved_name, mSaved)) {
-                                        ln2_input = *saved_ln2;
-                                    } else {
-                                        ln2_input = acts.ln2;
-                                    }
-                                }
-
-                                Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
-                                modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
-
-                                if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
-                                    dA_up = lora_grads.mlp.up->A;
-                                    dB_up = lora_grads.mlp.up->B;
-                                    lora_up = *lora_block.mlp.up;
-                                }
-                                if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
-                                    dA_gate = lora_grads.mlp.gate->A;
-                                    dB_gate = lora_grads.mlp.gate->B;
-                                    lora_gate = *lora_block.mlp.gate;
-                                }
-
-                                Tensor& d_ln2 = grad_tensor_or("ln2", grads_layer.d_ln2);
-                                Tensor& d_mlp_up = grad_tensor_or("mlp_up", grads_layer.d_mlp_up);
-
-                                modules::detail::backward_lora_mlp_up_gate_fused(
-                                    dA_up, dB_up,
-                                    dA_gate, dB_gate,
-                                    d_ln2,
-                                    d_mlp_up,
-                                    ln2_input,
-                                    lora_up, lora_gate,
-                                    scaling,
-                                    dropout,
-                                    dropout_seed(4), dropout_seed(5), training,
-                                    BT,
-                                    C,
-                                    D,
-                                    rank,
-                                    lora_accum,
-                                    lora_rs.intermediate,
-                                    lora_rs.intermediate2,
-                                    lora_rs.slice,
-                                    rs.CublasLtHandle,
-                                    rs.CuBlasWorkspace,
-                                    rs.MainStream);
-                            } else if (field == "mlp_down_weight") {
-                                if (lora_block.mlp.down.has_value() && lora_grads.mlp.down.has_value()) {
-                                    Tensor& d_swiglu = grad_tensor_or("swiglu", grads_layer.d_swiglu);
-                                    Tensor swiglu_input = acts.swiglu;
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "swiglu";
-                                    if (Tensor* saved_swiglu = try_get_tensor(st, saved_name, mSaved)) {
-                                        swiglu_input = *saved_swiglu;
-                                    }
-                                    Tensor& d_mlp_down = grad_tensor_or("mlp_down", grads_layer.d_mlp_down);
-                                    modules::detail::backward_lora_layer(
-                                        lora_grads.mlp.down->A, lora_grads.mlp.down->B,
-                                        d_swiglu,
-                                        d_mlp_down, 0,
-                                        swiglu_input,
-                                        lora_block.mlp.down->A, lora_block.mlp.down->B,
-                                        scaling,
-                                        dropout, dropout_seed(6), training,
-                                        lora_rs.intermediate, lora_rs.slice,
-                                        BT, D, C, rank, lora_accum,
-                                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                                }
-                            }
+                        modules::BackwardHookPoint hook_point;
+                        bool should_invoke = false;
+                        // For backward, we invoke the "After" hook point which corresponds
+                        // to when LoRA gradients should be computed
+                        if (field == "qkv_weight") {
+                            hook_point = modules::BackwardHookPoint::AfterQKVBackward;
+                            should_invoke = true;
+                        } else if (field == "out_weight") {
+                            hook_point = modules::BackwardHookPoint::AfterAttnOutBackward;
+                            should_invoke = true;
+                        } else if (field == "mlp_up_weight") {
+                            hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
+                            should_invoke = true;
+                        } else if (field == "mlp_down_weight") {
+                            hook_point = modules::BackwardHookPoint::AfterMLPDownBackward;
+                            should_invoke = true;
+                        }
+                        if (should_invoke) {
+                            invoke_backward_hook(lora_layer_idx, do_accumulate, hook_point, rs.MainStream, hook);
                         }
                     }
                 }
@@ -1227,231 +998,30 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                            N, M, K, mode_col, do_accumulate, rs.MainStream);
                 }
 
-                if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRAGrads && mLoRARunState) {
+                // Hook invocation for backward (LoRA is now handled via hooks from DslModel)
+                // Note: This path is for regular matmul ops that compute weight gradients
+                if (hook && *hook) {
                     if (auto base_name = base_param_from_grad(out_name)) {
                         int layer_idx = -1;
                         std::string field;
                         if (parse_block_param(*base_name, layer_idx, field)) {
-                            auto& acts = rs.simplified_acts(layer_idx);
-                            auto& grads_layer = rs.simplified_grads(layer_idx);
-                            auto& lora_rs = *mLoRARunState;
-                            auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
-                            bool lora_accum = false;
-                            auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, rs.MainStream, comm, lora_accum);
-                            lora_accum = lora_accum || (do_accumulate && !skip_weight_grad && is_param_grad);
-
-                            const int Bv = static_cast<int>(B);
-                            const int Tv = static_cast<int>(T);
-                            const int C = static_cast<int>(config.HiddenSize);
-                            const int D = static_cast<int>(config.IntermediateSize);
-                            const int Hq = static_cast<int>(config.NumQueryHeads);
-                            const int Hkv = static_cast<int>(config.NumKeyValHeads);
-                            const int Hs = static_cast<int>(config.head_size());
-                            const int rank = mLoRAConfig->rank;
-                            const float scaling = mLoRAConfig->scaling();
-                            const float dropout = mLoRAConfig->dropout;
-                            const bool training = lora_rs.is_training;
-                            const int BT = Bv * Tv;
-                            const int QKV = (Hq + 2 * Hkv) * Hs;
-                            const std::string block_prefix = "blocks[" + std::to_string(layer_idx) + "].";
-
-                            auto grad_tensor_or = [&](const std::string& field, Tensor& fallback) -> Tensor& {
-                                if (Tensor* mapped = try_get_tensor(st, "d_" + block_prefix + field, mSaved)) {
-                                    return *mapped;
-                                }
-                                return fallback;
-                            };
-
-                            auto dropout_seed = [&](int proj_type) -> unsigned int {
-                                return lora_rs.dropout_base_seed
-                                       + static_cast<unsigned int>(layer_idx) * 1000000u
-                                       + static_cast<unsigned int>(proj_type) * 100000u
-                                       + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
-                            };
-
+                            modules::BackwardHookPoint hook_point;
+                            bool should_invoke = false;
                             if (field == "qkv_weight") {
-                                Tensor ln1_input;
-                                if (mOptions.RecomputeLoRA) {
-                                    Tensor& res_ffn = rs.get_residual(layer_idx, rs.MainStream);
-                                    Tensor& ln1_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln1_weight");
-                                    ln1_input = recompute_lora_rmsnorm(lora_rs, res_ffn, ln1_weight,
-                                                                       config.RmsNormEps, Bv, Tv, C, rs.MainStream);
-                                } else {
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "ln1";
-                                    if (Tensor* saved_ln1 = try_get_tensor(st, saved_name, mSaved)) {
-                                        ln1_input = *saved_ln1;
-                                    } else {
-                                        ln1_input = acts.ln1;
-                                    }
-                                }
-
-                                Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
-                                modules::LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
-
-                                if (lora_block.attention.q.has_value() && lora_grads.attention.q.has_value()) {
-                                    dA_q = lora_grads.attention.q->A;
-                                    dB_q = lora_grads.attention.q->B;
-                                    lora_q = *lora_block.attention.q;
-                                }
-                                if (lora_block.attention.k.has_value() && lora_grads.attention.k.has_value()) {
-                                    dA_k = lora_grads.attention.k->A;
-                                    dB_k = lora_grads.attention.k->B;
-                                    lora_k = *lora_block.attention.k;
-                                }
-                                if (lora_block.attention.v.has_value() && lora_grads.attention.v.has_value()) {
-                                    dA_v = lora_grads.attention.v->A;
-                                    dB_v = lora_grads.attention.v->B;
-                                    lora_v = *lora_block.attention.v;
-                                }
-
-                                Tensor& d_ln1 = grad_tensor_or("ln1", grads_layer.d_ln1);
-                                Tensor* mapped_qkv = nullptr;
-                                if (Tensor* t = try_get_tensor(st, "d_" + block_prefix + "qkv", mSaved)) {
-                                    mapped_qkv = t;
-                                } else if (Tensor* t = try_get_tensor(st, "d_" + block_prefix + "qkv_flat", mSaved)) {
-                                    mapped_qkv = t;
-                                } else if (Tensor* t = try_get_tensor(st, "d_" + block_prefix + "qkv_rope", mSaved)) {
-                                    mapped_qkv = t;
-                                }
-                                Tensor* d_qkv_src = &grads_layer.d_qkv;
-                                if (mapped_qkv && mapped_qkv->Data) {
-                                    if (!d_qkv_src->Data || mapped_qkv->Data == d_qkv_src->Data) {
-                                        d_qkv_src = mapped_qkv;
-                                    }
-                                }
-                                if (env_enabled("SUROGATE_DEBUG_LORA_TENSORS") && layer_idx == 0) {
-                                    fprintf(stderr,
-                                            "[DSL DEBUG][LoRA] qkv grad src=%s ptr=%p base_ptr=%p rank=%d shape=%s\n",
-                                            (d_qkv_src == &grads_layer.d_qkv) ? "grads_layer.d_qkv" : "mapped",
-                                            d_qkv_src->Data, grads_layer.d_qkv.Data, d_qkv_src->Rank,
-                                            tensor_shape_str(*d_qkv_src).c_str());
-                                }
-                                Tensor d_qkv = *d_qkv_src;
-                                if (d_qkv.Sizes[d_qkv.Rank - 1] != QKV) {
-                                    const std::size_t expected = static_cast<std::size_t>(BT) * static_cast<std::size_t>(QKV);
-                                    if (d_qkv.nelem() == expected) {
-                                        d_qkv = view_tensor(d_qkv, {static_cast<long>(BT), static_cast<long>(QKV)});
-                                    }
-                                }
-                                modules::detail::backward_lora_qkv_fused(
-                                    dA_q, dB_q,
-                                    dA_k, dB_k,
-                                    dA_v, dB_v,
-                                    d_ln1,
-                                    d_qkv,
-                                    ln1_input,
-                                    lora_q, lora_k, lora_v,
-                                    scaling,
-                                    dropout,
-                                    dropout_seed(0), dropout_seed(1), dropout_seed(2),
-                                    training,
-                                    BT,
-                                    C,
-                                    Hq * Hs,
-                                    Hkv * Hs,
-                                    rank,
-                                    lora_accum,
-                                    lora_rs.intermediate,
-                                    lora_rs.intermediate2,
-                                    lora_rs.slice,
-                                    rs.CublasLtHandle,
-                                    rs.CuBlasWorkspace,
-                                    rs.MainStream);
+                                hook_point = modules::BackwardHookPoint::AfterQKVBackward;
+                                should_invoke = true;
                             } else if (field == "out_weight") {
-                                if (lora_block.attention.o.has_value() && lora_grads.attention.o.has_value()) {
-                                    Tensor att_input = acts.att;
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "att";
-                                    if (Tensor* saved_att = try_get_tensor(st, saved_name, mSaved)) {
-                                        att_input = *saved_att;
-                                    }
-                                    Tensor& d_att = grad_tensor_or("att", grads_layer.d_att);
-                                    Tensor& d_att_out = grad_tensor_or("att_out", grads_layer.d_res_att);
-                                    modules::detail::backward_lora_layer(
-                                        lora_grads.attention.o->A, lora_grads.attention.o->B,
-                                        d_att,
-                                        d_att_out, 0,
-                                        att_input,
-                                        lora_block.attention.o->A, lora_block.attention.o->B,
-                                        scaling,
-                                        dropout, dropout_seed(3), training,
-                                        lora_rs.intermediate, lora_rs.slice,
-                                        BT, Hq * Hs, C, rank, lora_accum,
-                                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                                }
+                                hook_point = modules::BackwardHookPoint::AfterAttnOutBackward;
+                                should_invoke = true;
                             } else if (field == "mlp_up_weight") {
-                                Tensor ln2_input;
-                                if (mOptions.RecomputeLoRA) {
-                                    Tensor& ln2_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln2_weight");
-                                    ln2_input = recompute_lora_rmsnorm(lora_rs, acts.residual_att, ln2_weight,
-                                                                       config.RmsNormEps, Bv, Tv, C, rs.MainStream);
-                                } else {
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "ln2";
-                                    if (Tensor* saved_ln2 = try_get_tensor(st, saved_name, mSaved)) {
-                                        ln2_input = *saved_ln2;
-                                    } else {
-                                        ln2_input = acts.ln2;
-                                    }
-                                }
-
-                                Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
-                                modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
-
-                                if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
-                                    dA_up = lora_grads.mlp.up->A;
-                                    dB_up = lora_grads.mlp.up->B;
-                                    lora_up = *lora_block.mlp.up;
-                                }
-                                if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
-                                    dA_gate = lora_grads.mlp.gate->A;
-                                    dB_gate = lora_grads.mlp.gate->B;
-                                    lora_gate = *lora_block.mlp.gate;
-                                }
-
-                                Tensor& d_ln2 = grad_tensor_or("ln2", grads_layer.d_ln2);
-                                Tensor& d_mlp_up = grad_tensor_or("mlp_up", grads_layer.d_mlp_up);
-
-                                modules::detail::backward_lora_mlp_up_gate_fused(
-                                    dA_up, dB_up,
-                                    dA_gate, dB_gate,
-                                    d_ln2,
-                                    d_mlp_up,
-                                    ln2_input,
-                                    lora_up, lora_gate,
-                                    scaling,
-                                    dropout,
-                                    dropout_seed(4), dropout_seed(5), training,
-                                    BT,
-                                    C,
-                                    D,
-                                    rank,
-                                    lora_accum,
-                                    lora_rs.intermediate,
-                                    lora_rs.intermediate2,
-                                    lora_rs.slice,
-                                    rs.CublasLtHandle,
-                                    rs.CuBlasWorkspace,
-                                    rs.MainStream);
+                                hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
+                                should_invoke = true;
                             } else if (field == "mlp_down_weight") {
-                                if (lora_block.mlp.down.has_value() && lora_grads.mlp.down.has_value()) {
-                                    Tensor& d_swiglu = grad_tensor_or("swiglu", grads_layer.d_swiglu);
-                                    Tensor swiglu_input = acts.swiglu;
-                                    const std::string saved_name = std::string(kSavedPrefix) + block_prefix + "swiglu";
-                                    if (Tensor* saved_swiglu = try_get_tensor(st, saved_name, mSaved)) {
-                                        swiglu_input = *saved_swiglu;
-                                    }
-                                    Tensor& d_mlp_down = grad_tensor_or("mlp_down", grads_layer.d_mlp_down);
-                                    modules::detail::backward_lora_layer(
-                                        lora_grads.mlp.down->A, lora_grads.mlp.down->B,
-                                        d_swiglu,
-                                        d_mlp_down, 0,
-                                        swiglu_input,
-                                        lora_block.mlp.down->A, lora_block.mlp.down->B,
-                                        scaling,
-                                        dropout, dropout_seed(6), training,
-                                        lora_rs.intermediate, lora_rs.slice,
-                                        BT, D, C, rank, lora_accum,
-                                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                                }
+                                hook_point = modules::BackwardHookPoint::AfterMLPDownBackward;
+                                should_invoke = true;
+                            }
+                            if (should_invoke) {
+                                invoke_backward_hook(layer_idx, do_accumulate, hook_point, rs.MainStream, hook);
                             }
                         }
                     }
@@ -1591,10 +1161,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         }
 
         if (op_type == "rope_backward") {
-            if (env_enabled("SUROGATE_DEBUG_DSL_QKV_BWD")) {
-                fprintf(stderr, "[DSL DEBUG] bwd op rope_backward id=%s\n", op.id.c_str());
-                fflush(stderr);
-            }
             Tensor& d_out = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& freqs = get_tensor(st, op.inputs.at(1), mSaved);
             Tensor& pos_ids = get_tensor(st, op.inputs.at(2), mSaved);
@@ -1623,10 +1189,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         }
 
         if (op_type == "qkv_qk_norm_rope_backward") {
-            if (env_enabled("SUROGATE_DEBUG_DSL_QKV_BWD")) {
-                fprintf(stderr, "[DSL DEBUG] bwd op qkv_qk_norm_rope_backward id=%s\n", op.id.c_str());
-                fflush(stderr);
-            }
             Tensor& d_qkv = get_tensor(st, op.inputs.at(0), mSaved);
             Tensor& qkv = get_tensor(st, op.inputs.at(1), mSaved);
             Tensor& q_norm = get_tensor(st, op.inputs.at(2), mSaved);

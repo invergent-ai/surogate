@@ -616,6 +616,213 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
 }
 
+void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
+                                      const modules::ForwardHook& hook) {
+    auto& rs = mRunState;
+
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        if (rs.has_fp8_delayed_scaling()) {
+            if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+                if (!mFP8ScalingInitialized) {
+                    fp8_state->reset(rs.MainStream);
+                    mFP8ScalingInitialized = true;
+                }
+                fp8_state->zero_recorded_amaxes(rs.MainStream);
+            }
+        }
+        rs.reset_moe_stats();
+    }
+
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+
+    // Copy inputs and position ids to device.
+    {
+        const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+        const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
+        if (position_ids.Device == -1) {
+            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+        }
+        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.MainStream));
+    }
+
+    // Configure graphs for hooked execution (may differ in topology)
+    if (hook) {
+        rs.configure_forward_graphs(/*hooked=*/true);
+    }
+
+    execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+
+    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
+    CUDA_CHECK(cudaEventRecord(rs.ForwardDone, rs.MainStream));
+}
+
+float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
+                                        int micro_step, const modules::ForwardHook& hook) {
+    auto& rs = mRunState;
+
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = false;
+    }
+
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        if (rs.has_fp8_delayed_scaling()) {
+            if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+                if (!mFP8ScalingInitialized) {
+                    fp8_state->reset(rs.MainStream);
+                    mFP8ScalingInitialized = true;
+                }
+                fp8_state->zero_recorded_amaxes(rs.MainStream);
+            }
+        }
+        rs.reset_moe_stats();
+    }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+
+    // Copy inputs and position ids to device.
+    {
+        const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+        const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
+        if (position_ids.Device == -1) {
+            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+        }
+        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.MainStream));
+    }
+
+    // Configure graphs for hooked execution
+    if (hook) {
+        rs.configure_forward_graphs(/*hooked=*/true);
+    }
+
+    execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+
+    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
+    CUDA_CHECK(cudaEventRecord(rs.ForwardDone, rs.MainStream));
+
+    fill_zero(rs.Losses, rs.MainStream);
+    fill_zero(rs.ValidTokenCount, rs.MainStream);
+    fill_zero(rs.CorrectCount, rs.MainStream);
+
+    const std::size_t target_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
+    if (targets.Device == -1) {
+        CUDA_CHECK(cudaMemcpy(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice));
+    } else {
+        CUDA_CHECK(cudaMemcpy(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice));
+    }
+
+    run_classifier(B, T, comm, /*grad_accum_steps=*/1, micro_step, /*compute_accuracy=*/true);
+
+    reduce_loss(rs, B, T, comm);
+    comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
+    comm.all_reduce_sum_int(rs.CorrectCount.template get<int>(), /*n=*/1, rs.MainStream);
+
+    CUDA_CHECK(cudaMemcpyAsync(rs.NormHost, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.AccuracyHost, rs.CorrectCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    int valid_tokens = *reinterpret_cast<int*>(rs.NormHost);
+    int correct_tokens = *reinterpret_cast<int*>(rs.AccuracyHost);
+    if (valid_tokens > 0) {
+        float avg_valid = static_cast<float>(valid_tokens) / static_cast<float>(std::max(1, comm.world_size()));
+        *rs.LossHost /= avg_valid;
+        *rs.AccuracyHost = (static_cast<float>(correct_tokens) / static_cast<float>(valid_tokens)) * 100.0f;
+    } else {
+        *rs.LossHost = 0.0f;
+        *rs.AccuracyHost = 0.0f;
+    }
+
+    rs.temp_free(rs.non_block_activations().output);
+
+    return *rs.LossHost;
+}
+
+void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommunicator& comm,
+                                       int grad_accum_steps, int micro_step, const modules::BackwardHook& hook) {
+    auto& rs = mRunState;
+    auto& grads = mGrads;
+    const auto& config = mConfig;
+    rs.GradAccumSteps = std::max(1, grad_accum_steps);
+    rs.WorldSize = std::max(1, comm.world_size());
+
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    mLastInputsCpu = inputs;
+
+    // Copy targets to device (side stream).
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
+        const std::size_t target_bytes =
+            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
+        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.side_stream()));
+        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.side_stream()));
+    }
+
+    if (micro_step == 0) {
+        fill_zero(rs.Losses, rs.MainStream);
+        fill_zero(rs.ValidTokenCount, rs.MainStream);
+        grads.start_micro_step(rs.side_stream(), micro_step, grad_accum_steps);
+        CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
+    } else {
+        grads.start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
+    }
+
+    // Zero d_ln_final.
+    fill_zero(rs.non_block_gradients().d_ln_final, rs.MainStream);
+    if (config.NumLayers > 0) {
+        fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
+    }
+
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads && mLoRARunState) {
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+        mLoRAGrads->start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
+    }
+
+    run_classifier(B, T, comm, grad_accum_steps, micro_step, /*compute_accuracy=*/false);
+
+    const bool last_step = micro_step == grad_accum_steps - 1;
+    if (last_step) {
+        reduce_loss(rs, B, T, comm);
+        comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
+    }
+
+    // Configure graphs for hooked execution (may differ in topology)
+    if (hook) {
+        rs.configure_backward_graphs(/*hooked=*/true);
+    }
+
+    execute_backward_graph(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
+
+    grads.end_micro_step(rs.MainStream, comm);
+    if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
+        mLoRAGrads->end_micro_step(rs.MainStream, comm);
+    }
+
+    // Start async all-reduce on last micro-step (overlaps with CPU work and optimizer prep)
+    // Note: LoRA gradients are already reduced in end_micro_step() above
+    if (last_step && comm.world_size() > 1) {
+        grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
+    }
+
+    CUDA_CHECK(cudaEventRecord(rs.BackwardDone, rs.MainStream));
+    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
+}
+
 void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy) {
     auto& rs = mRunState;
     const auto& config = mConfig;

@@ -81,7 +81,8 @@ Tensor recompute_lora_rmsnorm(modules::LoRARunState& lora_rs, const Tensor& resi
 }  // namespace
 
 
-void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full) {
+void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full,
+                                          const modules::ForwardHook* hook) {
     if (!mForward) {
         throw std::runtime_error("DSL graph executor: missing forward graph");
     }
@@ -373,14 +374,6 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 const bool allow_quant = op_kind.has_value() && allow_quant_layer(mOptions, config, layer_idx);
                 const modules::MatmulOp matmul_op = op_kind.value_or(modules::MatmulOp::LMHead);
 
-                if (env_enabled("SUROGATE_DEBUG_DSL_MATMUL")) {
-                    fprintf(stderr,
-                            "[DSL TRACE] fwd matmul op=%s layer=%d allow_quant=%d a=%s b=%s out=%s M=%d N=%d K=%d\n",
-                            op.inputs.at(1).c_str(), layer_idx, allow_quant ? 1 : 0,
-                            dtype_to_str(a.DType), dtype_to_str(b.DType), dtype_to_str(out.DType), M, N, K);
-                    fflush(stderr);
-                }
-
                 modules::MatmulContext ctx;
                 ctx.out = &out;
                 ctx.inp = &a;
@@ -408,16 +401,6 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                         ctx.cached_fp4_scales = &fp4_cache->scales;
                         ctx.cached_fp4_amax = fp4_cache->amax.get<float>();
                     }
-
-                    if (env_enabled("SUROGATE_DEBUG_DSL_MATMUL")) {
-                        fprintf(stderr,
-                                "[DSL TRACE] fwd matmul quant inp_q=%p weight_q=%p dq_idx=%d fp4=%p\n",
-                                ctx.inp_quant ? ctx.inp_quant->Data : nullptr,
-                                ctx.cached_weight ? ctx.cached_weight->Data : nullptr,
-                                ctx.delayed_quantizer_idx,
-                                ctx.cached_fp4_data ? ctx.cached_fp4_data->Data : nullptr);
-                        fflush(stderr);
-                    }
                 }
 
                 recipe.forward_matmul(ctx);
@@ -432,93 +415,29 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                        N, M, K, mode_col, false, rs.MainStream);
             }
 
-            if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRARunState) {
+            // Hook invocation (for LoRA or other extensions)
+            // LoRA is now handled via hooks provided by DslModel
+            if (hook && *hook) {
                 int layer_idx = -1;
                 std::string field;
                 if (parse_block_param(op.inputs.at(1), layer_idx, field)) {
-                    auto& acts = rs.simplified_acts(layer_idx);
-                    auto& lora_rs = *mLoRARunState;
-                    auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
-                    const int Bv = static_cast<int>(B);
-                    const int Tv = static_cast<int>(T);
-                    const int C = static_cast<int>(config.HiddenSize);
-                    const int D = static_cast<int>(config.IntermediateSize);
-                    const int Hq = static_cast<int>(config.NumQueryHeads);
-                    const int Hkv = static_cast<int>(config.NumKeyValHeads);
-                    const int Hs = static_cast<int>(config.head_size());
-                    const int rank = mLoRAConfig->rank;
-                    const int BT = Bv * Tv;
-                    const float scaling = mLoRAConfig->scaling();
-                    const float dropout = mLoRAConfig->dropout;
-                    const bool training = lora_rs.is_training;
-
-                    auto dropout_seed = [&](int proj_type) -> unsigned int {
-                        return lora_rs.dropout_base_seed
-                               + static_cast<unsigned int>(layer_idx) * 1000000u
-                               + static_cast<unsigned int>(proj_type) * 100000u
-                               + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
-                    };
-
+                    modules::ForwardHookPoint hook_point;
+                    bool should_invoke = false;
                     if (field == "qkv_weight") {
-                        if (lora_block.attention.q.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(0), training,
-                                BT, C, Hq * Hs, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
-                        if (lora_block.attention.k.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(1), training,
-                                BT, C, Hkv * Hs, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
-                        if (lora_block.attention.v.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(2), training,
-                                BT, C, Hkv * Hs, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
+                        hook_point = modules::ForwardHookPoint::AfterQKVProjection;
+                        should_invoke = true;
                     } else if (field == "out_weight") {
-                        if (lora_block.attention.o.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.att_out, 0, acts.att, lora_block.attention.o.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(3), training,
-                                BT, Hq * Hs, C, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
+                        hook_point = modules::ForwardHookPoint::AfterAttnOutProjection;
+                        should_invoke = true;
                     } else if (field == "mlp_up_weight") {
-                        if (lora_block.mlp.up.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(4), training,
-                                BT, C, D, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
-                        if (lora_block.mlp.gate.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(5), training,
-                                BT, C, D, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
+                        hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                        should_invoke = true;
                     } else if (field == "mlp_down_weight") {
-                        if (lora_block.mlp.down.has_value()) {
-                            modules::detail::apply_lora_contribution(
-                                acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
-                                lora_rs.intermediate, lora_rs.slice,
-                                scaling, dropout, dropout_seed(6), training,
-                                BT, D, C, rank,
-                                rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
+                        hook_point = modules::ForwardHookPoint::AfterMLPDownProjection;
+                        should_invoke = true;
+                    }
+                    if (should_invoke) {
+                        invoke_forward_hook(layer_idx, hook_point, rs.MainStream, hook);
                     }
                 }
             }

@@ -137,11 +137,6 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
     if (it == mFP8WeightCache.end()) {
         FP8WeightCacheEntry entry{};
         std::vector<long> shape(weight.Sizes.begin(), weight.Sizes.begin() + weight.Rank);
-        if (debug_cache) {
-            fprintf(stderr, "[DSL TRACE] fp8_cache alloc name=%s dtype=%s rank=%d\n",
-                    name.c_str(), dtype_to_str(weight.DType), weight.Rank);
-            fflush(stderr);
-        }
         entry.weight = mRunState.Allocator->allocate(ETensorDType::FP8_E4M3,
                                                      ("fp8_cache_" + name).c_str(),
                                                      EAllocationType::ON_DEVICE,
@@ -160,20 +155,10 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
         if (weight.DType == ETensorDType::BF16 || weight.DType == ETensorDType::FP32) {
             const long N = static_cast<long>(weight.nelem());
             if (N > 0) {
-                if (debug_cache) {
-                    fprintf(stderr, "[DSL TRACE] fp8_cache quant name=%s elems=%ld\n", name.c_str(), N);
-                    fflush(stderr);
-                }
                 abs_max(it->second.weight.abs_max(), weight, N, mRunState.DeviceProp, stream);
-                if (debug_cache) {
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                }
                 quantize_with_abs_max(it->second.weight, it->second.weight.scale(),
                                       weight, it->second.weight.abs_max(),
                                       N, mRunState.DeviceProp, stream);
-                if (debug_cache) {
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                }
             }
         }
         it->second.initialized = true;
@@ -193,8 +178,6 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
     if (!mForward) {
         return;
     }
-
-    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP4_CACHE");
 
     // Pre-quantize static weights for all matmul operations that allow FP4 (forward pass)
     for (std::size_t i = 0; i < mForward->operations.size(); ++i) {
@@ -224,12 +207,6 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
 
         Tensor& weight = mWeights.get(weight_name);
         (void)get_fp4_cached_weight(weight_name, weight, mRunState.MainStream);
-
-        if (debug_cache) {
-            fprintf(stderr, "[DSL TRACE] fp4_cache primed name=%s layer=%d\n",
-                    weight_name.c_str(), layer_idx);
-            fflush(stderr);
-        }
     }
 
     // Also prime transposed FP4 cache for backward pass (matmul_backward dgrad)
@@ -258,19 +235,12 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
 
             Tensor& weight = mWeights.get(weight_name);
             (void)get_fp4_cached_weight_transposed(weight_name, weight, mRunState.MainStream);
-
-            if (debug_cache) {
-                fprintf(stderr, "[DSL TRACE] fp4_cacheT primed name=%s layer=%d\n",
-                        weight_name.c_str(), layer_idx);
-                fflush(stderr);
-            }
         }
     }
 }
 
 const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
     const std::string& name, Tensor& weight, cudaStream_t stream) {
-    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP4_CACHE");
 
     // Check if FP4 is enabled
     if (!mOptions.fp4_enabled()) {
@@ -323,12 +293,6 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
                                                    EAllocationType::ON_DEVICE,
                                                    {1L});
 
-        if (debug_cache) {
-            fprintf(stderr, "[DSL TRACE] fp4_cache alloc name=%s N=%d K=%d scale_size=%zu\n",
-                    name.c_str(), N, K, scale_size);
-            fflush(stderr);
-        }
-
         auto [insert_it, _] = mFP4WeightCache.emplace(name, std::move(entry));
         it = insert_it;
     }
@@ -337,11 +301,6 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
     if (!it->second.initialized) {
         const int N = static_cast<int>(weight.Sizes[0]);
         const int K = static_cast<int>(weight.Sizes[1]);
-
-        if (debug_cache) {
-            fprintf(stderr, "[DSL TRACE] fp4_cache quant name=%s N=%d K=%d\n", name.c_str(), N, K);
-            fflush(stderr);
-        }
 
         // Use 4/6 quantization if enabled in recipe config
         // Check if recipe is NVFP4 and get 4/6 config from it
@@ -374,12 +333,6 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
         }
 
         it->second.initialized = true;
-
-        if (debug_cache) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            fprintf(stderr, "[DSL TRACE] fp4_cache quant done name=%s\n", name.c_str());
-            fflush(stderr);
-        }
     }
 
     return &it->second;
@@ -387,8 +340,6 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
 
 const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_transposed(
     const std::string& name, Tensor& weight, cudaStream_t stream) {
-    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP4_CACHE");
-
     // Check if FP4 is enabled
     if (!mOptions.fp4_enabled()) {
         return nullptr;
@@ -441,12 +392,6 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_t
                                                    EAllocationType::ON_DEVICE,
                                                    {1L});
 
-        if (debug_cache) {
-            fprintf(stderr, "[DSL TRACE] fp4_cacheT alloc name=%s K=%d N=%d scale_size=%zu\n",
-                    name.c_str(), K, N, scale_size);
-            fflush(stderr);
-        }
-
         auto [insert_it, _] = mFP4WeightCacheT.emplace(name, std::move(entry));
         it = insert_it;
     }
@@ -455,12 +400,7 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_t
     if (!it->second.initialized) {
         const int N = static_cast<int>(weight.Sizes[0]);
         const int K = static_cast<int>(weight.Sizes[1]);
-
-        if (debug_cache) {
-            fprintf(stderr, "[DSL TRACE] fp4_cacheT quant name=%s N=%d K=%d (transpose)\n", name.c_str(), N, K);
-            fflush(stderr);
-        }
-
+        
         // Use transpose quantization for dgrad
         // Note: No 4/6 variant for weight transpose quantization yet
         quantize_nvfp4_weight_cutlass_transpose_auto_scale(
@@ -472,12 +412,6 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_t
             mRunState.DeviceProp, stream);
 
         it->second.initialized = true;
-
-        if (debug_cache) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            fprintf(stderr, "[DSL TRACE] fp4_cacheT quant done name=%s\n", name.c_str());
-            fflush(stderr);
-        }
     }
 
     return &it->second;
