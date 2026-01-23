@@ -2006,6 +2006,26 @@ void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
         }
     }
 
+    // FP4 weight prefetching (async quantization on prefetch stream)
+    if (mRunState.has_fp4_forward() && mOptions.fp4_enabled()) {
+        const auto& weight_names = mLayerWeightNames[layer_idx];
+        for (const auto& name : weight_names) {
+            if (!mWeights.has(name) || mWeights.is_trainable(name)) {
+                continue;
+            }
+            Tensor& weight = mWeights.get(name);
+            if (weight.DType != ETensorDType::BF16) {
+                continue;  // FP4 cache only supports BF16 source weights
+            }
+
+            // Prefetch forward FP4 cache
+            (void)get_fp4_cached_weight(name, weight, stream);
+
+            // Also prefetch transposed FP4 cache for backward dgrad
+            (void)get_fp4_cached_weight_transposed(name, weight, stream);
+        }
+    }
+
     mPrefetchedLayer = layer_idx;
     if (mPrefetchEvent) {
         CUDA_CHECK(cudaEventRecord(mPrefetchEvent, stream));
