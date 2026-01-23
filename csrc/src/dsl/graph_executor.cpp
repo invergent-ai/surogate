@@ -178,6 +178,8 @@ void GraphExecutor::reset_cuda_graphs() {
             g = nullptr;
         }
     }
+    // Reset per-layer recompute graphs
+    reset_recompute_graphs();
     // Reset per-layer graphs in run state
     mRunState.reset_cuda_graphs();
 }

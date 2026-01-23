@@ -97,33 +97,11 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     };
     augment_shape_env(st.shape_env, mModule.config);
 
-    // Fine-grained recomputation flags
-    // When RecomputeBlock is true, it acts as a master switch enabling all components.
-    // Individual flags can be set independently for fine-grained control.
-    const bool disable_recompute_block = rs.is_lora_only_mode() && !mOptions.RecomputeLoRA;
-    const bool recompute_block = mOptions.RecomputeBlock && !disable_recompute_block;
-
-    // Attention path recomputation
-    const bool recompute_att = mOptions.RecomputeAtt || recompute_block;
-    const bool recompute_qkv = mOptions.RecomputeQKV || recompute_att;
-    const bool recompute_qk_norm = mOptions.RecomputeQKNorm || recompute_qkv;
-    const bool recompute_rope = mOptions.RecomputeRoPE || recompute_qkv;
-    const bool recompute_out_proj = mOptions.RecomputeOutProj || recompute_block;
-
-    // FFN/MLP path recomputation
-    const bool recompute_ffn = mOptions.RecomputeFFN || recompute_block;
-    const bool recompute_swiglu = mOptions.RecomputeSwiGLu || recompute_ffn;
-    const bool recompute_mlp_down = mOptions.RecomputeMLPDown || recompute_block;
-
-    // Normalization recomputation
-    const bool recompute_rmsnorm = mOptions.RecomputeRMSNorm || recompute_block;
-    const bool recompute_ln1 = recompute_rmsnorm || recompute_qkv || recompute_block;
-    const bool recompute_ln2 = recompute_rmsnorm || recompute_out_proj || recompute_ffn || recompute_block;
-
-    // Overall flag for any recomputation
-    const bool recompute_any = recompute_ln1 || recompute_qkv || recompute_att || recompute_ln2 ||
-                               recompute_ffn || recompute_swiglu || recompute_out_proj || recompute_mlp_down;
-    const bool recompute_lora = mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRARunState;
+    // Initialize precomputed recomputation flags (computed once per backward pass)
+    // This eliminates per-layer conditional overhead - flags are checked once here.
+    const_cast<GraphExecutor*>(this)->init_recompute_flags();
+    const bool recompute_any = mRecomputeFlags.any;
+    const bool recompute_block = mOptions.RecomputeBlock && !(rs.is_lora_only_mode() && !mOptions.RecomputeLoRA);
     const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0;
     
     std::vector<char> recomputed;
@@ -133,7 +111,17 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     st.recomputed_layers = recompute_any ? &recomputed : nullptr;
     int last_recompute_layer = -1;
 
-    auto recompute_layer = [&](int layer_idx) {
+    // Track whether we're in CUDA graph capture mode (must be declared before recompute_layer lambda)
+    bool bwd_capturing = false;
+
+    // Enable per-layer CUDA graph capture for recomputation when backward graphs are enabled.
+    // This significantly reduces kernel launch overhead by caching the entire recompute
+    // sequence per layer (matching the modular path's behavior).
+    const bool use_recompute_graphs = use_graphs_enabled && recompute_any;
+
+    // Wrapper lambda that delegates to the optimized method.
+    // The optimized method uses precomputed flags and optional CUDA graph caching.
+    auto recompute_layer = [&, this](int layer_idx) {
         if (!recompute_any) return;
         if (layer_idx < 0 || layer_idx >= config.NumLayers) return;
         if (recompute_block) {
@@ -148,350 +136,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             recomputed[layer_idx] = 1;
         }
 
-        const int Bv = static_cast<int>(B);
-        const int Tv = static_cast<int>(T);
-        const int C = static_cast<int>(config.HiddenSize);
-        const int D = static_cast<int>(config.IntermediateSize);
-        const int Hq = static_cast<int>(config.NumQueryHeads);
-        const int Hkv = static_cast<int>(config.NumKeyValHeads);
-        const int Hs = static_cast<int>(config.head_size());
-        const int qkv_channels = Hs * (Hq + 2 * Hkv);
-        const int att_dim = Hq * Hs;
-        const int MUp = 2 * D;
-
-        auto& acts = rs.simplified_acts(layer_idx);
-        auto ensure_act = [&](Tensor& t) {
-            if (!t.Data) {
-                rs.temp_acquire(t);
-                st.temps.push_back(t);
-            }
-        };
-        auto abs_max_host = [&](const Tensor& t) -> float {
-            if (t.DType == ETensorDType::FP8_E4M3 || t.DType == ETensorDType::FP8_E5M2) {
-                return 0.0f;
-            }
-            Tensor tmp = rs.temp_alloc(ETensorDType::FP32, {1});
-            st.temps.push_back(tmp);
-            abs_max(tmp.get<float>(), t, static_cast<long>(t.nelem()), rs.DeviceProp, rs.MainStream);
-            float host = 0.0f;
-            CUDA_CHECK(cudaMemcpyAsync(&host, tmp.Data, sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-            return host;
-        };
-        auto sample_max_diff = [&](const Tensor& a, const Tensor& b) -> float {
-            if (a.DType != b.DType) return -1.0f;
-            const std::size_t count = std::min<std::size_t>(1024, a.nelem());
-            if (count == 0) return 0.0f;
-            const std::size_t bytes = count * get_dtype_size(a.DType);
-            float max_diff = 0.0f;
-            if (a.DType == ETensorDType::BF16) {
-                std::vector<nv_bfloat16> host_a(count);
-                std::vector<nv_bfloat16> host_b(count);
-                CUDA_CHECK(cudaMemcpy(host_a.data(), a.Data, bytes, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(host_b.data(), b.Data, bytes, cudaMemcpyDeviceToHost));
-                for (std::size_t i = 0; i < count; ++i) {
-                    const float diff = std::fabs((float)host_a[i] - (float)host_b[i]);
-                    if (diff > max_diff) max_diff = diff;
-                }
-                return max_diff;
-            }
-            if (a.DType == ETensorDType::FP32) {
-                std::vector<float> host_a(count);
-                std::vector<float> host_b(count);
-                CUDA_CHECK(cudaMemcpy(host_a.data(), a.Data, bytes, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(host_b.data(), b.Data, bytes, cudaMemcpyDeviceToHost));
-                for (std::size_t i = 0; i < count; ++i) {
-                    const float diff = std::fabs(host_a[i] - host_b[i]);
-                    if (diff > max_diff) max_diff = diff;
-                }
-                return max_diff;
-            }
-            return -1.0f;
-        };
-       
-        Tensor& res_ffn = rs.get_residual(layer_idx, rs.MainStream);
-        if (recompute_ln1) {
-            ensure_act(acts.ln1);
-            ensure_act(acts.ln1_rstd);
-            Tensor& ln1_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln1_weight");
-            if (recompute_block) {
-                // res_ffn already holds the residual stream for this layer in the DSL path.
-                rmsnorm_forward(acts.ln1, acts.ln1_rstd, res_ffn, ln1_weight, nullptr,
-                                config.RmsNormEps, Bv, Tv, C, rs.MainStream);
-            } else {
-                Tensor residual_in;
-                Tensor x_in;
-                if (layer_idx == 0) {
-                    Tensor zero = rs.temp_alloc(acts.ln1.DType, {B, T, C});
-                    st.temps.push_back(zero);
-                    fill_zero(zero, rs.MainStream);
-                    residual_in = zero;
-                    x_in = rs.non_block_activations().encoded;
-                } else {
-                    residual_in = rs.simplified_acts(layer_idx - 1).residual_att;
-                    x_in = rs.simplified_acts(layer_idx - 1).mlp_down;
-                }
-                fused_residual_rmsnorm_forward(
-                    res_ffn, acts.ln1, acts.ln1_rstd,
-                    residual_in, x_in, ln1_weight, nullptr,
-                    config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
-            }
-        }
-
-        auto dsl_matmul = [&](Tensor& out, const Tensor& a_in, const Tensor& b_in, EMMTranspose mode,
-                              std::optional<Tensor> bias,
-                              std::string_view weight_name,
-                              std::optional<modules::MatmulOp> op_kind) {
-            int M = 0, N = 0, K = 0;
-            matmul_dims(a_in, b_in, mode, M, N, K);
-            bool used_recipe = false;
-            if (mOptions.TrainingRecipe && mode == EMMTranspose::NT && a_in.Sizes[0] == B * T) {
-                const recipes::Recipe& recipe = *mOptions.TrainingRecipe;
-                const int layer_idx_local = layer_idx;
-                const bool allow_quant = op_kind.has_value() && allow_quant_layer(mOptions, config, layer_idx_local);
-                const modules::MatmulOp matmul_op = op_kind.value_or(modules::MatmulOp::LMHead);
-
-                modules::MatmulContext ctx;
-                ctx.out = &out;
-                ctx.inp = const_cast<Tensor*>(&a_in);
-                ctx.weight = const_cast<Tensor*>(&b_in);
-                ctx.bias = bias ? &*bias : nullptr;
-                ctx.B = static_cast<int>(B);
-                ctx.T = static_cast<int>(T);
-                ctx.C_in = K;
-                ctx.C_out = N;
-                ctx.run_state = &rs;
-                ctx.stream = rs.MainStream;
-                ctx.layer_idx = layer_idx_local;
-                ctx.op = matmul_op;
-                // Disable FP8 for recompute to avoid numerical mismatch with forward pass.
-                // FP8 forward pass uses delayed scaling, but recompute would use JIT scaling
-                // which produces different results and causes gradient explosion.
-                // FP4 is fine because it uses per-block auto-scaling in both forward and recompute.
-                ctx.allow_fp8 = false;
-                ctx.allow_fp4 = allow_quant;
-                if (allow_quant) {
-                    ctx.cached_fp4_data = nullptr;  // Don't use cached FP4 weights for recompute
-                    ctx.cached_fp4_scales = nullptr;
-                    ctx.cached_fp4_amax = nullptr;
-                }
-                recipe.forward_matmul(ctx);
-                used_recipe = true;
-            }
-            if (!used_recipe) {
-                EMMTranspose mode_col = swap_transpose(mode);
-                matmul(out, b_in, a_in, bias, nullptr, nullptr,
-                       rs.CublasLtHandle, rs.CuBlasWorkspace,
-                       N, M, K, mode_col, false, rs.MainStream);
-            }
-        };
-
-        if (recompute_qkv) {
-            ensure_act(acts.qkv);
-            Tensor& qkv_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].qkv_weight");
-            Tensor ln1_flat = view_tensor(acts.ln1, {B * T, C});
-            Tensor qkv_flat = view_tensor(acts.qkv, {B * T, qkv_channels});
-            std::string bias_name = "blocks[" + std::to_string(layer_idx) + "].qkv_bias";
-            std::optional<Tensor> qkv_bias;
-            if (mWeights.has(bias_name)) {
-                qkv_bias = resolve_param_tensor(st, bias_name);
-            }
-            dsl_matmul(qkv_flat, ln1_flat, qkv_weight, EMMTranspose::NT, qkv_bias,
-                       "blocks[" + std::to_string(layer_idx) + "].qkv_weight",
-                       modules::MatmulOp::QKV);
-
-            if (recompute_lora) {
-                auto& lora_rs = *mLoRARunState;
-                auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
-                const int rank = mLoRAConfig->rank;
-                const float scaling = mLoRAConfig->scaling();
-                const float dropout = mLoRAConfig->dropout;
-                const bool training = lora_rs.is_training;
-                const int BT = Bv * Tv;
-                auto dropout_seed = [&](int proj_type) -> unsigned int {
-                    return lora_rs.dropout_base_seed
-                           + static_cast<unsigned int>(layer_idx) * 1000000u
-                           + static_cast<unsigned int>(proj_type) * 100000u
-                           + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
-                };
-                if (lora_block.attention.q.has_value()) {
-                    modules::detail::apply_lora_contribution(
-                        acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
-                        lora_rs.intermediate, lora_rs.slice,
-                        scaling, dropout, dropout_seed(0), training,
-                        BT, C, Hq * Hs, rank,
-                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                }
-                if (lora_block.attention.k.has_value()) {
-                    modules::detail::apply_lora_contribution(
-                        acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
-                        lora_rs.intermediate, lora_rs.slice,
-                        scaling, dropout, dropout_seed(1), training,
-                        BT, C, Hkv * Hs, rank,
-                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                }
-                if (lora_block.attention.v.has_value()) {
-                    modules::detail::apply_lora_contribution(
-                        acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
-                        lora_rs.intermediate, lora_rs.slice,
-                        scaling, dropout, dropout_seed(2), training,
-                        BT, C, Hkv * Hs, rank,
-                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                }
-            }
-
-            if (config.UseQKNorm) {
-                ensure_act(acts.q_rstd);
-                ensure_act(acts.k_rstd);
-                Tensor qkv_view = view_tensor(acts.qkv, {B, T, qkv_channels});
-                const bool rope_fusable = ((Hs % 2) == 0)
-                    && (((Hs / 2) % 32) == 0)
-                    && (rs.non_block_activations().freq_cis.Rank >= 2)
-                    && (rs.non_block_activations().freq_cis.Sizes[1] >= Hs);
-                if (rope_fusable) {
-                    qkv_qk_norm_rope_forward(qkv_view, acts.q_rstd, acts.k_rstd,
-                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
-                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
-                                             rs.non_block_activations().freq_cis,
-                                             reinterpret_cast<int*>(rs.PositionIDs.Data),
-                                             static_cast<float>(config.RmsNormEps),
-                                             Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
-                } else {
-                    qkv_head_rmsnorm_forward(qkv_view, acts.q_rstd,
-                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
-                                             static_cast<float>(config.RmsNormEps),
-                                             Bv, Tv, qkv_channels, Hq, Hs, 0, rs.MainStream);
-                    qkv_head_rmsnorm_forward(qkv_view, acts.k_rstd,
-                                             resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
-                                             static_cast<float>(config.RmsNormEps),
-                                             Bv, Tv, qkv_channels, Hkv, Hs, Hq * Hs, rs.MainStream);
-                    Tensor qkv_rope = (acts.qkv.Rank == 4)
-                        ? acts.qkv
-                        : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
-                    rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
-                                 reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
-                                 Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
-                }
-            } else {
-                Tensor qkv_rope = (acts.qkv.Rank == 4)
-                    ? acts.qkv
-                    : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
-                rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
-                             reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
-                             Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
-            }
-        }
-
-        if (recompute_att) {
-            ensure_act(acts.att);
-            ensure_act(acts.lse);
-            Tensor qkv_view = (acts.qkv.Rank == 4)
-                ? acts.qkv
-                : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
-            if (!rs.scratch().cudnn_workspace.Data) {
-                rs.temp_acquire(rs.scratch().cudnn_workspace);
-                st.temps.push_back(rs.scratch().cudnn_workspace);
-            }
-            Tensor att_out = view_tensor(acts.att, {B, T, Hq, Hs});
-            Tensor lse_view = view_tensor(acts.lse, {B, Hq, T});
-            attention_forward_cudnn(att_out, lse_view, qkv_view, rs.scratch().cudnn_workspace,
-                                    rs.CudnnHandle, Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
-
-            if (recompute_out_proj) {
-                ensure_act(acts.att_out);
-                Tensor& out_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].out_weight");
-                Tensor att_flat = view_tensor(acts.att, {B * T, att_dim});
-                Tensor att_out_flat = view_tensor(acts.att_out, {B * T, C});
-                dsl_matmul(att_out_flat, att_flat, out_weight, EMMTranspose::NT, std::nullopt,
-                           "blocks[" + std::to_string(layer_idx) + "].out_weight",
-                           modules::MatmulOp::AttnOut);
-
-                if (recompute_lora) {
-                    auto& lora_rs = *mLoRARunState;
-                    auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
-                    const int rank = mLoRAConfig->rank;
-                    const float scaling = mLoRAConfig->scaling();
-                    const float dropout = mLoRAConfig->dropout;
-                    const bool training = lora_rs.is_training;
-                    const int BT = Bv * Tv;
-                    auto dropout_seed = [&](int proj_type) -> unsigned int {
-                        return lora_rs.dropout_base_seed
-                               + static_cast<unsigned int>(layer_idx) * 1000000u
-                               + static_cast<unsigned int>(proj_type) * 100000u
-                               + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
-                    };
-                    if (lora_block.attention.o.has_value()) {
-                        modules::detail::apply_lora_contribution(
-                            acts.att_out, 0, acts.att, lora_block.attention.o.value(),
-                            lora_rs.intermediate, lora_rs.slice,
-                            scaling, dropout, dropout_seed(3), training,
-                            BT, Hq * Hs, C, rank,
-                            rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                        }
-                }
-            }
-        }
-
-        if (recompute_ln2) {
-            ensure_act(acts.ln2);
-            ensure_act(acts.ln2_rstd);
-            Tensor& ln2_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].ln2_weight");
-            fused_residual_rmsnorm_forward(
-                acts.residual_att, acts.ln2, acts.ln2_rstd,
-                res_ffn, acts.att_out, ln2_weight, nullptr,
-                config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
-        }
-
-        if (recompute_ffn) {
-            ensure_act(acts.mlp_up);
-            Tensor& mlp_up_weight = resolve_param_tensor(st, "blocks[" + std::to_string(layer_idx) + "].mlp_up_weight");
-            Tensor ln2_flat = view_tensor(acts.ln2, {B * T, C});
-            Tensor mlp_up_flat = view_tensor(acts.mlp_up, {B * T, MUp});
-            dsl_matmul(mlp_up_flat, ln2_flat, mlp_up_weight, EMMTranspose::NT, std::nullopt,
-                       "blocks[" + std::to_string(layer_idx) + "].mlp_up_weight",
-                       modules::MatmulOp::MLPUp);
-
-            if (recompute_lora) {
-                auto& lora_rs = *mLoRARunState;
-                auto& lora_block = mLoRAWeights->get_block(layer_idx, rs.MainStream);
-                const int rank = mLoRAConfig->rank;
-                const float scaling = mLoRAConfig->scaling();
-                const float dropout = mLoRAConfig->dropout;
-                const bool training = lora_rs.is_training;
-                const int BT = Bv * Tv;
-                auto dropout_seed = [&](int proj_type) -> unsigned int {
-                    return lora_rs.dropout_base_seed
-                           + static_cast<unsigned int>(layer_idx) * 1000000u
-                           + static_cast<unsigned int>(proj_type) * 100000u
-                           + static_cast<unsigned int>(lora_rs.micro_step) * 10000u;
-                };
-                if (lora_block.mlp.up.has_value()) {
-                    modules::detail::apply_lora_contribution(
-                        acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
-                        lora_rs.intermediate, lora_rs.slice,
-                        scaling, dropout, dropout_seed(4), training,
-                        BT, C, D, rank,
-                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                }
-                if (lora_block.mlp.gate.has_value()) {
-                    modules::detail::apply_lora_contribution(
-                        acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
-                        lora_rs.intermediate, lora_rs.slice,
-                        scaling, dropout, dropout_seed(5), training,
-                        BT, C, D, rank,
-                        rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
-                }
-            }
-        }
-
-        if (recompute_swiglu) {
-            ensure_act(acts.swiglu);
-            swiglu_forward(acts.swiglu, acts.mlp_up, nullptr,
-                           Bv, Tv, D, rs.MainStream);
-        }
-
-        // NOTE: mlp_down output is not required for backward (only swiglu + weights are needed),
-        // so skip recomputing it to save a large matmul in recompute_block mode.
+        // Delegate to optimized recompute with optional CUDA graph caching.
+        // The capturing flag is checked inside to avoid graphs during initial capture phase.
+        const bool use_graph = use_recompute_graphs && !bwd_capturing;
+        const_cast<GraphExecutor*>(this)->recompute_layer_optimized(layer_idx, B, T, use_graph);
     };
 
     // Bind forward inputs needed by backward ops (e.g., rope uses position_ids).
@@ -538,9 +186,6 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     // Track current layer for backward prefetching (need to declare before lambdas)
     int bwd_current_layer = -1;
     int bwd_last_prefetched = -1;
-
-    // Track whether we're in CUDA graph capture mode (set after lambdas are defined)
-    bool bwd_capturing = false;
 
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
@@ -1465,6 +1110,333 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     if (!use_graphs || capturing) {
         free_temps(st);
         rs.temp_free(rs.non_block_activations().output);
+    }
+}
+
+// ============================================================================
+// Optimized backward recomputation support
+// ============================================================================
+
+void GraphExecutor::init_recompute_flags() {
+    const bool disable_recompute_block = mRunState.is_lora_only_mode() && !mOptions.RecomputeLoRA;
+    const bool recompute_block = mOptions.RecomputeBlock && !disable_recompute_block;
+
+    // Attention path recomputation
+    mRecomputeFlags.att = mOptions.RecomputeAtt || recompute_block;
+    mRecomputeFlags.qkv = mOptions.RecomputeQKV || mRecomputeFlags.att;
+    mRecomputeFlags.qk_norm = mOptions.RecomputeQKNorm || mRecomputeFlags.qkv;
+    mRecomputeFlags.rope = mOptions.RecomputeRoPE || mRecomputeFlags.qkv;
+    mRecomputeFlags.out_proj = mOptions.RecomputeOutProj || recompute_block;
+
+    // FFN/MLP path recomputation
+    mRecomputeFlags.ffn = mOptions.RecomputeFFN || recompute_block;
+    mRecomputeFlags.swiglu = mOptions.RecomputeSwiGLu || mRecomputeFlags.ffn;
+    mRecomputeFlags.mlp_down = mOptions.RecomputeMLPDown || recompute_block;
+
+    // Normalization recomputation
+    const bool recompute_rmsnorm = mOptions.RecomputeRMSNorm || recompute_block;
+    mRecomputeFlags.ln1 = recompute_rmsnorm || mRecomputeFlags.qkv || recompute_block;
+    mRecomputeFlags.ln2 = recompute_rmsnorm || mRecomputeFlags.out_proj || mRecomputeFlags.ffn || recompute_block;
+
+    // Overall flag
+    mRecomputeFlags.any = mRecomputeFlags.ln1 || mRecomputeFlags.qkv || mRecomputeFlags.att ||
+                          mRecomputeFlags.ln2 || mRecomputeFlags.ffn || mRecomputeFlags.swiglu ||
+                          mRecomputeFlags.out_proj || mRecomputeFlags.mlp_down;
+}
+
+
+void GraphExecutor::reset_recompute_graphs() {
+    for (auto& graph : mRecomputeGraphs) {
+        if (graph != nullptr) {
+            cudaGraphExecDestroy(graph);
+            graph = nullptr;
+        }
+    }
+    mRecomputeGraphsInitialized = false;
+}
+
+void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, bool use_graph) {
+    if (!mRecomputeFlags.any) return;
+    if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) return;
+
+    auto& rs = mRunState;
+    const auto& config = mConfig;
+    const auto& flags = mRecomputeFlags;
+
+    // Check if we can use cached CUDA graph
+    if (use_graph && mRecomputeGraphsInitialized && layer_idx < static_cast<int>(mRecomputeGraphs.size())) {
+        cudaGraphExec_t& graph = mRecomputeGraphs[layer_idx];
+        if (graph != nullptr) {
+            rs.Stack.restore(mRecomputeCheckpoints[layer_idx]);
+            CUDA_CHECK(cudaGraphLaunch(graph, rs.MainStream));
+            return;
+        }
+    }
+
+    // Initialize graph arrays if needed
+    if (use_graph && !mRecomputeGraphsInitialized) {
+        mRecomputeGraphs.resize(static_cast<std::size_t>(config.NumLayers), nullptr);
+        mRecomputeCheckpoints.resize(static_cast<std::size_t>(config.NumLayers));
+        mRecomputeGraphsInitialized = true;
+    }
+
+    // Capture checkpoint for potential graph capture
+    DeviceMemoryStack::Checkpoint checkpoint;
+    if (use_graph && layer_idx < static_cast<int>(mRecomputeGraphs.size())) {
+        checkpoint = rs.Stack.checkpoint();
+        mRecomputeCheckpoints[layer_idx] = checkpoint;
+    }
+
+    // Start graph capture if enabled
+    cudaGraph_t captured_graph = nullptr;
+    if (use_graph && layer_idx < static_cast<int>(mRecomputeGraphs.size()) && mRecomputeGraphs[layer_idx] == nullptr) {
+        CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
+    }
+
+    // ========================================================================
+    // Recomputation logic (streamlined, no conditionals in hot path)
+    // ========================================================================
+    const int Bv = static_cast<int>(B);
+    const int Tv = static_cast<int>(T);
+    const int C = static_cast<int>(config.HiddenSize);
+    const int D = static_cast<int>(config.IntermediateSize);
+    const int Hq = static_cast<int>(config.NumQueryHeads);
+    const int Hkv = static_cast<int>(config.NumKeyValHeads);
+    const int Hs = static_cast<int>(config.head_size());
+    const int qkv_channels = Hs * (Hq + 2 * Hkv);
+    const int MUp = 2 * D;
+
+    auto& acts = rs.simplified_acts(layer_idx);
+
+    // Helper to ensure activation buffer is allocated
+    auto ensure_act = [&](Tensor& t) {
+        if (!t.Data) {
+            rs.temp_acquire(t);
+        }
+    };
+
+    Tensor& res_ffn = rs.get_residual(layer_idx, rs.MainStream);
+
+    // LN1 recomputation
+    if (flags.ln1) {
+        ensure_act(acts.ln1);
+        ensure_act(acts.ln1_rstd);
+        Tensor& ln1_weight = mWeights.get("blocks[" + std::to_string(layer_idx) + "].ln1_weight");
+        rmsnorm_forward(acts.ln1, acts.ln1_rstd, res_ffn, ln1_weight, nullptr,
+                        config.RmsNormEps, Bv, Tv, C, rs.MainStream);
+    }
+
+    // QKV + RoPE recomputation
+    // Recipe-based matmul dispatch (FP8 disabled for recompute to avoid JIT vs delayed scaling mismatch)
+    const bool allow_quant = allow_quant_layer(mOptions, config, layer_idx);
+    const bool use_recipe_matmul = mOptions.TrainingRecipe != nullptr;
+
+    if (flags.qkv) {
+        ensure_act(acts.qkv);
+        const std::string qkv_weight_name = "blocks[" + std::to_string(layer_idx) + "].qkv_weight";
+        Tensor& qkv_weight = mWeights.get(qkv_weight_name);
+        Tensor ln1_flat = view_tensor(acts.ln1, {B * T, C});
+        Tensor qkv_flat = view_tensor(acts.qkv, {B * T, qkv_channels});
+
+        // Check for bias
+        std::string bias_name = "blocks[" + std::to_string(layer_idx) + "].qkv_bias";
+        std::optional<Tensor> qkv_bias;
+        if (mWeights.has(bias_name)) {
+            qkv_bias = mWeights.get(bias_name);
+        }
+
+        if (use_recipe_matmul) {
+            // Use recipe dispatch (FP8 disabled, FP4 OK since it uses per-block auto-scaling)
+            const recipes::Recipe& recipe = *mOptions.TrainingRecipe;
+            modules::MatmulContext ctx;
+            ctx.out = &qkv_flat;
+            ctx.inp = &ln1_flat;
+            ctx.weight = &qkv_weight;
+            ctx.bias = qkv_bias ? &*qkv_bias : nullptr;
+            ctx.B = Bv;
+            ctx.T = Tv;
+            ctx.C_in = C;
+            ctx.C_out = qkv_channels;
+            ctx.run_state = &rs;
+            ctx.stream = rs.MainStream;
+            ctx.layer_idx = layer_idx;
+            ctx.op = modules::MatmulOp::QKV;
+            // Disable FP8 for recompute: JIT scaling produces different results than delayed scaling
+            // from forward pass, causing gradient explosion. FP4 is OK (per-block auto-scaling).
+            ctx.allow_fp8 = false;
+            ctx.allow_fp4 = allow_quant && mOptions.fp4_enabled();
+            recipe.forward_matmul(ctx);
+        } else {
+            // BF16 fallback when recipe not available
+            int M = static_cast<int>(B * T);
+            int N = qkv_channels;
+            int K_dim = C;
+            matmul(qkv_flat, qkv_weight, ln1_flat, qkv_bias, nullptr, nullptr,
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K_dim, EMMTranspose::TN, false, rs.MainStream);
+        }
+
+        // NOTE: LoRA contributions are NOT recomputed here.
+        // LoRA is applied once during forward pass via hooks, and the LoRA-modified
+        // activations are saved. During recompute, we only redo base model ops
+        // (matching the modular path's BlockExecutor::recompute behavior).
+
+        // QK normalization + RoPE (fused when possible)
+        if (config.UseQKNorm) {
+            ensure_act(acts.q_rstd);
+            ensure_act(acts.k_rstd);
+            Tensor qkv_view = view_tensor(acts.qkv, {B, T, qkv_channels});
+            const bool rope_fusable = ((Hs % 2) == 0)
+                && (((Hs / 2) % 32) == 0)
+                && (rs.non_block_activations().freq_cis.Rank >= 2)
+                && (rs.non_block_activations().freq_cis.Sizes[1] >= Hs);
+            if (rope_fusable) {
+                qkv_qk_norm_rope_forward(qkv_view, acts.q_rstd, acts.k_rstd,
+                                         mWeights.get("blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
+                                         mWeights.get("blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
+                                         rs.non_block_activations().freq_cis,
+                                         reinterpret_cast<int*>(rs.PositionIDs.Data),
+                                         static_cast<float>(config.RmsNormEps),
+                                         Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
+            } else {
+                qkv_head_rmsnorm_forward(qkv_view, acts.q_rstd,
+                                         mWeights.get("blocks[" + std::to_string(layer_idx) + "].q_norm_weight"),
+                                         static_cast<float>(config.RmsNormEps),
+                                         Bv, Tv, qkv_channels, Hq, Hs, 0, rs.MainStream);
+                qkv_head_rmsnorm_forward(qkv_view, acts.k_rstd,
+                                         mWeights.get("blocks[" + std::to_string(layer_idx) + "].k_norm_weight"),
+                                         static_cast<float>(config.RmsNormEps),
+                                         Bv, Tv, qkv_channels, Hkv, Hs, Hq * Hs, rs.MainStream);
+                Tensor qkv_rope = (acts.qkv.Rank == 4)
+                    ? acts.qkv
+                    : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+                rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
+                             reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
+                             Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
+            }
+        } else {
+            Tensor qkv_rope = (acts.qkv.Rank == 4)
+                ? acts.qkv
+                : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+            rope_forward(qkv_rope, qkv_rope, rs.non_block_activations().freq_cis,
+                         reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
+                         Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
+        }
+    }
+
+    // Attention recomputation
+    if (flags.att) {
+        ensure_act(acts.att);
+        ensure_act(acts.lse);
+        Tensor qkv_view = (acts.qkv.Rank == 4)
+            ? acts.qkv
+            : view_tensor(acts.qkv, {B, T, Hq + 2 * Hkv, Hs});
+        if (!rs.scratch().cudnn_workspace.Data) {
+            rs.temp_acquire(rs.scratch().cudnn_workspace);
+        }
+        Tensor att_out = view_tensor(acts.att, {B, T, Hq, Hs});
+        Tensor lse_view = view_tensor(acts.lse, {B, Hq, T});
+        attention_forward_cudnn(att_out, lse_view, qkv_view, rs.scratch().cudnn_workspace,
+                                rs.CudnnHandle, Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
+
+        // Attention output projection recomputation
+        if (flags.out_proj) {
+            ensure_act(acts.att_out);
+            const std::string out_weight_name = "blocks[" + std::to_string(layer_idx) + "].out_weight";
+            Tensor& out_weight = mWeights.get(out_weight_name);
+            Tensor att_flat = view_tensor(acts.att, {B * T, Hq * Hs});
+            Tensor att_out_flat = view_tensor(acts.att_out, {B * T, C});
+
+            if (use_recipe_matmul) {
+                // Use recipe dispatch (FP8 disabled, FP4 OK)
+                const recipes::Recipe& recipe = *mOptions.TrainingRecipe;
+                modules::MatmulContext ctx;
+                ctx.out = &att_out_flat;
+                ctx.inp = &att_flat;
+                ctx.weight = &out_weight;
+                ctx.bias = nullptr;
+                ctx.B = Bv;
+                ctx.T = Tv;
+                ctx.C_in = Hq * Hs;
+                ctx.C_out = C;
+                ctx.run_state = &rs;
+                ctx.stream = rs.MainStream;
+                ctx.layer_idx = layer_idx;
+                ctx.op = modules::MatmulOp::AttnOut;
+                ctx.allow_fp8 = false;  // Disabled: JIT vs delayed scaling mismatch
+                ctx.allow_fp4 = allow_quant && mOptions.fp4_enabled();
+                recipe.forward_matmul(ctx);
+            } else {
+                // BF16 fallback
+                int att_dim = Hq * Hs;
+                matmul(att_out_flat, out_weight, att_flat, std::nullopt, nullptr, nullptr,
+                       rs.CublasLtHandle, rs.CuBlasWorkspace,
+                       C, static_cast<int>(B * T), att_dim, EMMTranspose::TN, false, rs.MainStream);
+            }
+            // NOTE: LoRA o_proj contribution is NOT recomputed (applied once during forward)
+        }
+    }
+
+    // LN2 + residual recomputation
+    if (flags.ln2) {
+        ensure_act(acts.ln2);
+        ensure_act(acts.ln2_rstd);
+        Tensor& ln2_weight = mWeights.get("blocks[" + std::to_string(layer_idx) + "].ln2_weight");
+        fused_residual_rmsnorm_forward(
+            acts.residual_att, acts.ln2, acts.ln2_rstd,
+            res_ffn, acts.att_out, ln2_weight, nullptr,
+            config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
+    }
+
+    // FFN up projection recomputation
+    if (flags.ffn) {
+        ensure_act(acts.mlp_up);
+        const std::string mlp_up_weight_name = "blocks[" + std::to_string(layer_idx) + "].mlp_up_weight";
+        Tensor& mlp_up_weight = mWeights.get(mlp_up_weight_name);
+        Tensor ln2_flat = view_tensor(acts.ln2, {B * T, C});
+        Tensor mlp_up_flat = view_tensor(acts.mlp_up, {B * T, MUp});
+
+        if (use_recipe_matmul) {
+            // Use recipe dispatch (FP8 disabled, FP4 OK)
+            const recipes::Recipe& recipe = *mOptions.TrainingRecipe;
+            modules::MatmulContext ctx;
+            ctx.out = &mlp_up_flat;
+            ctx.inp = &ln2_flat;
+            ctx.weight = &mlp_up_weight;
+            ctx.bias = nullptr;
+            ctx.B = Bv;
+            ctx.T = Tv;
+            ctx.C_in = C;
+            ctx.C_out = MUp;
+            ctx.run_state = &rs;
+            ctx.stream = rs.MainStream;
+            ctx.layer_idx = layer_idx;
+            ctx.op = modules::MatmulOp::MLPUp;
+            ctx.allow_fp8 = false;  // Disabled: JIT vs delayed scaling mismatch
+            ctx.allow_fp4 = allow_quant && mOptions.fp4_enabled();
+            recipe.forward_matmul(ctx);
+        } else {
+            // BF16 fallback
+            matmul(mlp_up_flat, mlp_up_weight, ln2_flat, std::nullopt, nullptr, nullptr,
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   MUp, static_cast<int>(B * T), C, EMMTranspose::TN, false, rs.MainStream);
+        }
+        // NOTE: LoRA MLP contribution is NOT recomputed (applied once during forward)
+    }
+
+    // SwiGLU recomputation
+    if (flags.swiglu) {
+        ensure_act(acts.swiglu);
+        swiglu_forward(acts.swiglu, acts.mlp_up, nullptr,
+                       Bv, Tv, D, rs.MainStream);
+    }
+
+    // End graph capture if we were capturing
+    if (use_graph && layer_idx < static_cast<int>(mRecomputeGraphs.size()) && mRecomputeGraphs[layer_idx] == nullptr) {
+        CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &captured_graph));
+        CUDA_CHECK(cudaGraphInstantiate(&mRecomputeGraphs[layer_idx], captured_graph, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphDestroy(captured_graph));
+        CUDA_CHECK(cudaGraphLaunch(mRecomputeGraphs[layer_idx], rs.MainStream));
     }
 }
 

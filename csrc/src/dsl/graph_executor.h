@@ -249,6 +249,37 @@ private:
 
     // Per-layer CUDA graph execution (more granular than whole-graph capture)
     bool mPerLayerGraphsEnabled = false;
+
+    // ========================================================================
+    // Per-layer recompute CUDA graphs (optimization for backward recomputation)
+    // ========================================================================
+    // When RecomputeBlock=true, we cache the recomputation kernels per-layer
+    // to eliminate conditional overhead and enable kernel fusion via graph capture.
+    std::vector<cudaGraphExec_t> mRecomputeGraphs;           ///< One graph per layer
+    std::vector<DeviceMemoryStack::Checkpoint> mRecomputeCheckpoints;  ///< Stack state per layer
+    bool mRecomputeGraphsInitialized = false;
+
+    // Precomputed recomputation flags (computed once, reused per layer)
+    struct RecomputeFlags {
+        bool any = false;
+        bool ln1 = false;
+        bool qkv = false;
+        bool qk_norm = false;
+        bool rope = false;
+        bool att = false;
+        bool out_proj = false;
+        bool ln2 = false;
+        bool ffn = false;
+        bool swiglu = false;
+        bool mlp_down = false;
+    };
+    RecomputeFlags mRecomputeFlags;
+
+    void init_recompute_flags();
+    void reset_recompute_graphs();
+
+    // Optimized recompute using precomputed flags and optional graph capture
+    void recompute_layer_optimized(int layer_idx, long B, long T, bool use_graph);
 };
 
 }  // namespace dsl
