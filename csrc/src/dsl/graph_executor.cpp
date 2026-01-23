@@ -3432,6 +3432,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
 
     std::unordered_map<int, DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::unordered_map<int, std::size_t> layer_temp_marks;
+
+    // Cache whether overlapped gradient reduction is enabled (avoids per-layer check overhead)
+    const bool use_overlapped_grad_reduce = grads.is_overlapped_enabled();
+
     auto extract_layer = [&](const std::string& name, int& layer_idx) -> bool {
         std::string_view view{name};
         if (starts_with(view, "d_")) {
@@ -3539,6 +3543,12 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
         // Release residual buffer after backward pass is done with this layer
         if (rs.has_residual_offloading() && !bwd_capturing) {
             rs.release_residual(layer_idx, rs.MainStream);
+        }
+
+        // Notify gradient manager that this layer's backward is complete.
+        // This triggers overlapped all-reduce/reduce-scatter for multi-GPU training.
+        if (!bwd_capturing && use_overlapped_grad_reduce) {
+            grads.notify_block(layer_idx, rs.MainStream, comm);
         }
 
         layer_checkpoints.erase(layer_idx);

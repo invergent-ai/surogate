@@ -1320,6 +1320,17 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     mRunState = std::make_unique<DslRunState>(*mConfig, options, B, T, mAllocator, lora_enabled());
     mRunState->WorldSize = comm.world_size();
 
+    // Configure gradient manager for multi-GPU overlapped reduction
+    if (mGrads && comm.world_size() > 1) {
+        DslGradStoreConfig grad_config;
+        grad_config.num_shards = comm.world_size();
+        grad_config.shard_idx = comm.rank();
+        grad_config.shard_gradients = options.ShardGradients;  // ZeRO-2
+        grad_config.use_all_to_all_reduce = options.UseAllToAllReduce;
+        grad_config.num_layers = mModelConfig.NumLayers;
+        mGrads->configure(grad_config);
+    }
+
     GraphExecutorOptions exec_opts;
     exec_opts.auto_backward = true;
     exec_opts.debug_print_backward = false;
