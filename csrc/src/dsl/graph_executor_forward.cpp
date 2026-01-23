@@ -111,7 +111,10 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
     st.tensors.emplace("position_ids", rs.PositionIDs);
     st.tensors.emplace("x0", rs.non_block_activations().encoded);
 
-    const bool use_graphs = mGraphsEnabled;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
+                             capture_status != cudaStreamCaptureStatusNone);
+    const bool use_graphs = mGraphsEnabled && !in_capture;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;

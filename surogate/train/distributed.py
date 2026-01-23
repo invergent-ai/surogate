@@ -483,19 +483,35 @@ class NodeTrainer:
         B = config.per_device_train_batch_size
         T = config.sequence_len
         local_gpus = self.local_gpus
+        use_full_step_graphs = bool(config.use_dsl_ir)
+        if use_full_step_graphs and config.optimizer != "adamw_8bit":
+            raise RuntimeError("DSL training requires optimizer 'adamw_8bit' for full-step execution.")
+        if use_full_step_graphs and not config.use_cuda_graphs:
+            logger.info("CUDA graphs disabled; DSL full-step execution will use eager fallback.")
 
         # Allocate token buffers
-        in_tokens = np.empty((local_gpus * B, T), dtype=np.int32)
-        out_tokens = np.empty((local_gpus * B, T), dtype=np.int32)
-        pos_ids = np.empty((local_gpus * B, T), dtype=np.int32)
+        micro_steps = config.gradient_accumulation_steps if use_full_step_graphs else 1
+        total_rows = local_gpus * B * micro_steps
+        in_tokens = np.empty((total_rows, T), dtype=np.int32)
+        out_tokens = np.empty((total_rows, T), dtype=np.int32)
+        pos_ids = np.empty((total_rows, T), dtype=np.int32)
 
-        # Run gradient accumulation steps
-        for micro_step in range(config.gradient_accumulation_steps):
-            if not self._train_loader.has_next():
-                self._train_loader.advance_epoch()
+        if use_full_step_graphs:
+            chunk = local_gpus * B
+            for micro_step in range(config.gradient_accumulation_steps):
+                if not self._train_loader.has_next():
+                    self._train_loader.advance_epoch()
+                start = micro_step * chunk
+                end = start + chunk
+                self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+        else:
+            # Run gradient accumulation steps
+            for micro_step in range(config.gradient_accumulation_steps):
+                if not self._train_loader.has_next():
+                    self._train_loader.advance_epoch()
 
-            self._train_loader.load_batch(in_tokens, out_tokens, pos_ids)
-            self._trainer.step(in_tokens, out_tokens, pos_ids)
+                self._train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                self._trainer.step(in_tokens, out_tokens, pos_ids)
 
         # Optimizer update
         opt_config = _surogate.OptimizerConfig(
@@ -511,7 +527,10 @@ class NodeTrainer:
             normuon_lr=lr,
             normuon_cautious_wd=config.normuon_cautious_wd
         )
-        result = self._trainer.update_with_config(opt_config, step + 1)
+        if use_full_step_graphs:
+            result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+        else:
+            result = self._trainer.update_with_config(opt_config, step + 1)
 
         return result['loss'], result['norm']
 

@@ -102,7 +102,10 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     const_cast<GraphExecutor*>(this)->init_recompute_flags();
     const bool recompute_any = mRecomputeFlags.any;
     const bool recompute_block = mOptions.RecomputeBlock && !(rs.is_lora_only_mode() && !mOptions.RecomputeLoRA);
-    const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
+                             capture_status != cudaStreamCaptureStatusNone);
+    const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0 && !in_capture;
     
     std::vector<char> recomputed;
     if (recompute_any && config.NumLayers > 0) {

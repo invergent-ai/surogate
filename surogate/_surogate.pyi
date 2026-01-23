@@ -1337,6 +1337,33 @@ class SurogateTrainer:
 
         Returns: dict with keys {loss: float, norm: float}.
         """
+    def train_step_graphed(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32],
+                           config: OptimizerConfig, step: int) -> dict:
+        """
+        Run a full training step with CUDA graph capture (forward+backward+optimizer).
+
+        Parameters:
+        - inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
+        - targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
+        - config: OptimizerConfig with all hyperparameters.
+        - step: Global step index.
+
+        Returns: dict with keys {loss: float, norm: float}.
+        """
+    def train_step_graphed(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32],
+                           position_ids: npt.NDArray[np.int32], config: OptimizerConfig, step: int) -> dict:
+        """
+        Run a full training step with CUDA graph capture and explicit position ids.
+
+        Parameters:
+        - inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
+        - targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
+        - position_ids: int32 position ids shaped [grad_accum * local_gpus * batch_size, seq_length].
+        - config: OptimizerConfig with all hyperparameters.
+        - step: Global step index.
+
+        Returns: dict with keys {loss: float, norm: float}.
+        """
     def validate(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32]) -> float:
         """
         Compute validation loss for one batch (forward only).

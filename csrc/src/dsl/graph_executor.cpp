@@ -5,6 +5,7 @@
 
 #include "dsl/graph_executor.h"
 #include "dsl/autodiff.h"
+#include "dsl/compiled_ops.h"
 #include "dsl/dsl_runtime.h"
 #include "dsl/dsl_weight_manager.h"
 #include "dsl/graph_executor_internal.h"
@@ -80,6 +81,26 @@ inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStre
 
     CUDA_CHECK(cudaGraphDestroy(graph));
     CUDA_CHECK(cudaGraphLaunch(instance, stream));
+}
+
+inline bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
+        return false;
+    }
+    return status != cudaStreamCaptureStatusNone;
+}
+
+inline void sync_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(event));
+    }
+}
+
+inline void record_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventRecord(event, stream));
+    }
 }
 
 void reduce_loss(DslRunState& rs, long B, long T, NCCLCommunicator& comm) {
@@ -406,6 +427,127 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     if (mSaveList.empty()) {
         mSaveList = mForward->save;
     }
+
+    // Initialize compiled execution if enabled
+    mUseCompiledExecution = options.use_compiled_execution;
+    if (mUseCompiledExecution) {
+        init_compiled_execution();
+    }
+}
+
+void GraphExecutor::init_compiled_execution() {
+    mCompiler = std::make_unique<GraphCompiler>(mModule, mConfig, mOptions, mWeights, mGrads);
+    mCompiledExecutor = std::make_unique<CompiledExecutor>(mRunState, mWeights, mGrads, mConfig, mOptions);
+
+    // Wire up optional components
+    mCompiledExecutor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
+    mCompiledExecutor->set_weight_manager(mWeightManager);
+    if (mOptions.TrainingRecipe) {
+        mCompiledExecutor->set_recipe(mOptions.TrainingRecipe.get());
+    }
+    mCompiledExecutor->set_hook_context(mHookContext);
+    mCompiledExecutor->set_recompute_fn(
+        [this](int layer_idx, long B, long T, bool use_graph) {
+            recompute_layer_optimized(layer_idx, B, T, use_graph);
+        });
+    mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
+    mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
+    mCompiledExecutor->set_saved_tensors(&mSaved);
+    mCompiledExecutor->set_last_inputs_cpu(&mLastInputsCpu);
+    mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
+
+    // Graphs will be compiled lazily on first forward when B/T are known
+    mCompiledB = 0;
+    mCompiledT = 0;
+}
+
+void GraphExecutor::compile_graphs(long B, long T) {
+    if (!mCompiler || !mCompiledExecutor) {
+        return;
+    }
+
+    // Recompile if batch/sequence dimensions changed
+    if (B != mCompiledB || T != mCompiledT) {
+        if (mForward) {
+            mCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+        }
+        if (mBackward) {
+            mCompiledBackward = std::make_unique<CompiledGraph>(mCompiler->compile(*mBackward, B, T));
+        }
+        mCompiledB = B;
+        mCompiledT = T;
+    }
+}
+
+void GraphExecutor::execute_forward_compiled(long B, long T, NCCLCommunicator& comm, bool full,
+                                              const modules::ForwardHook* hook) {
+    compile_graphs(B, T);
+
+    if (!mCompiledForward || !mCompiledExecutor) {
+        throw std::runtime_error("DSL graph executor: compiled forward graph not available");
+    }
+
+    auto& rs = mRunState;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
+                             capture_status != cudaStreamCaptureStatusNone);
+    const bool use_graphs = mGraphsEnabled && !in_capture;
+    if (use_graphs && (mGraphB != B || mGraphT != T)) {
+        reset_cuda_graphs();
+        mGraphB = B;
+        mGraphT = T;
+    }
+    const bool capturing = use_graphs && mForwardGraph == nullptr;
+    if (!use_graphs || capturing) {
+        mSaved.clear();
+    }
+
+    auto run_ops = [&]() {
+        mCompiledExecutor->set_dimensions(B, T);
+        mCompiledExecutor->set_capturing(capturing);
+        mCompiledExecutor->execute_forward(*mCompiledForward, comm, full, hook);
+        // Save tensors for backward (same list as non-compiled path).
+        mCompiledExecutor->save_tensors(mSaveList);
+    };
+
+    trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mForwardGraph, use_graphs,
+                                           rs.Stack, mForwardCheckpoint);
+    mCompiledExecutor->set_capturing(false);
+}
+
+void GraphExecutor::execute_backward_compiled(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
+                                               int micro_step, const modules::BackwardHook* hook) {
+    compile_graphs(B, T);
+
+    if (!mCompiledBackward || !mCompiledExecutor) {
+        throw std::runtime_error("DSL graph executor: compiled backward graph not available");
+    }
+
+    auto& rs = mRunState;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
+                             capture_status != cudaStreamCaptureStatusNone);
+    const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture;
+    if (use_graphs && (mGraphB != B || mGraphT != T)) {
+        reset_cuda_graphs();
+        mGraphB = B;
+        mGraphT = T;
+    }
+    const int graph_idx = (micro_step > 0) ? 1 : 0;
+    const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
+
+    auto run_ops = [&]() {
+        mCompiledExecutor->set_dimensions(B, T);
+        init_recompute_flags();
+        mCompiledExecutor->set_recompute_enabled(mRecomputeFlags.any);
+        mCompiledExecutor->set_recompute_use_graphs(use_graphs && !capturing);
+        mCompiledExecutor->set_capturing(capturing);
+        mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook);
+    };
+
+    trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mBackwardGraph[graph_idx], use_graphs,
+                                           rs.Stack, mBackwardCheckpoint[graph_idx]);
+    mCompiledExecutor->set_capturing(false);
 }
 
 unsigned int GraphExecutor::next_rng_seed() {
@@ -437,8 +579,11 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
         mLoRARunState->is_training = true;
     }
 
+    const bool in_capture = stream_is_capturing(rs.MainStream);
     if (micro_step == 0) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        if (!in_capture) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        }
         if (rs.has_fp8_delayed_scaling()) {
             if (auto* fp8_state = rs.get_fp8_scaling_state()) {
                 if (!mFP8ScalingInitialized) {
@@ -464,13 +609,17 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
         }
-        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.MainStream));
+        record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    execute_forward_graph(B, T, comm, /*full=*/false);
+    if (mUseCompiledExecution) {
+        execute_forward_compiled(B, T, comm, /*full=*/false, nullptr);
+    } else {
+        execute_forward_graph(B, T, comm, /*full=*/false);
+    }
 
-    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
-    CUDA_CHECK(cudaEventRecord(rs.ForwardDone, rs.MainStream));
+    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
+    record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
 }
 
 float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
@@ -481,8 +630,11 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
         mLoRARunState->is_training = false;
     }
 
+    const bool in_capture = stream_is_capturing(rs.MainStream);
     if (micro_step == 0) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        if (!in_capture) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        }
         if (rs.has_fp8_delayed_scaling()) {
             if (auto* fp8_state = rs.get_fp8_scaling_state()) {
                 if (!mFP8ScalingInitialized) {
@@ -507,13 +659,17 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
         }
-        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.MainStream));
+        record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    execute_forward_graph(B, T, comm, /*full=*/false);
+    if (mUseCompiledExecution) {
+        execute_forward_compiled(B, T, comm, /*full=*/false, nullptr);
+    } else {
+        execute_forward_graph(B, T, comm, /*full=*/false);
+    }
 
-    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
-    CUDA_CHECK(cudaEventRecord(rs.ForwardDone, rs.MainStream));
+    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
+    record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
 
     fill_zero(rs.Losses, rs.MainStream);
     fill_zero(rs.ValidTokenCount, rs.MainStream);
@@ -563,20 +719,25 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     const long T = inputs.Sizes[1];
     mLastInputsCpu = inputs;
 
-    // Copy targets to device (side stream).
+    const bool in_capture = stream_is_capturing(rs.MainStream);
+    const cudaStream_t target_stream = in_capture ? rs.MainStream : rs.side_stream();
+    // Copy targets to device (side stream in eager, main stream during capture).
     {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
+        if (!in_capture) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
+        }
         const std::size_t target_bytes =
             static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.side_stream()));
-        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.side_stream()));
+        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, target_stream));
+        record_event_if_not_capturing(rs.TransferDone, target_stream);
     }
 
     if (micro_step == 0) {
         fill_zero(rs.Losses, rs.MainStream);
         fill_zero(rs.ValidTokenCount, rs.MainStream);
-        grads.start_micro_step(rs.side_stream(), micro_step, grad_accum_steps);
-        CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
+        const cudaStream_t grad_stream = in_capture ? rs.MainStream : rs.side_stream();
+        grads.start_micro_step(grad_stream, micro_step, grad_accum_steps);
+        record_event_if_not_capturing(rs.side_stream_event(), grad_stream);
     } else {
         grads.start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
     }
@@ -601,7 +762,11 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     }
 
-    execute_backward_graph(B, T, comm, grad_accum_steps, micro_step);
+    if (mUseCompiledExecution) {
+        execute_backward_compiled(B, T, comm, grad_accum_steps, micro_step, nullptr);
+    } else {
+        execute_backward_graph(B, T, comm, grad_accum_steps, micro_step);
+    }
 
     grads.end_micro_step(rs.MainStream, comm);
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
@@ -614,8 +779,8 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
     }
 
-    CUDA_CHECK(cudaEventRecord(rs.BackwardDone, rs.MainStream));
-    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
+    record_event_if_not_capturing(rs.BackwardDone, rs.MainStream);
+    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
 }
 
 void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
@@ -627,8 +792,11 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
         mLoRARunState->is_training = true;
     }
 
+    const bool in_capture = stream_is_capturing(rs.MainStream);
     if (micro_step == 0) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        if (!in_capture) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        }
         if (rs.has_fp8_delayed_scaling()) {
             if (auto* fp8_state = rs.get_fp8_scaling_state()) {
                 if (!mFP8ScalingInitialized) {
@@ -654,7 +822,7 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
         }
-        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.MainStream));
+        record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
     // Configure graphs for hooked execution (may differ in topology)
@@ -662,10 +830,14 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    if (mUseCompiledExecution) {
+        execute_forward_compiled(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    } else {
+        execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    }
 
-    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
-    CUDA_CHECK(cudaEventRecord(rs.ForwardDone, rs.MainStream));
+    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
+    record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
 }
 
 float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
@@ -677,8 +849,11 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
         mLoRARunState->is_training = false;
     }
 
+    const bool in_capture = stream_is_capturing(rs.MainStream);
     if (micro_step == 0) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        if (!in_capture) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+        }
         if (rs.has_fp8_delayed_scaling()) {
             if (auto* fp8_state = rs.get_fp8_scaling_state()) {
                 if (!mFP8ScalingInitialized) {
@@ -703,7 +878,7 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
         }
-        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.MainStream));
+        record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
     // Configure graphs for hooked execution
@@ -711,10 +886,14 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    if (mUseCompiledExecution) {
+        execute_forward_compiled(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    } else {
+        execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    }
 
-    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
-    CUDA_CHECK(cudaEventRecord(rs.ForwardDone, rs.MainStream));
+    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
+    record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
 
     fill_zero(rs.Losses, rs.MainStream);
     fill_zero(rs.ValidTokenCount, rs.MainStream);
@@ -765,20 +944,25 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
     const long T = inputs.Sizes[1];
     mLastInputsCpu = inputs;
 
-    // Copy targets to device (side stream).
+    const bool in_capture = stream_is_capturing(rs.MainStream);
+    const cudaStream_t target_stream = in_capture ? rs.MainStream : rs.side_stream();
+    // Copy targets to device (side stream in eager, main stream during capture).
     {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
+        if (!in_capture) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
+        }
         const std::size_t target_bytes =
             static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.side_stream()));
-        CUDA_CHECK(cudaEventRecord(rs.TransferDone, rs.side_stream()));
+        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, target_stream));
+        record_event_if_not_capturing(rs.TransferDone, target_stream);
     }
 
     if (micro_step == 0) {
         fill_zero(rs.Losses, rs.MainStream);
         fill_zero(rs.ValidTokenCount, rs.MainStream);
-        grads.start_micro_step(rs.side_stream(), micro_step, grad_accum_steps);
-        CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
+        const cudaStream_t grad_stream = in_capture ? rs.MainStream : rs.side_stream();
+        grads.start_micro_step(grad_stream, micro_step, grad_accum_steps);
+        record_event_if_not_capturing(rs.side_stream_event(), grad_stream);
     } else {
         grads.start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
     }
@@ -808,7 +992,11 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         rs.configure_backward_graphs(/*hooked=*/true);
     }
 
-    execute_backward_graph(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
+    if (mUseCompiledExecution) {
+        execute_backward_compiled(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
+    } else {
+        execute_backward_graph(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
+    }
 
     grads.end_micro_step(rs.MainStream, comm);
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
@@ -821,8 +1009,8 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
     }
 
-    CUDA_CHECK(cudaEventRecord(rs.BackwardDone, rs.MainStream));
-    CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
+    record_event_if_not_capturing(rs.BackwardDone, rs.MainStream);
+    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
 }
 
 void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy) {
@@ -839,10 +1027,13 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
 
     rs.temp_acquire(rs.non_block_activations().output);
 
+    const bool in_capture = stream_is_capturing(rs.MainStream);
     // Ensure targets and gradient zeroing are visible on main stream.
-    CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
-    if (!compute_accuracy && micro_step == 0) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
+    if (!in_capture) {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        if (!compute_accuracy && micro_step == 0) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
+        }
     }
 
     Tensor lnf_flat = view_tensor(rs.non_block_activations().ln_final, {B * T, config.HiddenSize});

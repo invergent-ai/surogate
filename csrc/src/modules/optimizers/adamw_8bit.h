@@ -17,6 +17,7 @@ namespace optimizers {
 // Block size for 8-bit optimizer (number of elements processed per block)
 // This determines the granularity of quantization - each block has its own absmax
 constexpr int ADAMW8BIT_BLOCK_SIZE = 2048;
+constexpr int ADAMW_GRAPH_PARAM_COUNT = 5;
 
 /**
  * @brief Creates a dynamic quantization map for 8-bit optimizer states.
@@ -74,6 +75,8 @@ void adamw_update_8bit(
     const float* quantiles2,
     float* absmax1,
     float* absmax2,
+    const float* opt_params,
+    const int* opt_step,
     cudaStream_t stream
 );
 
@@ -97,6 +100,8 @@ void adamw_update_8bit(
     const float* quantiles2,
     float* absmax1,
     float* absmax2,
+    const float* opt_params,
+    const int* opt_step,
     cudaStream_t stream
 );
 
@@ -120,6 +125,8 @@ void adamw_update_8bit(
     const float* quantiles2,
     float* absmax1,
     float* absmax2,
+    const float* opt_params,
+    const int* opt_step,
     cudaStream_t stream
 );
 
@@ -143,6 +150,8 @@ void adamw_update_8bit(
     const float* quantiles2,
     float* absmax1,
     float* absmax2,
+    const float* opt_params,
+    const int* opt_step,
     cudaStream_t stream
 );
 
@@ -173,6 +182,8 @@ void adamw_update_8bit_multi_tensor(
     const float* gnorm_scale,
     const float* quantiles1,
     const float* quantiles2,
+    const float* opt_params,
+    const int* opt_step,
     cudaStream_t stream
 );
 
@@ -199,6 +210,8 @@ void adamw_update_8bit_multi_tensor(
     const float* gnorm_scale,
     const float* quantiles1,
     const float* quantiles2,
+    const float* opt_params,
+    const int* opt_step,
     cudaStream_t stream
 );
 

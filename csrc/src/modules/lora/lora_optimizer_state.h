@@ -120,6 +120,7 @@ private:
 struct LoRAAdamW8BitState {
     bool initialized = false;
     bool values_restored = false;  // Set when state values loaded from checkpoint
+    bool grad_ptrs_initialized = false;  // Set after grad pointer array is populated
     size_t total_params = 0;
     size_t num_blocks = 0;
     int num_tensors = 0;

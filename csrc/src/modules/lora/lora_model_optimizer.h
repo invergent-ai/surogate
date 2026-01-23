@@ -107,6 +107,8 @@ void ModularLoRAModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, float le
             learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
             state.quantiles1.template get<float>(),
             state.quantiles2.template get<float>(),
+            nullptr,
+            nullptr,
             main_stream
         );
     } else if (lora_dtype == ETensorDType::BF16) {
@@ -124,6 +126,8 @@ void ModularLoRAModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, float le
             learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
             state.quantiles1.template get<float>(),
             state.quantiles2.template get<float>(),
+            nullptr,
+            nullptr,
             main_stream
         );
     } else {

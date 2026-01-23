@@ -100,6 +100,9 @@ public:
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
     void update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon, float weight_decay, float grad_clip) override;
     void update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) override;
+    void update_with_graph_params(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config,
+                                  const float* opt_params, const int* opt_step);
+    void prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config);
 
     ITensorContainer& weights() override;
     ITensorContainer& opt_momentum() override;
@@ -174,6 +177,10 @@ private:
     void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T);
     void update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
                                int t, float epsilon, float weight_decay, float grad_clip);
+    void update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
+                                 const float* opt_params, const int* opt_step);
+    void update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
+                                      const float* opt_params, const int* opt_step);
     void update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
     void initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);

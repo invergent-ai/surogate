@@ -254,6 +254,7 @@ target_sources(surogate-common PRIVATE
     src/dsl/graph_executor_forward.cpp
     src/dsl/graph_executor_backward.cpp
     src/dsl/graph_executor_helpers.cpp
+    src/dsl/compiled_ops.cpp
     src/dsl/weight_mapping.cpp
     src/dsl/autodiff.cpp
     src/dsl/autodiff_rules.cpp

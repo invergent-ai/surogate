@@ -345,6 +345,7 @@ void NCCLCommunicator::schedule_all_gather(const TensorShard& src, Tensor& tgt) 
  * @param stream CUDA stream to enqueue the NCCL all-reduce on.
  */
 void NCCLCommunicator::reduce_loss(float* loss, cudaStream_t stream) {
+    if (mWorld == 1) return;
     ncclCheck(ncclAllReduce(loss, loss, 1, ncclFloat, ncclAvg, mNcclComm, stream));
 }
 

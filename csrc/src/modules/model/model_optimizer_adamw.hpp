@@ -223,7 +223,7 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                     grad.template get<float>(),
                     s1, s2, n,
                     learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
-                    q1, q2, am1, am2, main_stream
+                    q1, q2, am1, am2, nullptr, nullptr, main_stream
                 );
             } else if (grad.DType == ETensorDType::BF16) {
                 // Mixed precision: FP32 master weights with BF16 gradients.
@@ -232,7 +232,7 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                     grad.template get<nv_bfloat16>(),
                     s1, s2, n,
                     learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
-                    q1, q2, am1, am2, main_stream
+                    q1, q2, am1, am2, nullptr, nullptr, main_stream
                 );
             } else {
                 throw std::runtime_error(std::string("adamw8bit: unsupported grad dtype for ") + name);
@@ -246,7 +246,7 @@ void ModularTransformerModel<Block>::update_adamw_8bit(NCCLCommunicator& comm, f
                 grad.template get<nv_bfloat16>(),
                 s1, s2, n,
                 learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
-                q1, q2, am1, am2, main_stream
+                q1, q2, am1, am2, nullptr, nullptr, main_stream
             );
         } else {
             throw std::runtime_error(std::string("adamw8bit: unsupported dtype for ") + name);

@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include "dsl/graph_executor_internal.h"
 #include "dsl/ir.h"
 #include "modules/forward_hooks.h"
 #include "modules/backward_hooks.h"
@@ -31,7 +32,17 @@ class ModularLoRAWeightsManager;
 class ModularLoRAGradsManager;
 struct LoRARunState;
 }
-namespace dsl { class DslRunState; class DslParamStore; class DslGradStore; class DslWeightManager; }
+namespace dsl {
+class DslRunState;
+class DslParamStore;
+class DslGradStore;
+class DslWeightManager;
+class GraphCompiler;
+class CompiledExecutor;
+struct CompiledGraph;
+struct FP8WeightCacheEntry;
+struct FP4WeightCacheEntry;
+}
 
 namespace dsl {
 
@@ -45,6 +56,11 @@ struct GraphExecutorOptions {
 
     // Whether to print derived backward graph for debugging
     bool debug_print_backward = false;
+
+    // Enable compiled execution mode for reduced dispatch overhead
+    // When enabled, operations are pre-compiled into direct function pointer calls
+    // with pre-resolved tensors and attributes, eliminating runtime string comparisons
+    bool use_compiled_execution = false;
 };
 
 class IGraphExecutor {
@@ -188,20 +204,9 @@ private:
     std::unordered_map<std::string, std::string> mViewSourcesReverse;
     Tensor mLastInputsCpu{};
     bool mFP8ScalingInitialized = false;
-    struct FP8WeightCacheEntry {
-        Tensor weight;
-        Tensor stats;
-        bool initialized = false;
-    };
-    std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
 
-    // FP4 weight cache for NVFP4 recipe (Blackwell+)
-    struct FP4WeightCacheEntry {
-        Tensor data;      ///< FP4 packed data (N, K/2) for forward; (K, N/2) for transposed
-        Tensor scales;    ///< Block scales (FP8 E4M3, CUTLASS layout)
-        Tensor amax;      ///< Global amax (FP32, single element)
-        bool initialized = false;
-    };
+    // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
+    std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
 
@@ -289,6 +294,30 @@ private:
 
     // Optimized recompute using precomputed flags and optional graph capture
     void recompute_layer_optimized(int layer_idx, long B, long T, bool use_graph);
+
+    // ========================================================================
+    // Compiled execution mode (eliminates dispatch overhead)
+    // ========================================================================
+    // When enabled, operations are pre-compiled into direct function pointer
+    // calls with pre-resolved tensors and attributes, eliminating:
+    // - Runtime string comparisons (op_type == "embedding")
+    // - Hash map lookups for tensor resolution (get_tensor())
+    // - Attribute parsing (find_attr(), attr_double())
+    // - Shape resolution (resolve_shape())
+    bool mUseCompiledExecution = false;
+    std::unique_ptr<GraphCompiler> mCompiler;
+    std::unique_ptr<CompiledExecutor> mCompiledExecutor;
+    std::unique_ptr<CompiledGraph> mCompiledForward;
+    std::unique_ptr<CompiledGraph> mCompiledBackward;
+    long mCompiledB = 0;
+    long mCompiledT = 0;
+
+    void init_compiled_execution();
+    void compile_graphs(long B, long T);
+    void execute_forward_compiled(long B, long T, NCCLCommunicator& comm, bool full,
+                                  const modules::ForwardHook* hook);
+    void execute_backward_compiled(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
+                                   int micro_step, const modules::BackwardHook* hook);
 };
 
 }  // namespace dsl

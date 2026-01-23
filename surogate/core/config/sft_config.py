@@ -164,7 +164,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         use_cuda_graphs (Optional[bool], defaults to True):
             Enable or disable CUDA graphs for performance.
         use_dsl_ir (Optional[bool], defaults to False):
-            Enable DSL IR backend (validation-only placeholder).
+            Enable DSL IR backend. DSL training always runs full-step execution; use_cuda_graphs controls capture.
 
         optimizer (Optional[Literal['adamw_8bit', 'normuon']], defaults to 'adamw_8bit'):
             Optimizer type to use for training. Supports:

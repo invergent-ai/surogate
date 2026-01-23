@@ -277,7 +277,7 @@ void ModularTransformerModel<Block>::update_normuon(NCCLCommunicator& comm,
                 grad.template get<nv_bfloat16>(),
                 s1, s2, n,
                 adamw_lr, adamw_beta1, adamw_beta2, t, adamw_eps, wd, grad_scale,
-                q1, q2, am1, am2, main_stream
+                q1, q2, am1, am2, nullptr, nullptr, main_stream
             );
         } else if (val.DType == ETensorDType::FP32) {
             if (grad.DType == ETensorDType::FP32) {
@@ -286,7 +286,7 @@ void ModularTransformerModel<Block>::update_normuon(NCCLCommunicator& comm,
                     grad.template get<float>(),
                     s1, s2, n,
                     adamw_lr, adamw_beta1, adamw_beta2, t, adamw_eps, wd, grad_scale,
-                    q1, q2, am1, am2, main_stream
+                    q1, q2, am1, am2, nullptr, nullptr, main_stream
                 );
             } else if (grad.DType == ETensorDType::BF16) {
                 adamw_update_8bit(
@@ -294,7 +294,7 @@ void ModularTransformerModel<Block>::update_normuon(NCCLCommunicator& comm,
                     grad.template get<nv_bfloat16>(),
                     s1, s2, n,
                     adamw_lr, adamw_beta1, adamw_beta2, t, adamw_eps, wd, grad_scale,
-                    q1, q2, am1, am2, main_stream
+                    q1, q2, am1, am2, nullptr, nullptr, main_stream
                 );
             }
         }

@@ -239,7 +239,7 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
     }
 }
 
-const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
+const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
     const std::string& name, Tensor& weight, cudaStream_t stream) {
 
     // Check if FP4 is enabled
@@ -338,7 +338,7 @@ const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
     return &it->second;
 }
 
-const GraphExecutor::FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_transposed(
+const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_transposed(
     const std::string& name, Tensor& weight, cudaStream_t stream) {
     // Check if FP4 is enabled
     if (!mOptions.fp4_enabled()) {

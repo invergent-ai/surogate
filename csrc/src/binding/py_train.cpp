@@ -422,6 +422,146 @@ std::pair<float, float> MultiGPUPyTrainer::update_with_config(const optimizers::
     return {step_loss, step_norm};
 }
 
+std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t* inputs,
+                                                              const std::int32_t* targets,
+                                                              const std::int32_t* position_ids,
+                                                              const optimizers::OptimizerConfig& config,
+                                                              int step) {
+    const int local_gpus = static_cast<int>(mContexts.size());
+    const int micro_steps = mGradAccumulation;
+    const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+
+    run_work([&](sThreadContext& ctx) {
+        auto& rs = ctx.Model->get_run_state();
+        if (!rs.Allocator) {
+            throw std::runtime_error("train_step_graphed: missing allocator");
+        }
+
+        if (!ctx.FullStepGraph) {
+            ctx.FullStepGraph = std::make_unique<sFullStepGraphState>();
+        }
+        auto& gs = *ctx.FullStepGraph;
+
+        // Reset graph if shape or accumulation changed.
+        if (gs.captured && (gs.captured_B != B || gs.captured_T != T || gs.captured_grad_accum != micro_steps)) {
+            if (gs.graph_exec) {
+                CUDA_CHECK(cudaGraphExecDestroy(gs.graph_exec));
+                gs.graph_exec = nullptr;
+            }
+            gs.captured = false;
+        }
+
+        // Allocate per-micro-step pinned buffers if needed.
+        if (gs.inputs.size() != static_cast<size_t>(micro_steps) ||
+            gs.targets.size() != static_cast<size_t>(micro_steps) ||
+            gs.position_ids.size() != static_cast<size_t>(micro_steps) ||
+            gs.captured_B != B || gs.captured_T != T) {
+            gs.inputs.clear();
+            gs.targets.clear();
+            gs.position_ids.clear();
+            gs.inputs.reserve(micro_steps);
+            gs.targets.reserve(micro_steps);
+            gs.position_ids.reserve(micro_steps);
+
+            const int rank = ctx.Communicator->local_rank();
+            for (int j = 0; j < micro_steps; ++j) {
+                auto in_name = fmt::format("graph_inputs_cpu_ms{}_rank{}", j, rank);
+                auto tgt_name = fmt::format("graph_targets_cpu_ms{}_rank{}", j, rank);
+                auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
+                gs.inputs.push_back(rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.targets.push_back(rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+            }
+
+            gs.captured_B = B;
+            gs.captured_T = T;
+            gs.captured_grad_accum = micro_steps;
+        }
+
+        // Allocate device-side optimizer parameter buffers if needed.
+        if (!gs.opt_params.Data) {
+            auto name = fmt::format("graph_opt_params_rank{}", ctx.Communicator->local_rank());
+            gs.opt_params = rs.Allocator->allocate(ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE,
+                                                  {optimizers::ADAMW_GRAPH_PARAM_COUNT});
+        }
+        if (!gs.opt_step.Data) {
+            auto name = fmt::format("graph_opt_step_rank{}", ctx.Communicator->local_rank());
+            gs.opt_step = rs.Allocator->allocate(ETensorDType::INT32, name.c_str(), EAllocationType::ON_DEVICE, {1});
+        }
+
+        // Stage inputs/targets/position_ids for all micro-steps.
+        const int rank = ctx.Communicator->local_rank();
+        for (int j = 0; j < micro_steps; ++j) {
+            const std::size_t offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) + static_cast<std::size_t>(rank)) * stride;
+            std::memcpy(gs.inputs[j].Data, inputs + offset, stride * sizeof(std::int32_t));
+            std::memcpy(gs.targets[j].Data, targets + offset, stride * sizeof(std::int32_t));
+            if (position_ids) {
+                std::memcpy(gs.position_ids[j].Data, position_ids + offset, stride * sizeof(std::int32_t));
+            } else {
+                fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data), B, T);
+            }
+        }
+
+        // Update optimizer parameters on device (dynamic LR/step support).
+        float opt_params_host[optimizers::ADAMW_GRAPH_PARAM_COUNT] = {
+            config.learning_rate, config.adamw_beta1, config.adamw_beta2, config.adamw_epsilon, config.weight_decay
+        };
+        const int opt_step_host = step + 1;
+        CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
+                                   sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data, &opt_step_host,
+                                   sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
+
+        // If graphs are disabled or unsupported, fall back to eager execution.
+        if (!mOptions.UseCudaGraphs) {
+            for (int j = 0; j < micro_steps; ++j) {
+                ctx.Model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                ctx.Model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+            }
+            ctx.Model->update_with_config(*ctx.Communicator, config, opt_step_host);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            return;
+        }
+
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("train_step_graphed: only supported for DSL models");
+        }
+        if (config.type != optimizers::OptimizerType::ADAMW_8BIT) {
+            throw std::runtime_error("train_step_graphed: only supports AdamW 8-bit optimizer");
+        }
+
+        if (!gs.captured) {
+            dsl_model->prepare_optimizer_state_for_graph(*ctx.Communicator, config);
+            cudaGraph_t graph = nullptr;
+            CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
+            for (int j = 0; j < micro_steps; ++j) {
+                dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+            }
+            dsl_model->update_with_graph_params(*ctx.Communicator, config,
+                                               gs.opt_params.template get<float>(),
+                                               gs.opt_step.template get<int>());
+            CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            gs.captured = true;
+        }
+
+        CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+
+    auto& ctx = mContexts.at(0);
+    float step_loss = ctx.Model->get_loss();
+    float step_norm = ctx.Model->get_norm();
+
+    mTrainMicroStep = 0;
+    mEvalStep = 0;
+
+    return {step_loss, step_norm};
+}
+
 
 /**
  * @brief Query per-GPU utilization information for all ranks.
@@ -619,6 +759,13 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
     comm.barrier();
 
     // free resources
+    if (ctx.FullStepGraph) {
+        if (ctx.FullStepGraph->graph_exec) {
+            CUDA_CHECK(cudaGraphExecDestroy(ctx.FullStepGraph->graph_exec));
+            ctx.FullStepGraph->graph_exec = nullptr;
+        }
+        ctx.FullStepGraph.reset();
+    }
     ctx.Model.reset();
     ctx.GPUUtil.reset();
     CUDA_CHECK(cudaDeviceSynchronize());

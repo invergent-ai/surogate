@@ -905,6 +905,46 @@ NB_MODULE(_surogate, m) {
              "- config: OptimizerConfig with all hyperparameters.\n"
              "- step: Global step index.\n\n"
              "Returns: dict with keys {loss: float, norm: float}.")
+        .def("train_step_graphed", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
+                                      const optimizers::OptimizerConfig& config, int step){
+            const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
+            CHECK_SHAPE(inputs, rows, trainer->seq_length());
+            CHECK_SHAPE(targets, rows, trainer->seq_length());
+
+            auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), nullptr, config, step);
+            nb::dict ret;
+            ret["loss"] = loss;
+            ret["norm"] = norm;
+            return ret;
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("config"), nb::arg("step"),
+             "Run a full training step with CUDA graph capture (forward+backward+optimizer).\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- config: OptimizerConfig with all hyperparameters.\n"
+             "- step: Global step index.\n\n"
+             "Returns: dict with keys {loss: float, norm: float}.")
+        .def("train_step_graphed", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
+                                      TokenArray position_ids, const optimizers::OptimizerConfig& config, int step){
+            const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
+            CHECK_SHAPE(inputs, rows, trainer->seq_length());
+            CHECK_SHAPE(targets, rows, trainer->seq_length());
+            CHECK_SHAPE(position_ids, rows, trainer->seq_length());
+
+            auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), position_ids.data(), config, step);
+            nb::dict ret;
+            ret["loss"] = loss;
+            ret["norm"] = norm;
+            return ret;
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"), nb::arg("config"), nb::arg("step"),
+             "Run a full training step with CUDA graph capture and explicit position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- position_ids: int32 position ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- config: OptimizerConfig with all hyperparameters.\n"
+             "- step: Global step index.\n\n"
+             "Returns: dict with keys {loss: float, norm: float}.")
         .def("get_gradients", [](MultiGPUPyTrainer* trainer, int gpu_id)
         {
             auto raw = trainer->get_gradients(gpu_id);
