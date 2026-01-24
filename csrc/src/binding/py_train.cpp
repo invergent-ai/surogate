@@ -6,6 +6,10 @@
 #include "py_train.h"
 
 #include <filesystem>
+#include <array>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -22,6 +26,123 @@
 #include "modules/moe/moe_block.h"
 #include "modules/lora/lora_model.h"
 #include "dsl/dsl_model.h"
+#include "dsl/dsl_runtime.h"
+
+namespace {
+bool env_enabled(const char* name) {
+    if (!name || !*name) {
+        return false;
+    }
+    const char* value = std::getenv(name);
+    if (!value) {
+        return false;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0) {
+        return false;
+    }
+    return true;
+}
+
+const char* capture_status_str(cudaStreamCaptureStatus status) {
+    switch (status) {
+        case cudaStreamCaptureStatusNone:
+            return "none";
+        case cudaStreamCaptureStatusActive:
+            return "active";
+        case cudaStreamCaptureStatusInvalidated:
+            return "invalidated";
+        default:
+            return "unknown";
+    }
+}
+
+struct GraphNodeCounts {
+    size_t kernel = 0;
+    size_t memcpy = 0;
+    size_t memset = 0;
+    size_t host = 0;
+    size_t empty = 0;
+    size_t child = 0;
+    size_t event_record = 0;
+    size_t event_wait = 0;
+    size_t ext_semaphore_wait = 0;
+    size_t ext_semaphore_signal = 0;
+    size_t mem_alloc = 0;
+    size_t mem_free = 0;
+    size_t batch_mem_op = 0;
+    size_t cond = 0;
+    size_t unknown = 0;
+};
+
+GraphNodeCounts count_graph_nodes(cudaGraph_t graph) {
+    GraphNodeCounts counts;
+    size_t node_count = 0;
+    if (cudaGraphGetNodes(graph, nullptr, &node_count) != cudaSuccess || node_count == 0) {
+        return counts;
+    }
+    std::vector<cudaGraphNode_t> nodes(node_count);
+    if (cudaGraphGetNodes(graph, nodes.data(), &node_count) != cudaSuccess) {
+        return counts;
+    }
+    for (size_t i = 0; i < node_count; ++i) {
+        cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
+        if (cudaGraphNodeGetType(nodes[i], &type) != cudaSuccess) {
+            counts.unknown++;
+            continue;
+        }
+        switch (type) {
+            case cudaGraphNodeTypeKernel:
+                counts.kernel++;
+                break;
+            case cudaGraphNodeTypeMemcpy:
+                counts.memcpy++;
+                break;
+            case cudaGraphNodeTypeMemset:
+                counts.memset++;
+                break;
+            case cudaGraphNodeTypeHost:
+                counts.host++;
+                break;
+            case cudaGraphNodeTypeGraph:
+                counts.child++;
+                break;
+            case cudaGraphNodeTypeEmpty:
+                counts.empty++;
+                break;
+            case cudaGraphNodeTypeWaitEvent:
+                counts.event_wait++;
+                break;
+            case cudaGraphNodeTypeEventRecord:
+                counts.event_record++;
+                break;
+            case cudaGraphNodeTypeExtSemaphoreWait:
+                counts.ext_semaphore_wait++;
+                break;
+            case cudaGraphNodeTypeExtSemaphoreSignal:
+                counts.ext_semaphore_signal++;
+                break;
+            case cudaGraphNodeTypeMemAlloc:
+                counts.mem_alloc++;
+                break;
+            case cudaGraphNodeTypeMemFree:
+                counts.mem_free++;
+                break;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+            case cudaGraphNodeTypeBatchMemOp:
+                counts.batch_mem_op++;
+                break;
+            case cudaGraphNodeTypeConditional:
+                counts.cond++;
+                break;
+#endif
+            default:
+                counts.unknown++;
+                break;
+        }
+    }
+    return counts;
+}
+}  // namespace
 
 static void fill_sequential_position_ids(std::int32_t* dst, int B, int T) {
     for (int b = 0; b < B; ++b) {
@@ -441,6 +562,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             ctx.FullStepGraph = std::make_unique<sFullStepGraphState>();
         }
         auto& gs = *ctx.FullStepGraph;
+        const bool debug_graph = env_enabled("SUROGATE_DEBUG_DSL_GRAPH");
 
         // Reset graph if shape or accumulation changed.
         if (gs.captured && (gs.captured_B != B || gs.captured_T != T || gs.captured_grad_accum != micro_steps)) {
@@ -449,6 +571,11 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 gs.graph_exec = nullptr;
             }
             gs.captured = false;
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d reset graph (B=%d T=%d grad_accum=%d)\n",
+                        ctx.Communicator->local_rank(), step, B, T, micro_steps);
+            }
         }
 
         // Allocate per-micro-step pinned buffers if needed.
@@ -476,6 +603,12 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             gs.captured_B = B;
             gs.captured_T = T;
             gs.captured_grad_accum = micro_steps;
+
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d allocated pinned buffers (B=%d T=%d micro_steps=%d)\n",
+                        ctx.Communicator->local_rank(), step, B, T, micro_steps);
+            }
         }
 
         // Allocate device-side optimizer parameter buffers if needed.
@@ -531,9 +664,91 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             throw std::runtime_error("train_step_graphed: only supports AdamW 8-bit optimizer");
         }
 
+        const bool warmup_full_graph = !gs.captured && !dsl_model->lora_enabled()
+                                       && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
+        const bool warmup_skip_bwd = env_enabled("SUROGATE_DSL_GRAPH_WARMUP_SKIP_BWD");
+        const bool prev_internal_graphs = dsl_model->internal_graphs_enabled();
+        if (prev_internal_graphs) {
+            dsl_model->set_internal_graphs_enabled(false);
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d internal graphs disabled for full-step capture\n",
+                        ctx.Communicator->local_rank(), step);
+            }
+        }
+        if (warmup_full_graph) {
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d warmup start (micro_steps=%d)\n",
+                        ctx.Communicator->local_rank(), step, micro_steps);
+            }
+            auto rng_state = dsl_model->rng_state();
+            for (int j = 0; j < micro_steps; ++j) {
+                if (debug_graph) {
+                    fprintf(stderr,
+                            "[DSL GRAPH] rank=%d step=%d warmup micro_step=%d forward begin\n",
+                            ctx.Communicator->local_rank(), step, j);
+                }
+                dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                if (debug_graph) {
+                    fprintf(stderr,
+                            "[DSL GRAPH] rank=%d step=%d warmup micro_step=%d forward done\n",
+                            ctx.Communicator->local_rank(), step, j);
+                }
+                if (!warmup_skip_bwd) {
+                    if (debug_graph) {
+                        fprintf(stderr,
+                                "[DSL GRAPH] rank=%d step=%d warmup micro_step=%d backward begin\n",
+                                ctx.Communicator->local_rank(), step, j);
+                    }
+                    dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+                    if (debug_graph) {
+                        fprintf(stderr,
+                                "[DSL GRAPH] rank=%d step=%d warmup micro_step=%d backward done\n",
+                                ctx.Communicator->local_rank(), step, j);
+                    }
+                } else if (debug_graph) {
+                    fprintf(stderr,
+                            "[DSL GRAPH] rank=%d step=%d warmup micro_step=%d backward skipped\n",
+                            ctx.Communicator->local_rank(), step, j);
+                }
+            }
+            dsl_model->zero_grads(rs.MainStream);
+            dsl_model->set_rng_state(rng_state);
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d warmup complete\n",
+                        ctx.Communicator->local_rank(), step);
+            }
+        }
+
+        if (debug_graph) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(rs.MainStream, &status);
+            int device_id = -1;
+            cudaGetDevice(&device_id);
+            fprintf(stderr,
+                    "[DSL GRAPH] rank=%d step=%d state: captured=%d exec=%p stream=%p capture=%s "
+                    "stack_used=%zuMB stack_max=%zuMB device=%d\n",
+                    ctx.Communicator->local_rank(), step, static_cast<int>(gs.captured),
+                    static_cast<void*>(gs.graph_exec), static_cast<void*>(rs.MainStream),
+                    capture_status_str(status),
+                    rs.Stack.bytes_used() / (1024 * 1024),
+                    rs.Stack.max_utilization() / (1024 * 1024),
+                    device_id);
+        }
+
         if (!gs.captured) {
             dsl_model->prepare_optimizer_state_for_graph(*ctx.Communicator, config);
+            // Ensure the main stream is idle before beginning capture (no external dependencies).
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
             cudaGraph_t graph = nullptr;
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d begin capture (stream=%p)\n",
+                        ctx.Communicator->local_rank(), step, static_cast<void*>(rs.MainStream));
+            }
             CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
             for (int j = 0; j < micro_steps; ++j) {
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
@@ -543,13 +758,95 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                                gs.opt_params.template get<float>(),
                                                gs.opt_step.template get<int>());
             CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &graph));
-            CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
+            if (debug_graph) {
+                size_t node_count = 0;
+                cudaError_t node_err = cudaGraphGetNodes(graph, nullptr, &node_count);
+                const auto counts = count_graph_nodes(graph);
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d capture done (nodes=%zu, node_err=%s) "
+                        "kernel=%zu memcpy=%zu memset=%zu host=%zu empty=%zu child=%zu "
+                        "event_rec=%zu event_wait=%zu ext_wait=%zu ext_sig=%zu mem_alloc=%zu mem_free=%zu batch=%zu cond=%zu unknown=%zu\n",
+                        ctx.Communicator->local_rank(), step, node_count,
+                        cudaGetErrorString(node_err),
+                        counts.kernel, counts.memcpy, counts.memset, counts.host, counts.empty, counts.child,
+                        counts.event_record, counts.event_wait, counts.ext_semaphore_wait, counts.ext_semaphore_signal,
+                        counts.mem_alloc, counts.mem_free, counts.batch_mem_op, counts.cond, counts.unknown);
+                if (env_enabled("SUROGATE_DEBUG_DSL_GRAPH_DOT")) {
+                    const auto path = fmt::format("dsl_full_step_graph_rank{}_step{}.dot",
+                                                  ctx.Communicator->local_rank(), step);
+                    cudaError_t dot_err = cudaGraphDebugDotPrint(graph, path.c_str(), cudaGraphDebugDotFlagsVerbose);
+                    fprintf(stderr,
+                            "[DSL GRAPH] rank=%d step=%d dot=%s err=%s\n",
+                            ctx.Communicator->local_rank(), step, path.c_str(),
+                            cudaGetErrorString(dot_err));
+                }
+            }
+            if (debug_graph) {
+                cudaGraphNode_t error_node = nullptr;
+                std::array<char, 2048> log{};
+                cudaError_t inst_err = cudaGraphInstantiate(&gs.graph_exec, graph, &error_node, log.data(), log.size());
+                if (inst_err != cudaSuccess) {
+                    fprintf(stderr,
+                            "[DSL GRAPH] rank=%d step=%d instantiate error=%s node=%p log=%s\n",
+                            ctx.Communicator->local_rank(), step, cudaGetErrorString(inst_err),
+                            static_cast<void*>(error_node), log.data());
+                    CUDA_CHECK(inst_err);
+                }
+            } else {
+                CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
+            }
             CUDA_CHECK(cudaGraphDestroy(graph));
             gs.captured = true;
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d graph instantiated (exec=%p)\n",
+                        ctx.Communicator->local_rank(), step, static_cast<void*>(gs.graph_exec));
+            }
+        }
+
+        if (prev_internal_graphs) {
+            dsl_model->set_internal_graphs_enabled(true);
+            if (debug_graph) {
+                fprintf(stderr,
+                        "[DSL GRAPH] rank=%d step=%d internal graphs re-enabled\n",
+                        ctx.Communicator->local_rank(), step);
+            }
+        }
+
+        if (debug_graph) {
+            const void* norm_dev = nullptr;
+            auto& dsl_rs = dynamic_cast<dsl::DslRunState&>(dsl_model->get_run_state());
+            if (dsl_model->lora_enabled()) {
+                auto& lora_rs = dsl_model->lora_run_state();
+                norm_dev = lora_rs.norm_buffer.Data;
+            } else {
+                norm_dev = dsl_rs.scratch().norm_buffer.Data;
+            }
+            fprintf(stderr,
+                    "[DSL GRAPH] rank=%d step=%d launch exec=%p loss_dev=%p norm_dev=%p opt_params=%p opt_step=%p\n",
+                    ctx.Communicator->local_rank(), step, static_cast<void*>(gs.graph_exec),
+                    rs.Losses.Data, norm_dev, gs.opt_params.Data, gs.opt_step.Data);
         }
 
         CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (debug_graph) {
+            fprintf(stderr,
+                    "[DSL GRAPH] rank=%d step=%d launch complete\n",
+                    ctx.Communicator->local_rank(), step);
+        }
+
+        // Refresh loss/norm on host after full-step graph launch.
+        CUDA_CHECK(cudaMemcpy(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost));
+        auto& dsl_rs = dynamic_cast<dsl::DslRunState&>(dsl_model->get_run_state());
+        if (dsl_model->lora_enabled()) {
+            auto& lora_rs = dsl_model->lora_run_state();
+            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost, lora_rs.norm_buffer.template get<float>(),
+                                  sizeof(float), cudaMemcpyDeviceToHost));
+        } else {
+            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost, dsl_rs.scratch().norm_buffer.template get<float>(),
+                                  sizeof(float), cudaMemcpyDeviceToHost));
+        }
     });
 
     auto& ctx = mContexts.at(0);

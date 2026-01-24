@@ -100,6 +100,10 @@ public:
     virtual std::vector<std::byte> rng_state() const = 0;
     virtual void set_rng_state(const std::vector<std::byte>& state) = 0;
 
+    // Control internal CUDA graph usage (forward/backward graphs inside DSL executor).
+    virtual void set_internal_graphs_enabled(bool enabled) { (void)enabled; }
+    virtual bool internal_graphs_enabled() const { return false; }
+
     // Optional LoRA state wiring (no-op for implementations that don't support it).
     virtual void set_lora_state(const modules::ModularLoRAConfig*,
                                 modules::ModularLoRAWeightsManager*,
@@ -148,6 +152,8 @@ public:
 
     std::vector<std::byte> rng_state() const;
     void set_rng_state(const std::vector<std::byte>& state);
+    void set_internal_graphs_enabled(bool enabled) override;
+    bool internal_graphs_enabled() const override;
 
 private:
     void init(const GraphExecutorOptions& options);

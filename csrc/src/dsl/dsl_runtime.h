@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_DSL_DSL_RUNTIME_H
 
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -144,12 +145,18 @@ private:
 // DSL run state for graph execution (activation buffers, scratch, etc).
 class DslRunState final : public IRunState {
 public:
+    static constexpr std::size_t kDefaultStackBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2GB
+
     DslRunState(const PretrainedConfig& config,
                 const RuntimeOptions& options,
                 int B, int T,
                 const std::shared_ptr<TensorAllocator>& allocator,
-                bool lora_only_mode = false);
+                bool lora_only_mode = false,
+                std::size_t stack_bytes = kDefaultStackBytes,
+                bool allocate_stack = true);
     ~DslRunState();
+
+    void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
     modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) { return mSimplifiedActivations[layer_idx]; }
     modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) { return mSimplifiedGradients[layer_idx]; }
@@ -249,6 +256,7 @@ private:
 
     std::shared_ptr<TensorAllocator> mAllocator;
     Tensor mStackBuffer{};
+    bool mStackSimulate = false;
     bool mRecomputeBlock = false;
     bool mRecomputeLoRA = false;
     bool mLoraOnlyMode = false;

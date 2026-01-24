@@ -698,9 +698,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             if (bias_trainable && op.outputs.size() > 1 && !op.outputs.at(1).empty()) {
                 Tensor& d_bias = ensure_tensor(st, op.outputs.at(1), d_out.DType, {static_cast<long>(OC)});
                 const bool do_accumulate = accumulate_tensors.count(op.outputs.at(1)) > 0;
-                const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, OC, rs.DeviceProp);
-                Tensor scratch = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(scratch_bytes / sizeof(float))});
-                st.temps.push_back(scratch);
+                Tensor& scratch = rs.scratch().matmul_bias_scratch;
                 if (do_accumulate) {
                     Tensor tmp = rs.temp_alloc(d_out.DType, {static_cast<long>(OC)});
                     st.temps.push_back(tmp);

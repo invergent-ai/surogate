@@ -389,7 +389,7 @@ endif ()
 if (PYTHON_BINDING)
     find_package(Python COMPONENTS Interpreter Development.Module OPTIONAL_COMPONENTS Development.SABIModule)
     FetchContent_MakeAvailable(nanobind)
-    nanobind_add_module(_surogate STABLE_ABI src/binding/binding.cpp src/binding/py_train.cpp)
+    nanobind_add_module(_surogate STABLE_ABI NOSTRIP src/binding/binding.cpp src/binding/py_train.cpp)
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
 
     # pick up cuda libraries from within the current python env, if available

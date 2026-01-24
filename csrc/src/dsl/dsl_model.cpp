@@ -33,6 +33,7 @@
 #include "modules/optimizers/normuon.h"
 #include "modules/fp8_scaling_state.h"
 #include "utilities/comm.h"
+#include "utilities/dtype.h"
 #include "utilities/safetensors.h"
 
 namespace dsl {
@@ -1308,6 +1309,22 @@ void DslModel::prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const o
     }
 }
 
+void DslModel::zero_grads(cudaStream_t stream) {
+    if (mGrads) {
+        mGrads->zero_all(stream);
+    }
+}
+
+void DslModel::set_internal_graphs_enabled(bool enabled) {
+    if (mExecutor) {
+        mExecutor->set_internal_graphs_enabled(enabled);
+    }
+}
+
+bool DslModel::internal_graphs_enabled() const {
+    return mExecutor ? mExecutor->internal_graphs_enabled() : false;
+}
+
 ITensorContainer& DslModel::weights() {
     if (lora_enabled()) {
         return *mLoRAWeights;
@@ -1844,8 +1861,45 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mAllocator = std::make_shared<TensorAllocator>();
     }
     mOptions = options;
-    mRunState = std::make_unique<DslRunState>(*mConfig, options, B, T, mAllocator, lora_enabled());
+    const std::size_t dummy_stack_bytes = 1024ULL * 1024ULL * 1024ULL * 1024ULL;  // 1TB dummy stack
+    mRunState = std::make_unique<DslRunState>(*mConfig, options, B, T, mAllocator, lora_enabled(),
+                                              dummy_stack_bytes, /*allocate_stack=*/false);
     mRunState->WorldSize = comm.world_size();
+
+    const long base_size = static_cast<long>(mRunState->Stack.max_utilization());
+    long moe_extra = 0;
+    if (mModelConfig.NumExperts > 0) {
+        const long moe_intermediate = (mModelConfig.MoeIntermediateSize > 0)
+                                          ? mModelConfig.MoeIntermediateSize
+                                          : mModelConfig.IntermediateSize;
+        const long hidden = mModelConfig.HiddenSize;
+        const long num_experts = mModelConfig.NumExperts;
+        const long top_k = std::max(1, mModelConfig.NumExpertsPerTok);
+        const long dtype_bytes = 2;  // BF16 bytes (matches modular sizing heuristic)
+        const long up_factor = mModelConfig.mlp_up_factor();
+        const long expert_gate_up_tp = num_experts * up_factor * moe_intermediate * hidden * dtype_bytes;
+        const long expert_down_tp = num_experts * moe_intermediate * hidden * dtype_bytes;
+        const long permuted_tokens = 2L * B * T * top_k * hidden * dtype_bytes;
+        moe_extra = expert_gate_up_tp + expert_down_tp + permuted_tokens;
+    }
+    ETensorDType act_dtype = options.ModelType.value_or(mConfig->DType);
+    if (is_fp8_dtype(act_dtype)) {
+        act_dtype = ETensorDType::BF16;
+    }
+    const long dtype_bytes = static_cast<long>(get_dtype_size(act_dtype));
+    const long BT = static_cast<long>(B) * static_cast<long>(T);
+    const long C = mModelConfig.HiddenSize;
+    const long QKV = mModelConfig.head_size() * (mModelConfig.NumQueryHeads + 2 * mModelConfig.NumKeyValHeads);
+    const long MUp = static_cast<long>(mModelConfig.mlp_up_rows());
+    const long extra_tmp = std::max({BT * C, BT * QKV, BT * MUp}) * dtype_bytes;
+    const long safety_bytes = std::max(64L * 1024 * 1024, base_size / 8);
+    long required_size = std::max(1024L * 1024, base_size + base_size + moe_extra + safety_bytes + extra_tmp);
+    required_size += 512L * 1024 * 1024;  // extra slack for unmodeled temps
+    required_size = std::max(required_size, 3L * 1024 * 1024 * 1024);  // 3GB minimum for full fine-tune stability
+    const auto high_mark = mRunState->Stack.get_high_mark();
+    Tensor stack_buffer = mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {required_size});
+    mRunState->set_stack_buffer(std::move(stack_buffer), high_mark);
+    comm.barrier();
 
     // Configure gradient manager for multi-GPU overlapped reduction
     if (mGrads && comm.world_size() > 1) {
@@ -2001,7 +2055,8 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, 
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
-    global_norm_sqrt(rs.scratch().norm_buffer.template get<float>(), rs.NormHost, grad_clip,
+    const bool capturing = stream_is_capturing(stream);
+    global_norm_sqrt(rs.scratch().norm_buffer.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
     record_event_if_not_capturing(rs.NormDone, stream);
@@ -2120,7 +2175,8 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
 
-    global_norm_sqrt(buf.template get<float>(), rs.NormHost, grad_clip,
+    const bool capturing = stream_is_capturing(stream);
+    global_norm_sqrt(buf.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
     record_event_if_not_capturing(rs.NormDone, stream);

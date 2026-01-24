@@ -255,6 +255,15 @@ Tensor IRunState::temp_alloc(ETensorDType dtype, const std::vector<long>& shape)
 }
 
 void IRunState::temp_acquire(Tensor& target) {
+    if (target.Data) {
+        if (Stack.owns(target.Data) && !Stack.is_live(target.Data)) {
+            if(target.Device != Stack.device_id()) {
+                throw std::logic_error("device mismatch");
+            }
+            target.Data = Stack.allocate(target.bytes());
+        }
+        return;
+    }
     if(target.Device != Stack.device_id()) {
         throw std::logic_error("device mismatch");
     }
@@ -263,7 +272,14 @@ void IRunState::temp_acquire(Tensor& target) {
 }
 
 void IRunState::temp_free(Tensor& tensor) {
+    if (!tensor.Data) {
+        return;
+    }
+    if (!Stack.owns(tensor.Data)) {
+        return;
+    }
     Stack.free(tensor);
+    tensor.Data = nullptr;
 }
 
 

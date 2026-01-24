@@ -300,6 +300,7 @@ public:
     void set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
+    void set_save_list(const std::vector<std::string>* save_list);
 
     // For embedding backward (requires CPU-side inputs for deterministic bucketing)
     void set_last_inputs_cpu(const Tensor* inputs_cpu);
@@ -377,6 +378,8 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4Cache = nullptr;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
+    const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
+    std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
 
     // For embedding backward
     const Tensor* mLastInputsCpu = nullptr;

@@ -91,7 +91,12 @@ void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cuda
 void reduce_loss(DslRunState& rs, long B, long T, NCCLCommunicator& comm) {
     deterministic_sum(rs.Losses.template get<float>(), rs.Losses.template get<float>(), B * T, rs.MainStream);
     comm.reduce_loss(rs.Losses.template get<float>(), rs.MainStream);
-    CUDA_CHECK(cudaMemcpyAsync(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    const bool capturing = (cudaStreamIsCapturing(rs.MainStream, &status) == cudaSuccess &&
+                            status != cudaStreamCaptureStatusNone);
+    if (!capturing) {
+        CUDA_CHECK(cudaMemcpyAsync(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+    }
 }
 
 Tensor recompute_lora_rmsnorm(::modules::LoRARunState& lora_rs, const Tensor& residual, const Tensor& weight,

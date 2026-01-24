@@ -665,6 +665,14 @@ void CompiledExecutor::set_saved_tensors(std::unordered_map<std::string, Tensor>
     mSaved = saved;
 }
 
+void CompiledExecutor::set_save_list(const std::vector<std::string>* save_list) {
+    mSaveList = save_list;
+    mSaveSet.clear();
+    if (save_list) {
+        mSaveSet.insert(save_list->begin(), save_list->end());
+    }
+}
+
 void CompiledExecutor::set_last_inputs_cpu(const Tensor* inputs_cpu) {
     mLastInputsCpu = inputs_cpu;
 }
@@ -1927,6 +1935,30 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mTemps.clear();
     mTensorMap.clear();
     mCurrentLayer = -1;
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    std::vector<DeviceMemoryStack::Checkpoint> layer_checkpoints;
+    std::vector<std::size_t> layer_temp_marks;
+    std::vector<char> layer_active;
+    if (num_layers > 0) {
+        layer_checkpoints.resize(static_cast<std::size_t>(num_layers));
+        layer_temp_marks.resize(static_cast<std::size_t>(num_layers));
+        layer_active.assign(static_cast<std::size_t>(num_layers), 0);
+    }
+    auto prune_stack_tensors = [&]() {
+        for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
+            // Skip tensors that are needed for backward (in save list)
+            if (mSaveSet.count(it->first) > 0) {
+                ++it;
+                continue;
+            }
+            if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
+                !mRunState.Stack.is_live(it->second.Data)) {
+                it = mTensorMap.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
 
     // Bind known inputs
     mTensorMap["token_ids"] = mRunState.Inputs;
@@ -1950,6 +1982,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
         // Handle layer boundaries
         if (op.layer_start >= 0) {
+            if (op.layer_start < num_layers &&
+                !layer_active[static_cast<std::size_t>(op.layer_start)]) {
+                layer_checkpoints[static_cast<std::size_t>(op.layer_start)] = mRunState.Stack.checkpoint();
+                layer_temp_marks[static_cast<std::size_t>(op.layer_start)] = mTemps.size();
+                layer_active[static_cast<std::size_t>(op.layer_start)] = 1;
+            }
             handle_layer_start(op.layer_start);
         }
 
@@ -2005,6 +2043,21 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
         // Handle layer end
         if (op.layer_end >= 0) {
+            if (op.layer_end < num_layers &&
+                layer_active[static_cast<std::size_t>(op.layer_end)]) {
+                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
+                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
+                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
+                }
+                prune_stack_tensors();
+                if (mRunState.ffn_temps_on_stack()) {
+                    auto& acts = mRunState.simplified_acts(op.layer_end);
+                    acts.mlp_up.Data = nullptr;
+                    acts.swiglu.Data = nullptr;
+                }
+                mRunState.scratch().cudnn_workspace.Data = nullptr;
+                layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
+            }
             handle_layer_end(op.layer_end);
         }
     }

@@ -316,6 +316,15 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
                       int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream) {
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
 
+    // CUDA graph capture: avoid cross-stream sync by copying on the main stream.
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool capturing = (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
+                            capture_status != cudaStreamCaptureStatusNone);
+    if (capturing) {
+        copy_stream = stream;
+        sync_event = nullptr;
+    }
+
     int num_c_groups = div_ceil((size_t)C, x128::size * 32);
     assert(B*T*num_c_groups * (sizeof(int4)+sizeof(int)) <= B*T*3*C * sizeof(floatX));
 
@@ -355,13 +364,15 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
         bucket_index++;
     }
 
-    // Step 3: Copy data from host to device (async on a different stream)
+    // Step 3: Copy data from host to device (async on a different stream unless capturing)
     int4* d_bucket_info = (int4*)scratch;
     int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * 4);
     CUDA_CHECK(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, copy_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice, copy_stream));
-    CUDA_CHECK(cudaEventRecord(sync_event, copy_stream));
-    CUDA_CHECK(cudaStreamWaitEvent(stream, sync_event, 0));
+    if (sync_event) {
+        CUDA_CHECK(cudaEventRecord(sync_event, copy_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, sync_event, 0));
+    }
 
     // Launch wte kernel
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)

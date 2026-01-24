@@ -2143,9 +2143,7 @@ void GraphExecutorImpl<Block>::execute_backward_graph(long B, long T, NCCLCommun
                     OC = static_cast<int>(d_out.Sizes[2]);
                 }
                 Tensor& d_bias = ensure_tensor(st, op.outputs.at(1), d_out.DType, {static_cast<long>(OC)});
-                const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, OC, rs.DeviceProp);
-                Tensor scratch = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(scratch_bytes / sizeof(float))});
-                st.temps.push_back(scratch);
+                Tensor& scratch = rs.scratch().matmul_bias_scratch;
                 backward_bias(d_bias, d_out, nullptr, nullptr, scratch,
                               Bv, Tv, OC, rs.DeviceProp, rs.MainStream);
             }

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 
 #include "kernels/kernels.h"
 #include "training/runtime_options.h"
@@ -22,8 +23,6 @@
 
 namespace dsl {
 namespace {
-
-constexpr std::size_t kDefaultStackBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2GB
 
 bool is_rope_param(const std::string& name) {
     return name.find("rope_freqs") != std::string::npos;
@@ -465,7 +464,9 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          const RuntimeOptions& options,
                          int B, int T,
                          const std::shared_ptr<TensorAllocator>& allocator,
-                         bool lora_only_mode)
+                         bool lora_only_mode,
+                         std::size_t stack_bytes,
+                         bool allocate_stack)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
       mRecomputeBlock(options.RecomputeBlock),
@@ -489,12 +490,19 @@ DslRunState::DslRunState(const PretrainedConfig& config,
         mGradQuantDtype = options.GradientType.value_or(mMatmulDtype);
     }
     mEnableFp8Forward = options.fp8_forward_enabled();
+    mStackSimulate = !allocate_stack;
 
-    // Allocate stack memory (heuristic size).
-    mStackBuffer = mAllocator->allocate(
-        ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE,
-        {static_cast<long>(kDefaultStackBytes)});
-    Stack = DeviceMemoryStack(mStackBuffer.Data, kDefaultStackBytes, DeviceId);
+    const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
+    if (allocate_stack) {
+        // Allocate stack memory (heuristic size).
+        mStackBuffer = mAllocator->allocate(
+            ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE,
+            {static_cast<long>(stack_capacity)});
+        Stack = DeviceMemoryStack(mStackBuffer.Data, stack_capacity, DeviceId);
+    } else {
+        // Dummy stack for sizing pass (no device allocation).
+        Stack = DeviceMemoryStack(nullptr, stack_capacity, DeviceId);
+    }
 
     create_cuda_resources();
     allocate_non_block_state(config);
@@ -511,6 +519,18 @@ DslRunState::DslRunState(const PretrainedConfig& config,
 DslRunState::~DslRunState() {
     destroy_cuda_graphs();
     release_cuda_resources();
+}
+
+void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark) {
+    if (!buffer.Data || buffer.bytes() == 0) {
+        throw std::runtime_error("DslRunState::set_stack_buffer: invalid stack buffer");
+    }
+    mStackBuffer = std::move(buffer);
+    Stack = DeviceMemoryStack(mStackBuffer.Data, static_cast<std::size_t>(mStackBuffer.bytes()), DeviceId);
+    if (!high_mark.empty()) {
+        Stack.set_high_mark(high_mark);
+    }
+    mStackSimulate = false;
 }
 
 Tensor& DslRunState::get_residual(int layer_idx, cudaStream_t stream) {
@@ -538,8 +558,8 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     mNonBlockActivations.ln_final = mAllocator->allocate(dtype, "ln_final", EAllocationType::ON_DEVICE, {B, T, C});
     mNonBlockActivations.ln_final_rstd = mAllocator->allocate(ETensorDType::FP32, "ln_final_rstd", EAllocationType::ON_DEVICE, {B, T});
 
-    // Output buffer (allocated on stack when needed).
-    mNonBlockActivations.output = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B * T, V});
+    // Output buffer (persistent; avoids large stack pressure for full fine-tuning).
+    mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {B * T, V});
 
     // RoPE frequencies (if not using fused RoPE).
     const int max_seq_len = std::min(static_cast<int>(T), cfg.MaxPositionEmbeddings);
@@ -603,6 +623,14 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const bool share_residual = false;
     const bool ffn_temps_on_stack = mRecomputeBlock && lora_can_share_mlp_up && lora_can_share_swiglu;
     mFfnTempsOnStack = ffn_temps_on_stack;
+    if (mStackSimulate && ffn_temps_on_stack) {
+        const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
+        const long swiglu_bytes = B * T * M * get_dtype_size(dtype);
+        auto* sim_mlp_up = Stack.allocate(static_cast<std::size_t>(mlp_up_bytes), "mlp_up_simulate");
+        auto* sim_swiglu = Stack.allocate(static_cast<std::size_t>(swiglu_bytes), "swiglu_simulate");
+        Stack.free(sim_swiglu);
+        Stack.free(sim_mlp_up);
+    }
 
     Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_att{}, shared_att_out{};
     Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};
@@ -682,6 +710,20 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto kind = EAllocationType::ON_DEVICE;
 
     const bool large_bwd_temps_on_stack = mRecomputeBlock;
+    if (mStackSimulate && large_bwd_temps_on_stack) {
+        const long d_qkv_bytes = B * T * QKV * get_dtype_size(dtype);
+        const long d_mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
+        const long d_swiglu_bytes = B * T * M * get_dtype_size(dtype);
+        const long d_up_bytes = B * T * MUp * get_dtype_size(dtype);
+        auto* sim_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
+        auto* sim_d_mlp_up = Stack.allocate(static_cast<std::size_t>(d_mlp_up_bytes), "d_mlp_up_simulate");
+        auto* sim_d_swiglu = Stack.allocate(static_cast<std::size_t>(d_swiglu_bytes), "d_swiglu_simulate");
+        auto* sim_d_up = Stack.allocate(static_cast<std::size_t>(d_up_bytes), "d_up_simulate");
+        Stack.free(sim_d_up);
+        Stack.free(sim_d_swiglu);
+        Stack.free(sim_d_mlp_up);
+        Stack.free(sim_d_qkv);
+    }
 
     mSimplifiedGradients.resize(cfg.NumLayers);
     for (int i = 0; i < cfg.NumLayers; ++i) {
@@ -774,8 +816,12 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     mScratch.rmsnorm_scratch = mAllocator->allocate(
         ETensorDType::BYTE, "rmsnorm_scratch", EAllocationType::ON_DEVICE, {rmsnorm_scratch_bytes});
 
+    const long M = cfg.IntermediateSize;
+    const long MUp = 2 * M;
+    const long V = cfg.VocabSize;
+    const long max_bias_channels = std::max<long>(QKV, std::max<long>(C, std::max<long>(MUp, V)));
     const long bias_scratch_bytes =
-        static_cast<long>(get_bias_backward_scratch_size(mGradDtype, static_cast<int>(QKV), DeviceProp));
+        static_cast<long>(get_bias_backward_scratch_size(mGradDtype, static_cast<int>(max_bias_channels), DeviceProp));
     mScratch.matmul_bias_scratch = mAllocator->allocate(
         ETensorDType::FP32, "bias_scratch", EAllocationType::ON_DEVICE, {bias_scratch_bytes / static_cast<long>(sizeof(float))});
 
@@ -799,6 +845,19 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         cudnn_get_workspace_size(static_cast<int>(B), static_cast<int>(T), static_cast<int>(Hq),
                                  static_cast<int>(Hkv), static_cast<int>(D), CudnnHandle));
     mScratch.cudnn_workspace = Tensor{ETensorDType::BYTE, {cudnn_ws_size}, nullptr, nullptr, 1, DeviceId};
+
+    if (mStackSimulate) {
+        if (mRecomputeBlock) {
+            const long d_qkv_bytes = B * T * QKV * get_dtype_size(mGradDtype);
+            auto* simulated_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
+            auto* simulated_ws = Stack.allocate(static_cast<std::size_t>(mScratch.cudnn_workspace.bytes()), "workspace");
+            Stack.free(simulated_ws);
+            Stack.free(simulated_d_qkv);
+        } else {
+            auto* simulated_ws = Stack.allocate(static_cast<std::size_t>(mScratch.cudnn_workspace.bytes()), "workspace");
+            Stack.free(simulated_ws);
+        }
+    }
 }
 
 Tensor* DslRunState::get_fp8_forward_buffer(int op) {

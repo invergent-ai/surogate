@@ -453,6 +453,7 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
     mCompiledExecutor->set_saved_tensors(&mSaved);
+    mCompiledExecutor->set_save_list(&mSaveList);
     mCompiledExecutor->set_last_inputs_cpu(&mLastInputsCpu);
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
 
@@ -477,6 +478,17 @@ void GraphExecutor::compile_graphs(long B, long T) {
         mCompiledB = B;
         mCompiledT = T;
     }
+}
+
+void GraphExecutor::set_internal_graphs_enabled(bool enabled) {
+    const bool allow = enabled && mOptions.UseCudaGraphs;
+    mGraphsEnabled = allow;
+    mBackwardGraphsEnabled = allow;
+    mPerLayerGraphsEnabled = allow && mRunState.per_layer_graphs_enabled();
+}
+
+bool GraphExecutor::internal_graphs_enabled() const {
+    return mGraphsEnabled;
 }
 
 void GraphExecutor::execute_forward_compiled(long B, long T, NCCLCommunicator& comm, bool full,

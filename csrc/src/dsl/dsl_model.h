@@ -103,6 +103,9 @@ public:
     void update_with_graph_params(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config,
                                   const float* opt_params, const int* opt_step);
     void prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config);
+    void zero_grads(cudaStream_t stream);
+    void set_internal_graphs_enabled(bool enabled);
+    [[nodiscard]] bool internal_graphs_enabled() const;
 
     ITensorContainer& weights() override;
     ITensorContainer& opt_momentum() override;
