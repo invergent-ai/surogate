@@ -157,9 +157,10 @@ class Qwen3MoEModel:
                 n_layers=self.n_layers,
             )
 
-            # Final norm
-            residual_final, xF, _ = g.fused_residual_rmsnorm(
-                residualN, xN, "final_norm", eps=self.eps
+            # Final norm - use explicit names for outputs to map to C++ activation slots
+            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
+                residualN, xN, "final_norm", eps=self.eps,
+                y_name="xF"  # Map to LNFinal slot in C++
             )
 
             # LM head

@@ -9,7 +9,7 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 10
+max_steps: 5
 
 learning_rate: 1e-4
 

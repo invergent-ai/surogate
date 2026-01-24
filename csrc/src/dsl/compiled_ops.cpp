@@ -319,7 +319,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         ref.slot = TensorSlot::PositionIDs;
     } else if (name == "x0" || name == "encoded") {
         ref.slot = TensorSlot::Encoded;
-    } else if (name == "ln_final") {
+    } else if (name == "ln_final" || name == "xF") {
         ref.slot = TensorSlot::LNFinal;
     } else if (name == "ln_final_rstd") {
         ref.slot = TensorSlot::LNFinalRSTD;
@@ -2124,15 +2124,20 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mTensorMap["position_ids"] = mRunState.PositionIDs;
 
     // Build the set of gradients that require accumulation (not the first micro-step).
-    // This mirrors the logic in graph_executor_backward.cpp.
+    // Also bind parameter gradient tensors to mTensorMap so they're used instead of temporaries.
+    // This mirrors the logic in graph_executor_backward.cpp (bind_param_grad).
     for (const auto& param_name : mGrads.param_names()) {
         if (param_name.find("rope_freqs") != std::string::npos) {
             continue;
         }
         bool accumulate = false;
         Tensor* grad_tensor = mGrads.get_param_grad(param_name, accumulate);
-        if (grad_tensor && accumulate) {
-            mAccumulateTensors.insert("d_" + param_name);
+        if (grad_tensor && grad_tensor->Data) {
+            std::string grad_name = "d_" + param_name;
+            mTensorMap[grad_name] = *grad_tensor;
+            if (accumulate) {
+                mAccumulateTensors.insert(grad_name);
+            }
         }
     }
 
