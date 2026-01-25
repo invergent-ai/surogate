@@ -208,6 +208,10 @@ Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ET
         return map_tensor(grads.d_qkv);
     }
     if (field == "att" || field == "att_flat") return map_tensor(grads.d_att);
+    if (field == "att_out" || field == "att_out_flat") {
+        // att_out gradient shares storage with residual-att gradient (res_att = res_ffn + att_out)
+        return map_tensor(grads.d_res_att);
+    }
     if (field == "swiglu") {
         return map_tensor(grads.d_swiglu);
     }

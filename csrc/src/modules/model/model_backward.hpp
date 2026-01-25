@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cmath>
+#include <cstdlib>
+#include <vector>
+
 // Backward pass
 
 template<typename Block>
@@ -25,6 +29,37 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
 
     // LoRA-only mode: skip computing base weight gradients (only compute dinp for gradient flow)
     const bool lora_only = rs.is_lora_only_mode();
+    const bool debug_grads = std::getenv("SUROGATE_DEBUG_MODULAR_GRADS") != nullptr;
+
+    auto dump_row95 = [&](const char* tag, const Tensor& t, int layer_idx) {
+        if (!t.Data) {
+            fprintf(stderr, "[MOD GRADS] %s layer=%d ptr=null\n", tag, layer_idx);
+            return;
+        }
+        long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+        long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+        if (rows <= 0 || hidden <= 0) {
+            fprintf(stderr, "[MOD GRADS] %s layer=%d ptr=%p\n", tag, layer_idx, (void*)t.Data);
+            return;
+        }
+        long row = rows > 95 ? 95 : (rows - 1);
+        const long N = hidden < 64 ? hidden : 64;
+        float sum_row = 0.0f;
+        if (t.DType == ETensorDType::BF16) {
+            std::vector<nv_bfloat16> buf(N);
+            CUDA_CHECK(cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+        } else if (t.DType == ETensorDType::FP32) {
+            std::vector<float> buf(N);
+            CUDA_CHECK(cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost));
+            for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+        } else {
+            fprintf(stderr, "[MOD GRADS] %s layer=%d ptr=%p dtype=%d\n",
+                    tag, layer_idx, (void*)t.Data, static_cast<int>(t.DType));
+            return;
+        }
+        fprintf(stderr, "[MOD GRADS] %s layer=%d row%ld_abssum=%.6f\n", tag, layer_idx, row, sum_row);
+    };
 
     const BackwardBlockHook* hook_ptr = hook ? &hook : nullptr;
 
@@ -74,6 +109,11 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
     mWeights->gather_final_norm(comm, fetch_stream);
     mWeights->gather_final_norm(comm, main_stream);
     auto& lnf_weight = mWeights->get_final_norm(main_stream);
+    static bool final_norm_dbg = false;
+    if (debug_grads && !final_norm_dbg) {
+        CUDA_CHECK(cudaStreamSynchronize(main_stream));
+        dump_row95("final pre d_y", rs.non_block_gradients().d_ln_final, -1);
+    }
     rmsnorm_backward(rs.simplified_grads((int)L - 1).d_res_ffn,
                      d_lnf_w,
                      rs.scratch().rmsnorm_scratch,
@@ -87,6 +127,11 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
                      rs.DeviceProp,
                      main_stream,
                      /*skip_weight_grad=*/lora_only);
+    if (debug_grads && !final_norm_dbg) {
+        CUDA_CHECK(cudaStreamSynchronize(main_stream));
+        dump_row95("final post d_input", rs.simplified_grads((int)L - 1).d_res_ffn, (int)L - 1);
+        final_norm_dbg = true;
+    }
     mWeights->release_final_norm(main_stream);
     mGrads->notify_final_norm(main_stream, comm);
 
@@ -137,6 +182,21 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
             if (!d_ln1_w) {
                 throw std::logic_error("ModularTransformerModel::backward_with_hook: LN1 weight gradients not available for this block type");
             }
+            static bool ln1_dbg_top = false;
+            static bool ln1_dbg_mid = false;
+            static bool ln1_dbg_l1 = false;
+            static bool ln1_dbg_l0 = false;
+            const int mid_layer = static_cast<int>(L / 2);
+            const bool ln1_dbg_layer =
+                (l == static_cast<int>(L) - 1 && !ln1_dbg_top) ||
+                (l == mid_layer && !ln1_dbg_mid) ||
+                (l == 1 && !ln1_dbg_l1) ||
+                (l == 0 && !ln1_dbg_l0);
+            if (debug_grads && ln1_dbg_layer) {
+                CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                dump_row95("ln1 pre d_y", da.d_ln1, l);
+                dump_row95("ln1 pre d_residual_next", da.d_res_att, l);
+            }
             if (l > 0) {
                 auto& prev_da = rs.simplified_grads(l - 1);
                 rmsnorm_backward(prev_da.d_res_ffn,
@@ -152,6 +212,14 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
                                  rs.DeviceProp,
                                  main_stream,
                                  /*skip_weight_grad=*/lora_only);
+                if (debug_grads && ln1_dbg_layer) {
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                    dump_row95("ln1 post d_input", prev_da.d_res_ffn, l);
+                    if (l == static_cast<int>(L) - 1) ln1_dbg_top = true;
+                    if (l == mid_layer) ln1_dbg_mid = true;
+                    if (l == 1) ln1_dbg_l1 = true;
+                    if (l == 0) ln1_dbg_l0 = true;
+                }
             } else {
                 rmsnorm_backward(rs.non_block_gradients().d_embeddings,
                                  *d_ln1_w,
@@ -166,6 +234,14 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
                                  rs.DeviceProp,
                                  main_stream,
                                  /*skip_weight_grad=*/lora_only);
+                if (debug_grads && ln1_dbg_layer) {
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                    dump_row95("ln1 post d_input", rs.non_block_gradients().d_embeddings, l);
+                    if (l == static_cast<int>(L) - 1) ln1_dbg_top = true;
+                    if (l == mid_layer) ln1_dbg_mid = true;
+                    if (l == 1) ln1_dbg_l1 = true;
+                    if (l == 0) ln1_dbg_l0 = true;
+                }
             }
         }
 
@@ -201,4 +277,3 @@ void ModularTransformerModel<Block>::backward_with_hook(Tensor inputs, Tensor ta
     // Ensure the host-side target buffer is safe to reuse.
     CUDA_CHECK(cudaEventSynchronize(rs.TransferDone));
 }
-

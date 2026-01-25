@@ -289,6 +289,26 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
     };
 
     mBaseModel->backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, hook);
+
+    // Debug: print gradient values for first down projection
+    static int grad_dbg = 0;
+    if (grad_dbg < 3) {
+        CUDA_CHECK(cudaStreamSynchronize(main_stream));
+        bool unused_acc = false;
+        auto& g0 = mLoRAGrads->get_block_full(0, main_stream, comm, unused_acc);
+        if (g0.mlp.down.has_value() && g0.mlp.down->A.Data && g0.mlp.down->B.Data) {
+            const long n = std::min<long>(64, g0.mlp.down->A.nelem());
+            std::vector<float> buf_A(n), buf_B(n);
+            cudaMemcpy(buf_A.data(), g0.mlp.down->A.Data, n * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(buf_B.data(), g0.mlp.down->B.Data, n * sizeof(float), cudaMemcpyDeviceToHost);
+            float sum_A = 0, sum_B = 0;
+            for (long i = 0; i < n; i++) { sum_A += fabsf(buf_A[i]); sum_B += fabsf(buf_B[i]); }
+            fprintf(stderr, "[MODULAR GRAD END] step=%d layer=0 dA abssum=%.6f dB abssum=%.6f\n",
+                    micro_step, sum_A, sum_B);
+        }
+        grad_dbg++;
+    }
+
     mLoRAGrads->end_micro_step(main_stream, comm);
     // Extend the base-model BackwardDone event to include LoRA gradient reductions.
     CUDA_CHECK(cudaEventRecord(rs.BackwardDone, main_stream));
@@ -530,6 +550,26 @@ void ModularLoRAModel<Block>::backward_lora_mlp_down(int layer_idx, int B, int T
 
     Tensor x = a.swiglu;
     Tensor dL_dy = da.d_res_ffn;
+
+    // Debug: compare input values with DSL path at row 95
+    static int input_dbg = 0;
+    if (input_dbg < 3 && layer_idx == 0) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const long row = 95;
+        // Check dL_dy at row 95
+        float sum_dy = 0;
+        std::vector<nv_bfloat16> buf_dy(64);
+        CUDA_CHECK(cudaMemcpy(buf_dy.data(), (nv_bfloat16*)dL_dy.Data + row * C, 64 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < 64; i++) sum_dy += fabsf(__bfloat162float(buf_dy[i]));
+        // Check x at row 95
+        float sum_x = 0;
+        std::vector<nv_bfloat16> buf_x(64);
+        CUDA_CHECK(cudaMemcpy(buf_x.data(), (nv_bfloat16*)x.Data + row * D, 64 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < 64; i++) sum_x += fabsf(__bfloat162float(buf_x[i]));
+        fprintf(stderr, "[MODULAR HOOK INPUT] layer=%d row=%ld dL_dy[row,0:64] abssum=%.6f | x[row,0:64] abssum=%.6f\n",
+                layer_idx, row, sum_dy, sum_x);
+        input_dbg++;
+    }
 
     detail::backward_lora_layer(lora_grads.mlp.down->A, lora_grads.mlp.down->B,
                                da.d_swiglu,

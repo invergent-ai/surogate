@@ -11,6 +11,9 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <cmath>
+#include <cstdlib>
 
 #include "dsl/dsl_runtime.h"
 #include "dsl/dsl_weight_manager.h"
@@ -105,7 +108,11 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
                              capture_status != cudaStreamCaptureStatusNone);
-    const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0 && !in_capture;
+    const bool debug_recompute_compare = env_enabled("SUROGATE_DEBUG_RECOMPUTE_COMPARE");
+    const bool debug_dsl_grads = env_enabled("SUROGATE_DEBUG_DSL_GRADS");
+    const bool debug_dsl_matmul = env_enabled("SUROGATE_DEBUG_DSL_MATMUL_GRADS");
+    const bool use_graphs_enabled = mBackwardGraphsEnabled && mBackwardGraphCut > 0 && !in_capture &&
+                                    !debug_recompute_compare && !debug_dsl_grads && !debug_dsl_matmul;
     
     std::vector<char> recomputed;
     if (recompute_any && config.NumLayers > 0) {
@@ -538,6 +545,66 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                     }
                 }
 
+                const bool debug_matmul = env_enabled("SUROGATE_DEBUG_DSL_MATMUL_GRADS");
+                const int mid_layer = static_cast<int>(config.NumLayers / 2);
+                const bool dbg_layer = debug_matmul && layer_idx >= 0 &&
+                    (layer_idx <= 1 || layer_idx == mid_layer || layer_idx == config.NumLayers - 1);
+                const bool dbg_op = op_kind.has_value() &&
+                    (*op_kind == modules::MatmulOp::MLPDown ||
+                     *op_kind == modules::MatmulOp::MLPUp ||
+                     *op_kind == modules::MatmulOp::AttnOut ||
+                     *op_kind == modules::MatmulOp::QKV);
+                if (dbg_layer && dbg_op) {
+                    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+                    auto op_name = [](modules::MatmulOp op) {
+                        switch (op) {
+                            case modules::MatmulOp::MLPDown: return "MLPDown";
+                            case modules::MatmulOp::MLPUp: return "MLPUp";
+                            case modules::MatmulOp::AttnOut: return "AttnOut";
+                            case modules::MatmulOp::QKV: return "QKV";
+                            default: return "Other";
+                        }
+                    };
+                    auto dump_row95 = [&](const char* tag, const Tensor& t, const std::string& name) {
+                        if (!t.Data) {
+                            fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=null\n", tag, name.c_str());
+                            return;
+                        }
+                        long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+                        long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+                        if (rows <= 0 || hidden <= 0) {
+                            fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=%p shape=%s\n",
+                                    tag, name.c_str(), (void*)t.Data, tensor_shape_str(t).c_str());
+                            return;
+                        }
+                        long row = std::min<long>(95, rows - 1);
+                        const long N = std::min<long>(64, hidden);
+                        float sum_row = 0.0f;
+                        if (t.DType == ETensorDType::BF16) {
+                            std::vector<nv_bfloat16> buf(N);
+                            cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                            for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+                        } else if (t.DType == ETensorDType::FP32) {
+                            std::vector<float> buf(N);
+                            cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost);
+                            for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+                        } else {
+                            fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=%p dtype=%d shape=%s\n",
+                                    tag, name.c_str(), (void*)t.Data, static_cast<int>(t.DType), tensor_shape_str(t).c_str());
+                            return;
+                        }
+                        fprintf(stderr, "[DSL MATMUL] layer=%d op=%s %s name=%s ptr=%p row%ld_abssum=%.6f\n",
+                                layer_idx, op_name(*op_kind), tag, name.c_str(), (void*)t.Data, row, sum_row);
+                    };
+                    fprintf(stderr, "[DSL MATMUL] layer=%d op=%s recipe=%d acc=%d skip_w=%d\n",
+                            layer_idx, op_name(*op_kind), used_recipe ? 1 : 0, do_accumulate ? 1 : 0,
+                            skip_weight_grad ? 1 : 0);
+                    dump_row95("d_out", d_out, op.inputs.at(0));
+                    if (dA_ptr && !dA_name.empty()) {
+                        dump_row95("d_in", *dA_ptr, dA_name);
+                    }
+                }
+
                 // Map dA output to simplified_grads for LoRA hooks
                 // The DSL autodiff generates generic names like "d_blocks[N].view_X" but the
                 // LoRA backward hooks expect the tensors to be in simplified_grads.
@@ -571,8 +638,8 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                     auto& grads = rs.simplified_grads(layer_idx);
                     switch (*op_kind) {
                         case modules::MatmulOp::MLPDown:
-                            // d_res_ffn is the upstream gradient for MLP down
-                            grads.d_res_ffn.Data = d_out.Data;
+                            // d_mlp_down is the upstream gradient for MLP down
+                            grads.d_mlp_down.Data = d_out.Data;
                             break;
                         case modules::MatmulOp::MLPUp:
                             // d_mlp_up is the upstream gradient for MLP up/gate
@@ -620,7 +687,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                                 if (op_kind.has_value()) {
                                     switch (*op_kind) {
                                         case modules::MatmulOp::MLPDown:
-                                            grads.d_res_ffn.Data = d_out.Data;
+                                            grads.d_mlp_down.Data = d_out.Data;
                                             break;
                                         case modules::MatmulOp::AttnOut:
                                             grads.d_res_att.Data = d_out.Data;
@@ -630,7 +697,7 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                                     }
                                 } else {
                                     if (field == "mlp_down_weight") {
-                                        grads.d_res_ffn.Data = d_out.Data;
+                                        grads.d_mlp_down.Data = d_out.Data;
                                     } else if (field == "out_weight") {
                                         grads.d_res_att.Data = d_out.Data;
                                     }
@@ -1049,6 +1116,12 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
             }
 
             Tensor& weight = resolve_param_tensor(st, op.inputs.at(3));
+            const bool debug_grads = env_enabled("SUROGATE_DEBUG_DSL_GRADS");
+            int ln_layer_idx = -1;
+            std::string ln_field;
+            if (!op.inputs.at(3).empty()) {
+                parse_block_param(op.inputs.at(3), ln_layer_idx, ln_field);
+            }
 
             Tensor& d_input = ensure_tensor(st, op.outputs.at(1), d_y.DType, {B, T, config.HiddenSize});
             Tensor* d_residual_out = nullptr;
@@ -1063,6 +1136,49 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                 fill_zero(d_residual_zero, rs.MainStream);
                 d_residual = &d_residual_zero;
             }
+
+            // For LN2 backward, use the residual stream gradient that already includes the
+            // MLP contribution (d_mlp_down) when available to match modular accumulation.
+            Tensor* d_residual_input = d_residual;
+            Tensor* d_residual_stream = d_residual;
+            if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
+                auto& grads = rs.simplified_grads(ln_layer_idx);
+                if (grads.d_mlp_down.Data) {
+                    d_residual_input = &grads.d_mlp_down;
+                }
+            }
+
+            auto dump_row95 = [&](const char* tag, const Tensor& t, const std::string& name) {
+                if (!t.Data) {
+                    fprintf(stderr, "[DSL GRADS] %s name=%s ptr=null\n", tag, name.c_str());
+                    return;
+                }
+                long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+                long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+                if (rows <= 0 || hidden <= 0) {
+                    fprintf(stderr, "[DSL GRADS] %s name=%s ptr=%p shape=%s\n",
+                            tag, name.c_str(), (void*)t.Data, tensor_shape_str(t).c_str());
+                    return;
+                }
+                long row = std::min<long>(95, rows - 1);
+                const long N = std::min<long>(64, hidden);
+                float sum_row = 0.0f;
+                if (t.DType == ETensorDType::BF16) {
+                    std::vector<nv_bfloat16> buf(N);
+                    cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                    for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+                } else if (t.DType == ETensorDType::FP32) {
+                    std::vector<float> buf(N);
+                    cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost);
+                    for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+                } else {
+                    fprintf(stderr, "[DSL GRADS] %s name=%s ptr=%p dtype=%d shape=%s\n",
+                            tag, name.c_str(), (void*)t.Data, static_cast<int>(t.DType), tensor_shape_str(t).c_str());
+                    return;
+                }
+                fprintf(stderr, "[DSL GRADS] %s layer=%d field=%s name=%s ptr=%p row%ld_abssum=%.6f\n",
+                        tag, ln_layer_idx, ln_field.c_str(), name.c_str(), (void*)t.Data, row, sum_row);
+            };
 
             const bool weight_trainable = mWeights.has(op.inputs.at(3)) && mWeights.is_trainable(op.inputs.at(3));
             Tensor* d_weight = nullptr;
@@ -1092,16 +1208,56 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                     ? rs.simplified_quant_grads().d_res_att.abs_max()
                     : rs.simplified_quant_grads().d_res_ffn.abs_max();
             }
+            const int mid_layer = static_cast<int>(config.NumLayers / 2);
+            const bool dbg_layer =
+                (ln_layer_idx >= 0) &&
+                (ln_layer_idx <= 1 || ln_layer_idx == mid_layer || ln_layer_idx == config.NumLayers - 1);
+            if (debug_grads && dbg_layer) {
+                CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+                dump_row95("pre_rmsnorm d_y", d_y, op.inputs.at(0));
+                dump_row95("pre_rmsnorm d_residual_next", *d_residual, op.inputs.at(1));
+                if (d_residual_input != d_residual) {
+                    dump_row95("pre_rmsnorm d_residual_input", *d_residual_input, "d_residual_input");
+                }
+                if (ln_field == "ln2_weight") {
+                    auto& grads = rs.simplified_grads(ln_layer_idx);
+                    if (grads.d_mlp_down.Data) {
+                        dump_row95("pre_rmsnorm grads.d_mlp_down", grads.d_mlp_down, "d_mlp_down");
+                    }
+                }
+            }
             rmsnorm_backward(d_input, *d_weight, rs.scratch().rmsnorm_scratch,
-                             *d_residual, d_y, residual_out, weight,
+                             *d_residual_input, d_y, residual_out, weight,
                              get_tensor(st, op.inputs.at(4), mSaved),
                              abs_max_ptr,
                              static_cast<int>(B), static_cast<int>(T), config.HiddenSize,
                              rs.DeviceProp, rs.MainStream,
                              skip_weight);
+            if (debug_grads && dbg_layer) {
+                CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+                dump_row95("post_rmsnorm d_input", d_input, op.outputs.at(1));
+                if (d_residual_stream && d_residual_stream->Data) {
+                    dump_row95("post_rmsnorm d_residual_stream", *d_residual_stream, op.inputs.at(1));
+                }
+            }
             if (d_residual_out && op.outputs.at(0) != op.outputs.at(1)) {
                 CUDA_CHECK(cudaMemcpyAsync(d_residual_out->Data, d_input.Data, d_input.bytes(),
                                            cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
+            if (d_residual_stream && d_residual_stream->Data && d_residual_stream->Data != d_input.Data) {
+                CUDA_CHECK(cudaMemcpyAsync(d_residual_stream->Data, d_input.Data, d_input.bytes(),
+                                           cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
+            if (op.outputs.size() > 1) {
+                int prev_layer = -1;
+                std::string out_field;
+                if (parse_block_param(op.outputs.at(1), prev_layer, out_field) && out_field == "mlp_down") {
+                    Tensor& d_res_ffn_prev = rs.simplified_grads(prev_layer).d_res_ffn;
+                    if (d_res_ffn_prev.Data && d_res_ffn_prev.Data != d_input.Data) {
+                        CUDA_CHECK(cudaMemcpyAsync(d_res_ffn_prev.Data, d_input.Data, d_input.bytes(),
+                                                   cudaMemcpyDeviceToDevice, rs.MainStream));
+                    }
+                }
             }
             int layer_idx = -1;
             std::string field;
@@ -1251,6 +1407,101 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
 
     auto& acts = rs.simplified_acts(layer_idx);
 
+    const bool debug_recompute_compare = env_enabled("SUROGATE_DEBUG_RECOMPUTE_COMPARE");
+    static int debug_recompute_layer = []() {
+        if (const char* v = std::getenv("SUROGATE_DEBUG_RECOMPUTE_LAYER")) {
+            return std::atoi(v);
+        }
+        return -1;
+    }();
+    const bool debug_compare_allowed = debug_recompute_compare && !use_graph && !mBackwardGraphsEnabled;
+
+    auto abs_max_host = [&](const Tensor& t) -> float {
+        if (!t.Data || t.nelem() == 0) return 0.0f;
+        Tensor tmp = rs.temp_alloc(ETensorDType::FP32, {1});
+        abs_max(tmp.get<float>(), t, static_cast<long>(t.nelem()), rs.DeviceProp, rs.MainStream);
+        float host = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&host, tmp.Data, sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        return host;
+    };
+    auto sample_max_diff = [&](const Tensor& a, const Tensor& b) -> float {
+        if (a.DType != b.DType) return -1.0f;
+        const std::size_t count = std::min<std::size_t>(1024, a.nelem());
+        if (count == 0) return 0.0f;
+        const std::size_t bytes = count * get_dtype_size(a.DType);
+        float max_diff = 0.0f;
+        if (a.DType == ETensorDType::BF16) {
+            std::vector<nv_bfloat16> host_a(count);
+            std::vector<nv_bfloat16> host_b(count);
+            CUDA_CHECK(cudaMemcpy(host_a.data(), a.Data, bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_b.data(), b.Data, bytes, cudaMemcpyDeviceToHost));
+            for (std::size_t i = 0; i < count; ++i) {
+                const float diff = std::fabs((float)host_a[i] - (float)host_b[i]);
+                if (diff > max_diff) max_diff = diff;
+            }
+            return max_diff;
+        }
+        if (a.DType == ETensorDType::FP32) {
+            std::vector<float> host_a(count);
+            std::vector<float> host_b(count);
+            CUDA_CHECK(cudaMemcpy(host_a.data(), a.Data, bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_b.data(), b.Data, bytes, cudaMemcpyDeviceToHost));
+            for (std::size_t i = 0; i < count; ++i) {
+                const float diff = std::fabs(host_a[i] - host_b[i]);
+                if (diff > max_diff) max_diff = diff;
+            }
+            return max_diff;
+        }
+        return -1.0f;
+    };
+    auto debug_compare = [&](const std::string& name, const Tensor& recomputed_tensor) {
+        if (!debug_compare_allowed) return;
+        if (debug_recompute_layer >= 0 && layer_idx != debug_recompute_layer) return;
+        if (!recomputed_tensor.Data) return;
+        auto it = mSaved.find(name);
+        if (it == mSaved.end()) return;
+        const Tensor& saved_tensor = it->second;
+        std::vector<long> saved_shape(saved_tensor.Sizes.begin(),
+                                      saved_tensor.Sizes.begin() + saved_tensor.Rank);
+        if (saved_tensor.DType != recomputed_tensor.DType) {
+            fprintf(stderr,
+                    "[DSL DEBUG] recompute cmp layer=%d name=%s dtype mismatch saved=%s recomputed=%s\n",
+                    layer_idx,
+                    name.c_str(),
+                    dtype_to_str(saved_tensor.DType),
+                    dtype_to_str(recomputed_tensor.DType));
+            fflush(stderr);
+            return;
+        }
+        Tensor recomputed_view = recomputed_tensor;
+        if (!tensor_shape_matches(recomputed_tensor, saved_shape)) {
+            if (saved_tensor.nelem() != recomputed_tensor.nelem()) {
+                fprintf(stderr,
+                        "[DSL DEBUG] recompute cmp layer=%d name=%s shape mismatch saved=%s recomputed=%s\n",
+                        layer_idx,
+                        name.c_str(),
+                        tensor_shape_str(saved_tensor).c_str(),
+                        tensor_shape_str(recomputed_tensor).c_str());
+                fflush(stderr);
+                return;
+            }
+            recomputed_view = view_for_shape(const_cast<Tensor&>(recomputed_tensor), saved_shape, name + "_dbg");
+        }
+        const float saved_max = abs_max_host(saved_tensor);
+        const float recomputed_max = abs_max_host(recomputed_view);
+        const float denom = saved_max > 0.0f ? saved_max : 1.0f;
+        const float sample_diff = sample_max_diff(saved_tensor, recomputed_view);
+        fprintf(stderr,
+                "[DSL DEBUG] recompute cmp layer=%d name=%s max_saved=%.6g max_recomputed=%.6g ratio=%.6g sample_max_diff=%.6g\n",
+                layer_idx, name.c_str(), saved_max, recomputed_max, recomputed_max / denom, sample_diff);
+        fflush(stderr);
+    };
+
+    auto block_name = [&](const char* field) {
+        return "blocks[" + std::to_string(layer_idx) + "]." + field;
+    };
+
     // Helper to ensure activation buffer is allocated
     auto ensure_act = [&](Tensor& t) {
         if (!t.Data) {
@@ -1267,6 +1518,8 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
         Tensor& ln1_weight = mWeights.get("blocks[" + std::to_string(layer_idx) + "].ln1_weight");
         rmsnorm_forward(acts.ln1, acts.ln1_rstd, res_ffn, ln1_weight, nullptr,
                         config.RmsNormEps, Bv, Tv, C, rs.MainStream);
+        debug_compare(block_name("ln1"), acts.ln1);
+        debug_compare(block_name("ln1_rstd"), acts.ln1_rstd);
     }
 
     // QKV + RoPE recomputation
@@ -1365,6 +1618,12 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
                          reinterpret_cast<int*>(rs.PositionIDs.Data), nullptr,
                          Bv, Tv, Hq, Hkv, Hs, Hs, rs.MainStream);
         }
+        debug_compare(block_name("qkv"), acts.qkv);
+        if (acts.qkv_rope.Data) {
+            debug_compare(block_name("qkv_rope"), acts.qkv_rope);
+        }
+        debug_compare(block_name("q_rstd"), acts.q_rstd);
+        debug_compare(block_name("k_rstd"), acts.k_rstd);
     }
 
     // Attention recomputation
@@ -1381,6 +1640,8 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
         Tensor lse_view = view_tensor(acts.lse, {B, Hq, T});
         attention_forward_cudnn(att_out, lse_view, qkv_view, rs.scratch().cudnn_workspace,
                                 rs.CudnnHandle, Bv, Tv, Hq, Hkv, Hs, rs.MainStream);
+        debug_compare(block_name("att"), acts.att);
+        debug_compare(block_name("lse"), acts.lse);
 
         // Attention output projection recomputation
         if (flags.out_proj) {
@@ -1417,6 +1678,7 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
                        C, static_cast<int>(B * T), att_dim, EMMTranspose::TN, false, rs.MainStream);
             }
             // NOTE: LoRA o_proj contribution is NOT recomputed (applied once during forward)
+            debug_compare(block_name("att_out"), acts.att_out);
         }
     }
 
@@ -1429,6 +1691,9 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
             acts.residual_att, acts.ln2, acts.ln2_rstd,
             res_ffn, acts.att_out, ln2_weight, nullptr,
             config.RmsNormEps, static_cast<int>(B * T), C, rs.MainStream);
+        debug_compare(block_name("res_att"), acts.residual_att);
+        debug_compare(block_name("ln2"), acts.ln2);
+        debug_compare(block_name("ln2_rstd"), acts.ln2_rstd);
     }
 
     // FFN up projection recomputation
@@ -1465,6 +1730,7 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
                    MUp, static_cast<int>(B * T), C, EMMTranspose::TN, false, rs.MainStream);
         }
         // NOTE: LoRA MLP contribution is NOT recomputed (applied once during forward)
+        debug_compare(block_name("mlp_up"), acts.mlp_up);
     }
 
     // SwiGLU recomputation
@@ -1472,6 +1738,7 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
         ensure_act(acts.swiglu);
         swiglu_forward(acts.swiglu, acts.mlp_up, nullptr,
                        Bv, Tv, D, rs.MainStream);
+        debug_compare(block_name("swiglu"), acts.swiglu);
     }
 
     // End graph capture if we were capturing

@@ -1079,6 +1079,55 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
                          &rs.ValidTokenCount,
                          static_cast<int>(B * T), static_cast<int>(V), static_cast<int>(Vp), true, rs.MainStream);
     }
+
+    // Debug: check d_logits at non-masked target positions after fused_classifier
+    static int classifier_dbg = 0;
+    if (classifier_dbg < 2 && !in_capture && logits.Data) {
+        cudaDeviceSynchronize();
+        const long BT_total = B * T;
+        // Get all targets to find non-masked positions
+        std::vector<int> all_tgt(BT_total);
+        cudaMemcpy(all_tgt.data(), tgt.Data, BT_total * sizeof(int), cudaMemcpyDeviceToHost);
+
+        // Find first 4 non-masked positions
+        std::vector<int> valid_rows;
+        int valid_count = 0;
+        for (long i = 0; i < BT_total && valid_count < 4; i++) {
+            if (all_tgt[i] >= 0 && all_tgt[i] < static_cast<int>(V)) {
+                valid_rows.push_back(i);
+                valid_count++;
+            }
+        }
+        fprintf(stderr, "[CLASSIFIER] call #%d BT=%ld valid_rows found=%d (first 4: ",
+                classifier_dbg, BT_total, valid_count);
+        for (int i = 0; i < valid_count; i++) fprintf(stderr, "%d ", valid_rows[i]);
+        fprintf(stderr, ")\n");
+
+        // Check gradients at valid target positions
+        if (valid_count > 0) {
+            float abssum_at_targets = 0.0f;
+            std::vector<float> grads_at_targets(4, 0.0f);
+            for (int i = 0; i < valid_count; i++) {
+                int row = valid_rows[i];
+                int tgt_id = all_tgt[row];
+                nv_bfloat16 val;
+                cudaMemcpy(&val, (nv_bfloat16*)logits.Data + row * Vp + tgt_id,
+                           sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                grads_at_targets[i] = __bfloat162float(val);
+                abssum_at_targets += fabsf(grads_at_targets[i]);
+            }
+            fprintf(stderr, "[CLASSIFIER] targets at valid rows: %d %d %d %d\n",
+                    valid_count > 0 ? all_tgt[valid_rows[0]] : -1,
+                    valid_count > 1 ? all_tgt[valid_rows[1]] : -1,
+                    valid_count > 2 ? all_tgt[valid_rows[2]] : -1,
+                    valid_count > 3 ? all_tgt[valid_rows[3]] : -1);
+            fprintf(stderr, "[CLASSIFIER] d_logits at valid targets: %.6f %.6f %.6f %.6f abssum=%.6f dloss=%.6e\n",
+                    grads_at_targets[0], grads_at_targets[1], grads_at_targets[2], grads_at_targets[3],
+                    abssum_at_targets, d_loss);
+        }
+
+        classifier_dbg++;
+    }
 }
 
 

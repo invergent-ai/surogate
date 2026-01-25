@@ -260,6 +260,9 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                 ref.slot = TensorSlot::BlockDQKV;
             } else if (field == "att" || field == "att_flat") {
                 ref.slot = TensorSlot::BlockDAtt;
+            } else if (field == "att_out" || field == "att_out_flat") {
+                // att_out gradients share storage with residual-att gradients
+                ref.slot = TensorSlot::BlockDResAtt;
             } else if (field == "swiglu" || field == "swiglu_flat") {
                 ref.slot = TensorSlot::BlockDSwiGLU;
             } else if (field == "mlp_up" || field == "mlp_up_flat") {
@@ -286,9 +289,11 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             const long Hs = mConfig.head_size();
             const long QKV = mConfig.qkv_channels();
 
-            if (field == "ln1" || field == "ln2" || field == "mlp_down" || field == "res_att" || field == "res_ffn") {
+            if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" ||
+                field == "res_att" || field == "res_ffn") {
                 ref.shape = {B, T, C};
-            } else if (field == "ln1_flat" || field == "ln2_flat" || field == "mlp_down_flat") {
+            } else if (field == "ln1_flat" || field == "ln2_flat" || field == "att_out_flat" ||
+                       field == "mlp_down_flat") {
                 ref.shape = {B * T, C};
             } else if (field == "qkv" || field == "qkv_rope") {
                 ref.shape = {B, T, QKV};
@@ -584,6 +589,18 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     // Try to infer shape from matmul dimensions
                     ref.dtype = ETensorDType::BF16;
                     // Shape will be determined at runtime
+                } else if (compiled.type == CompiledOpType::MatmulBackward) {
+                    // Match dA/dB shapes to their corresponding inputs (A/B).
+                    // inputs: d_out, A_for_dB, B_for_dA -> outputs: dA, dB
+                    if (i == 0 && compiled.inputs.size() > 1) {
+                        ref.shape = compiled.inputs[1].shape;
+                        ref.dtype = compiled.inputs[1].dtype;
+                    } else if (i == 1 && compiled.inputs.size() > 2) {
+                        ref.shape = compiled.inputs[2].shape;
+                        ref.dtype = compiled.inputs[2].dtype;
+                    } else {
+                        ref.dtype = ETensorDType::BF16;
+                    }
                 } else {
                     // Default for activation tensors
                     ref.dtype = ETensorDType::BF16;
@@ -1411,6 +1428,24 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // Addition backward: gradients pass through unchanged to both inputs
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
+    // Debug: check add_backward gradient values
+    static int add_bwd_dbg = 0;
+    if (add_bwd_dbg < 4) {
+        cudaDeviceSynchronize();
+        float sum = 0;
+        const long N = 256;
+        std::vector<nv_bfloat16> buf(N);
+        if (d_out.Data) {
+            cudaMemcpy(buf.data(), d_out.Data, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+            for (long i = 0; i < N; i++) sum += fabsf(__bfloat162float(buf[i]));
+        }
+        fprintf(stderr, "[ADD_BWD] input=%s slot=%d layer=%d d_out_abssum=%.4f out0=%s out1=%s\n",
+                op.inputs[0].name.c_str(), (int)op.inputs[0].slot, op.inputs[0].layer_idx, sum,
+                op.outputs[0].name.c_str(),
+                op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "none");
+        add_bwd_dbg++;
+    }
+
     // For pre-allocated gradient slots (like d_res_ffn, d_res_att), we need to
     // copy the data pointer to the ORIGINAL pre-allocated tensor, not just store in mTensorMap.
     // This ensures the LoRA hooks can access the gradients via simplified_grads().
@@ -1454,6 +1489,42 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
+    const bool debug_matmul = env_enabled("SUROGATE_DEBUG_DSL_MATMUL_GRADS");
+
+    // Debug: check d_out at start of matmul_backward
+    static int matmul_bwd_dbg = 0;
+    if (matmul_bwd_dbg < 2 && d_out.Data && !mCapturing) {
+        cudaDeviceSynchronize();
+        fprintf(stderr, "[MATMUL_BWD] #%d id=%s d_out shape=[%ld,%ld] ptr=%p\n",
+                matmul_bwd_dbg, op.op_id.c_str(), d_out.Sizes[0], d_out.Sizes[1], (void*)d_out.Data);
+
+        // Check at target positions for d_logits (vocab-sized cols)
+        if (d_out.Rank == 2 && d_out.Sizes[1] > 100000) {
+            // Get targets to check at actual gradient positions
+            std::vector<int> tgt_vals(100);
+            cudaMemcpy(tgt_vals.data(), mRunState.Targets.Data, 100 * sizeof(int), cudaMemcpyDeviceToHost);
+            // Find row 95 (target=271, which has largest gradient -6.1e-5)
+            const long row = 95;
+            const int tgt = tgt_vals[row];
+            nv_bfloat16 val;
+            if (tgt >= 0 && tgt < d_out.Sizes[1]) {
+                cudaMemcpy(&val, (nv_bfloat16*)d_out.Data + row * d_out.Sizes[1] + tgt,
+                           sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[MATMUL_BWD] d_out[row=%ld, tgt=%d] = %.6f\n",
+                        row, tgt, __bfloat162float(val));
+            }
+        } else {
+            float sum = 0;
+            const long N = 256;
+            std::vector<nv_bfloat16> buf(N);
+            cudaMemcpy(buf.data(), d_out.Data, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+            for (long i = 0; i < N; i++) sum += fabsf(__bfloat162float(buf[i]));
+            fprintf(stderr, "[MATMUL_BWD] d_out[0:N] abssum=%.6f d_out[0:4]=%.6f %.6f %.6f %.6f\n",
+                    sum, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
+                    __bfloat162float(buf[2]), __bfloat162float(buf[3]));
+        }
+        matmul_bwd_dbg++;
+    }
 
     EMMTranspose mode = op.attrs.transpose;
     const int layer_idx = op.attrs.layer_idx;
@@ -1478,11 +1549,40 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor* dA_ptr = nullptr;
     Tensor* dB_ptr = nullptr;
 
+    auto ensure_output_like = [&](const TensorRef& ref, const Tensor& like) -> Tensor* {
+        if (ref.slot != TensorSlot::Mapped) {
+            return &ensure_output_tensor(ref);
+        }
+        std::vector<long> shape(like.Sizes.begin(), like.Sizes.begin() + like.Rank);
+        auto it = mTensorMap.find(ref.name);
+        if (it != mTensorMap.end()) {
+            bool match = (it->second.Rank == static_cast<int>(shape.size()));
+            if (match) {
+                for (int i = 0; i < it->second.Rank; ++i) {
+                    if (it->second.Sizes[i] != shape[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+            }
+            if (match) {
+                return &it->second;
+            }
+        }
+        Tensor t = mRunState.temp_alloc(like.DType, shape);
+        mTemps.push_back(t);
+        auto [ins_it, inserted] = mTensorMap.emplace(ref.name, t);
+        if (!inserted) {
+            ins_it->second = t;
+        }
+        return &ins_it->second;
+    };
+
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
-        dA_ptr = &ensure_output_tensor(op.outputs[0]);
+        dA_ptr = ensure_output_like(op.outputs[0], a);
     }
     if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        dB_ptr = &ensure_output_tensor(op.outputs[1]);
+        dB_ptr = ensure_output_like(op.outputs[1], b);
     }
 
     if (!dA_ptr && !dB_ptr) {
@@ -1492,6 +1592,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     const bool do_accumulate = mAccumulateTensors.count(dB_name) > 0;
 
     bool used_recipe = false;
+    bool used_fp8 = false;
+    bool has_dout_quant = false;
     if (mRecipe && mode == EMMTranspose::NT && a.Sizes[0] == mB * mT && allow_quant) {
         Tensor dA_tmp{};
         Tensor dB_tmp{};
@@ -1534,9 +1636,30 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                 ctx.allow_fp8 = false;
             }
         }
+        used_fp8 = ctx.allow_fp8;
+        has_dout_quant = (ctx.dout_quant && ctx.dout_quant->Data);
 
         mRecipe->backward_matmul(ctx);
         used_recipe = true;
+
+        // Debug: check dinp after recipe matmul - row 95 should have non-zero gradients
+        if (matmul_bwd_dbg <= 2 && ctx.dinp && ctx.dinp->Data && !mCapturing) {
+            cudaDeviceSynchronize();
+            // Check row 95 (which has largest d_logits gradient)
+            if (ctx.dinp->Rank == 2 && ctx.dinp->Sizes[0] > 100) {
+                const long row = 95;
+                const long row_start = row * ctx.dinp->Sizes[1];
+                float sum_row95 = 0;
+                const long N_dbg = 64;
+                std::vector<nv_bfloat16> buf(N_dbg);
+                cudaMemcpy(buf.data(), (nv_bfloat16*)ctx.dinp->Data + row_start, N_dbg * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                for (long i = 0; i < N_dbg; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+                fprintf(stderr, "[MATMUL_BWD_RECIPE] dinp row95 abssum=%.6f dinp[95,0:4]=%.6f %.6f %.6f %.6f shape=[%ld,%ld]\n",
+                        sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
+                        __bfloat162float(buf[2]), __bfloat162float(buf[3]),
+                        ctx.dinp->Sizes[0], ctx.dinp->Sizes[1]);
+            }
+        }
     }
 
     if (!used_recipe) {
@@ -1569,6 +1692,25 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             matmul(*dA_ptr, b, d_out, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, false, mRunState.MainStream);
+
+            // Debug: check dA after matmul - row 95 should have non-zero gradients
+            if (matmul_bwd_dbg <= 2 && dA_ptr->Data && !mCapturing) {
+                cudaDeviceSynchronize();
+                // dA is d_xF which is (BT, hidden_size)
+                // Check row 95 (which has largest d_logits gradient)
+                const long row = 95;
+                const long hidden_size = dA_ptr->Sizes[1];
+                float sum_row95 = 0;
+                const long N_dbg = 64;
+                std::vector<nv_bfloat16> buf(N_dbg);
+                cudaMemcpy(buf.data(), (nv_bfloat16*)dA_ptr->Data + row * hidden_size, N_dbg * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                for (long i = 0; i < N_dbg; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+                fprintf(stderr, "[MATMUL_BWD] dA ptr=%p row95 abssum=%.6f dA[95,0:4]=%.6f %.6f %.6f %.6f output=%s shape=[%ld,%ld]\n",
+                        (void*)dA_ptr->Data, sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
+                        __bfloat162float(buf[2]), __bfloat162float(buf[3]),
+                        op.outputs.empty() ? "none" : op.outputs[0].name.c_str(),
+                        dA_ptr->Sizes[0], dA_ptr->Sizes[1]);
+            }
         }
         if (dB_ptr && !skip_weight_grad) {
             int M = 0, N = 0, K = 0;
@@ -1577,6 +1719,88 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             matmul(*dB_ptr, a, d_out, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, do_accumulate, mRunState.MainStream);
+        }
+    }
+
+    if (debug_matmul && !mCapturing && op.attrs.matmul_op.has_value()) {
+        const auto op_kind = *op.attrs.matmul_op;
+        if (op_kind == modules::MatmulOp::MLPDown || op_kind == modules::MatmulOp::MLPUp ||
+            op_kind == modules::MatmulOp::AttnOut || op_kind == modules::MatmulOp::QKV) {
+            const int layer_idx = op.attrs.layer_idx;
+            const int mid_layer = static_cast<int>(mConfig.NumLayers / 2);
+            const bool dbg_layer = layer_idx >= 0 &&
+                (layer_idx <= 1 || layer_idx == mid_layer || layer_idx == mConfig.NumLayers - 1);
+            if (dbg_layer) {
+                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                auto op_name = [](modules::MatmulOp op) {
+                    switch (op) {
+                        case modules::MatmulOp::MLPDown: return "MLPDown";
+                        case modules::MatmulOp::MLPUp: return "MLPUp";
+                        case modules::MatmulOp::AttnOut: return "AttnOut";
+                        case modules::MatmulOp::QKV: return "QKV";
+                        default: return "Other";
+                    }
+                };
+                auto mode_name = [](EMMTranspose mode) {
+                    switch (mode) {
+                        case EMMTranspose::NN: return "NN";
+                        case EMMTranspose::NT: return "NT";
+                        case EMMTranspose::TN: return "TN";
+                        case EMMTranspose::TT: return "TT";
+                    }
+                    return "NN";
+                };
+                auto shape_str = [](const Tensor& t) {
+                    std::string s = "[";
+                    for (int i = 0; i < t.Rank; ++i) {
+                        if (i) s += ",";
+                        s += std::to_string(t.Sizes[i]);
+                    }
+                    s += "]";
+                    return s;
+                };
+                auto dump_row95 = [&](const char* tag, const Tensor& t, const std::string& name) {
+                    if (!t.Data) {
+                        fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=null\n", tag, name.c_str());
+                        return;
+                    }
+                    long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+                    long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+                    if (rows <= 0 || hidden <= 0) {
+                        fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=%p shape=[%ld,%ld,%ld]\n",
+                                tag, name.c_str(), (void*)t.Data,
+                                t.Sizes[0], t.Rank > 1 ? t.Sizes[1] : 0L, t.Rank > 2 ? t.Sizes[2] : 0L);
+                        return;
+                    }
+                    long row = std::min<long>(95, rows - 1);
+                    const long N = std::min<long>(64, hidden);
+                    float sum_row = 0.0f;
+                    if (t.DType == ETensorDType::BF16) {
+                        std::vector<nv_bfloat16> buf(N);
+                        cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                        for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+                    } else if (t.DType == ETensorDType::FP32) {
+                        std::vector<float> buf(N);
+                        cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost);
+                        for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+                    } else {
+                        fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=%p dtype=%d\n",
+                                tag, name.c_str(), (void*)t.Data, static_cast<int>(t.DType));
+                        return;
+                    }
+                    fprintf(stderr, "[DSL MATMUL] layer=%d op=%s %s name=%s ptr=%p row%ld_abssum=%.6f shape=%s\n",
+                            layer_idx, op_name(op_kind), tag, name.c_str(), (void*)t.Data, row, sum_row,
+                            shape_str(t).c_str());
+                };
+                fprintf(stderr, "[DSL MATMUL] layer=%d op=%s recipe=%d acc=%d skip_w=%d fp8=%d dq=%d mode=%s a=%s b=%s\n",
+                        layer_idx, op_name(op_kind), used_recipe ? 1 : 0, do_accumulate ? 1 : 0,
+                        skip_weight_grad ? 1 : 0, used_fp8 ? 1 : 0, has_dout_quant ? 1 : 0,
+                        mode_name(mode), shape_str(a).c_str(), shape_str(b).c_str());
+                dump_row95("d_out", d_out, op.inputs[0].name);
+                if (dA_ptr && !op.outputs.empty()) {
+                    dump_row95("d_in", *dA_ptr, op.outputs[0].name);
+                }
+            }
         }
     }
 
@@ -1610,10 +1834,26 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     // Map d_out to simplified_grads for LoRA hooks that consume upstream gradients directly.
     if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
         auto& grads = mRunState.simplified_grads(layer_idx);
+        // Debug: check d_out at row 95 (first valid row) for simplified_grads mapping
+        static int dbg_count = 0;
+        if (dbg_count < 2 && (*op.attrs.matmul_op == modules::MatmulOp::MLPDown || *op.attrs.matmul_op == modules::MatmulOp::AttnOut) && !mCapturing) {
+            cudaDeviceSynchronize();
+            const long row = 95;
+            const long hidden = d_out.Sizes[1];
+            float sum_row95 = 0;
+            const long N = 64;
+            std::vector<nv_bfloat16> buf(N);
+            cudaMemcpy(buf.data(), (nv_bfloat16*)d_out.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+            for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+            fprintf(stderr, "[COMPILED_OPS] matmul_op=%d layer=%d d_out ptr=%p row95_abssum=%.6f d_out[95,0:4]=%.6f %.6f %.6f %.6f\n",
+                    (int)*op.attrs.matmul_op, layer_idx, (void*)d_out.Data, sum_row95,
+                    __bfloat162float(buf[0]), __bfloat162float(buf[1]), __bfloat162float(buf[2]), __bfloat162float(buf[3]));
+            dbg_count++;
+        }
         switch (*op.attrs.matmul_op) {
             case modules::MatmulOp::MLPDown:
-                // d_res_ffn is the upstream gradient for MLP down
-                grads.d_res_ffn.Data = d_out.Data;
+                // d_mlp_down is the upstream gradient for MLP down
+                grads.d_mlp_down.Data = d_out.Data;
                 break;
             case modules::MatmulOp::MLPUp:
                 // d_mlp_up is the upstream gradient for MLP up/gate
@@ -1911,9 +2151,36 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     // inputs: d_y, d_residual_next (may be empty), residual_out, weight, rstd
     // outputs: d_residual, d_input, d_weight (optional)
     Tensor& d_y = resolve_tensor(op.inputs[0]);
+
+    // Debug: check d_y values - row 95 should have non-zero gradients from LM head
+    static int rmsnorm_bwd_dbg = 0;
+    if (rmsnorm_bwd_dbg < 2 && d_y.Data && !mCapturing) {
+        cudaDeviceSynchronize();
+        fprintf(stderr, "[RMSNORM_BWD] d_y ptr=%p shape=[%ld,%ld,%ld]\n",
+                (void*)d_y.Data, d_y.Sizes[0], d_y.Sizes[1], d_y.Rank > 2 ? d_y.Sizes[2] : 0L);
+        // Check row 95 (first row with non-zero gradients)
+        const long row = 95;
+        const long hidden_size = d_y.Rank == 3 ? d_y.Sizes[2] : d_y.Sizes[1];
+        const long row_start = row * hidden_size;
+        float sum_row95 = 0;
+        const long N = 64;
+        std::vector<nv_bfloat16> buf(N);
+        cudaMemcpy(buf.data(), (nv_bfloat16*)d_y.Data + row_start, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+        for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+        fprintf(stderr, "[RMSNORM_BWD] d_y row95 abssum=%.6f d_y[95,0:4]=%.6f %.6f %.6f %.6f\n",
+                sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
+                __bfloat162float(buf[2]), __bfloat162float(buf[3]));
+        rmsnorm_bwd_dbg++;
+    }
     Tensor& residual_out = resolve_tensor(op.inputs[2]);
     Tensor& weight = resolve_tensor(op.inputs[3]);
     Tensor& rstd = resolve_tensor(op.inputs[4]);
+    const bool debug_grads = env_enabled("SUROGATE_DEBUG_DSL_GRADS");
+    int ln_layer_idx = -1;
+    std::string ln_field;
+    if (!op.inputs[3].name.empty()) {
+        parse_block_param(op.inputs[3].name, ln_layer_idx, ln_field);
+    }
 
     // d_residual_next is the incoming gradient from the next layer (may be zero/empty)
     Tensor d_residual_zero{};
@@ -1926,6 +2193,82 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         fill_zero(d_residual_zero, mRunState.MainStream);
         mTemps.push_back(d_residual_zero);
         d_residual_next = &d_residual_zero;
+    }
+
+    // For LN2 backward, the modular path feeds the residual stream gradient that already
+    // includes the MLP contribution. In the DSL graph, that upstream gradient is carried
+    // by d_mlp_down; use it when available to match modular accumulation.
+    Tensor* d_residual_input = d_residual_next;
+    Tensor* d_residual_stream = d_residual_next;
+    if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
+        auto& grads = mRunState.simplified_grads(ln_layer_idx);
+        if (grads.d_mlp_down.Data) {
+            d_residual_input = &grads.d_mlp_down;
+        }
+    }
+
+    auto dump_row95 = [&](const char* tag, const Tensor& t, const std::string& name) {
+        if (!t.Data) {
+            fprintf(stderr, "[DSL GRADS] %s name=%s ptr=null\n", tag, name.c_str());
+            return;
+        }
+        long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+        long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+        if (rows <= 0 || hidden <= 0) {
+            fprintf(stderr, "[DSL GRADS] %s name=%s ptr=%p shape=%s\n",
+                    tag, name.c_str(), (void*)t.Data, tensor_shape_str(t).c_str());
+            return;
+        }
+        long row = std::min<long>(95, rows - 1);
+        const long N = std::min<long>(64, hidden);
+        float sum_row = 0.0f;
+        if (t.DType == ETensorDType::BF16) {
+            std::vector<nv_bfloat16> buf(N);
+            cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+            for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+        } else if (t.DType == ETensorDType::FP32) {
+            std::vector<float> buf(N);
+            cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost);
+            for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+        } else {
+            fprintf(stderr, "[DSL GRADS] %s name=%s ptr=%p dtype=%d shape=%s\n",
+                    tag, name.c_str(), (void*)t.Data, static_cast<int>(t.DType), tensor_shape_str(t).c_str());
+            return;
+        }
+        fprintf(stderr, "[DSL GRADS] %s layer=%d field=%s name=%s ptr=%p row%ld_abssum=%.6f\n",
+                tag, ln_layer_idx, ln_field.c_str(), name.c_str(), (void*)t.Data, row, sum_row);
+    };
+
+    if (rmsnorm_bwd_dbg <= 2 && d_residual_next && d_residual_next->Data && !mCapturing) {
+        cudaDeviceSynchronize();
+        const long row = 95;
+        const long hidden_size = d_residual_next->Rank == 3 ? d_residual_next->Sizes[2] : d_residual_next->Sizes[1];
+        const long row_start = row * hidden_size;
+        float sum_row95 = 0;
+        const long N = 64;
+        std::vector<nv_bfloat16> buf(N);
+        cudaMemcpy(buf.data(), (nv_bfloat16*)d_residual_next->Data + row_start, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+        for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+        fprintf(stderr, "[RMSNORM_BWD] d_residual_next name=%s ptr=%p row95 abssum=%.6f\n",
+                op.inputs[1].name.c_str(), (void*)d_residual_next->Data, sum_row95);
+    }
+    const int mid_layer = static_cast<int>(mConfig.NumLayers / 2);
+    const bool dbg_layer =
+        (ln_layer_idx >= 0) &&
+        (ln_layer_idx <= 1 || ln_layer_idx == mid_layer || ln_layer_idx == mConfig.NumLayers - 1);
+    if (debug_grads && !mCapturing && dbg_layer) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        dump_row95("pre_rmsnorm d_y", d_y, op.inputs[0].name);
+        dump_row95("pre_rmsnorm d_residual_next", *d_residual_next, op.inputs[1].name);
+        if (d_residual_input != d_residual_next) {
+            dump_row95("pre_rmsnorm d_residual_input", *d_residual_input, "d_residual_input");
+        }
+        if (ln_field == "ln2_weight") {
+            auto& grads = mRunState.simplified_grads(ln_layer_idx);
+            if (grads.d_mlp_down.Data) {
+                dump_row95("pre_rmsnorm grads.d_mlp_down", grads.d_mlp_down, "d_mlp_down");
+            }
+        }
     }
 
     Tensor& d_input = ensure_output_tensor(op.outputs[1]);
@@ -1947,16 +2290,59 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 
     // Use the rmsnorm_backward kernel (note: it expects B, T separately)
     rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
-                     *d_residual_next, d_y, residual_out, weight, rstd,
+                     *d_residual_input, d_y, residual_out, weight, rstd,
                      nullptr,  // abs_max_ptr
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
+
+    // Debug: check d_input after rmsnorm_backward - row 95 should have non-zero gradients
+    if (rmsnorm_bwd_dbg <= 2 && d_input.Data && !mCapturing) {
+        cudaDeviceSynchronize();
+        // Check row 95 (first row with non-zero gradients)
+        const long row = 95;
+        const long hidden_size = d_input.Rank == 3 ? d_input.Sizes[2] : d_input.Sizes[1];
+        const long row_start = row * hidden_size;
+        float sum_row95 = 0;
+        const long N = 64;
+        std::vector<nv_bfloat16> buf(N);
+        cudaMemcpy(buf.data(), (nv_bfloat16*)d_input.Data + row_start, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+        for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+        fprintf(stderr, "[RMSNORM_BWD] d_input ptr=%p row95 abssum=%.6f d_input[95,0:4]=%.6f %.6f %.6f %.6f output=%s\n",
+                (void*)d_input.Data, sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
+                __bfloat162float(buf[2]), __bfloat162float(buf[3]), op.outputs[1].name.c_str());
+    }
+    if (debug_grads && !mCapturing && dbg_layer) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        dump_row95("post_rmsnorm d_input", d_input, op.outputs[1].name);
+        if (d_residual_stream && d_residual_stream->Data) {
+            dump_row95("post_rmsnorm d_residual_stream", *d_residual_stream, op.inputs[1].name);
+        }
+    }
 
     // Copy d_input to d_residual if they're different outputs
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {
         Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
         CUDA_CHECK(cudaMemcpyAsync(d_residual.Data, d_input.Data, d_input.bytes(),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
+    }
+
+    // Update residual_out gradient buffer to include norm contribution.
+    if (d_residual_stream && d_residual_stream->Data && d_residual_stream->Data != d_input.Data) {
+        CUDA_CHECK(cudaMemcpyAsync(d_residual_stream->Data, d_input.Data, d_input.bytes(),
+                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+    }
+
+    // LN1 backward writes grad for previous layer's residual stream into d_mlp_down;
+    // mirror it into that layer's d_res_ffn so gradient propagation matches modular.
+    if (op.outputs.size() > 1 && op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
+        const int prev_layer = op.outputs[1].layer_idx;
+        if (prev_layer >= 0) {
+            Tensor& d_res_ffn_prev = mRunState.simplified_grads(prev_layer).d_res_ffn;
+            if (d_res_ffn_prev.Data && d_res_ffn_prev.Data != d_input.Data) {
+                CUDA_CHECK(cudaMemcpyAsync(d_res_ffn_prev.Data, d_input.Data, d_input.bytes(),
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        }
     }
 }
 
@@ -2164,6 +2550,52 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         throw std::runtime_error("CompiledExecutor: output tensor has no data (B=" +
                                 std::to_string(mB) + ", T=" + std::to_string(mT) + ")");
     }
+
+    // Debug: check d_logits at non-masked positions in execute_backward
+    static int exec_bwd_dbg = 0;
+    if (exec_bwd_dbg < 2 && output.Data && !mCapturing) {
+        cudaDeviceSynchronize();
+        const long BT_total = mB * mT;
+        const long Vp = mConfig.VocabSize;
+
+        // Get all targets to find non-masked positions
+        std::vector<int> all_tgt(BT_total);
+        cudaMemcpy(all_tgt.data(), mRunState.Targets.Data, BT_total * sizeof(int), cudaMemcpyDeviceToHost);
+
+        // Find first 4 non-masked positions
+        std::vector<int> valid_rows;
+        int valid_count = 0;
+        for (long i = 0; i < BT_total && valid_count < 4; i++) {
+            if (all_tgt[i] >= 0 && all_tgt[i] < Vp) {
+                valid_rows.push_back(i);
+                valid_count++;
+            }
+        }
+        fprintf(stderr, "[EXEC_BWD] BT=%ld valid_count=%d (first valid rows: ",
+                BT_total, valid_count);
+        for (int i = 0; i < valid_count; i++) fprintf(stderr, "%d ", valid_rows[i]);
+        fprintf(stderr, ")\n");
+
+        // Check gradients at valid target positions
+        if (valid_count > 0) {
+            float abssum_at_targets = 0.0f;
+            std::vector<float> grads_at_targets(4, 0.0f);
+            for (int i = 0; i < valid_count; i++) {
+                int row = valid_rows[i];
+                int tgt_id = all_tgt[row];
+                nv_bfloat16 val;
+                cudaMemcpy(&val, (nv_bfloat16*)output.Data + row * Vp + tgt_id,
+                           sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+                grads_at_targets[i] = __bfloat162float(val);
+                abssum_at_targets += fabsf(grads_at_targets[i]);
+            }
+            fprintf(stderr, "[EXEC_BWD] d_logits at valid targets: %.6f %.6f %.6f %.6f abssum=%.6f\n",
+                    grads_at_targets[0], grads_at_targets[1], grads_at_targets[2], grads_at_targets[3],
+                    abssum_at_targets);
+        }
+        exec_bwd_dbg++;
+    }
+
     Tensor logits_view = view_tensor(output, {mB, mT, static_cast<long>(mConfig.VocabSize)});
     mTensorMap["d_logits"] = logits_view;
     // Also provide flattened version for matmul backward ops
@@ -2230,8 +2662,30 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return -1;
     };
 
+    static int bwd_trace_count = 0;
+    const bool do_trace = (bwd_trace_count < 1);
+    if (do_trace) bwd_trace_count++;
+
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
+
+        // Debug: trace backward ops
+        if (do_trace && idx < 30) {
+            std::string inputs_str;
+            for (size_t i = 0; i < op.inputs.size(); i++) {
+                if (i > 0) inputs_str += ", ";
+                inputs_str += op.inputs[i].name;
+            }
+            std::string outputs_str;
+            for (size_t i = 0; i < op.outputs.size(); i++) {
+                if (i > 0) outputs_str += ", ";
+                outputs_str += op.outputs[i].name;
+            }
+            fprintf(stderr, "[BWD_TRACE] op %zu type=%s id=%s layer=%d\n  inputs=[%s]\n  outputs=[%s]\n",
+                    idx, op_type_to_string(op.type), op.op_id.c_str(),
+                    op.layer_start >= 0 ? op.layer_start : (op.inputs.empty() ? -1 : op.inputs[0].layer_idx),
+                    inputs_str.c_str(), outputs_str.c_str());
+        }
 
         if (op.layer_start >= 0) {
             handle_layer_start(op.layer_start);
@@ -2299,9 +2753,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::View:
                     dispatch_view_backward(op);
                     break;
-                // Add is the same in backward - gradient flows to both inputs
+                // "add" ops in the backward graph are gradient-accumulation nodes,
+                // so we must execute them as forward add (sum inputs), not add-backward.
                 case CompiledOpType::Add:
-                    dispatch_add_backward(op);
+                    dispatch_add(op);
                     break;
                 // Zeros in backward is a no-op
                 case CompiledOpType::Zeros:

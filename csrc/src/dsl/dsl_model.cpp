@@ -809,8 +809,13 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
         auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
 
+        // Debug: count hook invocations
+        static int down_count = 0, up_count = 0, out_count = 0, qkv_count = 0;
+        static int step_count = 0;
+
         switch (point) {
             case modules::BackwardHookPoint::AfterMLPDownBackward: {
+                down_count++;
                 if (!lora_block.mlp.down.has_value()) break;
 
                 bool lora_accum = false;
@@ -820,14 +825,87 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
+                const bool debug_grads = env_enabled("SUROGATE_DEBUG_DSL_GRADS");
+
+                // Debug: check da.d_mlp_down
+                static int hook_dbg = 0;
+                if (hook_dbg < 2 && da.d_mlp_down.Data) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    float sum_row95 = 0;
+                    const long row = 95;
+                    const long hidden = C;
+                    const long N = 64;
+                    std::vector<nv_bfloat16> buf(N);
+                    CUDA_CHECK(cudaMemcpy(buf.data(), (nv_bfloat16*)da.d_mlp_down.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                    for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
+                    fprintf(stderr, "[HOOK] MLPDown layer=%d da.d_mlp_down ptr=%p row95_abssum=%.6f [95,0:4]=%.6f %.6f %.6f %.6f\n",
+                            layer_idx, (void*)da.d_mlp_down.Data, sum_row95,
+                            __bfloat162float(buf[0]), __bfloat162float(buf[1]),
+                            __bfloat162float(buf[2]), __bfloat162float(buf[3]));
+                    hook_dbg++;
+                }
+                if (debug_grads && layer_idx == 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    auto dump_row95 = [&](const char* tag, const Tensor& t) {
+                        if (!t.Data) {
+                            fprintf(stderr, "[DSL GRADS] %s ptr=null\n", tag);
+                            return;
+                        }
+                        long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+                        long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+                        if (rows <= 0 || hidden <= 0) {
+                            fprintf(stderr, "[DSL GRADS] %s ptr=%p\n", tag, (void*)t.Data);
+                            return;
+                        }
+                        long row = std::min<long>(95, rows - 1);
+                        const long N = std::min<long>(64, hidden);
+                        float sum_row = 0.0f;
+                        if (t.DType == ETensorDType::BF16) {
+                            std::vector<nv_bfloat16> buf(N);
+                            CUDA_CHECK(cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                            for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+                        } else if (t.DType == ETensorDType::FP32) {
+                            std::vector<float> buf(N);
+                            CUDA_CHECK(cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost));
+                            for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+                        } else {
+                            fprintf(stderr, "[DSL GRADS] %s ptr=%p dtype=%d\n",
+                                    tag, (void*)t.Data, static_cast<int>(t.DType));
+                            return;
+                        }
+                        fprintf(stderr, "[DSL GRADS] %s row%ld_abssum=%.6f\n", tag, row, sum_row);
+                    };
+                    dump_row95("hook d_mlp_down", da.d_mlp_down);
+                    dump_row95("hook d_res_ffn", da.d_res_ffn);
+                }
 
                 // Projection type 6 = Down
                 const unsigned int dropout_seed = get_dropout_seed(6);
 
+                // Debug: check input tensors for layer 0 at row 95 (first valid row)
+                static int input_chk = 0;
+                if (input_chk < 3 && layer_idx == 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    const long row = 95;
+                    // Check da.d_mlp_down (dL_dy) at row 95
+                    float sum_dy = 0;
+                    std::vector<nv_bfloat16> buf_dy(64);
+                    CUDA_CHECK(cudaMemcpy(buf_dy.data(), (nv_bfloat16*)da.d_mlp_down.Data + row * C, 64 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < 64; i++) sum_dy += fabsf(__bfloat162float(buf_dy[i]));
+                    // Check a.swiglu (x) at row 95
+                    float sum_x = 0;
+                    std::vector<nv_bfloat16> buf_x(64);
+                    CUDA_CHECK(cudaMemcpy(buf_x.data(), (nv_bfloat16*)a.swiglu.Data + row * D, 64 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < 64; i++) sum_x += fabsf(__bfloat162float(buf_x[i]));
+                    fprintf(stderr, "[DSL HOOK INPUT] layer=%d row=%ld dL_dy[row,0:64] abssum=%.6f | x[row,0:64] abssum=%.6f\n",
+                            layer_idx, row, sum_dy, sum_x);
+                    input_chk++;
+                }
+
                 modules::detail::backward_lora_layer(
                     lora_grads.mlp.down->A, lora_grads.mlp.down->B,
                     da.d_swiglu,
-                    da.d_res_ffn, 0,
+                    da.d_mlp_down, 0,
                     a.swiglu,
                     lora_block.mlp.down->A, lora_block.mlp.down->B,
                     mLoRAConfig->scaling(),
@@ -835,8 +913,24 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     mLoRARunState->intermediate, mLoRARunState->slice,
                     B * T, D, C, rank, lora_accum,
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+
+                // Debug: check gradient after computation
+                static int grad_chk = 0;
+                if (grad_chk < 3 && layer_idx == 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    float sum_dA = 0, sum_dB = 0;
+                    std::vector<float> buf_dA(64), buf_dB(64);
+                    CUDA_CHECK(cudaMemcpy(buf_dA.data(), lora_grads.mlp.down->A.Data, 64 * sizeof(float), cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(buf_dB.data(), lora_grads.mlp.down->B.Data, 64 * sizeof(float), cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < 64; i++) { sum_dA += fabsf(buf_dA[i]); sum_dB += fabsf(buf_dB[i]); }
+                    fprintf(stderr, "[DSL HOOK GRAD] layer=%d dA ptr=%p abssum=%.6f | dB ptr=%p abssum=%.6f | accum=%d\n",
+                            layer_idx, (void*)lora_grads.mlp.down->A.Data, sum_dA,
+                            (void*)lora_grads.mlp.down->B.Data, sum_dB, lora_accum);
+                    grad_chk++;
+                }
             } break;
             case modules::BackwardHookPoint::AfterMLPUpBackward: {
+                up_count++;
                 bool lora_accum = false;
                 auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                 lora_accum = lora_accum || accumulate;
@@ -894,6 +988,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     stream);
             } break;
             case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                out_count++;
                 if (!lora_block.attention.o.has_value()) break;
 
                 bool lora_accum = false;
@@ -920,6 +1015,15 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
             } break;
             case modules::BackwardHookPoint::AfterQKVBackward: {
+                qkv_count++;
+                // Print hook invocation summary when all QKV hooks are done (layer 0)
+                if (layer_idx == 0 && step_count < 3) {
+                    fprintf(stderr, "[DSL HOOK SUMMARY] step=%d down=%d up=%d out=%d qkv=%d total=%d\n",
+                            step_count, down_count, up_count, out_count, qkv_count,
+                            down_count + up_count + out_count + qkv_count);
+                    step_count++;
+                    down_count = up_count = out_count = qkv_count = 0;
+                }
                 bool lora_accum = false;
                 auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                 lora_accum = lora_accum || accumulate;
@@ -991,6 +1095,26 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
     };
 
     mExecutor->backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, hook);
+
+    // Debug: print gradient values for first down projection
+    static int grad_dbg = 0;
+    if (grad_dbg < 3) {
+        CUDA_CHECK(cudaStreamSynchronize(main_stream));
+        bool unused_acc = false;
+        auto& g0 = mLoRAGrads->get_block_full(0, main_stream, comm, unused_acc);
+        if (g0.mlp.down.has_value() && g0.mlp.down->A.Data && g0.mlp.down->B.Data) {
+            const long n = std::min<long>(64, g0.mlp.down->A.nelem());
+            std::vector<float> buf_A(n), buf_B(n);
+            cudaMemcpy(buf_A.data(), g0.mlp.down->A.Data, n * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(buf_B.data(), g0.mlp.down->B.Data, n * sizeof(float), cudaMemcpyDeviceToHost);
+            float sum_A = 0, sum_B = 0;
+            for (long i = 0; i < n; i++) { sum_A += fabsf(buf_A[i]); sum_B += fabsf(buf_B[i]); }
+            fprintf(stderr, "[DSL GRAD END] step=%d layer=0 dA abssum=%.6f dB abssum=%.6f\n",
+                    micro_step, sum_A, sum_B);
+        }
+        grad_dbg++;
+    }
+
     mLoRAGrads->end_micro_step(main_stream, comm);
     // Extend the base-model BackwardDone event to include LoRA gradient reductions.
     record_event_if_not_capturing(rs.BackwardDone, main_stream);

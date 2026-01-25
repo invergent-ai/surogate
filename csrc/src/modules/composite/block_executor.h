@@ -6,8 +6,11 @@
 #ifndef SUROGATE_SRC_MODULES_COMPOSITE_BLOCK_EXECUTOR_H
 #define SUROGATE_SRC_MODULES_COMPOSITE_BLOCK_EXECUTOR_H
 
+#include <cmath>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
+#include <vector>
 
 #include "block_spec.h"
 #include "modules/model_config.h"
@@ -971,6 +974,38 @@ struct BlockExecutor {
         const int mamba_chunks = (T + mamba_chunk_size - 1) / mamba_chunk_size;
 
         const bool skip_weight_grad = rs.is_lora_only_mode();
+        const bool debug_grads = std::getenv("SUROGATE_DEBUG_MODULAR_GRADS") != nullptr;
+        const bool debug_matmul = std::getenv("SUROGATE_DEBUG_MODULAR_MATMUL_GRADS") != nullptr;
+        const int debug_mid_layer = config.NumLayers / 2;
+
+        auto dump_row95 = [&](const char* tag, const Tensor& t) {
+            if (!t.Data) {
+                fprintf(stderr, "[MOD GRADS] %s ptr=null\n", tag);
+                return;
+            }
+            long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
+            long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
+            if (rows <= 0 || hidden <= 0) {
+                fprintf(stderr, "[MOD GRADS] %s ptr=%p\n", tag, (void*)t.Data);
+                return;
+            }
+            long row = rows > 95 ? 95 : (rows - 1);
+            const long N = hidden < 64 ? hidden : 64;
+            float sum_row = 0.0f;
+            if (t.DType == ETensorDType::BF16) {
+                std::vector<nv_bfloat16> buf(N);
+                CUDA_CHECK(cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
+            } else if (t.DType == ETensorDType::FP32) {
+                std::vector<float> buf(N);
+                CUDA_CHECK(cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost));
+                for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
+            } else {
+                fprintf(stderr, "[MOD GRADS] %s ptr=%p dtype=%d\n", tag, (void*)t.Data, static_cast<int>(t.DType));
+                return;
+            }
+            fprintf(stderr, "[MOD GRADS] %s layer=%d row%ld_abssum=%.6f\n", tag, layer_idx, row, sum_row);
+        };
 
         recipe_ops::BackwardQuantView qg{&quant_acts, rs.has_grad_quants() ? &quant_grads : nullptr};
 
@@ -1007,6 +1042,12 @@ struct BlockExecutor {
                     accumulate, skip_weight_grad,
                     qg.inp_swiglu(), qg.dout_d_res_ffn(),
                     nullptr, dgrad_cache, stream, allow_quant_layer);
+                if (debug_matmul &&
+                    (layer_idx <= 1 || layer_idx == debug_mid_layer || layer_idx == config.NumLayers - 1)) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    dump_row95("matmul mlp_down d_out", d_acts.d_res_ffn);
+                    dump_row95("matmul mlp_down d_in", d_acts.d_swiglu);
+                }
             }
         };
 
@@ -1074,6 +1115,12 @@ struct BlockExecutor {
                     accumulate, skip_weight_grad,
                     q_in, qg.dout_d_mlp_up(),
                     nullptr, dgrad_cache, stream, allow_quant_layer);
+                if (debug_matmul &&
+                    (layer_idx <= 1 || layer_idx == debug_mid_layer || layer_idx == config.NumLayers - 1)) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    dump_row95("matmul mlp_up d_out", d_acts.d_mlp_up);
+                    dump_row95("matmul mlp_up d_in", d_mlp_in);
+                }
             }
         };
 
@@ -1294,12 +1341,35 @@ struct BlockExecutor {
 
         auto bwd_ln2_dense = [&]() {
             Tensor& ln2_d_weight = ln2_weight_grad(grads);
+            static bool ln2_dbg_top = false;
+            static bool ln2_dbg_mid = false;
+            static bool ln2_dbg_l1 = false;
+            static bool ln2_dbg_l0 = false;
+            const int mid_layer = config.NumLayers / 2;
+            const bool ln2_dbg_layer =
+                (layer_idx == config.NumLayers - 1 && !ln2_dbg_top) ||
+                (layer_idx == mid_layer && !ln2_dbg_mid) ||
+                (layer_idx == 1 && !ln2_dbg_l1) ||
+                (layer_idx == 0 && !ln2_dbg_l0);
+            if (debug_grads && ln2_dbg_layer) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                dump_row95("ln2 pre d_y", d_acts.d_ln2);
+                dump_row95("ln2 pre d_residual_next", d_acts.d_res_ffn);
+            }
             rmsnorm_backward(d_acts.d_res_att, ln2_d_weight, rs.scratch().rmsnorm_scratch,
                              d_acts.d_res_ffn, d_acts.d_ln2,
                              acts.residual_att, weights.ln2.weight, acts.ln2_rstd,
                              qg.d_res_att_abs_max(),
                              B, T, C, rs.DeviceProp, stream,
                              skip_weight_grad);
+            if (debug_grads && ln2_dbg_layer) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                dump_row95("ln2 post d_input", d_acts.d_res_att);
+                if (layer_idx == config.NumLayers - 1) ln2_dbg_top = true;
+                if (layer_idx == mid_layer) ln2_dbg_mid = true;
+                if (layer_idx == 1) ln2_dbg_l1 = true;
+                if (layer_idx == 0) ln2_dbg_l0 = true;
+            }
         };
 
         auto bwd_attn_out = [&]() {
@@ -1313,6 +1383,12 @@ struct BlockExecutor {
                 accumulate, skip_weight_grad,
                 qg.inp_att(), qg.dout_d_res_att(),
                 nullptr, dgrad_cache, stream, allow_quant_layer);
+            if (debug_matmul &&
+                (layer_idx <= 1 || layer_idx == debug_mid_layer || layer_idx == config.NumLayers - 1)) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                dump_row95("matmul attn_out d_out", d_acts.d_res_att);
+                dump_row95("matmul attn_out d_in", d_acts.d_att);
+            }
         };
 
         auto bwd_attention = [&]() {
@@ -1363,6 +1439,12 @@ struct BlockExecutor {
                 accumulate, skip_weight_grad,
                 qg.inp_ln1(), qg.dout_d_qkv(),
                 nullptr, dgrad_cache, stream, allow_quant_layer);
+            if (debug_matmul &&
+                (layer_idx <= 1 || layer_idx == debug_mid_layer || layer_idx == config.NumLayers - 1)) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                dump_row95("matmul qkv d_out", d_acts.d_qkv);
+                dump_row95("matmul qkv d_in", d_acts.d_ln1);
+            }
         };
 
         // Hooks: layer start
