@@ -163,6 +163,8 @@ public:
     modules::SimplifiedQuantGradients& simplified_quant_grads() { return mSimplifiedQuantGrads; }
     modules::FP8ForwardQuantActivations& fp8_forward_quants() { return mFP8ForwardQuants; }
 
+    void reset_simplified_gradients();
+
     modules::NonBlockActivations& non_block_activations() { return mNonBlockActivations; }
     modules::NonBlockGradientBuffers& non_block_gradients() { return mNonBlockGradients; }
     modules::ScratchBuffers& scratch() { return mScratch; }
@@ -274,6 +276,7 @@ private:
 
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
+    std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradientsBase;
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     Tensor mFP8ForwardStats{};

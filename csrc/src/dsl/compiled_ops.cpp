@@ -431,6 +431,22 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // MatmulSwiGLUBackward: fused MLP up+gate backward uses weight at inputs[2]
+    // Set backward_hook_point so LoRA can hook into MLPUp gradients.
+    if (type == CompiledOpType::MatmulSwiGLUBackward) {
+        if (op.inputs.size() > 2) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(op.inputs[2], layer_idx, field)) {
+                if (field == "mlp_up_weight") {
+                    attrs.matmul_op = modules::MatmulOp::MLPUp;
+                    attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
+                }
+                attrs.layer_idx = layer_idx;
+            }
+        }
+    }
+
     return attrs;
 }
 
@@ -1572,24 +1588,44 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         switch (*op.attrs.matmul_op) {
             case modules::MatmulOp::MLPDown:
                 // d_swiglu = dA from MLP down backward
-                if (!grads.d_swiglu.Data) {
-                    grads.d_swiglu.Data = dA_ptr->Data;
-                }
+                grads.d_swiglu.Data = dA_ptr->Data;
                 break;
             case modules::MatmulOp::MLPUp:
                 // d_ln2 = dA from MLP up backward (though this goes through swiglu_backward first)
+                grads.d_ln2.Data = dA_ptr->Data;
                 break;
             case modules::MatmulOp::AttnOut:
                 // d_att = dA from attention out backward
-                if (!grads.d_att.Data) {
-                    grads.d_att.Data = dA_ptr->Data;
-                }
+                grads.d_att.Data = dA_ptr->Data;
                 break;
             case modules::MatmulOp::QKV:
                 // d_ln1 = dA from QKV backward
-                if (!grads.d_ln1.Data) {
-                    grads.d_ln1.Data = dA_ptr->Data;
-                }
+                grads.d_ln1.Data = dA_ptr->Data;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Map d_out to simplified_grads for LoRA hooks that consume upstream gradients directly.
+    if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
+        auto& grads = mRunState.simplified_grads(layer_idx);
+        switch (*op.attrs.matmul_op) {
+            case modules::MatmulOp::MLPDown:
+                // d_res_ffn is the upstream gradient for MLP down
+                grads.d_res_ffn.Data = d_out.Data;
+                break;
+            case modules::MatmulOp::MLPUp:
+                // d_mlp_up is the upstream gradient for MLP up/gate
+                grads.d_mlp_up.Data = d_out.Data;
+                break;
+            case modules::MatmulOp::AttnOut:
+                // d_res_att is the upstream gradient for attention out
+                grads.d_res_att.Data = d_out.Data;
+                break;
+            case modules::MatmulOp::QKV:
+                // d_qkv is the upstream gradient for QKV projections
+                grads.d_qkv.Data = d_out.Data;
                 break;
             default:
                 break;
@@ -1598,40 +1634,19 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
 
     // Hook invocation for LoRA backward
     if (hook && *hook && op.attrs.backward_hook_point.has_value()) {
-        // For LoRA hooks, we need to ensure simplified_grads has the correct data pointers.
-        // The hook reads d_res_ffn/d_res_att as the upstream gradient, but in the compiled
-        // executor these might not be set because the DSL IR doesn't use the standard names.
-        // Set them here before calling the hook.
+        // Ensure activations needed by LoRA hooks are available.
         if (layer_idx >= 0 && op.attrs.matmul_op.has_value()) {
-            auto& grads = mRunState.simplified_grads(layer_idx);
             auto& acts = mRunState.simplified_acts(layer_idx);
-            switch (*op.attrs.matmul_op) {
-                case modules::MatmulOp::MLPDown: {
-                    // d_res_ffn is the upstream gradient (input to mlp_down_backward)
-                    grads.d_res_ffn.Data = d_out.Data;
-
-                    // LoRA backward hook needs acts.swiglu (forward activation).
-                    // With RecomputeBlock=true, swiglu was computed to stack-allocated temp during forward
-                    // and freed at layer end. Need to recompute it now for the LoRA hook.
-                    // Recomputation requires: acts.mlp_up (valid with RecomputeBlock) -> swiglu_forward -> acts.swiglu
-                    bool did_recompute = false;
-                    if (!acts.swiglu.Data && acts.mlp_up.Data) {
-                        // Allocate swiglu buffer on stack
-                        mRunState.temp_acquire(acts.swiglu);
-                        // Recompute swiglu from mlp_up
-                        const int Bv = static_cast<int>(mB);
-                        const int Tv = static_cast<int>(mT);
-                        const int D = static_cast<int>(mConfig.IntermediateSize);
-                        swiglu_forward(acts.swiglu, acts.mlp_up, nullptr, Bv, Tv, D, mRunState.MainStream);
-                        did_recompute = true;
-                    }
-                } break;
-                case modules::MatmulOp::AttnOut:
-                    // d_res_att is the upstream gradient (input to att_out_backward)
-                    grads.d_res_att.Data = d_out.Data;
-                    break;
-                default:
-                    break;
+            if (*op.attrs.matmul_op == modules::MatmulOp::MLPDown) {
+                // LoRA backward hook needs acts.swiglu (forward activation).
+                // With RecomputeBlock=true, swiglu may have been stack-allocated and freed.
+                if (!acts.swiglu.Data && acts.mlp_up.Data) {
+                    mRunState.temp_acquire(acts.swiglu);
+                    const int Bv = static_cast<int>(mB);
+                    const int Tv = static_cast<int>(mT);
+                    const int D = static_cast<int>(mConfig.IntermediateSize);
+                    swiglu_forward(acts.swiglu, acts.mlp_up, nullptr, Bv, Tv, D, mRunState.MainStream);
+                }
             }
         }
         (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
@@ -1692,17 +1707,54 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
                     static_cast<int>(D), mRunState.MainStream);
 }
 
-void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op) {
+void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
     // Combined backward for matmul + swiglu (fused op in forward)
     // inputs: d_swiglu_out, ln2 (matmul input), mlp_up_weight, mlp_up (pre-swiglu)
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& inp = resolve_tensor(op.inputs[1]);
     Tensor& weight = resolve_tensor(op.inputs[2]);
-    Tensor& mlp_up = resolve_tensor(op.inputs[3]);
+    Tensor mlp_up = resolve_tensor(op.inputs[3]);
+
+    const int layer_idx = op.attrs.layer_idx;
+
+    // Recompute mlp_up if the saved tensor was stack-allocated and freed
+    bool recomputed_mlp_up = false;
+    if (!mlp_up.Data || (mRunState.Stack.owns(mlp_up.Data) && !mRunState.Stack.is_live(mlp_up.Data))) {
+        int M = 0, N = 0, K = 0;
+        Tensor inp_flat = (inp.Rank == 2) ? inp : view_tensor(inp, {mB * mT, inp.Sizes[inp.Rank - 1]});
+        matmul_dims(inp_flat, weight, op.attrs.transpose, M, N, K);
+        const long D2 = N;
+        Tensor mlp_up_flat = mRunState.temp_alloc(inp.DType, {mB * mT, D2});
+        mTemps.push_back(mlp_up_flat);
+
+        EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
+        matmul(mlp_up_flat, weight, inp_flat, std::nullopt, nullptr, nullptr,
+               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               N, M, K, mode_col, false, mRunState.MainStream);
+
+        mlp_up = view_tensor(mlp_up_flat, {mB, mT, D2});
+        if (layer_idx >= 0) {
+            auto& acts = mRunState.simplified_acts(layer_idx);
+            acts.mlp_up.Data = mlp_up.Data;
+        }
+        recomputed_mlp_up = true;
+    }
 
     // First: swiglu backward
-    Tensor d_mlp_up = mRunState.temp_alloc(mlp_up.DType, {mlp_up.Sizes[0], mlp_up.Sizes[1], mlp_up.Sizes[2]});
-    mTemps.push_back(d_mlp_up);
+    Tensor* d_mlp_up_ptr = nullptr;
+    if (layer_idx >= 0) {
+        auto& grads = mRunState.simplified_grads(layer_idx);
+        d_mlp_up_ptr = &grads.d_mlp_up;
+        if (!d_mlp_up_ptr->Data) {
+            mRunState.temp_acquire(*d_mlp_up_ptr);
+            mTemps.push_back(*d_mlp_up_ptr);
+        }
+    }
+    Tensor d_mlp_up = d_mlp_up_ptr ? *d_mlp_up_ptr
+                                   : mRunState.temp_alloc(mlp_up.DType, {mlp_up.Sizes[0], mlp_up.Sizes[1], mlp_up.Sizes[2]});
+    if (!d_mlp_up_ptr) {
+        mTemps.push_back(d_mlp_up);
+    }
 
     const long D = d_out.Sizes[2];
     swiglu_backward(d_mlp_up, d_out, mlp_up, nullptr,
@@ -1723,6 +1775,10 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op) {
         d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
     }
 
+    const bool do_accumulate = (op.outputs.size() > 1 && !op.outputs[1].name.empty())
+        ? (mAccumulateTensors.count(op.outputs[1].name) > 0)
+        : false;
+
     if (d_inp_ptr) {
         int M = static_cast<int>(mB * mT);
         int N = static_cast<int>(inp.Sizes[1]);
@@ -1736,10 +1792,19 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op) {
         int M = static_cast<int>(2 * D);
         int N = static_cast<int>(inp.Sizes[2]);
         int K = static_cast<int>(mB * mT);
-        bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
         matmul(*d_weight_ptr, inp_flat, d_mlp_up_flat, std::nullopt, nullptr, nullptr,
                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, accumulate, mRunState.MainStream);
+               N, M, K, EMMTranspose::TN, do_accumulate, mRunState.MainStream);
+    }
+
+    if (layer_idx >= 0 && d_inp_ptr) {
+        auto& grads = mRunState.simplified_grads(layer_idx);
+        grads.d_ln2.Data = d_inp_ptr->Data;
+    }
+
+    // Hook invocation for LoRA backward (MLP up/gate)
+    if (hook && *hook && op.attrs.backward_hook_point.has_value()) {
+        (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
     }
 }
 
@@ -1823,6 +1888,12 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
     }
+
+    // FIX: Zero-initialize d_qkv before cuDNN attention backward to prevent NaN from uninitialized memory.
+    // The d_qkv buffer may contain stale values from previous operations, and cuDNN attention backward
+    // may read parts of this buffer even though it's expected to be output-only. Without this zero-init,
+    // NaN values can appear in the gradient computation and propagate through the backward pass.
+    fill_zero(d_qkv, mRunState.MainStream);
 
     // Signature: attention_backward_cudnn(dqkv, stats, out, dout, qkv, workspace, handle, B, T, Hq, Hkv, HS, stream)
     attention_backward_cudnn(d_qkv, lse, out, d_out, qkv,
@@ -2075,6 +2146,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         int micro_step,
                                         const modules::BackwardHook* hook) {
     mComm = &comm;
+    mRunState.reset_simplified_gradients();
     mTemps.clear();
     mTensorMap.clear();
     mAccumulateTensors.clear();
@@ -2201,7 +2273,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     dispatch_swiglu_backward(op);
                     break;
                 case CompiledOpType::MatmulSwiGLUBackward:
-                    dispatch_matmul_swiglu_backward(op);
+                    dispatch_matmul_swiglu_backward(op, hook);
                     break;
                 case CompiledOpType::RoPEBackward:
                     dispatch_rope_backward(op);

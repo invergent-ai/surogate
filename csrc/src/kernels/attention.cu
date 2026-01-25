@@ -454,8 +454,8 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
     if(out.DType == ETensorDType::FP32) {
         attention_backward_cudnn(dqkv.get<float>(), stats.get<float>(), out.get<float>(), dout.get<float>(), qkv.get<float>(), ws, B, T, Hq, Hkv, HS, stream);
     } else if(out.DType == ETensorDType::BF16) {
-        // TODO make argument order consistent
-        attention_backward_cudnn(dqkv.get<nv_bfloat16>(), stats.get<float>(), dout.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(), out.get<nv_bfloat16>(), ws, handle, B, T, Hq, Hkv, HS, stream);
+        // Argument order is now consistent: out, dout, qkv (matching header declaration)
+        attention_backward_cudnn(dqkv.get<nv_bfloat16>(), stats.get<float>(), out.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(), ws, handle, B, T, Hq, Hkv, HS, stream);
     } else {
         throw std::logic_error("attention_backward: unsupported dtype");
     }

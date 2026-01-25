@@ -746,6 +746,39 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         g.d_att = mAllocator->allocate(dtype, "d_att", kind, {B, T, Hq * D});
         g.d_ln1 = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
+
+    // Preserve the original buffer pointers so we can restore them if the
+    // compiled executor temporarily aliases gradients to stack-backed temps.
+    mSimplifiedGradientsBase = mSimplifiedGradients;
+}
+
+void DslRunState::reset_simplified_gradients() {
+    if (mSimplifiedGradientsBase.size() != mSimplifiedGradients.size()) {
+        return;
+    }
+    for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
+        auto& dst = mSimplifiedGradients[i];
+        const auto& src = mSimplifiedGradientsBase[i];
+
+        dst.d_res_ffn.Data = src.d_res_ffn.Data;
+        dst.d_res_att.Data = src.d_res_att.Data;
+        dst.d_ln2.Data = src.d_ln2.Data;
+        dst.d_mlp_up.Data = src.d_mlp_up.Data;
+        dst.d_swiglu.Data = src.d_swiglu.Data;
+        dst.d_mlp_down.Data = src.d_mlp_down.Data;
+        dst.d_att.Data = src.d_att.Data;
+        dst.d_qkv.Data = src.d_qkv.Data;
+        dst.d_ln1.Data = src.d_ln1.Data;
+
+        dst.d_mamba_normed.Data = src.d_mamba_normed.Data;
+        dst.d_mamba_gated.Data = src.d_mamba_gated.Data;
+        dst.d_mamba_scan_out.Data = src.d_mamba_scan_out.Data;
+        dst.d_mamba_u.Data = src.d_mamba_u.Data;
+        dst.d_mamba_delta.Data = src.d_mamba_delta.Data;
+        dst.d_mamba_B.Data = src.d_mamba_B.Data;
+        dst.d_mamba_C.Data = src.d_mamba_C.Data;
+        dst.d_mamba_conv_out.Data = src.d_mamba_conv_out.Data;
+    }
 }
 
 void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {

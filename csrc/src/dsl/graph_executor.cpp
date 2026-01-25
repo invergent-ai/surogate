@@ -1049,7 +1049,7 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
     }
 
     Tensor lnf_flat = view_tensor(rs.non_block_activations().ln_final, {B * T, config.HiddenSize});
-    Tensor logits = rs.non_block_activations().output;
+    Tensor& logits = rs.non_block_activations().output;  // Use reference to ensure consistency
 
     // Row-major logits = lnf @ lm_head.T -> map to column-major backend by swapping A/B,
     // swapping M/N, and swapping transpose flags.

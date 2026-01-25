@@ -546,25 +546,45 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                     switch (*op_kind) {
                         case modules::MatmulOp::MLPDown:
                             // d_swiglu = dA from MLP down backward
-                            if (!grads.d_swiglu.Data) {
-                                // Tensor was allocated on stack, update the Data pointer
-                                grads.d_swiglu.Data = dA_ptr->Data;
-                            }
+                            // Always update pointer: compiled path can emit temporaries even when
+                            // simplified buffers are pre-allocated.
+                            grads.d_swiglu.Data = dA_ptr->Data;
                             break;
                         case modules::MatmulOp::MLPUp:
-                            // d_ln2 = dA from MLP up backward (though this goes through swiglu_backward first)
+                            // d_ln2 = dA from MLP up backward
+                            grads.d_ln2.Data = dA_ptr->Data;
                             break;
                         case modules::MatmulOp::AttnOut:
                             // d_att = dA from attention out backward
-                            if (!grads.d_att.Data) {
-                                grads.d_att.Data = dA_ptr->Data;
-                            }
+                            grads.d_att.Data = dA_ptr->Data;
                             break;
                         case modules::MatmulOp::QKV:
                             // d_ln1 = dA from QKV backward
-                            if (!grads.d_ln1.Data) {
-                                grads.d_ln1.Data = dA_ptr->Data;
-                            }
+                            grads.d_ln1.Data = dA_ptr->Data;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                // Map d_out to simplified_grads for LoRA hooks that consume upstream gradients directly.
+                if (op_kind.has_value() && layer_idx >= 0) {
+                    auto& grads = rs.simplified_grads(layer_idx);
+                    switch (*op_kind) {
+                        case modules::MatmulOp::MLPDown:
+                            // d_res_ffn is the upstream gradient for MLP down
+                            grads.d_res_ffn.Data = d_out.Data;
+                            break;
+                        case modules::MatmulOp::MLPUp:
+                            // d_mlp_up is the upstream gradient for MLP up/gate
+                            grads.d_mlp_up.Data = d_out.Data;
+                            break;
+                        case modules::MatmulOp::AttnOut:
+                            // d_res_att is the upstream gradient for attention out
+                            grads.d_res_att.Data = d_out.Data;
+                            break;
+                        case modules::MatmulOp::QKV:
+                            // d_qkv is the upstream gradient for QKV projections
+                            grads.d_qkv.Data = d_out.Data;
                             break;
                         default:
                             break;
@@ -594,6 +614,28 @@ void GraphExecutor::execute_backward_graph(long B, long T, NCCLCommunicator& com
                             should_invoke = true;
                         }
                         if (should_invoke) {
+                            // Ensure simplified_grads has upstream gradient for LoRA hooks.
+                            if (lora_layer_idx >= 0) {
+                                auto& grads = rs.simplified_grads(lora_layer_idx);
+                                if (op_kind.has_value()) {
+                                    switch (*op_kind) {
+                                        case modules::MatmulOp::MLPDown:
+                                            grads.d_res_ffn.Data = d_out.Data;
+                                            break;
+                                        case modules::MatmulOp::AttnOut:
+                                            grads.d_res_att.Data = d_out.Data;
+                                            break;
+                                        default:
+                                            break;
+                                    }
+                                } else {
+                                    if (field == "mlp_down_weight") {
+                                        grads.d_res_ffn.Data = d_out.Data;
+                                    } else if (field == "out_weight") {
+                                        grads.d_res_att.Data = d_out.Data;
+                                    }
+                                }
+                            }
                             invoke_backward_hook(lora_layer_idx, do_accumulate, hook_point, rs.MainStream, hook);
                         }
                     }

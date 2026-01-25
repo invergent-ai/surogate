@@ -335,7 +335,7 @@ private:
     void dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_bias_add_backward(const CompiledOp& op);
     void dispatch_swiglu_backward(const CompiledOp& op);
-    void dispatch_matmul_swiglu_backward(const CompiledOp& op);
+    void dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_rope_backward(const CompiledOp& op);
     void dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op);
     void dispatch_flash_attention_backward(const CompiledOp& op);
