@@ -26,7 +26,7 @@ DslGradStore::DslGradStore(const DslParamStore& params,
         if (!params.is_trainable(name)) {
             continue;
         }
-        const Tensor& weight = params.get(name);
+        const Tensor& weight = params.template_tensor(name);
         std::vector<long> shape(weight.Sizes.begin(), weight.Sizes.begin() + weight.Rank);
         Tensor grad = mAllocator->allocate(weight.DType, ("d_" + name).c_str(), EAllocationType::ON_DEVICE, shape);
         mGrads.emplace(name, grad);

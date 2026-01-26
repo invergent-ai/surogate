@@ -1035,7 +1035,6 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
 void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy) {
     auto& rs = mRunState;
     const auto& config = mConfig;
-    (void)comm;
     const size_t V = config.VocabSize;
     const size_t Vp = config.VocabSize;
     const long total_tokens = B * T;
@@ -1046,6 +1045,10 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
     const bool lora_only = rs.is_lora_only_mode();
 
     rs.temp_acquire(rs.non_block_activations().output);
+
+    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
+        mWeightManager->gather_lm_head(comm, rs.MainStream);
+    }
 
     const bool in_capture = stream_is_capturing(rs.MainStream);
     // Ensure targets and gradient zeroing are visible on main stream.
@@ -1134,6 +1137,10 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
                    static_cast<int>(config.HiddenSize), static_cast<int>(nano_batch_size), static_cast<int>(V),
                    swap_transpose(EMMTranspose::NN), false, rs.MainStream);
         }
+    }
+
+    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
+        mWeightManager->release_lm_head(rs.MainStream);
     }
 }
 

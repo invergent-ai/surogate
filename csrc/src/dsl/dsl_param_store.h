@@ -24,6 +24,7 @@ namespace dsl {
 
 struct Module;
 struct Graph;
+class DslWeightManager;
 }
 
 struct RuntimeOptions;
@@ -39,6 +40,7 @@ public:
         Tensor tensor;
         bool trainable = true;
         bool external = false;  ///< Provided by QLoRA weight provider (no local storage)
+        bool managed_by_weight_manager = false;  ///< Provided by DslWeightManager (no local storage)
     };
 
     DslParamStore(const Module& module,
@@ -47,16 +49,21 @@ public:
                   const PretrainedConfig& config,
                   const std::shared_ptr<TensorAllocator>& allocator,
                   const modules::ModularLoRAConfig* lora_config = nullptr,
-                  const std::unordered_set<std::string>* external_params = nullptr);
+                  const std::unordered_set<std::string>* external_params = nullptr,
+                  bool use_weight_manager = false);
 
     Tensor& get(const std::string& name);
     const Tensor& get(const std::string& name) const;
     bool has(const std::string& name) const;
     bool is_trainable(const std::string& name) const;
     bool is_external(const std::string& name) const;
+    /// Return a template tensor (shape + dtype) without forcing provider resolution.
+    const Tensor& template_tensor(const std::string& name) const;
 
     /// Wire an external QLoRA weight provider (optional).
     void set_qlora_provider(QLoRAWeightProvider* provider) { mQLoRAProvider = provider; }
+    /// Wire a DslWeightManager (optional).
+    void set_weight_manager(DslWeightManager* manager) { mWeightManager = manager; }
     /// Set default stream for provider-backed resolution.
     void set_default_stream(cudaStream_t stream) { mDefaultStream = stream; }
 
@@ -70,7 +77,9 @@ private:
     std::vector<std::string> mParamOrder;
     std::unordered_set<std::string> mExternalParams;
     QLoRAWeightProvider* mQLoRAProvider = nullptr;
+    DslWeightManager* mWeightManager = nullptr;
     cudaStream_t mDefaultStream = cudaStreamDefault;
+    bool mUsesWeightManager = false;
 };
 
 } // namespace dsl

@@ -110,7 +110,8 @@ public:
             if (options.DslIrJson.empty()) {
                 throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
             }
-            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc);
+            return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc,
+                                                   std::nullopt, modules::QLoRAConfig{}, rank, world);
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
@@ -171,7 +172,7 @@ public:
             }
             return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc,
                                                    std::optional<ModularLoRAConfig>{lora_config},
-                                                   qlora_config);
+                                                   qlora_config, comm.rank(), comm.world_size());
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);

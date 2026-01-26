@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <regex>
 #include <stdexcept>
+#include <string_view>
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
@@ -26,6 +27,23 @@ bool is_rope_param(const std::string& name) {
 
 bool is_router_param(const std::string& name) {
     return name.find("router") != std::string::npos;
+}
+
+std::string_view trim_optional(std::string_view name) {
+    if (!name.empty() && name.back() == '?') {
+        return name.substr(0, name.size() - 1);
+    }
+    return name;
+}
+
+bool is_embedding_name(std::string_view name) {
+    const std::string_view clean = trim_optional(name);
+    return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens";
+}
+
+bool is_lm_head_name(std::string_view name) {
+    const std::string_view clean = trim_optional(name);
+    return clean == "lm_head" || clean == "lm_head_weight";
 }
 
 // Augment shape env with model config values (same as dsl_runtime.cpp)
@@ -89,7 +107,9 @@ DslWeightManager::DslWeightManager(const Module& module,
                                    const RuntimeOptions& options,
                                    const PretrainedConfig& config,
                                    const std::shared_ptr<TensorAllocator>& allocator,
-                                   const modules::ModularLoRAConfig* lora_config)
+                                   const modules::ModularLoRAConfig* lora_config,
+                                   int shard_idx,
+                                   int num_shards)
     : mAllocator(allocator) {
     if (!mAllocator) {
         throw std::runtime_error("DslWeightManager: allocator is null");
@@ -101,8 +121,8 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.vocab_size = config.VocabSize;
     mConfig.master_dtype = options.MasterDType.value_or(config.DType);
     mConfig.work_dtype = options.ModelType.value_or(config.DType);
-    mConfig.shard_idx = 0;  // TODO: Get from comm
-    mConfig.num_shards = 1; // TODO: Get from comm
+    mConfig.shard_idx = shard_idx;
+    mConfig.num_shards = num_shards;
     mConfig.shard_weights = options.ShardWeights;
     mConfig.offload_master = options.OffloadMaster;
     mConfig.offload_quants = options.OffloadQuants;
@@ -115,6 +135,9 @@ DslWeightManager::DslWeightManager(const Module& module,
 
     // Allocate weights
     allocate_weights(module, graph, lora_config);
+
+    // Resolve non-block parameter names (embeddings/final_norm/lm_head)
+    resolve_non_block_names();
 
     // Allocate prefetch buffers if streaming
     if (mStreamWeights || mConfig.offload_master) {
@@ -139,6 +162,8 @@ void DslWeightManager::allocate_weights(const Module& module,
 
     // Prepare per-layer param name lists
     mBlockParamNames.resize(mConfig.num_layers);
+
+    const bool sharded_master = mConfig.shard_weights && mConfig.num_shards > 1;
 
     for (const auto& kv : graph.params) {
         const std::string& name = kv.first;
@@ -168,6 +193,9 @@ void DslWeightManager::allocate_weights(const Module& module,
             }
         }
 
+        // Cache global (unsharded) shape
+        entry.global_shape = shape;
+
         // Determine allocation location for master weights
         EAllocationType master_alloc = EAllocationType::ON_DEVICE;
         if (mConfig.offload_master && entry.is_block) {
@@ -175,8 +203,21 @@ void DslWeightManager::allocate_weights(const Module& module,
             master_alloc = EAllocationType::PINNED;
         }
 
-        // Allocate master weight
-        entry.master = mAllocator->allocate(dtype, name.c_str(), master_alloc, shape);
+        // Replicate embeddings and lm_head when sharding to avoid per-step all-gather
+        // before forward output projection (memory trade for comm reduction).
+        const bool replicate_non_block =
+            sharded_master && (is_embedding_name(name) || is_lm_head_name(name));
+        const bool entry_sharded = sharded_master && !replicate_non_block;
+
+        // Allocate master weight (sharded if enabled)
+        if (entry_sharded) {
+            TensorShard shard = mAllocator->allocate_shard(dtype, mConfig.shard_idx, mConfig.num_shards,
+                                                           name.c_str(), shape, master_alloc);
+            entry.master = static_cast<Tensor>(shard);
+        } else {
+            entry.master = mAllocator->allocate(dtype, name.c_str(), master_alloc, shape);
+        }
+        entry.master_sharded = entry_sharded;
 
         // Allocate work weight (always on device)
         // If not streaming/offloading, master and work can share storage
@@ -202,6 +243,40 @@ void DslWeightManager::allocate_weights(const Module& module,
     }
 }
 
+const DslWeightEntry* DslWeightManager::find_entry_by_name(const std::string& name) const {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+DslWeightEntry* DslWeightManager::find_entry_by_name(const std::string& name) {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+void DslWeightManager::resolve_non_block_names() {
+    auto match_name = [&](const std::vector<std::string_view>& aliases) -> std::string {
+        for (const auto& kv : mWeights) {
+            const std::string_view clean = trim_optional(kv.first);
+            for (auto alias : aliases) {
+                if (clean == alias) {
+                    return kv.first;
+                }
+            }
+        }
+        return {};
+    };
+
+    mEmbeddingName = match_name({"embedding", "embeddings", "embed_tokens"});
+    mFinalNormName = match_name({"final_norm", "final_norm_weight", "norm"});
+    mLmHeadName = match_name({"lm_head", "lm_head_weight"});
+}
+
 void DslWeightManager::allocate_prefetch_buffers() {
     if (!mStreamWeights && !mConfig.offload_master) {
         return;
@@ -214,7 +289,13 @@ void DslWeightManager::allocate_prefetch_buffers() {
         for (const auto& name : mBlockParamNames[l]) {
             auto it = mWeights.find(name);
             if (it != mWeights.end()) {
-                layer_bytes += it->second.master.bytes();
+                const auto& entry = it->second;
+                if (!entry.global_shape.empty()) {
+                    Tensor tmp = Tensor::empty(entry.master.DType, entry.global_shape);
+                    layer_bytes += tmp.bytes();
+                } else {
+                    layer_bytes += entry.master.bytes();
+                }
             }
         }
         max_layer_bytes = std::max(max_layer_bytes, layer_bytes);
@@ -233,8 +314,11 @@ void DslWeightManager::allocate_prefetch_buffers() {
                 auto it = mWeights.find(name);
                 if (it == mWeights.end()) continue;
                 const auto& entry = it->second;
-                std::vector<long> shape(entry.master.Sizes.begin(),
-                                        entry.master.Sizes.begin() + entry.master.Rank);
+                std::vector<long> shape = entry.global_shape;
+                if (shape.empty()) {
+                    shape.assign(entry.master.Sizes.begin(),
+                                 entry.master.Sizes.begin() + entry.master.Rank);
+                }
                 std::string buf_name = "prefetch_" + std::to_string(i) + "_" + name;
                 Tensor buf = mAllocator->allocate(mConfig.work_dtype, buf_name.c_str(),
                                                   EAllocationType::ON_DEVICE, shape);
@@ -248,9 +332,11 @@ void DslWeightManager::create_cuda_resources() {
     for (int i = 0; i < kNumPrefetchBuffers; ++i) {
         CUDA_CHECK(cudaEventCreate(&mGatherEvents[i]));
         mPrefetchStatus[i].done_event = mGatherEvents[i];
+        CUDA_CHECK(cudaEventRecord(mGatherEvents[i], 0));
     }
     for (int i = 0; i < 3; ++i) {
         CUDA_CHECK(cudaEventCreate(&mNonBlockEvents[i]));
+        CUDA_CHECK(cudaEventRecord(mNonBlockEvents[i], 0));
     }
     mEmbeddingsStatus.done_event = mNonBlockEvents[0];
     mFinalNormStatus.done_event = mNonBlockEvents[1];
@@ -303,6 +389,12 @@ bool DslWeightManager::is_trainable(const std::string& name) const {
     auto it = mWeights.find(name);
     if (it == mWeights.end()) return false;
     return it->second.trainable;
+}
+
+bool DslWeightManager::is_sharded(const std::string& name) const {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) return false;
+    return it->second.master_sharded;
 }
 
 Tensor& DslWeightManager::get_master(const std::string& name) {
@@ -389,22 +481,18 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
 
         Tensor& work = buf_it->second;
 
-        if (mConfig.shard_weights && mConfig.num_shards > 1) {
-            // Sharded: master is local shard, need to all-gather to work buffer
-            // First upload local shard to device if offloaded
-            Tensor local_shard = entry.master;
-            if (mConfig.offload_master) {
-                // Master is on CPU, need temp buffer for upload
-                // Use the work buffer's first 1/N for staging
-                std::size_t shard_bytes = entry.master.bytes();
-                CUDA_CHECK(cudaMemcpyAsync(work.Data, entry.master.Data, shard_bytes,
-                                           cudaMemcpyHostToDevice, stream));
-                local_shard.Data = work.Data;
+        if (entry.master_sharded) {
+            // Sharded: copy/convert local shard into staging buffer, then all-gather into full work tensor.
+            std::vector<long> shard_shape(entry.master.Sizes.begin(),
+                                          entry.master.Sizes.begin() + entry.master.Rank);
+            Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+            convert_to_work(entry.master, staging, stream);
+
+            std::vector<long> global_shape = entry.global_shape;
+            if (global_shape.empty()) {
+                global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
             }
-            // Schedule all-gather: local shard -> full tensor
-            // Build global shape from work tensor (full unsharded shape)
-            std::vector<long> global_shape(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
-            TensorShard local(local_shard, mConfig.shard_idx, mConfig.num_shards, global_shape);
+            TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
             comm.schedule_all_gather(local, work);
         } else {
             // Not sharded or single GPU: just copy/convert
@@ -465,31 +553,150 @@ void DslWeightManager::wait_for_gather(int layer_idx, cudaStream_t stream) {
 }
 
 void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t stream) {
-    // For now, embeddings are always on device - no streaming
-    (void)comm;
-    (void)stream;
+    if ((!mStreamWeights && !mConfig.offload_master) || mEmbeddingName.empty()) {
+        return;
+    }
+    if (mEmbeddingsStatus.version == mVersion) {
+        return;
+    }
+
+    auto* entry = find_entry_by_name(mEmbeddingName);
+    if (!entry) {
+        return;
+    }
+
+    CUDA_CHECK(cudaStreamWaitEvent(stream, mEmbeddingsStatus.done_event, 0));
+    mEmbeddingsStatus.fetch_pending = true;
+    mEmbeddingsStatus.is_ready = false;
+    mEmbeddingsStatus.version = mVersion;
+
+    Tensor& work = entry->work;
+    if (entry->master_sharded) {
+        std::vector<long> shard_shape(entry->master.Sizes.begin(),
+                                      entry->master.Sizes.begin() + entry->master.Rank);
+        Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+        convert_to_work(entry->master, staging, stream);
+
+        std::vector<long> global_shape = entry->global_shape;
+        if (global_shape.empty()) {
+            global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
+        }
+        comm.begin_transaction(stream);
+        TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
+        comm.schedule_all_gather(local, work);
+        comm.execute_transaction(mEmbeddingsStatus.done_event);
+        return;
+    }
+
+    convert_to_work(entry->master, work, stream);
+    CUDA_CHECK(cudaEventRecord(mEmbeddingsStatus.done_event, stream));
 }
 
 void DslWeightManager::release_embeddings(cudaStream_t stream) {
-    (void)stream;
+    if ((!mStreamWeights && !mConfig.offload_master) || mEmbeddingName.empty()) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(mEmbeddingsStatus.done_event, stream));
+    mEmbeddingsStatus.fetch_pending = false;
+    mEmbeddingsStatus.is_ready = true;
 }
 
 void DslWeightManager::gather_final_norm(NCCLCommunicator& comm, cudaStream_t stream) {
-    (void)comm;
-    (void)stream;
+    if ((!mStreamWeights && !mConfig.offload_master) || mFinalNormName.empty()) {
+        return;
+    }
+    if (mFinalNormStatus.version == mVersion) {
+        return;
+    }
+
+    auto* entry = find_entry_by_name(mFinalNormName);
+    if (!entry) {
+        return;
+    }
+
+    CUDA_CHECK(cudaStreamWaitEvent(stream, mFinalNormStatus.done_event, 0));
+    mFinalNormStatus.fetch_pending = true;
+    mFinalNormStatus.is_ready = false;
+    mFinalNormStatus.version = mVersion;
+
+    Tensor& work = entry->work;
+    if (entry->master_sharded) {
+        std::vector<long> shard_shape(entry->master.Sizes.begin(),
+                                      entry->master.Sizes.begin() + entry->master.Rank);
+        Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+        convert_to_work(entry->master, staging, stream);
+
+        std::vector<long> global_shape = entry->global_shape;
+        if (global_shape.empty()) {
+            global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
+        }
+        comm.begin_transaction(stream);
+        TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
+        comm.schedule_all_gather(local, work);
+        comm.execute_transaction(mFinalNormStatus.done_event);
+        return;
+    }
+
+    convert_to_work(entry->master, work, stream);
+    CUDA_CHECK(cudaEventRecord(mFinalNormStatus.done_event, stream));
 }
 
 void DslWeightManager::release_final_norm(cudaStream_t stream) {
-    (void)stream;
+    if ((!mStreamWeights && !mConfig.offload_master) || mFinalNormName.empty()) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(mFinalNormStatus.done_event, stream));
+    mFinalNormStatus.fetch_pending = false;
+    mFinalNormStatus.is_ready = true;
 }
 
 void DslWeightManager::gather_lm_head(NCCLCommunicator& comm, cudaStream_t stream) {
-    (void)comm;
-    (void)stream;
+    if ((!mStreamWeights && !mConfig.offload_master) || mLmHeadName.empty()) {
+        return;
+    }
+    if (mLmHeadStatus.version == mVersion) {
+        return;
+    }
+
+    auto* entry = find_entry_by_name(mLmHeadName);
+    if (!entry) {
+        return;
+    }
+
+    CUDA_CHECK(cudaStreamWaitEvent(stream, mLmHeadStatus.done_event, 0));
+    mLmHeadStatus.fetch_pending = true;
+    mLmHeadStatus.is_ready = false;
+    mLmHeadStatus.version = mVersion;
+
+    Tensor& work = entry->work;
+    if (entry->master_sharded) {
+        std::vector<long> shard_shape(entry->master.Sizes.begin(),
+                                      entry->master.Sizes.begin() + entry->master.Rank);
+        Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+        convert_to_work(entry->master, staging, stream);
+
+        std::vector<long> global_shape = entry->global_shape;
+        if (global_shape.empty()) {
+            global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
+        }
+        comm.begin_transaction(stream);
+        TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
+        comm.schedule_all_gather(local, work);
+        comm.execute_transaction(mLmHeadStatus.done_event);
+        return;
+    }
+
+    convert_to_work(entry->master, work, stream);
+    CUDA_CHECK(cudaEventRecord(mLmHeadStatus.done_event, stream));
 }
 
 void DslWeightManager::release_lm_head(cudaStream_t stream) {
-    (void)stream;
+    if ((!mStreamWeights && !mConfig.offload_master) || mLmHeadName.empty()) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(mLmHeadStatus.done_event, stream));
+    mLmHeadStatus.fetch_pending = false;
+    mLmHeadStatus.is_ready = true;
 }
 
 void DslWeightManager::invalidate() {
@@ -508,7 +715,11 @@ void DslWeightManager::iterate_tensors(const std::function<void(std::string, con
     for (const auto& name : mParamOrder) {
         auto it = mWeights.find(name);
         if (it == mWeights.end()) continue;
-        callback(name, TensorShard(it->second.master));
+        if (it->second.master_sharded && !it->second.global_shape.empty()) {
+            callback(name, TensorShard(it->second.master, mConfig.shard_idx, mConfig.num_shards, it->second.global_shape));
+        } else {
+            callback(name, TensorShard(it->second.master));
+        }
     }
 }
 

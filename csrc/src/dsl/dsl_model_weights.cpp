@@ -41,12 +41,14 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
     const float residual_scale = 1.0f / std::sqrt(2.0f * static_cast<float>(mConfig->NumLayers));
     unsigned long long seed = 42ULL;
     unsigned long long subseq = 0ULL;
+    const unsigned long long shard_base = static_cast<unsigned long long>(mShardIdx) * 100000ULL;
+    const bool use_weight_manager = (mWeightManager != nullptr);
 
     for (const auto& name : mParams->param_names()) {
         if (mParams->is_external(name)) {
             continue;
         }
-        Tensor& param = mParams->get(name);
+        Tensor& param = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         if (internal::is_bias_param_name(name)) {
             fill_zero(param, nullptr);
             continue;
@@ -59,7 +61,11 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         if (internal::contains_ci(name, "out_weight") || internal::contains_ci(name, "mlp_down_weight") || internal::contains_ci(name, "down_proj")) {
             stddev *= residual_scale;
         }
-        fill_normal(param, param.nelem(), 0.f, stddev, seed, subseq++, nullptr);
+        const bool param_sharded = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1) &&
+                                   mWeightManager->is_sharded(name);
+        const unsigned long long param_subseq = param_sharded ? (shard_base + subseq) : subseq;
+        fill_normal(param, param.nelem(), 0.f, stddev, seed, param_subseq, nullptr);
+        ++subseq;
     }
 
     if (lora_enabled()) {
@@ -113,11 +119,32 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         }
     }
 
+    const bool sharded_weights = mWeightManager && mOptions.ShardWeights && (mNumShards > 1);
+    auto shard_range = [&](long global_rows, bool param_sharded) -> std::pair<long, long> {
+        if (!param_sharded) {
+            return {0, global_rows};
+        }
+        if (global_rows % mNumShards != 0) {
+            throw std::runtime_error("DSL model: sharded load requires dim0 divisible by num_shards");
+        }
+        const long shard_rows = global_rows / mNumShards;
+        const long start = shard_rows * mShardIdx;
+        return {start, start + shard_rows};
+    };
+    auto row_stride = [](const std::vector<long>& shape) -> long {
+        long stride = 1;
+        for (std::size_t i = 1; i < shape.size(); ++i) {
+            stride *= shape[i];
+        }
+        return stride;
+    };
+
     for (const auto& name : mParams->param_names()) {
         if (mParams->is_external(name)) {
             continue;
         }
-        Tensor& param = mParams->get(name);
+        Tensor& param = mWeightManager ? mWeightManager->get_master(name) : mParams->get(name);
+        const bool param_sharded = sharded_weights && mWeightManager->is_sharded(name);
         int layer_idx = -1;
         const MappingSpec* spec = internal::find_mapping_spec(mHfMapping, name, layer_idx);
         MappingSpec direct_fallback;
@@ -136,7 +163,16 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             const std::string hf_name = internal::format_hf_name(
                 spec->source.empty() ? name : spec->source, layer_idx);
             const auto& entry = reader.find_entry(hf_name);
-            entry.read_tensor(param, allow_cast);
+            if (!param_sharded) {
+                entry.read_tensor(param, allow_cast);
+            } else {
+                const Tensor& global = mParams->template_tensor(name);
+                const long global_rows = global.Sizes[0];
+                auto [start, end] = shard_range(global_rows, param_sharded);
+                const long stride = row_stride(entry.shape());
+                (void)end;
+                entry.read_raw(param, static_cast<std::ptrdiff_t>(start) * stride, param.nelem(), allow_cast);
+            }
             continue;
         }
 
@@ -144,8 +180,26 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             if (spec->dim != 0) {
                 throw std::runtime_error("DSL model: fuse mapping only supports dim=0 for " + name);
             }
+            std::vector<long> slice_sizes = internal::infer_fuse_slices(name, *mConfig,
+                                                                        static_cast<int>(spec->sources.size()));
+            if (slice_sizes.empty()) {
+                if (param.Sizes[0] % static_cast<long>(spec->sources.size()) == 0) {
+                    const long chunk = param.Sizes[0] / static_cast<long>(spec->sources.size());
+                    slice_sizes.assign(spec->sources.size(), chunk);
+                } else {
+                    throw std::runtime_error("DSL model: cannot infer fuse slices for " + name);
+                }
+            } else if (slice_sizes.size() != spec->sources.size()) {
+                throw std::runtime_error("DSL model: fuse slice count mismatch for " + name);
+            }
+
+            const Tensor& global = mParams->template_tensor(name);
+            const long global_rows = global.Sizes[0];
+            auto [shard_start, shard_end] = shard_range(global_rows, param_sharded);
+
             long offset = 0;
-            for (const auto& src : spec->sources) {
+            for (std::size_t i = 0; i < spec->sources.size(); ++i) {
+                const auto& src = spec->sources[i];
                 const std::string hf_name = internal::format_hf_name(src, layer_idx);
                 const auto& entry = reader.find_entry(hf_name);
                 if (entry.shape().empty()) {
@@ -154,17 +208,36 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 if (static_cast<int>(entry.shape().size()) != param.Rank) {
                     throw std::runtime_error("DSL model: rank mismatch for " + hf_name);
                 }
-                for (int i = 1; i < param.Rank; ++i) {
-                    if (entry.shape().at(i) != param.Sizes[i]) {
+                for (int j = 1; j < param.Rank; ++j) {
+                    if (entry.shape().at(j) != global.Sizes[j]) {
                         throw std::runtime_error("DSL model: shape mismatch for " + hf_name);
                     }
                 }
-                const long slice_len = entry.shape().at(0);
-                Tensor slice = internal::slice_dim0(param, offset, slice_len);
-                entry.read_raw(slice, 0, slice.nelem(), allow_cast);
+
+                const long slice_len = slice_sizes.at(i);
+                if (!param_sharded) {
+                    Tensor slice = internal::slice_dim0(param, offset, slice_len);
+                    entry.read_raw(slice, 0, slice.nelem(), allow_cast);
+                    offset += slice_len;
+                    continue;
+                }
+
+                const long src_begin = offset;
+                const long src_end = offset + slice_len;
+                const long overlap_begin = std::max(src_begin, shard_start);
+                const long overlap_end = std::min(src_end, shard_end);
+                if (overlap_begin < overlap_end) {
+                    const long rows = overlap_end - overlap_begin;
+                    const long dst_row_offset = overlap_begin - shard_start;
+                    const long src_row_offset = overlap_begin - src_begin;
+                    Tensor slice = internal::slice_dim0(param, dst_row_offset, rows);
+                    const long stride = row_stride(entry.shape());
+                    entry.read_raw(slice, static_cast<std::ptrdiff_t>(src_row_offset) * stride,
+                                   slice.nelem(), allow_cast);
+                }
                 offset += slice_len;
             }
-            if (offset != param.Sizes[0]) {
+            if (offset != global_rows) {
                 throw std::runtime_error("DSL model: fuse mapping size mismatch for " + name);
             }
             continue;
@@ -182,17 +255,27 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 throw std::runtime_error("DSL model: unsupported split range for " + name);
             }
             const long expected = end - start;
-            if (param.Sizes[0] != expected) {
-                throw std::runtime_error("DSL model: split range size mismatch for " + name);
-            }
             const std::string hf_name = internal::format_hf_name(spec->source, layer_idx);
             const auto& entry = reader.find_entry(hf_name);
-            long stride = 1;
-            for (int i = 1; i < param.Rank; ++i) {
-                stride *= param.Sizes[i];
+            if (!param_sharded) {
+                if (param.Sizes[0] != expected) {
+                    throw std::runtime_error("DSL model: split range size mismatch for " + name);
+                }
+                long stride = 1;
+                for (int i = 1; i < param.Rank; ++i) {
+                    stride *= param.Sizes[i];
+                }
+                const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(start) * stride;
+                entry.read_raw(param, offset, param.nelem(), allow_cast);
+            } else {
+                const long shard_rows = expected / mNumShards;
+                if (expected % mNumShards != 0 || param.Sizes[0] != shard_rows) {
+                    throw std::runtime_error("DSL model: split shard size mismatch for " + name);
+                }
+                const long local_start = start + shard_rows * mShardIdx;
+                const long stride = row_stride(entry.shape());
+                entry.read_raw(param, static_cast<std::ptrdiff_t>(local_start) * stride, param.nelem(), allow_cast);
             }
-            const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(start) * stride;
-            entry.read_raw(param, offset, param.nelem(), allow_cast);
             continue;
         }
 
@@ -205,14 +288,37 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             if (entry.shape().size() != 2 || param.Rank != 2) {
                 throw std::runtime_error("DSL model: transpose expects 2D tensors for " + name);
             }
-            Tensor tmp = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
-                                              EAllocationType::ON_DEVICE,
-                                              {entry.shape().at(0), entry.shape().at(1)});
-            entry.read_tensor(tmp, allow_cast);
-            cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-            transpose(param, tmp, static_cast<int>(entry.shape().at(0)),
-                      static_cast<int>(entry.shape().at(1)), stream);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (!param_sharded) {
+                Tensor tmp = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
+                                                  EAllocationType::ON_DEVICE,
+                                                  {entry.shape().at(0), entry.shape().at(1)});
+                entry.read_tensor(tmp, allow_cast);
+                cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+                transpose(param, tmp, static_cast<int>(entry.shape().at(0)),
+                          static_cast<int>(entry.shape().at(1)), stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            } else {
+                const Tensor& global = mParams->template_tensor(name);
+                const long global_rows = global.Sizes[0];
+                auto [start, end] = shard_range(global_rows, param_sharded);
+                if (param.Sizes[0] != (end - start)) {
+                    throw std::runtime_error("DSL model: transpose shard size mismatch for " + name);
+                }
+                Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_src_" + name).c_str(),
+                                                      EAllocationType::ON_DEVICE,
+                                                      {entry.shape().at(0), entry.shape().at(1)});
+                entry.read_tensor(tmp_src, allow_cast);
+                Tensor tmp_full = mAllocator->allocate(param.DType, ("hf_tmp_full_" + name).c_str(),
+                                                       EAllocationType::ON_DEVICE,
+                                                       {global.Sizes[0], global.Sizes[1]});
+                cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+                transpose(tmp_full, tmp_src, static_cast<int>(entry.shape().at(0)),
+                          static_cast<int>(entry.shape().at(1)), stream);
+                Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
+                CUDA_CHECK(cudaMemcpyAsync(param.Data, slice.Data, param.bytes(),
+                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
             continue;
         }
 
@@ -223,8 +329,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         if (mParams->is_external(tie.first) || mParams->is_external(tie.second)) {
             continue;
         }
-        Tensor& dst = mParams->get(tie.first);
-        Tensor& src = mParams->get(tie.second);
+        Tensor& dst = mWeightManager ? mWeightManager->get_master(tie.first) : mParams->get(tie.first);
+        Tensor& src = mWeightManager ? mWeightManager->get_master(tie.second) : mParams->get(tie.second);
         CUDA_CHECK(cudaMemcpy(dst.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice));
     }
 
@@ -260,6 +366,9 @@ void DslModel::prepare_optimizer_for_checkpoint_load() {
 void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& comm) {
     if (!mParams) {
         throw std::logic_error("DslModel::export_weights called before parameters are initialized");
+    }
+    if (mWeightManager && mOptions.ShardWeights && mNumShards > 1) {
+        throw std::runtime_error("DslModel::export_weights: export is not supported for sharded weights; use --gpus 1");
     }
 
     const auto& mapping = !mHfExport.empty() ? mHfExport : mHfMapping;

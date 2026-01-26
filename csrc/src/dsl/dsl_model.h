@@ -95,7 +95,9 @@ public:
              const std::string& ir_json,
              const std::shared_ptr<TensorAllocator>& allocator,
              const std::optional<modules::ModularLoRAConfig>& lora_config = std::nullopt,
-             const modules::QLoRAConfig& qlora_config = modules::QLoRAConfig{});
+             const modules::QLoRAConfig& qlora_config = modules::QLoRAConfig{},
+             int shard_idx = 0,
+             int num_shards = 1);
     ~DslModel() override;
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
@@ -219,6 +221,8 @@ private:
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;
+    int mShardIdx = 0;
+    int mNumShards = 1;
     std::unique_ptr<QLoRAWeightProvider> mQLoRAProvider;
 
     struct AdamW8BitState {

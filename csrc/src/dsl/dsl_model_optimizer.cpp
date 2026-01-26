@@ -6,11 +6,13 @@
 #include "dsl/dsl_model.h"
 #include "dsl/dsl_model_internal.h"
 #include "dsl/dsl_runtime.h"
+#include "dsl/dsl_weight_manager.h"
 #include "kernels/kernels.h"
 #include "modules/fp8_scaling_state.h"
 #include "modules/optimizers/adamw_8bit.h"
 #include "modules/optimizers/normuon.h"
 #include "utilities/comm.h"
+#include "utilities/tensor.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -35,6 +37,12 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     auto& rs = *mRunState;
     cudaStream_t stream = rs.MainStream;
     wait_event_if_not_capturing(stream, rs.BackwardDone);
+
+    const bool use_weight_manager = (mWeightManager != nullptr);
+    const bool sharded_weights = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1);
+    auto param_is_sharded = [&](const std::string& name) -> bool {
+        return sharded_weights && mWeightManager->is_sharded(name);
+    };
 
     // Check if async all-reduce was already started in backward()
     const bool grads_reduced = comm.world_size() > 1;
@@ -64,12 +72,18 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     size_t state_offset = 0;
 
     for (const auto& name : mGrads->param_names()) {
-        Tensor& val = mParams->get(name);
+        Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         bool accumulate = false;
         Tensor* grad = mGrads->get_param_grad(name, accumulate);
         (void)accumulate;
         if (!grad) {
             continue;
+        }
+
+        const bool param_sharded = param_is_sharded(name);
+        Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
+        if (param_sharded && grad_view.nelem() != val.nelem()) {
+            throw std::runtime_error("DslModel::update: sharded grad size mismatch for " + name);
         }
 
         float wd = weight_decay;
@@ -79,7 +93,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
 
         state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         const size_t n = val.nelem();
-        if (!val.Data || !grad->Data) {
+        if (!val.Data || !grad_view.Data) {
             state_offset += n;
             continue;
         }
@@ -93,18 +107,18 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         float* q2 = state.quantiles2.template get<float>();
 
         if (val.DType == ETensorDType::FP32) {
-            if (grad->DType == ETensorDType::FP32) {
+            if (grad_view.DType == ETensorDType::FP32) {
                 adamw_update_8bit(
                     val.template get<float>(),
-                    grad->template get<float>(),
+                    grad_view.template get<float>(),
                     s1, s2, n,
                     learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
                     q1, q2, am1, am2, nullptr, nullptr, stream
                 );
-            } else if (grad->DType == ETensorDType::BF16) {
+            } else if (grad_view.DType == ETensorDType::BF16) {
                 adamw_update_8bit(
                     val.template get<float>(),
-                    grad->template get<nv_bfloat16>(),
+                    grad_view.template get<nv_bfloat16>(),
                     s1, s2, n,
                     learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
                     q1, q2, am1, am2, nullptr, nullptr, stream
@@ -113,12 +127,12 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
                 throw std::runtime_error("DslModel::update: unsupported grad dtype for " + name);
             }
         } else if (val.DType == ETensorDType::BF16) {
-            if (grad->DType != ETensorDType::BF16) {
+            if (grad_view.DType != ETensorDType::BF16) {
                 throw std::runtime_error("DslModel::update: unsupported grad dtype for " + name);
             }
             adamw_update_8bit(
                 val.template get<nv_bfloat16>(),
-                grad->template get<nv_bfloat16>(),
+                grad_view.template get<nv_bfloat16>(),
                 s1, s2, n,
                 learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
                 q1, q2, am1, am2, nullptr, nullptr, stream
@@ -139,6 +153,10 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         }
     }
 
+    if (mWeightManager) {
+        mWeightManager->invalidate();
+    }
+
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
@@ -154,6 +172,12 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
     auto& rs = *mRunState;
     cudaStream_t stream = rs.MainStream;
     wait_event_if_not_capturing(stream, rs.BackwardDone);
+
+    const bool use_weight_manager = (mWeightManager != nullptr);
+    const bool sharded_weights = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1);
+    auto param_is_sharded = [&](const std::string& name) -> bool {
+        return sharded_weights && mWeightManager->is_sharded(name);
+    };
 
     // Check if async all-reduce was already started in backward()
     const bool grads_reduced = comm.world_size() > 1;
@@ -178,7 +202,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
     size_t state_offset = 0;
 
     for (const auto& name : mGrads->param_names()) {
-        Tensor& val = mParams->get(name);
+        Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         bool accumulate = false;
         Tensor* grad = mGrads->get_param_grad(name, accumulate);
         (void)accumulate;
@@ -186,11 +210,17 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
             continue;
         }
 
+        const bool param_sharded = param_is_sharded(name);
+        Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
+        if (param_sharded && grad_view.nelem() != val.nelem()) {
+            throw std::runtime_error("DslModel::update_adamw_8bit_graph: sharded grad size mismatch for " + name);
+        }
+
         const float wd_scale = (is_norm_param_name(name) || is_bias_param_name(name)) ? 0.f : 1.f;
 
         state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         const size_t n = val.nelem();
-        if (!val.Data || !grad->Data) {
+        if (!val.Data || !grad_view.Data) {
             state_offset += n;
             continue;
         }
@@ -204,18 +234,18 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
         float* q2 = state.quantiles2.template get<float>();
 
         if (val.DType == ETensorDType::FP32) {
-            if (grad->DType == ETensorDType::FP32) {
+            if (grad_view.DType == ETensorDType::FP32) {
                 adamw_update_8bit(
                     val.template get<float>(),
-                    grad->template get<float>(),
+                    grad_view.template get<float>(),
                     s1, s2, n,
                     /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, wd_scale, grad_scale,
                     q1, q2, am1, am2, opt_params, opt_step, stream
                 );
-            } else if (grad->DType == ETensorDType::BF16) {
+            } else if (grad_view.DType == ETensorDType::BF16) {
                 adamw_update_8bit(
                     val.template get<float>(),
-                    grad->template get<nv_bfloat16>(),
+                    grad_view.template get<nv_bfloat16>(),
                     s1, s2, n,
                     /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, wd_scale, grad_scale,
                     q1, q2, am1, am2, opt_params, opt_step, stream
@@ -224,12 +254,12 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
                 throw std::runtime_error("DslModel::update_adamw_8bit_graph: unsupported grad dtype for " + name);
             }
         } else if (val.DType == ETensorDType::BF16) {
-            if (grad->DType != ETensorDType::BF16) {
+            if (grad_view.DType != ETensorDType::BF16) {
                 throw std::runtime_error("DslModel::update_adamw_8bit_graph: unsupported grad dtype for " + name);
             }
             adamw_update_8bit(
                 val.template get<nv_bfloat16>(),
-                grad->template get<nv_bfloat16>(),
+                grad_view.template get<nv_bfloat16>(),
                 s1, s2, n,
                 /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, wd_scale, grad_scale,
                 q1, q2, am1, am2, opt_params, opt_step, stream
@@ -248,6 +278,10 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
         if (auto* fp8_state = rs.get_fp8_scaling_state()) {
             delayed_scaling_update(*fp8_state, stream);
         }
+    }
+
+    if (mWeightManager) {
+        mWeightManager->invalidate();
     }
 
     record_event_if_not_capturing(rs.OptimizerDone, stream);
@@ -354,6 +388,7 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
     constexpr size_t BLOCK_SIZE = 2048;
     size_t total_params = 0;
     size_t state_elems = 0;
+    const bool use_weight_manager = (mWeightManager != nullptr);
     auto add_tensor = [&](size_t n) {
         total_params += n;
         state_elems = (state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
@@ -361,7 +396,7 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
     };
 
     for (const auto& name : mGrads->param_names()) {
-        Tensor& param = mParams->get(name);
+        Tensor& param = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         add_tensor(param.nelem());
     }
 

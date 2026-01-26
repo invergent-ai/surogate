@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "dsl/ir.h"
+#include "dsl/dsl_weight_manager.h"
 #include "training/runtime_options.h"
 #include "training/model.h"
 #include "modules/lora/lora_config.h"
@@ -103,7 +104,8 @@ DslParamStore::DslParamStore(const Module& module,
                              const PretrainedConfig& config,
                              const std::shared_ptr<TensorAllocator>& allocator,
                              const modules::ModularLoRAConfig* lora_config,
-                             const std::unordered_set<std::string>* external_params)
+                             const std::unordered_set<std::string>* external_params,
+                             bool use_weight_manager)
     : mAllocator(allocator) {
     if (!mAllocator) {
         throw std::runtime_error("DslParamStore: allocator is null");
@@ -122,6 +124,8 @@ DslParamStore::DslParamStore(const Module& module,
         mExternalParams = *external_params;
     }
 
+    mUsesWeightManager = use_weight_manager;
+
     for (const auto& kv : graph.params) {
         const std::string& name = kv.first;
         const TensorInfo& info = kv.second;
@@ -136,7 +140,8 @@ DslParamStore::DslParamStore(const Module& module,
 
         Entry entry;
         entry.external = mExternalParams.find(name) != mExternalParams.end();
-        if (entry.external) {
+        entry.managed_by_weight_manager = (!entry.external && mUsesWeightManager);
+        if (entry.external || entry.managed_by_weight_manager) {
             entry.tensor = Tensor::empty(dtype, shape);
         } else {
             entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
@@ -165,6 +170,12 @@ Tensor& DslParamStore::get(const std::string& name) {
         }
         return mQLoRAProvider->resolve_param(name, mDefaultStream);
     }
+    if (it->second.managed_by_weight_manager) {
+        if (!mWeightManager) {
+            throw std::runtime_error("DslParamStore: weight manager not set for parameter " + name);
+        }
+        return mWeightManager->get(name);
+    }
     return it->second.tensor;
 }
 
@@ -178,6 +189,12 @@ const Tensor& DslParamStore::get(const std::string& name) const {
             throw std::runtime_error("DslParamStore: external parameter requested without QLoRA provider: " + name);
         }
         return mQLoRAProvider->resolve_param(name, mDefaultStream);
+    }
+    if (it->second.managed_by_weight_manager) {
+        if (!mWeightManager) {
+            throw std::runtime_error("DslParamStore: weight manager not set for parameter " + name);
+        }
+        return mWeightManager->get(name);
     }
     return it->second.tensor;
 }
@@ -198,7 +215,22 @@ bool DslParamStore::is_external(const std::string& name) const {
     return it->second.external;
 }
 
+const Tensor& DslParamStore::template_tensor(const std::string& name) const {
+    auto it = mParams.find(name);
+    if (it == mParams.end()) {
+        throw std::runtime_error("DslParamStore: missing parameter " + name);
+    }
+    return it->second.tensor;
+}
+
 void DslParamStore::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
+    if (mUsesWeightManager) {
+        if (!mWeightManager) {
+            throw std::runtime_error("DslParamStore: weight manager not set for iterate_tensors");
+        }
+        mWeightManager->iterate_tensors(callback);
+        return;
+    }
     for (const auto& name : mParamOrder) {
         auto it = mParams.find(name);
         if (it == mParams.end()) continue;

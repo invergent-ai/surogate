@@ -2802,6 +2802,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mTensorMap["position_ids"] = mRunState.PositionIDs;
     mTensorMap["x0"] = mRunState.non_block_activations().encoded;
 
+    // Ensure non-block weights are gathered if streaming/offload is enabled
+    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
+        mWeightManager->gather_embeddings(comm, mRunState.MainStream);
+        mWeightManager->gather_final_norm(comm, mRunState.MainStream);
+    }
+
     // Prefetch layer 0 before loop
     if (mConfig.NumLayers > 0 && !mCapturing) {
         if (mWeightManager && mWeightManager->is_streaming_enabled()) {
@@ -2904,6 +2910,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         mRunState.temp_free(*it);
     }
     mTemps.clear();
+
+    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
+        mWeightManager->release_embeddings(mRunState.MainStream);
+        mWeightManager->release_final_norm(mRunState.MainStream);
+    }
 }
 
 void CompiledExecutor::execute_backward(const CompiledGraph& graph,
@@ -2918,6 +2929,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mAccumulateTensors.clear();
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
+
+    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
+        mWeightManager->gather_final_norm(comm, mRunState.MainStream);
+        if (mOptions.LMHeadChunks <= 1) {
+            mWeightManager->gather_lm_head(comm, mRunState.MainStream);
+        }
+    }
 
     // Save stack checkpoint at start of backward - we'll restore per-layer to manage memory
     auto initial_checkpoint = mRunState.Stack.checkpoint();
@@ -3144,6 +3162,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Final cleanup
     mRunState.Stack.restore(initial_checkpoint);
     mTemps.clear();
+
+    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
+        mWeightManager->release_final_norm(mRunState.MainStream);
+        if (mOptions.LMHeadChunks <= 1) {
+            mWeightManager->release_lm_head(mRunState.MainStream);
+        }
+    }
 }
 
 }  // namespace dsl

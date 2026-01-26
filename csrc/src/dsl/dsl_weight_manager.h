@@ -70,6 +70,8 @@ struct DslWeightManagerConfig {
 struct DslWeightEntry {
     Tensor master;           ///< Master weight (may be on CPU if offloaded)
     Tensor work;             ///< Work weight (always on GPU during computation)
+    std::vector<long> global_shape; ///< Full (unsharded) shape for this weight
+    bool master_sharded = false; ///< Whether master tensor is sharded across ranks
     bool trainable = true;   ///< Whether this weight is trainable
     bool is_block = false;   ///< Whether this is a per-layer block weight
     int layer_idx = -1;      ///< Layer index for block weights (-1 for non-block)
@@ -94,7 +96,9 @@ public:
                      const RuntimeOptions& options,
                      const PretrainedConfig& config,
                      const std::shared_ptr<TensorAllocator>& allocator,
-                     const modules::ModularLoRAConfig* lora_config = nullptr);
+                     const modules::ModularLoRAConfig* lora_config = nullptr,
+                     int shard_idx = 0,
+                     int num_shards = 1);
     ~DslWeightManager();
 
     // Weight access (simple path - all weights resident)
@@ -127,6 +131,7 @@ public:
     int num_layers() const { return mConfig.num_layers; }
     bool is_streaming_enabled() const { return mStreamWeights; }
     bool is_offload_enabled() const { return mConfig.offload_master || mConfig.offload_quants; }
+    bool is_sharded(const std::string& name) const;
 
     // ITensorContainer interface (for checkpointing)
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
@@ -143,6 +148,11 @@ private:
 
     // Helper to parse layer index from weight name
     static bool parse_layer_index(const std::string& name, int& layer_idx);
+
+    // Resolve non-block parameter names (embedding/final_norm/lm_head)
+    void resolve_non_block_names();
+    const DslWeightEntry* find_entry_by_name(const std::string& name) const;
+    DslWeightEntry* find_entry_by_name(const std::string& name);
 
     std::shared_ptr<TensorAllocator> mAllocator;
     DslWeightManagerConfig mConfig;
@@ -166,6 +176,11 @@ private:
     WeightGatherStatus mEmbeddingsStatus;
     WeightGatherStatus mFinalNormStatus;
     WeightGatherStatus mLmHeadStatus;
+
+    // Cached non-block parameter names
+    std::string mEmbeddingName;
+    std::string mFinalNormName;
+    std::string mLmHeadName;
 
     // CUDA resources
     cudaEvent_t mGatherEvents[kNumPrefetchBuffers] = {nullptr, nullptr};

@@ -506,12 +506,16 @@ DslModel::DslModel(const PretrainedConfig& config,
                    const std::string& ir_json,
                    const std::shared_ptr<TensorAllocator>& allocator,
                    const std::optional<modules::ModularLoRAConfig>& lora_config,
-                   const modules::QLoRAConfig& qlora_config)
+                   const modules::QLoRAConfig& qlora_config,
+                   int shard_idx,
+                   int num_shards)
     : mConfig(config.clone()),
       mAllocator(allocator ? allocator : std::make_shared<TensorAllocator>()),
       mOptions(options),
       mModelConfig(modules::ModelConfig::from_pretrained_config(config)),
-      mQLoRAConfig(qlora_config) {
+      mQLoRAConfig(qlora_config),
+      mShardIdx(shard_idx),
+      mNumShards(num_shards) {
     if (ir_json.empty()) {
         throw std::runtime_error("DSL model: IR JSON is empty");
     }
@@ -538,17 +542,20 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
     }
 
+    const bool use_weight_manager = (options.ShardWeights || options.OffloadMaster) && !mQLoRAConfig.is_quantized();
     mParams = std::make_unique<DslParamStore>(*mModule, mModule->forward.value(),
                                               options, *mConfig, mAllocator,
                                               lora_config ? &*lora_config : nullptr,
-                                              external_params.empty() ? nullptr : &external_params);
+                                              external_params.empty() ? nullptr : &external_params,
+                                              use_weight_manager);
     mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator);
 
     // Create weight manager for streaming/sharding if enabled
-    if ((options.ShardWeights || options.OffloadMaster) && !mQLoRAConfig.is_quantized()) {
+    if (use_weight_manager) {
         mWeightManager = std::make_unique<DslWeightManager>(
             *mModule, mModule->forward.value(), options, *mConfig, mAllocator,
-            lora_config ? &*lora_config : nullptr);
+            lora_config ? &*lora_config : nullptr, mShardIdx, mNumShards);
+        mParams->set_weight_manager(mWeightManager.get());
     }
 
     if (lora_config.has_value() && lora_config->enabled()) {
@@ -564,8 +571,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         wm.head_size = mModelConfig.head_size();
         wm.lora_config = *mLoRAConfig;
         wm.work_dtype = mModelConfig.DType;
-        wm.shard_idx = 0;
-        wm.num_shards = 1;
+        wm.shard_idx = mShardIdx;
+        wm.num_shards = mNumShards;
         wm.is_moe = mIsMoEModel;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
@@ -585,8 +592,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         gm.head_size = mModelConfig.head_size();
         gm.lora_config = *mLoRAConfig;
         gm.grad_dtype = mLoRAConfig->dtype;
-        gm.shard_idx = 0;
-        gm.num_shards = 1;
+        gm.shard_idx = mShardIdx;
+        gm.num_shards = mNumShards;
         gm.is_moe = mIsMoEModel;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             gm.num_experts = mModelConfig.moe_config->num_experts;
