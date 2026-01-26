@@ -226,7 +226,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Dropout rate for LoRA adapters.
         lora_dype(Optional[Literal['bf16','fp32']], defaults to 'fp32):
             Dropout rate for LoRA adapters.
-        lora_target_modules (Optional[str], default to 'all-linear'):
+        lora_target_modules (Optional[str], default to 'all'):
             List of comma-separated module names to apply LoRA adapters to.
         train_router (Optional[bool], defaults to False):
             Train the MoE router gate weights during LoRA fine-tuning.
@@ -470,7 +470,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.lora_alpha = cfg.get('lora_alpha', self.lora_alpha)
         self.lora_dropout = cfg['lora_dropout'] if 'lora_dropout' in cfg else self.lora_dropout
         self.lora_dtype = cfg.get('lora_dtype', self.lora_dtype)
-        self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
+        self.lora_target_modules = cfg.get('lora_target_modules', ['all'])
         self.train_router = cfg.get('train_router', self.train_router)
         self.router_aux_loss_coef = cfg.get('router_aux_loss_coef', self.router_aux_loss_coef)
         self.router_z_loss_coef = cfg.get('router_z_loss_coef', self.router_z_loss_coef)
