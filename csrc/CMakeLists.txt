@@ -251,7 +251,6 @@ target_sources(surogate-common PRIVATE
     src/dsl/graph_executor_utils.cpp
     src/dsl/graph_executor_tensors.cpp
     src/dsl/graph_executor_weight_cache.cpp
-    src/dsl/graph_executor_forward.cpp
     src/dsl/graph_executor_backward.cpp
     src/dsl/graph_executor_helpers.cpp
     src/dsl/compiled_ops.cpp

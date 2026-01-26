@@ -410,11 +410,8 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
         mForwardPlan.resize(static_cast<std::size_t>(mConfig.NumLayers));
     }
 
-    // Initialize compiled execution if enabled
-    mUseCompiledExecution = options.use_compiled_execution;
-    if (mUseCompiledExecution) {
-        init_compiled_execution();
-    }
+    // Initialize compiled execution
+    init_compiled_execution();
 }
 
 void GraphExecutor::reset_forward_plan() {
@@ -524,8 +521,8 @@ bool GraphExecutor::internal_graphs_enabled() const {
     return mGraphsEnabled;
 }
 
-void GraphExecutor::execute_forward_compiled(long B, long T, NCCLCommunicator& comm, bool full,
-                                              const modules::ForwardHook* hook) {
+void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
+                                    const modules::ForwardHook* hook) {
     compile_graphs(B, T);
 
     if (!mCompiledForward || !mCompiledExecutor) {
@@ -561,8 +558,8 @@ void GraphExecutor::execute_forward_compiled(long B, long T, NCCLCommunicator& c
     mCompiledExecutor->set_capturing(false);
 }
 
-void GraphExecutor::execute_backward_compiled(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
-                                               int micro_step, const modules::BackwardHook* hook) {
+void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
+                                     int micro_step, const modules::BackwardHook* hook) {
     compile_graphs(B, T);
 
     if (!mCompiledBackward || !mCompiledExecutor) {
@@ -658,11 +655,7 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    if (mUseCompiledExecution) {
-        execute_forward_compiled(B, T, comm, /*full=*/false, nullptr);
-    } else {
-        execute_forward_graph(B, T, comm, /*full=*/false);
-    }
+    execute_forward(B, T, comm, /*full=*/false, nullptr);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -708,11 +701,7 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    if (mUseCompiledExecution) {
-        execute_forward_compiled(B, T, comm, /*full=*/false, nullptr);
-    } else {
-        execute_forward_graph(B, T, comm, /*full=*/false);
-    }
+    execute_forward(B, T, comm, /*full=*/false, nullptr);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -808,11 +797,7 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     }
 
-    if (mUseCompiledExecution) {
-        execute_backward_compiled(B, T, comm, grad_accum_steps, micro_step, nullptr);
-    } else {
-        execute_backward_graph(B, T, comm, grad_accum_steps, micro_step);
-    }
+    execute_backward(B, T, comm, grad_accum_steps, micro_step, nullptr);
 
     grads.end_micro_step(rs.MainStream, comm);
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
@@ -876,11 +861,7 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    if (mUseCompiledExecution) {
-        execute_forward_compiled(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
-    } else {
-        execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
-    }
+    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -932,11 +913,7 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    if (mUseCompiledExecution) {
-        execute_forward_compiled(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
-    } else {
-        execute_forward_graph(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
-    }
+    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1038,11 +1015,7 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         rs.configure_backward_graphs(/*hooked=*/true);
     }
 
-    if (mUseCompiledExecution) {
-        execute_backward_compiled(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
-    } else {
-        execute_backward_graph(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
-    }
+    execute_backward(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
 
     grads.end_micro_step(rs.MainStream, comm);
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {

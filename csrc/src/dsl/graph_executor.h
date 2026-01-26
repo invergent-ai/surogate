@@ -59,11 +59,6 @@ struct GraphExecutorOptions {
 
     // Whether to print derived backward graph for debugging
     bool debug_print_backward = false;
-
-    // Enable compiled execution mode for reduced dispatch overhead
-    // When enabled, operations are pre-compiled into direct function pointer calls
-    // with pre-resolved tensors and attributes, eliminating runtime string comparisons
-    bool use_compiled_execution = false;
 };
 
 class IGraphExecutor {
@@ -224,11 +219,6 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
 
-    void execute_forward_graph(long B, long T, NCCLCommunicator& comm, bool full,
-                               const modules::ForwardHook* hook = nullptr);
-    void execute_backward_graph(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step,
-                                const modules::BackwardHook* hook = nullptr);
-
     void run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy);
 
     unsigned int next_rng_seed();
@@ -310,15 +300,8 @@ private:
     void recompute_layer_optimized(int layer_idx, long B, long T, bool use_graph);
 
     // ========================================================================
-    // Compiled execution mode (eliminates dispatch overhead)
+    // Compiled execution (operations pre-compiled into direct function calls)
     // ========================================================================
-    // When enabled, operations are pre-compiled into direct function pointer
-    // calls with pre-resolved tensors and attributes, eliminating:
-    // - Runtime string comparisons (op_type == "embedding")
-    // - Hash map lookups for tensor resolution (get_tensor())
-    // - Attribute parsing (find_attr(), attr_double())
-    // - Shape resolution (resolve_shape())
-    bool mUseCompiledExecution = false;
     std::unique_ptr<GraphCompiler> mCompiler;
     std::unique_ptr<CompiledExecutor> mCompiledExecutor;
     std::unique_ptr<CompiledGraph> mCompiledForward;
@@ -328,10 +311,10 @@ private:
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);
-    void execute_forward_compiled(long B, long T, NCCLCommunicator& comm, bool full,
-                                  const modules::ForwardHook* hook);
-    void execute_backward_compiled(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
-                                   int micro_step, const modules::BackwardHook* hook);
+    void execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
+                         const modules::ForwardHook* hook);
+    void execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
+                          int micro_step, const modules::BackwardHook* hook);
 };
 
 }  // namespace dsl

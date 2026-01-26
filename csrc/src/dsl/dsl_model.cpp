@@ -1911,7 +1911,6 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     GraphExecutorOptions exec_opts;
     exec_opts.auto_backward = true;
     exec_opts.debug_print_backward = false;
-    exec_opts.use_compiled_execution = options.UseCompiledDsl;
     mExecutor = std::make_unique<GraphExecutor>(*mModule, *mRunState, *mParams, *mGrads, mModelConfig, options, exec_opts);
     if (!mRngState.empty()) {
         mExecutor->set_rng_state(mRngState);
