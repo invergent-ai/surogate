@@ -588,7 +588,10 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     }
 
     mNonBlockGradients.d_ln_final = mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
-    mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    // Skip d_embeddings allocation in LoRA-only mode - embedding backward is skipped entirely
+    if (!mLoraOnlyMode) {
+        mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    }
 }
 
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
@@ -865,14 +868,17 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     mScratch.matmul_scales = mAllocator->allocate(
         ETensorDType::FP32, "matmul_scales", EAllocationType::ON_DEVICE, {2L});
 
-    const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);
-    const long num_c_groups = (C + group_width - 1) / group_width;
-    mScratch.encoder_bwd_scratch = mAllocator->allocate(
-        ETensorDType::INT32, "encoder_bwd_scratch", EAllocationType::ON_DEVICE, {B, T, num_c_groups * 5});
-    mScratch.encoder_bwd_indices = mAllocator->allocate(
-        ETensorDType::INT32, "encoder_bwd_indices", EAllocationType::PINNED, {B, T, num_c_groups});
-    mScratch.encoder_bwd_info = mAllocator->allocate(
-        ETensorDType::INT32, "encoder_bwd_info", EAllocationType::PINNED, {B, T, 4 * num_c_groups});
+    // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
+    if (!mLoraOnlyMode) {
+        const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);
+        const long num_c_groups = (C + group_width - 1) / group_width;
+        mScratch.encoder_bwd_scratch = mAllocator->allocate(
+            ETensorDType::INT32, "encoder_bwd_scratch", EAllocationType::ON_DEVICE, {B, T, num_c_groups * 5});
+        mScratch.encoder_bwd_indices = mAllocator->allocate(
+            ETensorDType::INT32, "encoder_bwd_indices", EAllocationType::PINNED, {B, T, num_c_groups});
+        mScratch.encoder_bwd_info = mAllocator->allocate(
+            ETensorDType::INT32, "encoder_bwd_info", EAllocationType::PINNED, {B, T, 4 * num_c_groups});
+    }
 
     const long cudnn_ws_size = static_cast<long>(
         cudnn_get_workspace_size(static_cast<int>(B), static_cast<int>(T), static_cast<int>(Hq),

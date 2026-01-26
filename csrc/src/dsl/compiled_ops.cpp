@@ -2648,6 +2648,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 }
 
 void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
+    // Skip embedding backward entirely in LoRA-only mode
+    if (mRunState.is_lora_only_mode()) {
+        return;
+    }
+
     // inputs: d_encoded, token_ids
     // outputs: d_embedding (sparse update)
     Tensor& d_out = resolve_tensor(op.inputs[0]);
@@ -2875,9 +2880,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mTensorMap["d_xF"] = mRunState.non_block_gradients().d_ln_final;
     mTensorMap["d_ln_final"] = mRunState.non_block_gradients().d_ln_final;
 
-    // Bind embedding output gradients
-    mTensorMap["d_encoded"] = mRunState.non_block_gradients().d_embeddings;
-    mTensorMap["d_x0"] = mRunState.non_block_gradients().d_embeddings;
+    // Bind embedding output gradients (skip in LoRA-only mode - embedding backward is skipped entirely)
+    if (!mRunState.is_lora_only_mode()) {
+        mTensorMap["d_encoded"] = mRunState.non_block_gradients().d_embeddings;
+        mTensorMap["d_x0"] = mRunState.non_block_gradients().d_embeddings;
+    }
 
     // Also bind standard inputs that backward ops may reference
     mTensorMap["token_ids"] = mRunState.Inputs;
