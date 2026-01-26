@@ -245,6 +245,11 @@ target_sources(surogate-common PRIVATE
 
     src/dsl/ir.cpp
     src/dsl/dsl_model.cpp
+    src/dsl/dsl_model_execution.cpp
+    src/dsl/dsl_model_helpers.cpp
+    src/dsl/dsl_model_lora.cpp
+    src/dsl/dsl_model_optimizer.cpp
+    src/dsl/dsl_model_weights.cpp
     src/dsl/dsl_param_store.cpp
     src/dsl/dsl_grad_store.cpp
     src/dsl/dsl_run_state.cpp
