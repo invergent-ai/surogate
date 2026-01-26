@@ -1,0 +1,62 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
+// SPDX-License-Identifier: Apache-2.0
+//
+// DSL parameter store - manages model parameters defined by DSL IR.
+
+#ifndef SUROGATE_SRC_DSL_DSL_PARAM_STORE_H
+#define SUROGATE_SRC_DSL_DSL_PARAM_STORE_H
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "utilities/allocator.h"
+#include "utilities/tensor_container.h"
+
+namespace dsl {
+
+struct Module;
+struct Graph;
+}
+
+struct RuntimeOptions;
+struct PretrainedConfig;
+namespace modules { struct ModularLoRAConfig; }
+
+namespace dsl {
+
+// Stores model parameters defined by the DSL IR.
+class DslParamStore final : public ITensorContainer {
+public:
+    struct Entry {
+        Tensor tensor;
+        bool trainable = true;
+    };
+
+    DslParamStore(const Module& module,
+                  const Graph& graph,
+                  const RuntimeOptions& options,
+                  const PretrainedConfig& config,
+                  const std::shared_ptr<TensorAllocator>& allocator,
+                  const modules::ModularLoRAConfig* lora_config = nullptr);
+
+    Tensor& get(const std::string& name);
+    const Tensor& get(const std::string& name) const;
+    bool has(const std::string& name) const;
+    bool is_trainable(const std::string& name) const;
+
+    const std::vector<std::string>& param_names() const { return mParamOrder; }
+
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
+
+private:
+    std::shared_ptr<TensorAllocator> mAllocator;
+    std::unordered_map<std::string, Entry> mParams;
+    std::vector<std::string> mParamOrder;
+};
+
+} // namespace dsl
+
+#endif // SUROGATE_SRC_DSL_DSL_PARAM_STORE_H
