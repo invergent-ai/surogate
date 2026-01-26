@@ -669,7 +669,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         acts.qkv = share_qkv ? shared_qkv : mAllocator->allocate(dtype, "qkv", kind, {B, T, QKV});
         acts.qkv_rope = {};
 
-        acts.lse = mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, T, Hq});
+        acts.lse = mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
         acts.att = share_att ? shared_att : mAllocator->allocate(dtype, "att", kind, {B, T, AttnDim});
         acts.att_out = share_att ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
 
@@ -877,18 +877,19 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long cudnn_ws_size = static_cast<long>(
         cudnn_get_workspace_size(static_cast<int>(B), static_cast<int>(T), static_cast<int>(Hq),
                                  static_cast<int>(Hkv), static_cast<int>(D), CudnnHandle));
-    mScratch.cudnn_workspace = Tensor{ETensorDType::BYTE, {cudnn_ws_size}, nullptr, nullptr, 1, DeviceId};
+    // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
+    // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
+    // from the temp stack, checkpoint restores during backward can cause it to be reallocated
+    // in a region that overlaps with gradient buffers.
+    mScratch.cudnn_workspace = mAllocator->allocate(
+        ETensorDType::BYTE, "cudnn_workspace", EAllocationType::ON_DEVICE, {cudnn_ws_size});
 
+    // Note: Stack simulation no longer needed for workspace since it's persistently allocated
     if (mStackSimulate) {
         if (mRecomputeBlock) {
             const long d_qkv_bytes = B * T * QKV * get_dtype_size(mGradDtype);
             auto* simulated_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
-            auto* simulated_ws = Stack.allocate(static_cast<std::size_t>(mScratch.cudnn_workspace.bytes()), "workspace");
-            Stack.free(simulated_ws);
             Stack.free(simulated_d_qkv);
-        } else {
-            auto* simulated_ws = Stack.allocate(static_cast<std::size_t>(mScratch.cudnn_workspace.bytes()), "workspace");
-            Stack.free(simulated_ws);
         }
     }
 }

@@ -399,18 +399,6 @@ Tensor& get_tensor(ExecState& st, const std::string& name, const std::unordered_
     if (Tensor* recomputed = resolve_recomputed_block_tensor(st, name)) {
         return *recomputed;
     }
-    if (st.recomputed_layers && env_enabled("SUROGATE_DEBUG_RECOMPUTE_FALLBACK")) {
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (layer_idx >= 0 && layer_idx < static_cast<int>(st.config.NumLayers) &&
-                !st.recomputed_layers->empty() && (*st.recomputed_layers)[layer_idx]) {
-                fprintf(stderr, "[DSL DEBUG] recompute fallback to saved for %s (layer=%d)\n",
-                        name.c_str(), layer_idx);
-                fflush(stderr);
-            }
-        }
-    }
     // Fall back to saved tensors (for forward intermediates used in backward)
     auto sit = saved.find(name);
     if (sit != saved.end()) {

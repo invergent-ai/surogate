@@ -241,29 +241,6 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
             save_set.erase("logits_flat");
             save_set.erase("logits");
             mSaveList.assign(save_set.begin(), save_set.end());
-
-            if (options.debug_print_backward) {
-                std::cerr << "[Autodiff] Derived backward graph with "
-                          << mDerivedBackward->operations.size() << " operations\n";
-                for (const auto& op : mDerivedBackward->operations) {
-                    std::cerr << "  " << op.kernel_type << ": [";
-                    for (size_t i = 0; i < op.inputs.size(); ++i) {
-                        if (i > 0) std::cerr << ", ";
-                        std::cerr << op.inputs[i];
-                    }
-                    std::cerr << "] -> [";
-                    for (size_t i = 0; i < op.outputs.size(); ++i) {
-                        if (i > 0) std::cerr << ", ";
-                        std::cerr << op.outputs[i];
-                    }
-                    std::cerr << "]\n";
-                }
-                std::cerr << "[Autodiff] Auto-computed saves: ";
-                for (const auto& s : mSaveList) {
-                    std::cerr << s << " ";
-                }
-                std::cerr << "\n";
-            }
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 std::string("DSL graph executor: autodiff failed: ") + e.what());
@@ -428,11 +405,66 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
         mSaveList = mForward->save;
     }
 
+    // Initialize forward plan storage (one per layer)
+    if (mForwardPlan.size() != static_cast<std::size_t>(mConfig.NumLayers)) {
+        mForwardPlan.resize(static_cast<std::size_t>(mConfig.NumLayers));
+    }
+
     // Initialize compiled execution if enabled
     mUseCompiledExecution = options.use_compiled_execution;
     if (mUseCompiledExecution) {
         init_compiled_execution();
     }
+}
+
+void GraphExecutor::reset_forward_plan() {
+    if (mForwardPlan.size() != static_cast<std::size_t>(mConfig.NumLayers)) {
+        mForwardPlan.resize(static_cast<std::size_t>(mConfig.NumLayers));
+    }
+    for (auto& plan : mForwardPlan) {
+        plan.qkv = {};
+        plan.out_proj = {};
+        plan.mlp_up = {};
+        plan.mlp_down = {};
+        plan.attn = {};
+    }
+}
+
+void GraphExecutor::record_matmul_plan(int layer_idx, modules::MatmulOp op, const MatmulForwardPlan& plan) {
+    if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= mForwardPlan.size()) {
+        return;
+    }
+    auto& layer_plan = mForwardPlan[static_cast<std::size_t>(layer_idx)];
+    switch (op) {
+        case modules::MatmulOp::QKV:
+            layer_plan.qkv = plan;
+            break;
+        case modules::MatmulOp::AttnOut:
+            layer_plan.out_proj = plan;
+            break;
+        case modules::MatmulOp::MLPUp:
+            layer_plan.mlp_up = plan;
+            break;
+        case modules::MatmulOp::MLPDown:
+            layer_plan.mlp_down = plan;
+            break;
+        default:
+            break;
+    }
+}
+
+void GraphExecutor::record_attn_plan(int layer_idx, const AttnForwardPlan& plan) {
+    if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= mForwardPlan.size()) {
+        return;
+    }
+    mForwardPlan[static_cast<std::size_t>(layer_idx)].attn = plan;
+}
+
+const LayerForwardPlan* GraphExecutor::forward_plan(int layer_idx) const {
+    if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= mForwardPlan.size()) {
+        return nullptr;
+    }
+    return &mForwardPlan[static_cast<std::size_t>(layer_idx)];
 }
 
 void GraphExecutor::init_compiled_execution() {
@@ -454,6 +486,7 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
     mCompiledExecutor->set_saved_tensors(&mSaved);
     mCompiledExecutor->set_save_list(&mSaveList);
+    mCompiledExecutor->set_forward_plan(&mForwardPlan);
     mCompiledExecutor->set_last_inputs_cpu(&mLastInputsCpu);
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
 
@@ -512,6 +545,7 @@ void GraphExecutor::execute_forward_compiled(long B, long T, NCCLCommunicator& c
     const bool capturing = use_graphs && mForwardGraph == nullptr;
     if (!use_graphs || capturing) {
         mSaved.clear();
+        reset_forward_plan();
     }
 
     auto run_ops = [&]() {
@@ -1078,55 +1112,6 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
         fused_classifier(logits, losses, d_loss, tgt,
                          &rs.ValidTokenCount,
                          static_cast<int>(B * T), static_cast<int>(V), static_cast<int>(Vp), true, rs.MainStream);
-    }
-
-    // Debug: check d_logits at non-masked target positions after fused_classifier
-    static int classifier_dbg = 0;
-    if (classifier_dbg < 2 && !in_capture && logits.Data) {
-        cudaDeviceSynchronize();
-        const long BT_total = B * T;
-        // Get all targets to find non-masked positions
-        std::vector<int> all_tgt(BT_total);
-        cudaMemcpy(all_tgt.data(), tgt.Data, BT_total * sizeof(int), cudaMemcpyDeviceToHost);
-
-        // Find first 4 non-masked positions
-        std::vector<int> valid_rows;
-        int valid_count = 0;
-        for (long i = 0; i < BT_total && valid_count < 4; i++) {
-            if (all_tgt[i] >= 0 && all_tgt[i] < static_cast<int>(V)) {
-                valid_rows.push_back(i);
-                valid_count++;
-            }
-        }
-        fprintf(stderr, "[CLASSIFIER] call #%d BT=%ld valid_rows found=%d (first 4: ",
-                classifier_dbg, BT_total, valid_count);
-        for (int i = 0; i < valid_count; i++) fprintf(stderr, "%d ", valid_rows[i]);
-        fprintf(stderr, ")\n");
-
-        // Check gradients at valid target positions
-        if (valid_count > 0) {
-            float abssum_at_targets = 0.0f;
-            std::vector<float> grads_at_targets(4, 0.0f);
-            for (int i = 0; i < valid_count; i++) {
-                int row = valid_rows[i];
-                int tgt_id = all_tgt[row];
-                nv_bfloat16 val;
-                cudaMemcpy(&val, (nv_bfloat16*)logits.Data + row * Vp + tgt_id,
-                           sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-                grads_at_targets[i] = __bfloat162float(val);
-                abssum_at_targets += fabsf(grads_at_targets[i]);
-            }
-            fprintf(stderr, "[CLASSIFIER] targets at valid rows: %d %d %d %d\n",
-                    valid_count > 0 ? all_tgt[valid_rows[0]] : -1,
-                    valid_count > 1 ? all_tgt[valid_rows[1]] : -1,
-                    valid_count > 2 ? all_tgt[valid_rows[2]] : -1,
-                    valid_count > 3 ? all_tgt[valid_rows[3]] : -1);
-            fprintf(stderr, "[CLASSIFIER] d_logits at valid targets: %.6f %.6f %.6f %.6f abssum=%.6f dloss=%.6e\n",
-                    grads_at_targets[0], grads_at_targets[1], grads_at_targets[2], grads_at_targets[3],
-                    abssum_at_targets, d_loss);
-        }
-
-        classifier_dbg++;
     }
 }
 

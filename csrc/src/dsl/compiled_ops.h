@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include "dsl/forward_plan.h"
 #include "dsl/graph_executor_internal.h"
 #include "dsl/ir.h"
 #include "kernels/kernels.h"
@@ -246,6 +247,19 @@ private:
 
     void annotate_layer_boundaries(CompiledGraph& graph);
 
+    // Shape validation methods
+    struct TensorShape {
+        std::vector<long> dims;
+        bool inferred = false;  // true if inferred, false if from IR
+        std::string source_op;  // Operation that produced this tensor
+    };
+
+    bool resolve_tensor_shape(const std::string& name, std::vector<long>& shape);
+    void infer_output_shapes(const Operation& op, CompiledOpType type,
+                            const std::vector<std::vector<long>>& input_shapes,
+                            std::vector<std::vector<long>>& output_shapes);
+    void validate_operation_shapes(const Operation& op, CompiledOpType type, size_t op_index);
+
     const Module& mModule;
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
@@ -254,6 +268,8 @@ private:
     ShapeEnv mShapeEnv;
     long mB = 0;
     long mT = 0;
+    std::unordered_map<std::string, std::vector<long>> mExtraShapes;
+    std::unordered_map<std::string, TensorShape> mTensorShapes;
 };
 
 // ============================================================================
@@ -301,6 +317,7 @@ public:
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
     void set_save_list(const std::vector<std::string>* save_list);
+    void set_forward_plan(std::vector<LayerForwardPlan>* plan) { mForwardPlan = plan; }
 
     // For embedding backward (requires CPU-side inputs for deterministic bucketing)
     void set_last_inputs_cpu(const Tensor* inputs_cpu);
@@ -380,6 +397,7 @@ private:
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
     std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
+    std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
 
     // For embedding backward
     const Tensor* mLastInputsCpu = nullptr;

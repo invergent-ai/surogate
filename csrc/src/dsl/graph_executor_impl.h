@@ -6,6 +6,7 @@
 #include "dsl/autodiff.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -938,6 +939,31 @@ void GraphExecutorImpl<Block>::init(const GraphExecutorOptions& options) {
     if (mSaveList.empty()) {
         mSaveList = mForward->save;
     }
+
+    // Debug helper: force-save QKV tensors for recompute comparisons.
+    if (env_enabled("SUROGATE_DEBUG_RECOMPUTE_COMPARE") &&
+        env_enabled("SUROGATE_DEBUG_RECOMPUTE_COMPARE_ATTN_ONLY")) {
+        int debug_layer = -1;
+        if (const char* v = std::getenv("SUROGATE_DEBUG_RECOMPUTE_LAYER")) {
+            debug_layer = std::atoi(v);
+        }
+        auto add_save = [&](const std::string& name) {
+            if (std::find(mSaveList.begin(), mSaveList.end(), name) == mSaveList.end()) {
+                mSaveList.push_back(name);
+            }
+        };
+        if (debug_layer >= 0) {
+            const std::string prefix = "blocks[" + std::to_string(debug_layer) + "].";
+            add_save(prefix + "qkv");
+            add_save(prefix + "qkv_rope");
+        } else {
+            for (int l = 0; l < mConfig.NumLayers; ++l) {
+                const std::string prefix = "blocks[" + std::to_string(l) + "].";
+                add_save(prefix + "qkv");
+                add_save(prefix + "qkv_rope");
+            }
+        }
+    }
 }
 
 template<typename Block>
@@ -1335,7 +1361,9 @@ void GraphExecutorImpl<Block>::backward(Tensor inputs, Tensor targets, NCCLCommu
                         + static_cast<unsigned int>(micro_step) * 10000u;
 
                     Tensor x = a.swiglu;
-                    Tensor dL_dy = da.d_res_ffn;
+                    // Prefer the direct upstream gradient from MLP down (d_mlp_down). In recompute
+                    // modes, d_res_ffn may be stale/aliased by stack temporaries before the hook runs.
+                    Tensor dL_dy = da.d_mlp_down.Data ? da.d_mlp_down : da.d_res_ffn;
 
                     modules::detail::backward_lora_layer(
                         lora_grads.mlp.down->A, lora_grads.mlp.down->B,
@@ -1527,7 +1555,7 @@ void GraphExecutorImpl<Block>::execute_forward_graph(long B, long T, NCCLCommuni
             acts.mlp_up.Data = nullptr;
             acts.swiglu.Data = nullptr;
         }
-        rs.scratch().cudnn_workspace.Data = nullptr;
+        // Note: cudnn_workspace is persistently allocated, don't clear
         layer_checkpoints.erase(layer_idx);
         layer_temp_marks.erase(layer_idx);
     };
@@ -2003,7 +2031,7 @@ void GraphExecutorImpl<Block>::execute_backward_graph(long B, long T, NCCLCommun
             grads_layer.d_mlp_up.Data = nullptr;
             grads_layer.d_swiglu.Data = nullptr;
         }
-        rs.scratch().cudnn_workspace.Data = nullptr;
+        // Note: cudnn_workspace is persistently allocated, don't clear
         layer_checkpoints.erase(layer_idx);
         layer_temp_marks.erase(layer_idx);
     };

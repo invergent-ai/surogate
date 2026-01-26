@@ -90,7 +90,6 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
     auto& rs = mRunState;
     auto& weights = mWeights;
     const auto& config = mConfig;
-    const bool trace_ops = env_enabled("SUROGATE_DEBUG_DSL_TRACE");
     (void)comm;
 
     ExecState st{
@@ -123,6 +122,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
     const bool capturing = use_graphs && mForwardGraph == nullptr;
     if (!use_graphs || capturing) {
         mSaved.clear();
+        reset_forward_plan();
     }
 
     std::vector<char> required;
@@ -237,7 +237,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                     acts.mlp_up.Data = nullptr;
                     acts.swiglu.Data = nullptr;
                 }
-                rs.scratch().cudnn_workspace.Data = nullptr;
+                // Note: cudnn_workspace is persistently allocated, don't clear
 
                 // Offload residual to CPU if enabled (for backward pass later)
                 if (rs.has_residual_offloading() && !capturing) {
@@ -269,7 +269,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
             acts.mlp_up.Data = nullptr;
             acts.swiglu.Data = nullptr;
         }
-        rs.scratch().cudnn_workspace.Data = nullptr;
+        // Note: cudnn_workspace is persistently allocated, don't clear
 
         // Offload residual to CPU if enabled (for backward pass later)
         if (rs.has_residual_offloading() && !capturing) {
@@ -291,11 +291,6 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
         }
         const auto& op = mForward->operations[idx];
         const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
-        if (trace_ops) {
-            fprintf(stderr, "[DSL TRACE] fwd op %zu/%zu id=%s type=%s\n",
-                    idx, mForward->operations.size(), op.id.c_str(), op_type.c_str());
-            fflush(stderr);
-        }
 
         // Check if we finished the previous layer (O(1) boundary check)
         if (idx > 0) {
@@ -426,14 +421,15 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 bias = get_tensor(st, op.inputs.at(2), mSaved);
             }
             bool used_recipe = false;
+            modules::MatmulContext ctx{};
+            modules::MatmulContext* ctx_ptr = nullptr;
+            int layer_idx = -1;
+            auto op_kind = matmul_op_from_weight(op.inputs.at(1), layer_idx);
+            const modules::MatmulOp matmul_op = op_kind.value_or(modules::MatmulOp::LMHead);
             if (mOptions.TrainingRecipe && mode == EMMTranspose::NT && a.Sizes[0] == B * T) {
                 const recipes::Recipe& recipe = *mOptions.TrainingRecipe;
-                int layer_idx = -1;
-                auto op_kind = matmul_op_from_weight(op.inputs.at(1), layer_idx);
                 const bool allow_quant = op_kind.has_value() && allow_quant_layer(mOptions, config, layer_idx);
-                const modules::MatmulOp matmul_op = op_kind.value_or(modules::MatmulOp::LMHead);
 
-                modules::MatmulContext ctx;
                 ctx.out = &out;
                 ctx.inp = &a;
                 ctx.weight = &b;
@@ -464,6 +460,7 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
 
                 recipe.forward_matmul(ctx);
                 used_recipe = true;
+                ctx_ptr = &ctx;
             }
             if (!used_recipe) {
                 // DSL matmul uses row-major semantics; map to column-major backend by swapping A/B,
@@ -472,6 +469,21 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 matmul(out, b, a, bias, nullptr, nullptr,
                        rs.CublasLtHandle, rs.CuBlasWorkspace,
                        N, M, K, mode_col, false, rs.MainStream);
+            }
+
+            if (op_kind.has_value() && layer_idx >= 0 && matmul_op != modules::MatmulOp::LMHead) {
+                MatmulForwardPlan plan{};
+                plan.valid = true;
+                plan.use_recipe = used_recipe;
+                plan.has_bias = bias.has_value();
+                if (used_recipe && ctx_ptr) {
+                    plan.allow_fp8 = ctx_ptr->allow_fp8;
+                    plan.allow_fp4 = ctx_ptr->allow_fp4;
+                    plan.delayed_quantizer_idx = ctx_ptr->delayed_quantizer_idx;
+                    plan.use_fp8_cache = (ctx_ptr->cached_weight && ctx_ptr->cached_weight->Data);
+                    plan.use_fp4_cache = (ctx_ptr->cached_fp4_data && ctx_ptr->cached_fp4_scales);
+                }
+                record_matmul_plan(layer_idx, matmul_op, plan);
             }
 
             // Hook invocation (for LoRA or other extensions)
@@ -602,6 +614,17 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 && (freqs.Rank >= 2)
                 && (freqs.Sizes[1] >= Hs)
                 && (qkv_view.Rank == 3);
+            int plan_layer_idx = -1;
+            std::string plan_field;
+            if (parse_block_param(op.inputs.at(0), plan_layer_idx, plan_field)) {
+                AttnForwardPlan plan{};
+                plan.valid = true;
+                plan.use_qk_norm = true;
+                plan.rope_fused = rope_fusable;
+                plan.use_cudnn = true;
+                plan.rotary_dim = rotary_dim;
+                record_attn_plan(plan_layer_idx, plan);
+            }
             if (rope_fusable) {
                 qkv_qk_norm_rope_forward(qkv_view, q_rstd, k_rstd, q_norm, k_norm,
                                          freqs, reinterpret_cast<int*>(pos_ids.Data),
@@ -643,6 +666,17 @@ void GraphExecutor::execute_forward_graph(long B, long T, NCCLCommunicator& comm
                 } else if (auto s = attr_string(*rd_attr)) {
                     rotary_dim = static_cast<int>(resolve_dim(Dim::symbolic(*s), st.shape_env));
                 }
+            }
+            int plan_layer_idx = -1;
+            std::string plan_field;
+            if (parse_block_param(op.inputs.at(0), plan_layer_idx, plan_field)) {
+                AttnForwardPlan plan{};
+                plan.valid = true;
+                plan.use_qk_norm = false;
+                plan.rope_fused = false;
+                plan.use_cudnn = true;
+                plan.rotary_dim = rotary_dim;
+                record_attn_plan(plan_layer_idx, plan);
             }
 
             rope_forward(out, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,

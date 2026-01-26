@@ -6,6 +6,7 @@
 #include "dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -14,6 +15,7 @@
 #include "dsl/dsl_weight_manager.h"
 #include "dsl/graph_executor_helpers.h"
 #include "dsl/graph_executor_utils.h"
+#include "dsl/op_shape_signatures.h"
 #include "modules/backward_hooks.h"
 #include "modules/forward_hooks.h"
 #include "modules/fp8_scaling_config.h"
@@ -24,6 +26,119 @@
 #include "utilities/comm.h"
 
 namespace dsl {
+namespace {
+
+float env_float(const char* name, float fallback) {
+    if (!name || !*name) {
+        return fallback;
+    }
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    char* end = nullptr;
+    float out = std::strtof(value, &end);
+    if (end == value) {
+        return fallback;
+    }
+    return out;
+}
+
+bool infer_known_tensor_shape(std::string_view name,
+                              const modules::ModelConfig& config,
+                              long B,
+                              long T,
+                              std::vector<long>& shape) {
+    if (starts_with(name, kSavedPrefix)) {
+        name = name.substr(kSavedPrefix.size());
+    }
+
+    int layer_idx = -1;
+    std::string field;
+    if (parse_block_param(name, layer_idx, field)) {
+        const long C = config.HiddenSize;
+        const long D = config.IntermediateSize;
+        const long Hq = config.NumQueryHeads;
+        const long Hkv = config.NumKeyValHeads;
+        const long Hs = config.head_size();
+        const long QKV = config.qkv_channels();
+
+        if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" ||
+            field == "res_att" || field == "res_ffn") {
+            shape = {B, T, C};
+            return true;
+        }
+        if (field == "ln1_flat" || field == "ln2_flat" || field == "att_out_flat" || field == "mlp_down_flat") {
+            shape = {B * T, C};
+            return true;
+        }
+        if (field == "ln1_rstd" || field == "ln2_rstd") {
+            shape = {B, T};
+            return true;
+        }
+        if (field == "qkv" || field == "qkv_rope") {
+            shape = {B, T, QKV};
+            return true;
+        }
+        if (field == "qkv_flat" || field == "qkv_biased") {
+            shape = {B * T, QKV};
+            return true;
+        }
+        if (field == "q_rstd") {
+            shape = {B, T, Hq};
+            return true;
+        }
+        if (field == "k_rstd") {
+            shape = {B, T, Hkv};
+            return true;
+        }
+        if (field == "att") {
+            shape = {B, T, Hq * Hs};
+            return true;
+        }
+        if (field == "att_flat") {
+            shape = {B * T, Hq * Hs};
+            return true;
+        }
+        if (field == "lse") {
+            shape = {B, Hq, T};
+            return true;
+        }
+        if (field == "mlp_up") {
+            shape = {B, T, 2 * D};
+            return true;
+        }
+        if (field == "mlp_up_flat") {
+            shape = {B * T, 2 * D};
+            return true;
+        }
+        if (field == "swiglu") {
+            shape = {B, T, D};
+            return true;
+        }
+        if (field == "swiglu_flat") {
+            shape = {B * T, D};
+            return true;
+        }
+    }
+
+    if (name == "x0" || name == "encoded" || name == "ln_final" || name == "xF" || name == "final_residual") {
+        shape = {B, T, config.HiddenSize};
+        return true;
+    }
+    if (name == "ln_final_rstd") {
+        shape = {B, T};
+        return true;
+    }
+    if (name == "token_ids" || name == "position_ids") {
+        shape = {B, T};
+        return true;
+    }
+
+    return false;
+}
+
+}  // namespace
 
 // ============================================================================
 // Operation type conversion
@@ -149,6 +264,12 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     if (starts_with(name, kSavedPrefix)) {
         ref.slot = TensorSlot::Saved;
         ref.name = std::string(name.substr(kSavedPrefix.size()));
+        if (ref.shape.empty()) {
+            auto it = mExtraShapes.find(ref.name);
+            if (it != mExtraShapes.end()) {
+                ref.shape = it->second;
+            }
+        }
         return ref;
     }
 
@@ -313,6 +434,13 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                 ref.shape = {B * T, 2 * D};
             }
 
+            if (ref.shape.empty()) {
+                const std::string base = name.substr(2);
+                auto it = mExtraShapes.find(base);
+                if (it != mExtraShapes.end()) {
+                    ref.shape = it->second;
+                }
+            }
             return ref;
         }
     }
@@ -338,6 +466,12 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         ref.slot = TensorSlot::Mapped;
     }
 
+    if (ref.shape.empty()) {
+        auto it = mExtraShapes.find(ref.name);
+        if (it != mExtraShapes.end()) {
+            ref.shape = it->second;
+        }
+    }
     return ref;
 }
 
@@ -507,8 +641,384 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
     }
 }
 
+// ============================================================================
+// Shape Validation Methods
+// ============================================================================
+
+bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<long>& shape) {
+    // Check shape cache first
+    auto it = mTensorShapes.find(name);
+    if (it != mTensorShapes.end()) {
+        shape = it->second.dims;
+        return true;
+    }
+
+    // Check IR tensor info
+    auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors) {
+        auto it = tensors.find(name);
+        if (it != tensors.end() && !it->second.shape.empty()) {
+            shape = resolve_shape(it->second.shape, mShapeEnv);
+            TensorShape ts;
+            ts.dims = shape;
+            ts.inferred = false;
+            mTensorShapes[name] = ts;
+            return true;
+        }
+        return false;
+    };
+
+    // Check in graph tensors
+    if (check_tensor_info(mModule.forward->inputs)) return true;
+    if (check_tensor_info(mModule.forward->outputs)) return true;
+    if (check_tensor_info(mModule.forward->params)) return true;
+    if (check_tensor_info(mModule.forward->intermediates)) return true;
+
+    // Try pattern-based inference for known tensor names
+    if (infer_known_tensor_shape(name, mConfig, mB, mT, shape)) {
+        TensorShape ts;
+        ts.dims = shape;
+        ts.inferred = true;
+        mTensorShapes[name] = ts;
+        return true;
+    }
+
+    // Check for saved tensors (use base name)
+    if (starts_with(name, kSavedPrefix)) {
+        std::string base_name = std::string(name.substr(kSavedPrefix.size()));
+        return resolve_tensor_shape(base_name, shape);
+    }
+
+    return false;
+}
+
+void GraphCompiler::infer_output_shapes(
+    const Operation& op,
+    CompiledOpType type,
+    const std::vector<std::vector<long>>& input_shapes,
+    std::vector<std::vector<long>>& output_shapes) {
+
+    output_shapes.clear();
+
+    // Infer output shapes based on operation type
+    switch (type) {
+        case CompiledOpType::Matmul:
+        case CompiledOpType::MatmulBias: {
+            if (input_shapes.size() >= 2 && !input_shapes[0].empty() && !input_shapes[1].empty()) {
+                const auto& a_shape = input_shapes[0];
+                const auto& b_shape = input_shapes[1];
+
+                // Parse transpose mode
+                EMMTranspose mode = parse_transpose(op.attrs);
+
+                // Compute output shape
+                std::vector<long> out_shape;
+
+                // Batch dims (min of both inputs)
+                size_t min_rank = std::min(a_shape.size(), b_shape.size());
+                for (size_t i = 0; i + 2 < min_rank; ++i) {
+                    out_shape.push_back(a_shape[i]);
+                }
+
+                // M and N dimensions
+                if (mode == EMMTranspose::NN || mode == EMMTranspose::NT) {
+                    out_shape.push_back(a_shape[a_shape.size() - 2]);  // M
+                } else {
+                    out_shape.push_back(a_shape[a_shape.size() - 1]);  // M (transposed)
+                }
+
+                if (mode == EMMTranspose::NN || mode == EMMTranspose::TN) {
+                    out_shape.push_back(b_shape[b_shape.size() - 1]);  // N
+                } else {
+                    out_shape.push_back(b_shape[b_shape.size() - 2]);  // N (transposed)
+                }
+
+                output_shapes.push_back(out_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::View: {
+            // Output shape from attributes
+            if (auto* shape_attr = find_attr(op.attrs, "shape")) {
+                auto out_shape = resolve_attr_shape(*shape_attr, mShapeEnv);
+                output_shapes.push_back(out_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::Add: {
+            // Output shape = broadcast(input shapes)
+            if (!input_shapes.empty()) {
+                output_shapes.push_back(input_shapes[0]);  // Simplified: assume same shape
+            }
+            break;
+        }
+
+        case CompiledOpType::SwiGLU: {
+            // Output last dim = input last dim / 2
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                auto out_shape = input_shapes[0];
+                out_shape.back() = out_shape.back() / 2;
+                output_shapes.push_back(out_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::Embedding: {
+            // Output = indices_shape + [embedding_dim]
+            if (input_shapes.size() >= 2 && !input_shapes[1].empty()) {
+                auto out_shape = input_shapes[0];  // indices shape
+                out_shape.push_back(input_shapes[1][1]);  // embedding dim
+                output_shapes.push_back(out_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::Zeros: {
+            // Try to infer from 'shape' attribute
+            if (auto* shape_attr = find_attr(op.attrs, "shape")) {
+                auto out_shape = resolve_attr_shape(*shape_attr, mShapeEnv);
+                output_shapes.push_back(out_shape);
+            }
+            break;
+        }
+
+        default:
+            // For other operations, output shape not inferred
+            break;
+    }
+}
+
+void GraphCompiler::validate_operation_shapes(
+    const Operation& op,
+    CompiledOpType type,
+    size_t op_index) {
+
+    using namespace shape_checker;
+
+    // Check if validation is disabled via environment variable
+    if (env_enabled("SUROGATE_NO_SHAPE_CHECK")) {
+        return;
+    }
+
+    // Get operation signature
+    const auto* sig = OpShapeRegistry::instance().get_signature(op.name);
+    if (!sig) {
+        // No signature registered - skip validation (only warn in verbose mode)
+        return;
+    }
+
+    // Resolve input shapes
+    std::vector<std::vector<long>> input_shapes;
+    input_shapes.reserve(op.inputs.size());
+    std::vector<std::string> unresolved_inputs;
+
+    for (const auto& input_name : op.inputs) {
+        std::vector<long> shape;
+        if (!resolve_tensor_shape(input_name, shape)) {
+            unresolved_inputs.push_back(input_name);
+            input_shapes.push_back({});  // Empty shape
+        } else {
+            input_shapes.push_back(shape);
+        }
+    }
+
+    // If we couldn't resolve some input shapes, we can't validate
+    if (!unresolved_inputs.empty()) {
+        // Skip validation when input shapes are unknown
+        return;
+    }
+
+    // Resolve or infer output shapes
+    std::vector<std::vector<long>> output_shapes;
+    output_shapes.reserve(op.outputs.size());
+
+    for (size_t i = 0; i < op.outputs.size(); ++i) {
+        const auto& output_name = op.outputs[i];
+        std::vector<long> shape;
+
+        if (resolve_tensor_shape(output_name, shape)) {
+            // Shape already known (from IR or previous inference)
+            output_shapes.push_back(shape);
+        } else {
+            // Try to infer from operation semantics
+            std::vector<std::vector<long>> inferred_outputs;
+            infer_output_shapes(op, type, input_shapes, inferred_outputs);
+
+            if (i < inferred_outputs.size() && !inferred_outputs[i].empty()) {
+                shape = inferred_outputs[i];
+                output_shapes.push_back(shape);
+
+                // Store inferred shape for future operations
+                TensorShape ts;
+                ts.dims = shape;
+                ts.inferred = true;
+                ts.source_op = op.id;
+                mTensorShapes[output_name] = ts;
+            } else {
+                output_shapes.push_back({});  // Unknown shape
+            }
+        }
+    }
+
+    // Run validator
+    if (sig->validator) {
+        auto error = sig->validator(input_shapes, output_shapes, op.attrs, mShapeEnv);
+        if (error) {
+            // Build detailed error message
+            std::ostringstream oss;
+            oss << "\n╔══════════════════════════════════════════════════════════════╗\n"
+                << "║ Shape Validation Error at Graph Compilation                 ║\n"
+                << "╚══════════════════════════════════════════════════════════════╝\n\n"
+                << "Operation: #" << op_index << " (id: '" << op.id << "')\n"
+                << "Type:      " << op.name << "\n\n";
+
+            // Show operation attributes if any
+            bool has_attrs = false;
+            std::ostringstream attrs_oss;
+            if (op.attrs.find("transpose") != op.attrs.end()) {
+                if (std::holds_alternative<std::string>(op.attrs.at("transpose").value)) {
+                    attrs_oss << "transpose=" << std::get<std::string>(op.attrs.at("transpose").value) << " ";
+                    has_attrs = true;
+                }
+            }
+            if (op.attrs.find("eps") != op.attrs.end()) {
+                if (std::holds_alternative<double>(op.attrs.at("eps").value)) {
+                    attrs_oss << "eps=" << std::get<double>(op.attrs.at("eps").value) << " ";
+                    has_attrs = true;
+                }
+            }
+            if (op.attrs.find("rotary_dim") != op.attrs.end()) {
+                if (std::holds_alternative<std::int64_t>(op.attrs.at("rotary_dim").value)) {
+                    attrs_oss << "rotary_dim=" << std::get<std::int64_t>(op.attrs.at("rotary_dim").value) << " ";
+                    has_attrs = true;
+                }
+            }
+            if (op.attrs.find("layer_idx") != op.attrs.end()) {
+                if (std::holds_alternative<std::int64_t>(op.attrs.at("layer_idx").value)) {
+                    attrs_oss << "layer_idx=" << std::get<std::int64_t>(op.attrs.at("layer_idx").value) << " ";
+                    has_attrs = true;
+                }
+            }
+            if (has_attrs) {
+                oss << "Attributes: " << attrs_oss.str() << "\n\n";
+            }
+
+            oss << "Inputs:\n";
+            if (op.inputs.empty()) {
+                oss << "  (none)\n";
+            } else {
+                for (size_t i = 0; i < op.inputs.size(); ++i) {
+                    oss << "  [" << i << "] " << op.inputs[i] << ": ";
+                    if (i < input_shapes.size() && !input_shapes[i].empty()) {
+                        oss << "shape=(";
+                        for (size_t j = 0; j < input_shapes[i].size(); ++j) {
+                            if (j > 0) oss << ", ";
+                            oss << input_shapes[i][j];
+                        }
+                        oss << ")";
+                    } else {
+                        oss << "<shape unknown>";
+                    }
+                    oss << "\n";
+                }
+            }
+
+            oss << "\nOutputs:\n";
+            for (size_t i = 0; i < op.outputs.size(); ++i) {
+                oss << "  [" << i << "] " << op.outputs[i] << ": ";
+                if (i < output_shapes.size() && !output_shapes[i].empty()) {
+                    oss << "shape=(";
+                    for (size_t j = 0; j < output_shapes[i].size(); ++j) {
+                        if (j > 0) oss << ", ";
+                        oss << output_shapes[i][j];
+                    }
+                    oss << ")";
+                } else {
+                    oss << "<shape unknown or not inferred>";
+                }
+                oss << "\n";
+            }
+
+            oss << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                << "ERROR: " << error->message << "\n";
+
+            if (!error->hint.empty()) {
+                oss << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    << "HINT:  " << error->hint << "\n";
+            }
+
+            oss << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                << "Debug Information:\n"
+                << "  Graph: " << mModule.name << "\n"
+                << "  Batch size (B): " << mB << "\n"
+                << "  Sequence length (T): " << mT << "\n"
+                << "  Hidden size: " << mConfig.HiddenSize << "\n\n"
+                << "To disable shape checking (not recommended):\n"
+                << "  export SUROGATE_NO_SHAPE_CHECK=1\n\n";
+
+            throw std::runtime_error(oss.str());
+        }
+    }
+}
+
 CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     update_dimensions(B, T);
+
+    mExtraShapes.clear();
+    mTensorShapes.clear();
+
+    // Initialize shape database from graph inputs and params
+    for (const auto& [name, info] : graph.inputs) {
+        if (!info.shape.empty()) {
+            TensorShape ts;
+            ts.dims = resolve_shape(info.shape, mShapeEnv);
+            ts.inferred = false;
+            mTensorShapes[name] = ts;
+        }
+    }
+    for (const auto& [name, info] : graph.params) {
+        if (!info.shape.empty()) {
+            TensorShape ts;
+            ts.dims = resolve_shape(info.shape, mShapeEnv);
+            ts.inferred = false;
+            mTensorShapes[name] = ts;
+        }
+    }
+
+    if (mModule.forward.has_value()) {
+        const auto& fwd = *mModule.forward;
+        for (const auto& op : fwd.operations) {
+            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            if (op_type != "view" && op_type != "reshape") {
+                continue;
+            }
+            std::vector<long> shape;
+            if (auto* shape_attr = find_attr(op.attrs, "shape")) {
+                shape = resolve_attr_shape(*shape_attr, mShapeEnv);
+            } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
+                if (auto ref_name = attr_string(*shape_like_attr)) {
+                    std::string ref = *ref_name;
+                    if (starts_with(ref, kSavedPrefix)) {
+                        ref = ref.substr(kSavedPrefix.size());
+                    }
+                    auto it = mExtraShapes.find(ref);
+                    if (it != mExtraShapes.end()) {
+                        shape = it->second;
+                    } else {
+                        infer_known_tensor_shape(ref, mConfig, B, T, shape);
+                    }
+                }
+            }
+            if (!shape.empty()) {
+                for (const auto& out : op.outputs) {
+                    if (!out.empty()) {
+                        mExtraShapes[out] = shape;
+                    }
+                }
+            }
+        }
+    }
 
     CompiledGraph result;
     result.name = graph.name;
@@ -526,6 +1036,16 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
         if (compiled.type == CompiledOpType::Unknown) {
             throw std::runtime_error("GraphCompiler: unsupported operation type: " + op_type);
+        }
+
+        // Validate operation shapes at compile time
+        try {
+            validate_operation_shapes(op, compiled.type, idx);
+        } catch (const std::exception& e) {
+            // Re-throw with additional context if validation fails
+            std::cerr << "Shape validation failed during graph compilation.\n"
+                      << "To disable shape checking, set SUROGATE_NO_SHAPE_CHECK=1\n";
+            throw;
         }
 
         // Pre-resolve inputs
@@ -612,6 +1132,15 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             if ((compiled.type == CompiledOpType::FusedResidualRMSNorm && i == 2) ||
                 (compiled.type == CompiledOpType::QKVQKNormRoPE && (i == 1 || i == 2))) {
                 ref.dtype = ETensorDType::FP32;
+            }
+
+            // Ensure embedding output writes into the persistent encoded buffer.
+            if (compiled.type == CompiledOpType::Embedding && i == 0) {
+                const long Bdim = mB;
+                const long Tdim = mT;
+                const long Cdim = mConfig.HiddenSize;
+                ref.slot = TensorSlot::Encoded;
+                ref.shape = {Bdim, Tdim, Cdim};
             }
 
             compiled.outputs.push_back(std::move(ref));
@@ -1150,7 +1679,6 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
     Tensor& a = resolve_tensor(op.inputs[0]);
     Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
-
     vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, mRunState.MainStream);
 }
 
@@ -1168,9 +1696,10 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     matmul_dims(a, b, op.attrs.transpose, M, N, K);
 
     bool used_recipe = false;
+    modules::MatmulContext ctx{};
+    modules::MatmulContext* ctx_ptr = nullptr;
     if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT) {
         if (op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
-            modules::MatmulContext ctx;
             ctx.out = &out;
             ctx.inp = &a;
             ctx.weight = &b;
@@ -1192,6 +1721,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
             mRecipe->forward_matmul(ctx);
             used_recipe = true;
+            ctx_ptr = &ctx;
         }
     }
 
@@ -1200,6 +1730,39 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         matmul(out, b, a, bias, nullptr, nullptr,
                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                N, M, K, mode_col, false, mRunState.MainStream);
+    }
+
+    if (mForwardPlan && op.attrs.matmul_op.has_value() && op.attrs.layer_idx >= 0 &&
+        static_cast<std::size_t>(op.attrs.layer_idx) < mForwardPlan->size() &&
+        *op.attrs.matmul_op != modules::MatmulOp::LMHead) {
+        MatmulForwardPlan plan{};
+        plan.valid = true;
+        plan.use_recipe = used_recipe;
+        plan.has_bias = bias.has_value();
+        if (used_recipe && ctx_ptr) {
+            plan.allow_fp8 = ctx_ptr->allow_fp8;
+            plan.allow_fp4 = ctx_ptr->allow_fp4;
+            plan.delayed_quantizer_idx = ctx_ptr->delayed_quantizer_idx;
+            plan.use_fp8_cache = (ctx_ptr->cached_weight && ctx_ptr->cached_weight->Data);
+            plan.use_fp4_cache = (ctx_ptr->cached_fp4_data && ctx_ptr->cached_fp4_scales);
+        }
+        auto& layer_plan = (*mForwardPlan)[static_cast<std::size_t>(op.attrs.layer_idx)];
+        switch (*op.attrs.matmul_op) {
+            case modules::MatmulOp::QKV:
+                layer_plan.qkv = plan;
+                break;
+            case modules::MatmulOp::AttnOut:
+                layer_plan.out_proj = plan;
+                break;
+            case modules::MatmulOp::MLPUp:
+                layer_plan.mlp_up = plan;
+                break;
+            case modules::MatmulOp::MLPDown:
+                layer_plan.mlp_down = plan;
+                break;
+            default:
+                break;
+        }
     }
 
     // Hook invocation
@@ -1273,6 +1836,21 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
         && (freqs.Sizes[1] >= Hs)
         && (qkv_view.Rank == 3);
 
+    if (mForwardPlan) {
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(op.inputs[0].name, layer_idx, field) &&
+            layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mForwardPlan->size()) {
+            AttnForwardPlan plan{};
+            plan.valid = true;
+            plan.use_qk_norm = true;
+            plan.rope_fused = rope_fusable;
+            plan.use_cudnn = true;
+            plan.rotary_dim = rotary_dim;
+            (*mForwardPlan)[static_cast<std::size_t>(layer_idx)].attn = plan;
+        }
+    }
+
     if (rope_fusable) {
         qkv_qk_norm_rope_forward(qkv_view, q_rstd, k_rstd, q_norm, k_norm,
                                  freqs, reinterpret_cast<int*>(pos_ids.Data),
@@ -1305,6 +1883,21 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
+
+    if (mForwardPlan) {
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(op.inputs[0].name, layer_idx, field) &&
+            layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mForwardPlan->size()) {
+            AttnForwardPlan plan{};
+            plan.valid = true;
+            plan.use_qk_norm = false;
+            plan.rope_fused = false;
+            plan.use_cudnn = true;
+            plan.rotary_dim = op.attrs.rotary_dim;
+            (*mForwardPlan)[static_cast<std::size_t>(layer_idx)].attn = plan;
+        }
+    }
 
     rope_forward(out, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
                  static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs,
@@ -1428,27 +2021,10 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // Addition backward: gradients pass through unchanged to both inputs
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
-    // Debug: check add_backward gradient values
-    static int add_bwd_dbg = 0;
-    if (add_bwd_dbg < 4) {
-        cudaDeviceSynchronize();
-        float sum = 0;
-        const long N = 256;
-        std::vector<nv_bfloat16> buf(N);
-        if (d_out.Data) {
-            cudaMemcpy(buf.data(), d_out.Data, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) sum += fabsf(__bfloat162float(buf[i]));
-        }
-        fprintf(stderr, "[ADD_BWD] input=%s slot=%d layer=%d d_out_abssum=%.4f out0=%s out1=%s\n",
-                op.inputs[0].name.c_str(), (int)op.inputs[0].slot, op.inputs[0].layer_idx, sum,
-                op.outputs[0].name.c_str(),
-                op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "none");
-        add_bwd_dbg++;
-    }
-
-    // For pre-allocated gradient slots (like d_res_ffn, d_res_att), we need to
-    // copy the data pointer to the ORIGINAL pre-allocated tensor, not just store in mTensorMap.
-    // This ensures the LoRA hooks can access the gradients via simplified_grads().
+    // For pre-allocated gradient slots (like d_res_ffn, d_res_att), we must copy the
+    // upstream gradient into the original simplified_grads buffer. Simply aliasing
+    // the data pointer causes shared storage between residual and branch gradients,
+    // which breaks LoRA (it does in-place dx accumulation).
     // IMPORTANT: We must get the base tensor directly from simplified_grads(), not via
     // resolve_tensor(), because resolve_tensor() may return a view from mTensorMap.
     auto assign_output = [&](const TensorRef& ref) {
@@ -1470,10 +2046,23 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
         }
 
         if (base_grad) {
-            // Set the Data pointer of the original simplified_grads tensor
+            if (base_grad->Data) {
+                if (base_grad->DType != d_out.DType) {
+                    throw std::runtime_error("dispatch_add_backward: dtype mismatch for " + ref.name);
+                }
+                if (base_grad->Data != d_out.Data) {
+                    CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
+                                               cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                }
+                mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+                return;
+            }
+            // Fall back to aliasing if the base grad has no storage yet.
             base_grad->Data = d_out.Data;
+            mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+            return;
         }
-        // Always also store in mTensorMap for other ops that reference by name
+        // Default: just expose d_out as-is.
         mTensorMap[ref.name] = d_out;
     };
 
@@ -1489,42 +2078,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
-    const bool debug_matmul = env_enabled("SUROGATE_DEBUG_DSL_MATMUL_GRADS");
-
-    // Debug: check d_out at start of matmul_backward
-    static int matmul_bwd_dbg = 0;
-    if (matmul_bwd_dbg < 2 && d_out.Data && !mCapturing) {
-        cudaDeviceSynchronize();
-        fprintf(stderr, "[MATMUL_BWD] #%d id=%s d_out shape=[%ld,%ld] ptr=%p\n",
-                matmul_bwd_dbg, op.op_id.c_str(), d_out.Sizes[0], d_out.Sizes[1], (void*)d_out.Data);
-
-        // Check at target positions for d_logits (vocab-sized cols)
-        if (d_out.Rank == 2 && d_out.Sizes[1] > 100000) {
-            // Get targets to check at actual gradient positions
-            std::vector<int> tgt_vals(100);
-            cudaMemcpy(tgt_vals.data(), mRunState.Targets.Data, 100 * sizeof(int), cudaMemcpyDeviceToHost);
-            // Find row 95 (target=271, which has largest gradient -6.1e-5)
-            const long row = 95;
-            const int tgt = tgt_vals[row];
-            nv_bfloat16 val;
-            if (tgt >= 0 && tgt < d_out.Sizes[1]) {
-                cudaMemcpy(&val, (nv_bfloat16*)d_out.Data + row * d_out.Sizes[1] + tgt,
-                           sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-                fprintf(stderr, "[MATMUL_BWD] d_out[row=%ld, tgt=%d] = %.6f\n",
-                        row, tgt, __bfloat162float(val));
-            }
-        } else {
-            float sum = 0;
-            const long N = 256;
-            std::vector<nv_bfloat16> buf(N);
-            cudaMemcpy(buf.data(), d_out.Data, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) sum += fabsf(__bfloat162float(buf[i]));
-            fprintf(stderr, "[MATMUL_BWD] d_out[0:N] abssum=%.6f d_out[0:4]=%.6f %.6f %.6f %.6f\n",
-                    sum, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
-                    __bfloat162float(buf[2]), __bfloat162float(buf[3]));
-        }
-        matmul_bwd_dbg++;
-    }
 
     EMMTranspose mode = op.attrs.transpose;
     const int layer_idx = op.attrs.layer_idx;
@@ -1549,40 +2102,11 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor* dA_ptr = nullptr;
     Tensor* dB_ptr = nullptr;
 
-    auto ensure_output_like = [&](const TensorRef& ref, const Tensor& like) -> Tensor* {
-        if (ref.slot != TensorSlot::Mapped) {
-            return &ensure_output_tensor(ref);
-        }
-        std::vector<long> shape(like.Sizes.begin(), like.Sizes.begin() + like.Rank);
-        auto it = mTensorMap.find(ref.name);
-        if (it != mTensorMap.end()) {
-            bool match = (it->second.Rank == static_cast<int>(shape.size()));
-            if (match) {
-                for (int i = 0; i < it->second.Rank; ++i) {
-                    if (it->second.Sizes[i] != shape[i]) {
-                        match = false;
-                        break;
-                    }
-                }
-            }
-            if (match) {
-                return &it->second;
-            }
-        }
-        Tensor t = mRunState.temp_alloc(like.DType, shape);
-        mTemps.push_back(t);
-        auto [ins_it, inserted] = mTensorMap.emplace(ref.name, t);
-        if (!inserted) {
-            ins_it->second = t;
-        }
-        return &ins_it->second;
-    };
-
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
-        dA_ptr = ensure_output_like(op.outputs[0], a);
+        dA_ptr = &ensure_output_tensor(op.outputs[0]);
     }
     if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        dB_ptr = ensure_output_like(op.outputs[1], b);
+        dB_ptr = &ensure_output_tensor(op.outputs[1]);
     }
 
     if (!dA_ptr && !dB_ptr) {
@@ -1641,25 +2165,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
 
         mRecipe->backward_matmul(ctx);
         used_recipe = true;
-
-        // Debug: check dinp after recipe matmul - row 95 should have non-zero gradients
-        if (matmul_bwd_dbg <= 2 && ctx.dinp && ctx.dinp->Data && !mCapturing) {
-            cudaDeviceSynchronize();
-            // Check row 95 (which has largest d_logits gradient)
-            if (ctx.dinp->Rank == 2 && ctx.dinp->Sizes[0] > 100) {
-                const long row = 95;
-                const long row_start = row * ctx.dinp->Sizes[1];
-                float sum_row95 = 0;
-                const long N_dbg = 64;
-                std::vector<nv_bfloat16> buf(N_dbg);
-                cudaMemcpy(buf.data(), (nv_bfloat16*)ctx.dinp->Data + row_start, N_dbg * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-                for (long i = 0; i < N_dbg; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
-                fprintf(stderr, "[MATMUL_BWD_RECIPE] dinp row95 abssum=%.6f dinp[95,0:4]=%.6f %.6f %.6f %.6f shape=[%ld,%ld]\n",
-                        sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
-                        __bfloat162float(buf[2]), __bfloat162float(buf[3]),
-                        ctx.dinp->Sizes[0], ctx.dinp->Sizes[1]);
-            }
-        }
     }
 
     if (!used_recipe) {
@@ -1692,25 +2197,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             matmul(*dA_ptr, b, d_out, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, false, mRunState.MainStream);
-
-            // Debug: check dA after matmul - row 95 should have non-zero gradients
-            if (matmul_bwd_dbg <= 2 && dA_ptr->Data && !mCapturing) {
-                cudaDeviceSynchronize();
-                // dA is d_xF which is (BT, hidden_size)
-                // Check row 95 (which has largest d_logits gradient)
-                const long row = 95;
-                const long hidden_size = dA_ptr->Sizes[1];
-                float sum_row95 = 0;
-                const long N_dbg = 64;
-                std::vector<nv_bfloat16> buf(N_dbg);
-                cudaMemcpy(buf.data(), (nv_bfloat16*)dA_ptr->Data + row * hidden_size, N_dbg * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-                for (long i = 0; i < N_dbg; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
-                fprintf(stderr, "[MATMUL_BWD] dA ptr=%p row95 abssum=%.6f dA[95,0:4]=%.6f %.6f %.6f %.6f output=%s shape=[%ld,%ld]\n",
-                        (void*)dA_ptr->Data, sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
-                        __bfloat162float(buf[2]), __bfloat162float(buf[3]),
-                        op.outputs.empty() ? "none" : op.outputs[0].name.c_str(),
-                        dA_ptr->Sizes[0], dA_ptr->Sizes[1]);
-            }
         }
         if (dB_ptr && !skip_weight_grad) {
             int M = 0, N = 0, K = 0;
@@ -1719,88 +2205,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             matmul(*dB_ptr, a, d_out, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, do_accumulate, mRunState.MainStream);
-        }
-    }
-
-    if (debug_matmul && !mCapturing && op.attrs.matmul_op.has_value()) {
-        const auto op_kind = *op.attrs.matmul_op;
-        if (op_kind == modules::MatmulOp::MLPDown || op_kind == modules::MatmulOp::MLPUp ||
-            op_kind == modules::MatmulOp::AttnOut || op_kind == modules::MatmulOp::QKV) {
-            const int layer_idx = op.attrs.layer_idx;
-            const int mid_layer = static_cast<int>(mConfig.NumLayers / 2);
-            const bool dbg_layer = layer_idx >= 0 &&
-                (layer_idx <= 1 || layer_idx == mid_layer || layer_idx == mConfig.NumLayers - 1);
-            if (dbg_layer) {
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                auto op_name = [](modules::MatmulOp op) {
-                    switch (op) {
-                        case modules::MatmulOp::MLPDown: return "MLPDown";
-                        case modules::MatmulOp::MLPUp: return "MLPUp";
-                        case modules::MatmulOp::AttnOut: return "AttnOut";
-                        case modules::MatmulOp::QKV: return "QKV";
-                        default: return "Other";
-                    }
-                };
-                auto mode_name = [](EMMTranspose mode) {
-                    switch (mode) {
-                        case EMMTranspose::NN: return "NN";
-                        case EMMTranspose::NT: return "NT";
-                        case EMMTranspose::TN: return "TN";
-                        case EMMTranspose::TT: return "TT";
-                    }
-                    return "NN";
-                };
-                auto shape_str = [](const Tensor& t) {
-                    std::string s = "[";
-                    for (int i = 0; i < t.Rank; ++i) {
-                        if (i) s += ",";
-                        s += std::to_string(t.Sizes[i]);
-                    }
-                    s += "]";
-                    return s;
-                };
-                auto dump_row95 = [&](const char* tag, const Tensor& t, const std::string& name) {
-                    if (!t.Data) {
-                        fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=null\n", tag, name.c_str());
-                        return;
-                    }
-                    long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
-                    long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
-                    if (rows <= 0 || hidden <= 0) {
-                        fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=%p shape=[%ld,%ld,%ld]\n",
-                                tag, name.c_str(), (void*)t.Data,
-                                t.Sizes[0], t.Rank > 1 ? t.Sizes[1] : 0L, t.Rank > 2 ? t.Sizes[2] : 0L);
-                        return;
-                    }
-                    long row = std::min<long>(95, rows - 1);
-                    const long N = std::min<long>(64, hidden);
-                    float sum_row = 0.0f;
-                    if (t.DType == ETensorDType::BF16) {
-                        std::vector<nv_bfloat16> buf(N);
-                        cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-                        for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
-                    } else if (t.DType == ETensorDType::FP32) {
-                        std::vector<float> buf(N);
-                        cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost);
-                        for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
-                    } else {
-                        fprintf(stderr, "[DSL MATMUL] %s name=%s ptr=%p dtype=%d\n",
-                                tag, name.c_str(), (void*)t.Data, static_cast<int>(t.DType));
-                        return;
-                    }
-                    fprintf(stderr, "[DSL MATMUL] layer=%d op=%s %s name=%s ptr=%p row%ld_abssum=%.6f shape=%s\n",
-                            layer_idx, op_name(op_kind), tag, name.c_str(), (void*)t.Data, row, sum_row,
-                            shape_str(t).c_str());
-                };
-                fprintf(stderr, "[DSL MATMUL] layer=%d op=%s recipe=%d acc=%d skip_w=%d fp8=%d dq=%d mode=%s a=%s b=%s\n",
-                        layer_idx, op_name(op_kind), used_recipe ? 1 : 0, do_accumulate ? 1 : 0,
-                        skip_weight_grad ? 1 : 0, used_fp8 ? 1 : 0, has_dout_quant ? 1 : 0,
-                        mode_name(mode), shape_str(a).c_str(), shape_str(b).c_str());
-                dump_row95("d_out", d_out, op.inputs[0].name);
-                if (dA_ptr && !op.outputs.empty()) {
-                    dump_row95("d_in", *dA_ptr, op.outputs[0].name);
-                }
-            }
         }
     }
 
@@ -1834,22 +2238,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     // Map d_out to simplified_grads for LoRA hooks that consume upstream gradients directly.
     if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
         auto& grads = mRunState.simplified_grads(layer_idx);
-        // Debug: check d_out at row 95 (first valid row) for simplified_grads mapping
-        static int dbg_count = 0;
-        if (dbg_count < 2 && (*op.attrs.matmul_op == modules::MatmulOp::MLPDown || *op.attrs.matmul_op == modules::MatmulOp::AttnOut) && !mCapturing) {
-            cudaDeviceSynchronize();
-            const long row = 95;
-            const long hidden = d_out.Sizes[1];
-            float sum_row95 = 0;
-            const long N = 64;
-            std::vector<nv_bfloat16> buf(N);
-            cudaMemcpy(buf.data(), (nv_bfloat16*)d_out.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
-            fprintf(stderr, "[COMPILED_OPS] matmul_op=%d layer=%d d_out ptr=%p row95_abssum=%.6f d_out[95,0:4]=%.6f %.6f %.6f %.6f\n",
-                    (int)*op.attrs.matmul_op, layer_idx, (void*)d_out.Data, sum_row95,
-                    __bfloat162float(buf[0]), __bfloat162float(buf[1]), __bfloat162float(buf[2]), __bfloat162float(buf[3]));
-            dbg_count++;
-        }
         switch (*op.attrs.matmul_op) {
             case modules::MatmulOp::MLPDown:
                 // d_mlp_down is the upstream gradient for MLP down
@@ -2089,24 +2477,42 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     Tensor d_qkv_view = (d_qkv.Rank == 4) ? view_tensor(d_qkv, {mB, mT, static_cast<long>(qkv_channels)}) : d_qkv;
 
     // Initialize d_qkv with upstream gradient (d_out) so V gradients pass through unchanged.
-    // The fused kernel updates Q/K channels in-place.
+    // The fused or fallback kernels update Q/K channels in-place.
     if (d_qkv_view.Data != d_out_view.Data) {
         const std::size_t bytes = static_cast<std::size_t>(d_out_view.nelem()) * get_dtype_size(d_out_view.DType);
         CUDA_CHECK(cudaMemcpyAsync(d_qkv_view.Data, d_out_view.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
 
-    // Combined backward for Q and K norms with RoPE
-    // Q norm backward (with RoPE): channel_offset=0
-    qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd,
-                                       freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                       static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                       Hq, Hs, 0, mRunState.MainStream, nullptr);
+    const bool disable_fused = env_enabled("SUROGATE_DISABLE_FUSED_QK_ROPE_BWD");
+    if (disable_fused) {
+        // Fallback: undo RoPE on gradients and activations, then run non-RoPE QK RMSNorm backward.
+        const int rotary_dim = op.attrs.rotary_dim;
+        rope_backward(d_qkv_view, d_qkv_view, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+                      static_cast<int>(mB), static_cast<int>(mT),
+                      Hq, Hkv, Hs, rotary_dim, mRunState.MainStream);
+        rope_backward(qkv_view, qkv_view, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+                      static_cast<int>(mB), static_cast<int>(mT),
+                      Hq, Hkv, Hs, rotary_dim, mRunState.MainStream);
+        qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd,
+                                     static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                     Hq, Hs, 0, mRunState.MainStream);
+        qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd,
+                                     static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                     Hkv, Hs, q_rows, mRunState.MainStream);
+    } else {
+        // Combined backward for Q and K norms with RoPE
+        // Q norm backward (with RoPE): channel_offset=0
+        qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd,
+                                           freqs, reinterpret_cast<int*>(pos_ids.Data),
+                                           static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                           Hq, Hs, 0, mRunState.MainStream, nullptr);
 
-    // K norm backward (with RoPE): channel_offset=q_rows
-    qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd,
-                                       freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                       static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                       Hkv, Hs, q_rows, mRunState.MainStream, nullptr);
+        // K norm backward (with RoPE): channel_offset=q_rows
+        qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd,
+                                           freqs, reinterpret_cast<int*>(pos_ids.Data),
+                                           static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                           Hkv, Hs, q_rows, mRunState.MainStream, nullptr);
+    }
 
     // V doesn't have normalization - its gradients pass through unchanged
     // The d_out already contains the V gradients at the correct offset
@@ -2120,6 +2526,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[3]);
     Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
 
+    Tensor* out_ptr = &out;
+    Tensor* lse_ptr = &lse;
+    Tensor* qkv_ptr = &qkv;
+
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
@@ -2129,6 +2539,11 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
     }
 
+    // Parse layer_idx for use in cuDNN call
+    int layer_idx = -1;
+    std::string field;
+    parse_block_param(op.inputs[3].name, layer_idx, field);
+
     // FIX: Zero-initialize d_qkv before cuDNN attention backward to prevent NaN from uninitialized memory.
     // The d_qkv buffer may contain stale values from previous operations, and cuDNN attention backward
     // may read parts of this buffer even though it's expected to be output-only. Without this zero-init,
@@ -2136,7 +2551,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     fill_zero(d_qkv, mRunState.MainStream);
 
     // Signature: attention_backward_cudnn(dqkv, stats, out, dout, qkv, workspace, handle, B, T, Hq, Hkv, HS, stream)
-    attention_backward_cudnn(d_qkv, lse, out, d_out, qkv,
+    attention_backward_cudnn(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
                              mRunState.scratch().cudnn_workspace,
                              mRunState.CudnnHandle,
                              static_cast<int>(mB), static_cast<int>(mT),
@@ -2151,36 +2566,20 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     // inputs: d_y, d_residual_next (may be empty), residual_out, weight, rstd
     // outputs: d_residual, d_input, d_weight (optional)
     Tensor& d_y = resolve_tensor(op.inputs[0]);
-
-    // Debug: check d_y values - row 95 should have non-zero gradients from LM head
-    static int rmsnorm_bwd_dbg = 0;
-    if (rmsnorm_bwd_dbg < 2 && d_y.Data && !mCapturing) {
-        cudaDeviceSynchronize();
-        fprintf(stderr, "[RMSNORM_BWD] d_y ptr=%p shape=[%ld,%ld,%ld]\n",
-                (void*)d_y.Data, d_y.Sizes[0], d_y.Sizes[1], d_y.Rank > 2 ? d_y.Sizes[2] : 0L);
-        // Check row 95 (first row with non-zero gradients)
-        const long row = 95;
-        const long hidden_size = d_y.Rank == 3 ? d_y.Sizes[2] : d_y.Sizes[1];
-        const long row_start = row * hidden_size;
-        float sum_row95 = 0;
-        const long N = 64;
-        std::vector<nv_bfloat16> buf(N);
-        cudaMemcpy(buf.data(), (nv_bfloat16*)d_y.Data + row_start, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-        for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
-        fprintf(stderr, "[RMSNORM_BWD] d_y row95 abssum=%.6f d_y[95,0:4]=%.6f %.6f %.6f %.6f\n",
-                sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
-                __bfloat162float(buf[2]), __bfloat162float(buf[3]));
-        rmsnorm_bwd_dbg++;
-    }
-    Tensor& residual_out = resolve_tensor(op.inputs[2]);
+    Tensor* residual_out_ptr = &resolve_tensor(op.inputs[2]);
     Tensor& weight = resolve_tensor(op.inputs[3]);
     Tensor& rstd = resolve_tensor(op.inputs[4]);
-    const bool debug_grads = env_enabled("SUROGATE_DEBUG_DSL_GRADS");
+
     int ln_layer_idx = -1;
     std::string ln_field;
     if (!op.inputs[3].name.empty()) {
         parse_block_param(op.inputs[3].name, ln_layer_idx, ln_field);
     }
+    if (ln_layer_idx >= 0 && ln_field == "ln1_weight") {
+        // LN1 backward uses the saved residual_out (res_ffn) for this layer.
+        residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
+    }
+    Tensor& residual_out = *residual_out_ptr;
 
     // d_residual_next is the incoming gradient from the next layer (may be zero/empty)
     Tensor d_residual_zero{};
@@ -2194,82 +2593,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         mTemps.push_back(d_residual_zero);
         d_residual_next = &d_residual_zero;
     }
-
-    // For LN2 backward, the modular path feeds the residual stream gradient that already
-    // includes the MLP contribution. In the DSL graph, that upstream gradient is carried
-    // by d_mlp_down; use it when available to match modular accumulation.
     Tensor* d_residual_input = d_residual_next;
     Tensor* d_residual_stream = d_residual_next;
-    if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
-        auto& grads = mRunState.simplified_grads(ln_layer_idx);
-        if (grads.d_mlp_down.Data) {
-            d_residual_input = &grads.d_mlp_down;
-        }
-    }
-
-    auto dump_row95 = [&](const char* tag, const Tensor& t, const std::string& name) {
-        if (!t.Data) {
-            fprintf(stderr, "[DSL GRADS] %s name=%s ptr=null\n", tag, name.c_str());
-            return;
-        }
-        long rows = (t.Rank >= 3) ? (t.Sizes[0] * t.Sizes[1]) : t.Sizes[0];
-        long hidden = (t.Rank >= 3) ? t.Sizes[2] : (t.Rank >= 2 ? t.Sizes[1] : 0);
-        if (rows <= 0 || hidden <= 0) {
-            fprintf(stderr, "[DSL GRADS] %s name=%s ptr=%p shape=%s\n",
-                    tag, name.c_str(), (void*)t.Data, tensor_shape_str(t).c_str());
-            return;
-        }
-        long row = std::min<long>(95, rows - 1);
-        const long N = std::min<long>(64, hidden);
-        float sum_row = 0.0f;
-        if (t.DType == ETensorDType::BF16) {
-            std::vector<nv_bfloat16> buf(N);
-            cudaMemcpy(buf.data(), (nv_bfloat16*)t.Data + row * hidden, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) sum_row += fabsf(__bfloat162float(buf[i]));
-        } else if (t.DType == ETensorDType::FP32) {
-            std::vector<float> buf(N);
-            cudaMemcpy(buf.data(), (float*)t.Data + row * hidden, N * sizeof(float), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) sum_row += fabsf(buf[i]);
-        } else {
-            fprintf(stderr, "[DSL GRADS] %s name=%s ptr=%p dtype=%d shape=%s\n",
-                    tag, name.c_str(), (void*)t.Data, static_cast<int>(t.DType), tensor_shape_str(t).c_str());
-            return;
-        }
-        fprintf(stderr, "[DSL GRADS] %s layer=%d field=%s name=%s ptr=%p row%ld_abssum=%.6f\n",
-                tag, ln_layer_idx, ln_field.c_str(), name.c_str(), (void*)t.Data, row, sum_row);
-    };
-
-    if (rmsnorm_bwd_dbg <= 2 && d_residual_next && d_residual_next->Data && !mCapturing) {
-        cudaDeviceSynchronize();
-        const long row = 95;
-        const long hidden_size = d_residual_next->Rank == 3 ? d_residual_next->Sizes[2] : d_residual_next->Sizes[1];
-        const long row_start = row * hidden_size;
-        float sum_row95 = 0;
-        const long N = 64;
-        std::vector<nv_bfloat16> buf(N);
-        cudaMemcpy(buf.data(), (nv_bfloat16*)d_residual_next->Data + row_start, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-        for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
-        fprintf(stderr, "[RMSNORM_BWD] d_residual_next name=%s ptr=%p row95 abssum=%.6f\n",
-                op.inputs[1].name.c_str(), (void*)d_residual_next->Data, sum_row95);
-    }
-    const int mid_layer = static_cast<int>(mConfig.NumLayers / 2);
-    const bool dbg_layer =
-        (ln_layer_idx >= 0) &&
-        (ln_layer_idx <= 1 || ln_layer_idx == mid_layer || ln_layer_idx == mConfig.NumLayers - 1);
-    if (debug_grads && !mCapturing && dbg_layer) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        dump_row95("pre_rmsnorm d_y", d_y, op.inputs[0].name);
-        dump_row95("pre_rmsnorm d_residual_next", *d_residual_next, op.inputs[1].name);
-        if (d_residual_input != d_residual_next) {
-            dump_row95("pre_rmsnorm d_residual_input", *d_residual_input, "d_residual_input");
-        }
-        if (ln_field == "ln2_weight") {
-            auto& grads = mRunState.simplified_grads(ln_layer_idx);
-            if (grads.d_mlp_down.Data) {
-                dump_row95("pre_rmsnorm grads.d_mlp_down", grads.d_mlp_down, "d_mlp_down");
-            }
-        }
-    }
 
     Tensor& d_input = ensure_output_tensor(op.outputs[1]);
 
@@ -2294,30 +2619,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                      nullptr,  // abs_max_ptr
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
-
-    // Debug: check d_input after rmsnorm_backward - row 95 should have non-zero gradients
-    if (rmsnorm_bwd_dbg <= 2 && d_input.Data && !mCapturing) {
-        cudaDeviceSynchronize();
-        // Check row 95 (first row with non-zero gradients)
-        const long row = 95;
-        const long hidden_size = d_input.Rank == 3 ? d_input.Sizes[2] : d_input.Sizes[1];
-        const long row_start = row * hidden_size;
-        float sum_row95 = 0;
-        const long N = 64;
-        std::vector<nv_bfloat16> buf(N);
-        cudaMemcpy(buf.data(), (nv_bfloat16*)d_input.Data + row_start, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-        for (long i = 0; i < N; i++) sum_row95 += fabsf(__bfloat162float(buf[i]));
-        fprintf(stderr, "[RMSNORM_BWD] d_input ptr=%p row95 abssum=%.6f d_input[95,0:4]=%.6f %.6f %.6f %.6f output=%s\n",
-                (void*)d_input.Data, sum_row95, __bfloat162float(buf[0]), __bfloat162float(buf[1]),
-                __bfloat162float(buf[2]), __bfloat162float(buf[3]), op.outputs[1].name.c_str());
-    }
-    if (debug_grads && !mCapturing && dbg_layer) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        dump_row95("post_rmsnorm d_input", d_input, op.outputs[1].name);
-        if (d_residual_stream && d_residual_stream->Data) {
-            dump_row95("post_rmsnorm d_residual_stream", *d_residual_stream, op.inputs[1].name);
-        }
-    }
 
     // Copy d_input to d_residual if they're different outputs
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {
@@ -2512,7 +2813,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     acts.mlp_up.Data = nullptr;
                     acts.swiglu.Data = nullptr;
                 }
-                mRunState.scratch().cudnn_workspace.Data = nullptr;
+                // Note: cudnn_workspace is persistently allocated, don't clear
                 layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
             }
             handle_layer_end(op.layer_end);
@@ -2549,51 +2850,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (!output.Data) {
         throw std::runtime_error("CompiledExecutor: output tensor has no data (B=" +
                                 std::to_string(mB) + ", T=" + std::to_string(mT) + ")");
-    }
-
-    // Debug: check d_logits at non-masked positions in execute_backward
-    static int exec_bwd_dbg = 0;
-    if (exec_bwd_dbg < 2 && output.Data && !mCapturing) {
-        cudaDeviceSynchronize();
-        const long BT_total = mB * mT;
-        const long Vp = mConfig.VocabSize;
-
-        // Get all targets to find non-masked positions
-        std::vector<int> all_tgt(BT_total);
-        cudaMemcpy(all_tgt.data(), mRunState.Targets.Data, BT_total * sizeof(int), cudaMemcpyDeviceToHost);
-
-        // Find first 4 non-masked positions
-        std::vector<int> valid_rows;
-        int valid_count = 0;
-        for (long i = 0; i < BT_total && valid_count < 4; i++) {
-            if (all_tgt[i] >= 0 && all_tgt[i] < Vp) {
-                valid_rows.push_back(i);
-                valid_count++;
-            }
-        }
-        fprintf(stderr, "[EXEC_BWD] BT=%ld valid_count=%d (first valid rows: ",
-                BT_total, valid_count);
-        for (int i = 0; i < valid_count; i++) fprintf(stderr, "%d ", valid_rows[i]);
-        fprintf(stderr, ")\n");
-
-        // Check gradients at valid target positions
-        if (valid_count > 0) {
-            float abssum_at_targets = 0.0f;
-            std::vector<float> grads_at_targets(4, 0.0f);
-            for (int i = 0; i < valid_count; i++) {
-                int row = valid_rows[i];
-                int tgt_id = all_tgt[row];
-                nv_bfloat16 val;
-                cudaMemcpy(&val, (nv_bfloat16*)output.Data + row * Vp + tgt_id,
-                           sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-                grads_at_targets[i] = __bfloat162float(val);
-                abssum_at_targets += fabsf(grads_at_targets[i]);
-            }
-            fprintf(stderr, "[EXEC_BWD] d_logits at valid targets: %.6f %.6f %.6f %.6f abssum=%.6f\n",
-                    grads_at_targets[0], grads_at_targets[1], grads_at_targets[2], grads_at_targets[3],
-                    abssum_at_targets);
-        }
-        exec_bwd_dbg++;
     }
 
     Tensor logits_view = view_tensor(output, {mB, mT, static_cast<long>(mConfig.VocabSize)});
@@ -2662,30 +2918,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return -1;
     };
 
-    static int bwd_trace_count = 0;
-    const bool do_trace = (bwd_trace_count < 1);
-    if (do_trace) bwd_trace_count++;
-
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
-
-        // Debug: trace backward ops
-        if (do_trace && idx < 30) {
-            std::string inputs_str;
-            for (size_t i = 0; i < op.inputs.size(); i++) {
-                if (i > 0) inputs_str += ", ";
-                inputs_str += op.inputs[i].name;
-            }
-            std::string outputs_str;
-            for (size_t i = 0; i < op.outputs.size(); i++) {
-                if (i > 0) outputs_str += ", ";
-                outputs_str += op.outputs[i].name;
-            }
-            fprintf(stderr, "[BWD_TRACE] op %zu type=%s id=%s layer=%d\n  inputs=[%s]\n  outputs=[%s]\n",
-                    idx, op_type_to_string(op.type), op.op_id.c_str(),
-                    op.layer_start >= 0 ? op.layer_start : (op.inputs.empty() ? -1 : op.inputs[0].layer_idx),
-                    inputs_str.c_str(), outputs_str.c_str());
-        }
 
         if (op.layer_start >= 0) {
             handle_layer_start(op.layer_start);
@@ -2777,6 +3011,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
+                // Note: cudnn_workspace is persistently allocated, no need to clear
                 // Clear stack-allocated tensor pointers in simplified_acts/grads for this layer.
                 // These pointers become stale after checkpoint restore.
                 if (mRunState.ffn_temps_on_stack()) {

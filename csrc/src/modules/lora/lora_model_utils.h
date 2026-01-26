@@ -403,42 +403,6 @@ inline void backward_lora_layer(
     Tensor& workspace,
     cudaStream_t stream) {
 
-    static int debug_count = 0;
-    if (debug_count < 2 && dL_dy.Data && x.Data) {
-        cudaDeviceSynchronize();
-        // Check row 95 (first non-masked row)
-        const long row = 95;
-        float dL_dy_sum95 = 0, x_sum95 = 0;
-        const long N = 64;
-        std::vector<float> dL_dy_buf(N), x_buf(N);
-
-        if (dL_dy.DType == ETensorDType::BF16) {
-            std::vector<nv_bfloat16> tmp(N);
-            cudaMemcpy(tmp.data(), (nv_bfloat16*)dL_dy.Data + row * out_features, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) dL_dy_buf[i] = __bfloat162float(tmp[i]);
-        } else {
-            cudaMemcpy(dL_dy_buf.data(), (float*)dL_dy.Data + row * out_features, N * sizeof(float), cudaMemcpyDeviceToHost);
-        }
-        for (long i = 0; i < N; i++) dL_dy_sum95 += fabsf(dL_dy_buf[i]);
-
-        if (x.DType == ETensorDType::BF16) {
-            std::vector<nv_bfloat16> tmp(N);
-            cudaMemcpy(tmp.data(), (nv_bfloat16*)x.Data + row * in_features, N * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-            for (long i = 0; i < N; i++) x_buf[i] = __bfloat162float(tmp[i]);
-        } else {
-            cudaMemcpy(x_buf.data(), (float*)x.Data + row * in_features, N * sizeof(float), cudaMemcpyDeviceToHost);
-        }
-        for (long i = 0; i < N; i++) x_sum95 += fabsf(x_buf[i]);
-
-        fprintf(stderr, "[LORA_BWD] call=%d in=%d out=%d | row95: dL_dy_abssum=%.6f x_abssum=%.6f\n",
-                debug_count, in_features, out_features, dL_dy_sum95, x_sum95);
-        fprintf(stderr, "  dL_dy[95,0:4]: %.6f %.6f %.6f %.6f\n",
-                dL_dy_buf[0], dL_dy_buf[1], dL_dy_buf[2], dL_dy_buf[3]);
-        fprintf(stderr, "  x[95,0:4]:     %.6f %.6f %.6f %.6f\n",
-                x_buf[0], x_buf[1], x_buf[2], x_buf[3]);
-        debug_count++;
-    }
-
     if (!A.Data || !B.Data) return;
 
     Tensor dL_dy_slice = dL_dy;

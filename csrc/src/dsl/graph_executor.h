@@ -17,6 +17,7 @@
 
 #include "dsl/graph_executor_internal.h"
 #include "dsl/ir.h"
+#include "dsl/forward_plan.h"
 #include "modules/forward_hooks.h"
 #include "modules/backward_hooks.h"
 #include "utilities/stack.h"
@@ -31,6 +32,8 @@ struct ModularLoRAConfig;
 class ModularLoRAWeightsManager;
 class ModularLoRAGradsManager;
 struct LoRARunState;
+struct MatmulContext;
+enum class MatmulOp;
 }
 namespace dsl {
 class DslRunState;
@@ -158,6 +161,10 @@ public:
 private:
     void init(const GraphExecutorOptions& options);
     void reset_cuda_graphs();
+    void reset_forward_plan();
+    void record_matmul_plan(int layer_idx, modules::MatmulOp op, const MatmulForwardPlan& plan);
+    void record_attn_plan(int layer_idx, const AttnForwardPlan& plan);
+    const LayerForwardPlan* forward_plan(int layer_idx) const;
 
     // Internal hook invocation helpers
     void invoke_forward_hook(int layer_idx, modules::ForwardHookPoint point, cudaStream_t stream,
@@ -210,6 +217,7 @@ private:
     std::unordered_map<std::string, std::string> mViewSourcesReverse;
     Tensor mLastInputsCpu{};
     bool mFP8ScalingInitialized = false;
+    std::vector<LayerForwardPlan> mForwardPlan;
 
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;

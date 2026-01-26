@@ -291,12 +291,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     recompute_swiglu: Optional[bool] = True
     recompute_rmsnorm: Optional[bool] = True
     recompute_ffn: Optional[bool] = True
-    recompute_mlp_down: Optional[bool] = False
+    recompute_mlp_down: Optional[bool] = True
     recompute_qkv: Optional[bool] = True
-    recompute_qk_norm: Optional[bool] = False
-    recompute_rope: Optional[bool] = False
+    recompute_qk_norm: Optional[bool] = True
+    recompute_rope: Optional[bool] = True
     recompute_att: Optional[bool] = True
-    recompute_out_proj: Optional[bool] = False
+    recompute_out_proj: Optional[bool] = True
     recompute_block: Optional[bool] = True
     recompute_lora: Optional[bool] = False
 
