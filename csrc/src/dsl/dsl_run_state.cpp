@@ -49,6 +49,14 @@ DslRunState::DslRunState(const PretrainedConfig& config,
         mGradQuantDtype = options.GradientType.value_or(mMatmulDtype);
     }
     mEnableFp8Forward = options.fp8_forward_enabled();
+    if (options.LMHeadChunks < 1) {
+        throw std::runtime_error("lmhead_chunks must be >= 1");
+    }
+    if (options.AttBwdChunks < 1) {
+        throw std::runtime_error("attn_bwd_chunks must be >= 1");
+    }
+    mLMHeadChunks = options.LMHeadChunks;
+    mAttnBwdChunks = options.AttBwdChunks;
     mStackSimulate = !allocate_stack;
 
     const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
@@ -118,7 +126,9 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     mNonBlockActivations.ln_final_rstd = mAllocator->allocate(ETensorDType::FP32, "ln_final_rstd", EAllocationType::ON_DEVICE, {B, T});
 
     // Output buffer (persistent; avoids large stack pressure for full fine-tuning).
-    mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {B * T, V});
+    const long lmhead_chunks = static_cast<long>(mLMHeadChunks);
+    const long out_size = (B * T) / lmhead_chunks;
+    mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {out_size, V});
 
     // RoPE frequencies (if not using fused RoPE).
     const int max_seq_len = std::min(static_cast<int>(T), cfg.MaxPositionEmbeddings);
@@ -439,9 +449,16 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             ETensorDType::INT32, "encoder_bwd_info", EAllocationType::PINNED, {B, T, 4 * num_c_groups});
     }
 
+    const int attn_chunks = mAttnBwdChunks;
+    if (attn_chunks < 1) {
+        throw std::runtime_error("attn_bwd_chunks must be >= 1");
+    }
+    const long attn_ws_batch_size =
+        (attn_chunks == 1) ? B : div_exact(B, static_cast<long>(attn_chunks));
     const long cudnn_ws_size = static_cast<long>(
-        cudnn_get_workspace_size(static_cast<int>(B), static_cast<int>(T), static_cast<int>(Hq),
-                                 static_cast<int>(Hkv), static_cast<int>(D), CudnnHandle));
+        cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size), static_cast<int>(T),
+                                 static_cast<int>(Hq), static_cast<int>(Hkv),
+                                 static_cast<int>(D), CudnnHandle));
     // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
     // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
     // from the temp stack, checkpoint restores during backward can cause it to be reallocated

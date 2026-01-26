@@ -1036,13 +1036,14 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
     auto& rs = mRunState;
     const auto& config = mConfig;
     (void)comm;
-    if (mOptions.LMHeadChunks != 1) {
-        throw std::runtime_error("DSL graph executor: lmhead_chunks > 1 not supported yet");
-    }
-
     const size_t V = config.VocabSize;
     const size_t Vp = config.VocabSize;
+    const long total_tokens = B * T;
+    const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
+    const long nano_batch_size = total_tokens / static_cast<long>(lmhead_chunks);
     const float d_loss = compute_accuracy ? 1.0f : (1.0f / static_cast<float>(B * T * grad_accum_steps));
+    const bool manual_lmhead_backward = (!compute_accuracy && lmhead_chunks > 1);
+    const bool lora_only = rs.is_lora_only_mode();
 
     rs.temp_acquire(rs.non_block_activations().output);
 
@@ -1055,36 +1056,84 @@ void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int g
         }
     }
 
-    Tensor lnf_flat = view_tensor(rs.non_block_activations().ln_final, {B * T, config.HiddenSize});
-    Tensor& logits = rs.non_block_activations().output;  // Use reference to ensure consistency
-
     // Row-major logits = lnf @ lm_head.T -> map to column-major backend by swapping A/B,
     // swapping M/N, and swapping transpose flags.
-    Tensor& lm_head = mWeights.has("lm_head")
-        ? mWeights.get("lm_head")
-        : mWeights.get("lm_head_weight");
+    const bool has_lm_head = mWeights.has("lm_head");
+    Tensor& lm_head = has_lm_head ? mWeights.get("lm_head") : mWeights.get("lm_head_weight");
+    const std::string lm_head_name = has_lm_head ? "lm_head" : "lm_head_weight";
 
-    matmul(logits, lm_head, lnf_flat,
-           std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-           static_cast<int>(V), static_cast<int>(B * T), static_cast<int>(config.HiddenSize),
-           swap_transpose(EMMTranspose::NT), false, rs.MainStream);
+    Tensor* d_lm_head = nullptr;
+    bool d_lm_head_accumulate = false;
+    if (manual_lmhead_backward && !lora_only) {
+        bool accum = false;
+        d_lm_head = mGrads.get_param_grad(lm_head_name, accum);
+        d_lm_head_accumulate = accum;
+        if (!d_lm_head || !d_lm_head->Data) {
+            d_lm_head = nullptr;
+        }
+    }
 
-    Tensor tgt = rs.Targets;
-    tgt.Sizes[0] = static_cast<long>(B * T);
-    tgt.Rank = 1;
+    for (int nano_step = 0; nano_step < lmhead_chunks; ++nano_step) {
+        const long token_offset = static_cast<long>(nano_step) * nano_batch_size;
 
-    Tensor losses = rs.Losses;
-    losses.Sizes[0] = static_cast<long>(B * T);
-    losses.Rank = 1;
+        Tensor lnf_slice = rs.non_block_activations().ln_final;
+        lnf_slice.Data = static_cast<std::byte*>(lnf_slice.Data) +
+                         token_offset * config.HiddenSize * get_dtype_size(lnf_slice.DType);
+        lnf_slice.Sizes[0] = nano_batch_size;
+        lnf_slice.Sizes[1] = static_cast<long>(config.HiddenSize);
+        lnf_slice.Rank = 2;
 
-    if (compute_accuracy) {
-        fused_classifier(logits, losses, d_loss, tgt,
-                         &rs.ValidTokenCount, &rs.CorrectCount,
-                         static_cast<int>(B * T), static_cast<int>(V), static_cast<int>(Vp), true, rs.MainStream);
-    } else {
-        fused_classifier(logits, losses, d_loss, tgt,
-                         &rs.ValidTokenCount,
-                         static_cast<int>(B * T), static_cast<int>(V), static_cast<int>(Vp), true, rs.MainStream);
+        Tensor tgt = rs.Targets;
+        tgt.Data = static_cast<std::byte*>(tgt.Data) +
+                   token_offset * get_dtype_size(tgt.DType);
+        tgt.Sizes[0] = nano_batch_size;
+        tgt.Rank = 1;
+
+        Tensor losses = rs.Losses;
+        losses.Data = static_cast<std::byte*>(losses.Data) +
+                      token_offset * get_dtype_size(losses.DType);
+        losses.Sizes[0] = nano_batch_size;
+        losses.Rank = 1;
+
+        Tensor& logits = rs.non_block_activations().output;  // scratch buffer
+        matmul(logits, lm_head, lnf_slice,
+               std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
+               static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(config.HiddenSize),
+               swap_transpose(EMMTranspose::NT), false, rs.MainStream);
+
+        if (compute_accuracy) {
+            fused_classifier(logits, losses, d_loss, tgt,
+                             &rs.ValidTokenCount, &rs.CorrectCount,
+                             static_cast<int>(nano_batch_size), static_cast<int>(V), static_cast<int>(Vp),
+                             true, rs.MainStream);
+        } else {
+            fused_classifier(logits, losses, d_loss, tgt,
+                             &rs.ValidTokenCount,
+                             static_cast<int>(nano_batch_size), static_cast<int>(V), static_cast<int>(Vp),
+                             true, rs.MainStream);
+        }
+
+        if (manual_lmhead_backward) {
+            Tensor dlnf_slice = rs.non_block_gradients().d_ln_final;
+            dlnf_slice.Data = static_cast<std::byte*>(dlnf_slice.Data) +
+                              token_offset * config.HiddenSize * get_dtype_size(dlnf_slice.DType);
+            dlnf_slice.Sizes[0] = nano_batch_size;
+            dlnf_slice.Sizes[1] = static_cast<long>(config.HiddenSize);
+            dlnf_slice.Rank = 2;
+
+            if (d_lm_head) {
+                const bool accumulate = d_lm_head_accumulate || (nano_step != 0);
+                matmul(*d_lm_head, lnf_slice, logits,
+                       std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
+                       static_cast<int>(config.HiddenSize), static_cast<int>(V), static_cast<int>(nano_batch_size),
+                       swap_transpose(EMMTranspose::TN), accumulate, rs.MainStream);
+            }
+
+            matmul(dlnf_slice, lm_head, logits,
+                   std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   static_cast<int>(config.HiddenSize), static_cast<int>(nano_batch_size), static_cast<int>(V),
+                   swap_transpose(EMMTranspose::NN), false, rs.MainStream);
+        }
     }
 }
 

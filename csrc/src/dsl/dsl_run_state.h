@@ -151,6 +151,8 @@ private:
     ETensorDType mGradQuantDtype = ETensorDType::BF16;
     bool mEnableFp8Forward = false;
     bool mOffloadResiduals = false;
+    int mLMHeadChunks = 1;
+    int mAttnBwdChunks = 1;
 
     modules::NonBlockActivations mNonBlockActivations;
     modules::NonBlockGradientBuffers mNonBlockGradients;

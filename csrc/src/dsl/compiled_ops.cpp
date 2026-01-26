@@ -2075,9 +2075,9 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
 void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
     // inputs: d_out, A, B (weight)
     // outputs: dA, dB
-    Tensor& d_out = resolve_tensor(op.inputs[0]);
-    Tensor& a = resolve_tensor(op.inputs[1]);
-    Tensor& b = resolve_tensor(op.inputs[2]);
+    const std::string& weight_name = (op.inputs.size() > 2) ? op.inputs[2].name : "";
+    const bool is_lm_head = (weight_name == "lm_head" || weight_name == "lm_head_weight");
+    const bool skip_lm_head = is_lm_head && mOptions.LMHeadChunks > 1;
 
     EMMTranspose mode = op.attrs.transpose;
     const int layer_idx = op.attrs.layer_idx;
@@ -2097,6 +2097,20 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         Tensor* grad = mGrads.get_param_grad(weight_name, accum);
         skip_weight_grad = (grad == nullptr || !grad->Data);
     }
+
+    if (skip_lm_head) {
+        if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+            (void)ensure_output_tensor(op.outputs[0]);
+        }
+        if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+            (void)ensure_output_tensor(op.outputs[1]);
+        }
+        return;
+    }
+
+    Tensor& d_out = resolve_tensor(op.inputs[0]);
+    Tensor& a = resolve_tensor(op.inputs[1]);
+    Tensor& b = resolve_tensor(op.inputs[2]);
 
     // Now allocate output tensors - skip dB if weights are frozen
     Tensor* dA_ptr = nullptr;
@@ -2572,12 +2586,39 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     // NaN values can appear in the gradient computation and propagate through the backward pass.
     fill_zero(d_qkv, mRunState.MainStream);
 
+    const int attn_chunks = mOptions.AttBwdChunks;
+    if (attn_chunks < 1) {
+        throw std::runtime_error("attn_bwd_chunks must be >= 1");
+    }
+    const int chunk_B = (attn_chunks == 1)
+        ? static_cast<int>(mB)
+        : static_cast<int>(div_exact(mB, static_cast<long>(attn_chunks)));
+
     // Signature: attention_backward_cudnn(dqkv, stats, out, dout, qkv, workspace, handle, B, T, Hq, Hkv, HS, stream)
-    attention_backward_cudnn(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
-                             mRunState.scratch().cudnn_workspace,
-                             mRunState.CudnnHandle,
-                             static_cast<int>(mB), static_cast<int>(mT),
-                             Hq, Hkv, Hs, mRunState.MainStream);
+    if (attn_chunks == 1) {
+        attention_backward_cudnn(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
+                                 mRunState.scratch().cudnn_workspace,
+                                 mRunState.CudnnHandle,
+                                 static_cast<int>(mB), static_cast<int>(mT),
+                                 Hq, Hkv, Hs, mRunState.MainStream);
+        return;
+    }
+
+    for (int chunk = 0; chunk < attn_chunks; ++chunk) {
+        const long start = static_cast<long>(chunk) * static_cast<long>(chunk_B);
+        const long end = start + static_cast<long>(chunk_B);
+        Tensor d_out_chunk = slice(d_out, 0, start, end);
+        Tensor out_chunk = slice(*out_ptr, 0, start, end);
+        Tensor lse_chunk = slice(*lse_ptr, 0, start, end);
+        Tensor qkv_chunk = slice(*qkv_ptr, 0, start, end);
+        Tensor d_qkv_chunk = slice(d_qkv, 0, start, end);
+
+        attention_backward_cudnn(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
+                                 mRunState.scratch().cudnn_workspace,
+                                 mRunState.CudnnHandle,
+                                 chunk_B, static_cast<int>(mT),
+                                 Hq, Hkv, Hs, mRunState.MainStream);
+    }
 }
 
 void CompiledExecutor::dispatch_zeros_backward(const CompiledOp& op) {
@@ -2883,27 +2924,29 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     int last_layer_restored = -1;
 
     // Bind initial gradient tensors (from loss computation)
-    // d_logits is stored in the output buffer after loss backward
+    // d_logits is stored in the output buffer after loss backward (only when lmhead_chunks == 1)
     auto& output = mRunState.non_block_activations().output;
     if (!output.Data) {
         throw std::runtime_error("CompiledExecutor: output tensor has no data (B=" +
                                 std::to_string(mB) + ", T=" + std::to_string(mT) + ")");
     }
 
-    Tensor logits_view = view_tensor(output, {mB, mT, static_cast<long>(mConfig.VocabSize)});
-    mTensorMap["d_logits"] = logits_view;
-    // Also provide flattened version for matmul backward ops
-    Tensor logits_flat = view_tensor(output, {mB * mT, static_cast<long>(mConfig.VocabSize)});
-    if (logits_flat.Rank != 2) {
-        throw std::runtime_error("CompiledExecutor: d_logits_flat has wrong rank=" +
-                                std::to_string(logits_flat.Rank) + " expected 2");
-    }
-    mTensorMap["d_logits_flat"] = logits_flat;
-    // Verify the map entry
-    auto& check = mTensorMap["d_logits_flat"];
-    if (check.Rank != 2) {
-        throw std::runtime_error("CompiledExecutor: d_logits_flat in map has wrong rank=" +
-                                std::to_string(check.Rank));
+    if (mOptions.LMHeadChunks <= 1) {
+        Tensor logits_view = view_tensor(output, {mB, mT, static_cast<long>(mConfig.VocabSize)});
+        mTensorMap["d_logits"] = logits_view;
+        // Also provide flattened version for matmul backward ops
+        Tensor logits_flat = view_tensor(output, {mB * mT, static_cast<long>(mConfig.VocabSize)});
+        if (logits_flat.Rank != 2) {
+            throw std::runtime_error("CompiledExecutor: d_logits_flat has wrong rank=" +
+                                    std::to_string(logits_flat.Rank) + " expected 2");
+        }
+        mTensorMap["d_logits_flat"] = logits_flat;
+        // Verify the map entry
+        auto& check = mTensorMap["d_logits_flat"];
+        if (check.Rank != 2) {
+            throw std::runtime_error("CompiledExecutor: d_logits_flat in map has wrong rank=" +
+                                    std::to_string(check.Rank));
+        }
     }
 
     // Bind gradient output buffers for final layer norm backward
@@ -2958,8 +3001,26 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return -1;
     };
 
+    const bool skip_logits_grad = (mOptions.LMHeadChunks > 1);
+    auto is_logits_grad_name = [](const std::string& name) {
+        return name == "d_logits" || name == "d_logits_flat";
+    };
+    auto is_logits_grad_op = [&](const CompiledOp& op) {
+        for (const auto& ref : op.inputs) {
+            if (is_logits_grad_name(ref.name)) return true;
+        }
+        for (const auto& ref : op.outputs) {
+            if (is_logits_grad_name(ref.name)) return true;
+        }
+        return false;
+    };
+
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
+
+        if (skip_logits_grad && is_logits_grad_op(op)) {
+            continue;
+        }
 
         if (op.layer_start >= 0) {
             handle_layer_start(op.layer_start);
