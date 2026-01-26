@@ -43,6 +43,9 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
     unsigned long long subseq = 0ULL;
 
     for (const auto& name : mParams->param_names()) {
+        if (mParams->is_external(name)) {
+            continue;
+        }
         Tensor& param = mParams->get(name);
         if (internal::is_bias_param_name(name)) {
             fill_zero(param, nullptr);
@@ -74,7 +77,46 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
     SafeTensorsReader reader(file_name);
     std::vector<std::pair<std::string, std::string>> tied_params;
 
+    if (qlora_enabled()) {
+        if (!mLoRAConfig) {
+            throw std::runtime_error("DSL model: QLoRA enabled without LoRA config");
+        }
+        if (mModelConfig.moe_config.has_value()) {
+            const auto& moe = mModelConfig.moe_config.value();
+            if (mQLoRAConfig.num_experts == 0) {
+                mQLoRAConfig.num_experts = moe.num_experts;
+            }
+            if (mQLoRAConfig.num_experts_per_tok == 0) {
+                mQLoRAConfig.num_experts_per_tok = moe.top_k;
+            }
+            if (mQLoRAConfig.moe_intermediate_size == 0) {
+                mQLoRAConfig.moe_intermediate_size = moe.moe_intermediate_size;
+            }
+            if (mQLoRAConfig.num_shared_experts == 0 && moe.use_shared_expert) {
+                mQLoRAConfig.num_shared_experts = 1;
+            }
+            if (mQLoRAConfig.moe_shared_expert_intermediate_size == 0 && moe.use_shared_expert) {
+                mQLoRAConfig.moe_shared_expert_intermediate_size = moe.shared_expert_size;
+            }
+        }
+
+        mQLoRAProvider = internal::create_dsl_qlora_provider(*mConfig, mModelConfig, mOptions,
+                                                             *mLoRAConfig, mQLoRAConfig, mAllocator);
+        cudaStream_t quant_stream = nullptr;
+        CUDA_CHECK(cudaStreamCreate(&quant_stream));
+        mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);
+        CUDA_CHECK(cudaStreamSynchronize(quant_stream));
+        CUDA_CHECK(cudaStreamDestroy(quant_stream));
+        mParams->set_qlora_provider(mQLoRAProvider.get());
+        if (mRunState) {
+            mParams->set_default_stream(mRunState->MainStream);
+        }
+    }
+
     for (const auto& name : mParams->param_names()) {
+        if (mParams->is_external(name)) {
+            continue;
+        }
         Tensor& param = mParams->get(name);
         int layer_idx = -1;
         const MappingSpec* spec = internal::find_mapping_spec(mHfMapping, name, layer_idx);
@@ -178,6 +220,9 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
     }
 
     for (const auto& tie : tied_params) {
+        if (mParams->is_external(tie.first) || mParams->is_external(tie.second)) {
+            continue;
+        }
         Tensor& dst = mParams->get(tie.first);
         Tensor& src = mParams->get(tie.second);
         CUDA_CHECK(cudaMemcpy(dst.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice));

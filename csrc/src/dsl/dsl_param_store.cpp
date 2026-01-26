@@ -102,7 +102,8 @@ DslParamStore::DslParamStore(const Module& module,
                              const RuntimeOptions& options,
                              const PretrainedConfig& config,
                              const std::shared_ptr<TensorAllocator>& allocator,
-                             const modules::ModularLoRAConfig* lora_config)
+                             const modules::ModularLoRAConfig* lora_config,
+                             const std::unordered_set<std::string>* external_params)
     : mAllocator(allocator) {
     if (!mAllocator) {
         throw std::runtime_error("DslParamStore: allocator is null");
@@ -117,6 +118,10 @@ DslParamStore::DslParamStore(const Module& module,
         return name.find("router") != std::string::npos;
     };
 
+    if (external_params) {
+        mExternalParams = *external_params;
+    }
+
     for (const auto& kv : graph.params) {
         const std::string& name = kv.first;
         const TensorInfo& info = kv.second;
@@ -130,7 +135,12 @@ DslParamStore::DslParamStore(const Module& module,
         std::vector<long> shape = resolve_shape(info.shape, env);
 
         Entry entry;
-        entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
+        entry.external = mExternalParams.find(name) != mExternalParams.end();
+        if (entry.external) {
+            entry.tensor = Tensor::empty(dtype, shape);
+        } else {
+            entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
+        }
         entry.trainable = !is_rope_param(name);
         if (freeze_base) {
             entry.trainable = train_router && is_router_param(name);
@@ -149,6 +159,12 @@ Tensor& DslParamStore::get(const std::string& name) {
     if (it == mParams.end()) {
         throw std::runtime_error("DslParamStore: missing parameter " + name);
     }
+    if (it->second.external) {
+        if (!mQLoRAProvider) {
+            throw std::runtime_error("DslParamStore: external parameter requested without QLoRA provider: " + name);
+        }
+        return mQLoRAProvider->resolve_param(name, mDefaultStream);
+    }
     return it->second.tensor;
 }
 
@@ -156,6 +172,12 @@ const Tensor& DslParamStore::get(const std::string& name) const {
     auto it = mParams.find(name);
     if (it == mParams.end()) {
         throw std::runtime_error("DslParamStore: missing parameter " + name);
+    }
+    if (it->second.external) {
+        if (!mQLoRAProvider) {
+            throw std::runtime_error("DslParamStore: external parameter requested without QLoRA provider: " + name);
+        }
+        return mQLoRAProvider->resolve_param(name, mDefaultStream);
     }
     return it->second.tensor;
 }
@@ -170,11 +192,24 @@ bool DslParamStore::is_trainable(const std::string& name) const {
     return it->second.trainable;
 }
 
+bool DslParamStore::is_external(const std::string& name) const {
+    auto it = mParams.find(name);
+    if (it == mParams.end()) return false;
+    return it->second.external;
+}
+
 void DslParamStore::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
     for (const auto& name : mParamOrder) {
         auto it = mParams.find(name);
         if (it == mParams.end()) continue;
-        callback(name, TensorShard(it->second.tensor));
+        if (it->second.external) {
+            if (!mQLoRAProvider) {
+                throw std::runtime_error("DslParamStore: external parameter requested without QLoRA provider: " + name);
+            }
+            callback(name, TensorShard(mQLoRAProvider->resolve_param(name, mDefaultStream)));
+        } else {
+            callback(name, TensorShard(it->second.tensor));
+        }
     }
 }
 

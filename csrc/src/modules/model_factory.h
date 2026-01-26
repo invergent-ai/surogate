@@ -169,11 +169,9 @@ public:
             if (options.DslIrJson.empty()) {
                 throw std::runtime_error("DSL IR enabled but no IR JSON provided in RuntimeOptions");
             }
-            if (qlora_config.is_quantized()) {
-                throw std::runtime_error("DSL IR LoRA path does not support QLoRA yet");
-            }
             return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc,
-                                                   std::optional<ModularLoRAConfig>{lora_config});
+                                                   std::optional<ModularLoRAConfig>{lora_config},
+                                                   qlora_config);
         }
 
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);

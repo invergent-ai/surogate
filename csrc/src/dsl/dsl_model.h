@@ -19,9 +19,11 @@
 #include "modules/lora/lora_optimizer_state.h"
 #include "modules/lora/lora_run_state.h"
 #include "modules/lora/lora_weights_manager.h"
+#include "modules/qlora/qlora_config.h"
 #include "training/model.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
+#include "dsl/qlora_provider.h"
 
 namespace dsl {
 
@@ -92,7 +94,8 @@ public:
              const RuntimeOptions& options,
              const std::string& ir_json,
              const std::shared_ptr<TensorAllocator>& allocator,
-             const std::optional<modules::ModularLoRAConfig>& lora_config = std::nullopt);
+             const std::optional<modules::ModularLoRAConfig>& lora_config = std::nullopt,
+             const modules::QLoRAConfig& qlora_config = modules::QLoRAConfig{});
     ~DslModel() override;
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
@@ -120,13 +123,13 @@ public:
     void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
 
     [[nodiscard]] bool lora_enabled() const { return mLoRAConfig.has_value() && mLoRAConfig->enabled(); }
-    [[nodiscard]] bool qlora_enabled() const { return false; }
+    [[nodiscard]] bool qlora_enabled() const { return lora_enabled() && mQLoRAConfig.is_quantized(); }
     [[nodiscard]] bool is_moe_model() const { return mIsMoEModel; }
     [[nodiscard]] std::size_t lora_num_parameters() const {
         return mLoRAWeights ? mLoRAWeights->num_parameters() : 0;
     }
-    [[nodiscard]] std::size_t qlora_quantized_weights_bytes() const { return 0; }
-    [[nodiscard]] float qlora_memory_savings_ratio() const { return 0.f; }
+    [[nodiscard]] std::size_t qlora_quantized_weights_bytes() const;
+    [[nodiscard]] float qlora_memory_savings_ratio() const;
     DslModel& base_model() { return *this; }
     [[nodiscard]] const modules::ModelConfig& config() const { return mModelConfig; }
 
@@ -213,6 +216,10 @@ private:
     std::unique_ptr<modules::LoRAAdamW8BitState> mLoRAAdamW8BitState;
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
+
+    // QLoRA state (optional)
+    modules::QLoRAConfig mQLoRAConfig;
+    std::unique_ptr<QLoRAWeightProvider> mQLoRAProvider;
 
     struct AdamW8BitState {
         bool initialized = false;

@@ -34,6 +34,9 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
     }
 
     ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+    if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+        mQLoRAProvider->invalidate_cache();
+    }
 
     // Store micro_step for dropout seed computation (needed by backward pass)
     mLoRARunState->micro_step = micro_step;
@@ -466,10 +469,19 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mAllocator = std::make_shared<TensorAllocator>();
     }
     mOptions = options;
+    if (qlora_enabled() && mQLoRAConfig.is_fp4()) {
+        mOptions.UseCudaGraphs = false;
+    }
     const std::size_t dummy_stack_bytes = 1024ULL * 1024ULL * 1024ULL * 1024ULL;  // 1TB dummy stack
-    mRunState = std::make_unique<DslRunState>(*mConfig, options, B, T, mAllocator, lora_enabled(),
+    mRunState = std::make_unique<DslRunState>(*mConfig, mOptions, B, T, mAllocator, lora_enabled(),
                                               dummy_stack_bytes, /*allocate_stack=*/false);
     mRunState->WorldSize = comm.world_size();
+    if (mParams) {
+        mParams->set_default_stream(mRunState->MainStream);
+        if (mQLoRAProvider) {
+            mParams->set_qlora_provider(mQLoRAProvider.get());
+        }
+    }
 
     const long base_size = static_cast<long>(mRunState->Stack.max_utilization());
     long moe_extra = 0;
@@ -487,7 +499,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         const long permuted_tokens = 2L * B * T * top_k * hidden * dtype_bytes;
         moe_extra = expert_gate_up_tp + expert_down_tp + permuted_tokens;
     }
-    ETensorDType act_dtype = options.ModelType.value_or(mConfig->DType);
+    ETensorDType act_dtype = mOptions.ModelType.value_or(mConfig->DType);
     if (is_fp8_dtype(act_dtype)) {
         act_dtype = ETensorDType::BF16;
     }
@@ -511,8 +523,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         DslGradStoreConfig grad_config;
         grad_config.num_shards = comm.world_size();
         grad_config.shard_idx = comm.rank();
-        grad_config.shard_gradients = options.ShardGradients;  // ZeRO-2
-        grad_config.use_all_to_all_reduce = options.UseAllToAllReduce;
+        grad_config.shard_gradients = mOptions.ShardGradients;  // ZeRO-2
+        grad_config.use_all_to_all_reduce = mOptions.UseAllToAllReduce;
         grad_config.num_layers = mModelConfig.NumLayers;
         mGrads->configure(grad_config);
     }
@@ -520,7 +532,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     GraphExecutorOptions exec_opts;
     exec_opts.auto_backward = true;
     exec_opts.debug_print_backward = false;
-    mExecutor = std::make_unique<GraphExecutor>(*mModule, *mRunState, *mParams, *mGrads, mModelConfig, options, exec_opts);
+    mExecutor = std::make_unique<GraphExecutor>(*mModule, *mRunState, *mParams, *mGrads, mModelConfig, mOptions, exec_opts);
     if (!mRngState.empty()) {
         mExecutor->set_rng_state(mRngState);
     }

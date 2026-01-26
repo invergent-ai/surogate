@@ -12,6 +12,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <unordered_set>
+
+#include <cuda_runtime.h>
+
+#include "dsl/qlora_provider.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
 
@@ -33,6 +38,7 @@ public:
     struct Entry {
         Tensor tensor;
         bool trainable = true;
+        bool external = false;  ///< Provided by QLoRA weight provider (no local storage)
     };
 
     DslParamStore(const Module& module,
@@ -40,12 +46,19 @@ public:
                   const RuntimeOptions& options,
                   const PretrainedConfig& config,
                   const std::shared_ptr<TensorAllocator>& allocator,
-                  const modules::ModularLoRAConfig* lora_config = nullptr);
+                  const modules::ModularLoRAConfig* lora_config = nullptr,
+                  const std::unordered_set<std::string>* external_params = nullptr);
 
     Tensor& get(const std::string& name);
     const Tensor& get(const std::string& name) const;
     bool has(const std::string& name) const;
     bool is_trainable(const std::string& name) const;
+    bool is_external(const std::string& name) const;
+
+    /// Wire an external QLoRA weight provider (optional).
+    void set_qlora_provider(QLoRAWeightProvider* provider) { mQLoRAProvider = provider; }
+    /// Set default stream for provider-backed resolution.
+    void set_default_stream(cudaStream_t stream) { mDefaultStream = stream; }
 
     const std::vector<std::string>& param_names() const { return mParamOrder; }
 
@@ -55,6 +68,9 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     std::unordered_map<std::string, Entry> mParams;
     std::vector<std::string> mParamOrder;
+    std::unordered_set<std::string> mExternalParams;
+    QLoRAWeightProvider* mQLoRAProvider = nullptr;
+    cudaStream_t mDefaultStream = cudaStreamDefault;
 };
 
 } // namespace dsl
