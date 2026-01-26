@@ -2118,6 +2118,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     bool used_recipe = false;
     bool used_fp8 = false;
     bool has_dout_quant = false;
+
     if (mRecipe && mode == EMMTranspose::NT && a.Sizes[0] == mB * mT && allow_quant) {
         Tensor dA_tmp{};
         Tensor dB_tmp{};
@@ -2240,8 +2241,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         auto& grads = mRunState.simplified_grads(layer_idx);
         switch (*op.attrs.matmul_op) {
             case modules::MatmulOp::MLPDown:
-                // d_mlp_down is the upstream gradient for MLP down
-                grads.d_mlp_down.Data = d_out.Data;
+                // d_res_ffn is the upstream gradient for MLP down (matches modular path)
+                grads.d_res_ffn.Data = d_out.Data;
                 break;
             case modules::MatmulOp::MLPUp:
                 // d_mlp_up is the upstream gradient for MLP up/gate
@@ -2328,8 +2329,13 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[1]);
     Tensor& d_inp = ensure_output_tensor(op.outputs[0]);
 
+    // For FP8 hybrid backward, record abs_max of d_mlp_up for subsequent quantization
+    float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()
+        ? mRunState.simplified_quant_grads().d_mlp_up.abs_max()
+        : nullptr;
+
     const long D = d_out.Sizes[2];
-    swiglu_backward(d_inp, d_out, inp, nullptr,
+    swiglu_backward(d_inp, d_out, inp, abs_max_ptr,
                     static_cast<int>(d_out.Sizes[0]),
                     static_cast<int>(d_out.Sizes[1]),
                     static_cast<int>(D), mRunState.MainStream);
@@ -2384,8 +2390,13 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         mTemps.push_back(d_mlp_up);
     }
 
+    // For FP8 hybrid backward, record abs_max of d_mlp_up for subsequent quantization
+    float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()
+        ? mRunState.simplified_quant_grads().d_mlp_up.abs_max()
+        : nullptr;
+
     const long D = d_out.Sizes[2];
-    swiglu_backward(d_mlp_up, d_out, mlp_up, nullptr,
+    swiglu_backward(d_mlp_up, d_out, mlp_up, abs_max_ptr,
                     static_cast<int>(d_out.Sizes[0]),
                     static_cast<int>(d_out.Sizes[1]),
                     static_cast<int>(D), mRunState.MainStream);
@@ -2447,8 +2458,12 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
 
-    // RoPE backward doesn't need abs_max tracking in compiled path
-    rope_backward(d_qkv, d_out, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+    // For FP8 hybrid backward, record abs_max of d_qkv for subsequent quantization
+    float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()
+        ? mRunState.simplified_quant_grads().d_qkv.abs_max()
+        : nullptr;
+
+    rope_backward(d_qkv, d_out, freqs, reinterpret_cast<int*>(pos_ids.Data), abs_max_ptr,
                   static_cast<int>(mB), static_cast<int>(mT),
                   Hq, Hkv, Hs, op.attrs.rotary_dim, mRunState.MainStream);
 }
@@ -2516,6 +2531,13 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
 
     // V doesn't have normalization - its gradients pass through unchanged
     // The d_out already contains the V gradients at the correct offset
+
+    // For FP8 hybrid backward, record abs_max of the final d_qkv for subsequent quantization
+    if (mRunState.has_fp8_hybrid_backward()) {
+        float* abs_max_ptr = mRunState.simplified_quant_grads().d_qkv.abs_max();
+        abs_max(abs_max_ptr, d_qkv_view, static_cast<long>(d_qkv_view.nelem()),
+                mRunState.DeviceProp, mRunState.MainStream);
+    }
 }
 
 void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
@@ -2613,10 +2635,21 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 
     const int C = mConfig.HiddenSize;
 
+    // Determine abs_max pointer for FP8 gradient quantization.
+    // LN1 backward produces d_res_ffn (gradient for previous layer's residual).
+    // LN2 backward produces d_res_att (gradient for attention path).
+    float* abs_max_ptr = nullptr;
+    if (mRunState.has_grad_quants()) {
+        const bool is_ln2 = (ln_field == "ln2_weight");
+        abs_max_ptr = is_ln2
+            ? mRunState.simplified_quant_grads().d_res_att.abs_max()
+            : mRunState.simplified_quant_grads().d_res_ffn.abs_max();
+    }
+
     // Use the rmsnorm_backward kernel (note: it expects B, T separately)
     rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
                      *d_residual_input, d_y, residual_out, weight, rstd,
-                     nullptr,  // abs_max_ptr
+                     abs_max_ptr,
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
 

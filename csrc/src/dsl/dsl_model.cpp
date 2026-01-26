@@ -822,7 +822,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 modules::detail::backward_lora_layer(
                     lora_grads.mlp.down->A, lora_grads.mlp.down->B,
                     da.d_swiglu,
-                    da.d_mlp_down, 0,
+                    da.d_res_ffn, 0,  
                     a.swiglu,
                     lora_block.mlp.down->A, lora_block.mlp.down->B,
                     mLoRAConfig->scaling(),
