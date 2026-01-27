@@ -209,7 +209,7 @@ class SurogateTrainerWrapper():
             # Save final model
             if self.config.lora:
                 # Export LoRA adapter in PEFT-compatible format
-                adapter_dir = Path(self.config.output_dir) / "adapter"
+                adapter_dir = Path(self.config.output_dir)
                 logger.info(f"Saving LoRA adapter to {adapter_dir}...")
                 adapter_dir.mkdir(parents=True, exist_ok=True)
                 self.trainer.export_adapter(str(adapter_dir))
@@ -218,7 +218,7 @@ class SurogateTrainerWrapper():
 
                 # Merge adapter into base model if requested
                 if self.config.merge_adapter:
-                    merged_dir = Path(self.config.output_dir) / "merged"
+                    merged_dir = Path(self.config.output_dir)
                     try:
                         merge_adapter(
                             base_model_path=self.config.model_dir,
