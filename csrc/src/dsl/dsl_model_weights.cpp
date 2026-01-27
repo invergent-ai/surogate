@@ -57,8 +57,17 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
             fill_constant(param, 1.f, param.nelem(), nullptr);
             continue;
         }
+
+        // Check if this is a projection weight that should be zeroed
+        const bool is_out_proj = internal::contains_ci(name, "out_weight") || internal::contains_ci(name, "o_proj");
+        const bool is_mlp_down = internal::contains_ci(name, "mlp_down_weight") || internal::contains_ci(name, "down_proj");
+        if (mOptions.InitProjectionsToZero && (is_out_proj || is_mlp_down)) {
+            fill_zero(param, nullptr);
+            continue;
+        }
+
         float stddev = scale;
-        if (internal::contains_ci(name, "out_weight") || internal::contains_ci(name, "mlp_down_weight") || internal::contains_ci(name, "down_proj")) {
+        if (is_out_proj || is_mlp_down) {
             stddev *= residual_scale;
         }
         const bool param_sharded = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1) &&
