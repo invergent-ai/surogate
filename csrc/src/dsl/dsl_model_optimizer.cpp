@@ -404,10 +404,23 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
     state.total_state_elems = state_elems;
     state.num_blocks = (state.total_state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    state.state1 = mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state1", {(long)state.total_state_elems});
-    state.state2 = mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state2", {(long)state.total_state_elems});
-    state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_absmax1", {(long)state.num_blocks});
-    state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_absmax2", {(long)state.num_blocks});
+    // Determine allocation location based on offload options
+    // For adamw8bit, only zero-copy offloading is supported (state accessed directly by GPU).
+    state.offload_state = mOptions.OffloadOptimizer;
+    state.use_zero_copy = mOptions.UseZeroCopy;
+    EAllocationType alloc_kind = EAllocationType::ON_DEVICE;
+    if (state.offload_state) {
+        if (state.use_zero_copy) {
+            alloc_kind = mOptions.offload_alloc();
+        } else {
+            alloc_kind = EAllocationType::ON_DEVICE;
+        }
+    }
+
+    state.state1 = mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state1", alloc_kind, {(long)state.total_state_elems});
+    state.state2 = mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state2", alloc_kind, {(long)state.total_state_elems});
+    state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_absmax1", alloc_kind, {(long)state.num_blocks});
+    state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_absmax2", alloc_kind, {(long)state.num_blocks});
 
     init_adamw8bit_state(reinterpret_cast<unsigned char*>(state.state1.template get<std::byte>()),
                          reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()),

@@ -230,6 +230,9 @@ private:
         size_t total_params = 0;
         size_t total_state_elems = 0;
         size_t num_blocks = 0;
+        // Offloading configuration (copied from options during init)
+        bool offload_state = false;
+        bool use_zero_copy = false;
         Tensor quantiles1;
         Tensor quantiles2;
         Tensor state1;

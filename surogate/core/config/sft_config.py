@@ -555,6 +555,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!")
 
         self._validate_chunking_config()
+        if self.offload_optimizer and not self.use_zero_copy:
+            logger.warning(
+                "offload_optimizer is enabled but use_zero_copy is false; "
+                "optimizer state will remain on device. Set use_zero_copy=true to offload.")
 
         self.create_runtime_config()
         self.create_lora_config()
