@@ -161,6 +161,14 @@ private:
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradientsBase;
+
+    // Shared gradient buffers (when recompute_block=true)
+    std::array<Tensor, 2> mSharedDResFFN{};  ///< Alternating buffers for d_res_ffn
+    std::array<Tensor, 2> mSharedDMlpDown{}; ///< Alternating buffers for d_mlp_down
+    Tensor mSharedDResAtt{};
+    Tensor mSharedDLn2{};
+    Tensor mSharedDAtt{};
+    Tensor mSharedDLn1{};
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     Tensor mFP8ForwardStats{};

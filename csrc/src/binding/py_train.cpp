@@ -310,12 +310,19 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
                 breakdown_ctx.seq_length = T;
 
                 // Get QLoRA stats if applicable
-                modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
-                    if (lora_model->qlora_enabled()) {
-                        breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
-                        breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
+                if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+                    if (dsl_model->qlora_enabled()) {
+                        breakdown_ctx.qlora_quantized_bytes = dsl_model->qlora_quantized_weights_bytes();
+                        breakdown_ctx.qlora_savings_ratio = dsl_model->qlora_memory_savings_ratio();
                     }
-                });
+                } else {
+                    modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
+                        if (lora_model->qlora_enabled()) {
+                            breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
+                            breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
+                        }
+                    });
+                }
 
                 // Use a temporary logger to print the breakdown
                 TrainingRunLogger logger("", 0, TrainingRunLogger::VERBOSE);

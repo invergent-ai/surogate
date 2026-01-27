@@ -532,8 +532,12 @@ DslModel::DslModel(const PretrainedConfig& config,
     }
 
     std::unordered_set<std::string> external_params;
-    if (lora_config.has_value() && lora_config->enabled() && mQLoRAConfig.is_quantized()) {
-        const bool train_router = lora_config->train_router;
+    // When QLoRA is enabled (quantized base weights), mark base model weights as "external".
+    // External params are not allocated in DslParamStore - they're provided on-demand by the
+    // QLoRA weight provider which holds quantized weights and dequantizes them as needed.
+    // This is critical for memory efficiency: avoids allocating full-precision base weights.
+    if (mQLoRAConfig.is_quantized()) {
+        const bool train_router = lora_config.has_value() && lora_config->train_router;
         for (const auto& kv : mModule->forward->params) {
             const std::string& name = kv.first;
             if (is_qlora_param_name(name, train_router)) {

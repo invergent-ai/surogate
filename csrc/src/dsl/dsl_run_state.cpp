@@ -179,21 +179,26 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const auto dtype = mActivationDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
+    // Activation sharing logic - matches modular path (run_state_impl.tpp)
+    // Key insight: qkv, mlp_up can always be shared when recompute_block=true because
+    // backward will recompute them anyway. Only att/swiglu need special LoRA handling
+    // because they are inputs to O-proj and down-proj LoRA backward respectively.
     const bool lora_only = mLoraOnlyMode;
     const bool lora_can_share_ln = !lora_only || mRecomputeLoRA;
-    const bool lora_can_share_att = !lora_only;
-    const bool lora_can_share_qkv = !lora_only;
-    const bool lora_can_share_mlp_up = !lora_only;
-    const bool lora_can_share_swiglu = !lora_only || mRecomputeLoRA;
-    const bool share_ln1 = mRecomputeBlock && lora_can_share_ln;
-    const bool share_ln2 = mRecomputeBlock && lora_can_share_ln;
-    const bool share_qkv = mRecomputeBlock && lora_can_share_qkv;
-    const bool share_att = mRecomputeBlock && lora_can_share_att;
-    const bool share_mlp_up = mRecomputeBlock && lora_can_share_mlp_up;
-    const bool share_swiglu = mRecomputeBlock && lora_can_share_swiglu;
-    // Keep per-layer residual_att and mlp_down to preserve per-layer inputs for recompute.
-    const bool share_residual = false;
-    const bool ffn_temps_on_stack = mRecomputeBlock && lora_can_share_mlp_up && lora_can_share_swiglu;
+    const bool lora_can_share_att = !lora_only;  // att needed per-layer for O-proj LoRA backward
+    const bool lora_can_share_swiglu = !lora_only;  // swiglu needed per-layer for down-proj LoRA backward
+    const bool share_ln1 = lora_can_share_ln && mRecomputeBlock;
+    const bool share_ln2 = lora_can_share_ln && mRecomputeBlock;
+    // QKV can be shared when recompute_block=true (backward recomputes it) - no lora_only dependency
+    const bool share_qkv = mRecomputeBlock;
+    const bool share_att = lora_can_share_att && mRecomputeBlock;
+    // mlp_up can be shared when recompute_block=true (backward recomputes it) - no lora_only dependency
+    const bool share_mlp_up = mRecomputeBlock;
+    const bool share_swiglu = lora_can_share_swiglu && mRecomputeBlock;
+    // residual_att can be shared when recompute_block=true (matches modular path)
+    const bool share_residual_intermediates = mRecomputeBlock;
+    // FFN temps on stack when recompute_block=true (matches modular path)
+    const bool ffn_temps_on_stack = mRecomputeBlock;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -214,10 +219,20 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         shared_att = mAllocator->allocate(dtype, "att_shared", kind, {B, T, AttnDim});
         shared_att_out = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
     }
+    // In lora_only mode, att_out can be shared even when share_att is false
+    // (att_out is not needed for LoRA backward - we can share it across layers)
+    if (lora_only && !shared_att_out.Data) {
+        shared_att_out = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
+    }
     if (share_mlp_up && !ffn_temps_on_stack) shared_mlp_up = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, MUp});
     if (share_swiglu && !ffn_temps_on_stack) shared_swiglu = mAllocator->allocate(dtype, "swiglu_shared", kind, {B, T, M});
-    if (share_residual) {
+    if (share_residual_intermediates) {
         shared_residual_att = mAllocator->allocate(dtype, "residual_att_shared", kind, {B, T, C});
+    }
+    // In lora_only mode, mlp_down can be shared (not needed for LoRA backward)
+    if (lora_only) {
+        shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
+    } else if (share_residual_intermediates) {
         shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
     }
 
@@ -243,13 +258,16 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
 
         acts.lse = mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
         acts.att = share_att ? shared_att : mAllocator->allocate(dtype, "att", kind, {B, T, AttnDim});
-        acts.att_out = share_att ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
-
-        if (share_residual) {
-            acts.residual_att = shared_residual_att;
+        // att_out can be shared in lora_only mode (not needed for LoRA backward)
+        if (lora_only) {
+            acts.att_out = shared_att_out;
         } else {
-            acts.residual_att = mAllocator->allocate(dtype, "residual_att", kind, {B, T, C});
+            acts.att_out = share_att ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
         }
+
+        // residual_att can be shared when recompute_block=true
+        acts.residual_att = share_residual_intermediates ? shared_residual_att
+                                                          : mAllocator->allocate(dtype, "residual_att", kind, {B, T, C});
 
         if (ffn_temps_on_stack) {
             acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, MUp});
@@ -259,7 +277,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.swiglu = share_swiglu ? shared_swiglu : mAllocator->allocate(dtype, "swiglu", kind, {B, T, M});
         }
 
-        if (share_residual) {
+        // mlp_down can be shared in lora_only mode (not needed for LoRA backward)
+        if (lora_only || share_residual_intermediates) {
             acts.mlp_down = shared_mlp_down;
         } else {
             acts.mlp_down = mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
@@ -274,6 +293,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
     const long Hkv = cfg.NumKeyValHeads;
+    const long AttnDim = Hq * D;
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
     const long MUp = 2 * M;
@@ -281,7 +301,12 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto dtype = mGradDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
+    // Gradient sharing flags - match modular path (run_state_impl.tpp)
+    const bool share_grads = mRecomputeBlock;
+    const bool share_res_ffn = mRecomputeBlock;
+    const bool share_mlp_down = mRecomputeBlock;
     const bool large_bwd_temps_on_stack = mRecomputeBlock;
+
     if (mStackSimulate && large_bwd_temps_on_stack) {
         const long d_qkv_bytes = B * T * QKV * get_dtype_size(dtype);
         const long d_mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -297,12 +322,31 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         Stack.free(sim_d_qkv);
     }
 
+    // Allocate shared gradient buffers if recompute_block is enabled
+    if (share_grads && !mSharedDResAtt.Data) {
+        if (share_res_ffn) {
+            mSharedDResFFN[0] = mAllocator->allocate(dtype, "d_res_ffn_a", kind, {B, T, C});
+            mSharedDResFFN[1] = mAllocator->allocate(dtype, "d_res_ffn_b", kind, {B, T, C});
+        }
+        if (share_mlp_down) {
+            mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
+            mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
+        }
+        mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
+        mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
+        mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
+        mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
+    }
+
     mSimplifiedGradients.resize(cfg.NumLayers);
     for (int i = 0; i < cfg.NumLayers; ++i) {
         auto& g = mSimplifiedGradients[i];
-        g.d_res_ffn = mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
-        g.d_res_att = mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_ln2 = mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
+
+        // d_res_ffn uses alternating buffers (i % 2) to avoid aliasing in adjacent layers
+        g.d_res_ffn = share_res_ffn ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
+                                    : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
+        g.d_res_att = share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
+        g.d_ln2 = share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
         if (large_bwd_temps_on_stack) {
             g.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, MUp});
@@ -314,9 +358,11 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             g.d_qkv = mAllocator->allocate(dtype, "d_qkv", kind, {B, T, QKV});
         }
 
-        g.d_mlp_down = mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
-        g.d_att = mAllocator->allocate(dtype, "d_att", kind, {B, T, Hq * D});
-        g.d_ln1 = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
+        // d_mlp_down uses alternating buffers (i % 2) to avoid aliasing in adjacent layers
+        g.d_mlp_down = share_mlp_down ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)]
+                                      : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
+        g.d_att = share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, AttnDim});
+        g.d_ln1 = share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
 
     // Preserve the original buffer pointers so we can restore them if the
