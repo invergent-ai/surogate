@@ -10,7 +10,7 @@
 // - Token unpermutation (gather outputs back to token order)
 // - Auxiliary load-balancing loss computation
 //
-// Design philosophy (inspired by Unsloth grouped GEMM optimizations):
+// Design philosophy:
 // - Fuse permutation into GEMM prologue/epilogue when possible
 // - Use persistent kernel patterns for expert iteration
 // - Support both softmax (standard MoE) and sigmoid (DeepSeek-style) routing

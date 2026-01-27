@@ -483,6 +483,19 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     mScratch.matmul_scales = mAllocator->allocate(
         ETensorDType::FP32, "matmul_scales", EAllocationType::ON_DEVICE, {2L});
 
+    const long BT = B * T;
+    mScratch.cross_entropy_dloss = mAllocator->allocate(
+        ETensorDType::FP32, "cross_entropy_dloss", EAllocationType::ON_DEVICE, {BT});
+    mScratch.cross_entropy_logsumexp = mAllocator->allocate(
+        ETensorDType::FP32, "cross_entropy_logsumexp", EAllocationType::ON_DEVICE, {BT});
+    const int n_chunks = static_cast<int>(
+        (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE);
+    if (n_chunks > 1) {
+        mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(
+            ETensorDType::FP32, "cross_entropy_chunk_logsumexp", EAllocationType::ON_DEVICE,
+            {BT, n_chunks});
+    }
+
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
     if (!mLoraOnlyMode) {
         const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);

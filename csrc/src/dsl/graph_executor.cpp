@@ -209,6 +209,16 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     if (!mForward) {
         throw std::runtime_error("DSL graph executor: module missing forward graph");
     }
+    mHasLossOp = false;
+    for (const auto& op : mForward->operations) {
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        if (op_type == "fused_lm_head_loss" || op_type == "lm_head_loss" ||
+            op_type == "cross_entropy_loss" || op_type == "cross_entropy") {
+            mHasLossOp = true;
+            break;
+        }
+    }
 
     // Check if module has explicit backward graph
     if (mModule.backward.has_value()) {
@@ -225,18 +235,17 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
             mBackward = &mDerivedBackward.value();
 
             // Merge auto-computed saves with forward.save, but filter out:
-            // 1. Graph outputs (they're re-computed during backward by classifier)
+            // 1. Graph outputs (they don't need to be saved for backward)
             // 2. Tensors produced by ops that depend on lm_head (not available in full=false mode)
             std::unordered_set<std::string> save_set(mForward->save.begin(), mForward->save.end());
             for (const auto& s : mDerivedBackward->save) {
                 save_set.insert(s);
             }
-            // Remove graph outputs - they're handled by the classifier
+            // Remove graph outputs - they don't need to be saved for backward
             for (const auto& [name, _] : mForward->outputs) {
                 save_set.erase(name);
             }
-            // Also remove tensors that are produced by ops that come after the last save-able tensor
-            // (i.e., tensors that depend on lm_head which isn't available during training forward)
+            // Also remove tensors that are produced by ops we don't want to save (e.g., large lm_head logits)
             // For now, we specifically exclude "logits_flat" as it's produced by the lm_head matmul
             save_set.erase("logits_flat");
             save_set.erase("logits");
@@ -252,7 +261,8 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     mEmbeddingOutputs.clear();
     if (mForward) {
         for (const auto& op : mForward->operations) {
-            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            const std::string& op_type =
+                (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
             if ((op_type == "view" || op_type == "reshape") && !op.outputs.empty() && !op.inputs.empty()) {
                 const std::string& out = op.outputs.at(0);
                 const std::string& in = op.inputs.at(0);
@@ -271,7 +281,8 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     }
 
     auto is_noncapturable_op = [&](const Operation& op) {
-        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         const bool is_embedding_bwd = (op_type == "embedding_backward" || op_type == "encoder_backward"
                                        || op.name == "embedding_backward" || op.name == "encoder_backward");
         return is_embedding_bwd;
@@ -642,6 +653,12 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
 
+    if (mHasLossOp && micro_step == 0) {
+        fill_zero(rs.Losses, rs.MainStream);
+        fill_zero(rs.ValidTokenCount, rs.MainStream);
+        fill_zero(rs.CorrectCount, rs.MainStream);
+    }
+
     // Copy inputs and position ids to device.
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
@@ -651,6 +668,12 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+        }
+        if (mHasLossOp) {
+            const std::size_t target_bytes =
+                static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
+            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, rs.Targets_CPU.Data, target_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
@@ -688,6 +711,12 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
 
+    if (mHasLossOp) {
+        fill_zero(rs.Losses, rs.MainStream);
+        fill_zero(rs.ValidTokenCount, rs.MainStream);
+        fill_zero(rs.CorrectCount, rs.MainStream);
+    }
+
     // Copy inputs and position ids to device.
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
@@ -698,6 +727,15 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
         }
+        if (mHasLossOp) {
+            const std::size_t target_bytes =
+                static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
+            if (targets.Device == -1) {
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
+        }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
@@ -705,19 +743,6 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
-
-    fill_zero(rs.Losses, rs.MainStream);
-    fill_zero(rs.ValidTokenCount, rs.MainStream);
-    fill_zero(rs.CorrectCount, rs.MainStream);
-
-    const std::size_t target_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-    if (targets.Device == -1) {
-        CUDA_CHECK(cudaMemcpy(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice));
-    } else {
-        CUDA_CHECK(cudaMemcpy(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice));
-    }
-
-    run_classifier(B, T, comm, /*grad_accum_steps=*/1, micro_step, /*compute_accuracy=*/true);
 
     reduce_loss(rs, B, T, comm);
     comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
@@ -768,8 +793,6 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     }
 
     if (micro_step == 0) {
-        fill_zero(rs.Losses, rs.MainStream);
-        fill_zero(rs.ValidTokenCount, rs.MainStream);
         const cudaStream_t grad_stream = in_capture ? rs.MainStream : rs.side_stream();
         grads.start_micro_step(grad_stream, micro_step, grad_accum_steps);
         record_event_if_not_capturing(rs.side_stream_event(), grad_stream);
@@ -789,12 +812,17 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         mLoRAGrads->start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
     }
 
-    run_classifier(B, T, comm, grad_accum_steps, micro_step, /*compute_accuracy=*/false);
-
     const bool last_step = micro_step == grad_accum_steps - 1;
     if (last_step) {
         reduce_loss(rs, B, T, comm);
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
+    }
+
+    if (!in_capture) {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        if (micro_step == 0) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
+        }
     }
 
     execute_backward(B, T, comm, grad_accum_steps, micro_step, nullptr);
@@ -843,6 +871,12 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
 
+    if (mHasLossOp && micro_step == 0) {
+        fill_zero(rs.Losses, rs.MainStream);
+        fill_zero(rs.ValidTokenCount, rs.MainStream);
+        fill_zero(rs.CorrectCount, rs.MainStream);
+    }
+
     // Copy inputs and position ids to device.
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
@@ -852,6 +886,12 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+        }
+        if (mHasLossOp) {
+            const std::size_t target_bytes =
+                static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
+            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, rs.Targets_CPU.Data, target_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
@@ -895,6 +935,12 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
 
+    if (mHasLossOp) {
+        fill_zero(rs.Losses, rs.MainStream);
+        fill_zero(rs.ValidTokenCount, rs.MainStream);
+        fill_zero(rs.CorrectCount, rs.MainStream);
+    }
+
     // Copy inputs and position ids to device.
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
@@ -904,6 +950,15 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+        }
+        if (mHasLossOp) {
+            const std::size_t target_bytes =
+                static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
+            if (targets.Device == -1) {
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
@@ -917,19 +972,6 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
-
-    fill_zero(rs.Losses, rs.MainStream);
-    fill_zero(rs.ValidTokenCount, rs.MainStream);
-    fill_zero(rs.CorrectCount, rs.MainStream);
-
-    const std::size_t target_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-    if (targets.Device == -1) {
-        CUDA_CHECK(cudaMemcpy(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice));
-    } else {
-        CUDA_CHECK(cudaMemcpy(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice));
-    }
-
-    run_classifier(B, T, comm, /*grad_accum_steps=*/1, micro_step, /*compute_accuracy=*/true);
 
     reduce_loss(rs, B, T, comm);
     comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
@@ -981,8 +1023,6 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
     }
 
     if (micro_step == 0) {
-        fill_zero(rs.Losses, rs.MainStream);
-        fill_zero(rs.ValidTokenCount, rs.MainStream);
         const cudaStream_t grad_stream = in_capture ? rs.MainStream : rs.side_stream();
         grads.start_micro_step(grad_stream, micro_step, grad_accum_steps);
         record_event_if_not_capturing(rs.side_stream_event(), grad_stream);
@@ -1002,12 +1042,17 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         mLoRAGrads->start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
     }
 
-    run_classifier(B, T, comm, grad_accum_steps, micro_step, /*compute_accuracy=*/false);
-
     const bool last_step = micro_step == grad_accum_steps - 1;
     if (last_step) {
         reduce_loss(rs, B, T, comm);
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
+    }
+
+    if (!in_capture) {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        if (micro_step == 0) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
+        }
     }
 
     // Configure graphs for hooked execution (may differ in topology)
@@ -1030,118 +1075,6 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
 
     record_event_if_not_capturing(rs.BackwardDone, rs.MainStream);
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
-}
-
-void GraphExecutor::run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy) {
-    auto& rs = mRunState;
-    const auto& config = mConfig;
-    const size_t V = config.VocabSize;
-    const size_t Vp = config.VocabSize;
-    const long total_tokens = B * T;
-    const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
-    const long nano_batch_size = total_tokens / static_cast<long>(lmhead_chunks);
-    const float d_loss = compute_accuracy ? 1.0f : (1.0f / static_cast<float>(B * T * grad_accum_steps));
-    const bool manual_lmhead_backward = (!compute_accuracy && lmhead_chunks > 1);
-    const bool lora_only = rs.is_lora_only_mode();
-
-    rs.temp_acquire(rs.non_block_activations().output);
-
-    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
-        mWeightManager->gather_lm_head(comm, rs.MainStream);
-    }
-
-    const bool in_capture = stream_is_capturing(rs.MainStream);
-    // Ensure targets and gradient zeroing are visible on main stream.
-    if (!in_capture) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
-        if (!compute_accuracy && micro_step == 0) {
-            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
-        }
-    }
-
-    // Row-major logits = lnf @ lm_head.T -> map to column-major backend by swapping A/B,
-    // swapping M/N, and swapping transpose flags.
-    const bool has_lm_head = mWeights.has("lm_head");
-    Tensor& lm_head = has_lm_head ? mWeights.get("lm_head") : mWeights.get("lm_head_weight");
-    const std::string lm_head_name = has_lm_head ? "lm_head" : "lm_head_weight";
-
-    Tensor* d_lm_head = nullptr;
-    bool d_lm_head_accumulate = false;
-    if (manual_lmhead_backward && !lora_only) {
-        bool accum = false;
-        d_lm_head = mGrads.get_param_grad(lm_head_name, accum);
-        d_lm_head_accumulate = accum;
-        if (!d_lm_head || !d_lm_head->Data) {
-            d_lm_head = nullptr;
-        }
-    }
-
-    for (int nano_step = 0; nano_step < lmhead_chunks; ++nano_step) {
-        const long token_offset = static_cast<long>(nano_step) * nano_batch_size;
-
-        Tensor lnf_slice = rs.non_block_activations().ln_final;
-        lnf_slice.Data = static_cast<std::byte*>(lnf_slice.Data) +
-                         token_offset * config.HiddenSize * get_dtype_size(lnf_slice.DType);
-        lnf_slice.Sizes[0] = nano_batch_size;
-        lnf_slice.Sizes[1] = static_cast<long>(config.HiddenSize);
-        lnf_slice.Rank = 2;
-
-        Tensor tgt = rs.Targets;
-        tgt.Data = static_cast<std::byte*>(tgt.Data) +
-                   token_offset * get_dtype_size(tgt.DType);
-        tgt.Sizes[0] = nano_batch_size;
-        tgt.Rank = 1;
-
-        Tensor losses = rs.Losses;
-        losses.Data = static_cast<std::byte*>(losses.Data) +
-                      token_offset * get_dtype_size(losses.DType);
-        losses.Sizes[0] = nano_batch_size;
-        losses.Rank = 1;
-
-        Tensor& logits = rs.non_block_activations().output;  // scratch buffer
-        matmul(logits, lm_head, lnf_slice,
-               std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-               static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(config.HiddenSize),
-               swap_transpose(EMMTranspose::NT), false, rs.MainStream);
-
-        if (compute_accuracy) {
-            fused_classifier(logits, losses, d_loss, tgt,
-                             &rs.ValidTokenCount, &rs.CorrectCount,
-                             static_cast<int>(nano_batch_size), static_cast<int>(V), static_cast<int>(Vp),
-                             true, rs.MainStream);
-        } else {
-            fused_classifier(logits, losses, d_loss, tgt,
-                             &rs.ValidTokenCount,
-                             static_cast<int>(nano_batch_size), static_cast<int>(V), static_cast<int>(Vp),
-                             true, rs.MainStream);
-        }
-
-        if (manual_lmhead_backward) {
-            Tensor dlnf_slice = rs.non_block_gradients().d_ln_final;
-            dlnf_slice.Data = static_cast<std::byte*>(dlnf_slice.Data) +
-                              token_offset * config.HiddenSize * get_dtype_size(dlnf_slice.DType);
-            dlnf_slice.Sizes[0] = nano_batch_size;
-            dlnf_slice.Sizes[1] = static_cast<long>(config.HiddenSize);
-            dlnf_slice.Rank = 2;
-
-            if (d_lm_head) {
-                const bool accumulate = d_lm_head_accumulate || (nano_step != 0);
-                matmul(*d_lm_head, lnf_slice, logits,
-                       std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-                       static_cast<int>(config.HiddenSize), static_cast<int>(V), static_cast<int>(nano_batch_size),
-                       swap_transpose(EMMTranspose::TN), accumulate, rs.MainStream);
-            }
-
-            matmul(dlnf_slice, lm_head, logits,
-                   std::nullopt, nullptr, nullptr, rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   static_cast<int>(config.HiddenSize), static_cast<int>(nano_batch_size), static_cast<int>(V),
-                   swap_transpose(EMMTranspose::NN), false, rs.MainStream);
-        }
-    }
-
-    if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
-        mWeightManager->release_lm_head(rs.MainStream);
-    }
 }
 
 

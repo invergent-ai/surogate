@@ -128,6 +128,9 @@ struct NonBlockGradientBuffers {
 struct ScratchBuffers {
     Tensor rmsnorm_scratch;      ///< For RMSNorm backward
     Tensor matmul_bias_scratch;  ///< For fused matmul+bias
+    Tensor cross_entropy_dloss;  ///< [B*T] per-token d_loss (filled with scalar)
+    Tensor cross_entropy_logsumexp;       ///< [B*T] final logsumexp per token
+    Tensor cross_entropy_chunk_logsumexp; ///< [B*T, n_chunks] intermediate logsumexp per chunk
     // cuDNN attention backward workspace.
     // Like legacy `LLamaRunState::CuDNNWorkspace`, this is a descriptor that is backed by the DeviceMemoryStack
     // via temp_acquire/temp_free, so it can overlap with other temporaries (e.g. output logits chunks).

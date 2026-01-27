@@ -138,7 +138,8 @@ class Qwen3MoEModel:
         self,
         token_ids: Tensor["B", "T", "int32"],
         position_ids: Tensor["T", "int32"],
-    ) -> Tensor["B", "T", "vocab_size"]:
+        targets: Tensor["B", "T", "int32"],
+    ) -> Tensor["B * T", "fp32"]:
         with graph() as g:
             # Embedding lookup
             x0 = g.embedding(token_ids, "embedding")
@@ -163,9 +164,9 @@ class Qwen3MoEModel:
                 y_name="xF"  # Map to LNFinal slot in C++
             )
 
-            # LM head
+            # Fused LM head + loss
             xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
-            logits_flat = g.matmul(xF_flat, "lm_head", transpose="NT", out_name="logits_flat")
-            logits = g.view(logits_flat, shape=["B", "T", "vocab_size"], out_name="logits")
+            loss = g.fused_lm_head_loss(xF_flat, "lm_head", targets,
+                                        compute_accuracy=True, out_name="loss")
 
-            return logits
+            return loss

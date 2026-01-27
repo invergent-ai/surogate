@@ -655,6 +655,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         // If graphs are disabled or unsupported, fall back to eager execution.
         if (!mOptions.UseCudaGraphs) {
             for (int j = 0; j < micro_steps; ++j) {
+                rs.Targets_CPU = gs.targets[j];
                 ctx.Model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
                 ctx.Model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
             }
@@ -696,6 +697,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             "[DSL GRAPH] rank=%d step=%d warmup micro_step=%d forward begin\n",
                             ctx.Communicator->local_rank(), step, j);
                 }
+                rs.Targets_CPU = gs.targets[j];
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
                 if (debug_graph) {
                     fprintf(stderr,
@@ -758,6 +760,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             }
             CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
             for (int j = 0; j < micro_steps; ++j) {
+                rs.Targets_CPU = gs.targets[j];
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
                 dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
             }

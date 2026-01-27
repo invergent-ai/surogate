@@ -145,13 +145,6 @@ DslParamStore::DslParamStore(const Module& module,
         if (entry.external || entry.managed_by_weight_manager) {
             entry.tensor = Tensor::empty(dtype, shape);
         } else {
-            // Calculate size for debug
-            long total_elems = 1;
-            for (auto s : shape) total_elems *= s;
-            long bytes = total_elems * (dtype == ETensorDType::BF16 ? 2 : dtype == ETensorDType::FP32 ? 4 : 1);
-            std::cerr << "[DslParamStore] ALLOCATING " << name << " shape=[";
-            for (size_t i = 0; i < shape.size(); i++) std::cerr << (i > 0 ? "," : "") << shape[i];
-            std::cerr << "] " << bytes / (1024*1024) << " MB\n";
             entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
         }
         entry.trainable = !is_rope_param(name);

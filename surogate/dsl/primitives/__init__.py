@@ -9,6 +9,7 @@ from .embedding import embedding
 from .tensor_ops import view, transpose, concat, split
 from .elementwise import add, mul, scale, bias_add
 from .initialization import zeros, ones, fill_normal
+from .losses import fused_lm_head_loss
 from .moe import (
     moe_softmax,
     moe_sigmoid,
@@ -53,6 +54,8 @@ __all__ = [
     "zeros",
     "ones",
     "fill_normal",
+    # Losses
+    "fused_lm_head_loss",
     # MoE
     "moe_softmax",
     "moe_sigmoid",

@@ -72,6 +72,8 @@ enum class CompiledOpType : std::uint8_t {
     QKVQKNormRoPE,
     RoPE,
     FlashAttention,
+    CrossEntropyLoss,
+    FusedLMHeadLoss,
     // Backward operations
     ViewBackward,
     AddBackward,
@@ -85,6 +87,8 @@ enum class CompiledOpType : std::uint8_t {
     ZerosBackward,
     FusedResidualRMSNormBackward,
     EmbeddingBackward,
+    CrossEntropyLossBackward,
+    FusedLMHeadLossBackward,
     // Sentinel
     Unknown
 };
@@ -131,6 +135,9 @@ enum class TensorSlot : std::uint8_t {
     // Inputs
     TokenIDs,
     PositionIDs,
+    Targets,
+    Losses,
+    DLoss,
     // Named parameter (uses name lookup)
     Parameter,
     // Temporary (stack-allocated)
@@ -159,6 +166,7 @@ struct CompiledAttrs {
     float eps = 1e-6f;
     EMMTranspose transpose = EMMTranspose::NN;
     int rotary_dim = 0;
+    bool compute_accuracy = false;
 
     // Shape info
     std::vector<long> shape;
@@ -345,6 +353,8 @@ private:
     void dispatch_qkv_qk_norm_rope(const CompiledOp& op);
     void dispatch_rope(const CompiledOp& op);
     void dispatch_flash_attention(const CompiledOp& op);
+    void dispatch_cross_entropy_loss(const CompiledOp& op);
+    void dispatch_fused_lm_head_loss(const CompiledOp& op);
 
     // Backward dispatch functions
     void dispatch_view_backward(const CompiledOp& op);
@@ -359,6 +369,8 @@ private:
     void dispatch_zeros_backward(const CompiledOp& op);
     void dispatch_fused_residual_rmsnorm_backward(const CompiledOp& op);
     void dispatch_embedding_backward(const CompiledOp& op);
+    void dispatch_cross_entropy_loss_backward(const CompiledOp& op);
+    void dispatch_fused_lm_head_loss_backward(const CompiledOp& op);
 
     // Tensor resolution (pre-resolved, O(1) lookup)
     Tensor& resolve_tensor(const TensorRef& ref);

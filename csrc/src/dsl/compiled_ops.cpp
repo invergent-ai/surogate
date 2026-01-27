@@ -134,6 +134,10 @@ bool infer_known_tensor_shape(std::string_view name,
         shape = {B, T};
         return true;
     }
+    if (name == "targets" || name == "labels" || name == "loss" || name == "losses" || name == "d_loss") {
+        shape = {B * T};
+        return true;
+    }
 
     return false;
 }
@@ -161,6 +165,10 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"rope", CompiledOpType::RoPE},
         {"flash_attention", CompiledOpType::FlashAttention},
         {"flash_attention_qkv", CompiledOpType::FlashAttention},
+        {"cross_entropy", CompiledOpType::CrossEntropyLoss},
+        {"cross_entropy_loss", CompiledOpType::CrossEntropyLoss},
+        {"fused_lm_head_loss", CompiledOpType::FusedLMHeadLoss},
+        {"lm_head_loss", CompiledOpType::FusedLMHeadLoss},
         // Backward operations
         {"view_backward", CompiledOpType::ViewBackward},
         {"add_backward", CompiledOpType::AddBackward},
@@ -174,6 +182,8 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"zeros_backward", CompiledOpType::ZerosBackward},
         {"fused_residual_rmsnorm_backward", CompiledOpType::FusedResidualRMSNormBackward},
         {"embedding_backward", CompiledOpType::EmbeddingBackward},
+        {"cross_entropy_backward", CompiledOpType::CrossEntropyLossBackward},
+        {"fused_lm_head_loss_backward", CompiledOpType::FusedLMHeadLossBackward},
     };
 
     auto it = type_map.find(op_type);
@@ -195,6 +205,8 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::QKVQKNormRoPE: return "qkv_qk_norm_rope";
         case CompiledOpType::RoPE: return "rope";
         case CompiledOpType::FlashAttention: return "flash_attention";
+        case CompiledOpType::CrossEntropyLoss: return "cross_entropy_loss";
+        case CompiledOpType::FusedLMHeadLoss: return "fused_lm_head_loss";
         case CompiledOpType::ViewBackward: return "view_backward";
         case CompiledOpType::AddBackward: return "add_backward";
         case CompiledOpType::MatmulBackward: return "matmul_backward";
@@ -207,6 +219,8 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::ZerosBackward: return "zeros_backward";
         case CompiledOpType::FusedResidualRMSNormBackward: return "fused_residual_rmsnorm_backward";
         case CompiledOpType::EmbeddingBackward: return "embedding_backward";
+        case CompiledOpType::CrossEntropyLossBackward: return "cross_entropy_backward";
+        case CompiledOpType::FusedLMHeadLossBackward: return "fused_lm_head_loss_backward";
         case CompiledOpType::Unknown: return "unknown";
     }
     return "unknown";
@@ -450,6 +464,15 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         ref.slot = TensorSlot::TokenIDs;
     } else if (name == "position_ids") {
         ref.slot = TensorSlot::PositionIDs;
+    } else if (name == "targets" || name == "labels") {
+        ref.slot = TensorSlot::Targets;
+        ref.dtype = ETensorDType::INT32;
+    } else if (name == "loss" || name == "losses") {
+        ref.slot = TensorSlot::Losses;
+        ref.dtype = ETensorDType::FP32;
+    } else if (name == "d_loss") {
+        ref.slot = TensorSlot::DLoss;
+        ref.dtype = ETensorDType::FP32;
     } else if (name == "x0" || name == "encoded") {
         ref.slot = TensorSlot::Encoded;
     } else if (name == "ln_final" || name == "xF") {
@@ -467,9 +490,14 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     }
 
     if (ref.shape.empty()) {
-        auto it = mExtraShapes.find(ref.name);
-        if (it != mExtraShapes.end()) {
-            ref.shape = it->second;
+        std::vector<long> resolved;
+        if (resolve_tensor_shape(ref.name, resolved)) {
+            ref.shape = std::move(resolved);
+        } else {
+            auto it = mExtraShapes.find(ref.name);
+            if (it != mExtraShapes.end()) {
+                ref.shape = it->second;
+            }
         }
     }
     return ref;
@@ -509,6 +537,12 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         // Store the reference name for runtime lookup
         if (auto ref_name = attr_string(*shape_like_attr)) {
             attrs.shape_like = *ref_name;
+        }
+    }
+
+    if (auto* acc_attr = find_attr(op.attrs, "compute_accuracy")) {
+        if (auto v = attr_bool(*acc_attr)) {
+            attrs.compute_accuracy = *v;
         }
     }
 
@@ -774,6 +808,44 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
+        case CompiledOpType::CrossEntropyLoss: {
+            // Output: per-token loss [B*T]
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                const auto& logits_shape = input_shapes[0];
+                if (!logits_shape.empty()) {
+                    output_shapes.push_back({logits_shape[0]});
+                }
+            }
+            break;
+        }
+
+        case CompiledOpType::CrossEntropyLossBackward: {
+            // Output: d_logits shape matches logits input
+            if (input_shapes.size() > 1 && !input_shapes[1].empty()) {
+                output_shapes.push_back(input_shapes[1]);
+            }
+            break;
+        }
+
+        case CompiledOpType::FusedLMHeadLoss: {
+            // Output: per-token loss [B*T]
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back({input_shapes[0][0]});
+            }
+            break;
+        }
+
+        case CompiledOpType::FusedLMHeadLossBackward: {
+            // Outputs: d_xF_flat [B*T, C], d_lm_head [V, C]
+            if (input_shapes.size() > 1 && !input_shapes[1].empty()) {
+                output_shapes.push_back(input_shapes[1]);
+            }
+            if (input_shapes.size() > 2 && !input_shapes[2].empty()) {
+                output_shapes.push_back(input_shapes[2]);
+            }
+            break;
+        }
+
         case CompiledOpType::Zeros: {
             // Try to infer from 'shape' attribute
             if (auto* shape_attr = find_attr(op.attrs, "shape")) {
@@ -867,11 +939,11 @@ void GraphCompiler::validate_operation_shapes(
         if (error) {
             // Build detailed error message
             std::ostringstream oss;
-            oss << "\n╔══════════════════════════════════════════════════════════════╗\n"
-                << "║ Shape Validation Error at Graph Compilation                 ║\n"
-                << "╚══════════════════════════════════════════════════════════════╝\n\n"
-                << "Operation: #" << op_index << " (id: '" << op.id << "')\n"
-                << "Type:      " << op.name << "\n\n";
+            oss << "\n╔═══════════════════════════════════════════════════════╗\n"
+                <<   "║ Found Shape Validation Error during Graph Compilation ║\n"
+                <<   "╚═══════════════════════════════════════════════════════╝\n\n"
+                <<   "Operation: #" << op_index << " (id: '" << op.id << "')\n"
+                <<   "Type:      " << op.name << "\n\n";
 
             // Show operation attributes if any
             bool has_attrs = false;
@@ -989,7 +1061,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     if (mModule.forward.has_value()) {
         const auto& fwd = *mModule.forward;
         for (const auto& op : fwd.operations) {
-            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            const std::string& op_type =
+                (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
             if (op_type != "view" && op_type != "reshape") {
                 continue;
             }
@@ -1027,7 +1100,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
     for (std::size_t idx = 0; idx < graph.operations.size(); ++idx) {
         const auto& op = graph.operations[idx];
-        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
 
         CompiledOp compiled;
         compiled.original_idx = static_cast<std::uint16_t>(idx);
@@ -1079,6 +1153,42 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     } else if (i == 2) {
                         ref.dtype = ETensorDType::FP32;
                         ref.shape = {B * T};
+                    }
+                } else if (compiled.type == CompiledOpType::CrossEntropyLoss) {
+                    // output[0] = loss [B*T] FP32 (per-token)
+                    ref.dtype = ETensorDType::FP32;
+                    ref.shape = {B * T};
+                } else if (compiled.type == CompiledOpType::CrossEntropyLossBackward) {
+                    // output[0] = d_logits [B*T, V] (match logits dtype)
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[1].dtype;
+                        ref.shape = compiled.inputs[1].shape;
+                    } else {
+                        ref.dtype = ETensorDType::BF16;
+                        ref.shape = {B * T, static_cast<long>(mConfig.VocabSize)};
+                    }
+                } else if (compiled.type == CompiledOpType::FusedLMHeadLoss) {
+                    // output[0] = loss [B*T] FP32 (per-token)
+                    ref.dtype = ETensorDType::FP32;
+                    ref.shape = {B * T};
+                } else if (compiled.type == CompiledOpType::FusedLMHeadLossBackward) {
+                    // output[0] = d_xF_flat [B*T, C], output[1] = d_lm_head [V, C]
+                    if (i == 0) {
+                        if (compiled.inputs.size() > 1) {
+                            ref.dtype = compiled.inputs[1].dtype;
+                            ref.shape = compiled.inputs[1].shape;
+                        } else {
+                            ref.dtype = ETensorDType::BF16;
+                            ref.shape = {B * T, C};
+                        }
+                    } else if (i == 1) {
+                        if (compiled.inputs.size() > 2) {
+                            ref.dtype = compiled.inputs[2].dtype;
+                            ref.shape = compiled.inputs[2].shape;
+                        } else {
+                            ref.dtype = ETensorDType::BF16;
+                            ref.shape = {static_cast<long>(mConfig.VocabSize), C};
+                        }
                     }
                 } else if (compiled.type == CompiledOpType::QKVQKNormRoPE) {
                     // output[0] = qkv_out [B, T, QKV] BF16
@@ -1447,6 +1557,11 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         // Need to create a view - get the base tensor and create view
         Tensor* base = nullptr;
         switch (ref.slot) {
+            case TensorSlot::TokenIDs: base = &rs.Inputs; break;
+            case TensorSlot::PositionIDs: base = &rs.PositionIDs; break;
+            case TensorSlot::Targets: base = &rs.Targets; break;
+            case TensorSlot::Losses: base = &rs.Losses; break;
+            case TensorSlot::DLoss: base = &rs.scratch().cross_entropy_dloss; break;
             case TensorSlot::BlockDLN1: base = &rs.simplified_grads(ref.layer_idx).d_ln1; break;
             case TensorSlot::BlockDQKV: base = &rs.simplified_grads(ref.layer_idx).d_qkv; break;
             case TensorSlot::BlockDAtt: base = &rs.simplified_grads(ref.layer_idx).d_att; break;
@@ -1477,6 +1592,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             return rs.Inputs;
         case TensorSlot::PositionIDs:
             return rs.PositionIDs;
+        case TensorSlot::Targets:
+            return rs.Targets;
+        case TensorSlot::Losses:
+            return rs.Losses;
+        case TensorSlot::DLoss:
+            return rs.scratch().cross_entropy_dloss;
         case TensorSlot::Encoded:
             return rs.non_block_activations().encoded;
         case TensorSlot::LNFinal:
@@ -1921,6 +2042,144 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
                             mRunState.CudnnHandle, static_cast<int>(mB), static_cast<int>(mT),
                             Hq, Hkv, Hs, mRunState.MainStream);
+}
+
+void CompiledExecutor::dispatch_cross_entropy_loss(const CompiledOp& op) {
+    Tensor& logits = resolve_tensor(op.inputs[0]);
+    Tensor& targets = resolve_tensor(op.inputs[1]);
+    Tensor& loss = ensure_output_tensor(op.outputs[0]);
+
+    const int BT = static_cast<int>(logits.Sizes[0]);
+    const int V = static_cast<int>(logits.Sizes[1]);
+    const int P = V;
+
+    Tensor logsumexp_view{};
+    Tensor* logsumexp = nullptr;
+    if (mRunState.scratch().cross_entropy_logsumexp.Data) {
+        logsumexp_view = mRunState.scratch().cross_entropy_logsumexp;
+        logsumexp_view.Sizes[0] = BT;
+        logsumexp_view.Rank = 1;
+        logsumexp = &logsumexp_view;
+    }
+
+    if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+        if (!mRunState.scratch().cross_entropy_chunk_logsumexp.Data) {
+            throw std::runtime_error("cross_entropy_loss: chunk logsumexp buffer is not allocated");
+        }
+        const int n_chunks = (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE;
+        Tensor chunk_lse = mRunState.scratch().cross_entropy_chunk_logsumexp;
+        chunk_lse.Sizes[0] = BT;
+        chunk_lse.Sizes[1] = n_chunks;
+        chunk_lse.Rank = 2;
+
+        chunked_cross_entropy_forward(logits, loss, logsumexp, chunk_lse, targets,
+                                      &mRunState.ValidTokenCount,
+                                      op.attrs.compute_accuracy ? &mRunState.CorrectCount : nullptr,
+                                      BT, V, P, n_chunks, mRunState.MainStream);
+    } else {
+        fused_cross_entropy_forward(logits, loss, logsumexp, targets,
+                                    &mRunState.ValidTokenCount,
+                                    op.attrs.compute_accuracy ? &mRunState.CorrectCount : nullptr,
+                                    BT, V, P, mRunState.MainStream);
+    }
+}
+
+void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
+    Tensor& xF_flat = resolve_tensor(op.inputs[0]);
+    Tensor& weight = resolve_tensor(op.inputs[1]);
+    Tensor& targets = resolve_tensor(op.inputs[2]);
+    Tensor& loss = ensure_output_tensor(op.outputs[0]);
+
+    const long BT = xF_flat.Sizes[0];
+    const int V = static_cast<int>(weight.Sizes[0]);
+    const int C = static_cast<int>(weight.Sizes[1]);
+    const int P = V;
+
+    const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
+    const long nano_batch_size = BT / static_cast<long>(lmhead_chunks);
+    const int n_chunks = (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE;
+
+    const bool need_lm_head =
+        mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled());
+    if (need_lm_head && mComm) {
+        mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
+    }
+
+    const std::size_t xf_stride = get_dtype_size(xF_flat.DType);
+    const std::size_t tgt_stride = get_dtype_size(targets.DType);
+    const std::size_t loss_stride = get_dtype_size(loss.DType);
+    const std::size_t lse_stride = get_dtype_size(ETensorDType::FP32);
+    const std::size_t chunk_lse_stride = lse_stride * static_cast<std::size_t>(n_chunks);
+
+    for (int nano_step = 0; nano_step < lmhead_chunks; ++nano_step) {
+        const long token_offset = static_cast<long>(nano_step) * nano_batch_size;
+
+        Tensor xF_slice = xF_flat;
+        xF_slice.Data = static_cast<std::byte*>(xF_slice.Data) +
+                        static_cast<std::size_t>(token_offset) * xf_stride * static_cast<std::size_t>(C);
+        xF_slice.Sizes[0] = nano_batch_size;
+        xF_slice.Sizes[1] = C;
+        xF_slice.Rank = 2;
+
+        Tensor tgt_slice = targets;
+        tgt_slice.Data = static_cast<std::byte*>(tgt_slice.Data) +
+                         static_cast<std::size_t>(token_offset) * tgt_stride;
+        tgt_slice.Sizes[0] = nano_batch_size;
+        tgt_slice.Rank = 1;
+
+        Tensor loss_slice = loss;
+        loss_slice.Data = static_cast<std::byte*>(loss_slice.Data) +
+                          static_cast<std::size_t>(token_offset) * loss_stride;
+        loss_slice.Sizes[0] = nano_batch_size;
+        loss_slice.Rank = 1;
+
+        Tensor logits = mRunState.non_block_activations().output;
+        logits.Sizes[0] = nano_batch_size;
+        logits.Sizes[1] = V;
+        logits.Rank = 2;
+
+        matmul(logits, weight, xF_slice,
+               std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(C),
+               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        Tensor logsumexp_view{};
+        Tensor* logsumexp = nullptr;
+        if (mRunState.scratch().cross_entropy_logsumexp.Data) {
+            logsumexp_view = mRunState.scratch().cross_entropy_logsumexp;
+            logsumexp_view.Data = static_cast<std::byte*>(logsumexp_view.Data) +
+                                  static_cast<std::size_t>(token_offset) * lse_stride;
+            logsumexp_view.Sizes[0] = nano_batch_size;
+            logsumexp_view.Rank = 1;
+            logsumexp = &logsumexp_view;
+        }
+
+        if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+            if (!mRunState.scratch().cross_entropy_chunk_logsumexp.Data) {
+                throw std::runtime_error("fused_lm_head_loss: chunk logsumexp buffer is not allocated");
+            }
+            Tensor chunk_lse = mRunState.scratch().cross_entropy_chunk_logsumexp;
+            chunk_lse.Data = static_cast<std::byte*>(chunk_lse.Data) +
+                             static_cast<std::size_t>(token_offset) * chunk_lse_stride;
+            chunk_lse.Sizes[0] = nano_batch_size;
+            chunk_lse.Sizes[1] = n_chunks;
+            chunk_lse.Rank = 2;
+
+            chunked_cross_entropy_forward(logits, loss_slice, logsumexp, chunk_lse, tgt_slice,
+                                          &mRunState.ValidTokenCount,
+                                          op.attrs.compute_accuracy ? &mRunState.CorrectCount : nullptr,
+                                          static_cast<int>(nano_batch_size), V, P, n_chunks, mRunState.MainStream);
+        } else {
+            fused_cross_entropy_forward(logits, loss_slice, logsumexp, tgt_slice,
+                                        &mRunState.ValidTokenCount,
+                                        op.attrs.compute_accuracy ? &mRunState.CorrectCount : nullptr,
+                                        static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
+    }
+
+    if (need_lm_head) {
+        mWeightManager->release_lm_head(mRunState.MainStream);
+    }
 }
 
 // Backward dispatch implementations
@@ -2764,6 +3023,173 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
                      mRunState.side_stream());
 }
 
+void CompiledExecutor::dispatch_cross_entropy_loss_backward(const CompiledOp& op) {
+    Tensor& d_loss = resolve_tensor(op.inputs[0]);
+    Tensor& logits = resolve_tensor(op.inputs[1]);
+    Tensor& targets = resolve_tensor(op.inputs[2]);
+    Tensor& d_logits = ensure_output_tensor(op.outputs[0]);
+
+    const int BT = static_cast<int>(logits.Sizes[0]);
+    const int V = static_cast<int>(logits.Sizes[1]);
+    const int P = V;
+
+    if (op.inputs[0].slot == TensorSlot::DLoss) {
+        const long total_tokens = mB * mT;
+        const int accum_steps = std::max(1, mRunState.GradAccumSteps);
+        const float dloss_val = 1.0f / static_cast<float>(total_tokens * accum_steps);
+        fill_constant(d_loss, dloss_val, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+    }
+
+    Tensor logsumexp_view{};
+    Tensor* logsumexp = nullptr;
+    if (mRunState.scratch().cross_entropy_logsumexp.Data) {
+        logsumexp_view = mRunState.scratch().cross_entropy_logsumexp;
+        logsumexp_view.Sizes[0] = BT;
+        logsumexp_view.Rank = 1;
+        logsumexp = &logsumexp_view;
+    }
+
+    if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+        chunked_cross_entropy_backward(d_logits, logits, logsumexp, d_loss, targets,
+                                       BT, V, P, mRunState.MainStream);
+    } else {
+        fused_cross_entropy_backward(d_logits, logits, logsumexp, d_loss, targets,
+                                     BT, V, P, mRunState.MainStream);
+    }
+}
+
+void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op) {
+    Tensor& d_loss = resolve_tensor(op.inputs[0]);
+    Tensor& xF_flat = resolve_tensor(op.inputs[1]);
+    Tensor& weight = resolve_tensor(op.inputs[2]);
+    Tensor& targets = resolve_tensor(op.inputs[3]);
+
+    Tensor* d_xF_ptr = nullptr;
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        d_xF_ptr = &ensure_output_tensor(op.outputs[0]);
+    }
+
+    Tensor* d_weight_ptr = nullptr;
+    bool d_weight_accumulate = false;
+    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        std::string weight_name = op.outputs[1].name;
+        if (weight_name.rfind("d_", 0) == 0) {
+            weight_name = weight_name.substr(2);
+        }
+        bool accum = false;
+        Tensor* grad = mGrads.get_param_grad(weight_name, accum);
+        d_weight_accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
+        if (grad && grad->Data) {
+            d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
+        }
+    }
+
+    if (op.inputs[0].slot == TensorSlot::DLoss) {
+        const long total_tokens = mB * mT;
+        const int accum_steps = std::max(1, mRunState.GradAccumSteps);
+        const float dloss_val = 1.0f / static_cast<float>(total_tokens * accum_steps);
+        fill_constant(d_loss, dloss_val, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+    }
+
+    const long BT = xF_flat.Sizes[0];
+    const int V = static_cast<int>(weight.Sizes[0]);
+    const int C = static_cast<int>(weight.Sizes[1]);
+    const int P = V;
+
+    const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
+    const long nano_batch_size = BT / static_cast<long>(lmhead_chunks);
+    const bool need_lm_head =
+        mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled()) &&
+        (mOptions.LMHeadChunks > 1);
+    if (need_lm_head && mComm) {
+        mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
+    }
+
+    const std::size_t xf_stride = get_dtype_size(xF_flat.DType);
+    const std::size_t tgt_stride = get_dtype_size(targets.DType);
+    const std::size_t lse_stride = get_dtype_size(ETensorDType::FP32);
+    const std::size_t dloss_stride = get_dtype_size(d_loss.DType);
+
+    for (int nano_step = 0; nano_step < lmhead_chunks; ++nano_step) {
+        const long token_offset = static_cast<long>(nano_step) * nano_batch_size;
+
+        Tensor xF_slice = xF_flat;
+        xF_slice.Data = static_cast<std::byte*>(xF_slice.Data) +
+                        static_cast<std::size_t>(token_offset) * xf_stride * static_cast<std::size_t>(C);
+        xF_slice.Sizes[0] = nano_batch_size;
+        xF_slice.Sizes[1] = C;
+        xF_slice.Rank = 2;
+
+        Tensor tgt_slice = targets;
+        tgt_slice.Data = static_cast<std::byte*>(tgt_slice.Data) +
+                         static_cast<std::size_t>(token_offset) * tgt_stride;
+        tgt_slice.Sizes[0] = nano_batch_size;
+        tgt_slice.Rank = 1;
+
+        Tensor dloss_slice = d_loss;
+        dloss_slice.Data = static_cast<std::byte*>(dloss_slice.Data) +
+                           static_cast<std::size_t>(token_offset) * dloss_stride;
+        dloss_slice.Sizes[0] = nano_batch_size;
+        dloss_slice.Rank = 1;
+
+        Tensor logits = mRunState.non_block_activations().output;
+        logits.Sizes[0] = nano_batch_size;
+        logits.Sizes[1] = V;
+        logits.Rank = 2;
+
+        matmul(logits, weight, xF_slice,
+               std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(C),
+               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        Tensor logsumexp_view{};
+        Tensor* logsumexp = nullptr;
+        if (mRunState.scratch().cross_entropy_logsumexp.Data) {
+            logsumexp_view = mRunState.scratch().cross_entropy_logsumexp;
+            logsumexp_view.Data = static_cast<std::byte*>(logsumexp_view.Data) +
+                                  static_cast<std::size_t>(token_offset) * lse_stride;
+            logsumexp_view.Sizes[0] = nano_batch_size;
+            logsumexp_view.Rank = 1;
+            logsumexp = &logsumexp_view;
+        }
+
+        if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+            chunked_cross_entropy_backward(logits, logits, logsumexp, dloss_slice, tgt_slice,
+                                           static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        } else {
+            fused_cross_entropy_backward(logits, logits, logsumexp, dloss_slice, tgt_slice,
+                                         static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
+
+        if (d_weight_ptr) {
+            const bool accumulate = d_weight_accumulate || (nano_step != 0);
+            matmul(*d_weight_ptr, xF_slice, logits,
+                   std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   static_cast<int>(C), static_cast<int>(V), static_cast<int>(nano_batch_size),
+                   swap_transpose(EMMTranspose::TN), accumulate, mRunState.MainStream);
+        }
+
+        if (d_xF_ptr) {
+            Tensor d_xF_slice = *d_xF_ptr;
+            const std::size_t dx_stride = get_dtype_size(d_xF_slice.DType);
+            d_xF_slice.Data = static_cast<std::byte*>(d_xF_slice.Data) +
+                              static_cast<std::size_t>(token_offset) * dx_stride * static_cast<std::size_t>(C);
+            d_xF_slice.Sizes[0] = nano_batch_size;
+            d_xF_slice.Sizes[1] = C;
+            d_xF_slice.Rank = 2;
+
+            matmul(d_xF_slice, weight, logits,
+                   std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   static_cast<int>(C), static_cast<int>(nano_batch_size), static_cast<int>(V),
+                   swap_transpose(EMMTranspose::NN), false, mRunState.MainStream);
+        }
+    }
+
+    if (need_lm_head) {
+        mWeightManager->release_lm_head(mRunState.MainStream);
+    }
+}
+
 void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
@@ -2873,6 +3299,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::FlashAttention:
                     dispatch_flash_attention(op);
+                    break;
+                case CompiledOpType::CrossEntropyLoss:
+                    dispatch_cross_entropy_loss(op);
+                    break;
+                case CompiledOpType::FusedLMHeadLoss:
+                    dispatch_fused_lm_head_loss(op);
                     break;
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
@@ -3060,6 +3492,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::AddBackward:
                     dispatch_add_backward(op);
+                    break;
+                case CompiledOpType::CrossEntropyLossBackward:
+                    dispatch_cross_entropy_loss_backward(op);
+                    break;
+                case CompiledOpType::FusedLMHeadLossBackward:
+                    dispatch_fused_lm_head_loss_backward(op);
                     break;
                 case CompiledOpType::MatmulBackward:
                     dispatch_matmul_backward(op, hook);

@@ -1299,6 +1299,317 @@ void register_builtin_shape_signatures() {
         };
         reg.register_signature(sig);
     }
+
+    // ------------------------------------------------------------------------
+    // CrossEntropyLoss
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "cross_entropy_loss";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap&,
+                          const ShapeEnv&) -> std::optional<ShapeValidationError> {
+            const auto& logits = inputs[0];
+            const auto& targets = inputs[1];
+            const auto& loss = outputs[0];
+
+            // logits should be rank 2: [BT, V]
+            if (auto err = validators::check_rank(logits, 2, "logits", "cross_entropy_loss")) {
+                return err;
+            }
+            // targets should be rank 1: [BT] or rank 2: [B, T]
+            if (targets.size() != 1 && targets.size() != 2) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "cross_entropy_loss: targets has rank " << targets.size()
+                    << " but expected 1 or 2";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            // loss should be rank 1: [BT]
+            if (auto err = validators::check_rank(loss, 1, "loss", "cross_entropy_loss")) {
+                return err;
+            }
+
+            if (!logits.empty() && !targets.empty()) {
+                const long target_bt = (targets.size() == 2) ? targets[0] * targets[1] : targets[0];
+                if (logits[0] != target_bt) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "cross_entropy_loss: logits BT (" << logits[0]
+                        << ") doesn't match targets BT (" << target_bt << ")";
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+            if (!logits.empty() && !loss.empty() && logits[0] != loss[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "cross_entropy_loss: logits BT (" << logits[0]
+                    << ") doesn't match loss BT (" << loss[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // CrossEntropyLossBackward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "cross_entropy_backward";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap&,
+                          const ShapeEnv&) -> std::optional<ShapeValidationError> {
+            const auto& d_loss = inputs[0];
+            const auto& logits = inputs[1];
+            const auto& targets = inputs[2];
+            const auto& d_logits = outputs[0];
+
+            if (auto err = validators::check_rank(d_loss, 1, "d_loss", "cross_entropy_backward")) {
+                return err;
+            }
+            if (auto err = validators::check_rank(logits, 2, "logits", "cross_entropy_backward")) {
+                return err;
+            }
+            if (targets.size() != 1 && targets.size() != 2) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "cross_entropy_backward: targets has rank " << targets.size()
+                    << " but expected 1 or 2";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (auto err = validators::check_rank(d_logits, 2, "d_logits", "cross_entropy_backward")) {
+                return err;
+            }
+
+            if (!logits.empty() && !d_logits.empty() && logits[0] != d_logits[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "cross_entropy_backward: logits BT (" << logits[0]
+                    << ") doesn't match d_logits BT (" << d_logits[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!logits.empty() && !d_logits.empty() && logits[1] != d_logits[1]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "cross_entropy_backward: logits V (" << logits[1]
+                    << ") doesn't match d_logits V (" << d_logits[1] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!logits.empty() && !targets.empty()) {
+                const long target_bt = (targets.size() == 2) ? targets[0] * targets[1] : targets[0];
+                if (logits[0] != target_bt) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "cross_entropy_backward: logits BT (" << logits[0]
+                        << ") doesn't match targets BT (" << target_bt << ")";
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+            if (!logits.empty() && !d_loss.empty() && logits[0] != d_loss[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "cross_entropy_backward: logits BT (" << logits[0]
+                    << ") doesn't match d_loss BT (" << d_loss[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // FusedLMHeadLoss
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "fused_lm_head_loss";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap&,
+                          const ShapeEnv&) -> std::optional<ShapeValidationError> {
+            const auto& xF_flat = inputs[0];
+            const auto& weight = inputs[1];
+            const auto& targets = inputs[2];
+            const auto& loss = outputs[0];
+
+            if (auto err = validators::check_rank(xF_flat, 2, "xF_flat", "fused_lm_head_loss")) {
+                return err;
+            }
+            if (auto err = validators::check_rank(weight, 2, "weight", "fused_lm_head_loss")) {
+                return err;
+            }
+            if (targets.size() != 1 && targets.size() != 2) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss: targets has rank " << targets.size()
+                    << " but expected 1 or 2";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (auto err = validators::check_rank(loss, 1, "loss", "fused_lm_head_loss")) {
+                return err;
+            }
+
+            if (!xF_flat.empty() && !weight.empty() && xF_flat[1] != weight[1]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss: xF_flat C (" << xF_flat[1]
+                    << ") doesn't match weight C (" << weight[1] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!xF_flat.empty() && !targets.empty()) {
+                const long target_bt = (targets.size() == 2) ? targets[0] * targets[1] : targets[0];
+                if (xF_flat[0] != target_bt) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "fused_lm_head_loss: xF_flat BT (" << xF_flat[0]
+                        << ") doesn't match targets BT (" << target_bt << ")";
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+            if (!xF_flat.empty() && !loss.empty() && xF_flat[0] != loss[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss: xF_flat BT (" << xF_flat[0]
+                    << ") doesn't match loss BT (" << loss[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // FusedLMHeadLossBackward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "fused_lm_head_loss_backward";
+        sig.min_inputs = 4;
+        sig.max_inputs = 4;
+        sig.min_outputs = 2;
+        sig.max_outputs = 2;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap&,
+                          const ShapeEnv&) -> std::optional<ShapeValidationError> {
+            const auto& d_loss = inputs[0];
+            const auto& xF_flat = inputs[1];
+            const auto& weight = inputs[2];
+            const auto& targets = inputs[3];
+            const auto& d_xF_flat = outputs[0];
+            const auto& d_weight = outputs[1];
+
+            if (auto err = validators::check_rank(d_loss, 1, "d_loss", "fused_lm_head_loss_backward")) {
+                return err;
+            }
+            if (auto err = validators::check_rank(xF_flat, 2, "xF_flat", "fused_lm_head_loss_backward")) {
+                return err;
+            }
+            if (auto err = validators::check_rank(weight, 2, "weight", "fused_lm_head_loss_backward")) {
+                return err;
+            }
+            if (targets.size() != 1 && targets.size() != 2) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss_backward: targets has rank " << targets.size()
+                    << " but expected 1 or 2";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (auto err = validators::check_rank(d_xF_flat, 2, "d_xF_flat", "fused_lm_head_loss_backward")) {
+                return err;
+            }
+            if (auto err = validators::check_rank(d_weight, 2, "d_weight", "fused_lm_head_loss_backward")) {
+                return err;
+            }
+
+            if (!xF_flat.empty() && !d_xF_flat.empty() && xF_flat[0] != d_xF_flat[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss_backward: xF_flat BT (" << xF_flat[0]
+                    << ") doesn't match d_xF_flat BT (" << d_xF_flat[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!xF_flat.empty() && !d_xF_flat.empty() && xF_flat[1] != d_xF_flat[1]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss_backward: xF_flat C (" << xF_flat[1]
+                    << ") doesn't match d_xF_flat C (" << d_xF_flat[1] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!weight.empty() && !d_weight.empty() && weight[0] != d_weight[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss_backward: weight V (" << weight[0]
+                    << ") doesn't match d_weight V (" << d_weight[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!weight.empty() && !d_weight.empty() && weight[1] != d_weight[1]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss_backward: weight C (" << weight[1]
+                    << ") doesn't match d_weight C (" << d_weight[1] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            if (!xF_flat.empty() && !targets.empty()) {
+                const long target_bt = (targets.size() == 2) ? targets[0] * targets[1] : targets[0];
+                if (xF_flat[0] != target_bt) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "fused_lm_head_loss_backward: xF_flat BT (" << xF_flat[0]
+                        << ") doesn't match targets BT (" << target_bt << ")";
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+            if (!xF_flat.empty() && !d_loss.empty() && xF_flat[0] != d_loss[0]) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "fused_lm_head_loss_backward: xF_flat BT (" << xF_flat[0]
+                    << ") doesn't match d_loss BT (" << d_loss[0] << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
 }
 
 }}  // namespace dsl::shape_checker

@@ -98,7 +98,8 @@ void GraphExecutor::prime_fp8_weight_cache(const std::vector<char>& required) {
             continue;
         }
         const auto& op = mForward->operations[idx];
-        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul" && op_type != "matmul_bias") {
             continue;
         }
@@ -185,7 +186,8 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
             continue;
         }
         const auto& op = mForward->operations[i];
-        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul" && op_type != "matmul_bias") {
             continue;
         }
@@ -212,7 +214,8 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
     // Also prime transposed FP4 cache for backward pass (matmul_backward dgrad)
     if (mBackward) {
         for (const auto& op : mBackward->operations) {
-            const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+            const std::string& op_type =
+                (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
             if (op_type != "matmul_backward") {
                 continue;
             }
@@ -427,7 +430,8 @@ void GraphExecutor::build_layer_weight_map() {
 
     // Scan forward graph for matmul operations and map weight names to layers
     for (const auto& op : mForward->operations) {
-        const std::string& op_type = op.kernel_type.empty() ? op.name : op.kernel_type;
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul" && op_type != "matmul_bias") {
             continue;
         }

@@ -489,6 +489,90 @@ void fused_classifier(Tensor& logits, Tensor& losses,
     }
 }
 
+void fused_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                 const Tensor& targets, Tensor* valid_token_count,
+                                 Tensor* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream) {
+    float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
+    int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
+    if (logits.DType == ETensorDType::FP32) {
+        fused_cross_entropy_forward(logits.get<float>(), losses.get<float>(), lse_ptr,
+                                    targets.get<int>(), count_ptr, correct_ptr,
+                                    BT, V, P, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        fused_cross_entropy_forward(logits.get<nv_bfloat16>(), losses.get<float>(), lse_ptr,
+                                    targets.get<int>(), count_ptr, correct_ptr,
+                                    BT, V, P, stream);
+    } else {
+        throw std::runtime_error("fused_cross_entropy_forward: unsupported dtype");
+    }
+}
+
+void fused_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                  const Tensor& dloss, const Tensor& targets,
+                                  int BT, int V, int P, cudaStream_t stream) {
+    const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    const float* dloss_ptr = dloss.get<float>();
+    if (dlogits.DType == ETensorDType::FP32) {
+        fused_cross_entropy_backward(dlogits.get<float>(), logits.get<float>(), lse_ptr,
+                                     dloss_ptr, targets.get<int>(),
+                                     BT, V, P, stream);
+    } else if (dlogits.DType == ETensorDType::BF16) {
+        fused_cross_entropy_backward(dlogits.get<nv_bfloat16>(), logits.get<nv_bfloat16>(), lse_ptr,
+                                     dloss_ptr, targets.get<int>(),
+                                     BT, V, P, stream);
+    } else {
+        throw std::runtime_error("fused_cross_entropy_backward: unsupported dtype");
+    }
+}
+
+void chunked_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                   Tensor& chunk_logsumexp, const Tensor& targets,
+                                   Tensor* valid_token_count, Tensor* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+    float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    if (!lse_ptr) {
+        throw std::runtime_error("chunked_cross_entropy_forward: logsumexp buffer is required");
+    }
+    int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
+    int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
+    if (logits.DType == ETensorDType::FP32) {
+        chunked_cross_entropy_forward(logits.get<float>(), losses.get<float>(), lse_ptr,
+                                      chunk_logsumexp.get<float>(), targets.get<int>(),
+                                      count_ptr, correct_ptr,
+                                      BT, V, P, n_chunks, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        chunked_cross_entropy_forward(logits.get<nv_bfloat16>(), losses.get<float>(), lse_ptr,
+                                      chunk_logsumexp.get<float>(), targets.get<int>(),
+                                      count_ptr, correct_ptr,
+                                      BT, V, P, n_chunks, stream);
+    } else {
+        throw std::runtime_error("chunked_cross_entropy_forward: unsupported dtype");
+    }
+}
+
+void chunked_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                    const Tensor& dloss, const Tensor& targets,
+                                    int BT, int V, int P, cudaStream_t stream) {
+    const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    if (!lse_ptr) {
+        throw std::runtime_error("chunked_cross_entropy_backward: logsumexp buffer is required");
+    }
+    const float* dloss_ptr = dloss.get<float>();
+    if (dlogits.DType == ETensorDType::FP32) {
+        chunked_cross_entropy_backward(dlogits.get<float>(), logits.get<float>(), lse_ptr,
+                                       dloss_ptr, targets.get<int>(),
+                                       BT, V, P, stream);
+    } else if (dlogits.DType == ETensorDType::BF16) {
+        chunked_cross_entropy_backward(dlogits.get<nv_bfloat16>(), logits.get<nv_bfloat16>(), lse_ptr,
+                                       dloss_ptr, targets.get<int>(),
+                                       BT, V, P, stream);
+    } else {
+        throw std::runtime_error("chunked_cross_entropy_backward: unsupported dtype");
+    }
+}
+
 /**
  * @brief Performs the forward pass of the encoder layer (embedding lookup + positional encoding).
  *

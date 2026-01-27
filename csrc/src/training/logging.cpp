@@ -697,7 +697,7 @@ namespace {
 /**
  * @brief Print detailed memory breakdown for raining optimization.
  *
- * Analyzes memory usage by category and compares against Unsloth's baseline.
+ * Analyzes memory usage by category
  */
 void print_memory_breakdown(
     const MemoryBreakdownContext& ctx,

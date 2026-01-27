@@ -335,6 +335,52 @@ void fused_classifier(Tensor& logits, Tensor& losses,
                       Tensor* correct_count,
                       int BT, int V, int P, bool write_dlogits, cudaStream_t stream);
 
+constexpr int CROSS_ENTROPY_MAX_FUSED_SIZE = 65536;
+constexpr int CROSS_ENTROPY_BACKWARD_CHUNK_SIZE = 4096;
+
+void fused_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
+                                 const int* targets, int* valid_token_count,
+                                 int* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
+                                 const int* targets, int* valid_token_count,
+                                 int* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
+                                  const float* dloss, const int* targets,
+                                  int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
+                                  const float* dloss, const int* targets,
+                                  int BT, int V, int P, cudaStream_t stream);
+void chunked_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
+                                   float* chunk_logsumexp, const int* targets,
+                                   int* valid_token_count, int* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream);
+void chunked_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
+                                   float* chunk_logsumexp, const int* targets,
+                                   int* valid_token_count, int* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream);
+void chunked_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
+                                    const float* dloss, const int* targets,
+                                    int BT, int V, int P, cudaStream_t stream);
+void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
+                                    const float* dloss, const int* targets,
+                                    int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                 const Tensor& targets, Tensor* valid_token_count,
+                                 Tensor* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                  const Tensor& dloss, const Tensor& targets,
+                                  int BT, int V, int P, cudaStream_t stream);
+void chunked_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                   Tensor& chunk_logsumexp, const Tensor& targets,
+                                   Tensor* valid_token_count, Tensor* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream);
+void chunked_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                    const Tensor& dloss, const Tensor& targets,
+                                    int BT, int V, int P, cudaStream_t stream);
+
 int get_max_num_block_sums(const cudaDeviceProp& dp);
 void global_norm_squared(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
 void global_norm_squared(float* out, const nv_bfloat16* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);

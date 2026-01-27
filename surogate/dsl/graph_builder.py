@@ -368,6 +368,29 @@ class GraphBuilder:
         ))
         return self._make_outputs([out, up_out])
 
+    def fused_lm_head_loss(
+        self,
+        xF_flat: str | GraphRef,
+        weight: str | GraphRef,
+        targets: str | GraphRef,
+        *,
+        compute_accuracy: bool = False,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Fused LM head matmul + cross-entropy loss."""
+        out = out_name if out_name else self._fresh_name("loss")
+        self._add_node(GraphNode(
+            op="fused_lm_head_loss",
+            inputs=[
+                self._resolve_input(xF_flat),
+                self._resolve_input(weight),
+                self._resolve_input(targets),
+            ],
+            outputs=[out],
+            attrs={"compute_accuracy": compute_accuracy},
+        ))
+        return self._make_output(out)
+
     # =========================================================================
     # Attention
     # =========================================================================

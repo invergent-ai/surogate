@@ -728,6 +728,41 @@ std::vector<Operation> stacked_blocks_backward(const BackwardRuleContext& ctx) {
     return ops;
 }
 
+// -----------------------------------------------------------------------------
+// Fused LMHead + loss backward
+// Forward: loss = fused_lm_head_loss(xF_flat, weight, targets)
+// Backward: d_xF_flat, d_weight = fused_lm_head_loss_backward(d_loss, xF_flat, weight, targets)
+// -----------------------------------------------------------------------------
+std::vector<Operation> fused_lm_head_loss_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (!ctx.needs_grad(0) && !ctx.needs_grad(1)) {
+        return ops;
+    }
+
+    const auto& fwd = ctx.fwd_op;
+    const std::string& xF_flat = fwd.inputs[0];
+    const std::string& weight = fwd.inputs[1];
+    const std::string& targets = fwd.inputs[2];
+
+    std::string xF_ref = ctx.is_param(xF_flat) ? xF_flat : saved_ref(xF_flat);
+    std::string weight_ref = ctx.is_param(weight) ? weight : saved_ref(weight);
+
+    std::vector<std::string> inputs = {ctx.d_output, xF_ref, weight_ref, targets};
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+
+    ops.push_back(make_operation(
+        "fused_lm_head_loss_backward_" + std::to_string(ctx.op_counter++),
+        "fused_lm_head_loss_backward",
+        "fused_lm_head_loss_backward",
+        inputs,
+        outputs));
+
+    return ops;
+}
+
 } // anonymous namespace
 
 // -----------------------------------------------------------------------------
@@ -776,6 +811,8 @@ void register_builtin_backward_rules() {
     // Loss
     reg.register_rule("cross_entropy", cross_entropy_backward);
     reg.register_rule("cross_entropy_loss", cross_entropy_backward);
+    reg.register_rule("fused_lm_head_loss", fused_lm_head_loss_backward);
+    reg.register_rule("lm_head_loss", fused_lm_head_loss_backward);
 
     // Compound ops (handled as units)
     reg.register_rule("StackedBlocks", stacked_blocks_backward);

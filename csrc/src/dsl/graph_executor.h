@@ -219,8 +219,6 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
 
-    void run_classifier(long B, long T, NCCLCommunicator& comm, int grad_accum_steps, int micro_step, bool compute_accuracy);
-
     unsigned int next_rng_seed();
 
     void prime_fp8_weight_cache(const std::vector<char>& required);
@@ -244,6 +242,7 @@ private:
     int mPrefetchedLayer = -1;
     cudaEvent_t mPrefetchEvent = nullptr;
     bool mPrefetchEnabled = false;
+    bool mHasLossOp = false;
 
     // Pre-computed layer boundaries for predictable prefetch
     struct LayerBoundary {
