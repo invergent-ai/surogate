@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,7 @@
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
+#include "utilities/tensor.h"
 #include "utilities/utils.h"
 
 namespace fs = std::filesystem;
@@ -225,6 +227,70 @@ std::vector<double> read_tensor_as_double(const Tensor& t) {
     }
 
     throw std::runtime_error("read_tensor_as_double: unsupported dtype");
+}
+
+std::vector<float> compute_logsumexp_from_logits(const GoldenTensor& logits) {
+    if (logits.shape.size() != 2) {
+        throw std::runtime_error("logits must be rank-2 for logsumexp");
+    }
+    const long BT = logits.shape[0];
+    const long V = logits.shape[1];
+    if (logits.f64.size() != static_cast<std::size_t>(BT * V)) {
+        throw std::runtime_error("logits data size mismatch for logsumexp");
+    }
+    std::vector<float> out(static_cast<std::size_t>(BT), 0.0f);
+    for (long i = 0; i < BT; ++i) {
+        double max_val = -std::numeric_limits<double>::infinity();
+        const std::size_t row_off = static_cast<std::size_t>(i * V);
+        for (long j = 0; j < V; ++j) {
+            max_val = std::max(max_val, logits.f64[row_off + static_cast<std::size_t>(j)]);
+        }
+        double sum = 0.0;
+        for (long j = 0; j < V; ++j) {
+            sum += std::exp(logits.f64[row_off + static_cast<std::size_t>(j)] - max_val);
+        }
+        out[static_cast<std::size_t>(i)] = static_cast<float>(max_val + std::log(sum));
+    }
+    return out;
+}
+
+std::vector<float> compute_logsumexp_from_xf_weight(const GoldenTensor& xF_flat,
+                                                    const GoldenTensor& weight) {
+    if (xF_flat.shape.size() != 2 || weight.shape.size() != 2) {
+        throw std::runtime_error("xF_flat and weight must be rank-2 for logsumexp");
+    }
+    const long BT = xF_flat.shape[0];
+    const long C = xF_flat.shape[1];
+    const long V = weight.shape[0];
+    if (weight.shape[1] != C) {
+        throw std::runtime_error("weight shape mismatch for logsumexp");
+    }
+    if (xF_flat.f64.size() != static_cast<std::size_t>(BT * C) ||
+        weight.f64.size() != static_cast<std::size_t>(V * C)) {
+        throw std::runtime_error("xF_flat/weight data size mismatch for logsumexp");
+    }
+    std::vector<float> out(static_cast<std::size_t>(BT), 0.0f);
+    for (long i = 0; i < BT; ++i) {
+        double max_val = -std::numeric_limits<double>::infinity();
+        std::vector<double> logits_row(static_cast<std::size_t>(V));
+        for (long v = 0; v < V; ++v) {
+            double acc = 0.0;
+            const std::size_t w_off = static_cast<std::size_t>(v * C);
+            const std::size_t x_off = static_cast<std::size_t>(i * C);
+            for (long c = 0; c < C; ++c) {
+                acc += xF_flat.f64[x_off + static_cast<std::size_t>(c)] *
+                       weight.f64[w_off + static_cast<std::size_t>(c)];
+            }
+            logits_row[static_cast<std::size_t>(v)] = acc;
+            max_val = std::max(max_val, acc);
+        }
+        double sum = 0.0;
+        for (long v = 0; v < V; ++v) {
+            sum += std::exp(logits_row[static_cast<std::size_t>(v)] - max_val);
+        }
+        out[static_cast<std::size_t>(i)] = static_cast<float>(max_val + std::log(sum));
+    }
+    return out;
 }
 
 void copy_int32_to_host(Tensor& dst, const GoldenTensor& src) {
@@ -436,6 +502,14 @@ std::pair<long, long> infer_B_T(const GoldenCase& gc) {
         }
     }
 
+    // Generic fallback: use first 2D+ input tensor if available.
+    for (const auto& kv : gc.inputs) {
+        const auto& shape = kv.second.shape;
+        if (shape.size() >= 2) {
+            return {shape[0], shape[1]};
+        }
+    }
+
     // Fallback
     return {1, 1};
 }
@@ -472,6 +546,29 @@ PretrainedConfig build_config(const GoldenCase& gc, long B, long T) {
     if (auto v = meta_long(gc.meta, "head_dim")) {
         cfg.HeadDim = static_cast<int>(*v);
     }
+    if (cfg.HeadDim <= 0) {
+        if (auto it = gc.inputs.find("qkv"); it != gc.inputs.end() && !it->second.shape.empty()) {
+            const long last_dim = it->second.shape.back();
+            const long denom = static_cast<long>(cfg.NumQueryHeads) + 2L * static_cast<long>(cfg.NumKeyValHeads);
+            if (denom > 0 && last_dim % denom == 0) {
+                cfg.HeadDim = static_cast<int>(last_dim / denom);
+            }
+        }
+    }
+    if (cfg.HeadDim <= 0) {
+        if (auto it = gc.inputs.find("d_out"); it != gc.inputs.end() && it->second.shape.size() >= 4) {
+            cfg.NumQueryHeads = cfg.NumQueryHeads > 0 ? cfg.NumQueryHeads : static_cast<int>(it->second.shape[2]);
+            cfg.HeadDim = static_cast<int>(it->second.shape.back());
+        }
+    }
+    if (cfg.HeadDim <= 0) {
+        if (auto it = gc.outputs.find("out"); it != gc.outputs.end() && !it->second.shape.empty()) {
+            const long last_dim = it->second.shape.back();
+            if (cfg.NumQueryHeads > 0 && last_dim % cfg.NumQueryHeads == 0) {
+                cfg.HeadDim = static_cast<int>(last_dim / cfg.NumQueryHeads);
+            }
+        }
+    }
 
     if (auto v = meta_long(gc.meta, "C")) {
         cfg.HiddenSize = static_cast<int>(*v);
@@ -481,6 +578,13 @@ PretrainedConfig build_config(const GoldenCase& gc, long B, long T) {
         cfg.HiddenSize = static_cast<int>(*v);
     } else if (cfg.HeadDim > 0 && cfg.NumQueryHeads > 0) {
         cfg.HiddenSize = cfg.HeadDim * cfg.NumQueryHeads;
+    }
+    if (cfg.HiddenSize <= 1) {
+        if (auto it = gc.inputs.find("xF_flat"); it != gc.inputs.end() && it->second.shape.size() >= 2) {
+            cfg.HiddenSize = static_cast<int>(it->second.shape[1]);
+        } else if (auto it = gc.inputs.find("xF"); it != gc.inputs.end() && !it->second.shape.empty()) {
+            cfg.HiddenSize = static_cast<int>(it->second.shape.back());
+        }
     }
 
     bool set_intermediate = false;
@@ -618,6 +722,13 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
             std::unordered_map<std::string, GoldenTensor> param_inputs;
 
             auto input_from_json = [&](const std::string& name) -> const GoldenTensor& {
+                if (gc.op == "swiglu_backward" && name == "inp") {
+                    auto it = gc.inputs.find("mlp_up");
+                    if (it == gc.inputs.end()) {
+                        throw std::runtime_error("swiglu_backward golden missing mlp_up");
+                    }
+                    return it->second;
+                }
                 if (gc.op == "embedding" && name == "embedding") {
                     auto it = gc.inputs.find("weight");
                     if (it == gc.inputs.end()) {
@@ -664,7 +775,7 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
 
             // Build operation
             dsl::Operation op;
-            op.id = gc.op + \"_\" + gc.case_id;
+            op.id = gc.op + "_" + gc.case_id;
             op.name = gc.op;
             op.kernel_type = gc.op;
             op.inputs = spec.inputs;
@@ -717,6 +828,30 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                 copy_tensor_to_device(run_state.scratch().cross_entropy_dloss, it->second);
             }
 
+            // If backward loss op runs without a prior forward, populate logsumexp.
+            if (run_state.scratch().cross_entropy_logsumexp.Data) {
+                if (gc.op == "cross_entropy_backward") {
+                    auto it = gc.inputs.find("logits");
+                    if (it == gc.inputs.end()) {
+                        throw std::runtime_error("cross_entropy_backward missing logits input");
+                    }
+                    const auto lse = compute_logsumexp_from_logits(it->second);
+                    CUDA_CHECK(cudaMemcpy(run_state.scratch().cross_entropy_logsumexp.Data,
+                                          lse.data(), lse.size() * sizeof(float),
+                                          cudaMemcpyHostToDevice));
+                } else if (gc.op == "fused_lm_head_loss_backward") {
+                    auto it_x = gc.inputs.find("xF_flat");
+                    auto it_w = gc.inputs.find("weight");
+                    if (it_x == gc.inputs.end() || it_w == gc.inputs.end()) {
+                        throw std::runtime_error("fused_lm_head_loss_backward missing xF_flat/weight input");
+                    }
+                    const auto lse = compute_logsumexp_from_xf_weight(it_x->second, it_w->second);
+                    CUDA_CHECK(cudaMemcpy(run_state.scratch().cross_entropy_logsumexp.Data,
+                                          lse.data(), lse.size() * sizeof(float),
+                                          cudaMemcpyHostToDevice));
+                }
+            }
+
             dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
             auto compiled = compiler.compile(graph, B, T);
 
@@ -727,9 +862,32 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                 exec.set_last_inputs_cpu(&run_state.Inputs_CPU);
             }
 
+            if (gc.op == "fused_residual_rmsnorm_backward") {
+                const auto& op0 = compiled.ops.at(0);
+                INFO("compiled inputs for " << op0.op_id);
+                for (std::size_t i = 0; i < op0.inputs.size(); ++i) {
+                    const auto& ref = op0.inputs[i];
+                    INFO("  in[" << i << "] name=" << ref.name
+                                 << " dtype=" << dtype_to_str(ref.dtype)
+                                 << " slot=" << static_cast<int>(ref.slot));
+                }
+                INFO("compiled outputs for " << op0.op_id);
+                for (std::size_t i = 0; i < op0.outputs.size(); ++i) {
+                    const auto& ref = op0.outputs[i];
+                    INFO("  out[" << i << "] name=" << ref.name
+                                  << " dtype=" << dtype_to_str(ref.dtype)
+                                  << " slot=" << static_cast<int>(ref.slot));
+                }
+            }
+
             if (is_backward_op(gc.op)) {
                 exec.execute_backward(compiled, comm, 1, 0, nullptr);
             } else {
+                if (gc.op == "cross_entropy_loss" || gc.op == "fused_lm_head_loss") {
+                    fill_zero(run_state.Losses, run_state.MainStream);
+                    fill_zero(run_state.ValidTokenCount, run_state.MainStream);
+                    fill_zero(run_state.CorrectCount, run_state.MainStream);
+                }
                 exec.execute_forward(compiled, comm, true, nullptr);
             }
 
@@ -744,7 +902,7 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                 const auto& expected = exp_it->second;
 
                 if (is_special_output_name(name)) {
-                    Tensor loss_view = view_tensor(run_state.Losses, expected.shape);
+                    Tensor loss_view = dsl::view_tensor(run_state.Losses, expected.shape);
                     expect_allclose(name, expected, loss_view, rtol, atol);
                     continue;
                 }

@@ -328,22 +328,12 @@ def _flash_attention_backward_ref(qkv: np.ndarray, d_out: np.ndarray, B: int, T:
 # -----------------------------------------------------------------------------
 
 def gen_matmul_swiglu() -> List[GoldenCase]:
-    # Small deterministic case with negative/positive values
-    B, T, K, D = 1, 2, 3, 2
+    # swiglu_forward kernel requires (B*T*D) to be a multiple of 1024 for FP32.
+    B, T, K, D = 2, 2, 3, 256
     M, N = B * T, 2 * D
 
-    A = np.array(
-        [[1.0, 2.0, -1.0],
-         [0.5, -1.0, 3.0]],
-        dtype=np.float64,
-    )  # (M,K)
-
-    W = np.array(
-        [[1.0, 0.0, 2.0, -1.0],
-         [0.0, 1.0, -1.0, 0.5],
-         [1.0, 1.0, 0.0, 2.0]],
-        dtype=np.float64,
-    )  # (K,N)
+    A = (np.arange(M * K, dtype=np.float64).reshape(M, K) * 0.1) - 0.2  # (M,K)
+    W = ((np.arange(K * N, dtype=np.float64).reshape(K, N) % 17) - 8.0) * 0.01  # (K,N)
 
     # Forward
     up = A @ W  # (M,N)
@@ -354,7 +344,7 @@ def gen_matmul_swiglu() -> List[GoldenCase]:
     out = x1 * x2 * sig  # (B,T,D)
 
     # Backward: pick a fixed upstream gradient
-    DOUT = np.array([[[1.0, -0.5], [0.25, 2.0]]], dtype=np.float64)
+    DOUT = (np.arange(B * T * D, dtype=np.float64).reshape(B, T, D) * 0.01) - 0.5
     dx1 = DOUT * x2 * sig
     dx2 = DOUT * x1 * sig * (1.0 + x2 * (1.0 - sig))
     d_up = np.concatenate([dx1, dx2], axis=-1)  # (B,T,N)
@@ -376,7 +366,7 @@ def gen_matmul_swiglu() -> List[GoldenCase]:
         },
         "outputs": {
             "out": _tensor_payload(out),
-            "up_out": _tensor_payload(up_3d),
+            "up_out": _tensor_payload(up),
         },
         "grads": {
             "d_out": _tensor_payload(DOUT),
@@ -400,12 +390,12 @@ def gen_embedding() -> List[GoldenCase]:
     # Small deterministic embedding lookup
     token_ids = np.array([[0, 1, 3], [2, 1, 0]], dtype=np.int32)
     vocab_size = 4
-    hidden = 3
+    hidden = 4
     weight = np.array(
-        [[0.1, -0.2, 0.3],
-         [0.0, 0.5, -0.5],
-         [1.0, -1.0, 2.0],
-         [-0.75, 0.25, 0.5]],
+        [[0.1, -0.2, 0.3, 0.4],
+         [0.0, 0.5, -0.5, -0.25],
+         [1.0, -1.0, 2.0, 0.75],
+         [-0.75, 0.25, 0.5, -1.25]],
         dtype=np.float64,
     )
     out = weight[token_ids]
@@ -605,12 +595,12 @@ def gen_flash_attention() -> List[GoldenCase]:
 
 def gen_cross_entropy_loss() -> List[GoldenCase]:
     logits = np.array(
-        [[1.0, -0.5, 0.25, 2.0, -1.0],
-         [0.5, 1.5, -0.25, -1.0, 0.75],
-         [-0.5, 0.25, 1.0, -0.75, 1.5]],
+        [[1.0, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25],
+         [0.5, 1.5, -0.25, -1.0, 0.75, -0.5, 1.0, -1.25],
+         [-0.5, 0.25, 1.0, -0.75, 1.5, -1.0, 0.5, 0.25]],
         dtype=np.float64,
     )
-    targets = np.array([3, 1, 4], dtype=np.int32)
+    targets = np.array([3, 1, 6], dtype=np.int32)
 
     losses = []
     for i in range(logits.shape[0]):
@@ -720,12 +710,12 @@ def gen_flash_attention_backward() -> List[GoldenCase]:
 
 def gen_cross_entropy_backward() -> List[GoldenCase]:
     logits = np.array(
-        [[1.0, -0.5, 0.25, 2.0, -1.0],
-         [0.5, 1.5, -0.25, -1.0, 0.75],
-         [-0.5, 0.25, 1.0, -0.75, 1.5]],
+        [[1.0, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25],
+         [0.5, 1.5, -0.25, -1.0, 0.75, -0.5, 1.0, -1.25],
+         [-0.5, 0.25, 1.0, -0.75, 1.5, -1.0, 0.5, 0.25]],
         dtype=np.float64,
     )
-    targets = np.array([3, 1, 4], dtype=np.int32)
+    targets = np.array([3, 1, 6], dtype=np.int32)
     BT = logits.shape[0]
     d_loss = np.ones((BT,), dtype=np.float64) / BT
 
@@ -1012,8 +1002,8 @@ def gen_view_backward() -> List[GoldenCase]:
 
 def gen_bias_add_backward() -> List[GoldenCase]:
     d_out = np.array(
-        [[[1.0, -0.5, 2.0],
-          [0.25, 3.0, -1.5]]],
+        [[[1.0, -0.5, 2.0, 0.75],
+          [0.25, 3.0, -1.5, -2.0]]],
         dtype=np.float64,
     )
     d_x = d_out.copy()
@@ -1069,21 +1059,14 @@ def gen_matmul_backward() -> List[GoldenCase]:
 
 
 def gen_swiglu_backward() -> List[GoldenCase]:
-    B, T, C = 1, 2, 2
-    inp = np.array(
-        [[[1.0, -2.0, 0.5, 1.5],
-          [0.25, 3.0, -1.5, 2.0]]],
-        dtype=np.float64,
-    )  # (B,T,2C)
+    # swiglu_backward kernel requires (B*T*C) to be a multiple of 1024 for FP32.
+    B, T, C = 2, 2, 256
+    inp = (np.arange(B * T * 2 * C, dtype=np.float64).reshape(B, T, 2 * C) * 0.01) - 0.5
     up = inp[..., :C]
     gate = inp[..., C:]
     sig = 1.0 / (1.0 + np.exp(-gate))
 
-    d_out = np.array(
-        [[[1.0, -0.5],
-          [0.25, 2.0]]],
-        dtype=np.float64,
-    )
+    d_out = (np.arange(B * T * C, dtype=np.float64).reshape(B, T, C) * 0.01) - 0.5
     dx1 = d_out * gate * sig
     dx2 = d_out * up * sig * (1.0 + gate * (1.0 - sig))
     d_inp = np.concatenate([dx1, dx2], axis=-1)
@@ -1107,29 +1090,19 @@ def gen_swiglu_backward() -> List[GoldenCase]:
 
 
 def gen_matmul_swiglu_backward() -> List[GoldenCase]:
-    B, T, K, D = 1, 2, 3, 2
+    # swiglu_backward kernel requires (B*T*D) to be a multiple of 1024 for FP32.
+    B, T, K, D = 2, 2, 3, 256
     M, N = B * T, 2 * D
 
-    ln2 = np.array(
-        [[1.0, 2.0, -1.0],
-         [0.5, -1.0, 3.0]],
-        dtype=np.float64,
-    )  # (M,K)
-
-    weight = np.array(
-        [[1.0, 0.0, 2.0, -1.0],
-         [0.0, 1.0, -1.0, 0.5],
-         [1.0, 1.0, 0.0, 2.0]],
-        dtype=np.float64,
-    )  # (K,N)
+    ln2 = (np.arange(M * K, dtype=np.float64).reshape(M, K) * 0.1) - 0.2  # (M,K)
+    weight = ((np.arange(K * N, dtype=np.float64).reshape(K, N) % 17) - 8.0) * 0.01  # (K,N)
 
     mlp_up = (ln2 @ weight).reshape(B, T, N)
     up = mlp_up[..., :D]
     gate = mlp_up[..., D:]
     sig = 1.0 / (1.0 + np.exp(-gate))
 
-    d_out = np.array([[[1.0, -0.5],
-                       [0.25, 2.0]]], dtype=np.float64)
+    d_out = (np.arange(B * T * D, dtype=np.float64).reshape(B, T, D) * 0.01) - 0.5
     dx1 = d_out * gate * sig
     dx2 = d_out * up * sig * (1.0 + gate * (1.0 - sig))
     d_mlp_up = np.concatenate([dx1, dx2], axis=-1).reshape(M, N)
@@ -1165,12 +1138,12 @@ def gen_matmul_swiglu_backward() -> List[GoldenCase]:
 def gen_embedding_backward() -> List[GoldenCase]:
     token_ids = np.array([[0, 1, 3], [2, 1, 0]], dtype=np.int32)
     d_out = np.array(
-        [[[0.1, -0.2, 0.3],
-          [0.0, 0.5, -0.5],
-          [1.0, -1.0, 2.0]],
-         [[-0.75, 0.25, 0.5],
-          [0.2, -0.1, 0.4],
-          [0.05, 0.15, -0.25]]],
+        [[[0.1, -0.2, 0.3, 0.4],
+          [0.0, 0.5, -0.5, 0.25],
+          [1.0, -1.0, 2.0, -0.75]],
+         [[-0.75, 0.25, 0.5, -1.25],
+          [0.2, -0.1, 0.4, 0.6],
+          [0.05, 0.15, -0.25, -0.35]]],
         dtype=np.float64,
     )
     vocab_size = 4
@@ -1312,16 +1285,16 @@ def gen_zeros() -> List[GoldenCase]:
 def gen_bias_add() -> List[GoldenCase]:
     # x shape (B,T,C), bias shape (C)
     x = np.array(
-        [[[1.0, -2.0, 0.5],
-          [0.25, 3.0, -1.5]]],
+        [[[1.0, -2.0, 0.5, 1.25],
+          [0.25, 3.0, -1.5, -0.75]]],
         dtype=np.float64,
     )
-    bias = np.array([0.5, -1.0, 2.0], dtype=np.float64)
+    bias = np.array([0.5, -1.0, 2.0, -0.25], dtype=np.float64)
     out = x + bias
 
     d_out = np.array(
-        [[[1.0, -0.5, 2.0],
-          [0.25, 3.0, -1.5]]],
+        [[[1.0, -0.5, 2.0, 0.75],
+          [0.25, 3.0, -1.5, -2.0]]],
         dtype=np.float64,
     )
     d_x = d_out.copy()
@@ -1459,22 +1432,15 @@ def gen_matmul_bias() -> List[GoldenCase]:
 
 
 def gen_swiglu() -> List[GoldenCase]:
-    B, T, C = 1, 2, 2
-    inp = np.array(
-        [[[1.0, -2.0, 0.5, 1.5],
-          [0.25, 3.0, -1.5, 2.0]]],
-        dtype=np.float64,
-    )  # (B,T,2C)
+    # swiglu_forward kernel requires (B*T*C) to be a multiple of 1024 for FP32.
+    B, T, C = 2, 2, 256
+    inp = (np.arange(B * T * 2 * C, dtype=np.float64).reshape(B, T, 2 * C) * 0.01) - 0.5
     up = inp[..., :C]
     gate = inp[..., C:]
     sig = 1.0 / (1.0 + np.exp(-gate))
     out = up * gate * sig
 
-    d_out = np.array(
-        [[[1.0, -0.5],
-          [0.25, 2.0]]],
-        dtype=np.float64,
-    )
+    d_out = (np.arange(B * T * C, dtype=np.float64).reshape(B, T, C) * 0.01) - 0.5
     dx1 = d_out * gate * sig
     dx2 = d_out * up * sig * (1.0 + gate * (1.0 - sig))
     d_inp = np.concatenate([dx1, dx2], axis=-1)

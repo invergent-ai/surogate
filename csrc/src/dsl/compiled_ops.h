@@ -278,6 +278,7 @@ private:
     long mT = 0;
     std::unordered_map<std::string, std::vector<long>> mExtraShapes;
     std::unordered_map<std::string, TensorShape> mTensorShapes;
+    std::unordered_map<std::string, ETensorDType> mTensorDtypes;
 };
 
 // ============================================================================
@@ -333,8 +334,14 @@ public:
     // RNG seed for embedding backward
     void set_rng_seed_fn(std::function<unsigned int()> fn);
 
+    // Set embedding output names from forward graph (for binding d_embed_N to d_embeddings)
+    void set_embedding_outputs(const std::vector<std::string>& names) { mEmbeddingOutputs = names; }
+
     // Set batch/sequence dimensions before execution
     void set_dimensions(long B, long T) { mB = B; mT = T; }
+
+    // Expose mapped tensors for test/debug (returns nullptr if not found).
+    const Tensor* try_get_tensor(const std::string& name) const;
 
     // Save specified tensors to the saved map (for backward use)
     void save_tensors(const std::vector<std::string>& save_list);
@@ -414,6 +421,7 @@ private:
     // For embedding backward
     const Tensor* mLastInputsCpu = nullptr;
     std::function<unsigned int()> mRngSeedFn;
+    std::vector<std::string> mEmbeddingOutputs;  // Forward graph embedding output names
 
     // Execution state
     long mB = 0;
