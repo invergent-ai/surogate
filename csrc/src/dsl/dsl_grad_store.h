@@ -40,7 +40,10 @@ struct DslGradStoreConfig {
 class DslGradStore {
 public:
     DslGradStore(const DslParamStore& params,
-                 const std::shared_ptr<TensorAllocator>& allocator);
+                 const std::shared_ptr<TensorAllocator>& allocator,
+                 bool offload_grads = false,
+                 EAllocationType offload_alloc = EAllocationType::PINNED,
+                 int num_shards = 1);
 
     /// Configure multi-GPU gradient reduction
     void configure(const DslGradStoreConfig& config);

@@ -559,6 +559,20 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             logger.warning(
                 "offload_optimizer is enabled but use_zero_copy is false; "
                 "optimizer state will remain on device. Set use_zero_copy=true to offload.")
+        if self.offload_grads and self.use_dsl_ir:
+            num_shards = None
+            if self.distributed:
+                gpus_per_node = self.distributed.gpus_per_node or self.gpus
+                if gpus_per_node and gpus_per_node > 0:
+                    num_shards = self.distributed.num_nodes * gpus_per_node
+            elif self.gpus and self.gpus > 0:
+                num_shards = self.gpus
+            if num_shards and num_shards > 1:
+                logger.warning(
+                    "offload_grads is enabled with num_shards=%d; "
+                    "true ZeRO-2 sharded/offloaded grads for DSL is not implemented yet.",
+                    num_shards,
+                )
 
         self.create_runtime_config()
         self.create_lora_config()

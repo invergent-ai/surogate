@@ -552,7 +552,10 @@ DslModel::DslModel(const PretrainedConfig& config,
                                               lora_config ? &*lora_config : nullptr,
                                               external_params.empty() ? nullptr : &external_params,
                                               use_weight_manager);
-    mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator);
+    mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator,
+                                            options.OffloadGrads,
+                                            options.offload_alloc(),
+                                            mNumShards);
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {

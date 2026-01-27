@@ -16,11 +16,17 @@
 namespace dsl {
 
 DslGradStore::DslGradStore(const DslParamStore& params,
-                           const std::shared_ptr<TensorAllocator>& allocator)
+                           const std::shared_ptr<TensorAllocator>& allocator,
+                           bool offload_grads,
+                           EAllocationType offload_alloc,
+                           int num_shards)
     : mAllocator(allocator) {
     if (!mAllocator) {
         throw std::runtime_error("DslGradStore: allocator is null");
     }
+
+    const bool allow_offload = offload_grads && num_shards == 1;
+    const EAllocationType grad_alloc = allow_offload ? offload_alloc : EAllocationType::ON_DEVICE;
 
     for (const auto& name : params.param_names()) {
         if (!params.is_trainable(name)) {
@@ -28,7 +34,7 @@ DslGradStore::DslGradStore(const DslParamStore& params,
         }
         const Tensor& weight = params.template_tensor(name);
         std::vector<long> shape(weight.Sizes.begin(), weight.Sizes.begin() + weight.Rank);
-        Tensor grad = mAllocator->allocate(weight.DType, ("d_" + name).c_str(), EAllocationType::ON_DEVICE, shape);
+        Tensor grad = mAllocator->allocate(weight.DType, ("d_" + name).c_str(), grad_alloc, shape);
         mGrads.emplace(name, grad);
         mParamOrder.push_back(name);
     }
