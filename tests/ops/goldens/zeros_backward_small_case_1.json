@@ -1,0 +1,10 @@
+{
+  "attrs": {},
+  "case": "small_case_1",
+  "inputs": {},
+  "meta": {
+    "note": "Zeros backward is a no-op."
+  },
+  "op": "zeros_backward",
+  "outputs": {}
+}

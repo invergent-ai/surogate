@@ -1,0 +1,57 @@
+{
+  "attrs": {},
+  "case": "small_case_1",
+  "inputs": {
+    "d_out": {
+      "data": [
+        1.0,
+        -0.5,
+        2.0,
+        0.25,
+        3.0,
+        -1.5
+      ],
+      "dtype": "fp64",
+      "shape": [
+        2,
+        3
+      ]
+    }
+  },
+  "meta": {
+    "note": "Add backward passes gradient to both inputs unchanged."
+  },
+  "op": "add_backward",
+  "outputs": {
+    "d_a": {
+      "data": [
+        1.0,
+        -0.5,
+        2.0,
+        0.25,
+        3.0,
+        -1.5
+      ],
+      "dtype": "fp64",
+      "shape": [
+        2,
+        3
+      ]
+    },
+    "d_b": {
+      "data": [
+        1.0,
+        -0.5,
+        2.0,
+        0.25,
+        3.0,
+        -1.5
+      ],
+      "dtype": "fp64",
+      "shape": [
+        2,
+        3
+      ]
+    }
+  }
+}

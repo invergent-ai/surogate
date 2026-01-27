@@ -1,0 +1,61 @@
+{
+  "attrs": {
+    "shape": [
+      2,
+      3,
+      2
+    ]
+  },
+  "case": "small_case_1",
+  "inputs": {
+    "d_out": {
+      "data": [
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        0.5,
+        0.25,
+        -0.5,
+        1.5,
+        3.0,
+        -3.0,
+        4.0,
+        -4.0
+      ],
+      "dtype": "fp64",
+      "shape": [
+        3,
+        4
+      ]
+    }
+  },
+  "meta": {
+    "note": "View backward reshapes gradient to input shape."
+  },
+  "op": "view_backward",
+  "outputs": {
+    "d_inp": {
+      "data": [
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        0.5,
+        0.25,
+        -0.5,
+        1.5,
+        3.0,
+        -3.0,
+        4.0,
+        -4.0
+      ],
+      "dtype": "fp64",
+      "shape": [
+        2,
+        3,
+        2
+      ]
+    }
+  }
+}

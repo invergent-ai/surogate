@@ -1,0 +1,55 @@
+{
+  "attrs": {},
+  "case": "small_case_1",
+  "inputs": {
+    "d_out": {
+      "data": [
+        1.0,
+        -0.5,
+        2.0,
+        0.25,
+        3.0,
+        -1.5
+      ],
+      "dtype": "fp64",
+      "shape": [
+        1,
+        2,
+        3
+      ]
+    }
+  },
+  "meta": {
+    "note": "d_bias is sum over B,T; d_x passthrough."
+  },
+  "op": "bias_add_backward",
+  "outputs": {
+    "d_bias": {
+      "data": [
+        1.25,
+        2.5,
+        0.5
+      ],
+      "dtype": "fp64",
+      "shape": [
+        3
+      ]
+    },
+    "d_x": {
+      "data": [
+        1.0,
+        -0.5,
+        2.0,
+        0.25,
+        3.0,
+        -1.5
+      ],
+      "dtype": "fp64",
+      "shape": [
+        1,
+        2,
+        3
+      ]
+    }
+  }
+}

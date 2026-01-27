@@ -465,6 +465,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             # Utilities
             src/testing/utilities/test-sol.cpp
             src/testing/utilities/test_dsl_ir.cpp
+            src/testing/utilities/test_dsl_goldens.cpp
         )
         target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
         target_compile_options(unit-tests PRIVATE
