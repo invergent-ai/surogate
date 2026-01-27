@@ -921,7 +921,7 @@ class RayDistributedTrainer:
         logger.info("Training complete. Saving final model...")
         try:
             if config.lora:
-                adapter_dir = str(Path(config.output_dir) / "adapter")
+                adapter_dir = str(Path(config.output_dir))
                 logger.info(f"Exporting LoRA adapter to {adapter_dir}...")
                 # Call export on ALL nodes - they all participate in NCCL barriers
                 # Only node 0 actually writes the file
@@ -944,7 +944,7 @@ class RayDistributedTrainer:
                 # Merge adapter into base model if requested (only on head node)
                 if config.merge_adapter:
                     from surogate.utils.adapter_merge import merge_adapter
-                    merged_dir = Path(config.output_dir) / "merged"
+                    merged_dir = Path(config.output_dir)
                     try:
                         merge_adapter(
                             base_model_path=config.model_dir,
