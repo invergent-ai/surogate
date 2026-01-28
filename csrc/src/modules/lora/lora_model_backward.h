@@ -326,7 +326,7 @@ void ModularLoRAModel<Block>::backward_lora_qkv(int layer_idx, int B, int T, boo
 
     // Get ln1 input: either from stored activation or recompute from residual
     Tensor ln1_input;
-    if (rs.config().recompute_lora) {
+    if (rs.config().recompute_block) {
         // Recompute ln1 from the residual input
         Tensor& residual = rs.get_residual(layer_idx, stream);
         auto& block_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
@@ -454,7 +454,7 @@ void ModularLoRAModel<Block>::backward_lora_mlp_up(int layer_idx, int B, int T, 
 
     // Get ln2 input: either from stored activation or recompute from residual_att
     Tensor ln2_input;
-    if (rs.config().recompute_lora) {
+    if (rs.config().recompute_block) {
         // Recompute ln2 from residual_att (which is residual + att_out)
         auto& block_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
         ln2_input = recompute_rmsnorm(a.residual_att, block_weights.ln2.weight,

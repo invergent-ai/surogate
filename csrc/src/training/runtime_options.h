@@ -54,7 +54,6 @@ struct RuntimeOptions {
     bool RecomputeAtt = false;       ///< Recompute attention (flash attention forward) (implies RecomputeQKV)
     bool RecomputeOutProj = false;   ///< Recompute attention output projection
     bool RecomputeBlock = true;      ///< Recompute entire layer (enables all component flags)
-    bool RecomputeLoRA = false;      ///< Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models)
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;

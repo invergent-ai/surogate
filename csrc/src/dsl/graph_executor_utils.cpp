@@ -6,6 +6,7 @@
 #include "dsl/graph_executor_utils.h"
 
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 

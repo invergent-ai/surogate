@@ -37,8 +37,7 @@ Recomputation options trade compute for memory by recomputing activations during
 | `recompute_ffn`     | bool | `true`  | Recompute Feed-Forward Network (FFN) activations during backward pass. Implies `recompute_swiglu`.                                                                                                                                     |
 | `recompute_qkv`     | bool | `true`  | Recompute QKV projections during backward pass to save memory.                                                                                                                                                                         |
 | `recompute_att`     | bool | `true`  | Recompute attention block during backward pass. Implies `recompute_qkv`.                                                                                                                                                               |
-| `recompute_block`   | bool | `true`  | Recompute entire Transformer block during backward pass to save memory.                                                                                                                                                                |
-| `recompute_lora`    | bool | `true`  | Recompute ln1/ln2 activations during LoRA backward pass instead of storing per-layer. Only effective when LoRA is enabled. Requires and sets `recompute_block` to `true`. When used with `offload_residual`, CUDA graphs are disabled. |
+| `recompute_block`   | bool | `true`  | Recompute entire Transformer block during backward pass to save memory. For LoRA, this also recomputes ln1/ln2 during LoRA backward instead of storing per-layer.                                                                       |
 
 ### Recomputation Hierarchy
 
@@ -101,7 +100,7 @@ distributed:
 | Option            | Type | Default | Description                                                                                                                       |
 | ----------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `gpus`            | int  | `1`     | Number of GPUs to use for training. Use `0` for all available GPUs.                                                               |
-| `use_cuda_graphs` | bool | `true`  | Enable CUDA graphs for performance. Automatically disabled for QLoRA and when `recompute_lora` conflicts with `offload_residual`. |
+| `use_cuda_graphs` | bool | `true`  | Enable CUDA graphs for performance. Automatically disabled for QLoRA and when `offload_residual` is used with `recompute_block` in LoRA mode. |
 
 ## Mixed Precision & Recipe Options
 

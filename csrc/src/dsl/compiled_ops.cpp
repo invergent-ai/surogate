@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -27,99 +26,10 @@
 #include "recipes/recipe.h"
 #include "training/runtime_options.h"
 #include "utilities/comm.h"
+#include "utilities/dtype.h"
 
 namespace dsl {
 namespace {
-
-// ============================================================================
-// Debug utilities for numerical stability diagnosis
-// ============================================================================
-
-inline bool debug_backward_enabled() {
-    static bool enabled = std::getenv("SUROGATE_DEBUG_DSL_BACKWARD") != nullptr;
-    return enabled;
-}
-
-struct GradStats {
-    double abs_sum = 0.0;
-    float max_val = -std::numeric_limits<float>::infinity();
-    float min_val = std::numeric_limits<float>::infinity();
-    int nan_count = 0;
-    int inf_count = 0;
-    long numel = 0;
-};
-
-GradStats compute_grad_stats(const Tensor& t, cudaStream_t stream) {
-    GradStats stats;
-    if (!t.Data) return stats;
-
-    stats.numel = 1;
-    for (int i = 0; i < t.Rank; ++i) {
-        stats.numel *= t.Sizes[i];
-    }
-    if (stats.numel <= 0) return stats;
-
-    const long sample_size = std::min(stats.numel, 2048L);
-    const long first_n = std::min(stats.numel, 1024L);
-    const long last_n = std::min(stats.numel - first_n, 1024L);
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    if (t.DType == ETensorDType::BF16) {
-        std::vector<nv_bfloat16> buf(sample_size);
-        auto* data_ptr = reinterpret_cast<nv_bfloat16*>(t.Data);
-        CUDA_CHECK(cudaMemcpy(buf.data(), data_ptr, first_n * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-        if (last_n > 0) {
-            CUDA_CHECK(cudaMemcpy(buf.data() + first_n,
-                                  data_ptr + (stats.numel - last_n),
-                                  last_n * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-        }
-        for (long i = 0; i < first_n + last_n; ++i) {
-            float v = __bfloat162float(buf[i]);
-            if (std::isnan(v)) { stats.nan_count++; continue; }
-            if (std::isinf(v)) { stats.inf_count++; continue; }
-            stats.abs_sum += std::fabs(v);
-            stats.max_val = std::max(stats.max_val, v);
-            stats.min_val = std::min(stats.min_val, v);
-        }
-    } else if (t.DType == ETensorDType::FP32) {
-        std::vector<float> buf(sample_size);
-        auto* data_ptr = reinterpret_cast<float*>(t.Data);
-        CUDA_CHECK(cudaMemcpy(buf.data(), data_ptr, first_n * sizeof(float), cudaMemcpyDeviceToHost));
-        if (last_n > 0) {
-            CUDA_CHECK(cudaMemcpy(buf.data() + first_n,
-                                  data_ptr + (stats.numel - last_n),
-                                  last_n * sizeof(float), cudaMemcpyDeviceToHost));
-        }
-        for (long i = 0; i < first_n + last_n; ++i) {
-            float v = buf[i];
-            if (std::isnan(v)) { stats.nan_count++; continue; }
-            if (std::isinf(v)) { stats.inf_count++; continue; }
-            stats.abs_sum += std::fabs(v);
-            stats.max_val = std::max(stats.max_val, v);
-            stats.min_val = std::min(stats.min_val, v);
-        }
-    }
-    return stats;
-}
-
-void print_grad_stats(const char* tag, int layer_idx, const Tensor& t, cudaStream_t stream) {
-    if (!debug_backward_enabled()) return;
-    auto stats = compute_grad_stats(t, stream);
-    fprintf(stderr, "[DSL BACKWARD] %s layer=%d numel=%ld abssum=%.6g max=%.6g min=%.6g nan=%d inf=%d\n",
-            tag, layer_idx, stats.numel, stats.abs_sum, stats.max_val, stats.min_val,
-            stats.nan_count, stats.inf_count);
-}
-
-void print_grad_stats_by_name(const char* name, const Tensor& t, cudaStream_t stream) {
-    if (!debug_backward_enabled()) return;
-    auto stats = compute_grad_stats(t, stream);
-    fprintf(stderr, "[DSL BACKWARD] %s numel=%ld abssum=%.6g max=%.6g min=%.6g nan=%d inf=%d\n",
-            name, stats.numel, stats.abs_sum, stats.max_val, stats.min_val,
-            stats.nan_count, stats.inf_count);
-}
-
-// ============================================================================
 
 float env_float(const char* name, float fallback) {
     if (!name || !*name) {
@@ -726,24 +636,109 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
     int current_layer = -1;
     std::size_t layer_start = 0;
 
+    auto is_grad_ref = [](const TensorRef& ref) -> bool {
+        if (!ref.name.empty() && ref.name.size() > 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
+            return true;
+        }
+        switch (ref.slot) {
+            case TensorSlot::BlockDLN1:
+            case TensorSlot::BlockDQKV:
+            case TensorSlot::BlockDAtt:
+            case TensorSlot::BlockDSwiGLU:
+            case TensorSlot::BlockDMLPUp:
+            case TensorSlot::BlockDMLPDown:
+            case TensorSlot::BlockDLN2:
+            case TensorSlot::BlockDResAtt:
+            case TensorSlot::BlockDResFFN:
+            case TensorSlot::DLoss:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    auto ref_layer_idx = [&](const TensorRef& ref) -> int {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+        if (ref.name.empty()) {
+            return -1;
+        }
+        std::string_view name = ref.name;
+        if (name.rfind("saved.", 0) == 0) {
+            name.remove_prefix(6);
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            return layer_idx;
+        }
+        return -1;
+    };
+
+    auto ref_layer_idx_any = [&](const TensorRef& ref) -> int {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+        if (ref.name.empty()) {
+            return -1;
+        }
+        std::string_view name = ref.name;
+        if (name.rfind("d_", 0) == 0) {
+            name.remove_prefix(2);
+        }
+        if (name.rfind("saved.", 0) == 0) {
+            name.remove_prefix(6);
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            return layer_idx;
+        }
+        return -1;
+    };
+
     for (std::size_t i = 0; i < graph.ops.size(); ++i) {
         auto& op = graph.ops[i];
 
-        // Check inputs/outputs for layer index
+        // Check inputs/outputs for layer index. Use the highest layer index found,
+        // since some ops (e.g., LN1 fused residual) consume previous-layer tensors
+        // but are parameterized by the current layer's weights.
         int detected_layer = -1;
         for (const auto& ref : op.inputs) {
-            if (ref.layer_idx >= 0) {
-                detected_layer = ref.layer_idx;
-                break;
+            if (is_grad_ref(ref)) {
+                continue;
+            }
+            const int layer_idx = ref_layer_idx(ref);
+            if (layer_idx >= 0) {
+                detected_layer = std::max(detected_layer, layer_idx);
+            }
+        }
+        for (const auto& ref : op.outputs) {
+            if (is_grad_ref(ref)) {
+                continue;
+            }
+            const int layer_idx = ref_layer_idx(ref);
+            if (layer_idx >= 0) {
+                detected_layer = std::max(detected_layer, layer_idx);
             }
         }
         if (detected_layer < 0) {
-            for (const auto& ref : op.outputs) {
-                if (ref.layer_idx >= 0) {
-                    detected_layer = ref.layer_idx;
-                    break;
+            for (const auto& ref : op.inputs) {
+                const int layer_idx = ref_layer_idx_any(ref);
+                if (layer_idx >= 0) {
+                    detected_layer = std::max(detected_layer, layer_idx);
                 }
             }
+            for (const auto& ref : op.outputs) {
+                const int layer_idx = ref_layer_idx_any(ref);
+                if (layer_idx >= 0) {
+                    detected_layer = std::max(detected_layer, layer_idx);
+                }
+            }
+        }
+        if (op.attrs.layer_idx >= 0) {
+            detected_layer = std::max(detected_layer, op.attrs.layer_idx);
         }
 
         if (detected_layer >= 0 && detected_layer != current_layer) {
@@ -1340,11 +1335,16 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.shape = {C};
                     }
                 } else if (compiled.type == CompiledOpType::QKVQKNormRoPE) {
-                    // output[0] = qkv_out [B, T, QKV] BF16
+                    // output[0] = qkv_out [B, T, QKV] (match input dtype)
                     // output[1] = q_rstd [B, T, Hq] FP32
                     // output[2] = k_rstd [B, T, Hkv] FP32
                     if (i == 0) {
-                        ref.dtype = ETensorDType::BF16;
+                        // Match input dtype (first input is qkv tensor)
+                        if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                        } else {
+                            ref.dtype = ETensorDType::BF16;
+                        }
                         if (ref.shape.empty()) {
                             ref.shape = {B, T, QKV};
                         }
@@ -1395,11 +1395,34 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     }
                 } else if (compiled.type == CompiledOpType::Matmul ||
                            compiled.type == CompiledOpType::MatmulBias) {
-                    // Try to infer shape from matmul dimensions
+                    // Infer output shape from matmul dimensions: C = A @ B
+                    // NT: A [M, K], B [N, K] -> C [M, N]
+                    // NN: A [M, K], B [K, N] -> C [M, N]
+                    // TN: A [K, M], B [K, N] -> C [M, N]
+                    // TT: A [K, M], B [N, K] -> C [M, N]
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
                     }
-                    // Shape will be determined at runtime
+                    if (ref.shape.empty() && compiled.inputs.size() >= 2) {
+                        const auto& a_shape = compiled.inputs[0].shape;
+                        const auto& b_shape = compiled.inputs[1].shape;
+                        if (a_shape.size() >= 2 && b_shape.size() >= 2) {
+                            // Parse transpose from op.attrs (compiled.attrs not yet resolved!)
+                            EMMTranspose transpose = parse_transpose(op.attrs);
+                            long M = 0, N = 0;
+                            if (transpose == EMMTranspose::NT || transpose == EMMTranspose::NN) {
+                                M = a_shape[0];
+                            } else {
+                                M = a_shape[1];
+                            }
+                            if (transpose == EMMTranspose::NT || transpose == EMMTranspose::TT) {
+                                N = b_shape[0];
+                            } else {
+                                N = b_shape[1];
+                            }
+                            ref.shape = {M, N};
+                        }
+                    }
                 } else if (compiled.type == CompiledOpType::MatmulSwiGLU) {
                     // outputs: out [B, T, D], up_out [M, 2D]
                     ETensorDType base_dtype =
@@ -1423,6 +1446,12 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     }
                 } else if (compiled.type == CompiledOpType::Zeros) {
                     // Preserve explicit output dtype/shape from graph.
+                    // Read dtype from op attributes if specified
+                    if (auto* dtype_attr = find_attr(op.attrs, "dtype")) {
+                        if (auto dtype_str = attr_string(*dtype_attr)) {
+                            ref.dtype = dtype_from_str(*dtype_str);
+                        }
+                    }
                     if (ref.shape.empty()) {
                         ref.shape = {B, T, C};
                     }
@@ -1469,6 +1498,13 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     } else {
                         ref.dtype = ETensorDType::BF16;
                     }
+                } else if (compiled.type == CompiledOpType::View ||
+                           compiled.type == CompiledOpType::ViewBackward) {
+                    // View preserves dtype from input; shape comes from attributes
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                    }
+                    // Shape is set from attrs in resolve_attrs, not here
                 } else {
                     // Default for activation tensors
                     ref.dtype = ETensorDType::BF16;
@@ -1489,6 +1525,12 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 const long Cdim = mConfig.HiddenSize;
                 ref.slot = TensorSlot::Encoded;
                 ref.shape = {Bdim, Tdim, Cdim};
+            }
+
+            // Track output dtype for downstream operations to reference.
+            // This allows intermediate tensors to have their dtypes properly propagated.
+            if (!op.outputs[i].empty()) {
+                mTensorDtypes[op.outputs[i]] = ref.dtype;
             }
 
             compiled.outputs.push_back(std::move(ref));
@@ -1782,6 +1824,22 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
 
+    if (!ref.name.empty()) {
+        if (auto base = base_param_from_grad(ref.name)) {
+            bool accum = false;
+            if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
+                if (grad->Data) {
+                    if (!ref.shape.empty()) {
+                        auto [it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*grad, ref.shape));
+                        return it->second;
+                    }
+                    auto [it, _] = mTensorMap.insert_or_assign(ref.name, *grad);
+                    return it->second;
+                }
+            }
+        }
+    }
+
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
@@ -1936,6 +1994,22 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
+    if (!ref.name.empty()) {
+        if (auto base = base_param_from_grad(ref.name)) {
+            bool accum = false;
+            if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
+                if (grad->Data) {
+                    if (!ref.shape.empty()) {
+                        auto [it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*grad, ref.shape));
+                        return it->second;
+                    }
+                    auto [it, _] = mTensorMap.insert_or_assign(ref.name, *grad);
+                    return it->second;
+                }
+            }
+        }
+    }
+
     // For pre-allocated slots, just return the tensor
     if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Temporary) {
         Tensor& t = resolve_tensor(ref);
@@ -2035,39 +2109,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
                                    op.attrs.eps, static_cast<int>(mB * mT),
                                    mConfig.HiddenSize, mRunState.MainStream);
 
-    // Debug: print forward LN2 residual_out for selected layers
-    int ln_layer_idx = -1;
-    std::string ln_field;
-    if (!op.inputs[2].name.empty()) {
-        parse_block_param(op.inputs[2].name, ln_layer_idx, ln_field);
-    }
-    if (ln_field == "ln2_weight" && ln_layer_idx >= 0 && ln_layer_idx <= 5) {
-        static std::array<bool, 30> debug_ln2_fwd = {};
-        if (!debug_ln2_fwd[ln_layer_idx]) {
-            debug_ln2_fwd[ln_layer_idx] = true;
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (residual_out.DType == ETensorDType::BF16) {
-                size_t nelem = residual_out.nelem();
-                std::vector<nv_bfloat16> h_resout(nelem);
-                CUDA_CHECK(cudaMemcpy(h_resout.data(), residual_out.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                float max_resout = 0;
-                for (size_t i = 0; i < nelem; ++i) {
-                    max_resout = std::max(max_resout, std::abs((float)h_resout[i]));
-                }
-                // Check rstd
-                size_t rstd_nelem = rstd.nelem();
-                std::vector<float> h_rstd(rstd_nelem);
-                CUDA_CHECK(cudaMemcpy(h_rstd.data(), rstd.get<float>(), rstd_nelem * sizeof(float), cudaMemcpyDeviceToHost));
-                float max_rstd = 0, min_rstd = 1e30f;
-                for (size_t i = 0; i < rstd_nelem; ++i) {
-                    max_rstd = std::max(max_rstd, h_rstd[i]);
-                    min_rstd = std::min(min_rstd, h_rstd[i]);
-                }
-                fprintf(stderr, "[DSL LN2 L%d FWD] resout max=%.6f, rstd [%.4f,%.4f], resout_name=%s, rstd_name=%s, resout_ptr=%p\n",
-                        ln_layer_idx, max_resout, min_rstd, max_rstd, op.outputs[0].name.c_str(), op.outputs[2].name.c_str(), (void*)residual_out.Data);
-            }
-        }
-    }
 }
 
 void CompiledExecutor::dispatch_view(const CompiledOp& op) {
@@ -2560,26 +2601,47 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // Addition backward: gradients pass through unchanged to both inputs
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
-    // Debug: print add_backward info for layers 3, 2, 1, 0
-    static std::unordered_set<std::string> debug_printed;
-    auto debug_key = op.op_id;
-    int out_layer = op.outputs.size() > 0 ? op.outputs[0].layer_idx : -1;
-    if (debug_printed.find(debug_key) == debug_printed.end() && out_layer >= 0 && out_layer <= 5) {
-        debug_printed.insert(debug_key);
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        float max_dout = 0;
-        if (d_out.DType == ETensorDType::BF16) {
-            size_t nelem = d_out.nelem();
-            std::vector<nv_bfloat16> h_dout(nelem);
-            CUDA_CHECK(cudaMemcpy(h_dout.data(), d_out.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            for (size_t i = 0; i < nelem; ++i) {
-                max_dout = std::max(max_dout, std::abs((float)h_dout[i]));
-            }
+    if (env_enabled("SUROGATE_DSL_DEBUG_ADD_BWD") || env_enabled("SUROGATE_DSL_DEBUG_RECOMPUTE_GRAD")) {
+        static int debug_add_count = 0;
+        static Tensor debug_add_norm_buf{};
+        if (!debug_add_norm_buf.Data && mRunState.Allocator && env_enabled("SUROGATE_DSL_DEBUG_RECOMPUTE_GRAD")) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            debug_add_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                "debug_add_bwd_norm",
+                                                                EAllocationType::ON_DEVICE,
+                                                                {num_sums});
         }
-        fprintf(stderr, "[DSL ADD_BWD L%d] op=%s, d_out max=%.6f, input=%s, out0=%s, out1=%s\n",
-                out_layer, op.op_id.c_str(), max_dout, op.inputs[0].name.c_str(),
-                op.outputs[0].name.c_str(),
-                op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "none");
+        auto norm_of = [&](const Tensor& t) -> float {
+            if (!debug_add_norm_buf.Data) return 0.0f;
+            fill_zero(debug_add_norm_buf, mRunState.MainStream);
+            global_norm_squared(debug_add_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+            deterministic_sum(debug_add_norm_buf.template get<float>(),
+                              debug_add_norm_buf.template get<float>(),
+                              debug_add_norm_buf.nelem(),
+                              mRunState.MainStream);
+            float host_sum = 0.0f;
+            CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                       debug_add_norm_buf.template get<float>(),
+                                       sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            return std::sqrt(host_sum);
+        };
+        if (debug_add_count < 20) {
+            std::fprintf(stderr,
+                         "[DSL DEBUG ADD BWD] op_id=%s in=%s (norm=%g) out0=%s (slot=%d layer=%d) out1=%s (slot=%d layer=%d)\n",
+                         op.op_id.c_str(),
+                         op.inputs.size() > 0 ? op.inputs[0].name.c_str() : "",
+                         debug_add_norm_buf.Data ? norm_of(d_out) : 0.0f,
+                         op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "",
+                         op.outputs.size() > 0 ? static_cast<int>(op.outputs[0].slot) : -1,
+                         op.outputs.size() > 0 ? op.outputs[0].layer_idx : -1,
+                         op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "",
+                         op.outputs.size() > 1 ? static_cast<int>(op.outputs[1].slot) : -1,
+                         op.outputs.size() > 1 ? op.outputs[1].layer_idx : -1);
+        }
+        ++debug_add_count;
     }
 
     // For pre-allocated gradient slots (like d_res_ffn, d_res_att), we must copy the
@@ -2648,12 +2710,15 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     bool skip_weight_grad = true;
     const std::string& dB_name = op.outputs.size() > 1 ? op.outputs[1].name : "";
     if (!dB_name.empty()) {
-        // Strip "d_" prefix to get weight name
-        std::string weight_name = dB_name;
-        if (weight_name.rfind("d_", 0) == 0) {
-            weight_name = weight_name.substr(2);
+        std::string weight_name;
+        if (auto base = base_param_from_grad(dB_name)) {
+            weight_name = *base;
+        } else {
+            weight_name = dB_name;
+            if (weight_name.rfind("d_", 0) == 0) {
+                weight_name = weight_name.substr(2);
+            }
         }
-        // Check if grad tensor exists and is allocated
         bool accum = false;
         Tensor* grad = mGrads.get_param_grad(weight_name, accum);
         skip_weight_grad = (grad == nullptr || !grad->Data);
@@ -2673,6 +2738,65 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
 
+    if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
+        static int debug_matmul_count = 0;
+        static Tensor debug_norm_buf{};
+        if (!debug_norm_buf.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            debug_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                           "debug_matmul_bwd_norm",
+                                                           EAllocationType::ON_DEVICE,
+                                                           {num_sums});
+        }
+        const char* layer_env = std::getenv("SUROGATE_DSL_DEBUG_MATMUL_LAYER");
+        const int layer_filter = layer_env ? std::atoi(layer_env) : -999999;
+        const bool layer_match = !layer_env || layer_idx == layer_filter;
+        if (layer_match && debug_matmul_count < 20) {
+            std::string base_name;
+            if (!dB_name.empty()) {
+                if (auto base = base_param_from_grad(dB_name)) {
+                    base_name = *base;
+                }
+            }
+            bool grad_accum = false;
+            Tensor* grad = (!base_name.empty()) ? mGrads.get_param_grad(base_name, grad_accum) : nullptr;
+            std::fprintf(stderr,
+                         "[DSL DEBUG MATMUL] op_id=%s layer=%d matmul_op=%d d_out=%s a=%s weight=%s dB=%s base=%s grad=%p skip=%d\n",
+                         op.op_id.c_str(),
+                         layer_idx,
+                         static_cast<int>(op.attrs.matmul_op.value_or(modules::MatmulOp::LMHead)),
+                         op.inputs.size() > 0 ? op.inputs[0].name.c_str() : "",
+                         op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "",
+                         weight_name.c_str(),
+                         dB_name.c_str(),
+                         base_name.c_str(),
+                         grad ? grad->Data : nullptr,
+                         skip_weight_grad ? 1 : 0);
+            if (debug_norm_buf.Data && debug_matmul_count < 4) {
+                auto print_norm = [&](const char* name, const Tensor& t) {
+                    fill_zero(debug_norm_buf, mRunState.MainStream);
+                    global_norm_squared(debug_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                    deterministic_sum(debug_norm_buf.template get<float>(),
+                                      debug_norm_buf.template get<float>(),
+                                      debug_norm_buf.nelem(),
+                                      mRunState.MainStream);
+                    float host_sum = 0.0f;
+                    CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                               debug_norm_buf.template get<float>(),
+                                               sizeof(float),
+                                               cudaMemcpyDeviceToHost,
+                                               mRunState.MainStream));
+                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                    const float norm = std::sqrt(host_sum);
+                    std::fprintf(stderr, "  [DSL DEBUG MATMUL] %s norm=%g\n", name, norm);
+                };
+                print_norm("d_out", d_out);
+                print_norm("a_inp", a);
+            }
+            ++debug_matmul_count;
+        }
+    }
+
     // Now allocate output tensors - skip dB if weights are frozen
     Tensor* dA_ptr = nullptr;
     Tensor* dB_ptr = nullptr;
@@ -2688,7 +2812,12 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         return;
     }
 
-    const bool do_accumulate = mAccumulateTensors.count(dB_name) > 0;
+    bool do_accumulate = mAccumulateTensors.count(dB_name) > 0;
+    if (!do_accumulate && !dB_name.empty()) {
+        if (auto base = base_param_from_grad(dB_name)) {
+            do_accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+        }
+    }
 
     bool used_recipe = false;
     bool used_fp8 = false;
@@ -2741,6 +2870,55 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
 
         mRecipe->backward_matmul(ctx);
         used_recipe = true;
+
+        if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
+            static int debug_recipe_count = 0;
+            static Tensor debug_norm_buf_recipe{};
+            if (!debug_norm_buf_recipe.Data && mRunState.Allocator) {
+                const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+                debug_norm_buf_recipe = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                      "debug_matmul_bwd_recipe_norm",
+                                                                      EAllocationType::ON_DEVICE,
+                                                                      {num_sums});
+            }
+            if (debug_norm_buf_recipe.Data && debug_recipe_count < 4) {
+                auto norm_of = [&](const Tensor& t) {
+                    fill_zero(debug_norm_buf_recipe, mRunState.MainStream);
+                    global_norm_squared(debug_norm_buf_recipe, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                    deterministic_sum(debug_norm_buf_recipe.template get<float>(),
+                                      debug_norm_buf_recipe.template get<float>(),
+                                      debug_norm_buf_recipe.nelem(),
+                                      mRunState.MainStream);
+                    float host_sum = 0.0f;
+                    CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                               debug_norm_buf_recipe.template get<float>(),
+                                               sizeof(float),
+                                               cudaMemcpyDeviceToHost,
+                                               mRunState.MainStream));
+                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                    return std::sqrt(host_sum);
+                };
+                if (dA_use) {
+                    std::fprintf(stderr, "  [DSL DEBUG MATMUL] recipe dA norm=%g ptr=%p\n",
+                                 norm_of(*dA_use), dA_use->Data);
+                }
+                if (dB_use) {
+                    std::fprintf(stderr,
+                                 "  [DSL DEBUG MATMUL] recipe dB norm=%g ptr=%p accum=%d skip=%d\n",
+                                 norm_of(*dB_use),
+                                 dB_use->Data,
+                                 do_accumulate ? 1 : 0,
+                                 ctx.skip_weight_grad ? 1 : 0);
+                }
+                if (dB_ptr && dB_ptr != dB_use) {
+                    std::fprintf(stderr,
+                                 "  [DSL DEBUG MATMUL] recipe dB_ptr ptr=%p (view=%s)\n",
+                                 dB_ptr->Data,
+                                 dB_ptr->Data == dB_use->Data ? "yes" : "no");
+                }
+            }
+            ++debug_recipe_count;
+        }
     }
 
     if (!used_recipe) {
@@ -2808,90 +2986,140 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             int M = 0, N = 0, K = 0;
             matmul_dims(*lhs, *rhs, mode_rm, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode_rm);
+            if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
+                static int debug_db_count = 0;
+                static Tensor debug_norm_buf_db{};
+                if (!debug_norm_buf_db.Data && mRunState.Allocator) {
+                    const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+                    debug_norm_buf_db = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                      "debug_matmul_bwd_db_norm",
+                                                                      EAllocationType::ON_DEVICE,
+                                                                      {num_sums});
+                }
+                if (debug_norm_buf_db.Data && debug_db_count < 4) {
+                    auto norm_of = [&](const Tensor& t) {
+                        fill_zero(debug_norm_buf_db, mRunState.MainStream);
+                        global_norm_squared(debug_norm_buf_db, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                        deterministic_sum(debug_norm_buf_db.template get<float>(),
+                                          debug_norm_buf_db.template get<float>(),
+                                          debug_norm_buf_db.nelem(),
+                                          mRunState.MainStream);
+                        float host_sum = 0.0f;
+                        CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                                   debug_norm_buf_db.template get<float>(),
+                                                   sizeof(float),
+                                                   cudaMemcpyDeviceToHost,
+                                                   mRunState.MainStream));
+                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                        return std::sqrt(host_sum);
+                    };
+                    const float norm_before = norm_of(*dB_ptr);
+                    std::fprintf(stderr,
+                                 "  [DSL DEBUG MATMUL] dB before norm=%g M=%d N=%d K=%d mode=%d accum=%d\n",
+                                 norm_before, M, N, K, static_cast<int>(mode_col), do_accumulate ? 1 : 0);
+                }
+                ++debug_db_count;
+            }
             matmul(*dB_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, do_accumulate, mRunState.MainStream);
-        }
-    }
-
-    // Map dA output to simplified_grads for LoRA hooks
-    // The DSL autodiff generates generic names like "d_blocks[N].view_X" but the
-    // LoRA backward hooks expect the tensors to be in simplified_grads.
-    if (dA_ptr && op.attrs.matmul_op.has_value() && layer_idx >= 0) {
-        auto& grads = mRunState.simplified_grads(layer_idx);
-        switch (*op.attrs.matmul_op) {
-            case modules::MatmulOp::MLPDown:
-                // d_swiglu = dA from MLP down backward
-                grads.d_swiglu.Data = dA_ptr->Data;
-                break;
-            case modules::MatmulOp::MLPUp:
-                // d_ln2 = dA from MLP up backward (though this goes through swiglu_backward first)
-                grads.d_ln2.Data = dA_ptr->Data;
-                break;
-            case modules::MatmulOp::AttnOut:
-                // d_att = dA from attention out backward
-                grads.d_att.Data = dA_ptr->Data;
-                break;
-            case modules::MatmulOp::QKV:
-                // d_ln1 = dA from QKV backward
-                grads.d_ln1.Data = dA_ptr->Data;
-                // Debug: print d_ln1 max for selected layers
-                {
-                    static std::array<bool, 30> debug_qkv_bwd = {};
-                    if (!debug_qkv_bwd[layer_idx]) {
-                        debug_qkv_bwd[layer_idx] = true;
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        if (dA_ptr->DType == ETensorDType::BF16) {
-                            size_t nelem = dA_ptr->nelem();
-                            std::vector<nv_bfloat16> h_dln1(nelem);
-                            CUDA_CHECK(cudaMemcpy(h_dln1.data(), dA_ptr->get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                            float max_dln1 = 0;
-                            for (size_t i = 0; i < nelem; ++i) {
-                                max_dln1 = std::max(max_dln1, std::abs((float)h_dln1[i]));
-                            }
-                            float max_dqkv = 0;
-                            std::vector<nv_bfloat16> h_dqkv(d_out.nelem());
-                            CUDA_CHECK(cudaMemcpy(h_dqkv.data(), d_out.get<nv_bfloat16>(), d_out.nelem() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                            for (size_t i = 0; i < d_out.nelem(); ++i) {
-                                max_dqkv = std::max(max_dqkv, std::abs((float)h_dqkv[i]));
-                            }
-                            fprintf(stderr, "[DSL QKV_BWD L%d] d_qkv max=%.6f -> d_ln1 max=%.6f\n", layer_idx, max_dqkv, max_dln1);
-                        }
-                    }
+            if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
+                static int debug_db_after_count = 0;
+                static Tensor debug_norm_buf_db_after{};
+                if (!debug_norm_buf_db_after.Data && mRunState.Allocator) {
+                    const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+                    debug_norm_buf_db_after = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                            "debug_matmul_bwd_db_norm_after",
+                                                                            EAllocationType::ON_DEVICE,
+                                                                            {num_sums});
                 }
-                break;
-            default:
-                break;
-        }
-    }
-
-    // Map d_out to simplified_grads for LoRA hooks that consume upstream gradients directly.
-    if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
-        auto& grads = mRunState.simplified_grads(layer_idx);
-        switch (*op.attrs.matmul_op) {
-            case modules::MatmulOp::MLPDown:
-                // d_res_ffn is the upstream gradient for MLP down (matches modular path)
-                grads.d_res_ffn.Data = d_out.Data;
-                break;
-            case modules::MatmulOp::MLPUp:
-                // d_mlp_up is the upstream gradient for MLP up/gate
-                grads.d_mlp_up.Data = d_out.Data;
-                break;
-            case modules::MatmulOp::AttnOut:
-                // d_res_att is the upstream gradient for attention out
-                grads.d_res_att.Data = d_out.Data;
-                break;
-            case modules::MatmulOp::QKV:
-                // d_qkv is the upstream gradient for QKV projections
-                grads.d_qkv.Data = d_out.Data;
-                break;
-            default:
-                break;
+                if (debug_norm_buf_db_after.Data && debug_db_after_count < 4) {
+                    auto norm_of = [&](const Tensor& t) {
+                        fill_zero(debug_norm_buf_db_after, mRunState.MainStream);
+                        global_norm_squared(debug_norm_buf_db_after, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                        deterministic_sum(debug_norm_buf_db_after.template get<float>(),
+                                          debug_norm_buf_db_after.template get<float>(),
+                                          debug_norm_buf_db_after.nelem(),
+                                          mRunState.MainStream);
+                        float host_sum = 0.0f;
+                        CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                                   debug_norm_buf_db_after.template get<float>(),
+                                                   sizeof(float),
+                                                   cudaMemcpyDeviceToHost,
+                                                   mRunState.MainStream));
+                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                        return std::sqrt(host_sum);
+                    };
+                    const float norm_after = norm_of(*dB_ptr);
+                    std::fprintf(stderr, "  [DSL DEBUG MATMUL] dB after norm=%g\n", norm_after);
+                }
+                ++debug_db_after_count;
+            }
         }
     }
 
     // Hook invocation for LoRA backward
     if (hook && *hook && op.attrs.backward_hook_point.has_value()) {
+        // Temporarily map grads to current backward tensors for LoRA hooks, then restore.
+        struct GradPtrs {
+            std::byte* d_swiglu{nullptr};
+            std::byte* d_ln2{nullptr};
+            std::byte* d_att{nullptr};
+            std::byte* d_ln1{nullptr};
+            std::byte* d_res_ffn{nullptr};
+            std::byte* d_mlp_up{nullptr};
+            std::byte* d_res_att{nullptr};
+            std::byte* d_qkv{nullptr};
+        } prev{};
+
+        if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
+            auto& grads = mRunState.simplified_grads(layer_idx);
+            prev.d_swiglu = reinterpret_cast<std::byte*>(grads.d_swiglu.Data);
+            prev.d_ln2 = reinterpret_cast<std::byte*>(grads.d_ln2.Data);
+            prev.d_att = reinterpret_cast<std::byte*>(grads.d_att.Data);
+            prev.d_ln1 = reinterpret_cast<std::byte*>(grads.d_ln1.Data);
+            prev.d_res_ffn = reinterpret_cast<std::byte*>(grads.d_res_ffn.Data);
+            prev.d_mlp_up = reinterpret_cast<std::byte*>(grads.d_mlp_up.Data);
+            prev.d_res_att = reinterpret_cast<std::byte*>(grads.d_res_att.Data);
+            prev.d_qkv = reinterpret_cast<std::byte*>(grads.d_qkv.Data);
+
+            if (dA_ptr) {
+                switch (*op.attrs.matmul_op) {
+                    case modules::MatmulOp::MLPDown:
+                        grads.d_swiglu.Data = dA_ptr->Data;
+                        break;
+                    case modules::MatmulOp::MLPUp:
+                        grads.d_ln2.Data = dA_ptr->Data;
+                        break;
+                    case modules::MatmulOp::AttnOut:
+                        grads.d_att.Data = dA_ptr->Data;
+                        break;
+                    case modules::MatmulOp::QKV:
+                        grads.d_ln1.Data = dA_ptr->Data;
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            switch (*op.attrs.matmul_op) {
+                case modules::MatmulOp::MLPDown:
+                    grads.d_res_ffn.Data = d_out.Data;
+                    break;
+                case modules::MatmulOp::MLPUp:
+                    grads.d_mlp_up.Data = d_out.Data;
+                    break;
+                case modules::MatmulOp::AttnOut:
+                    grads.d_res_att.Data = d_out.Data;
+                    break;
+                case modules::MatmulOp::QKV:
+                    grads.d_qkv.Data = d_out.Data;
+                    break;
+                default:
+                    break;
+            }
+        }
+
         // Ensure activations needed by LoRA hooks are available.
         if (layer_idx >= 0 && op.attrs.matmul_op.has_value()) {
             auto& acts = mRunState.simplified_acts(layer_idx);
@@ -2908,6 +3136,18 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             }
         }
         (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
+
+        if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
+            auto& grads = mRunState.simplified_grads(layer_idx);
+            grads.d_swiglu.Data = prev.d_swiglu;
+            grads.d_ln2.Data = prev.d_ln2;
+            grads.d_att.Data = prev.d_att;
+            grads.d_ln1.Data = prev.d_ln1;
+            grads.d_res_ffn.Data = prev.d_res_ffn;
+            grads.d_mlp_up.Data = prev.d_mlp_up;
+            grads.d_res_att.Data = prev.d_res_att;
+            grads.d_qkv.Data = prev.d_qkv;
+        }
     }
 }
 
@@ -2934,6 +3174,11 @@ void CompiledExecutor::dispatch_bias_add_backward(const CompiledOp& op) {
 
         Tensor& d_bias = ensure_output_tensor(op.outputs[1]);
         bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
+        if (!accumulate && !op.outputs[1].name.empty()) {
+            if (auto base = base_param_from_grad(op.outputs[1].name)) {
+                accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+            }
+        }
 
         // Allocate scratch buffer for bias reduction
         const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, OC, mRunState.DeviceProp);
@@ -3043,9 +3288,15 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
     }
 
-    const bool do_accumulate = (op.outputs.size() > 1 && !op.outputs[1].name.empty())
-        ? (mAccumulateTensors.count(op.outputs[1].name) > 0)
-        : false;
+    bool do_accumulate = false;
+    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        do_accumulate = (mAccumulateTensors.count(op.outputs[1].name) > 0);
+        if (!do_accumulate) {
+            if (auto base = base_param_from_grad(op.outputs[1].name)) {
+                do_accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+            }
+        }
+    }
 
     if (d_inp_ptr) {
         EMMTranspose mode_dA = EMMTranspose::NN;
@@ -3307,6 +3558,50 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
     Tensor& residual_out = *residual_out_ptr;
 
+    if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
+        static int debug_ln_count = 0;
+        static Tensor debug_ln_norm_buf{};
+        if (!debug_ln_norm_buf.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            debug_ln_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                              "debug_ln_bwd_norm",
+                                                              EAllocationType::ON_DEVICE,
+                                                              {num_sums});
+        }
+        const char* ln_layer_env = std::getenv("SUROGATE_DSL_DEBUG_LN_LAYER");
+        const int ln_layer_filter = ln_layer_env ? std::atoi(ln_layer_env) : -999999;
+        const bool ln_layer_match = !ln_layer_env || ln_layer_idx == ln_layer_filter;
+        if (ln_layer_match && debug_ln_count < 16) {
+            std::fprintf(stderr,
+                         "[DSL DEBUG LN BWD] layer=%d field=%s in1=%s out0=%s slot0=%d out1=%s slot1=%d\n",
+                         ln_layer_idx,
+                         ln_field.c_str(),
+                         op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "",
+                         op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "",
+                         op.outputs.size() > 0 ? static_cast<int>(op.outputs[0].slot) : -1,
+                         op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "",
+                         op.outputs.size() > 1 ? static_cast<int>(op.outputs[1].slot) : -1);
+            if (debug_ln_norm_buf.Data && op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
+                Tensor& in1 = resolve_tensor(op.inputs[1]);
+                fill_zero(debug_ln_norm_buf, mRunState.MainStream);
+                global_norm_squared(debug_ln_norm_buf, in1, in1.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                deterministic_sum(debug_ln_norm_buf.template get<float>(),
+                                  debug_ln_norm_buf.template get<float>(),
+                                  debug_ln_norm_buf.nelem(),
+                                  mRunState.MainStream);
+                float host_sum = 0.0f;
+                CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                           debug_ln_norm_buf.template get<float>(),
+                                           sizeof(float),
+                                           cudaMemcpyDeviceToHost,
+                                           mRunState.MainStream));
+                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                std::fprintf(stderr, "  [DSL DEBUG LN BWD] in1 norm=%g\n", std::sqrt(host_sum));
+            }
+        }
+        ++debug_ln_count;
+    }
+
     // d_residual_next is the incoming gradient from the next layer (may be zero/empty)
     Tensor d_residual_zero{};
     Tensor* d_residual_next = nullptr;
@@ -3353,185 +3648,106 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             : mRunState.simplified_quant_grads().d_res_ffn.abs_max();
     }
 
-    // Debug: print LN2 backward info for selected layers
-    auto print_ln2_debug = [&](int target_layer) {
-        static std::array<bool, 30> debug_ln2_flags = {};
-        if (ln_layer_idx == target_layer && ln_field == "ln2_weight" && !debug_ln2_flags[target_layer]) {
-            debug_ln2_flags[target_layer] = true;
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (d_y.DType == ETensorDType::BF16) {
-                size_t nelem = d_y.nelem();
-                std::vector<nv_bfloat16> h_dy(nelem), h_dres(nelem);
-                CUDA_CHECK(cudaMemcpy(h_dy.data(), d_y.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_dres.data(), d_residual_input->get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                float max_dy = 0, max_dres = 0;
-                for (size_t i = 0; i < nelem; ++i) {
-                    max_dy = std::max(max_dy, std::abs((float)h_dy[i]));
-                    max_dres = std::max(max_dres, std::abs((float)h_dres[i]));
-                }
-                // Also check rstd and residual_out
-                size_t rstd_nelem = rstd.nelem();
-                std::vector<float> h_rstd(rstd_nelem);
-                CUDA_CHECK(cudaMemcpy(h_rstd.data(), rstd.get<float>(), rstd_nelem * sizeof(float), cudaMemcpyDeviceToHost));
-                float max_rstd = 0, min_rstd = 1e30f;
-                for (size_t i = 0; i < rstd_nelem; ++i) {
-                    max_rstd = std::max(max_rstd, h_rstd[i]);
-                    min_rstd = std::min(min_rstd, h_rstd[i]);
-                }
-                // Check residual_out
-                std::vector<nv_bfloat16> h_resout(nelem);
-                CUDA_CHECK(cudaMemcpy(h_resout.data(), residual_out.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                float max_resout = 0;
-                for (size_t i = 0; i < nelem; ++i) {
-                    max_resout = std::max(max_resout, std::abs((float)h_resout[i]));
-                }
-                fprintf(stderr, "[DSL LN2 L%d BWD] BEFORE: d_y max=%.6f, d_residual max=%.6f, rstd [%.4f,%.4f], resout max=%.6f\n",
-                        target_layer, max_dy, max_dres, min_rstd, max_rstd, max_resout);
-                fprintf(stderr, "[DSL LN2 L%d BWD] BEFORE: d_res_name=%s, resout_name=%s, rstd_name=%s, out0=%s, out1=%s\n",
-                        target_layer, op.inputs[1].name.c_str(), op.inputs[2].name.c_str(), op.inputs[4].name.c_str(),
-                        op.outputs[0].name.c_str(), op.outputs[1].name.c_str());
-                fprintf(stderr, "[DSL LN2 L%d BWD] BEFORE: resout_ptr=%p, rstd_ptr=%p, slot=%d\n",
-                        target_layer, (void*)residual_out.Data, (void*)rstd.Data, static_cast<int>(op.inputs[2].slot));
-            }
-        }
-    };
-    for (int i = 5; i >= 0; --i) {
-        print_ln2_debug(i);
-    }
-    // Debug LN2 backward OUTPUT
-    auto print_ln2_output = [&](int target_layer) {
-        static std::array<bool, 30> debug_ln2_out_flags = {};
-        if (ln_layer_idx == target_layer && ln_field == "ln2_weight" && !debug_ln2_out_flags[target_layer]) {
-            debug_ln2_out_flags[target_layer] = true;
-        }
-    };
-
-    // Use the rmsnorm_backward kernel (note: it expects B, T separately)
-    // Debug: print input/output values for all layers LN1 backward
-    auto print_ln1_debug = [&](int target_layer) {
-        static std::array<bool, 30> debug_flags = {};
-        if (ln_layer_idx == target_layer && ln_field == "ln1_weight" && !debug_flags[target_layer]) {
-            debug_flags[target_layer] = true;
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (d_y.DType == ETensorDType::BF16) {
-                size_t nelem = d_y.nelem();
-                std::vector<nv_bfloat16> h_dy(nelem), h_dres(nelem);
-                CUDA_CHECK(cudaMemcpy(h_dy.data(), d_y.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_dres.data(), d_residual_input->get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                float max_dy = 0, max_dres = 0;
-                for (size_t i = 0; i < nelem; ++i) {
-                    max_dy = std::max(max_dy, std::abs((float)h_dy[i]));
-                    max_dres = std::max(max_dres, std::abs((float)h_dres[i]));
-                }
-                // Print d_residual_input tensor name/source
-                fprintf(stderr, "[DSL LN1 L%d BWD] d_y max=%.6f, d_residual max=%.6f, d_res_name=%s, d_res_ptr=%p\n",
-                        target_layer, max_dy, max_dres, op.inputs[1].name.c_str(), (void*)d_residual_input->Data);
-            }
-        }
-    };
-    for (int i = 27; i >= 0; --i) {
-        print_ln1_debug(i);
-    }
-    static bool debug_ln1_l0 = false;
-    if (ln_layer_idx == 0 && ln_field == "ln1_weight" && !debug_ln1_l0) {
-        debug_ln1_l0 = true;
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        if (d_y.DType == ETensorDType::BF16) {
-            std::vector<nv_bfloat16> h_dy(4), h_dres(4);
-            CUDA_CHECK(cudaMemcpy(h_dy.data(), d_y.get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_dres.data(), d_residual_input->get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            fprintf(stderr, "[DSL LN1 L0 BWD] BEFORE: d_y[0..3]: %.6f %.6f %.6f %.6f\n",
-                    (float)h_dy[0], (float)h_dy[1], (float)h_dy[2], (float)h_dy[3]);
-            fprintf(stderr, "[DSL LN1 L0 BWD] BEFORE: d_residual_input[0..3]: %.6f %.6f %.6f %.6f\n",
-                    (float)h_dres[0], (float)h_dres[1], (float)h_dres[2], (float)h_dres[3]);
-            // Print max_abs for d_y and d_residual_input
-            size_t nelem = d_y.nelem();
-            std::vector<nv_bfloat16> h_dy_full(nelem), h_dres_full(nelem);
-            CUDA_CHECK(cudaMemcpy(h_dy_full.data(), d_y.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_dres_full.data(), d_residual_input->get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            float max_dy = 0, max_dres = 0;
-            for (size_t i = 0; i < nelem; ++i) {
-                max_dy = std::max(max_dy, std::abs((float)h_dy_full[i]));
-                max_dres = std::max(max_dres, std::abs((float)h_dres_full[i]));
-            }
-            fprintf(stderr, "[DSL LN1 L0 BWD] BEFORE: d_y max_abs=%.6f, d_residual_input max_abs=%.6f\n", max_dy, max_dres);
-        }
-    }
-
     rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
                      *d_residual_input, d_y, residual_out, weight, rstd,
                      abs_max_ptr,
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
 
-    // Debug: print LN2 backward OUTPUT for layers 2-5
-    if (ln_field == "ln2_weight" && ln_layer_idx >= 2 && ln_layer_idx <= 5) {
-        static std::array<bool, 30> debug_ln2_output = {};
-        if (!debug_ln2_output[ln_layer_idx]) {
-            debug_ln2_output[ln_layer_idx] = true;
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (d_input.DType == ETensorDType::BF16) {
-                size_t nelem = d_input.nelem();
-                std::vector<nv_bfloat16> h_dinput(nelem);
-                CUDA_CHECK(cudaMemcpy(h_dinput.data(), d_input.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                float max_dinput = 0;
-                for (size_t i = 0; i < nelem; ++i) {
-                    max_dinput = std::max(max_dinput, std::abs((float)h_dinput[i]));
-                }
-                fprintf(stderr, "[DSL LN2 L%d BWD] AFTER: d_input max=%.6f, out0=%s (L%d), out1=%s (L%d)\n",
-                        ln_layer_idx, max_dinput, op.outputs[0].name.c_str(), op.outputs[0].layer_idx,
-                        op.outputs[1].name.c_str(), op.outputs[1].layer_idx);
-            }
-        }
-    }
-
-    // Debug: print d_input layer_idx for all LN1 backward calls
-    static std::array<bool, 30> debug_output_layer = {};
-    if (ln_field == "ln1_weight" && !debug_output_layer[ln_layer_idx]) {
-        debug_output_layer[ln_layer_idx] = true;
-        fprintf(stderr, "[DSL LN1 L%d BWD] OUTPUT: d_input layer_idx=%d, name=%s (expected l-1=%d)\n",
-                ln_layer_idx, op.outputs[1].layer_idx, op.outputs[1].name.c_str(), ln_layer_idx - 1);
-    }
-
-    // Debug: print d_input after layer 0 LN1 backward
-    if (ln_layer_idx == 0 && ln_field == "ln1_weight") {
-        static bool debug_ln1_l0_after = false;
-        if (!debug_ln1_l0_after) {
-            debug_ln1_l0_after = true;
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (d_input.DType == ETensorDType::BF16) {
-                size_t nelem = d_input.nelem();
-                std::vector<nv_bfloat16> h_dinput(nelem);
-                CUDA_CHECK(cudaMemcpy(h_dinput.data(), d_input.get<nv_bfloat16>(), nelem * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                float max_dinput = 0;
-                for (size_t i = 0; i < nelem; ++i) {
-                    max_dinput = std::max(max_dinput, std::abs((float)h_dinput[i]));
-                }
-                fprintf(stderr, "[DSL LN1 L0 BWD] AFTER: d_input max_abs=%.6f, output_name=%s\n", max_dinput, op.outputs[1].name.c_str());
-            }
-        }
-    }
-
     // Copy d_input to d_residual if they're different outputs
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {
         Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
         CUDA_CHECK(cudaMemcpyAsync(d_residual.Data, d_input.Data, d_input.bytes(),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
-        // Debug: print outputs[0] copy for LN1 backward
-        if (ln_field == "ln1_weight" && ln_layer_idx <= 5 && ln_layer_idx >= 0) {
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            fprintf(stderr, "[DSL LN1 L%d BWD] Copied d_input to outputs[0]=%s (L%d), ptr=%p\n",
-                    ln_layer_idx, op.outputs[0].name.c_str(), op.outputs[0].layer_idx, (void*)d_residual.Data);
-        }
-    } else if (ln_field == "ln1_weight" && ln_layer_idx <= 5 && ln_layer_idx >= 0) {
-        fprintf(stderr, "[DSL LN1 L%d BWD] NO COPY - outputs[0].name=%s, outputs[1].name=%s\n",
-                ln_layer_idx, op.outputs[0].name.c_str(), op.outputs[1].name.c_str());
     }
 
     // Update residual_out gradient buffer to include norm contribution.
     if (d_residual_stream && d_residual_stream->Data && d_residual_stream->Data != d_input.Data) {
         CUDA_CHECK(cudaMemcpyAsync(d_residual_stream->Data, d_input.Data, d_input.bytes(),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
+    }
+
+    // LN2 backward produces d_res_ffn (gradient for MLP down output). Mirror it into d_mlp_down
+    // so downstream matmul backward sees a valid d_out.
+    if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
+        Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
+        Tensor& d_mlp_down = mRunState.simplified_grads(ln_layer_idx).d_mlp_down;
+
+        if (env_enabled("SUROGATE_DSL_DEBUG_RECOMPUTE_GRAD")) {
+            static Tensor debug_norm_buf_rc{};
+            if (!debug_norm_buf_rc.Data && mRunState.Allocator) {
+                const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+                debug_norm_buf_rc = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                   "debug_recompute_grad_norm",
+                                                                   EAllocationType::ON_DEVICE,
+                                                                   {num_sums});
+            }
+            if (debug_norm_buf_rc.Data) {
+                auto norm_of = [&](const Tensor& t) {
+                    fill_zero(debug_norm_buf_rc, mRunState.MainStream);
+                    global_norm_squared(debug_norm_buf_rc, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                    deterministic_sum(debug_norm_buf_rc.template get<float>(),
+                                      debug_norm_buf_rc.template get<float>(),
+                                      debug_norm_buf_rc.nelem(),
+                                      mRunState.MainStream);
+                    float host_sum = 0.0f;
+                    CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                               debug_norm_buf_rc.template get<float>(),
+                                               sizeof(float),
+                                               cudaMemcpyDeviceToHost,
+                                               mRunState.MainStream));
+                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                    return std::sqrt(host_sum);
+                };
+                std::fprintf(stderr,
+                             "[DSL DEBUG RECOMPUTE] LN2 bwd layer=%d: d_residual=%p norm=%g, d_mlp_down=%p norm=%g (bucket=%d)\n",
+                             ln_layer_idx,
+                             d_residual.Data, norm_of(d_residual),
+                             d_mlp_down.Data, d_mlp_down.Data ? norm_of(d_mlp_down) : 0.0f,
+                             ln_layer_idx % 2);
+            }
+        }
+
+        if (d_mlp_down.Data && d_mlp_down.Data != d_residual.Data) {
+            CUDA_CHECK(cudaMemcpyAsync(d_mlp_down.Data, d_residual.Data, d_residual.bytes(),
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+        if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
+            const char* ln_layer_env = std::getenv("SUROGATE_DSL_DEBUG_LN_LAYER");
+            const int ln_layer_filter = ln_layer_env ? std::atoi(ln_layer_env) : -999999;
+            if (!ln_layer_env || ln_layer_idx == ln_layer_filter) {
+                static Tensor debug_ln_out_buf{};
+                if (!debug_ln_out_buf.Data && mRunState.Allocator) {
+                    const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+                    debug_ln_out_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                     "debug_ln_bwd_out_norm",
+                                                                     EAllocationType::ON_DEVICE,
+                                                                     {num_sums});
+                }
+                if (debug_ln_out_buf.Data) {
+                    auto norm_of = [&](const Tensor& t) {
+                        fill_zero(debug_ln_out_buf, mRunState.MainStream);
+                        global_norm_squared(debug_ln_out_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                        deterministic_sum(debug_ln_out_buf.template get<float>(),
+                                          debug_ln_out_buf.template get<float>(),
+                                          debug_ln_out_buf.nelem(),
+                                          mRunState.MainStream);
+                        float host_sum = 0.0f;
+                        CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                                   debug_ln_out_buf.template get<float>(),
+                                                   sizeof(float),
+                                                   cudaMemcpyDeviceToHost,
+                                                   mRunState.MainStream));
+                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                        return std::sqrt(host_sum);
+                    };
+                    std::fprintf(stderr,
+                                 "[DSL DEBUG LN BWD] ln2 out0 norm=%g d_mlp_down norm=%g\n",
+                                 norm_of(d_residual),
+                                 d_mlp_down.Data ? norm_of(d_mlp_down) : 0.0f);
+                }
+            }
+        }
     }
 
     // LN1 backward writes grad for previous layer's residual stream into d_mlp_down;
@@ -3543,6 +3759,16 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             if (d_res_ffn_prev.Data && d_res_ffn_prev.Data != d_input.Data) {
                 CUDA_CHECK(cudaMemcpyAsync(d_res_ffn_prev.Data, d_input.Data, d_input.bytes(),
                                            cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+            if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
+                static int debug_ln_copy_count = 0;
+                if (debug_ln_copy_count < 8) {
+                    std::fprintf(stderr,
+                                 "[DSL DEBUG LN BWD] copy to d_res_ffn_prev layer=%d ptr=%p\n",
+                                 prev_layer,
+                                 d_res_ffn_prev.Data);
+                }
+                ++debug_ln_copy_count;
             }
         }
     }
@@ -3557,38 +3783,6 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
     // inputs: d_encoded, token_ids
     // outputs: d_embedding (sparse update)
     Tensor& d_out = resolve_tensor(op.inputs[0]);
-
-    // Debug: print d_out values and op info
-    static bool debug_embedding_bwd = false;
-    if (!debug_embedding_bwd) {
-        debug_embedding_bwd = true;
-        fprintf(stderr, "[DSL EMBEDDING BWD] op.inputs[0].name=%s, slot=%d\n",
-                op.inputs[0].name.c_str(), static_cast<int>(op.inputs[0].slot));
-        fprintf(stderr, "[DSL EMBEDDING BWD] d_embeddings shape from RunState: [%ld, %ld, %ld]\n",
-                mRunState.non_block_gradients().d_embeddings.Sizes[0],
-                mRunState.non_block_gradients().d_embeddings.Sizes[1],
-                mRunState.non_block_gradients().d_embeddings.Sizes[2]);
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        if (d_out.DType == ETensorDType::BF16) {
-            nv_bfloat16 d_out_bf16[4];
-            CUDA_CHECK(cudaMemcpy(d_out_bf16, d_out.get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            fprintf(stderr, "[DSL EMBEDDING BWD] d_out[0,0..3]: %.6f %.6f %.6f %.6f\n",
-                    (float)d_out_bf16[0], (float)d_out_bf16[1], (float)d_out_bf16[2], (float)d_out_bf16[3]);
-            // Also print d_out shape (including rank) and max abs value
-            fprintf(stderr, "[DSL EMBEDDING BWD] d_out shape (rank=%d): [%ld, %ld, %ld], nelem=%ld\n",
-                    d_out.Rank, d_out.Sizes[0], d_out.Sizes[1], d_out.Sizes[2], d_out.nelem());
-            // Check max value
-            size_t total = d_out.nelem();
-            std::vector<nv_bfloat16> h_d_out(total);
-            CUDA_CHECK(cudaMemcpy(h_d_out.data(), d_out.get<nv_bfloat16>(), total * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-            float max_abs = 0.0f;
-            for (size_t i = 0; i < total; ++i) {
-                float val = std::abs((float)h_d_out[i]);
-                if (val > max_abs) max_abs = val;
-            }
-            fprintf(stderr, "[DSL EMBEDDING BWD] d_out max_abs: %.6f\n", max_abs);
-        }
-    }
 
     if (op.outputs.empty() || op.outputs[0].name.empty()) {
         return;  // Skip if no output expected
@@ -3673,12 +3867,19 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     bool d_weight_accumulate = false;
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         std::string weight_name = op.outputs[1].name;
-        if (weight_name.rfind("d_", 0) == 0) {
+        if (auto base = base_param_from_grad(weight_name)) {
+            weight_name = *base;
+        } else if (weight_name.rfind("d_", 0) == 0) {
             weight_name = weight_name.substr(2);
         }
         bool accum = false;
         Tensor* grad = mGrads.get_param_grad(weight_name, accum);
         d_weight_accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
+        if (!d_weight_accumulate) {
+            if (auto base = base_param_from_grad(op.outputs[1].name)) {
+                d_weight_accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+            }
+        }
         if (grad && grad->Data) {
             d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
         }
@@ -3689,19 +3890,6 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         const int accum_steps = std::max(1, mRunState.GradAccumSteps);
         const float dloss_val = 1.0f / static_cast<float>(total_tokens * accum_steps);
         fill_constant(d_loss, dloss_val, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
-        static bool debug_printed = false;
-        if (!debug_printed) {
-            fprintf(stderr, "[DSL DEBUG] fused_lm_head_loss_backward: mB=%ld, mT=%ld, accum=%d, dloss=%.10f (expected 1/%ld = %.10f)\n",
-                    mB, mT, accum_steps, dloss_val, total_tokens * accum_steps, 1.0f / static_cast<float>(total_tokens * accum_steps));
-            debug_printed = true;
-        }
-    } else {
-        static bool debug_printed = false;
-        if (!debug_printed) {
-            fprintf(stderr, "[DSL DEBUG] fused_lm_head_loss_backward: dloss NOT filled (slot=%d, name=%s)\n",
-                    static_cast<int>(op.inputs[0].slot), op.inputs[0].name.c_str());
-            debug_printed = true;
-        }
     }
 
     const long BT = xF_flat.Sizes[0];
@@ -3774,59 +3962,12 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                                          static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
         }
 
-        // Debug: print xF and dlogits (in logits buffer) before d_weight matmul
-        static bool debug_inputs = false;
-        if (!debug_inputs && nano_step == 0) {
-            debug_inputs = true;
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (xF_slice.DType == ETensorDType::BF16) {
-                nv_bfloat16 xf_bf16[4], dl_bf16[4];
-                CUDA_CHECK(cudaMemcpy(xf_bf16, xF_slice.get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(dl_bf16, logits.get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                fprintf(stderr, "[DSL DEBUG] xF[0,0..3]: %.6f %.6f %.6f %.6f\n",
-                        (float)xf_bf16[0], (float)xf_bf16[1], (float)xf_bf16[2], (float)xf_bf16[3]);
-                fprintf(stderr, "[DSL DEBUG] dlogits[0,0..3]: %.10f %.10f %.10f %.10f\n",
-                        (float)dl_bf16[0], (float)dl_bf16[1], (float)dl_bf16[2], (float)dl_bf16[3]);
-            }
-        }
-
         if (d_weight_ptr) {
-            // Debug: check if d_weight_ptr is the same as embedding gradient
-            static bool debug_weight_ptr = false;
-            if (!debug_weight_ptr && nano_step == 0) {
-                debug_weight_ptr = true;
-                bool dummy_accum = false;
-                Tensor* emb_grad = mGrads.get_param_grad("embedding", dummy_accum);
-                Tensor* lm_grad = mGrads.get_param_grad("lm_head", dummy_accum);
-                fprintf(stderr, "[DSL DEBUG] d_weight_ptr=%p, embedding_grad=%p, lm_head_grad=%p\n",
-                        d_weight_ptr->Data,
-                        emb_grad ? emb_grad->Data : nullptr,
-                        lm_grad ? lm_grad->Data : nullptr);
-            }
-
             const bool accumulate = d_weight_accumulate || (nano_step != 0);
             matmul(*d_weight_ptr, xF_slice, logits,
                    std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    static_cast<int>(C), static_cast<int>(V), static_cast<int>(nano_batch_size),
                    swap_transpose(EMMTranspose::TN), accumulate, mRunState.MainStream);
-
-            // Debug: print d_weight values after first nano_step
-            static bool debug_dweight = false;
-            if (!debug_dweight && nano_step == 0) {
-                debug_dweight = true;
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                if (d_weight_ptr->DType == ETensorDType::BF16) {
-                    nv_bfloat16 dw_bf16[4];
-                    CUDA_CHECK(cudaMemcpy(dw_bf16, d_weight_ptr->get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                    fprintf(stderr, "[DSL DEBUG] d_weight[0..3]: %.8f %.8f %.8f %.8f\n",
-                            (float)dw_bf16[0], (float)dw_bf16[1], (float)dw_bf16[2], (float)dw_bf16[3]);
-                    // Also print a sample from middle of tensor
-                    size_t mid_offset = (V / 2) * C;
-                    CUDA_CHECK(cudaMemcpy(dw_bf16, d_weight_ptr->get<nv_bfloat16>() + mid_offset, 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                    fprintf(stderr, "[DSL DEBUG] d_weight[mid,0..3]: %.8f %.8f %.8f %.8f\n",
-                            (float)dw_bf16[0], (float)dw_bf16[1], (float)dw_bf16[2], (float)dw_bf16[3]);
-                }
-            }
         }
 
         if (d_xF_ptr) {
@@ -3842,25 +3983,6 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                    std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    static_cast<int>(C), static_cast<int>(nano_batch_size), static_cast<int>(V),
                    swap_transpose(EMMTranspose::NN), false, mRunState.MainStream);
-
-            // Debug: print d_xF values
-            static bool debug_dxf = false;
-            if (!debug_dxf) {
-                debug_dxf = true;
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                if (d_xF_slice.DType == ETensorDType::BF16) {
-                    // Print at position 0 (ignore target)
-                    nv_bfloat16 dxf_bf16[4];
-                    CUDA_CHECK(cudaMemcpy(dxf_bf16, d_xF_slice.get<nv_bfloat16>(), 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                    fprintf(stderr, "[DSL DEBUG] d_xF[row0,0..3]: %.8f %.8f %.8f %.8f (BF16)\n",
-                            (float)dxf_bf16[0], (float)dxf_bf16[1], (float)dxf_bf16[2], (float)dxf_bf16[3]);
-                    // Print at row 94 (valid target) - offset by 94 * C elements
-                    std::size_t row94_offset = 94ULL * C;
-                    CUDA_CHECK(cudaMemcpy(dxf_bf16, d_xF_slice.get<nv_bfloat16>() + row94_offset, 4 * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                    fprintf(stderr, "[DSL DEBUG] d_xF[row94,0..3]: %.8f %.8f %.8f %.8f (BF16)\n",
-                            (float)dxf_bf16[0], (float)dxf_bf16[1], (float)dxf_bf16[2], (float)dxf_bf16[3]);
-                }
-            }
         }
     }
 
@@ -3877,6 +3999,24 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mTemps.clear();
     mTensorMap.clear();
     mCurrentLayer = -1;
+
+    // Match GraphExecutor behavior: initialize loss/counter buffers for full forward runs.
+    // This avoids stale accumulation when tests call CompiledExecutor directly.
+    if (full) {
+        bool has_loss_op = false;
+        for (const auto& op : graph.ops) {
+            if (op.type == CompiledOpType::CrossEntropyLoss ||
+                op.type == CompiledOpType::FusedLMHeadLoss) {
+                has_loss_op = true;
+                break;
+            }
+        }
+        if (has_loss_op) {
+            fill_zero(mRunState.Losses, mRunState.MainStream);
+            fill_zero(mRunState.ValidTokenCount, mRunState.MainStream);
+            fill_zero(mRunState.CorrectCount, mRunState.MainStream);
+        }
+    }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     std::vector<DeviceMemoryStack::Checkpoint> layer_checkpoints;
     std::vector<std::size_t> layer_temp_marks;
@@ -4054,6 +4194,34 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Save stack checkpoint at start of backward - we'll restore per-layer to manage memory
     auto initial_checkpoint = mRunState.Stack.checkpoint();
     int last_layer_restored = -1;
+    auto clear_shared_grads = [&](int layer_idx) {
+        if (!mRunState.large_bwd_temps_on_stack()) {
+            return;
+        }
+        if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
+            return;
+        }
+        auto& grads = mRunState.simplified_grads(layer_idx);
+        if (grads.d_ln2.Data) {
+            fill_zero(grads.d_ln2, mRunState.MainStream);
+        }
+        if (grads.d_att.Data) {
+            fill_zero(grads.d_att, mRunState.MainStream);
+        }
+        if (grads.d_ln1.Data) {
+            fill_zero(grads.d_ln1, mRunState.MainStream);
+        }
+    };
+    auto prune_stack_tensors = [&]() {
+        for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
+            if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
+                !mRunState.Stack.is_live(it->second.Data)) {
+                it = mTensorMap.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
 
     // Bind initial gradient tensors (from loss computation)
     // d_logits is stored in the output buffer after loss backward (only when lmhead_chunks == 1)
@@ -4099,16 +4267,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             mTensorMap[grad_name] = mRunState.non_block_gradients().d_embeddings;
         }
 
-        static bool debug_bind = false;
-        if (!debug_bind) {
-            debug_bind = true;
-            fprintf(stderr, "[DSL BINDING] d_encoded/d_x0 bound to d_embeddings with shape [%ld, %ld, %ld], nelem=%ld\n",
-                    mTensorMap["d_encoded"].Sizes[0], mTensorMap["d_encoded"].Sizes[1],
-                    mTensorMap["d_encoded"].Sizes[2], mTensorMap["d_encoded"].nelem());
-            for (const auto& emb_out : mEmbeddingOutputs) {
-                fprintf(stderr, "[DSL BINDING] d_%s also bound to d_embeddings\n", emb_out.c_str());
-            }
-        }
     }
 
     // Also bind standard inputs that backward ops may reference
@@ -4133,21 +4291,107 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    auto op_layer_idx = [](const CompiledOp& op) -> int {
-        if (op.layer_start >= 0) {
-            return op.layer_start;
+    auto is_grad_ref = [](const TensorRef& ref) -> bool {
+        if (!ref.name.empty() && ref.name.size() > 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
+            return true;
         }
+        switch (ref.slot) {
+            case TensorSlot::BlockDLN1:
+            case TensorSlot::BlockDQKV:
+            case TensorSlot::BlockDAtt:
+            case TensorSlot::BlockDSwiGLU:
+            case TensorSlot::BlockDMLPUp:
+            case TensorSlot::BlockDMLPDown:
+            case TensorSlot::BlockDLN2:
+            case TensorSlot::BlockDResAtt:
+            case TensorSlot::BlockDResFFN:
+            case TensorSlot::DLoss:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    auto ref_layer_idx = [&](const TensorRef& ref) -> int {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+        if (ref.name.empty()) {
+            return -1;
+        }
+        std::string_view name = ref.name;
+        if (name.rfind("saved.", 0) == 0) {
+            name.remove_prefix(6);
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            return layer_idx;
+        }
+        return -1;
+    };
+
+    auto ref_layer_idx_any = [&](const TensorRef& ref) -> int {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+        if (ref.name.empty()) {
+            return -1;
+        }
+        std::string_view name = ref.name;
+        if (name.rfind("d_", 0) == 0) {
+            name.remove_prefix(2);
+        }
+        if (name.rfind("saved.", 0) == 0) {
+            name.remove_prefix(6);
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            return layer_idx;
+        }
+        return -1;
+    };
+
+    auto op_layer_idx = [&](const CompiledOp& op) -> int {
+        int detected_non_grad = -1;
         for (const auto& ref : op.inputs) {
-            if (ref.layer_idx >= 0) {
-                return ref.layer_idx;
+            if (!is_grad_ref(ref)) {
+                const int layer_idx = ref_layer_idx(ref);
+                if (layer_idx >= 0) {
+                    detected_non_grad = std::max(detected_non_grad, layer_idx);
+                }
             }
         }
         for (const auto& ref : op.outputs) {
-            if (ref.layer_idx >= 0) {
-                return ref.layer_idx;
+            if (!is_grad_ref(ref)) {
+                const int layer_idx = ref_layer_idx(ref);
+                if (layer_idx >= 0) {
+                    detected_non_grad = std::max(detected_non_grad, layer_idx);
+                }
             }
         }
-        return -1;
+        return (detected_non_grad >= 0) ? detected_non_grad : -1;
+    };
+
+    auto op_layer_idx_any = [&](const CompiledOp& op) -> int {
+        int detected_any = -1;
+        for (const auto& ref : op.inputs) {
+            const int layer_idx = ref_layer_idx_any(ref);
+            if (layer_idx >= 0) {
+                detected_any = std::max(detected_any, layer_idx);
+            }
+        }
+        for (const auto& ref : op.outputs) {
+            const int layer_idx = ref_layer_idx_any(ref);
+            if (layer_idx >= 0) {
+                detected_any = std::max(detected_any, layer_idx);
+            }
+        }
+        if (op.attrs.layer_idx >= 0) {
+            detected_any = std::max(detected_any, op.attrs.layer_idx);
+        }
+        return detected_any;
     };
 
     const bool skip_logits_grad = (mOptions.LMHeadChunks > 1);
@@ -4164,8 +4408,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return false;
     };
 
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
+    std::vector<bool> layer_seen_any(num_layers, false);
+    for (const auto& op : graph.ops) {
+        if (op.layer_start >= 0 && op.layer_start < num_layers) {
+            layer_start_indices[op.layer_start] = &op - graph.ops.data();
+        }
+    }
+
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
+        const int op_layer_any = op_layer_idx_any(op);
 
         if (skip_logits_grad && is_logits_grad_op(op)) {
             continue;
@@ -4173,21 +4427,33 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
         if (op.layer_start >= 0) {
             handle_layer_start(op.layer_start);
+            if (mRecomputeEnabled && mRecomputeFn) {
+                const int layer_idx = op.layer_start;
+                if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
+                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
+                        clear_shared_grads(layer_idx);
+                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
+                    }
+                    mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                    mLastRecomputeLayer = layer_idx;
+                }
+            }
         }
 
         if (mRecomputeEnabled && mRecomputeFn) {
             const int layer_idx = op_layer_idx(op);
             if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                // Debug: print BEFORE recomputation for first few layers
-                if (debug_backward_enabled() && layer_idx <= 5) {
-                    fprintf(stderr, "[DSL BACKWARD] === About to recompute layer %d (op idx=%zu, type=%d, id=%s) ===\n",
-                            layer_idx, idx, static_cast<int>(op.type), op.op_id.c_str());
-                }
-                mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
-                mLastRecomputeLayer = layer_idx;
-                // Debug: print layer boundary info after recomputation
-                if (debug_backward_enabled() && layer_idx <= 5) {
-                    fprintf(stderr, "[DSL BACKWARD] === Recomputed layer %d, starting backward ops ===\n", layer_idx);
+                const std::size_t start_idx =
+                    (layer_idx < num_layers) ? layer_start_indices[static_cast<std::size_t>(layer_idx)] : SIZE_MAX;
+                const bool missing_start = start_idx == SIZE_MAX;
+                const bool op_before_start = start_idx != SIZE_MAX && start_idx > idx;
+                if (missing_start || op_before_start) {
+                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
+                        clear_shared_grads(layer_idx);
+                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
+                    }
+                    mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                    mLastRecomputeLayer = layer_idx;
                 }
             }
         }
@@ -4274,23 +4540,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // This prevents memory accumulation during backward pass
             // Option 1: At layer boundaries if annotated
             if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
-                // Debug: print gradient statistics at layer boundary BEFORE cleanup
-                // (d_qkv, d_mlp_up, d_swiglu are on stack and will be nulled after restore)
-                if (debug_backward_enabled() && (op.layer_end == 0 || op.layer_end == 1 || op.layer_end == mConfig.NumLayers - 1)) {
-                    auto& grads = mRunState.simplified_grads(op.layer_end);
-                    fprintf(stderr, "[DSL BACKWARD] === Layer %d backward complete ===\n", op.layer_end);
-                    print_grad_stats("d_ln1", op.layer_end, grads.d_ln1, mRunState.MainStream);
-                    print_grad_stats("d_qkv", op.layer_end, grads.d_qkv, mRunState.MainStream);
-                    print_grad_stats("d_att", op.layer_end, grads.d_att, mRunState.MainStream);
-                    print_grad_stats("d_res_att", op.layer_end, grads.d_res_att, mRunState.MainStream);
-                    print_grad_stats("d_ln2", op.layer_end, grads.d_ln2, mRunState.MainStream);
-                    print_grad_stats("d_mlp_up", op.layer_end, grads.d_mlp_up, mRunState.MainStream);
-                    print_grad_stats("d_swiglu", op.layer_end, grads.d_swiglu, mRunState.MainStream);
-                    print_grad_stats("d_res_ffn", op.layer_end, grads.d_res_ffn, mRunState.MainStream);
-                }
-                // Restore stack and clear temps AFTER debug prints
+                // Restore stack and clear temps
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
+                prune_stack_tensors();
                 // Note: cudnn_workspace is persistently allocated, no need to clear
                 // Clear stack-allocated tensor pointers in simplified_acts/grads for this layer.
                 // These pointers become stale after checkpoint restore.
@@ -4311,6 +4564,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             else if (!mRecomputeEnabled && (idx + 1) % 20 == 0) {
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
+                prune_stack_tensors();
             }
         } catch (const std::exception& e) {
             std::ostringstream oss;
@@ -4318,10 +4572,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 << ", id=" << op.op_id << "): " << e.what();
             throw std::runtime_error(oss.str());
         }
+
     }
 
     // Final cleanup
     mRunState.Stack.restore(initial_checkpoint);
+    prune_stack_tensors();
     mTemps.clear();
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {

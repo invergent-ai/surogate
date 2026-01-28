@@ -298,7 +298,7 @@ NB_MODULE(_surogate, m) {
         "Backwards-compatibility: `LLamaOptions` is an alias of this class.")
         .def("__init__", [](RuntimeOptions *t, bool recompute_swiglu, bool recompute_rmsnorm,
             bool recompute_ffn, bool recompute_mlp_down, bool recompute_qkv, bool recompute_qk_norm,
-            bool recompute_rope, bool recompute_att, bool recompute_out_proj, bool recompute_block, bool recompute_lora, bool offload_residual,
+            bool recompute_rope, bool recompute_att, bool recompute_out_proj, bool recompute_block, bool offload_residual,
             bool use_cuda_graphs, bool trigger_timing_events,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
@@ -334,7 +334,6 @@ NB_MODULE(_surogate, m) {
                 .RecomputeAtt = recompute_att,
                 .RecomputeOutProj = recompute_out_proj,
                 .RecomputeBlock = recompute_block,
-                .RecomputeLoRA = recompute_lora,
                 .OffloadResidual = offload_residual,
                 .LMHeadChunks = lmhead_chunks,
                 .AttBwdChunks = attn_bwd_chunks,
@@ -372,7 +371,6 @@ NB_MODULE(_surogate, m) {
              nb::arg("recompute_att") = false,
              nb::arg("recompute_out_proj") = false,
              nb::arg("recompute_block") = false,
-             nb::arg("recompute_lora") = false,
              nb::arg("offload_residual") = false,
              nb::arg("use_cuda_graphs") = true,
              nb::arg("trigger_timing_events") = false,
@@ -428,7 +426,6 @@ NB_MODULE(_surogate, m) {
         .def_rw("recompute_att", &RuntimeOptions::RecomputeAtt, "Recompute attention in backward.")
         .def_rw("recompute_out_proj", &RuntimeOptions::RecomputeOutProj, "Recompute attention output projection in backward.")
         .def_rw("recompute_block", &RuntimeOptions::RecomputeBlock, "Recompute the whole block (coarse-grained).")
-        .def_rw("recompute_lora", &RuntimeOptions::RecomputeLoRA, "Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models).")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")

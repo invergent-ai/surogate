@@ -17,7 +17,6 @@ save_steps: 0
 learning_rate: 2e-4
 
 recipe: bf16
-recompute_lora: true
 lmhead_chunks: 8
 warmup_steps: 20
 

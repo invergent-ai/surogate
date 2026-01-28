@@ -5,16 +5,18 @@ apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
+max_steps: 15
 
 sample_packing: true
 sequence_len: 2048
+use_cuda_graphs: false
+recompute_block: true
+use_dsl_ir: true
+offload_residual: false
 
-max_steps: 5
-
-learning_rate: 1e-4
+learning_rate: 1e-5
 
 recipe: bf16
-
 lora: false
 
 dataloader_num_workers: 4

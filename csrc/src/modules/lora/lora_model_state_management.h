@@ -95,8 +95,8 @@ void ModularLoRAModel<Block>::allocate_run_state(const RuntimeOptions& options, 
     if (qlora_enabled() && mFP4WeightProvider) {
         model_opts.use_cuda_graphs = false;
     }
-    // recompute_lora + offload_residuals: CUDA graphs must be disabled.
-    if (model_opts.recompute_lora && model_opts.offload_residuals) {
+    // recompute_block + offload_residuals: CUDA graphs must be disabled.
+    if (model_opts.recompute_block && model_opts.offload_residuals) {
         model_opts.use_cuda_graphs = false;
     }
     // MoE + LoRA: CUDA graphs must be disabled because the MoE forward pass
@@ -178,8 +178,8 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
     mLoRARunState->norm_buffer = mAllocator->allocate(
         ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 2});
 
-    // Allocate recompute buffers only when recompute_lora is enabled
-    if (rs.config().recompute_lora) {
+    // Allocate recompute buffers only when recompute_block is enabled
+    if (rs.config().recompute_block) {
         const int C = (int)cfg.HiddenSize;
         mLoRARunState->recompute_ln = mAllocator->allocate(
             work_dtype, "lora_recompute_ln", EAllocationType::ON_DEVICE, {B, T, C});

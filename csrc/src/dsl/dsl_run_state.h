@@ -142,7 +142,6 @@ private:
     Tensor mStackBuffer{};
     bool mStackSimulate = false;
     bool mRecomputeBlock = false;
-    bool mRecomputeLoRA = false;
     bool mLoraOnlyMode = false;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;

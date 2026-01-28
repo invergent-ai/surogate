@@ -29,7 +29,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
       mRecomputeBlock(options.RecomputeBlock),
-      mRecomputeLoRA(options.RecomputeLoRA),
       mLoraOnlyMode(lora_only_mode),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
@@ -58,13 +57,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     mLMHeadChunks = options.LMHeadChunks;
     mAttnBwdChunks = options.AttBwdChunks;
     mStackSimulate = !allocate_stack;
-
-    // Match GraphExecutor's recompute behavior in LoRA-only mode.
-    // When recompute_block is disabled for LoRA (no recompute_lora), we must
-    // avoid stack/shared activation layouts that assume full recomputation.
-    if (mLoraOnlyMode && !mRecomputeLoRA) {
-        mRecomputeBlock = false;
-    }
 
     const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
     if (allocate_stack) {
@@ -191,7 +183,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // backward will recompute them anyway. Only att/swiglu need special LoRA handling
     // because they are inputs to O-proj and down-proj LoRA backward respectively.
     const bool lora_only = mLoraOnlyMode;
-    const bool lora_can_share_ln = !lora_only || mRecomputeLoRA;
+    const bool lora_can_share_ln = !lora_only || mRecomputeBlock;
     const bool lora_can_share_att = !lora_only;  // att needed per-layer for O-proj LoRA backward
     const bool lora_can_share_swiglu = !lora_only;  // swiglu needed per-layer for down-proj LoRA backward
     const bool share_ln1 = lora_can_share_ln && mRecomputeBlock;
@@ -309,9 +301,13 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto kind = EAllocationType::ON_DEVICE;
 
     // Gradient sharing flags - match modular path (run_state_impl.tpp)
-    const bool share_grads = mRecomputeBlock;
-    const bool share_res_ffn = mRecomputeBlock;
-    const bool share_mlp_down = mRecomputeBlock;
+    // IMPORTANT: In FFT mode (not lora_only), gradient buffer sharing can cause issues because
+    // the DSL backward graph structure differs from LoRA mode. The gradients may be needed
+    // at different points in the backward pass, and sharing can cause corruption.
+    // For safety, disable all gradient sharing in FFT mode with recompute_block.
+    const bool share_grads = mRecomputeBlock && mLoraOnlyMode;
+    const bool share_res_ffn = mRecomputeBlock && mLoraOnlyMode;
+    const bool share_mlp_down = mRecomputeBlock && mLoraOnlyMode;
     const bool large_bwd_temps_on_stack = mRecomputeBlock;
 
     if (mStackSimulate && large_bwd_temps_on_stack) {
@@ -370,6 +366,25 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
                                       : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
         g.d_att = share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, AttnDim});
         g.d_ln1 = share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
+    }
+
+    // Debug: print gradient buffer pointers when SUROGATE_DSL_DEBUG_GRAD_BUFFERS is set
+    if (std::getenv("SUROGATE_DSL_DEBUG_GRAD_BUFFERS")) {
+        std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] share_grads=%d share_res_ffn=%d share_mlp_down=%d\n",
+                     share_grads, share_res_ffn, share_mlp_down);
+        if (share_res_ffn) {
+            std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] mSharedDResFFN[0]=%p mSharedDResFFN[1]=%p\n",
+                         mSharedDResFFN[0].Data, mSharedDResFFN[1].Data);
+        }
+        if (share_mlp_down) {
+            std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] mSharedDMlpDown[0]=%p mSharedDMlpDown[1]=%p\n",
+                         mSharedDMlpDown[0].Data, mSharedDMlpDown[1].Data);
+        }
+        for (int i = 0; i < cfg.NumLayers; ++i) {
+            auto& g = mSimplifiedGradients[i];
+            std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] layer=%d d_res_ffn=%p d_mlp_down=%p (bucket=%d)\n",
+                         i, g.d_res_ffn.Data, g.d_mlp_down.Data, i % 2);
+        }
     }
 
     // Preserve the original buffer pointers so we can restore them if the

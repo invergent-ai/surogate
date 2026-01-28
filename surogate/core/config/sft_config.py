@@ -92,11 +92,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         recompute_block (Optional[bool], defaults to True):
             Whether to enable recompute for entire Transformer block to save memory during training.
             This reduces GPU memory usage but slows down training.
-        recompute_lora (Optional[bool], defaults to False):
-            Recompute ln1/ln2 activations during LoRA backward pass instead of storing per-layer.
-            Only effective when LoRA is enabled. It requires and sets recompute_block to True.
-            When used together with offload_residual, it disables CUDA graphs.
-
         offload_residual (Optional[bool], defaults to False):
             Offload the residuals (of the ffn block; the only remaining part of the block that is not recomputed) to pinned host memory.
             Combined with --recompute-block, the total activation memory consumption becomes independent of the network depth.
@@ -298,7 +293,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     recompute_att: Optional[bool] = True
     recompute_out_proj: Optional[bool] = True
     recompute_block: Optional[bool] = True
-    recompute_lora: Optional[bool] = False
 
     offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
@@ -410,7 +404,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.recompute_att = cfg.get('recompute_att', self.recompute_att)
         self.recompute_out_proj = cfg.get('recompute_out_proj', self.recompute_out_proj)
         self.recompute_block = cfg.get('recompute_block', self.recompute_block)
-        self.recompute_lora = cfg.get('recompute_lora', self.recompute_lora)
 
         self.offload_residual = cfg.get('offload_residual', self.offload_residual)
         self.offload_master = cfg.get('offload_master', self.offload_master)
@@ -506,6 +499,31 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         if self.recompute_ffn:
             self.recompute_swiglu = True
             
+        if self.recompute_block is False:
+            # When recompute_block is explicitly False, disable selective recomputation
+            # unless the user explicitly enabled specific options in their config.
+            # This ensures "recompute_block: false" gives deterministic backward behavior.
+            if 'recompute_att' not in cfg:
+                self.recompute_att = False
+            if 'recompute_ffn' not in cfg:
+                self.recompute_ffn = False
+            if 'recompute_rmsnorm' not in cfg:
+                self.recompute_rmsnorm = False
+            if 'recompute_qkv' not in cfg:
+                self.recompute_qkv = False
+            if 'recompute_out_proj' not in cfg:
+                self.recompute_out_proj = False
+            if 'recompute_swiglu' not in cfg:
+                self.recompute_swiglu = False
+            if 'recompute_mlp_down' not in cfg:
+                self.recompute_mlp_down = False
+
+        if self.recompute_att:
+            self.recompute_qkv = True
+
+        if self.recompute_ffn:
+            self.recompute_swiglu = True
+
         # Parse distributed config
         distributed_cfg = cfg.get('distributed', None)
         if distributed_cfg:
@@ -647,6 +665,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         if self.zero_level >= 3:
             shard_weights = True
 
+        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
+            self.recompute_block = True
+            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
+
+        if self.lora and self.recompute_block and self.offload_residual:
+            self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with block recompute
+
         # Handle recomputation hierarchy (block -> att/ffn -> individual components)
         recompute_block = self.recompute_block
         recompute_att = self.recompute_att or recompute_block
@@ -658,16 +683,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         recompute_mlp_down = self.recompute_mlp_down or recompute_block
         recompute_swiglu = self.recompute_swiglu or recompute_ffn
         recompute_rmsnorm = self.recompute_rmsnorm or recompute_block
-        
-        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
-            self.recompute_lora = True
-            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
-            
-        if self.recompute_lora:
-            self.recompute_block = True  # Enforce block recompute if LoRA recompute is enabled            
-            if self.offload_residual:
-                self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with LoRA recompute
-            
+
         self.runtime_config = _surogate.RuntimeOptions(
             recompute_swiglu=recompute_swiglu,
             recompute_rmsnorm=recompute_rmsnorm,
@@ -679,7 +695,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             recompute_att=recompute_att,
             recompute_out_proj=recompute_out_proj,
             recompute_block=recompute_block,
-            recompute_lora=self.recompute_lora,
             offload_residual=self.offload_residual,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,

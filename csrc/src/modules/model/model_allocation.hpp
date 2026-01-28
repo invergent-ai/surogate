@@ -61,7 +61,6 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     rs_config.lmhead_chunks = options.lmhead_chunks;
     rs_config.attention_bwd_chunks = options.attention_bwd_chunks;
     rs_config.lora_only_mode = options.lora_only_mode;
-    rs_config.recompute_lora = options.recompute_lora;
     rs_config.train_router = options.train_router;
     rs_config.use_fused_rope = options.use_fused_rope;
 

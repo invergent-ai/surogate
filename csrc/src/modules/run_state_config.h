@@ -86,16 +86,6 @@ struct ModularRunStateConfig {
     // - att_out, mlp_down (not needed for LoRA)
     bool lora_only_mode = false;
 
-    // LoRA activation recomputation mode: recompute ln1/ln2/att during LoRA backward
-    // instead of storing per-layer. This allows activation buffer sharing across layers
-    // even in LoRA mode, trading compute for memory (~600MB savings for 4B model).
-    // When enabled:
-    // - ln1/ln2 are recomputed from residual stream during LoRA QKV/MLP backward
-    // - att is recomputed during LoRA O backward
-    // - swiglu is recomputed during LoRA down backward (uses existing recompute_swiglu)
-    // Requires: recompute_block or (recompute_attention + recompute_ffn)
-    bool recompute_lora = false;
-
     // Train MoE router gate during LoRA fine-tuning
     // When enabled, router gradients are computed even in lora_only mode
     bool train_router = false;

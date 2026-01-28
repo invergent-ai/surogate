@@ -26,8 +26,7 @@ namespace dsl {
 // ============================================================================
 
 void GraphExecutor::init_recompute_flags() {
-    const bool disable_recompute_block = mRunState.is_lora_only_mode() && !mOptions.RecomputeLoRA;
-    const bool recompute_block = mOptions.RecomputeBlock && !disable_recompute_block;
+    const bool recompute_block = mOptions.RecomputeBlock;
 
     // Check if LoRA is enabled and needs activations for backward
     const bool lora_needs_activations = mLoRAConfig && mLoRAConfig->enabled() &&
@@ -172,8 +171,9 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
     };
 
     // Residual input to this layer:
-    // - Layer 0: input is the encoded embeddings (equivalent to res_ffn[0])
-    // - Layer L>0: input is the residual stream for THIS layer (res_ffn[L])
+    // - Layer 0: input is the encoded embeddings
+    // - Layer L>0: input is the residual stream for THIS layer (res_ffn[L]),
+    //   which is produced by the LN1 fused-residual op in the DSL block.
     Tensor& res_in = (layer_idx == 0)
         ? rs.non_block_activations().encoded
         : rs.get_residual(layer_idx, rs.MainStream);

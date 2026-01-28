@@ -9,11 +9,12 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 10
+max_steps: 50
 
-learning_rate: 1e-4
-
+learning_rate: 2e-4
 recipe: bf16
+use_cuda_graphs: false
+recompute_block: true
 
 lora: true
 lora_rank: 16

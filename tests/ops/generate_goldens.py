@@ -105,6 +105,18 @@ def _precompute_freqs_cis(dim: int, end: int, theta: float) -> np.ndarray:
     return freqs
 
 
+def _precompute_freqs_cis_complex(dim: int, end: int, theta: float) -> np.ndarray:
+    """Compute RoPE frequencies in 3D complex format [T, D//2, 2] for DSL."""
+    freqs = np.zeros((end, dim // 2, 2), dtype=np.float64)
+    for i in range(dim // 2):
+        inv_freq = 1.0 / (theta ** ((2 * i) / dim))
+        for t in range(end):
+            angle = t * inv_freq
+            freqs[t, i, 0] = np.cos(angle)  # real part
+            freqs[t, i, 1] = np.sin(angle)  # imaginary part
+    return freqs
+
+
 def _rope_forward_cpu(qkv: np.ndarray, freqs: np.ndarray, position_ids: np.ndarray | None,
                       Hq: int, Hkv: int, head_dim: int, rotary_dim: int) -> np.ndarray:
     B, T, _ = qkv.shape
@@ -1476,9 +1488,1147 @@ def gen_swiglu() -> List[GoldenCase]:
     return [GoldenCase(op="swiglu", case="small_case_1", payload=payload)]
 
 
+def gen_swiglu_mlp() -> List[GoldenCase]:
+    """Generate SwiGLU MLP golden test (composed: matmul -> swiglu -> matmul)."""
+    if torch is None:
+        raise RuntimeError("PyTorch required for module golden generation")
+
+    B, T, C, M = 2, 4, 128, 256
+
+    # Initialize weights
+    np.random.seed(42)
+    up_weight = np.random.randn(2 * M, C).astype(np.float64) * 0.02
+    down_weight = np.random.randn(C, M).astype(np.float64) * 0.02
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.5
+
+    # Forward pass with PyTorch
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    up_w_t = torch.tensor(up_weight, dtype=torch.float64, requires_grad=True)
+    down_w_t = torch.tensor(down_weight, dtype=torch.float64, requires_grad=True)
+
+    # MLP forward: x -> matmul(up) -> swiglu -> matmul(down)
+    x_flat = x_t.reshape(B * T, C)
+    up_out = x_flat @ up_w_t.T  # (B*T, 2*M)
+    up_3d = up_out.reshape(B, T, 2 * M)
+
+    # SwiGLU
+    gate = up_3d[..., :M]
+    up = up_3d[..., M:]
+    swiglu_out = gate * up * torch.sigmoid(up)  # (B, T, M)
+
+    # Down projection
+    swiglu_flat = swiglu_out.reshape(B * T, M)
+    out_flat = swiglu_flat @ down_w_t.T
+    out = out_flat.reshape(B, T, C)
+
+    # Backward pass
+    d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_out_t = torch.tensor(d_out, dtype=torch.float64)
+    d_x, d_up_w, d_down_w = torch.autograd.grad(
+        out, (x_t, up_w_t, down_w_t),
+        grad_outputs=d_out_t
+    )
+
+    # Save intermediate activations for verification
+    up_3d_np = up_3d.detach().numpy()
+    swiglu_out_np = swiglu_out.detach().numpy()
+
+    payload = {
+        "op": "swiglu_mlp",
+        "case": "small_case_1",
+        "attrs": {},
+        "inputs": {
+            "x": _tensor_payload(x),
+            "up_weight": _tensor_payload(up_weight),
+            "down_weight": _tensor_payload(down_weight),
+        },
+        "outputs": {
+            "out": _tensor_payload(out.detach().numpy()),
+            "up": _tensor_payload(up_3d_np),  # intermediate
+            "swiglu": _tensor_payload(swiglu_out_np),  # intermediate
+        },
+        "grads": {
+            "d_out": _tensor_payload(d_out),
+            "d_x": _tensor_payload(d_x.numpy()),
+            "d_up_weight": _tensor_payload(d_up_w.numpy()),
+            "d_down_weight": _tensor_payload(d_down_w.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "M": M,
+            "note": "SwiGLU MLP: x -> up_proj -> swiglu -> down_proj",
+        },
+    }
+    return [GoldenCase(op="swiglu_mlp", case="small_case_1", payload=payload)]
+
+
+def gen_gqa_attention() -> List[GoldenCase]:
+    """Generate GQA Attention golden test (composed: qkv_proj -> rope -> flash_attn -> out_proj)."""
+    if torch is None:
+        raise RuntimeError("PyTorch required for module golden generation")
+
+    B, T = 2, 8
+    C = 256  # d_model
+    Hq, Hkv = 4, 2  # num_query_heads, num_kv_heads
+    HD = 64  # head_dim
+    QKV = (Hq + 2 * Hkv) * HD
+
+    # Initialize weights
+    np.random.seed(43)
+    qkv_weight = np.random.randn(QKV, C).astype(np.float64) * 0.02
+    out_weight = np.random.randn(C, Hq * HD).astype(np.float64) * 0.02
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    freqs = _precompute_freqs_cis_complex(HD, T, 10000.0)  # 3D format [T, D//2, 2]
+    pos_ids = np.arange(T, dtype=np.int32)  # 1D format [T]
+
+    # Forward with PyTorch
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    qkv_w_t = torch.tensor(qkv_weight, dtype=torch.float64, requires_grad=True)
+    out_w_t = torch.tensor(out_weight, dtype=torch.float64, requires_grad=True)
+    freqs_t = torch.tensor(freqs, dtype=torch.float64)
+
+    # QKV projection
+    x_flat = x_t.reshape(B * T, C)
+    qkv_flat = x_flat @ qkv_w_t.T
+    qkv_packed = qkv_flat.reshape(B, T, Hq + 2 * Hkv, HD)
+
+    # Apply RoPE
+    qkv_rope = _torch_rope(qkv_packed, freqs_t, pos_ids, Hq, Hkv, HD)
+
+    # Flash Attention (PyTorch reference for autograd)
+    attn_out, lse = _torch_flash_attention_ref(qkv_rope, B, T, Hq, Hkv, HD, causal=True)
+
+    # Output projection
+    attn_flat = attn_out.reshape(B * T, Hq * HD)
+    out_flat = attn_flat @ out_w_t.T
+    out = out_flat.reshape(B, T, C)
+
+    # Backward pass
+    d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_out_t = torch.tensor(d_out, dtype=torch.float64)
+    d_x, d_qkv_w, d_out_w = torch.autograd.grad(
+        out, (x_t, qkv_w_t, out_w_t),
+        grad_outputs=d_out_t
+    )
+
+    # Save intermediates
+    qkv_packed_np = qkv_packed.detach().numpy()
+    qkv_rope_np = qkv_rope.detach().numpy()
+    attn_out_np = attn_out.detach().numpy()
+    lse_np = lse.detach().numpy()
+
+    payload = {
+        "op": "gqa_attention",
+        "case": "small_case_1",
+        "attrs": {"causal": True},
+        "inputs": {
+            "x": _tensor_payload(x),
+            "qkv_weight": _tensor_payload(qkv_weight),
+            "out_weight": _tensor_payload(out_weight),
+            "rope_freqs": _tensor_payload(freqs),
+            "position_ids": _tensor_payload(pos_ids, dtype="int32"),
+        },
+        "outputs": {
+            "out": _tensor_payload(out.detach().numpy()),
+            "qkv": _tensor_payload(qkv_packed_np),  # intermediate
+            "qkv_rope": _tensor_payload(qkv_rope_np.reshape(B, T, QKV)),  # intermediate
+            "attn_out": _tensor_payload(attn_out_np.reshape(B, T, Hq * HD)),  # intermediate
+            "lse": _tensor_payload(lse_np),  # intermediate
+        },
+        "grads": {
+            "d_out": _tensor_payload(d_out),
+            "d_x": _tensor_payload(d_x.numpy()),
+            "d_qkv_weight": _tensor_payload(d_qkv_w.numpy()),
+            "d_out_weight": _tensor_payload(d_out_w.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "Hq": Hq,
+            "Hkv": Hkv,
+            "head_dim": HD,
+            "note": "GQA Attention: x -> qkv_proj -> rope -> flash_attn -> out_proj",
+        },
+    }
+    return [GoldenCase(op="gqa_attention", case="small_case_1", payload=payload)]
+
+
+def _torch_flash_attention_ref(qkv: torch.Tensor, B: int, T: int, Hq: int, Hkv: int, HS: int, causal: bool):
+    """PyTorch flash attention reference (supports autograd)."""
+    N = Hq + 2 * Hkv
+    qkv4 = qkv.reshape(B, T, N, HS)
+    q = qkv4[:, :, :Hq, :]
+    k = qkv4[:, :, Hq:Hq + Hkv, :]
+    v = qkv4[:, :, Hq + Hkv:, :]
+
+    group = Hq // Hkv
+    scale = 1.0 / np.sqrt(HS)
+
+    # Reshape for batched ops: (B, Hq, T, HS)
+    q = q.permute(0, 2, 1, 3)  # (B, Hq, T, HS)
+    k = k.permute(0, 2, 1, 3)  # (B, Hkv, T, HS)
+    v = v.permute(0, 2, 1, 3)  # (B, Hkv, T, HS)
+
+    # Repeat KV for GQA
+    k = k.repeat_interleave(group, dim=1)  # (B, Hq, T, HS)
+    v = v.repeat_interleave(group, dim=1)  # (B, Hq, T, HS)
+
+    # Compute attention scores
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, Hq, T, T)
+
+    # Apply causal mask
+    if causal:
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=scores.device), diagonal=1)
+        scores = scores.masked_fill(mask, float('-inf'))
+
+    # Compute LSE (logsumexp) for each query position
+    lse = torch.logsumexp(scores, dim=-1)  # (B, Hq, T)
+
+    # Softmax
+    attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, Hq, T, T)
+
+    # Apply attention
+    out = torch.matmul(attn_weights, v)  # (B, Hq, T, HS)
+
+    # Reshape back
+    out = out.permute(0, 2, 1, 3).reshape(B, T, Hq, HS)  # (B, T, Hq, HS)
+
+    return out, lse
+
+
+def _torch_rope(qkv: torch.Tensor, freqs: torch.Tensor, position_ids: np.ndarray,
+                Hq: int, Hkv: int, head_dim: int) -> torch.Tensor:
+    """Apply RoPE using PyTorch (for golden generation).
+
+    Args:
+        qkv: [B, T, N, HD] where N = Hq + 2*Hkv
+        freqs: [T, HD//2, 2] - complex format (cos, sin)
+        position_ids: [T] - 1D position indices
+    """
+    B, T, N, HD = qkv.shape
+    rotary_half = HD // 2
+
+    out = qkv.clone()
+    for b in range(B):
+        for t in range(T):
+            t_pos = int(position_ids[t])  # 1D position_ids
+            cos_vals = freqs[t_pos, :, 0]  # [HD//2] cos values
+            sin_vals = freqs[t_pos, :, 1]  # [HD//2] sin values
+
+            for h in range(N):
+                # Q and K get RoPE, V passes through
+                if h >= Hq and h < Hq + Hkv:
+                    qkv_type = 1  # K
+                elif h < Hq:
+                    qkv_type = 0  # Q
+                else:
+                    qkv_type = 2  # V
+                    continue
+
+                # Clone to avoid in-place modification issue - real/imag are views,
+                # so writing to out[..., :rotary_half] modifies what real points to
+                real = out[b, t, h, :rotary_half].clone()
+                imag = out[b, t, h, rotary_half:2*rotary_half].clone()
+
+                out[b, t, h, :rotary_half] = real * cos_vals - imag * sin_vals
+                out[b, t, h, rotary_half:2*rotary_half] = real * sin_vals + imag * cos_vals
+
+    return out
+
+
+def gen_embedding_module() -> List[GoldenCase]:
+    """Generate Embedding module golden test (token lookup)."""
+    if torch is None:
+        raise RuntimeError("PyTorch required for module golden generation")
+
+    B, T = 2, 8
+    V = 256  # vocab size
+    C = 128  # embedding dim
+
+    # Initialize weights
+    np.random.seed(50)
+    embed_weight = np.random.randn(V, C).astype(np.float64) * 0.02
+    token_ids = np.random.randint(0, V, size=(B, T), dtype=np.int32)
+
+    # Forward with PyTorch
+    embed_w_t = torch.tensor(embed_weight, dtype=torch.float64, requires_grad=True)
+    token_ids_t = torch.tensor(token_ids, dtype=torch.long)
+
+    # Embedding lookup
+    out = torch.nn.functional.embedding(token_ids_t, embed_w_t)
+
+    # Backward pass
+    d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_out_t = torch.tensor(d_out, dtype=torch.float64)
+    d_embed_w, = torch.autograd.grad(out, (embed_w_t,), grad_outputs=d_out_t)
+
+    payload = {
+        "op": "embedding_module",
+        "case": "small_case_1",
+        "attrs": {},
+        "inputs": {
+            "token_ids": _tensor_payload(token_ids, dtype="int32"),
+            "embedding_weight": _tensor_payload(embed_weight),
+        },
+        "outputs": {
+            "out": _tensor_payload(out.detach().numpy()),
+        },
+        "grads": {
+            "d_out": _tensor_payload(d_out),
+            "d_embedding_weight": _tensor_payload(d_embed_w.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "V": V,
+            "C": C,
+            "note": "Embedding module: token_ids -> embedding lookup -> out",
+        },
+    }
+    return [GoldenCase(op="embedding_module", case="small_case_1", payload=payload)]
+
+
+def gen_rmsnorm_module() -> List[GoldenCase]:
+    """Generate RMSNorm module golden test (fused residual + RMS normalization)."""
+    if torch is None:
+        raise RuntimeError("PyTorch required for module golden generation")
+
+    B, T = 2, 8
+    C = 128  # hidden size
+    eps = 1e-5
+
+    # Initialize
+    np.random.seed(51)
+    residual = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0  # gamma near 1
+
+    # Forward with PyTorch
+    residual_t = torch.tensor(residual, dtype=torch.float64, requires_grad=True)
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    weight_t = torch.tensor(weight, dtype=torch.float64, requires_grad=True)
+
+    # Fused residual + RMSNorm
+    residual_out = residual_t + x_t
+    rms = torch.sqrt(torch.mean(residual_out ** 2, dim=-1, keepdim=True) + eps)
+    rstd = 1.0 / rms
+    y = residual_out * rstd * weight_t
+
+    # Backward pass
+    d_y = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_y_t = torch.tensor(d_y, dtype=torch.float64)
+    d_residual, d_x, d_weight = torch.autograd.grad(
+        y, (residual_t, x_t, weight_t), grad_outputs=d_y_t
+    )
+
+    payload = {
+        "op": "rmsnorm_module",
+        "case": "small_case_1",
+        "attrs": {"eps": eps},
+        "inputs": {
+            "residual": _tensor_payload(residual),
+            "x": _tensor_payload(x),
+            "weight": _tensor_payload(weight),
+        },
+        "outputs": {
+            "residual_out": _tensor_payload(residual_out.detach().numpy()),
+            "y": _tensor_payload(y.detach().numpy()),
+            "rstd": _tensor_payload(rstd.detach().numpy().squeeze(-1)),  # [B, T]
+        },
+        "grads": {
+            "d_y": _tensor_payload(d_y),
+            "d_residual": _tensor_payload(d_residual.numpy()),
+            "d_x": _tensor_payload(d_x.numpy()),
+            "d_weight": _tensor_payload(d_weight.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "eps": eps,
+            "note": "RMSNorm module: residual + x -> fused_residual_rmsnorm -> y",
+        },
+    }
+    return [GoldenCase(op="rmsnorm_module", case="small_case_1", payload=payload)]
+
+
+def gen_transformer_block() -> List[GoldenCase]:
+    """Generate TransformerBlock golden test (attention + MLP with residuals)."""
+    if torch is None:
+        raise RuntimeError("PyTorch required for module golden generation")
+
+    B, T = 2, 4
+    C = 128  # hidden size
+    M = 256  # MLP intermediate size (2x hidden for gate+up fused)
+    Hq, Hkv = 4, 2  # num heads
+    HD = C // Hq  # head dim = 32
+    eps = 1e-5
+
+    QKV = (Hq + 2 * Hkv) * HD
+
+    # Initialize weights
+    np.random.seed(52)
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    ln1_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    qkv_weight = np.random.randn(QKV, C).astype(np.float64) * 0.02
+    out_weight = np.random.randn(C, Hq * HD).astype(np.float64) * 0.02
+    ln2_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    up_weight = np.random.randn(M, C).astype(np.float64) * 0.02
+    down_weight = np.random.randn(C, M // 2).astype(np.float64) * 0.02
+
+    freqs = _precompute_freqs_cis_complex(HD, T, 10000.0)
+    pos_ids = np.arange(T, dtype=np.int32)
+
+    # Forward with PyTorch
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    ln1_w_t = torch.tensor(ln1_weight, dtype=torch.float64, requires_grad=True)
+    qkv_w_t = torch.tensor(qkv_weight, dtype=torch.float64, requires_grad=True)
+    out_w_t = torch.tensor(out_weight, dtype=torch.float64, requires_grad=True)
+    ln2_w_t = torch.tensor(ln2_weight, dtype=torch.float64, requires_grad=True)
+    up_w_t = torch.tensor(up_weight, dtype=torch.float64, requires_grad=True)
+    down_w_t = torch.tensor(down_weight, dtype=torch.float64, requires_grad=True)
+    freqs_t = torch.tensor(freqs, dtype=torch.float64)
+
+    # Pre-attention RMSNorm
+    rms1 = torch.sqrt(torch.mean(x_t ** 2, dim=-1, keepdim=True) + eps)
+    ln1_out = x_t / rms1 * ln1_w_t
+
+    # QKV projection
+    ln1_flat = ln1_out.reshape(B * T, C)
+    qkv_flat = ln1_flat @ qkv_w_t.T
+    qkv = qkv_flat.reshape(B, T, Hq + 2 * Hkv, HD)
+
+    # RoPE
+    qkv_rope = _torch_rope(qkv, freqs_t, pos_ids, Hq, Hkv, HD)
+
+    # Attention
+    attn_out, lse = _torch_flash_attention_ref(qkv_rope, B, T, Hq, Hkv, HD, causal=True)
+
+    # Output projection + residual
+    attn_flat = attn_out.reshape(B * T, Hq * HD)
+    proj_out = attn_flat @ out_w_t.T
+    attn_residual = x_t + proj_out.reshape(B, T, C)
+
+    # Pre-MLP RMSNorm
+    rms2 = torch.sqrt(torch.mean(attn_residual ** 2, dim=-1, keepdim=True) + eps)
+    ln2_out = attn_residual / rms2 * ln2_w_t
+
+    # MLP with SwiGLU
+    ln2_flat = ln2_out.reshape(B * T, C)
+    up_out = ln2_flat @ up_w_t.T  # [B*T, M]
+    gate = up_out[:, :M // 2]
+    up = up_out[:, M // 2:]
+    swiglu_out = torch.nn.functional.silu(gate) * up  # [B*T, M//2]
+    down_out = swiglu_out @ down_w_t.T  # [B*T, C]
+
+    # Final residual
+    out = attn_residual + down_out.reshape(B, T, C)
+
+    # Backward pass
+    d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_out_t = torch.tensor(d_out, dtype=torch.float64)
+
+    grads = torch.autograd.grad(
+        out, (x_t, ln1_w_t, qkv_w_t, out_w_t, ln2_w_t, up_w_t, down_w_t),
+        grad_outputs=d_out_t
+    )
+    d_x, d_ln1_w, d_qkv_w, d_out_w, d_ln2_w, d_up_w, d_down_w = grads
+
+    payload = {
+        "op": "transformer_block",
+        "case": "small_case_1",
+        "attrs": {"eps": eps, "causal": True},
+        "inputs": {
+            "x": _tensor_payload(x),
+            "ln1_weight": _tensor_payload(ln1_weight),
+            "qkv_weight": _tensor_payload(qkv_weight),
+            "out_weight": _tensor_payload(out_weight),
+            "ln2_weight": _tensor_payload(ln2_weight),
+            "up_weight": _tensor_payload(up_weight),
+            "down_weight": _tensor_payload(down_weight),
+            "rope_freqs": _tensor_payload(freqs),
+            "position_ids": _tensor_payload(pos_ids, dtype="int32"),
+        },
+        "outputs": {
+            "out": _tensor_payload(out.detach().numpy()),
+            "ln1_out": _tensor_payload(ln1_out.detach().numpy()),
+            "attn_out": _tensor_payload(attn_out.detach().numpy().reshape(B, T, Hq * HD)),
+            "attn_residual": _tensor_payload(attn_residual.detach().numpy()),
+            "ln2_out": _tensor_payload(ln2_out.detach().numpy()),
+        },
+        "grads": {
+            "d_out": _tensor_payload(d_out),
+            "d_x": _tensor_payload(d_x.numpy()),
+            "d_ln1_weight": _tensor_payload(d_ln1_w.numpy()),
+            "d_qkv_weight": _tensor_payload(d_qkv_w.numpy()),
+            "d_out_weight": _tensor_payload(d_out_w.numpy()),
+            "d_ln2_weight": _tensor_payload(d_ln2_w.numpy()),
+            "d_up_weight": _tensor_payload(d_up_w.numpy()),
+            "d_down_weight": _tensor_payload(d_down_w.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "M": M,
+            "Hq": Hq,
+            "Hkv": Hkv,
+            "head_dim": HD,
+            "eps": eps,
+            "note": "TransformerBlock: x -> ln1 -> attn -> residual -> ln2 -> mlp -> residual -> out",
+        },
+    }
+    return [GoldenCase(op="transformer_block", case="small_case_1", payload=payload)]
+
+
+def gen_lm_head_module() -> List[GoldenCase]:
+    """Generate LMHead module golden test (final norm + projection + loss)."""
+    if torch is None:
+        raise RuntimeError("PyTorch required for module golden generation")
+
+    B, T = 2, 8
+    C = 128  # hidden size
+    V = 256  # vocab size
+    eps = 1e-5
+
+    # Initialize
+    np.random.seed(53)
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    ln_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    lm_head_weight = np.random.randn(V, C).astype(np.float64) * 0.02
+    targets = np.random.randint(0, V, size=(B, T), dtype=np.int32)
+
+    # Forward with PyTorch
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    ln_w_t = torch.tensor(ln_weight, dtype=torch.float64, requires_grad=True)
+    lm_w_t = torch.tensor(lm_head_weight, dtype=torch.float64, requires_grad=True)
+    targets_t = torch.tensor(targets, dtype=torch.long)
+
+    # Final RMSNorm
+    rms = torch.sqrt(torch.mean(x_t ** 2, dim=-1, keepdim=True) + eps)
+    ln_out = x_t / rms * ln_w_t
+
+    # LM Head projection
+    ln_flat = ln_out.reshape(B * T, C)
+    logits = ln_flat @ lm_w_t.T  # [B*T, V]
+    logits_3d = logits.reshape(B, T, V)
+
+    # Cross-entropy loss
+    loss = torch.nn.functional.cross_entropy(
+        logits_3d.reshape(-1, V), targets_t.reshape(-1), reduction='mean'
+    )
+
+    # Backward pass
+    d_loss = torch.ones_like(loss)
+    d_x, d_ln_w, d_lm_w = torch.autograd.grad(
+        loss, (x_t, ln_w_t, lm_w_t), grad_outputs=d_loss
+    )
+
+    payload = {
+        "op": "lm_head_module",
+        "case": "small_case_1",
+        "attrs": {"eps": eps},
+        "inputs": {
+            "x": _tensor_payload(x),
+            "ln_weight": _tensor_payload(ln_weight),
+            "lm_head_weight": _tensor_payload(lm_head_weight),
+            "targets": _tensor_payload(targets, dtype="int32"),
+        },
+        "outputs": {
+            "ln_out": _tensor_payload(ln_out.detach().numpy()),
+            "logits": _tensor_payload(logits_3d.detach().numpy()),
+            "loss": _tensor_payload(np.array([loss.item()])),
+        },
+        "grads": {
+            "d_x": _tensor_payload(d_x.numpy()),
+            "d_ln_weight": _tensor_payload(d_ln_w.numpy()),
+            "d_lm_head_weight": _tensor_payload(d_lm_w.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "V": V,
+            "eps": eps,
+            "note": "LMHead module: x -> rmsnorm -> lm_head -> cross_entropy -> loss",
+        },
+    }
+    return [GoldenCase(op="lm_head_module", case="small_case_1", payload=payload)]
+
+
+def gen_llama_block() -> List[GoldenCase]:
+    """Generate LlamaBlock golden test.
+
+    Matches the structure from surogate/dsl/blocks/llama.py:
+    - fused_residual_rmsnorm (pre-attention)
+    - QKV projection (no bias)
+    - RoPE (no QK-Norm)
+    - FlashAttention (causal)
+    - Output projection
+    - fused_residual_rmsnorm (pre-MLP)
+    - MLP with SwiGLU
+    - Returns (out, residual_out)
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch required for block golden generation")
+
+    B, T = 2, 4
+    Hq, Hkv = 4, 2  # num_query_heads, num_kv_heads
+    HD = 64  # head_size (must be 64 or 128 for CUDA attention kernel)
+    C = Hq * HD  # d_model (hidden size) = 256
+    M = 512  # d_ff (intermediate size for MLP), gate+up is 2*M
+    eps = 1e-6
+    max_seq = 64
+
+    QKV = (Hq + 2 * Hkv) * HD
+    AttnDim = Hq * HD
+    MUp = 2 * M  # gate + up fused
+
+    # Initialize weights
+    np.random.seed(60)
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    residual = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    ln1_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    qkv_weight = np.random.randn(QKV, C).astype(np.float64) * 0.02
+    out_weight = np.random.randn(C, AttnDim).astype(np.float64) * 0.02
+    ln2_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    mlp_up_weight = np.random.randn(MUp, C).astype(np.float64) * 0.02
+    mlp_down_weight = np.random.randn(C, M).astype(np.float64) * 0.02
+
+    freqs = _precompute_freqs_cis_complex(HD, max_seq, 10000.0)
+    pos_ids = np.arange(T, dtype=np.int32)
+
+    # Forward with PyTorch
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    residual_t = torch.tensor(residual, dtype=torch.float64, requires_grad=True)
+    ln1_w_t = torch.tensor(ln1_weight, dtype=torch.float64, requires_grad=True)
+    qkv_w_t = torch.tensor(qkv_weight, dtype=torch.float64, requires_grad=True)
+    out_w_t = torch.tensor(out_weight, dtype=torch.float64, requires_grad=True)
+    ln2_w_t = torch.tensor(ln2_weight, dtype=torch.float64, requires_grad=True)
+    mlp_up_w_t = torch.tensor(mlp_up_weight, dtype=torch.float64, requires_grad=True)
+    mlp_down_w_t = torch.tensor(mlp_down_weight, dtype=torch.float64, requires_grad=True)
+    freqs_t = torch.tensor(freqs, dtype=torch.float64)
+
+    # === Pre-attention fused_residual_rmsnorm ===
+    # res_ffn = residual + x; ln1 = rmsnorm(res_ffn)
+    res_ffn = residual_t + x_t
+    rms1 = torch.sqrt(torch.mean(res_ffn ** 2, dim=-1, keepdim=True) + eps)
+    ln1_out = res_ffn / rms1 * ln1_w_t
+
+    # === QKV projection (no bias) ===
+    ln1_flat = ln1_out.reshape(B * T, C)
+    qkv_flat = ln1_flat @ qkv_w_t.T
+    qkv = qkv_flat.reshape(B, T, Hq + 2 * Hkv, HD)
+
+    # === RoPE (no QK-Norm) ===
+    qkv_rope = _torch_rope(qkv, freqs_t, pos_ids, Hq, Hkv, HD)
+
+    # === FlashAttention (causal) ===
+    attn_out, lse = _torch_flash_attention_ref(qkv_rope, B, T, Hq, Hkv, HD, causal=True)
+
+    # === Output projection ===
+    attn_flat = attn_out.reshape(B * T, AttnDim)
+    att_out_flat = attn_flat @ out_w_t.T
+    att_out = att_out_flat.reshape(B, T, C)
+
+    # === Pre-MLP fused_residual_rmsnorm ===
+    # res_att = res_ffn + att_out; ln2 = rmsnorm(res_att)
+    res_att = res_ffn + att_out
+    rms2 = torch.sqrt(torch.mean(res_att ** 2, dim=-1, keepdim=True) + eps)
+    ln2_out = res_att / rms2 * ln2_w_t
+
+    # === MLP with SwiGLU ===
+    ln2_flat = ln2_out.reshape(B * T, C)
+    mlp_up_flat = ln2_flat @ mlp_up_w_t.T  # [B*T, MUp]
+    mlp_up = mlp_up_flat.reshape(B, T, MUp)
+    # SwiGLU: CUDA kernel expects [up, gate] order, so first half is up, second half is gate
+    up = mlp_up[:, :, :M]
+    gate = mlp_up[:, :, M:]
+    swiglu_out = up * torch.nn.functional.silu(gate)  # [B, T, M]
+    mlp_act_flat = swiglu_out.reshape(B * T, M)
+    out_flat = mlp_act_flat @ mlp_down_w_t.T  # [B*T, C]
+    out = out_flat.reshape(B, T, C)
+
+    # Final outputs: (out, res_att) per LlamaBlock.forward signature
+    # out is the MLP output, res_att is the residual for next layer
+
+    # Backward pass
+    d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_res_att = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_out_t = torch.tensor(d_out, dtype=torch.float64)
+    d_res_att_t = torch.tensor(d_res_att, dtype=torch.float64)
+
+    # Combined loss for backward
+    loss = (out * d_out_t).sum() + (res_att * d_res_att_t).sum()
+    loss.backward()
+
+    payload = {
+        "op": "llama_block",
+        "case": "small_case_1",
+        "attrs": {"eps": eps, "causal": True},
+        "inputs": {
+            "x": _tensor_payload(x),
+            "residual": _tensor_payload(residual),
+            "ln1_weight": _tensor_payload(ln1_weight),
+            "qkv_weight": _tensor_payload(qkv_weight),
+            "out_weight": _tensor_payload(out_weight),
+            "ln2_weight": _tensor_payload(ln2_weight),
+            "mlp_up_weight": _tensor_payload(mlp_up_weight),
+            "mlp_down_weight": _tensor_payload(mlp_down_weight),
+            "rope_freqs": _tensor_payload(freqs.astype(np.float32), dtype="fp32"),
+            "position_ids": _tensor_payload(pos_ids, dtype="int32"),
+        },
+        "outputs": {
+            "out": _tensor_payload(out.detach().numpy()),
+            "residual_out": _tensor_payload(res_att.detach().numpy()),
+            # Intermediate outputs for debugging
+            "res_ffn": _tensor_payload(res_ffn.detach().numpy()),
+            "ln1": _tensor_payload(ln1_out.detach().numpy()),
+            "qkv": _tensor_payload(qkv.detach().numpy()),
+            "qkv_rope": _tensor_payload(qkv_rope.detach().numpy()),
+            "att": _tensor_payload(attn_out.detach().numpy().reshape(B, T, AttnDim)),
+            "att_out": _tensor_payload(att_out.detach().numpy()),
+            "ln2": _tensor_payload(ln2_out.detach().numpy()),
+            "mlp_up": _tensor_payload(mlp_up.detach().numpy()),
+            "swiglu": _tensor_payload(swiglu_out.detach().numpy()),
+        },
+        "grads": {
+            "d_out": _tensor_payload(d_out),
+            "d_residual_out": _tensor_payload(d_res_att),
+            "d_x": _tensor_payload(x_t.grad.numpy()),
+            "d_residual": _tensor_payload(residual_t.grad.numpy()),
+            "d_ln1_weight": _tensor_payload(ln1_w_t.grad.numpy()),
+            "d_qkv_weight": _tensor_payload(qkv_w_t.grad.numpy()),
+            "d_out_weight": _tensor_payload(out_w_t.grad.numpy()),
+            "d_ln2_weight": _tensor_payload(ln2_w_t.grad.numpy()),
+            "d_mlp_up_weight": _tensor_payload(mlp_up_w_t.grad.numpy()),
+            "d_mlp_down_weight": _tensor_payload(mlp_down_w_t.grad.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "M": M,
+            "Hq": Hq,
+            "Hkv": Hkv,
+            "head_dim": HD,
+            "max_seq": max_seq,
+            "eps": eps,
+            "note": "LlamaBlock: fused_residual_rmsnorm -> QKV -> RoPE -> FlashAttn -> fused_residual_rmsnorm -> SwiGLU MLP",
+        },
+    }
+    return [GoldenCase(op="llama_block", case="small_case_1", payload=payload)]
+
+
+def gen_qwen3_block() -> List[GoldenCase]:
+    """Generate Qwen3Block golden test.
+
+    Matches the structure from surogate/dsl/blocks/qwen3.py:
+    - fused_residual_rmsnorm (pre-attention)
+    - QKV projection (optional bias, we test without)
+    - QK-Norm + RoPE (fused) - key difference from LlamaBlock
+    - FlashAttention (causal)
+    - Output projection
+    - fused_residual_rmsnorm (pre-MLP)
+    - MLP with SwiGLU
+    - Returns (out, residual_out)
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch required for block golden generation")
+
+    B, T = 2, 4
+    Hq, Hkv = 4, 2  # num_query_heads, num_kv_heads
+    HD = 64  # head_size (must be 64 or 128 for CUDA attention kernel)
+    C = Hq * HD  # d_model (hidden size) = 256
+    M = 512  # d_ff (intermediate size for MLP)
+    eps = 1e-6
+    max_seq = 64
+    use_qk_norm = True
+
+    QKV = (Hq + 2 * Hkv) * HD
+    AttnDim = Hq * HD
+    MUp = 2 * M  # gate + up fused
+
+    # Initialize weights
+    np.random.seed(61)
+    x = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    residual = np.random.randn(B, T, C).astype(np.float64) * 0.3
+    ln1_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    qkv_weight = np.random.randn(QKV, C).astype(np.float64) * 0.02
+    out_weight = np.random.randn(C, AttnDim).astype(np.float64) * 0.02
+    ln2_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    mlp_up_weight = np.random.randn(MUp, C).astype(np.float64) * 0.02
+    mlp_down_weight = np.random.randn(C, M).astype(np.float64) * 0.02
+    # QK-Norm weights
+    q_norm_weight = np.random.randn(HD).astype(np.float64) * 0.1 + 1.0
+    k_norm_weight = np.random.randn(HD).astype(np.float64) * 0.1 + 1.0
+
+    freqs = _precompute_freqs_cis_complex(HD, max_seq, 10000.0)
+    pos_ids = np.arange(T, dtype=np.int32)
+
+    # Forward with PyTorch
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    residual_t = torch.tensor(residual, dtype=torch.float64, requires_grad=True)
+    ln1_w_t = torch.tensor(ln1_weight, dtype=torch.float64, requires_grad=True)
+    qkv_w_t = torch.tensor(qkv_weight, dtype=torch.float64, requires_grad=True)
+    out_w_t = torch.tensor(out_weight, dtype=torch.float64, requires_grad=True)
+    ln2_w_t = torch.tensor(ln2_weight, dtype=torch.float64, requires_grad=True)
+    mlp_up_w_t = torch.tensor(mlp_up_weight, dtype=torch.float64, requires_grad=True)
+    mlp_down_w_t = torch.tensor(mlp_down_weight, dtype=torch.float64, requires_grad=True)
+    q_norm_w_t = torch.tensor(q_norm_weight, dtype=torch.float64, requires_grad=True)
+    k_norm_w_t = torch.tensor(k_norm_weight, dtype=torch.float64, requires_grad=True)
+    freqs_t = torch.tensor(freqs, dtype=torch.float64)
+
+    # === Pre-attention fused_residual_rmsnorm ===
+    res_ffn = residual_t + x_t
+    rms1 = torch.sqrt(torch.mean(res_ffn ** 2, dim=-1, keepdim=True) + eps)
+    ln1_out = res_ffn / rms1 * ln1_w_t
+
+    # === QKV projection (no bias) ===
+    ln1_flat = ln1_out.reshape(B * T, C)
+    qkv_flat = ln1_flat @ qkv_w_t.T
+    qkv = qkv_flat.reshape(B, T, Hq + 2 * Hkv, HD)
+
+    # === QK-Norm + RoPE (fused) ===
+    # Split QKV
+    q = qkv[:, :, :Hq, :]  # [B, T, Hq, HD]
+    k = qkv[:, :, Hq:Hq+Hkv, :]  # [B, T, Hkv, HD]
+    v = qkv[:, :, Hq+Hkv:, :]  # [B, T, Hkv, HD]
+
+    # Apply RMSNorm to Q and K per-head
+    q_rms = torch.sqrt(torch.mean(q ** 2, dim=-1, keepdim=True) + eps)
+    q_normed = q / q_rms * q_norm_w_t
+    k_rms = torch.sqrt(torch.mean(k ** 2, dim=-1, keepdim=True) + eps)
+    k_normed = k / k_rms * k_norm_w_t
+
+    # Reassemble QKV for RoPE
+    qkv_normed = torch.cat([q_normed, k_normed, v], dim=2)
+
+    # Apply RoPE
+    qkv_rope = _torch_rope(qkv_normed, freqs_t, pos_ids, Hq, Hkv, HD)
+
+    # === FlashAttention (causal) ===
+    attn_out, lse = _torch_flash_attention_ref(qkv_rope, B, T, Hq, Hkv, HD, causal=True)
+
+    # === Output projection ===
+    attn_flat = attn_out.reshape(B * T, AttnDim)
+    att_out_flat = attn_flat @ out_w_t.T
+    att_out = att_out_flat.reshape(B, T, C)
+
+    # === Pre-MLP fused_residual_rmsnorm ===
+    res_att = res_ffn + att_out
+    rms2 = torch.sqrt(torch.mean(res_att ** 2, dim=-1, keepdim=True) + eps)
+    ln2_out = res_att / rms2 * ln2_w_t
+
+    # === MLP with SwiGLU ===
+    ln2_flat = ln2_out.reshape(B * T, C)
+    mlp_up_flat = ln2_flat @ mlp_up_w_t.T
+    mlp_up = mlp_up_flat.reshape(B, T, MUp)
+    # SwiGLU: CUDA kernel expects [up, gate] order, so first half is up, second half is gate
+    up = mlp_up[:, :, :M]
+    gate = mlp_up[:, :, M:]
+    swiglu_out = up * torch.nn.functional.silu(gate)  # [B, T, M]
+    mlp_act_flat = swiglu_out.reshape(B * T, M)
+    out_flat = mlp_act_flat @ mlp_down_w_t.T
+    out = out_flat.reshape(B, T, C)
+
+    # Backward pass
+    d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_res_att = np.random.randn(B, T, C).astype(np.float64) * 0.1
+    d_out_t = torch.tensor(d_out, dtype=torch.float64)
+    d_res_att_t = torch.tensor(d_res_att, dtype=torch.float64)
+
+    loss = (out * d_out_t).sum() + (res_att * d_res_att_t).sum()
+    loss.backward()
+
+    payload = {
+        "op": "qwen3_block",
+        "case": "small_case_1",
+        "attrs": {"eps": eps, "causal": True, "use_qk_norm": use_qk_norm},
+        "inputs": {
+            "x": _tensor_payload(x),
+            "residual": _tensor_payload(residual),
+            "ln1_weight": _tensor_payload(ln1_weight),
+            "qkv_weight": _tensor_payload(qkv_weight),
+            "q_norm_weight": _tensor_payload(q_norm_weight),
+            "k_norm_weight": _tensor_payload(k_norm_weight),
+            "out_weight": _tensor_payload(out_weight),
+            "ln2_weight": _tensor_payload(ln2_weight),
+            "mlp_up_weight": _tensor_payload(mlp_up_weight),
+            "mlp_down_weight": _tensor_payload(mlp_down_weight),
+            "rope_freqs": _tensor_payload(freqs.astype(np.float32), dtype="fp32"),
+            "position_ids": _tensor_payload(pos_ids, dtype="int32"),
+        },
+        "outputs": {
+            "out": _tensor_payload(out.detach().numpy()),
+            "residual_out": _tensor_payload(res_att.detach().numpy()),
+            # Intermediate outputs for debugging
+            "res_ffn": _tensor_payload(res_ffn.detach().numpy()),
+            "ln1": _tensor_payload(ln1_out.detach().numpy()),
+            "qkv": _tensor_payload(qkv.detach().numpy()),
+            "qkv_rope": _tensor_payload(qkv_rope.detach().numpy()),
+            "att": _tensor_payload(attn_out.detach().numpy().reshape(B, T, AttnDim)),
+            "att_out": _tensor_payload(att_out.detach().numpy()),
+            "ln2": _tensor_payload(ln2_out.detach().numpy()),
+            "mlp_up": _tensor_payload(mlp_up.detach().numpy()),
+            "swiglu": _tensor_payload(swiglu_out.detach().numpy()),
+        },
+        "grads": {
+            "d_out": _tensor_payload(d_out),
+            "d_residual_out": _tensor_payload(d_res_att),
+            "d_x": _tensor_payload(x_t.grad.numpy()),
+            "d_residual": _tensor_payload(residual_t.grad.numpy()),
+            "d_ln1_weight": _tensor_payload(ln1_w_t.grad.numpy()),
+            "d_qkv_weight": _tensor_payload(qkv_w_t.grad.numpy()),
+            "d_q_norm_weight": _tensor_payload(q_norm_w_t.grad.numpy()),
+            "d_k_norm_weight": _tensor_payload(k_norm_w_t.grad.numpy()),
+            "d_out_weight": _tensor_payload(out_w_t.grad.numpy()),
+            "d_ln2_weight": _tensor_payload(ln2_w_t.grad.numpy()),
+            "d_mlp_up_weight": _tensor_payload(mlp_up_w_t.grad.numpy()),
+            "d_mlp_down_weight": _tensor_payload(mlp_down_w_t.grad.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "C": C,
+            "M": M,
+            "Hq": Hq,
+            "Hkv": Hkv,
+            "head_dim": HD,
+            "max_seq": max_seq,
+            "eps": eps,
+            "use_qk_norm": use_qk_norm,
+            "note": "Qwen3Block: fused_residual_rmsnorm -> QKV -> QK-Norm+RoPE -> FlashAttn -> fused_residual_rmsnorm -> SwiGLU MLP",
+        },
+    }
+    return [GoldenCase(op="qwen3_block", case="small_case_1", payload=payload)]
+
+
+def gen_qwen3_model() -> List[GoldenCase]:
+    """Generate Qwen3Model golden test (1-layer model).
+
+    Matches the structure from surogate/dsl/models/qwen3.py:
+    - Embedding lookup
+    - Zero initialization for residual
+    - Single Qwen3Block layer (simplified: no StackedBlocks call)
+    - Final fused_residual_rmsnorm
+    - Fused LM head + cross-entropy loss
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch required for model golden generation")
+
+    # Model dimensions (small for testing)
+    B, T = 2, 4
+    V = 128  # vocab_size
+    C = 256  # d_model (hidden size)
+    Hq, Hkv = 4, 2  # num_query_heads, num_kv_heads
+    HD = 64  # head_size (must be 64 or 128 for CUDA attention kernel)
+    M = 512  # d_ff (intermediate size)
+    eps = 1e-6
+    max_seq = 64
+    n_layers = 1  # Single layer for simplicity
+    use_qk_norm = True
+
+    QKV = (Hq + 2 * Hkv) * HD
+    AttnDim = Hq * HD
+    MUp = 2 * M
+
+    # Initialize weights
+    np.random.seed(70)
+
+    # Model-level weights
+    embedding_weight = np.random.randn(V, C).astype(np.float64) * 0.02
+    final_norm_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    lm_head_weight = np.random.randn(V, C).astype(np.float64) * 0.02
+
+    # Block weights (layer 0)
+    ln1_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    qkv_weight = np.random.randn(QKV, C).astype(np.float64) * 0.02
+    out_weight = np.random.randn(C, AttnDim).astype(np.float64) * 0.02
+    q_norm_weight = np.random.randn(HD).astype(np.float64) * 0.1 + 1.0
+    k_norm_weight = np.random.randn(HD).astype(np.float64) * 0.1 + 1.0
+    ln2_weight = np.random.randn(C).astype(np.float64) * 0.1 + 1.0
+    mlp_up_weight = np.random.randn(MUp, C).astype(np.float64) * 0.02
+    mlp_down_weight = np.random.randn(C, M).astype(np.float64) * 0.02
+
+    freqs = _precompute_freqs_cis_complex(HD, max_seq, 10000.0)
+
+    # Inputs
+    token_ids = np.random.randint(0, V, size=(B, T)).astype(np.int32)
+    position_ids = np.arange(T, dtype=np.int32)
+    targets = np.random.randint(0, V, size=(B, T)).astype(np.int32)
+
+    # Forward pass with PyTorch
+    embedding_w_t = torch.tensor(embedding_weight, dtype=torch.float64, requires_grad=True)
+    final_norm_w_t = torch.tensor(final_norm_weight, dtype=torch.float64, requires_grad=True)
+    lm_head_w_t = torch.tensor(lm_head_weight, dtype=torch.float64, requires_grad=True)
+
+    ln1_w_t = torch.tensor(ln1_weight, dtype=torch.float64, requires_grad=True)
+    qkv_w_t = torch.tensor(qkv_weight, dtype=torch.float64, requires_grad=True)
+    out_w_t = torch.tensor(out_weight, dtype=torch.float64, requires_grad=True)
+    q_norm_w_t = torch.tensor(q_norm_weight, dtype=torch.float64, requires_grad=True)
+    k_norm_w_t = torch.tensor(k_norm_weight, dtype=torch.float64, requires_grad=True)
+    ln2_w_t = torch.tensor(ln2_weight, dtype=torch.float64, requires_grad=True)
+    mlp_up_w_t = torch.tensor(mlp_up_weight, dtype=torch.float64, requires_grad=True)
+    mlp_down_w_t = torch.tensor(mlp_down_weight, dtype=torch.float64, requires_grad=True)
+    freqs_t = torch.tensor(freqs, dtype=torch.float64)
+
+    token_ids_t = torch.tensor(token_ids, dtype=torch.long)
+    targets_t = torch.tensor(targets, dtype=torch.long)
+
+    # === 1. Embedding lookup ===
+    x0 = embedding_w_t[token_ids_t]  # [B, T, C]
+
+    # === 2. Zero residual ===
+    residual0 = torch.zeros(B, T, C, dtype=torch.float64)
+
+    # === 3. Qwen3Block forward (single layer) ===
+    # Pre-attention norm
+    res_ffn = residual0 + x0
+    rms1 = torch.sqrt(torch.mean(res_ffn ** 2, dim=-1, keepdim=True) + eps)
+    ln1_out = res_ffn / rms1 * ln1_w_t
+
+    # QKV projection
+    ln1_flat = ln1_out.reshape(B * T, C)
+    qkv_flat = ln1_flat @ qkv_w_t.T
+    qkv = qkv_flat.reshape(B, T, Hq + 2 * Hkv, HD)
+
+    # QK-Norm + RoPE
+    q = qkv[:, :, :Hq, :]
+    k = qkv[:, :, Hq:Hq+Hkv, :]
+    v = qkv[:, :, Hq+Hkv:, :]
+
+    q_rms = torch.sqrt(torch.mean(q ** 2, dim=-1, keepdim=True) + eps)
+    q_normed = q / q_rms * q_norm_w_t
+    k_rms = torch.sqrt(torch.mean(k ** 2, dim=-1, keepdim=True) + eps)
+    k_normed = k / k_rms * k_norm_w_t
+
+    qkv_normed = torch.cat([q_normed, k_normed, v], dim=2)
+    qkv_rope = _torch_rope(qkv_normed, freqs_t, position_ids, Hq, Hkv, HD)
+
+    # FlashAttention
+    attn_out, _ = _torch_flash_attention_ref(qkv_rope, B, T, Hq, Hkv, HD, causal=True)
+
+    # Output projection
+    attn_flat = attn_out.reshape(B * T, AttnDim)
+    att_out_flat = attn_flat @ out_w_t.T
+    att_out = att_out_flat.reshape(B, T, C)
+
+    # Pre-MLP norm
+    res_att = res_ffn + att_out
+    rms2 = torch.sqrt(torch.mean(res_att ** 2, dim=-1, keepdim=True) + eps)
+    ln2_out = res_att / rms2 * ln2_w_t
+
+    # MLP with SwiGLU
+    ln2_flat = ln2_out.reshape(B * T, C)
+    mlp_up_flat = ln2_flat @ mlp_up_w_t.T
+    mlp_up = mlp_up_flat.reshape(B, T, MUp)
+    # SwiGLU: CUDA kernel expects [up, gate] order
+    up = mlp_up[:, :, :M]
+    gate = mlp_up[:, :, M:]
+    swiglu_out = up * torch.nn.functional.silu(gate)
+    mlp_act_flat = swiglu_out.reshape(B * T, M)
+    block_out_flat = mlp_act_flat @ mlp_down_w_t.T
+    block_out = block_out_flat.reshape(B, T, C)
+
+    # Block outputs
+    x1 = block_out
+    residual1 = res_att
+
+    # === 4. Final fused_residual_rmsnorm ===
+    residual_final = residual1 + x1
+    rms_final = torch.sqrt(torch.mean(residual_final ** 2, dim=-1, keepdim=True) + eps)
+    xF = residual_final / rms_final * final_norm_w_t
+
+    # === 5. LM head + cross-entropy loss ===
+    xF_flat = xF.reshape(B * T, C)
+    logits = xF_flat @ lm_head_w_t.T  # [B*T, V]
+
+    # Cross-entropy loss (per-token, no reduction for golden)
+    log_softmax = torch.nn.functional.log_softmax(logits, dim=-1)
+    targets_flat = targets_t.reshape(-1)
+    # Gather the log probabilities for the target tokens
+    loss_per_token = -log_softmax[torch.arange(B * T), targets_flat]
+    loss = loss_per_token.mean()
+
+    # Backward pass
+    loss.backward()
+
+    payload = {
+        "op": "qwen3_model",
+        "case": "small_1layer",
+        "attrs": {
+            "eps": eps,
+            "causal": True,
+            "use_qk_norm": use_qk_norm,
+            "n_layers": n_layers,
+        },
+        "inputs": {
+            # Model weights
+            "embedding": _tensor_payload(embedding_weight),
+            "final_norm": _tensor_payload(final_norm_weight),
+            "lm_head": _tensor_payload(lm_head_weight),
+            # Block 0 weights
+            "block0_ln1_weight": _tensor_payload(ln1_weight),
+            "block0_qkv_weight": _tensor_payload(qkv_weight),
+            "block0_out_weight": _tensor_payload(out_weight),
+            "block0_q_norm_weight": _tensor_payload(q_norm_weight),
+            "block0_k_norm_weight": _tensor_payload(k_norm_weight),
+            "block0_ln2_weight": _tensor_payload(ln2_weight),
+            "block0_mlp_up_weight": _tensor_payload(mlp_up_weight),
+            "block0_mlp_down_weight": _tensor_payload(mlp_down_weight),
+            "rope_freqs": _tensor_payload(freqs.astype(np.float32), dtype="fp32"),
+            # Inputs
+            "token_ids": _tensor_payload(token_ids, dtype="int32"),
+            "position_ids": _tensor_payload(position_ids, dtype="int32"),
+            "targets": _tensor_payload(targets, dtype="int32"),
+        },
+        "outputs": {
+            # Intermediates
+            "x0": _tensor_payload(x0.detach().numpy()),
+            "block_out": _tensor_payload(block_out.detach().numpy()),
+            "xF": _tensor_payload(xF.detach().numpy()),
+            "logits": _tensor_payload(logits.detach().numpy()),
+            "loss": _tensor_payload(np.array([loss.item()])),
+        },
+        "grads": {
+            "d_embedding": _tensor_payload(embedding_w_t.grad.numpy()),
+            "d_final_norm": _tensor_payload(final_norm_w_t.grad.numpy()),
+            "d_lm_head": _tensor_payload(lm_head_w_t.grad.numpy()),
+            "d_block0_ln1_weight": _tensor_payload(ln1_w_t.grad.numpy()),
+            "d_block0_qkv_weight": _tensor_payload(qkv_w_t.grad.numpy()),
+            "d_block0_out_weight": _tensor_payload(out_w_t.grad.numpy()),
+            "d_block0_q_norm_weight": _tensor_payload(q_norm_w_t.grad.numpy()),
+            "d_block0_k_norm_weight": _tensor_payload(k_norm_w_t.grad.numpy()),
+            "d_block0_ln2_weight": _tensor_payload(ln2_w_t.grad.numpy()),
+            "d_block0_mlp_up_weight": _tensor_payload(mlp_up_w_t.grad.numpy()),
+            "d_block0_mlp_down_weight": _tensor_payload(mlp_down_w_t.grad.numpy()),
+        },
+        "meta": {
+            "B": B,
+            "T": T,
+            "V": V,
+            "C": C,
+            "M": M,
+            "Hq": Hq,
+            "Hkv": Hkv,
+            "head_dim": HD,
+            "max_seq": max_seq,
+            "n_layers": n_layers,
+            "eps": eps,
+            "use_qk_norm": use_qk_norm,
+            "note": "Qwen3Model (1-layer): embedding -> Qwen3Block -> final_norm -> lm_head_loss",
+        },
+    }
+    return [GoldenCase(op="qwen3_model", case="small_1layer", payload=payload)]
+
+
 # Registry of all ops. Add generators as they are implemented.
 OP_GENERATORS: Dict[str, Callable[[], List[GoldenCase]]] = {
-    # Forward ops
+    # Forward ops (primitives)
     "embedding": gen_embedding,
     "zeros": gen_zeros,
     "fused_residual_rmsnorm": gen_fused_residual_rmsnorm,
@@ -1494,7 +2644,7 @@ OP_GENERATORS: Dict[str, Callable[[], List[GoldenCase]]] = {
     "flash_attention": gen_flash_attention,
     "cross_entropy_loss": gen_cross_entropy_loss,
     "fused_lm_head_loss": gen_fused_lm_head_loss,
-    # Backward ops
+    # Backward ops (primitives)
     "view_backward": gen_view_backward,
     "add_backward": gen_add_backward,
     "matmul_backward": gen_matmul_backward,
@@ -1509,6 +2659,18 @@ OP_GENERATORS: Dict[str, Callable[[], List[GoldenCase]]] = {
     "embedding_backward": gen_embedding_backward,
     "cross_entropy_backward": gen_cross_entropy_backward,
     "fused_lm_head_loss_backward": gen_fused_lm_head_loss_backward,
+    # Composed modules
+    "swiglu_mlp": gen_swiglu_mlp,
+    "gqa_attention": gen_gqa_attention,
+    "embedding_module": gen_embedding_module,
+    "rmsnorm_module": gen_rmsnorm_module,
+    "transformer_block": gen_transformer_block,
+    "lm_head_module": gen_lm_head_module,
+    # DSL Blocks (full transformer blocks matching Python DSL definitions)
+    "llama_block": gen_llama_block,
+    "qwen3_block": gen_qwen3_block,
+    # DSL Models (full models matching Python DSL definitions)
+    "qwen3_model": gen_qwen3_model,
 }
 
 

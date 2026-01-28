@@ -141,26 +141,18 @@ std::vector<Operation> add_backward(const BackwardRuleContext& ctx) {
 
     // Gradient passes through unchanged (identity for addition)
     // Note: if shapes differ due to broadcasting, would need reduce_sum
-    // For now, assume same shapes
-
-    if (ctx.needs_grad(0)) {
-        // dA = dC (just alias/copy)
+    // For now, assume same shapes. Emit a single add_backward op so compiled
+    // executor can copy into both base gradients in one place.
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    if (ctx.needs_grad(0) || ctx.needs_grad(1)) {
         ops.push_back(make_operation(
-            "add_dA_" + std::to_string(ctx.op_counter++),
-            "identity",
-            "identity",
+            "add_backward_" + std::to_string(ctx.op_counter++),
+            "add_backward",
+            "add_backward",
             {ctx.d_output},
-            {ctx.d_inputs[0]}));
-    }
-
-    if (ctx.needs_grad(1)) {
-        // dB = dC
-        ops.push_back(make_operation(
-            "add_dB_" + std::to_string(ctx.op_counter++),
-            "identity",
-            "identity",
-            {ctx.d_output},
-            {ctx.d_inputs[1]}));
+            outputs));
     }
 
     return ops;
