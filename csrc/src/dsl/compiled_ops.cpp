@@ -1985,6 +1985,17 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             if (it != mTensorMap.end()) {
                 return it->second;
             }
+            // Debug: print similar tensor names
+            if (env_enabled("SUROGATE_DSL_DEBUG_TENSOR_MAP")) {
+                std::fprintf(stderr, "[DSL DEBUG] tensor not found: %s\n", ref.name.c_str());
+                std::fprintf(stderr, "[DSL DEBUG] available tensors with similar prefix:\n");
+                std::string prefix = ref.name.substr(0, std::min(size_t(15), ref.name.size()));
+                for (const auto& [name, t] : mTensorMap) {
+                    if (name.find(prefix.substr(0, 10)) != std::string::npos) {
+                        std::fprintf(stderr, "  %s\n", name.c_str());
+                    }
+                }
+            }
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
         case TensorSlot::Temporary:
@@ -3573,18 +3584,18 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         const bool ln_layer_match = !ln_layer_env || ln_layer_idx == ln_layer_filter;
         if (ln_layer_match && debug_ln_count < 16) {
             std::fprintf(stderr,
-                         "[DSL DEBUG LN BWD] layer=%d field=%s in1=%s out0=%s slot0=%d out1=%s slot1=%d\n",
+                         "[DSL DEBUG LN BWD] layer=%d field=%s in0=%s in1=%s out0=%s slot0=%d out1=%s slot1=%d\n",
                          ln_layer_idx,
                          ln_field.c_str(),
+                         op.inputs.size() > 0 ? op.inputs[0].name.c_str() : "",
                          op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "",
                          op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "",
                          op.outputs.size() > 0 ? static_cast<int>(op.outputs[0].slot) : -1,
                          op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "",
                          op.outputs.size() > 1 ? static_cast<int>(op.outputs[1].slot) : -1);
-            if (debug_ln_norm_buf.Data && op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
-                Tensor& in1 = resolve_tensor(op.inputs[1]);
+            auto norm_of = [&](const Tensor& t) {
                 fill_zero(debug_ln_norm_buf, mRunState.MainStream);
-                global_norm_squared(debug_ln_norm_buf, in1, in1.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+                global_norm_squared(debug_ln_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
                 deterministic_sum(debug_ln_norm_buf.template get<float>(),
                                   debug_ln_norm_buf.template get<float>(),
                                   debug_ln_norm_buf.nelem(),
@@ -3596,7 +3607,16 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                                            cudaMemcpyDeviceToHost,
                                            mRunState.MainStream));
                 CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                std::fprintf(stderr, "  [DSL DEBUG LN BWD] in1 norm=%g\n", std::sqrt(host_sum));
+                return std::sqrt(host_sum);
+            };
+            if (debug_ln_norm_buf.Data) {
+                // Print d_y (in0) norm - this is upstream gradient from MLPUp backward
+                std::fprintf(stderr, "  [DSL DEBUG LN BWD] in0 (d_y) norm=%g\n", norm_of(d_y));
+                // Print d_residual_next (in1) norm if present
+                if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
+                    Tensor& in1 = resolve_tensor(op.inputs[1]);
+                    std::fprintf(stderr, "  [DSL DEBUG LN BWD] in1 (d_residual_next) norm=%g\n", norm_of(in1));
+                }
             }
         }
         ++debug_ln_count;
@@ -4561,15 +4581,30 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 last_layer_restored = op.layer_end;
             }
             // Option 2: Every N ops as fallback (catches non-annotated layers)
-            else if (!mRecomputeEnabled && (idx + 1) % 20 == 0) {
-                mRunState.Stack.restore(initial_checkpoint);
-                mTemps.clear();
-                prune_stack_tensors();
-            }
+            // NOTE: When recompute is disabled, we cannot aggressively prune tensors because
+            // the backward graph may reference intermediate tensors (like d_blocks[N].view_K)
+            // that were produced earlier but are still needed. The stack restore + prune
+            // would remove these tensors from mTensorMap, causing "tensor not found" errors.
+            // For now, skip periodic cleanup when recompute is disabled to preserve correctness.
+            // Memory usage will be higher but the backward pass will complete successfully.
+            // TODO: Implement proper tensor lifetime tracking to enable safe pruning.
         } catch (const std::exception& e) {
             std::ostringstream oss;
             oss << "CompiledExecutor backward op " << idx << " (type=" << op_type_to_string(op.type)
                 << ", id=" << op.op_id << "): " << e.what();
+            // Add inputs/outputs for debugging
+            oss << "\n  inputs: [";
+            for (size_t i = 0; i < op.inputs.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << op.inputs[i].name << "(slot=" << static_cast<int>(op.inputs[i].slot) << ")";
+            }
+            oss << "]";
+            oss << "\n  outputs: [";
+            for (size_t i = 0; i < op.outputs.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << op.outputs[i].name << "(slot=" << static_cast<int>(op.outputs[i].slot) << ")";
+            }
+            oss << "]";
             throw std::runtime_error(oss.str());
         }
 
