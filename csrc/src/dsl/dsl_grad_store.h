@@ -43,7 +43,8 @@ public:
                  const std::shared_ptr<TensorAllocator>& allocator,
                  bool offload_grads = false,
                  EAllocationType offload_alloc = EAllocationType::PINNED,
-                 int num_shards = 1);
+                 int num_shards = 1,
+                 bool tied_embeddings = false);
 
     /// Configure multi-GPU gradient reduction
     void configure(const DslGradStoreConfig& config);

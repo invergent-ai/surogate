@@ -15,11 +15,26 @@
 
 namespace dsl {
 
+namespace {
+
+// Helper to check if a parameter name is an embedding name
+bool is_embedding_name(const std::string& name) {
+    return name == "embedding" || name == "embeddings" || name == "embed_tokens";
+}
+
+// Helper to check if a parameter name is an lm_head name
+bool is_lm_head_name(const std::string& name) {
+    return name == "lm_head" || name == "lm_head_weight";
+}
+
+} // namespace
+
 DslGradStore::DslGradStore(const DslParamStore& params,
                            const std::shared_ptr<TensorAllocator>& allocator,
                            bool offload_grads,
                            EAllocationType offload_alloc,
-                           int num_shards)
+                           int num_shards,
+                           bool tied_embeddings)
     : mAllocator(allocator) {
     if (!mAllocator) {
         throw std::runtime_error("DslGradStore: allocator is null");
@@ -28,10 +43,34 @@ DslGradStore::DslGradStore(const DslParamStore& params,
     const bool allow_offload = offload_grads && num_shards == 1;
     const EAllocationType grad_alloc = allow_offload ? offload_alloc : EAllocationType::ON_DEVICE;
 
+    // First pass: find embedding gradient name if present (for weight tying)
+    std::string embedding_grad_name;
+    if (tied_embeddings) {
+        for (const auto& name : params.param_names()) {
+            if (params.is_trainable(name) && is_embedding_name(name)) {
+                embedding_grad_name = name;
+                break;
+            }
+        }
+    }
+
     for (const auto& name : params.param_names()) {
         if (!params.is_trainable(name)) {
             continue;
         }
+
+        // When embeddings are tied, make lm_head gradient point to same tensor as embedding
+        if (tied_embeddings && is_lm_head_name(name) && !embedding_grad_name.empty()) {
+            // lm_head shares gradient with embedding - add alias to existing gradient
+            auto emb_it = mGrads.find(embedding_grad_name);
+            if (emb_it != mGrads.end()) {
+                mGrads.emplace(name, emb_it->second);  // Same tensor, different key
+                mParamOrder.push_back(name);
+                continue;
+            }
+            // Fall through to allocate if embedding not found yet (shouldn't happen)
+        }
+
         const Tensor& weight = params.template_tensor(name);
         std::vector<long> shape(weight.Sizes.begin(), weight.Sizes.begin() + weight.Rank);
         Tensor grad = mAllocator->allocate(weight.DType, ("d_" + name).c_str(), grad_alloc, shape);

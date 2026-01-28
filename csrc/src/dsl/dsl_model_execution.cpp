@@ -7,6 +7,7 @@
 #include "dsl/dsl_model_internal.h"
 #include "dsl/dsl_runtime.h"
 #include "dsl/graph_executor.h"
+#include "dsl/graph_executor_helpers.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -310,12 +311,21 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
 
-                // Get ln2 input: either from stored activation or recompute from residual_att
+                // Get ln2 input: either from stored activation or recompute from residual stream
                 Tensor ln2_input;
-                if (mOptions.RecomputeLoRA) {
-                    // Recompute ln2 from residual_att
-                    // TODO: Implement recomputation for DSL path
-                    ln2_input = a.ln2;
+                if (mOptions.RecomputeLoRA && !mOptions.RecomputeBlock) {
+                    if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
+                        const std::string ln2_name = "blocks[" + std::to_string(layer_idx) + "].ln2_weight";
+                        Tensor& ln2_weight = mParams->get(ln2_name);
+                        Tensor ln2_residual = a.residual_att.Data
+                            ? a.residual_att
+                            : (layer_idx == 0 ? rs.non_block_activations().encoded
+                                              : rs.get_residual(layer_idx, stream));
+                        ln2_input = recompute_lora_rmsnorm(*mLoRARunState, ln2_residual, ln2_weight,
+                                                          mModelConfig.RmsNormEps, B, T, C, stream);
+                    } else {
+                        ln2_input = a.ln2;
+                    }
                 } else {
                     ln2_input = a.ln2;
                 }
@@ -395,10 +405,17 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 // Get ln1 input: either from stored activation or recompute from residual
                 Tensor ln1_input;
-                if (mOptions.RecomputeLoRA) {
-                    // Recompute ln1 from the residual input
-                    // TODO: Implement recomputation for DSL path
-                    ln1_input = a.ln1;
+                if (mOptions.RecomputeLoRA && !mOptions.RecomputeBlock) {
+                    if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
+                        const std::string ln1_name = "blocks[" + std::to_string(layer_idx) + "].ln1_weight";
+                        Tensor& ln1_weight = mParams->get(ln1_name);
+                        Tensor ln1_residual = (layer_idx == 0) ? rs.non_block_activations().encoded
+                                                               : rs.get_residual(layer_idx, stream);
+                        ln1_input = recompute_lora_rmsnorm(*mLoRARunState, ln1_residual, ln1_weight,
+                                                          mModelConfig.RmsNormEps, B, T, C, stream);
+                    } else {
+                        ln1_input = a.ln1;
+                    }
                 } else {
                     ln1_input = a.ln1;
                 }

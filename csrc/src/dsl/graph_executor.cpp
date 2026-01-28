@@ -497,6 +497,7 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_forward_plan(&mForwardPlan);
     mCompiledExecutor->set_last_inputs_cpu(&mLastInputsCpu);
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
+    mCompiledExecutor->set_embedding_outputs(mEmbeddingOutputs);
 
     // Graphs will be compiled lazily on first forward when B/T are known
     mCompiledB = 0;

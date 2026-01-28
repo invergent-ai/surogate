@@ -429,11 +429,10 @@ __global__ void cross_entropy_forward_kernel(const floatX* logits, float* losses
     }
     int ix = targets[idx];
     if (ix == -100) {
-        if (threadIdx.x == 0) {
-            losses[idx] = 0.0f;
-            if (logsumexp) {
-                logsumexp[idx] = 0.0f;
-            }
+        // For padding tokens, don't touch the loss buffer to preserve accumulated values
+        // from previous micro-steps. Only zero logsumexp for backward correctness.
+        if (threadIdx.x == 0 && logsumexp) {
+            logsumexp[idx] = 0.0f;
         }
         return;
     }
@@ -505,7 +504,8 @@ __global__ void cross_entropy_forward_kernel(const floatX* logits, float* losses
 
     if (threadIdx.x == 0) {
         float logit_val = (float)logits[idx * P + ix];
-        losses[idx] = lse - logit_val;
+        // Accumulate loss (not overwrite) to support gradient accumulation
+        losses[idx] += lse - logit_val;
         if (logsumexp) {
             logsumexp[idx] = lse;
         }
@@ -582,10 +582,11 @@ __global__ void chunked_cross_entropy_forward_kernel(const floatX* logits, float
                     atomicAdd(valid_token_count, 1);
                 }
                 float logit_val = (float)logits[row_idx * P + ix];
-                losses[row_idx] = -logit_val;
-            } else {
-                losses[row_idx] = 0.0f;
+                // Accumulate loss (not overwrite) to support gradient accumulation
+                losses[row_idx] -= logit_val;
             }
+            // For padding tokens (ix == -100), don't touch the loss buffer
+            // to preserve accumulated values from previous micro-steps
         }
     }
 }

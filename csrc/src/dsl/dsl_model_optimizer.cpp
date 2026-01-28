@@ -15,7 +15,10 @@
 #include "utilities/tensor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
+#include <unordered_set>
+#include <vector>
 
 namespace dsl {
 
@@ -71,6 +74,9 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     constexpr size_t BLOCK_SIZE = 2048;  // Must match ADAMW8BIT_BLOCK_SIZE in adamw8bit.cu
     size_t state_offset = 0;
 
+    // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
+    std::unordered_set<void*> seen_grad_ptrs;
+
     for (const auto& name : mGrads->param_names()) {
         Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         bool accumulate = false;
@@ -79,6 +85,15 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         if (!grad) {
             continue;
         }
+
+        // Skip if we've already updated with this gradient (tied weights share the same gradient pointer)
+        if (seen_grad_ptrs.count(grad->Data) > 0) {
+            // Still advance state_offset to maintain alignment for subsequent params
+            state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            state_offset += val.nelem();
+            continue;
+        }
+        seen_grad_ptrs.insert(grad->Data);
 
         const bool param_sharded = param_is_sharded(name);
         Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
@@ -201,6 +216,9 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
     constexpr size_t BLOCK_SIZE = 2048;  // Must match ADAMW8BIT_BLOCK_SIZE in adamw8bit.cu
     size_t state_offset = 0;
 
+    // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
+    std::unordered_set<void*> seen_grad_ptrs_graph;
+
     for (const auto& name : mGrads->param_names()) {
         Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         bool accumulate = false;
@@ -209,6 +227,15 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
         if (!grad) {
             continue;
         }
+
+        // Skip if we've already updated with this gradient (tied weights share the same gradient pointer)
+        if (seen_grad_ptrs_graph.count(grad->Data) > 0) {
+            // Still advance state_offset to maintain alignment for subsequent params
+            state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            state_offset += val.nelem();
+            continue;
+        }
+        seen_grad_ptrs_graph.insert(grad->Data);
 
         const bool param_sharded = param_is_sharded(name);
         Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
@@ -437,12 +464,19 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, 
     auto& rs = *mRunState;
 
     fill_zero(rs.scratch().norm_buffer, stream);
+
+    // Track seen Data pointers to avoid double-counting tied gradients (e.g., embedding/lm_head)
+    std::unordered_set<void*> seen_ptrs;
     for (const auto& kv : mGrads->grads()) {
         const Tensor& grad = kv.second;
         if (!grad.Data || grad.nelem() == 0) continue;
+        // Skip if we've already counted this gradient (tied weights share the same Data pointer)
+        if (seen_ptrs.count(grad.Data) > 0) {
+            continue;
+        }
+        seen_ptrs.insert(grad.Data);
         global_norm_squared(rs.scratch().norm_buffer, grad, grad.nelem(), rs.DeviceProp, stream);
     }
-
     deterministic_sum(rs.scratch().norm_buffer.template get<float>(),
                       rs.scratch().norm_buffer.template get<float>(),
                       rs.scratch().norm_buffer.nelem(),

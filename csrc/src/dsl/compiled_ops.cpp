@@ -951,6 +951,25 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
+        case CompiledOpType::RoPE: {
+            // RoPE output shape matches input qkv shape
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::FlashAttention: {
+            // FlashAttention outputs: attn_out [B, T, Hq, D] (or [B, T, Hq*D]), lse [B, Hq, T]
+            // For now, attn_out shape matches input qkv shape but with Hq instead of (Hq+2*Hkv)
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);  // Simplified: same shape as input
+                // LSE shape - hard to infer without model config, leave empty for now
+                output_shapes.push_back({});
+            }
+            break;
+        }
+
         default:
             // For other operations, output shape not inferred
             break;
@@ -3278,13 +3297,12 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         parse_block_param(op.inputs[3].name, ln_layer_idx, ln_field);
     }
     if (ln_layer_idx >= 0 && ln_field == "ln1_weight") {
-        // LN1 backward uses the input residual to this layer:
-        // - Layer 0: input is the encoded embeddings
-        // - Layer L>0: input is the residual from the previous layer (res_ffn of layer L-1)
+        // LN1 backward expects residual_out from the forward fused residual op.
+        // In the DSL graphs, res_ffn is stored per-layer at index L.
         if (ln_layer_idx == 0) {
             residual_out_ptr = &mRunState.non_block_activations().encoded;
         } else {
-            residual_out_ptr = &mRunState.get_residual(ln_layer_idx - 1, mRunState.MainStream);
+            residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
         }
     }
     Tensor& residual_out = *residual_out_ptr;

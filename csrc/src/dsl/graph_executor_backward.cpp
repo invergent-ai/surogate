@@ -171,8 +171,12 @@ void GraphExecutor::recompute_layer_optimized(int layer_idx, long B, long T, boo
         }
     };
 
-    // Residual input to this layer: res_ffn saved during forward for this layer.
-    Tensor& res_in = rs.get_residual(layer_idx, rs.MainStream);
+    // Residual input to this layer:
+    // - Layer 0: input is the encoded embeddings (equivalent to res_ffn[0])
+    // - Layer L>0: input is the residual stream for THIS layer (res_ffn[L])
+    Tensor& res_in = (layer_idx == 0)
+        ? rs.non_block_activations().encoded
+        : rs.get_residual(layer_idx, rs.MainStream);
 
     // LN1 recomputation
     if (flags.ln1) {

@@ -59,6 +59,13 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     mAttnBwdChunks = options.AttBwdChunks;
     mStackSimulate = !allocate_stack;
 
+    // Match GraphExecutor's recompute behavior in LoRA-only mode.
+    // When recompute_block is disabled for LoRA (no recompute_lora), we must
+    // avoid stack/shared activation layouts that assume full recomputation.
+    if (mLoraOnlyMode && !mRecomputeLoRA) {
+        mRecomputeBlock = false;
+    }
+
     const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
     if (allocate_stack) {
         // Allocate stack memory (heuristic size).
@@ -514,16 +521,22 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     }
     const long attn_ws_batch_size =
         (attn_chunks == 1) ? B : div_exact(B, static_cast<long>(attn_chunks));
-    const long cudnn_ws_size = static_cast<long>(
-        cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size), static_cast<int>(T),
-                                 static_cast<int>(Hq), static_cast<int>(Hkv),
-                                 static_cast<int>(D), CudnnHandle));
-    // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
-    // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
-    // from the temp stack, checkpoint restores during backward can cause it to be reallocated
-    // in a region that overlaps with gradient buffers.
-    mScratch.cudnn_workspace = mAllocator->allocate(
-        ETensorDType::BYTE, "cudnn_workspace", EAllocationType::ON_DEVICE, {cudnn_ws_size});
+    const bool cudnn_ok = (D > 0 && Hq > 0 && Hkv > 0 && (D % 8 == 0) && D <= 128);
+    if (cudnn_ok) {
+        const long cudnn_ws_size = static_cast<long>(
+            cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size), static_cast<int>(T),
+                                     static_cast<int>(Hq), static_cast<int>(Hkv),
+                                     static_cast<int>(D), CudnnHandle));
+        // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
+        // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
+        // from the temp stack, checkpoint restores during backward can cause it to be reallocated
+        // in a region that overlaps with gradient buffers.
+        mScratch.cudnn_workspace = mAllocator->allocate(
+            ETensorDType::BYTE, "cudnn_workspace", EAllocationType::ON_DEVICE, {cudnn_ws_size});
+    } else {
+        // Leave an empty descriptor; attention ops will fail later if invoked with invalid head size.
+        mScratch.cudnn_workspace = Tensor::empty(ETensorDType::BYTE, {0});
+    }
 
     // Note: Stack simulation no longer needed for workspace since it's persistently allocated
     if (mStackSimulate) {

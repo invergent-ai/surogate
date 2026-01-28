@@ -1149,8 +1149,8 @@ void register_builtin_shape_signatures() {
     {
         OpShapeSignature sig;
         sig.op_name = "qkv_qk_norm_rope_backward";
-        sig.min_inputs = 7;
-        sig.max_inputs = 7;
+        sig.min_inputs = 8;
+        sig.max_inputs = 8;
         sig.min_outputs = 1;
         sig.max_outputs = 1;
         sig.validator = [](const std::vector<std::vector<long>>& inputs,
@@ -1159,7 +1159,7 @@ void register_builtin_shape_signatures() {
                           const ShapeEnv& env) -> std::optional<ShapeValidationError> {
             const auto& d_out = inputs[0];
             const auto& qkv = inputs[1];
-            // inputs[2-6] are norm weights, rstds, freqs, pos_ids
+            // inputs[2-7] are norm weights, rstds, freqs, pos_ids
             const auto& d_qkv = outputs[0];
 
             // d_qkv should match d_out and qkv
@@ -1236,8 +1236,8 @@ void register_builtin_shape_signatures() {
     {
         OpShapeSignature sig;
         sig.op_name = "fused_residual_rmsnorm_backward";
-        sig.min_inputs = 3;
-        sig.max_inputs = 4;
+        sig.min_inputs = 4;
+        sig.max_inputs = 5;
         sig.min_outputs = 2;
         sig.max_outputs = 3;
         sig.validator = [](const std::vector<std::vector<long>>& inputs,
@@ -1245,7 +1245,7 @@ void register_builtin_shape_signatures() {
                           const AttrMap& attrs,
                           const ShapeEnv& env) -> std::optional<ShapeValidationError> {
             const auto& d_y = inputs[0];
-            // inputs[1] is d_residual_next (optional), inputs[2] is residual_out, inputs[3] is weight
+            // inputs[1] is d_residual_next (optional), inputs[2] is residual_out, inputs[3] is weight, inputs[4] is rstd
             const auto& residual_out = inputs[2];
             const auto& d_residual = outputs[0];
             const auto& d_input = outputs[1];

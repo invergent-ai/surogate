@@ -555,7 +555,8 @@ DslModel::DslModel(const PretrainedConfig& config,
     mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator,
                                             options.OffloadGrads,
                                             options.offload_alloc(),
-                                            mNumShards);
+                                            mNumShards,
+                                            mConfig->TiedWordEmbeddings);
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {
