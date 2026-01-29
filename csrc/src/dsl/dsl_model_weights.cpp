@@ -171,7 +171,20 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         if (spec->kind == MappingSpec::Kind::Direct) {
             const std::string hf_name = internal::format_hf_name(
                 spec->source.empty() ? name : spec->source, layer_idx);
-            const auto& entry = reader.find_entry(hf_name);
+
+            // Handle tied embeddings: if lm_head.weight is not found and embeddings are tied,
+            // fall back to model.embed_tokens.weight
+            const SafeTensorEntry* entry_ptr = nullptr;
+            try {
+                entry_ptr = &reader.find_entry(hf_name);
+            } catch (const std::out_of_range&) {
+                if (mConfig->TiedWordEmbeddings && hf_name == "lm_head.weight") {
+                    entry_ptr = &reader.find_entry("model.embed_tokens.weight");
+                } else {
+                    throw std::runtime_error("DSL model: missing HF tensor '" + hf_name + "' for param '" + name + "'");
+                }
+            }
+            const auto& entry = *entry_ptr;
             if (!param_sharded) {
                 entry.read_tensor(param, allow_cast);
             } else {
