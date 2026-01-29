@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import module, param, forward, save
+from ..decorators import module, forward, save, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -23,15 +23,9 @@ class SwiGLUMLP:
         # Derived dimensions (DimExpr)
         self.MUp = 2 * self.M  # gate + up concatenated
 
-    @param
-    def up_weight(self) -> Tensor["MUp", "C"]:
-        """Up projection weight [2*d_ff, d_model] (gate+up fused)."""
-        ...
-
-    @param
-    def down_weight(self) -> Tensor["C", "M"]:
-        """Down projection weight [d_model, d_ff]."""
-        ...
+    # MLP weights
+    up_weight = Param(Tensor["MUp", "C"])
+    down_weight = Param(Tensor["C", "M"])
 
     @forward
     @save("x", "up")
@@ -73,20 +67,10 @@ class GatedMLP:
         self.C = Dim("C")
         self.M = Dim("M")
 
-    @param
-    def gate_weight(self) -> Tensor["M", "C"]:
-        """Gate projection weight [d_ff, d_model]."""
-        ...
-
-    @param
-    def up_weight(self) -> Tensor["M", "C"]:
-        """Up projection weight [d_ff, d_model]."""
-        ...
-
-    @param
-    def down_weight(self) -> Tensor["C", "M"]:
-        """Down projection weight [d_model, d_ff]."""
-        ...
+    # MLP weights
+    gate_weight = Param(Tensor["M", "C"])
+    up_weight = Param(Tensor["M", "C"])
+    down_weight = Param(Tensor["C", "M"])
 
     @forward
     def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:

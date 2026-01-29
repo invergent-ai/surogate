@@ -105,7 +105,7 @@ def _extract_constructor_params(cls: type) -> dict[str, tuple[type | None, Any]]
 
 
 def _extract_param_specs(cls: type) -> dict[str, ParamSpec]:
-    """Extract parameter specs from @param decorated methods."""
+    """Extract parameter specs from @param decorated methods and Param class attributes."""
     params: dict[str, ParamSpec] = {}
 
     for name in dir(cls):
@@ -116,7 +116,13 @@ def _extract_param_specs(cls: type) -> dict[str, ParamSpec]:
         if attr is None:
             continue
 
-        # Check if it has _param_spec attached by @param decorator
+        # Check for Param class attribute (new style)
+        if isinstance(attr, Param):
+            spec = attr.to_spec(name)
+            params[name] = spec
+            continue
+
+        # Check if it has _param_spec attached by @param decorator (old style)
         if hasattr(attr, "_param_spec"):
             spec: ParamSpec = attr._param_spec
             spec.name = name  # Ensure name matches method name
@@ -277,7 +283,104 @@ def extends(base_name: str) -> Callable[[T], T]:
 
 
 # =============================================================================
-# Parameter Decorator
+# Parameter Declaration (Class Attribute Style)
+# =============================================================================
+
+
+class Param:
+    """Lightweight parameter declaration for class attributes.
+
+    Allows declaring parameters as class attributes instead of methods:
+
+        class Qwen3Block:
+            # Tensor parameters
+            ln1_weight = Param(Tensor["C"])
+            qkv_weight = Param(Tensor["QKV", "C"])
+            qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
+            rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
+
+        class Qwen3Model:
+            # Array parameters (stacked blocks)
+            blocks = Param(Array["n_layers", "Qwen3Block"])
+
+    Args:
+        param_type: A Tensor[...] or Array[...] annotation
+        when: Condition for optional parameters. Can be:
+            - str: attribute name to check (e.g., "use_bias")
+            - callable: lambda self: self.use_bias
+        frozen: If True, this parameter is precomputed and not trained
+        hf_mapping: HuggingFace weight path for import
+    """
+
+    def __init__(
+        self,
+        param_type: TensorAnnotation | ArrayAnnotation,
+        *,
+        when: str | Callable[[Any], bool] | None = None,
+        frozen: bool = False,
+        hf_mapping: str | None = None,
+    ):
+        if not isinstance(param_type, (TensorAnnotation, ArrayAnnotation)):
+            raise TypeError(
+                f"Param() requires a Tensor[...] or Array[...] annotation, "
+                f"got {type(param_type).__name__}. "
+                f"Usage: Param(Tensor[\"C\", \"D\"]) or Param(Array[\"n_layers\", \"Block\"])"
+            )
+        self.param_type = param_type
+        self.when = when
+        self.frozen = frozen
+        self.hf_mapping = hf_mapping
+        # Name will be set by __set_name__
+        self._name: str | None = None
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Called when the attribute is assigned to a class."""
+        self._name = name
+
+    def __repr__(self) -> str:
+        parts = [f"Param({self.param_type!r}"]
+        if self.when is not None:
+            parts.append(f", when={self.when!r}")
+        if self.frozen:
+            parts.append(", frozen=True")
+        if self.hf_mapping:
+            parts.append(f", hf_mapping={self.hf_mapping!r}")
+        parts.append(")")
+        return "".join(parts)
+
+    def to_spec(self, name: str) -> ParamSpec:
+        """Convert to ParamSpec for the compilation pipeline."""
+        spec = ParamSpec(name=name)
+
+        if isinstance(self.param_type, TensorAnnotation):
+            spec.kind = ParamKind.TENSOR
+            spec.shape = self.param_type.dims
+            spec.dtype = self.param_type.dtype
+            spec.optional = self.param_type.optional
+        elif isinstance(self.param_type, ArrayAnnotation):
+            spec.kind = ParamKind.ARRAY
+            spec.array_size = self.param_type.size
+            spec.element_type = self.param_type.element_type
+
+        spec.frozen = self.frozen
+        spec.hf_path = self.hf_mapping
+
+        # Handle condition
+        if self.when is not None:
+            if isinstance(self.when, str):
+                # Convert string attribute name to lambda that accesses self.attr directly
+                # (no default - let it raise AttributeError like @param style, which
+                # causes the exception handler to include the param)
+                attr_name = self.when
+                spec.condition = lambda self, attr=attr_name: getattr(self, attr)
+            else:
+                spec.condition = self.when
+
+        return spec
+
+
+# =============================================================================
+# Parameter Decorator (Method Style)
 # =============================================================================
 
 

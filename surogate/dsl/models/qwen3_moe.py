@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor, Array
-from ..decorators import model, param, forward, hf_config
+from ..decorators import model, forward, hf_config, Param
 from ..graph_builder import graph
 from ..hf import fuse
 
@@ -75,25 +75,11 @@ class Qwen3MoEModel:
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
 
-    @param(hf_mapping="model.embed_tokens.weight")
-    def embedding(self) -> Tensor["vocab_size", "d_model"]:
-        """Token embedding table."""
-        ...
-
-    @param
-    def blocks(self) -> Array["n_layers", "Qwen3MoEBlock"]:
-        """Stacked MoE transformer blocks."""
-        ...
-
-    @param(hf_mapping="model.norm.weight")
-    def final_norm(self) -> Tensor["d_model"]:
-        """Final layer norm weight."""
-        ...
-
-    @param(hf_mapping="lm_head.weight")
-    def lm_head(self) -> Tensor["vocab_size", "d_model"]:
-        """Language model head."""
-        ...
+    # Model weights
+    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="model.embed_tokens.weight")
+    blocks = Param(Array["n_layers", "Qwen3MoEBlock"])
+    final_norm = Param(Tensor["d_model"], hf_mapping="model.norm.weight")
+    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
 
     # HF mappings for block parameters
     _hf_block_mappings_ = {

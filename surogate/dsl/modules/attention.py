@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import module, param, forward, save
+from ..decorators import module, forward, save, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -39,25 +39,11 @@ class GQAAttention:
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    @param
-    def qkv_weight(self) -> Tensor["QKV", "C"]:
-        """Combined QKV projection weight."""
-        ...
-
-    @param(condition=lambda self: self.use_qkv_bias)
-    def qkv_bias(self) -> Tensor["QKV"]:
-        """Optional QKV projection bias."""
-        ...
-
-    @param
-    def out_weight(self) -> Tensor["C", "AttnDim"]:
-        """Output projection weight."""
-        ...
-
-    @param(frozen=True)
-    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
-        """Precomputed RoPE frequencies."""
-        ...
+    # Attention weights
+    qkv_weight = Param(Tensor["QKV", "C"])
+    qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
+    out_weight = Param(Tensor["C", "AttnDim"])
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
     @forward
     @save("qkv", "out", "lse")
@@ -124,29 +110,13 @@ class Qwen3Attention:
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    @param
-    def qkv_weight(self) -> Tensor["QKV", "C"]:
-        ...
-
-    @param(condition=lambda self: self.use_qkv_bias)
-    def qkv_bias(self) -> Tensor["QKV"]:
-        ...
-
-    @param
-    def out_weight(self) -> Tensor["C", "AttnDim"]:
-        ...
-
-    @param(condition=lambda self: self.use_qk_norm)
-    def q_norm_weight(self) -> Tensor["D"]:
-        ...
-
-    @param(condition=lambda self: self.use_qk_norm)
-    def k_norm_weight(self) -> Tensor["D"]:
-        ...
-
-    @param(frozen=True)
-    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
-        ...
+    # Attention weights
+    qkv_weight = Param(Tensor["QKV", "C"])
+    qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
+    out_weight = Param(Tensor["C", "AttnDim"])
+    q_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    k_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
     @forward
     def forward(

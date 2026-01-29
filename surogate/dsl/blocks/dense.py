@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import block, param, forward
+from ..decorators import block, forward, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 from .common import Activation
@@ -60,57 +60,20 @@ class DenseTransformerBlock:
         self.MUp = self._mup_multiplier * self.M
 
     # LayerNorm weights
-    @param
-    def ln1_weight(self) -> Tensor["C"]:
-        """Pre-attention layer norm weight."""
-        ...
-
-    @param
-    def ln2_weight(self) -> Tensor["C"]:
-        """Pre-MLP layer norm weight."""
-        ...
+    ln1_weight = Param(Tensor["C"])
+    ln2_weight = Param(Tensor["C"])
 
     # Attention weights
-    @param
-    def qkv_weight(self) -> Tensor["QKV", "C"]:
-        """Combined QKV projection."""
-        ...
-
-    @param(condition=lambda self: self.use_qkv_bias)
-    def qkv_bias(self) -> Tensor["QKV"]:
-        """QKV projection bias."""
-        ...
-
-    @param
-    def out_weight(self) -> Tensor["C", "AttnDim"]:
-        """Attention output projection."""
-        ...
-
-    @param(condition=lambda self: self.use_qk_norm)
-    def q_norm_weight(self) -> Tensor["D"]:
-        """Query norm weight for QK-Norm."""
-        ...
-
-    @param(condition=lambda self: self.use_qk_norm)
-    def k_norm_weight(self) -> Tensor["D"]:
-        """Key norm weight for QK-Norm."""
-        ...
-
-    @param(frozen=True)
-    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
-        """Precomputed RoPE frequencies."""
-        ...
+    qkv_weight = Param(Tensor["QKV", "C"])
+    qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
+    out_weight = Param(Tensor["C", "AttnDim"])
+    q_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    k_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
     # MLP weights
-    @param
-    def mlp_up_weight(self) -> Tensor["MUp", "C"]:
-        """MLP up (+ gate for SwiGLU) projection."""
-        ...
-
-    @param
-    def mlp_down_weight(self) -> Tensor["C", "M"]:
-        """MLP down projection."""
-        ...
+    mlp_up_weight = Param(Tensor["MUp", "C"])
+    mlp_down_weight = Param(Tensor["C", "M"])
 
     @forward
     def forward(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import module, param, forward
+from ..decorators import module, forward, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -19,10 +19,8 @@ class RMSNorm:
         # Typed dimension - use short symbolic names that C++ ShapeEnv expects
         self.C = Dim("C")
 
-    @param
-    def weight(self) -> Tensor["C"]:
-        """Normalization weight [d_model]."""
-        ...
+    # Normalization weight
+    weight = Param(Tensor["C"])
 
     @forward
     def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
@@ -42,10 +40,8 @@ class FusedResidualRMSNorm:
         # Typed dimension - use short symbolic names that C++ ShapeEnv expects
         self.C = Dim("C")
 
-    @param
-    def weight(self) -> Tensor["C"]:
-        """Normalization weight [d_model]."""
-        ...
+    # Normalization weight
+    weight = Param(Tensor["C"])
 
     @forward
     def forward(

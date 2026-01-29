@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import module, param, forward, save
+from ..decorators import module, forward, save, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -21,15 +21,9 @@ class Linear:
         self.C = Dim("in_dim")
         self.O = Dim("out_dim")
 
-    @param
-    def weight(self) -> Tensor["O", "C"]:
-        """Weight matrix [out_dim, in_dim]."""
-        ...
-
-    @param(condition=lambda self: self.use_bias)
-    def bias(self) -> Tensor["O"]:
-        """Optional bias vector [out_dim]."""
-        ...
+    # Linear weights
+    weight = Param(Tensor["O", "C"])
+    bias = Param(Tensor["O"], when="use_bias")
 
     @forward
     @save("x")

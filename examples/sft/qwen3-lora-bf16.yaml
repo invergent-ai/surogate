@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-8B
+model: Qwen/Qwen3-1.7B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false

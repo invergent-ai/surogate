@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import block, param, forward
+from ..decorators import block, forward, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -76,79 +76,28 @@ class Qwen3MoEBlock:
         self.SharedMUp = 2 * self.SharedM
 
     # LayerNorm weights
-    @param
-    def ln1_weight(self) -> Tensor["C"]:
-        """Pre-attention layer norm weight."""
-        ...
-
-    @param
-    def ln2_weight(self) -> Tensor["C"]:
-        """Pre-MoE layer norm weight."""
-        ...
+    ln1_weight = Param(Tensor["C"])
+    ln2_weight = Param(Tensor["C"])
 
     # Attention weights
-    @param
-    def qkv_weight(self) -> Tensor["QKV", "C"]:
-        """Combined QKV projection."""
-        ...
-
-    @param(condition=lambda self: self.use_qkv_bias)
-    def qkv_bias(self) -> Tensor["QKV"]:
-        """QKV projection bias."""
-        ...
-
-    @param
-    def out_weight(self) -> Tensor["C", "AttnDim"]:
-        """Attention output projection."""
-        ...
-
-    @param(condition=lambda self: self.use_qk_norm)
-    def q_norm_weight(self) -> Tensor["D"]:
-        """Query norm weight for QK-Norm."""
-        ...
-
-    @param(condition=lambda self: self.use_qk_norm)
-    def k_norm_weight(self) -> Tensor["D"]:
-        """Key norm weight for QK-Norm."""
-        ...
-
-    @param(frozen=True)
-    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
-        """Precomputed RoPE frequencies."""
-        ...
+    qkv_weight = Param(Tensor["QKV", "C"])
+    qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
+    out_weight = Param(Tensor["C", "AttnDim"])
+    q_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    k_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
     # Router weight
-    @param
-    def router_weight(self) -> Tensor["E", "C"]:
-        """Router gate weight [num_experts, hidden_size]."""
-        ...
+    router_weight = Param(Tensor["E", "C"])
 
     # Expert weights (batched format: [num_experts, ...])
-    @param
-    def experts_gate_up(self) -> Tensor["E", "MUp", "C"]:
-        """Batched expert gate+up weights [num_experts, 2*d_ff, hidden_size]."""
-        ...
-
-    @param
-    def experts_down(self) -> Tensor["E", "C", "M"]:
-        """Batched expert down weights [num_experts, hidden_size, d_ff]."""
-        ...
+    experts_gate_up = Param(Tensor["E", "MUp", "C"])
+    experts_down = Param(Tensor["E", "C", "M"])
 
     # Shared expert weights (optional)
-    @param(condition=lambda self: self.use_shared_expert)
-    def shared_expert_gate(self) -> Tensor["SharedM", "C"]:
-        """Shared expert gate projection."""
-        ...
-
-    @param(condition=lambda self: self.use_shared_expert)
-    def shared_expert_up(self) -> Tensor["SharedM", "C"]:
-        """Shared expert up projection."""
-        ...
-
-    @param(condition=lambda self: self.use_shared_expert)
-    def shared_expert_down(self) -> Tensor["C", "SharedM"]:
-        """Shared expert down projection."""
-        ...
+    shared_expert_gate = Param(Tensor["SharedM", "C"], when="use_shared_expert")
+    shared_expert_up = Param(Tensor["SharedM", "C"], when="use_shared_expert")
+    shared_expert_down = Param(Tensor["C", "SharedM"], when="use_shared_expert")
 
     @forward
     def forward(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import block, param, forward
+from ..decorators import block, forward, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -43,33 +43,18 @@ class LlamaBlock:
         self.AttnDim = self.Hq * self.D
         self.MUp = 2 * self.M
 
-    @param
-    def ln1_weight(self) -> Tensor["C"]:
-        ...
+    # LayerNorm weights
+    ln1_weight = Param(Tensor["C"])
+    ln2_weight = Param(Tensor["C"])
 
-    @param
-    def ln2_weight(self) -> Tensor["C"]:
-        ...
+    # Attention weights
+    qkv_weight = Param(Tensor["QKV", "C"])
+    out_weight = Param(Tensor["C", "AttnDim"])
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
-    @param
-    def qkv_weight(self) -> Tensor["QKV", "C"]:
-        ...
-
-    @param
-    def out_weight(self) -> Tensor["C", "AttnDim"]:
-        ...
-
-    @param(frozen=True)
-    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
-        ...
-
-    @param
-    def mlp_up_weight(self) -> Tensor["MUp", "C"]:
-        ...
-
-    @param
-    def mlp_down_weight(self) -> Tensor["C", "M"]:
-        ...
+    # MLP weights
+    mlp_up_weight = Param(Tensor["MUp", "C"])
+    mlp_down_weight = Param(Tensor["C", "M"])
 
     @forward
     def forward(
