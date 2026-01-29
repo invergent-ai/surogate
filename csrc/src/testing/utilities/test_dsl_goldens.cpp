@@ -715,7 +715,7 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
 
             RuntimeOptions options;
             options.UseCudaGraphs = false;
-            options.RecomputeBlock = false;
+            options.Recompute = RecomputeLevel::None;
             options.ModelType = cfg.DType;
             options.MatmulType = cfg.DType;
             options.GradientType = cfg.DType;

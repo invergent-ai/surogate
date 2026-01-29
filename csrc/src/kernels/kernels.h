@@ -47,6 +47,13 @@ void rmsnorm_forward(float* out, float* rms, const float* inp, const float* weig
 void rmsnorm_forward(nv_bfloat16* out, float* rms, const nv_bfloat16* inp, const nv_bfloat16* weight, float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 void rmsnorm_forward(Tensor& out, Tensor& rms, const Tensor& inp, const Tensor& weight, float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 
+/// @brief Apply RMSNorm using a pre-computed rstd value (for deterministic recomputation)
+/// This avoids recomputing rstd which can differ due to floating-point non-associativity.
+/// out[i] = inp[i] * rstd[batch_idx] * weight[i % C]
+void rmsnorm_apply_saved(float* out, const float* inp, const float* weight, const float* rstd, int B, int T, int C, cudaStream_t stream);
+void rmsnorm_apply_saved(nv_bfloat16* out, const nv_bfloat16* inp, const nv_bfloat16* weight, const float* rstd, int B, int T, int C, cudaStream_t stream);
+void rmsnorm_apply_saved(Tensor& out, const Tensor& inp, const Tensor& weight, const Tensor& rstd, int B, int T, int C, cudaStream_t stream);
+
 void rmsnorm_forward_quant(__nv_fp8_e4m3* out, float* scale_ptr, float* rms, const nv_bfloat16* inp, const nv_bfloat16* weight, const float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 void rmsnorm_forward_quant(Tensor& out, float* scale_ptr, Tensor& rms, const Tensor& inp, const Tensor& weight, const float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 
@@ -64,6 +71,13 @@ void fused_residual_rmsnorm_forward(nv_bfloat16* residual, nv_bfloat16* normed, 
                                     float epsilon, int N, int C, cudaStream_t stream);
 void fused_residual_rmsnorm_forward(Tensor& residual, Tensor& normed, Tensor& rrms, const Tensor& inp1, const Tensor& inp2, const Tensor& weight, float* abs_max_ptr,
                                     float epsilon, int N, int C, cudaStream_t stream);
+
+/// @brief Fused residual add + RMSNorm apply using pre-computed rstd (for deterministic recomputation)
+/// residual = inp1 + inp2
+/// normed = residual * rstd * weight
+void fused_residual_rmsnorm_apply_saved(float* residual, float* normed, const float* inp1, const float* inp2, const float* weight, const float* rstd, int N, int C, cudaStream_t stream);
+void fused_residual_rmsnorm_apply_saved(nv_bfloat16* residual, nv_bfloat16* normed, const nv_bfloat16* inp1, const nv_bfloat16* inp2, const nv_bfloat16* weight, const float* rstd, int N, int C, cudaStream_t stream);
+void fused_residual_rmsnorm_apply_saved(Tensor& residual, Tensor& normed, const Tensor& inp1, const Tensor& inp2, const Tensor& weight, const Tensor& rstd, int N, int C, cudaStream_t stream);
 
 // Head-wise RMSNorm over packed QKV buffers (used for Qwen3-style Q/K norm).
 // Operates in-place on @p qkv, normalizing vectors of length @p head_size for each (token, head)

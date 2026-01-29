@@ -40,6 +40,16 @@ void rmsnorm_forward(Tensor& out, Tensor& rms, const Tensor& inp, const Tensor& 
     }
 }
 
+void rmsnorm_apply_saved(Tensor& out, const Tensor& inp, const Tensor& weight, const Tensor& rstd, int B, int T, int C, cudaStream_t stream) {
+    if(out.DType == ETensorDType::BF16) {
+        rmsnorm_apply_saved(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), B, T, C, stream);
+    } else if (out.DType == ETensorDType::FP32) {
+        rmsnorm_apply_saved(out.get<float>(), inp.get<float>(), weight.get<float>(), rstd.get<float>(), B, T, C, stream);
+    } else {
+        throw std::logic_error("rmsnorm_apply_saved: unsupported dtype");
+    }
+}
+
 /**
  * @brief Computes the backward pass for Root Mean Square Normalization (RMSNorm).
  *
@@ -122,6 +132,21 @@ void fused_residual_rmsnorm_forward(Tensor& residual, Tensor& normed, Tensor& rr
             inp1.get<float>(), inp2.get<float>(), weight.get<float>(), abs_max_ptr, epsilon, N, C, stream);
     } else {
         throw std::logic_error("fused_residual_rmsnorm_forward: unsupported dtype");
+    }
+}
+
+void fused_residual_rmsnorm_apply_saved(Tensor& residual, Tensor& normed,
+                                        const Tensor& inp1, const Tensor& inp2,
+                                        const Tensor& weight, const Tensor& rstd,
+                                        int N, int C, cudaStream_t stream) {
+    if(residual.DType == ETensorDType::BF16) {
+        fused_residual_rmsnorm_apply_saved(residual.get<nv_bfloat16>(), normed.get<nv_bfloat16>(),
+            inp1.get<nv_bfloat16>(), inp2.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), N, C, stream);
+    } else if (residual.DType == ETensorDType::FP32) {
+        fused_residual_rmsnorm_apply_saved(residual.get<float>(), normed.get<float>(),
+            inp1.get<float>(), inp2.get<float>(), weight.get<float>(), rstd.get<float>(), N, C, stream);
+    } else {
+        throw std::logic_error("fused_residual_rmsnorm_apply_saved: unsupported dtype");
     }
 }
 

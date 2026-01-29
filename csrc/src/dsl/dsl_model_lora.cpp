@@ -223,7 +223,7 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
     mLoRARunState->norm_buffer = mAllocator->allocate(
         ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 2});
 
-    if (mOptions.RecomputeBlock) {
+    if (mOptions.recompute_enabled()) {
         const int C = mModelConfig.HiddenSize;
         mLoRARunState->recompute_ln = mAllocator->allocate(
             work_dtype, "lora_recompute_ln", EAllocationType::ON_DEVICE, {B, T, C});

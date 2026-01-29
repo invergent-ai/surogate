@@ -16,44 +16,38 @@
 #include "utilities/allocator.h"
 #include "utilities/dtype.h"
 
+// ============================================================================
+// Recomputation levels for activation checkpointing
+// ============================================================================
+// These levels trade compute for memory by recomputing activations during backward.
+// The implementation uses segment-based recomputation with clearly defined checkpoint
+// boundaries to ensure numerical correctness.
+//
+// Level summary:
+//   - None:       Save all activations. Maximum memory, fastest training.
+//                 Guarantees identical gradients. Use for FFT or debugging.
+//   - Standard:   Recompute attention + FFN intermediates from checkpoints.
+//                 Saves: residuals and rstd values (attention LSE/out_proj are recomputed).
+//                 Good balance of memory and speed.
+//   - Aggressive: Recompute everything except residuals (maximum memory savings).
+//
+enum class RecomputeLevel {
+    None = 0,       ///< No recomputation - save all activations
+    Standard = 1,   ///< Standard recomputation - save checkpoints, recompute intermediates
+    Aggressive = 2, ///< Aggressive recomputation - minimize memory, maximize recompute
+};
+
 // Runtime/training options used by the CLI and python bindings.
 // The modular system consumes these via modules::ModelOptions::from_runtime_options().
 struct RuntimeOptions {
     bool KeepAllActivations = false;
 
     // ========================================================================
-    // Fine-grained recomputation flags (per-component instead of per-layer)
+    // Recomputation configuration
     // ========================================================================
-    // These provide memory-compute tradeoffs at different granularities.
-    // When RecomputeBlock=true (default), all component flags are effectively enabled.
-    //
-    // Memory savings per component (approximate for 7B model, B=4, T=2048):
-    //   - swiglu:    ~200MB  (B*T*2*D tensor saved)
-    //   - mlp_up:    ~400MB  (B*T*2*D tensor saved)
-    //   - qkv:       ~200MB  (B*T*QKV_C tensor saved)
-    //   - att:       ~150MB  (B*T*Hq*Hs tensor saved)
-    //   - att_out:   ~100MB  (B*T*C tensor saved)
-    //   - ln1/ln2:    ~50MB each (B*T*C tensors + rstd)
-    //
-    // Compute cost per recompute (relative):
-    //   - swiglu:    ~0.5%   (elementwise, very cheap)
-    //   - rmsnorm:   ~1%     (reduction, cheap)
-    //   - qkv:       ~15%    (large matmul)
-    //   - att:       ~30%    (flash attention)
-    //   - att_out:   ~10%    (matmul)
-    //   - mlp_up:    ~15%    (large matmul)
-    //   - mlp_down:  ~15%    (large matmul)
-    //
-    bool RecomputeSwiGLu = false;    ///< Recompute SwiGLU activation in FFN backward
-    bool RecomputeRMSNorm = false;   ///< Recompute RMSNorm (LN1/LN2) forward
-    bool RecomputeFFN = false;       ///< Recompute FFN/MLP up projection (implies RecomputeSwiGLu)
-    bool RecomputeMLPDown = false;   ///< Recompute MLP down projection (rarely needed, output saved anyway)
-    bool RecomputeQKV = false;       ///< Recompute QKV projection
-    bool RecomputeQKNorm = false;    ///< Recompute QK head normalization (Qwen3-style)
-    bool RecomputeRoPE = false;      ///< Recompute RoPE rotation (cheap, usually saved for QK-norm backward)
-    bool RecomputeAtt = false;       ///< Recompute attention (flash attention forward) (implies RecomputeQKV)
-    bool RecomputeOutProj = false;   ///< Recompute attention output projection
-    bool RecomputeBlock = true;      ///< Recompute entire layer (enables all component flags)
+    // Controls activation checkpointing strategy for memory-compute tradeoff.
+    // See RecomputeLevel enum above for level descriptions.
+    RecomputeLevel Recompute = RecomputeLevel::Standard;
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;
@@ -202,6 +196,44 @@ struct RuntimeOptions {
 
     [[nodiscard]] EAllocationType offload_alloc() const {
         return UseWriteCombined ? EAllocationType::WRITE_CMB : EAllocationType::PINNED;
+    }
+
+    // ========================================================================
+    // Recomputation level helpers
+    // ========================================================================
+
+    /// Returns true if any recomputation is enabled (level > None)
+    [[nodiscard]] bool recompute_enabled() const {
+        return Recompute != RecomputeLevel::None;
+    }
+
+    /// Returns true if standard or aggressive recomputation is enabled
+    [[nodiscard]] bool recompute_standard_or_higher() const {
+        return Recompute >= RecomputeLevel::Standard;
+    }
+
+    /// Returns true if aggressive recomputation is enabled
+    [[nodiscard]] bool recompute_aggressive() const {
+        return Recompute == RecomputeLevel::Aggressive;
+    }
+
+    /// Returns the recompute level as a string for logging
+    [[nodiscard]] std::string_view recompute_level_name() const {
+        switch (Recompute) {
+            case RecomputeLevel::None: return "none";
+            case RecomputeLevel::Standard: return "standard";
+            case RecomputeLevel::Aggressive: return "aggressive";
+            default: return "unknown";
+        }
+    }
+
+    /// Parse recompute level from string (for Python bindings)
+    static RecomputeLevel parse_recompute_level(const std::string& level) {
+        if (level == "none" || level == "0") return RecomputeLevel::None;
+        if (level == "standard" || level == "1") return RecomputeLevel::Standard;
+        if (level == "aggressive" || level == "2") return RecomputeLevel::Aggressive;
+        throw std::invalid_argument("Invalid recompute level: " + level +
+                                    ". Valid values: none, standard, aggressive");
     }
 };
 

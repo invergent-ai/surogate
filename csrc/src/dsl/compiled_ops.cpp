@@ -2691,7 +2691,23 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                 mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
                 return;
             }
-            // Fall back to aliasing if the base grad has no storage yet.
+            // For stack-allocated gradient temps, allocate proper storage instead of aliasing.
+            // Aliasing to d_out can cause stale memory access when the stack is restored at
+            // layer boundaries because the aliased memory gets recycled.
+            const bool is_stack_grad = mRunState.large_bwd_temps_on_stack() &&
+                (ref.slot == TensorSlot::BlockDQKV ||
+                 ref.slot == TensorSlot::BlockDMLPUp ||
+                 ref.slot == TensorSlot::BlockDSwiGLU);
+            if (is_stack_grad) {
+                // Allocate proper stack storage and copy data
+                mRunState.temp_acquire(*base_grad);
+                mTemps.push_back(*base_grad);
+                CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+                return;
+            }
+            // Fall back to aliasing if the base grad has no storage yet (non-stack temps).
             base_grad->Data = d_out.Data;
             mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
             return;
@@ -2748,6 +2764,40 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
+
+    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
+    static bool debug_grad_norms = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
+    if (debug_recompute && layer_idx >= 0) {
+        std::fprintf(stderr, "[RECOMPUTE DEBUG] matmul_backward layer=%d weight=%s a_ptr=%p last_recompute=%d\n",
+                     layer_idx, weight_name.c_str(), a.Data, mLastRecomputeLayer);
+    }
+
+    // Debug: compute input norms for gradient tracking
+    static Tensor mm_bwd_norm_buf{};
+    auto compute_norm_mm = [&](const Tensor& t) -> float {
+        if (!debug_grad_norms || !t.Data) return 0.0f;
+        if (!mm_bwd_norm_buf.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            mm_bwd_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32, "debug_mm_bwd_norm",
+                                                            EAllocationType::ON_DEVICE, {num_sums});
+        }
+        if (!mm_bwd_norm_buf.Data) return 0.0f;
+        fill_zero(mm_bwd_norm_buf, mRunState.MainStream);
+        global_norm_squared(mm_bwd_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+        deterministic_sum(mm_bwd_norm_buf.template get<float>(),
+                          mm_bwd_norm_buf.template get<float>(),
+                          mm_bwd_norm_buf.nelem(), mRunState.MainStream);
+        float host_sum = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&host_sum, mm_bwd_norm_buf.template get<float>(),
+                                   sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        return std::sqrt(host_sum);
+    };
+
+    if (debug_grad_norms && layer_idx >= 0) {
+        std::fprintf(stderr, "[GRAD NORM] matmul_bwd layer=%d weight=%s: d_out=%.6g a=%.6g\n",
+                     layer_idx, weight_name.c_str(), compute_norm_mm(d_out), compute_norm_mm(a));
+    }
 
     if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
         static int debug_matmul_count = 0;
@@ -3136,7 +3186,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             auto& acts = mRunState.simplified_acts(layer_idx);
             if (*op.attrs.matmul_op == modules::MatmulOp::MLPDown) {
                 // LoRA backward hook needs acts.swiglu (forward activation).
-                // With RecomputeBlock=true, swiglu may have been stack-allocated and freed.
+                // With recompute enabled, swiglu may have been stack-allocated and freed.
                 if (!acts.swiglu.Data && acts.mlp_up.Data) {
                     mRunState.temp_acquire(acts.swiglu);
                     const int Bv = static_cast<int>(mB);
@@ -3500,6 +3550,56 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     std::string field;
     parse_block_param(op.inputs[3].name, layer_idx, field);
 
+    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
+    static bool debug_grad_norms = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
+    if (debug_recompute) {
+        std::fprintf(stderr, "[RECOMPUTE DEBUG] flash_attention_backward layer=%d qkv_ptr=%p out_ptr=%p lse_ptr=%p last_recompute=%d\n",
+                     layer_idx, qkv_ptr->Data, out_ptr->Data, lse_ptr->Data, mLastRecomputeLayer);
+    }
+
+    // Debug: compute input norms for gradient tracking
+    static Tensor attn_bwd_norm_buf{};
+    auto compute_norm_attn = [&](const Tensor& t) -> float {
+        if (!debug_grad_norms || !t.Data) return 0.0f;
+        if (!attn_bwd_norm_buf.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            attn_bwd_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32, "debug_attn_bwd_norm",
+                                                              EAllocationType::ON_DEVICE, {num_sums});
+        }
+        if (!attn_bwd_norm_buf.Data) return 0.0f;
+        fill_zero(attn_bwd_norm_buf, mRunState.MainStream);
+        global_norm_squared(attn_bwd_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+        deterministic_sum(attn_bwd_norm_buf.template get<float>(),
+                          attn_bwd_norm_buf.template get<float>(),
+                          attn_bwd_norm_buf.nelem(), mRunState.MainStream);
+        float host_sum = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&host_sum, attn_bwd_norm_buf.template get<float>(),
+                                   sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        return std::sqrt(host_sum);
+    };
+
+    if (debug_grad_norms) {
+        std::fprintf(stderr, "[GRAD NORM] attn_bwd layer=%d BEFORE:\n", layer_idx);
+        std::fprintf(stderr, "  d_out: norm=%.6g ptr=%p\n", compute_norm_attn(d_out), d_out.Data);
+        std::fprintf(stderr, "  out (att): norm=%.6g ptr=%p name=%s\n", compute_norm_attn(*out_ptr), out_ptr->Data, op.inputs[1].name.c_str());
+        std::fprintf(stderr, "  lse: norm=%.6g ptr=%p name=%s\n", compute_norm_attn(*lse_ptr), lse_ptr->Data, op.inputs[2].name.c_str());
+        std::fprintf(stderr, "  qkv: norm=%.6g ptr=%p name=%s\n", compute_norm_attn(*qkv_ptr), qkv_ptr->Data, op.inputs[3].name.c_str());
+        // Check expected values from simplified_acts
+        if (layer_idx >= 0) {
+            auto& acts = mRunState.simplified_acts(layer_idx);
+            std::fprintf(stderr, "  [expected] acts.att: ptr=%p norm=%.6g\n", acts.att.Data, compute_norm_attn(acts.att));
+            std::fprintf(stderr, "  [expected] acts.lse: ptr=%p norm=%.6g\n", acts.lse.Data, compute_norm_attn(acts.lse));
+            std::fprintf(stderr, "  [expected] acts.qkv: ptr=%p norm=%.6g\n", acts.qkv.Data, compute_norm_attn(acts.qkv));
+            if (out_ptr->Data != acts.att.Data) {
+                std::fprintf(stderr, "  WARNING: out_ptr != acts.att!\n");
+            }
+            if (lse_ptr->Data != acts.lse.Data) {
+                std::fprintf(stderr, "  WARNING: lse_ptr != acts.lse!\n");
+            }
+        }
+    }
+
     // FIX: Zero-initialize d_qkv before cuDNN attention backward to prevent NaN from uninitialized memory.
     // The d_qkv buffer may contain stale values from previous operations, and cuDNN attention backward
     // may read parts of this buffer even though it's expected to be output-only. Without this zero-init,
@@ -3521,6 +3621,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                  mRunState.CudnnHandle,
                                  static_cast<int>(mB), static_cast<int>(mT),
                                  Hq, Hkv, Hs, mRunState.MainStream);
+        if (debug_grad_norms) {
+            std::fprintf(stderr, "[GRAD NORM] attn_bwd layer=%d AFTER: d_qkv norm=%.6g\n",
+                         layer_idx, compute_norm_attn(d_qkv));
+        }
         return;
     }
 
@@ -3567,7 +3671,71 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
         }
     }
+    // FIX: LN2 backward needs the recomputed residual_att from simplified_acts.
+    // The backward graph may have wrong tensor names for the last layer (e.g., "StackedBlocks_N"
+    // instead of "blocks[N].res_att"), causing it to resolve to stale/wrong data.
+    // When recompute is enabled, always use the freshly recomputed residual_att.
+    if (ln_layer_idx >= 0 && ln_field == "ln2_weight" && mRecomputeEnabled) {
+        residual_out_ptr = &mRunState.simplified_acts(ln_layer_idx).residual_att;
+    }
     Tensor& residual_out = *residual_out_ptr;
+
+    // Debug: FFT recompute verification
+    static bool debug_fft_recompute = env_enabled("SUROGATE_DEBUG_FFT_RECOMPUTE");
+    if (debug_fft_recompute && ln_layer_idx >= 0) {
+        static Tensor fft_norm_buf{};
+        if (!fft_norm_buf.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            fft_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                          "debug_fft_ln_bwd_norm",
+                                                          EAllocationType::ON_DEVICE,
+                                                          {num_sums});
+        }
+        auto norm_of = [&](const Tensor& t) -> float {
+            if (!fft_norm_buf.Data || !t.Data) return 0.0f;
+            fill_zero(fft_norm_buf, mRunState.MainStream);
+            global_norm_squared(fft_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+            deterministic_sum(fft_norm_buf.template get<float>(),
+                              fft_norm_buf.template get<float>(),
+                              fft_norm_buf.nelem(),
+                              mRunState.MainStream);
+            float host_sum = 0.0f;
+            CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                       fft_norm_buf.template get<float>(),
+                                       sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            return std::sqrt(host_sum);
+        };
+
+        std::fprintf(stderr, "[FFT LN BWD] layer=%d field=%s last_recompute=%d\n",
+                     ln_layer_idx, ln_field.c_str(), mLastRecomputeLayer);
+        std::fprintf(stderr, "  d_y: ptr=%p norm=%.6g\n", d_y.Data, norm_of(d_y));
+        std::fprintf(stderr, "  residual_out: ptr=%p norm=%.6g (input[2].name=%s slot=%d)\n",
+                     residual_out.Data, norm_of(residual_out),
+                     op.inputs[2].name.c_str(), static_cast<int>(op.inputs[2].slot));
+        std::fprintf(stderr, "  rstd: ptr=%p norm=%.6g\n", rstd.Data, norm_of(rstd));
+
+        // Check if residual_out matches the expected recomputed value
+        if (ln_field == "ln2_weight") {
+            // For LN2, residual_out should be residual_att from simplified_acts
+            auto& acts = mRunState.simplified_acts(ln_layer_idx);
+            std::fprintf(stderr, "  acts.residual_att: ptr=%p norm=%.6g\n",
+                         acts.residual_att.Data, norm_of(acts.residual_att));
+            if (residual_out.Data != acts.residual_att.Data) {
+                std::fprintf(stderr, "  WARNING: residual_out ptr != acts.residual_att ptr!\n");
+            }
+        }
+
+        // Check for NaN/Inf
+        float d_y_norm = norm_of(d_y);
+        float residual_norm = norm_of(residual_out);
+        float rstd_norm = norm_of(rstd);
+        if (!std::isfinite(d_y_norm) || !std::isfinite(residual_norm) || !std::isfinite(rstd_norm)) {
+            std::fprintf(stderr, "  ERROR: NaN/Inf detected in inputs!\n");
+        }
+    }
 
     if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
         static int debug_ln_count = 0;
@@ -3673,6 +3841,68 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                      abs_max_ptr,
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
+
+    // Debug: gradient norm tracking
+    static bool debug_grad_norms_ln = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
+    if (debug_grad_norms_ln && ln_layer_idx >= 0) {
+        static Tensor grad_norm_buf_ln{};
+        if (!grad_norm_buf_ln.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            grad_norm_buf_ln = mRunState.Allocator->allocate(ETensorDType::FP32, "debug_ln_grad_norm",
+                                                              EAllocationType::ON_DEVICE, {num_sums});
+        }
+        auto norm_ln = [&](const Tensor& t) -> float {
+            if (!grad_norm_buf_ln.Data || !t.Data) return 0.0f;
+            fill_zero(grad_norm_buf_ln, mRunState.MainStream);
+            global_norm_squared(grad_norm_buf_ln, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+            deterministic_sum(grad_norm_buf_ln.template get<float>(),
+                              grad_norm_buf_ln.template get<float>(),
+                              grad_norm_buf_ln.nelem(), mRunState.MainStream);
+            float host_sum = 0.0f;
+            CUDA_CHECK(cudaMemcpyAsync(&host_sum, grad_norm_buf_ln.template get<float>(),
+                                       sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            return std::sqrt(host_sum);
+        };
+        std::fprintf(stderr, "[GRAD NORM] ln_bwd layer=%d field=%s: d_y=%.6g d_input=%.6g residual_out=%.6g\n",
+                     ln_layer_idx, ln_field.c_str(), norm_ln(d_y), norm_ln(d_input), norm_ln(residual_out));
+    }
+
+    // Debug: check output gradients after rmsnorm_backward
+    if (debug_fft_recompute && ln_layer_idx >= 0) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        static Tensor fft_out_norm_buf{};
+        if (!fft_out_norm_buf.Data && mRunState.Allocator) {
+            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
+            fft_out_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                              "debug_fft_ln_out_norm",
+                                                              EAllocationType::ON_DEVICE,
+                                                              {num_sums});
+        }
+        auto norm_of_out = [&](const Tensor& t) -> float {
+            if (!fft_out_norm_buf.Data || !t.Data) return 0.0f;
+            fill_zero(fft_out_norm_buf, mRunState.MainStream);
+            global_norm_squared(fft_out_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
+            deterministic_sum(fft_out_norm_buf.template get<float>(),
+                              fft_out_norm_buf.template get<float>(),
+                              fft_out_norm_buf.nelem(),
+                              mRunState.MainStream);
+            float host_sum = 0.0f;
+            CUDA_CHECK(cudaMemcpyAsync(&host_sum,
+                                       fft_out_norm_buf.template get<float>(),
+                                       sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            return std::sqrt(host_sum);
+        };
+        float d_input_norm = norm_of_out(d_input);
+        std::fprintf(stderr, "[FFT LN BWD] layer=%d field=%s OUTPUT: d_input norm=%.6g\n",
+                     ln_layer_idx, ln_field.c_str(), d_input_norm);
+        if (!std::isfinite(d_input_norm)) {
+            std::fprintf(stderr, "  ERROR: d_input has NaN/Inf after rmsnorm_backward!\n");
+        }
+    }
 
     // Copy d_input to d_residual if they're different outputs
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {
@@ -4437,6 +4667,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
+    // Debug logging for recompute diagnosis
+    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
+    static int debug_step = 0;
+    int prev_layer_idx_debug = -1;
+    int layer_switches = 0;
+
+    if (debug_recompute) {
+        std::fprintf(stderr, "\n[RECOMPUTE DEBUG] === Backward pass step %d ===\n", debug_step);
+        std::fprintf(stderr, "[RECOMPUTE DEBUG] recompute_enabled=%d, num_ops=%zu, num_layers=%d\n",
+                     mRecomputeEnabled ? 1 : 0, graph.ops.size(), num_layers);
+        ++debug_step;
+    }
+
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
@@ -4450,6 +4693,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
+                    if (debug_recompute) {
+                        std::fprintf(stderr, "[RECOMPUTE DEBUG] op[%zu] layer_start=%d triggers recompute (prev=%d)\n",
+                                     idx, layer_idx, mLastRecomputeLayer);
+                    }
                     if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
                         clear_shared_grads(layer_idx);
                         layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
@@ -4462,20 +4709,46 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
         if (mRecomputeEnabled && mRecomputeFn) {
             const int layer_idx = op_layer_idx(op);
+            // Always recompute when switching layers. This is critical because:
+            // - Shared buffers (ln1, ln2, qkv, mlp_up, swiglu) contain only ONE layer's data
+            // - If the backward graph interleaves ops from different layers, we MUST
+            //   recompute to ensure the correct layer's data is in the shared buffers
+            // - The old check (missing_start || op_before_start) would skip recomputation
+            //   for layer N's late ops if we had already visited layer N earlier, causing
+            //   those ops to read stale data from whatever layer was recomputed last
             if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                const std::size_t start_idx =
-                    (layer_idx < num_layers) ? layer_start_indices[static_cast<std::size_t>(layer_idx)] : SIZE_MAX;
-                const bool missing_start = start_idx == SIZE_MAX;
-                const bool op_before_start = start_idx != SIZE_MAX && start_idx > idx;
-                if (missing_start || op_before_start) {
-                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                        clear_shared_grads(layer_idx);
-                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                    }
-                    mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
-                    mLastRecomputeLayer = layer_idx;
+                if (debug_recompute) {
+                    std::fprintf(stderr, "[RECOMPUTE DEBUG] op[%zu] %s (op_layer=%d) triggers recompute (prev=%d) [INTERLEAVE]\n",
+                                 idx, op_type_to_string(op.type), layer_idx, mLastRecomputeLayer);
+                    ++layer_switches;
                 }
+                if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
+                    clear_shared_grads(layer_idx);
+                    layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
+                }
+                mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                mLastRecomputeLayer = layer_idx;
             }
+        }
+
+        // Debug: log each op's layer assignment
+        if (debug_recompute) {
+            const int layer_any = op_layer_idx_any(op);
+            const int layer_non_grad = op_layer_idx(op);
+            if (layer_any != prev_layer_idx_debug || op.layer_start >= 0 || op.layer_end >= 0) {
+                std::fprintf(stderr, "[RECOMPUTE DEBUG] op[%zu] %s layer_any=%d layer_non_grad=%d layer_start=%d layer_end=%d id=%s\n",
+                             idx, op_type_to_string(op.type), layer_any, layer_non_grad,
+                             op.layer_start, op.layer_end, op.op_id.c_str());
+                prev_layer_idx_debug = layer_any;
+            }
+        }
+
+        // Debug: trace operation order and layers for gradient tracking
+        static bool debug_grad_norms = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
+        if (debug_grad_norms) {
+            const int layer_idx = op_layer_idx_any(op);
+            std::fprintf(stderr, "[OP TRACE] idx=%zu type=%s layer=%d id=%s\n",
+                         idx, op_type_to_string(op.type), layer_idx, op.op_id.c_str());
         }
 
         try {
@@ -4560,6 +4833,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // This prevents memory accumulation during backward pass
             // Option 1: At layer boundaries if annotated
             if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
+                // Debug: log layer completion
+                static bool debug_fft_layers = env_enabled("SUROGATE_DEBUG_FFT_RECOMPUTE");
+                if (debug_fft_layers) {
+                    std::fprintf(stderr, "[FFT BWD] Layer %d backward complete, restoring stack checkpoint\n",
+                                 op.layer_end);
+                }
+
                 // Restore stack and clear temps
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
@@ -4608,6 +4888,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             throw std::runtime_error(oss.str());
         }
 
+    }
+
+    // Debug summary
+    if (debug_recompute) {
+        std::fprintf(stderr, "[RECOMPUTE DEBUG] === Backward pass complete: %d interleaved layer switches ===\n\n",
+                     layer_switches);
     }
 
     // Final cleanup

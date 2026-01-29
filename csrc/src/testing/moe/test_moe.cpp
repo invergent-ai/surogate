@@ -1346,7 +1346,7 @@ TEST_CASE("Modular MoE model: 1 step forward/backward/update runs (full finetune
 
         RuntimeOptions opts;
         opts.UseCudaGraphs = false;
-        opts.RecomputeBlock = false;
+        opts.Recompute = RecomputeLevel::None;
         opts.ModelType = ETensorDType::BF16;
         opts.MatmulType = ETensorDType::BF16;
         opts.MasterDType = ETensorDType::BF16;
@@ -1451,7 +1451,7 @@ TEST_CASE("Modular MoE model: LoRA 1-step grad-norm stays finite", "[moe][lora]"
 
         RuntimeOptions opts;
         opts.UseCudaGraphs = false;
-        opts.RecomputeBlock = false;
+        opts.Recompute = RecomputeLevel::None;
         opts.ModelType = ETensorDType::BF16;
         opts.MatmulType = ETensorDType::BF16;
         opts.MasterDType = ETensorDType::BF16;
@@ -1596,7 +1596,7 @@ TEST_CASE("Modular MoE model: QLoRA(BnB) selective expert dequant works in backw
 
         RuntimeOptions opts;
         opts.UseCudaGraphs = false;
-        opts.RecomputeBlock = false;
+        opts.Recompute = RecomputeLevel::None;
         opts.ModelType = ETensorDType::BF16;
         opts.MatmulType = ETensorDType::BF16;
         opts.MasterDType = ETensorDType::BF16;

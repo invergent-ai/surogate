@@ -294,11 +294,9 @@ NB_MODULE(_surogate, m) {
 
     nb::class_<RuntimeOptions>(m, "RuntimeOptions",
         "Execution/training options controlling recomputation, offloading, sharding, and dtypes.\n\n"
-        "Many flags trade compute for memory (recompute) or host/device transfers (offload).\n\n"
+        "Recomputation trades compute for memory. Offloading trades host/device transfers for VRAM.\n\n"
         "Backwards-compatibility: `LLamaOptions` is an alias of this class.")
-        .def("__init__", [](RuntimeOptions *t, bool recompute_swiglu, bool recompute_rmsnorm,
-            bool recompute_ffn, bool recompute_mlp_down, bool recompute_qkv, bool recompute_qk_norm,
-            bool recompute_rope, bool recompute_att, bool recompute_out_proj, bool recompute_block, bool offload_residual,
+        .def("__init__", [](RuntimeOptions *t, const std::string& recompute, bool offload_residual,
             bool use_cuda_graphs, bool trigger_timing_events,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
@@ -323,17 +321,11 @@ NB_MODULE(_surogate, m) {
                 backend = matmul_backend_from_str(matmul_backend);
             }
 
+            // Parse recompute level
+            RecomputeLevel recompute_level = RuntimeOptions::parse_recompute_level(recompute);
+
             new (t) RuntimeOptions{
-                .RecomputeSwiGLu = recompute_swiglu,
-                .RecomputeRMSNorm = recompute_rmsnorm,
-                .RecomputeFFN = recompute_ffn,
-                .RecomputeMLPDown = recompute_mlp_down,
-                .RecomputeQKV = recompute_qkv,
-                .RecomputeQKNorm = recompute_qk_norm,
-                .RecomputeRoPE = recompute_rope,
-                .RecomputeAtt = recompute_att,
-                .RecomputeOutProj = recompute_out_proj,
-                .RecomputeBlock = recompute_block,
+                .Recompute = recompute_level,
                 .OffloadResidual = offload_residual,
                 .LMHeadChunks = lmhead_chunks,
                 .AttBwdChunks = attn_bwd_chunks,
@@ -361,16 +353,7 @@ NB_MODULE(_surogate, m) {
                 .MasterDType = opt_dtype_from_str(master_dtype)
             };
         }, nb::kw_only(),
-             nb::arg("recompute_swiglu") = false,
-             nb::arg("recompute_rmsnorm") = false,
-             nb::arg("recompute_ffn") = false,
-             nb::arg("recompute_mlp_down") = false,
-             nb::arg("recompute_qkv") = false,
-             nb::arg("recompute_qk_norm") = false,
-             nb::arg("recompute_rope") = false,
-             nb::arg("recompute_att") = false,
-             nb::arg("recompute_out_proj") = false,
-             nb::arg("recompute_block") = false,
+             nb::arg("recompute") = "standard",
              nb::arg("offload_residual") = false,
              nb::arg("use_cuda_graphs") = true,
              nb::arg("trigger_timing_events") = false,
@@ -401,7 +384,10 @@ NB_MODULE(_surogate, m) {
              nb::arg("use_dsl_ir") = false,
              "Create runtime/training options.\n\n"
              "Parameters:\n"
-             "- recompute_*: Enable recomputation for submodules to reduce activation memory.\n"
+             "- recompute: Recomputation level ('none', 'standard', 'aggressive').\n"
+             "  - 'none': Save all activations. Maximum memory, fastest training.\n"
+             "  - 'standard': Recompute intermediates from checkpoints. Good balance.\n"
+             "  - 'aggressive': Recompute everything except residuals/LSE. Minimum memory.\n"
              "- offload_*: Offload specific buffers/states; may reduce VRAM at performance cost.\n"
              "- use_cuda_graphs: Enable CUDA graphs where supported.\n"
              "- trigger_timing_events: Log additional timing information.\n"
@@ -415,17 +401,11 @@ NB_MODULE(_surogate, m) {
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
              "- skip_quant_last_layers: Skip quantization for last N layers.\n"
-             "- use_dsl_ir: Enable DSL IR backend (validation-only placeholder).")
-        .def_rw("recompute_swiglu", &RuntimeOptions::RecomputeSwiGLu, "Recompute SwiGLU activations in backward.")
-        .def_rw("recompute_rms_norm", &RuntimeOptions::RecomputeRMSNorm, "Recompute RMSNorm in backward.")
-        .def_rw("recompute_ffn", &RuntimeOptions::RecomputeFFN, "Recompute FFN in backward.")
-        .def_rw("recompute_mlp_down", &RuntimeOptions::RecomputeMLPDown, "Recompute MLP down projection in backward.")
-        .def_rw("recompute_qkv", &RuntimeOptions::RecomputeQKV, "Recompute QKV projections in backward.")
-        .def_rw("recompute_qk_norm", &RuntimeOptions::RecomputeQKNorm, "Recompute QK head normalization (Qwen3-style) in backward.")
-        .def_rw("recompute_rope", &RuntimeOptions::RecomputeRoPE, "Recompute RoPE rotation in backward.")
-        .def_rw("recompute_att", &RuntimeOptions::RecomputeAtt, "Recompute attention in backward.")
-        .def_rw("recompute_out_proj", &RuntimeOptions::RecomputeOutProj, "Recompute attention output projection in backward.")
-        .def_rw("recompute_block", &RuntimeOptions::RecomputeBlock, "Recompute the whole block (coarse-grained).")
+             "- use_dsl_ir: Enable DSL IR backend.")
+        .def_prop_rw("recompute",
+            [](const RuntimeOptions& self) { return std::string(self.recompute_level_name()); },
+            [](RuntimeOptions& self, const std::string& level) { self.Recompute = RuntimeOptions::parse_recompute_level(level); },
+            "Recomputation level: 'none', 'standard', or 'aggressive'.")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")

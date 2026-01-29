@@ -112,7 +112,7 @@ modules::ModularLoRAConfig create_lora_config() {
 RuntimeOptions create_test_options() {
     RuntimeOptions opts;
     opts.UseCudaGraphs = false;
-    opts.RecomputeBlock = false;
+    opts.Recompute = RecomputeLevel::None;
     opts.ModelType = ETensorDType::BF16;
     opts.MatmulType = ETensorDType::BF16;
     opts.MasterDType = ETensorDType::BF16;

@@ -122,7 +122,7 @@ Qwen3MoEConfig create_moe_config(int num_layers = 2, int vocab_size = 128) {
 RuntimeOptions create_test_options() {
     RuntimeOptions opts;
     opts.UseCudaGraphs = false;
-    opts.RecomputeBlock = false;
+    opts.Recompute = RecomputeLevel::None;
     opts.ModelType = ETensorDType::BF16;
     opts.MatmulType = ETensorDType::BF16;
     opts.MasterDType = ETensorDType::BF16;

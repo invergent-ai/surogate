@@ -434,7 +434,7 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -710,7 +710,7 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -1078,7 +1078,7 @@ TEST_CASE("dsl module goldens: embedding_module", "[dsl][modules][goldens]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -1207,7 +1207,7 @@ TEST_CASE("dsl module goldens: rmsnorm_module", "[dsl][modules][goldens]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -1344,7 +1344,7 @@ TEST_CASE("dsl module goldens: transformer_block", "[dsl][modules][goldens]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -1411,7 +1411,7 @@ TEST_CASE("dsl module goldens: lm_head_module", "[dsl][modules][goldens]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -1511,7 +1511,7 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -2080,7 +2080,7 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -2644,7 +2644,7 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = false;
+        options.Recompute = RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;
@@ -3276,7 +3276,7 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.RecomputeBlock = recompute_block;
+        options.Recompute = recompute_block ? RecomputeLevel::Standard : RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;

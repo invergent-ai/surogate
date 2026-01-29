@@ -663,12 +663,17 @@ struct ModelOptions {
 
     [[nodiscard]] RuntimeOptions to_runtime_options() const {
         RuntimeOptions opts;
-        opts.RecomputeSwiGLu = recompute_swiglu;
-        opts.RecomputeRMSNorm = recompute_rmsnorm;
-        opts.RecomputeFFN = recompute_ffn;
-        opts.RecomputeQKV = recompute_qkv;
-        opts.RecomputeAtt = recompute_attention;
-        opts.RecomputeBlock = recompute_block;
+        // Convert fine-grained recompute flags to RecomputeLevel
+        // If recompute_block is true, use Standard level
+        // Otherwise, if any recompute flag is set, use Standard level
+        // Otherwise, use None
+        if (recompute_block) {
+            opts.Recompute = RecomputeLevel::Standard;
+        } else if (recompute_attention || recompute_ffn || recompute_qkv || recompute_swiglu || recompute_rmsnorm) {
+            opts.Recompute = RecomputeLevel::Standard;
+        } else {
+            opts.Recompute = RecomputeLevel::None;
+        }
         opts.OffloadResidual = offload_residuals;
         opts.LMHeadChunks = lmhead_chunks;
         opts.AttBwdChunks = attention_bwd_chunks;
@@ -698,12 +703,16 @@ struct ModelOptions {
 
     static ModelOptions from_runtime_options(const RuntimeOptions& opts) {
         ModelOptions options;
-        options.recompute_swiglu = opts.RecomputeSwiGLu;
-        options.recompute_rmsnorm = opts.RecomputeRMSNorm;
-        options.recompute_ffn = opts.RecomputeFFN;
-        options.recompute_qkv = opts.RecomputeQKV;
-        options.recompute_attention = opts.RecomputeAtt;
-        options.recompute_block = opts.RecomputeBlock;
+        // Convert RecomputeLevel to fine-grained flags for modular path
+        // Standard level enables all recompute flags (like the old recompute_block=true)
+        // Aggressive level is also mapped to full recompute (modular path doesn't have aggressive mode)
+        const bool recompute_enabled = opts.recompute_enabled();
+        options.recompute_swiglu = recompute_enabled;
+        options.recompute_rmsnorm = recompute_enabled;
+        options.recompute_ffn = recompute_enabled;
+        options.recompute_qkv = recompute_enabled;
+        options.recompute_attention = recompute_enabled;
+        options.recompute_block = recompute_enabled;
         options.offload_residuals = opts.OffloadResidual;
         options.lmhead_chunks = opts.LMHeadChunks;
         options.attention_bwd_chunks = opts.AttBwdChunks;

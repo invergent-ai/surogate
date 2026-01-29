@@ -17,9 +17,8 @@
 #include "modules/run_state_types.h"
 #include "modules/residual_manager.h"
 #include "training/model.h"
+#include "training/runtime_options.h"
 #include "utilities/allocator.h"
-
-struct RuntimeOptions;
 namespace modules { class FP8ScalingState; }
 
 namespace dsl {
@@ -62,8 +61,23 @@ public:
     bool has_residual_offloading() const { return mOffloadResiduals; }
 
     bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
-    bool large_bwd_temps_on_stack() const { return mRecomputeBlock; }
+    bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Standard; }
     bool is_lora_only_mode() const { return mLoraOnlyMode; }
+
+    /// @brief Get the recompute level
+    RecomputeLevel recompute_level() const { return mRecomputeLevel; }
+
+    /// @brief Check if any recomputation is enabled
+    bool recompute_enabled() const { return mRecomputeLevel != RecomputeLevel::None; }
+
+    /// @brief Check if standard or higher recomputation is enabled
+    bool recompute_standard_or_higher() const { return mRecomputeLevel >= RecomputeLevel::Standard; }
+
+    /// @brief Get temporary rstd buffer for recomputation (avoids overwriting saved values)
+    Tensor& recompute_rstd() { return mRecomputeRstd; }
+
+    /// @brief Get temporary LSE buffer for recomputation (avoids overwriting saved values)
+    Tensor& recompute_lse() { return mRecomputeLSE; }
 
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
@@ -141,7 +155,7 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     Tensor mStackBuffer{};
     bool mStackSimulate = false;
-    bool mRecomputeBlock = false;
+    RecomputeLevel mRecomputeLevel = RecomputeLevel::Standard;
     bool mLoraOnlyMode = false;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
@@ -172,6 +186,10 @@ private:
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     Tensor mFP8ForwardStats{};
     Tensor mGradQuantStats{};
+
+    // Temporary buffers for recomputation (to avoid overwriting saved activations)
+    Tensor mRecomputeRstd{};  ///< Temp buffer for rstd during recomputation [B, T]
+    Tensor mRecomputeLSE{};   ///< Temp buffer for LSE during recomputation [B, Hq, T]
     std::unique_ptr<modules::FP8ScalingState> mFP8ScalingState;
 
     std::unique_ptr<modules::ResidualManager> mResidualManager;

@@ -313,7 +313,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 // Get ln2 input: either from stored activation or recompute from residual stream
                 Tensor ln2_input;
-                if (mOptions.RecomputeBlock) {
+                if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
                         const std::string ln2_name = "blocks[" + std::to_string(layer_idx) + "].ln2_weight";
                         Tensor& ln2_weight = mParams->get(ln2_name);
@@ -405,7 +405,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 // Get ln1 input: either from stored activation or recompute from residual
                 Tensor ln1_input;
-                if (mOptions.RecomputeBlock) {
+                if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
                         const std::string ln1_name = "blocks[" + std::to_string(layer_idx) + "].ln1_weight";
                         Tensor& ln1_weight = mParams->get(ln1_name);

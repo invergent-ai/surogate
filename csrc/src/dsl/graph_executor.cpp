@@ -199,8 +199,6 @@ void GraphExecutor::reset_cuda_graphs() {
             g = nullptr;
         }
     }
-    // Reset per-layer recompute graphs
-    reset_recompute_graphs();
     // Reset per-layer graphs in run state
     mRunState.reset_cuda_graphs();
 }
@@ -487,8 +485,8 @@ void GraphExecutor::init_compiled_execution() {
     }
     mCompiledExecutor->set_hook_context(mHookContext);
     mCompiledExecutor->set_recompute_fn(
-        [this](int layer_idx, long B, long T, bool use_graph) {
-            recompute_layer_optimized(layer_idx, B, T, use_graph);
+        [this](int layer_idx, long B, long T, bool /*use_graph*/) {
+            recompute_block(layer_idx, B, T);
         });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
@@ -593,8 +591,7 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);
-        init_recompute_flags();
-        mCompiledExecutor->set_recompute_enabled(mRecomputeFlags.any);
+        mCompiledExecutor->set_recompute_enabled(mOptions.recompute_enabled());
         mCompiledExecutor->set_recompute_use_graphs(use_graphs && !capturing);
         mCompiledExecutor->set_capturing(capturing);
         mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook);

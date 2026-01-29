@@ -5,14 +5,12 @@ apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
-max_steps: 15
+max_steps: 20
 
 sample_packing: true
 sequence_len: 2048
 use_cuda_graphs: false
-recompute_block: true
-use_dsl_ir: true
-offload_residual: false
+recompute: none
 
 learning_rate: 1e-5
 

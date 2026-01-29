@@ -14,7 +14,7 @@ max_steps: 50
 learning_rate: 2e-4
 recipe: bf16
 use_cuda_graphs: false
-recompute_block: true
+recompute: none
 
 lora: true
 lora_rank: 16

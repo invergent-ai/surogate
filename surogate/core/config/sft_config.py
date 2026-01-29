@@ -63,35 +63,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             If a value is passed, will limit the total amount of checkpoints. Deletes the older checkpoints in
             `output_dir`.
 
-        recompute_swiglu (Optional[bool], defaults to True):
-            Recompute SwiGLU activation during backward pass to save activation memory.
-            As SwiGLU is at the widest part of the model, this will result in substantial memory savings at only moderate compute increases (especially for large models).
-            This reduces GPU memory usage but slows down training.
-        recompute_rmsnorm (Optional[bool], defaults to True):
-            Whether to enable recompute for RMSNorm activations during the backward pass to save memory during training.
-            This reduces GPU memory usage but slows down training.
-        recompute_ffn (Optional[bool], defaults to True):
-            Whether to enable recompute for Feed-Forward Network (FFN) activations during the backward pass to save memory during training.
-            Implies --recompute-swiglu.
-            This reduces GPU memory usage but slows down training.
-        recompute_mlp_down (Optional[bool], defaults to False):
-            Recompute MLP down projection in backward pass. Rarely needed as output is saved anyway.
-        recompute_qkv (Optional[bool], defaults to True):
-            Whether to enable recompute for QKV projections during the backward pass to save memory during training.
-            This reduces GPU memory usage but slows down training.
-        recompute_qk_norm (Optional[bool], defaults to False):
-            Recompute QK head normalization (Qwen3-style) in backward pass.
-        recompute_rope (Optional[bool], defaults to False):
-            Recompute RoPE rotation in backward pass. Cheap operation, usually saved for QK-norm backward.
-        recompute_att (Optional[bool], defaults to True):
-            Whether to enable recompute for the attention block to save memory during training.
-            Implies --recompute-qkv.
-            This reduces GPU memory usage but slows down training.
-        recompute_out_proj (Optional[bool], defaults to False):
-            Recompute attention output projection in backward pass.
-        recompute_block (Optional[bool], defaults to True):
-            Whether to enable recompute for entire Transformer block to save memory during training.
-            This reduces GPU memory usage but slows down training.
+        recompute (Literal['none', 'standard', 'aggressive'], defaults to 'standard'):
+            Activation recomputation level for trading compute for memory:
+            - 'none': Save all activations. Maximum memory, fastest training.
+                      Guarantees identical gradients to non-recompute path.
+                      Recommended for FFT or when debugging gradient issues.
+            - 'standard': Recompute attention and FFN intermediates from checkpoints.
+                          Saves residuals, LSE, rstd values, and att_out.
+                          Good balance of memory and speed. Default for most training.
+            - 'aggressive': Recompute everything except residuals and LSE.
+                            Minimum memory, ~1.3x compute overhead.
+                            Use for very large models where memory is critical.
         offload_residual (Optional[bool], defaults to False):
             Offload the residuals (of the ffn block; the only remaining part of the block that is not recomputed) to pinned host memory.
             Combined with --recompute-block, the total activation memory consumption becomes independent of the network depth.
@@ -283,16 +265,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     save_steps: Optional[int] = 50
     save_total_limit: Optional[int] = 5
 
-    recompute_swiglu: Optional[bool] = True
-    recompute_rmsnorm: Optional[bool] = True
-    recompute_ffn: Optional[bool] = True
-    recompute_mlp_down: Optional[bool] = True
-    recompute_qkv: Optional[bool] = True
-    recompute_qk_norm: Optional[bool] = True
-    recompute_rope: Optional[bool] = True
-    recompute_att: Optional[bool] = True
-    recompute_out_proj: Optional[bool] = True
-    recompute_block: Optional[bool] = True
+    recompute: Optional[Literal['none', 'standard', 'aggressive']] = 'standard'
 
     offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
@@ -394,16 +367,24 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.save_steps = cfg.get('save_steps', self.save_steps)
         self.save_total_limit = cfg.get('save_total_limit', self.save_total_limit)
 
-        self.recompute_swiglu = cfg.get('recompute_swiglu', self.recompute_swiglu)
-        self.recompute_rmsnorm = cfg.get('recompute_rmsnorm', self.recompute_rmsnorm)
-        self.recompute_ffn = cfg.get('recompute_ffn', self.recompute_ffn)
-        self.recompute_mlp_down = cfg.get('recompute_mlp_down', self.recompute_mlp_down)
-        self.recompute_qkv = cfg.get('recompute_qkv', self.recompute_qkv)
-        self.recompute_qk_norm = cfg.get('recompute_qk_norm', self.recompute_qk_norm)
-        self.recompute_rope = cfg.get('recompute_rope', self.recompute_rope)
-        self.recompute_att = cfg.get('recompute_att', self.recompute_att)
-        self.recompute_out_proj = cfg.get('recompute_out_proj', self.recompute_out_proj)
-        self.recompute_block = cfg.get('recompute_block', self.recompute_block)
+        # New unified recompute level
+        self.recompute = cfg.get('recompute', self.recompute)
+
+        # Backward compatibility: if old flags are present, derive level
+        old_flags_present = any(f'recompute_{x}' in cfg for x in [
+            'block', 'att', 'ffn', 'qkv', 'swiglu', 'rmsnorm', 'mlp_down', 'qk_norm', 'rope', 'out_proj'
+        ])
+        if old_flags_present and 'recompute' not in cfg:
+            logger = get_logger()
+            if cfg.get('recompute_block', False):
+                self.recompute = 'standard'
+                logger.warning("Deprecated: recompute_block=true is now recompute='standard'")
+            elif any(cfg.get(f'recompute_{x}', False) for x in ['att', 'ffn', 'qkv']):
+                self.recompute = 'standard'
+                logger.warning("Deprecated: Fine-grained recompute flags are now recompute='standard'")
+            else:
+                self.recompute = 'none'
+                logger.warning("Deprecated: All recompute flags disabled is now recompute='none'")
 
         self.offload_residual = cfg.get('offload_residual', self.offload_residual)
         self.offload_master = cfg.get('offload_master', self.offload_master)
@@ -488,41 +469,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.aim_repo = cfg.get('aim_repo', self.aim_repo)
         self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
         
-        if self.recompute_block:
-            self.recompute_att = True
-            self.recompute_ffn = True
-            self.recompute_rmsnorm = True
-        
-        if self.recompute_att:
-            self.recompute_qkv = True
-        
-        if self.recompute_ffn:
-            self.recompute_swiglu = True
-            
-        if self.recompute_block is False:
-            # When recompute_block is explicitly False, disable selective recomputation
-            # unless the user explicitly enabled specific options in their config.
-            # This ensures "recompute_block: false" gives deterministic backward behavior.
-            if 'recompute_att' not in cfg:
-                self.recompute_att = False
-            if 'recompute_ffn' not in cfg:
-                self.recompute_ffn = False
-            if 'recompute_rmsnorm' not in cfg:
-                self.recompute_rmsnorm = False
-            if 'recompute_qkv' not in cfg:
-                self.recompute_qkv = False
-            if 'recompute_out_proj' not in cfg:
-                self.recompute_out_proj = False
-            if 'recompute_swiglu' not in cfg:
-                self.recompute_swiglu = False
-            if 'recompute_mlp_down' not in cfg:
-                self.recompute_mlp_down = False
-
-        if self.recompute_att:
-            self.recompute_qkv = True
-
-        if self.recompute_ffn:
-            self.recompute_swiglu = True
+        # Validate recompute level
+        if self.recompute not in ('none', 'standard', 'aggressive'):
+            raise ValueError(f"recompute must be 'none', 'standard', or 'aggressive', got '{self.recompute}'")
 
         # Parse distributed config
         distributed_cfg = cfg.get('distributed', None)
@@ -666,35 +615,16 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             shard_weights = True
 
         if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
-            self.recompute_block = True
+            # QLoRA requires at least standard recompute level
+            if self.recompute == 'none':
+                self.recompute = 'standard'
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
 
-        if self.lora and self.recompute_block and self.offload_residual:
-            self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with block recompute
-
-        # Handle recomputation hierarchy (block -> att/ffn -> individual components)
-        recompute_block = self.recompute_block
-        recompute_att = self.recompute_att or recompute_block
-        recompute_ffn = self.recompute_ffn or recompute_block
-        recompute_qkv = self.recompute_qkv or recompute_att
-        recompute_qk_norm = self.recompute_qk_norm or recompute_qkv
-        recompute_rope = self.recompute_rope or recompute_qkv
-        recompute_out_proj = self.recompute_out_proj or recompute_block
-        recompute_mlp_down = self.recompute_mlp_down or recompute_block
-        recompute_swiglu = self.recompute_swiglu or recompute_ffn
-        recompute_rmsnorm = self.recompute_rmsnorm or recompute_block
+        if self.lora and self.recompute != 'none' and self.offload_residual:
+            self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
 
         self.runtime_config = _surogate.RuntimeOptions(
-            recompute_swiglu=recompute_swiglu,
-            recompute_rmsnorm=recompute_rmsnorm,
-            recompute_ffn=recompute_ffn,
-            recompute_mlp_down=recompute_mlp_down,
-            recompute_qkv=recompute_qkv,
-            recompute_qk_norm=recompute_qk_norm,
-            recompute_rope=recompute_rope,
-            recompute_att=recompute_att,
-            recompute_out_proj=recompute_out_proj,
-            recompute_block=recompute_block,
+            recompute=self.recompute,
             offload_residual=self.offload_residual,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,

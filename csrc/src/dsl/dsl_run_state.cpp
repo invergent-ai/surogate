@@ -28,7 +28,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          bool allocate_stack)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
-      mRecomputeBlock(options.RecomputeBlock),
+      mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
@@ -178,26 +178,44 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const auto dtype = mActivationDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Activation sharing logic - matches modular path (run_state_impl.tpp)
-    // Key insight: qkv, mlp_up can always be shared when recompute_block=true because
-    // backward will recompute them anyway. Only att/swiglu need special LoRA handling
-    // because they are inputs to O-proj and down-proj LoRA backward respectively.
+    // Activation sharing logic - based on recompute level
+    // When recompute is enabled (Standard or Aggressive), intermediates can be shared
+    // because backward will recompute them from checkpoints.
+    //
+    // Recompute levels:
+    //   - None: Save everything, no sharing (maximum memory, correct gradients)
+    //   - Standard: Share attention/FFN intermediates (recomputed from checkpoints)
+    //   - Aggressive: Share everything except residuals/LSE (maximum sharing)
+    //
+    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Standard;
     const bool lora_only = mLoraOnlyMode;
-    const bool lora_can_share_ln = !lora_only || mRecomputeBlock;
-    const bool lora_can_share_att = !lora_only;  // att needed per-layer for O-proj LoRA backward
-    const bool lora_can_share_swiglu = !lora_only;  // swiglu needed per-layer for down-proj LoRA backward
-    const bool share_ln1 = lora_can_share_ln && mRecomputeBlock;
-    const bool share_ln2 = lora_can_share_ln && mRecomputeBlock;
-    // QKV can be shared when recompute_block=true (backward recomputes it) - no lora_only dependency
-    const bool share_qkv = mRecomputeBlock;
-    const bool share_att = lora_can_share_att && mRecomputeBlock;
-    // mlp_up can be shared when recompute_block=true (backward recomputes it) - no lora_only dependency
-    const bool share_mlp_up = mRecomputeBlock;
-    const bool share_swiglu = lora_can_share_swiglu && mRecomputeBlock;
-    // residual_att can be shared when recompute_block=true (matches modular path)
-    const bool share_residual_intermediates = mRecomputeBlock;
-    // FFN temps on stack when recompute_block=true (matches modular path)
-    const bool ffn_temps_on_stack = mRecomputeBlock;
+
+    // LN outputs can be shared when recompute is enabled
+    const bool share_ln1 = recompute_enabled;
+    const bool share_ln2 = recompute_enabled;
+
+    // QKV sharing: only in LoRA mode where attention is recomputed.
+    // In FFT mode, we skip attention recompute and need saved QKV per-layer for bit-exact gradients.
+    // If QKV is shared, all layers would use the last layer's QKV data during backward!
+    const bool share_qkv = recompute_enabled && lora_only;
+
+    // Attention output sharing:
+    // IMPORTANT: att/att_out/lse must NOT be shared when recompute is enabled for FFT.
+    // We need the original forward values for bit-exact gradients - skipping attention
+    // recompute avoids numerical differences from cuDNN non-determinism.
+    // Only share attention outputs in LoRA-only mode where we don't need bit-exact gradients.
+    const bool share_att = recompute_enabled && lora_only;
+
+    // MLP intermediates are shared (recomputed) when recompute is enabled.
+    // The backward will recompute mlp_up and swiglu from ln2 using saved rstd values.
+    const bool share_mlp_up = recompute_enabled;
+    const bool share_swiglu = recompute_enabled;
+
+    // Residual intermediates can be shared when recompute is enabled
+    const bool share_residual_intermediates = recompute_enabled;
+
+    // FFN temps go on stack when recompute is enabled (saves per-layer allocation).
+    const bool ffn_temps_on_stack = recompute_enabled;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -208,21 +226,19 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         Stack.free(sim_mlp_up);
     }
 
-    Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_att{}, shared_att_out{};
+    Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_att{}, shared_att_out{}, shared_lse{};
     Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};
 
     if (share_ln1) shared_ln1 = mAllocator->allocate(dtype, "ln1_shared", kind, {B, T, C});
     if (share_ln2) shared_ln2 = mAllocator->allocate(dtype, "ln2_shared", kind, {B, T, C});
     if (share_qkv) shared_qkv = mAllocator->allocate(dtype, "qkv_shared", kind, {B, T, QKV});
+    // LSE sharing: only in lora_only mode. FFT needs per-layer LSE for bit-exact gradients.
+    if (share_att) shared_lse = mAllocator->allocate(ETensorDType::FP32, "lse_shared", kind, {B, Hq, T});
     if (share_att) {
         shared_att = mAllocator->allocate(dtype, "att_shared", kind, {B, T, AttnDim});
         shared_att_out = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
     }
-    // In lora_only mode, att_out can be shared even when share_att is false
-    // (att_out is not needed for LoRA backward - we can share it across layers)
-    if (lora_only && !shared_att_out.Data) {
-        shared_att_out = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
-    }
+    // att_out sharing is handled by share_att when recompute is enabled.
     if (share_mlp_up && !ffn_temps_on_stack) shared_mlp_up = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, MUp});
     if (share_swiglu && !ffn_temps_on_stack) shared_swiglu = mAllocator->allocate(dtype, "swiglu_shared", kind, {B, T, M});
     if (share_residual_intermediates) {
@@ -255,14 +271,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         acts.qkv = share_qkv ? shared_qkv : mAllocator->allocate(dtype, "qkv", kind, {B, T, QKV});
         acts.qkv_rope = {};
 
-        acts.lse = mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
+        acts.lse = share_att ? shared_lse
+                             : mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
         acts.att = share_att ? shared_att : mAllocator->allocate(dtype, "att", kind, {B, T, AttnDim});
-        // att_out can be shared in lora_only mode (not needed for LoRA backward)
-        if (lora_only) {
-            acts.att_out = shared_att_out;
-        } else {
-            acts.att_out = share_att ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
-        }
+        // When recompute is enabled, att_out can be shared across layers.
+        acts.att_out = share_att ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
 
         // residual_att can be shared when recompute_block=true
         acts.residual_att = share_residual_intermediates ? shared_residual_att
@@ -283,6 +296,14 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.mlp_down = mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
         }
     }
+
+    // Allocate temporary buffers for recomputation
+    // This prevents overwriting saved values when recomputing forward activations
+    if (recompute_enabled) {
+        mRecomputeRstd = mAllocator->allocate(ETensorDType::FP32, "recompute_rstd", kind, {B, T});
+        // LSE buffer for attention recomputation - same shape as acts.lse [B, Hq, T]
+        mRecomputeLSE = mAllocator->allocate(ETensorDType::FP32, "recompute_lse", kind, {B, Hq, T});
+    }
 }
 
 void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
@@ -300,15 +321,16 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto dtype = mGradDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Gradient sharing flags - match modular path (run_state_impl.tpp)
+    // Gradient sharing flags - based on recompute level
     // IMPORTANT: In FFT mode (not lora_only), gradient buffer sharing can cause issues because
     // the DSL backward graph structure differs from LoRA mode. The gradients may be needed
     // at different points in the backward pass, and sharing can cause corruption.
-    // For safety, disable all gradient sharing in FFT mode with recompute_block.
-    const bool share_grads = mRecomputeBlock && mLoraOnlyMode;
-    const bool share_res_ffn = mRecomputeBlock && mLoraOnlyMode;
-    const bool share_mlp_down = mRecomputeBlock && mLoraOnlyMode;
-    const bool large_bwd_temps_on_stack = mRecomputeBlock;
+    // For safety, disable all gradient sharing in FFT mode.
+    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Standard;
+    const bool share_grads = recompute_enabled && mLoraOnlyMode;
+    const bool share_res_ffn = recompute_enabled && mLoraOnlyMode;
+    const bool share_mlp_down = recompute_enabled && mLoraOnlyMode;
+    const bool large_bwd_temps_on_stack = recompute_enabled;
 
     if (mStackSimulate && large_bwd_temps_on_stack) {
         const long d_qkv_bytes = B * T * QKV * get_dtype_size(dtype);
@@ -555,7 +577,7 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
 
     // Note: Stack simulation no longer needed for workspace since it's persistently allocated
     if (mStackSimulate) {
-        if (mRecomputeBlock) {
+        if (mRecomputeLevel >= RecomputeLevel::Standard) {
             const long d_qkv_bytes = B * T * QKV * get_dtype_size(mGradDtype);
             auto* simulated_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
             Stack.free(simulated_d_qkv);

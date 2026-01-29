@@ -268,35 +268,30 @@ private:
     bool mPerLayerGraphsEnabled = false;
 
     // ========================================================================
-    // Per-layer recompute CUDA graphs (optimization for backward recomputation)
+    // Segment-based recomputation system
     // ========================================================================
-    // When RecomputeBlock=true, we cache the recomputation kernels per-layer
-    // to eliminate conditional overhead and enable kernel fusion via graph capture.
-    std::vector<cudaGraphExec_t> mRecomputeGraphs;           ///< One graph per layer
-    std::vector<DeviceMemoryStack::Checkpoint> mRecomputeCheckpoints;  ///< Stack state per layer
-    bool mRecomputeGraphsInitialized = false;
+    // Recomputation is organized into segments that can be executed atomically.
+    // This ensures correct dependency ordering and numerical consistency.
+    //
+    // Segments:
+    //   - Attention: ln1 -> qkv -> rope -> attention -> out_proj
+    //   - FFN: ln2 -> mlp_up -> swiglu
+    //
+    // The recompute level (from RuntimeOptions) determines which segments
+    // are recomputed vs saved:
+    //   - None: All activations saved, no recomputation
+    //   - Standard: Attention and FFN intermediates recomputed from checkpoints
+    //   - Aggressive: Everything recomputed except residuals and LSE
+    //
 
-    // Precomputed recomputation flags (computed once, reused per layer)
-    struct RecomputeFlags {
-        bool any = false;
-        bool ln1 = false;
-        bool qkv = false;
-        bool qk_norm = false;
-        bool rope = false;
-        bool att = false;
-        bool out_proj = false;
-        bool ln2 = false;
-        bool ffn = false;
-        bool swiglu = false;
-        bool mlp_down = false;
-    };
-    RecomputeFlags mRecomputeFlags;
+    // Execute attention segment recomputation for a layer
+    void recompute_attention_segment(int layer_idx, long B, long T);
 
-    void init_recompute_flags();
-    void reset_recompute_graphs();
+    // Execute FFN segment recomputation for a layer
+    void recompute_ffn_segment(int layer_idx, long B, long T);
 
-    // Optimized recompute using precomputed flags and optional graph capture
-    void recompute_layer_optimized(int layer_idx, long B, long T, bool use_graph);
+    // Execute full block recomputation (both segments)
+    void recompute_block(int layer_idx, long B, long T);
 
     // ========================================================================
     // Compiled execution (operations pre-compiled into direct function calls)

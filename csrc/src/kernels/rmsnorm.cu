@@ -410,6 +410,108 @@ void rmsnorm_forward(nv_bfloat16* out, float* rms, const nv_bfloat16* inp, const
     rmsnorm_forward_unified_imp<nv_bfloat16>(nullptr, out, rms, inp, nullptr, weight, abs_max_ptr, epsilon, B*T, C, stream);
 }
 
+// ============================================================================
+// RMSNorm apply with pre-computed rstd (for deterministic recomputation)
+// ============================================================================
+// This kernel applies out = inp * rstd * weight using a saved rstd value,
+// avoiding the need to recompute rstd which can differ due to FP non-associativity.
+
+template<typename floatX>
+__global__ void rmsnorm_apply_saved_kernel(floatX* __restrict__ out,
+                                           const floatX* __restrict__ inp,
+                                           const floatX* __restrict__ weight,
+                                           const float* __restrict__ rstd,
+                                           int N, int C) {
+    // Each block handles one token (row), threads handle C elements
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    float s = rstd[row];
+    inp += row * C;
+    out += row * C;
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float inp_val = (float)inp[c];
+        float weight_val = (float)weight[c];
+        out[c] = (floatX)(inp_val * s * weight_val);
+    }
+}
+
+template<typename floatX>
+void rmsnorm_apply_saved_imp(floatX* out, const floatX* inp, const floatX* weight,
+                             const float* rstd, int N, int C, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = N;
+    rmsnorm_apply_saved_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, weight, rstd, N, C);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rmsnorm_apply_saved(float* out, const float* inp, const float* weight, const float* rstd,
+                         int B, int T, int C, cudaStream_t stream) {
+    rmsnorm_apply_saved_imp<float>(out, inp, weight, rstd, B * T, C, stream);
+}
+
+void rmsnorm_apply_saved(nv_bfloat16* out, const nv_bfloat16* inp, const nv_bfloat16* weight, const float* rstd,
+                         int B, int T, int C, cudaStream_t stream) {
+    rmsnorm_apply_saved_imp<nv_bfloat16>(out, inp, weight, rstd, B * T, C, stream);
+}
+
+// ============================================================================
+// Fused residual add + RMSNorm apply with pre-computed rstd
+// ============================================================================
+// Computes: residual = inp1 + inp2, normed = residual * rstd * weight
+// Uses saved rstd for deterministic recomputation.
+
+template<typename floatX>
+__global__ void fused_residual_rmsnorm_apply_saved_kernel(floatX* __restrict__ residual,
+                                                          floatX* __restrict__ normed,
+                                                          const floatX* __restrict__ inp1,
+                                                          const floatX* __restrict__ inp2,
+                                                          const floatX* __restrict__ weight,
+                                                          const float* __restrict__ rstd,
+                                                          int N, int C) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    float s = rstd[row];
+    inp1 += row * C;
+    inp2 += row * C;
+    residual += row * C;
+    normed += row * C;
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float r = (float)inp1[c] + (float)inp2[c];
+        residual[c] = (floatX)r;
+        normed[c] = (floatX)(r * s * (float)weight[c]);
+    }
+}
+
+template<typename floatX>
+void fused_residual_rmsnorm_apply_saved_imp(floatX* residual, floatX* normed,
+                                             const floatX* inp1, const floatX* inp2,
+                                             const floatX* weight, const float* rstd,
+                                             int N, int C, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = N;
+    fused_residual_rmsnorm_apply_saved_kernel<<<grid_size, block_size, 0, stream>>>(
+        residual, normed, inp1, inp2, weight, rstd, N, C);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_residual_rmsnorm_apply_saved(float* residual, float* normed,
+                                        const float* inp1, const float* inp2,
+                                        const float* weight, const float* rstd,
+                                        int N, int C, cudaStream_t stream) {
+    fused_residual_rmsnorm_apply_saved_imp<float>(residual, normed, inp1, inp2, weight, rstd, N, C, stream);
+}
+
+void fused_residual_rmsnorm_apply_saved(nv_bfloat16* residual, nv_bfloat16* normed,
+                                        const nv_bfloat16* inp1, const nv_bfloat16* inp2,
+                                        const nv_bfloat16* weight, const float* rstd,
+                                        int N, int C, cudaStream_t stream) {
+    fused_residual_rmsnorm_apply_saved_imp<nv_bfloat16>(residual, normed, inp1, inp2, weight, rstd, N, C, stream);
+}
+
 /// @brief Fused residual addition + RMS normalization forward for FP32 tensors.
 void fused_residual_rmsnorm_forward(float* residual, float* normed, float* rrms, const float* inp1, const float* inp2, const float* weight, float* abs_max_ptr,
                                     float epsilon, int N, int C, cudaStream_t stream) {
