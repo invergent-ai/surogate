@@ -497,65 +497,6 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, 
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
     record_event_if_not_capturing(rs.NormDone, stream);
-
-    if (env_enabled("SUROGATE_DSL_DEBUG_GRADS")) {
-        static bool debug_done = false;
-        if (!debug_done) {
-            debug_done = true;
-
-            const int num_sums = get_max_num_block_sums(rs.DeviceProp);
-            Tensor debug_buf = rs.Allocator->allocate(ETensorDType::FP32,
-                                                      "debug_norm_buffer",
-                                                      EAllocationType::ON_DEVICE,
-                                                      {num_sums});
-
-            auto dump_grad_norm = [&](const char* name) {
-                bool accum = false;
-                Tensor* grad = mGrads->get_param_grad(name, accum);
-                if (!grad || !grad->Data || grad->nelem() == 0) {
-                    std::fprintf(stderr, "[DSL DEBUG] grad %s missing or empty\n", name);
-                    return;
-                }
-                fill_zero(debug_buf, stream);
-                global_norm_squared(debug_buf, *grad, grad->nelem(), rs.DeviceProp, stream);
-                deterministic_sum(debug_buf.template get<float>(),
-                                  debug_buf.template get<float>(),
-                                  debug_buf.nelem(),
-                                  stream);
-                float host_sum = 0.0f;
-                CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                           debug_buf.template get<float>(),
-                                           sizeof(float),
-                                           cudaMemcpyDeviceToHost,
-                                           stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                const float norm = std::sqrt(host_sum);
-                std::fprintf(stderr, "[DSL DEBUG] grad %s norm=%g nelem=%ld\n",
-                             name, norm, static_cast<long>(grad->nelem()));
-            };
-
-            dump_grad_norm("embedding");
-            dump_grad_norm("lm_head");
-            dump_grad_norm("blocks[0].qkv_weight");
-            dump_grad_norm("blocks[0].out_weight");
-            dump_grad_norm("blocks[0].mlp_up_weight");
-            dump_grad_norm("blocks[0].mlp_down_weight");
-            dump_grad_norm("blocks[0].ln1_weight");
-            dump_grad_norm("blocks[0].ln2_weight");
-            dump_grad_norm("blocks[1].qkv_weight");
-            dump_grad_norm("blocks[1].mlp_down_weight");
-            dump_grad_norm("blocks[10].qkv_weight");
-            dump_grad_norm("blocks[10].mlp_down_weight");
-            dump_grad_norm("blocks[15].qkv_weight");
-            dump_grad_norm("blocks[15].mlp_down_weight");
-            dump_grad_norm("blocks[27].qkv_weight");
-            dump_grad_norm("blocks[27].out_weight");
-            dump_grad_norm("blocks[27].mlp_up_weight");
-            dump_grad_norm("blocks[27].mlp_down_weight");
-            dump_grad_norm("blocks[27].ln1_weight");
-            dump_grad_norm("blocks[27].ln2_weight");
-        }
-    }
 }
 
 ITensorContainer& DslModel::weights() {

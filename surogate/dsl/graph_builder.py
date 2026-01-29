@@ -798,16 +798,17 @@ class GraphBuilder:
         indices: str | GraphRef,
         *,
         top_k: int,
-    ) -> GraphRef:
-        """MoE input permutation."""
-        out = self._fresh_name("moe_permuted")
+    ) -> tuple[GraphRef, GraphRef]:
+        """MoE input permutation. Returns (permuted_input, scatter_indices)."""
+        permuted = self._fresh_name("moe_permuted")
+        scatter_indices = self._fresh_name("moe_scatter_indices")
         self._add_node(GraphNode(
             op="moe_permute",
             inputs=[self._resolve_input(x), self._resolve_input(indices)],
-            outputs=[out],
+            outputs=[permuted, scatter_indices],
             attrs={"top_k": top_k},
         ))
-        return self._make_output(out)
+        return self._make_outputs([permuted, scatter_indices])
 
     def moe_unpermute(
         self,
@@ -845,6 +846,62 @@ class GraphBuilder:
                 self._resolve_input(x),
                 self._resolve_input(weights),
                 self._resolve_input(offsets),
+            ],
+            outputs=[out],
+        ))
+        return self._make_output(out)
+
+    def moe_grouped_gemm_gate_up(
+        self,
+        x: str | GraphRef,
+        weights: str,
+        scatter_indices: str | GraphRef,
+    ) -> GraphRef:
+        """MoE grouped GEMM for gate+up projection.
+
+        Args:
+            x: Permuted input tensor (total_tokens, hidden_size)
+            weights: Parameter name for expert weights (num_experts, 2*intermediate, hidden_size)
+            scatter_indices: Scatter indices from moe_permute (total_tokens,)
+
+        Returns:
+            Output tensor (total_tokens, 2*intermediate_size)
+        """
+        out = self._fresh_name("moe_gate_up")
+        self._add_node(GraphNode(
+            op="moe_grouped_gemm_gate_up",
+            inputs=[
+                self._resolve_input(x),
+                weights,  # Parameter name, not resolved
+                self._resolve_input(scatter_indices),
+            ],
+            outputs=[out],
+        ))
+        return self._make_output(out)
+
+    def moe_grouped_gemm_down(
+        self,
+        x: str | GraphRef,
+        weights: str,
+        scatter_indices: str | GraphRef,
+    ) -> GraphRef:
+        """MoE grouped GEMM for down projection.
+
+        Args:
+            x: Activated tensor after SwiGLU (total_tokens, intermediate_size)
+            weights: Parameter name for expert weights (num_experts, hidden_size, intermediate_size)
+            scatter_indices: Scatter indices from moe_permute (total_tokens,)
+
+        Returns:
+            Output tensor (total_tokens, hidden_size)
+        """
+        out = self._fresh_name("moe_down")
+        self._add_node(GraphNode(
+            op="moe_grouped_gemm_down",
+            inputs=[
+                self._resolve_input(x),
+                weights,  # Parameter name, not resolved
+                self._resolve_input(scatter_indices),
             ],
             outputs=[out],
         ))

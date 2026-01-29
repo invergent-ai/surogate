@@ -68,18 +68,30 @@ enum class CompiledOpType : std::uint8_t {
     MatmulBias,
     BiasAdd,
     SwiGLU,
+    Silu,
+    Mul,
     MatmulSwiGLU,
     QKVQKNormRoPE,
     RoPE,
     FlashAttention,
     CrossEntropyLoss,
     FusedLMHeadLoss,
+    // MoE forward operations
+    MoESoftmax,
+    MoESigmoid,
+    MoETopK,
+    MoEPermute,
+    MoEGroupedGemmGateUp,
+    MoEGroupedGemmDown,
+    MoEUnpermute,
     // Backward operations
     ViewBackward,
     AddBackward,
     MatmulBackward,
     BiasAddBackward,
     SwiGLUBackward,
+    SiluBackward,
+    MulBackward,
     MatmulSwiGLUBackward,
     RoPEBackward,
     QKVQKNormRoPEBackward,
@@ -89,6 +101,14 @@ enum class CompiledOpType : std::uint8_t {
     EmbeddingBackward,
     CrossEntropyLossBackward,
     FusedLMHeadLossBackward,
+    // MoE backward operations
+    MoESoftmaxBackward,
+    MoESigmoidBackward,
+    MoETopKBackward,
+    MoEPermuteBackward,
+    MoEGroupedGemmGateUpBackward,
+    MoEGroupedGemmDownBackward,
+    MoEUnpermuteBackward,
     // Sentinel
     Unknown
 };
@@ -180,6 +200,10 @@ struct CompiledAttrs {
     // Hook-specific
     std::optional<modules::ForwardHookPoint> forward_hook_point;
     std::optional<modules::BackwardHookPoint> backward_hook_point;
+
+    // MoE-specific
+    int top_k = 0;
+    bool normalize_weights = true;
 };
 
 // ============================================================================
@@ -292,6 +316,7 @@ public:
                      DslGradStore& grads,
                      const modules::ModelConfig& config,
                      const RuntimeOptions& options);
+    ~CompiledExecutor();
 
     // Execute a compiled forward graph
     void execute_forward(const CompiledGraph& graph,
@@ -356,12 +381,22 @@ private:
     void dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook);
     void dispatch_bias_add(const CompiledOp& op);
     void dispatch_swiglu(const CompiledOp& op);
+    void dispatch_silu(const CompiledOp& op);
+    void dispatch_mul(const CompiledOp& op);
     void dispatch_matmul_swiglu(const CompiledOp& op);
     void dispatch_qkv_qk_norm_rope(const CompiledOp& op);
     void dispatch_rope(const CompiledOp& op);
     void dispatch_flash_attention(const CompiledOp& op);
     void dispatch_cross_entropy_loss(const CompiledOp& op);
     void dispatch_fused_lm_head_loss(const CompiledOp& op);
+    // MoE forward dispatch
+    void dispatch_moe_softmax(const CompiledOp& op);
+    void dispatch_moe_sigmoid(const CompiledOp& op);
+    void dispatch_moe_topk(const CompiledOp& op);
+    void dispatch_moe_permute(const CompiledOp& op);
+    void dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op);
+    void dispatch_moe_grouped_gemm_down(const CompiledOp& op);
+    void dispatch_moe_unpermute(const CompiledOp& op);
 
     // Backward dispatch functions
     void dispatch_view_backward(const CompiledOp& op);
@@ -369,6 +404,8 @@ private:
     void dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_bias_add_backward(const CompiledOp& op);
     void dispatch_swiglu_backward(const CompiledOp& op);
+    void dispatch_silu_backward(const CompiledOp& op);
+    void dispatch_mul_backward(const CompiledOp& op);
     void dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_rope_backward(const CompiledOp& op);
     void dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op);
@@ -378,6 +415,14 @@ private:
     void dispatch_embedding_backward(const CompiledOp& op);
     void dispatch_cross_entropy_loss_backward(const CompiledOp& op);
     void dispatch_fused_lm_head_loss_backward(const CompiledOp& op);
+    // MoE backward dispatch
+    void dispatch_moe_softmax_backward(const CompiledOp& op);
+    void dispatch_moe_sigmoid_backward(const CompiledOp& op);
+    void dispatch_moe_topk_backward(const CompiledOp& op);
+    void dispatch_moe_permute_backward(const CompiledOp& op);
+    void dispatch_moe_grouped_gemm_gate_up_backward(const CompiledOp& op);
+    void dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op);
+    void dispatch_moe_unpermute_backward(const CompiledOp& op);
 
     // Tensor resolution (pre-resolved, O(1) lookup)
     Tensor& resolve_tensor(const TensorRef& ref);
@@ -435,6 +480,17 @@ private:
 
     // Gradient accumulation tracking (set of gradient tensor names that need accumulation)
     std::unordered_set<std::string> mAccumulateTensors;
+
+    // Persistent storage for MoE expert_offsets (needs to survive from forward to backward)
+    std::vector<int> mMoEExpertOffsetsData;
+    Tensor mMoEExpertOffsets;  // Views into mMoEExpertOffsetsData
+    void* mMoEExpertOffsetsGPU = nullptr;  // Persistent GPU buffer (not stack-allocated)
+    size_t mMoEExpertOffsetsGPUSize = 0;   // Size in bytes
+
+    // Persistent storage for MoE saved tensors (per-layer copies to prevent buffer reuse corruption)
+    // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)
+    std::unordered_map<std::string, void*> mMoESavedBuffers;
+    std::unordered_map<std::string, size_t> mMoESavedSizes;
 };
 
 // ============================================================================

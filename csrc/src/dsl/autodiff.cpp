@@ -114,12 +114,14 @@ bool is_non_diff_dtype(ETensorDType dtype) {
 }
 
 bool is_non_differentiable(const Graph& forward, const std::string& name) {
+    // Check graph inputs
     auto it_input = forward.inputs.find(name);
     if (it_input != forward.inputs.end()) {
         if (it_input->second.dtype && is_non_diff_dtype(*it_input->second.dtype)) {
             return true;
         }
     }
+    // Check graph params
     auto it_param = forward.params.find(name);
     if (it_param != forward.params.end()) {
         if (it_param->second.dtype && is_non_diff_dtype(*it_param->second.dtype)) {
@@ -128,6 +130,20 @@ bool is_non_differentiable(const Graph& forward, const std::string& name) {
         if (name.find("rope_freqs") != std::string::npos) {
             return true;
         }
+    }
+    // Check intermediate tensors (e.g., MoE scatter_indices)
+    auto it_inter = forward.intermediates.find(name);
+    if (it_inter != forward.intermediates.end()) {
+        if (it_inter->second.dtype && is_non_diff_dtype(*it_inter->second.dtype)) {
+            return true;
+        }
+    }
+    // Also handle MoE index tensors by name pattern (in case intermediates map is incomplete)
+    if (name.find("scatter_indices") != std::string::npos ||
+        name.find("routing_indices") != std::string::npos ||
+        name.find("gather_indices") != std::string::npos ||
+        name.find("expert_offsets") != std::string::npos) {
+        return true;
     }
     return false;
 }

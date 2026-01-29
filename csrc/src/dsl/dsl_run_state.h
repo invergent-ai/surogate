@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include "utilities/stack.h"
 #include "modules/run_state_types.h"
@@ -79,6 +80,7 @@ public:
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
     cudaEvent_t all_reduce_done_event() const { return mAllReduceDone; }
+    cublasHandle_t cublas_handle() const { return mCublasHandle; }
 
     // ========================================================================
     // Per-layer CUDA graphs (for efficient layer-by-layer execution)
@@ -195,6 +197,7 @@ private:
     cudaStream_t mSideStream = nullptr;
     cudaEvent_t mSideStreamEvent = nullptr;
     cudaEvent_t mAllReduceDone = nullptr;  ///< Recorded after async all-reduce completes
+    cublasHandle_t mCublasHandle = nullptr;  ///< cuBLAS handle for MoE grouped GEMM
 
     // Per-layer CUDA graph support
     int mNumLayers = 0;

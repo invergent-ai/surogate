@@ -63,10 +63,6 @@ void GraphExecutor::recompute_attention_segment(int layer_idx, long B, long T) {
     if (!mOptions.recompute_enabled()) return;
     if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) return;
 
-    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
-    static bool debug_recompute_norms = env_enabled("SUROGATE_DEBUG_RECOMPUTE_NORMS");
-    static bool debug_fft_recompute = env_enabled("SUROGATE_DEBUG_FFT_RECOMPUTE");
-
     auto& rs = mRunState;
     const auto& config = mConfig;
     const int Bv = static_cast<int>(B);
@@ -110,11 +106,6 @@ void GraphExecutor::recompute_attention_segment(int layer_idx, long B, long T) {
         ensure_act(acts.ln1);
         Tensor& ln1_weight = mWeights.get(block_name("ln1_weight"));
         rmsnorm_apply_saved(acts.ln1, res_in, ln1_weight, acts.ln1_rstd, Bv, Tv, C, rs.MainStream);
-
-        if (debug_fft_recompute) {
-            std::fprintf(stderr, "[FFT RECOMPUTE] layer=%d Recomputed ln1 (bit-exact from saved rstd), skipping qkv/att/att_out recompute\n",
-                         layer_idx);
-        }
         return;
     }
 
@@ -130,42 +121,12 @@ void GraphExecutor::recompute_attention_segment(int layer_idx, long B, long T) {
     const bool allow_quant = allow_quant_layer(mOptions, config, layer_idx);
     const bool have_recipe = mOptions.TrainingRecipe != nullptr;
 
-    // Helper for debug norm computation
-    auto compute_norm = [&](const Tensor& t) -> float {
-        if ((!debug_recompute_norms && !debug_fft_recompute) || !t.Data) return 0.0f;
-        static Tensor norm_buf{};
-        if (!norm_buf.Data && rs.Allocator) {
-            const int num_sums = get_max_num_block_sums(rs.DeviceProp);
-            norm_buf = rs.Allocator->allocate(ETensorDType::FP32, "recompute_debug_norm",
-                                              EAllocationType::ON_DEVICE, {num_sums});
-        }
-        if (!norm_buf.Data) return 0.0f;
-        fill_zero(norm_buf, rs.MainStream);
-        global_norm_squared(norm_buf, t, t.nelem(), rs.DeviceProp, rs.MainStream);
-        deterministic_sum(norm_buf.template get<float>(), norm_buf.template get<float>(),
-                          norm_buf.nelem(), rs.MainStream);
-        float host_sum = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&host_sum, norm_buf.template get<float>(), sizeof(float),
-                                   cudaMemcpyDeviceToHost, rs.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-        return std::sqrt(host_sum);
-    };
-
-    if (debug_recompute) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] recompute_attention_segment layer=%d res_in_ptr=%p\n",
-                     layer_idx, (void*)res_in.Data);
-    }
-
     // ========================================================================
     // Step 1: Recompute LN1 using saved rstd for bit-exact results (LoRA mode)
     // ========================================================================
     ensure_act(acts.ln1);
     Tensor& ln1_weight = mWeights.get(block_name("ln1_weight"));
     rmsnorm_apply_saved(acts.ln1, res_in, ln1_weight, acts.ln1_rstd, Bv, Tv, C, rs.MainStream);
-
-    if (debug_recompute_norms) {
-        std::fprintf(stderr, "[RECOMPUTE NORMS] layer=%d ln1 recomputed (LoRA mode)\n", layer_idx);
-    }
 
     // ========================================================================
     // Step 2: Recompute QKV projection
@@ -408,22 +369,12 @@ void GraphExecutor::recompute_attention_segment(int layer_idx, long B, long T) {
                                                      rs.CublasLtHandle, rs.CuBlasWorkspace, rs.MainStream);
         }
     }
-
-    if (debug_recompute_norms) {
-        std::fprintf(stderr, "[RECOMPUTE NORMS] layer=%d qkv=%.4g att=%.4g lse=%.4g att_out=%.4g\n",
-                     layer_idx, compute_norm(acts.qkv), compute_norm(acts.att),
-                     compute_norm(acts.lse), compute_norm(acts.att_out));
-    }
 }
 
 
 void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
     if (!mOptions.recompute_enabled()) return;
     if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) return;
-
-    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
-    static bool debug_recompute_norms = env_enabled("SUROGATE_DEBUG_RECOMPUTE_NORMS");
-    static bool debug_fft_recompute = env_enabled("SUROGATE_DEBUG_FFT_RECOMPUTE");
 
     auto& rs = mRunState;
     const auto& config = mConfig;
@@ -471,57 +422,30 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
         fused_residual_rmsnorm_apply_saved(
             acts.residual_att, acts.ln2,
             res_in, acts.att_out, ln2_weight, acts.ln2_rstd, BT, C, rs.MainStream);
-
-        if (debug_fft_recompute) {
-            std::fprintf(stderr, "[FFT RECOMPUTE] layer=%d Recomputed ln2/residual_att (bit-exact), skipping mlp_up/swiglu recompute\n",
-                         layer_idx);
-        }
         return;
     }
 
-    // LoRA mode: full FFN segment recompute
+    // MoE models don't have dense MLP weights (mlp_up_weight/mlp_down_weight).
+    // Skip MLP recompute for MoE - the MoE ops save their activations differently.
+    // Only recompute LN2 and residual_att for MoE models.
+    const bool is_moe = config.NumExperts > 0;
+    if (is_moe) {
+        // For MoE, only recompute LN2 (already done below)
+        ensure_act(acts.ln2);
+        ensure_act(acts.residual_att);
+        Tensor& ln2_weight = mWeights.get(block_name("ln2_weight"));
+        fused_residual_rmsnorm_apply_saved(
+            acts.residual_att, acts.ln2,
+            res_in, acts.att_out, ln2_weight, acts.ln2_rstd, BT, C, rs.MainStream);
+        return;
+    }
+
+    // LoRA mode: full FFN segment recompute (dense MLP only)
     const int D = static_cast<int>(config.IntermediateSize);
     const int MUp = 2 * D;
     const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState &&
                               mLoRAConfig->enabled() && mLoRAWeights->enabled();
 
-    // Helper for debug norm computation
-    auto compute_norm = [&](const Tensor& t) -> float {
-        if ((!debug_recompute_norms && !debug_fft_recompute) || !t.Data) return 0.0f;
-        static Tensor norm_buf{};
-        if (!norm_buf.Data && rs.Allocator) {
-            const int num_sums = get_max_num_block_sums(rs.DeviceProp);
-            norm_buf = rs.Allocator->allocate(ETensorDType::FP32, "recompute_debug_norm_ffn",
-                                              EAllocationType::ON_DEVICE, {num_sums});
-        }
-        if (!norm_buf.Data) return 0.0f;
-        fill_zero(norm_buf, rs.MainStream);
-        global_norm_squared(norm_buf, t, t.nelem(), rs.DeviceProp, rs.MainStream);
-        deterministic_sum(norm_buf.template get<float>(), norm_buf.template get<float>(),
-                          norm_buf.nelem(), rs.MainStream);
-        float host_sum = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&host_sum, norm_buf.template get<float>(), sizeof(float),
-                                   cudaMemcpyDeviceToHost, rs.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-        return std::sqrt(host_sum);
-    };
-
-    // Helper to check for NaN/Inf in a tensor
-    auto check_finite = [&](const Tensor& t, const char* name) -> bool {
-        if (!debug_fft_recompute || !t.Data) return true;
-        float norm = compute_norm(t);
-        bool is_finite = std::isfinite(norm);
-        if (!is_finite) {
-            std::fprintf(stderr, "[FFT RECOMPUTE] WARNING: %s has NaN/Inf (norm=%g) layer=%d ptr=%p\n",
-                         name, norm, layer_idx, t.Data);
-        }
-        return is_finite;
-    };
-
-    if (debug_recompute) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] recompute_ffn_segment layer=%d att_out_ptr=%p\n",
-                     layer_idx, (void*)acts.att_out.Data);
-    }
     const LayerForwardPlan* fwd_plan = forward_plan(layer_idx);
     const bool allow_quant = allow_quant_layer(mOptions, config, layer_idx);
     const bool have_recipe = mOptions.TrainingRecipe != nullptr;
@@ -542,35 +466,11 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
     ensure_act(acts.residual_att);
     Tensor& ln2_weight = mWeights.get(block_name("ln2_weight"));
 
-    // Debug: check inputs before fused_residual_rmsnorm_apply_saved
-    if (debug_fft_recompute) {
-        std::fprintf(stderr, "[FFT RECOMPUTE] layer=%d FFN segment BEFORE fused_residual_rmsnorm_apply_saved:\n", layer_idx);
-        std::fprintf(stderr, "  res_in: ptr=%p norm=%.6g\n", res_in.Data, compute_norm(res_in));
-        std::fprintf(stderr, "  att_out: ptr=%p norm=%.6g\n", acts.att_out.Data, compute_norm(acts.att_out));
-        std::fprintf(stderr, "  ln2_rstd: ptr=%p norm=%.6g\n", acts.ln2_rstd.Data, compute_norm(acts.ln2_rstd));
-        std::fprintf(stderr, "  ln2_weight: ptr=%p norm=%.6g\n", ln2_weight.Data, compute_norm(ln2_weight));
-        std::fprintf(stderr, "  residual_att (output): ptr=%p\n", acts.residual_att.Data);
-        std::fprintf(stderr, "  ln2 (output): ptr=%p\n", acts.ln2.Data);
-        check_finite(res_in, "res_in");
-        check_finite(acts.att_out, "att_out");
-        check_finite(acts.ln2_rstd, "ln2_rstd");
-    }
-
     // LN2 takes residual_att = res_in + att_out as input
     // att_out is recomputed during backward when recompute is enabled
     fused_residual_rmsnorm_apply_saved(
         acts.residual_att, acts.ln2,
         res_in, acts.att_out, ln2_weight, acts.ln2_rstd, BT, C, rs.MainStream);
-
-    // Debug: check outputs after fused_residual_rmsnorm_apply_saved
-    if (debug_fft_recompute) {
-        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-        std::fprintf(stderr, "[FFT RECOMPUTE] layer=%d FFN segment AFTER fused_residual_rmsnorm_apply_saved:\n", layer_idx);
-        std::fprintf(stderr, "  residual_att: ptr=%p norm=%.6g\n", acts.residual_att.Data, compute_norm(acts.residual_att));
-        std::fprintf(stderr, "  ln2: ptr=%p norm=%.6g\n", acts.ln2.Data, compute_norm(acts.ln2));
-        check_finite(acts.residual_att, "residual_att");
-        check_finite(acts.ln2, "ln2");
-    }
 
     // ========================================================================
     // Step 2: Recompute MLP Up projection
@@ -656,30 +556,15 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
     // ========================================================================
     ensure_act(acts.swiglu);
     swiglu_forward(acts.swiglu, acts.mlp_up, nullptr, Bv, Tv, D, rs.MainStream);
-
-    if (debug_recompute_norms) {
-        std::fprintf(stderr, "[RECOMPUTE NORMS] layer=%d residual_att=%.4g ln2=%.4g mlp_up=%.4g swiglu=%.4g\n",
-                     layer_idx, compute_norm(acts.residual_att), compute_norm(acts.ln2),
-                     compute_norm(acts.mlp_up), compute_norm(acts.swiglu));
-    }
 }
 
 
 void GraphExecutor::recompute_block(int layer_idx, long B, long T) {
     if (!mOptions.recompute_enabled()) return;
 
-    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
-    if (debug_recompute) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] >>> recompute_block layer=%d B=%ld T=%ld\n", layer_idx, B, T);
-    }
-
     // Execute both segments in order
     recompute_attention_segment(layer_idx, B, T);
     recompute_ffn_segment(layer_idx, B, T);
-
-    if (debug_recompute) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] <<< recompute_block layer=%d complete\n", layer_idx);
-    }
 }
 
 }  // namespace dsl

@@ -357,6 +357,26 @@ DslModel::MappingSpec parse_mapping_spec(const AttrValue& value) {
         return spec;
     }
 
+    if (type == "stack_experts") {
+        spec.kind = DslModel::MappingSpec::Kind::StackExperts;
+        if (const auto* pattern_val = find_key(map, "pattern")) {
+            if (auto pattern = as_string(*pattern_val)) {
+                spec.source = *pattern;
+            }
+        }
+        if (const auto* fuse_val = find_key(map, "fuse_gate_up")) {
+            if (auto fuse = as_bool(*fuse_val)) {
+                spec.fuse_gate_up = *fuse;
+            }
+        }
+        if (const auto* num_val = find_key(map, "num_experts")) {
+            if (auto num = as_int(*num_val)) {
+                spec.num_experts = static_cast<int>(*num);
+            }
+        }
+        return spec;
+    }
+
     return spec;
 }
 

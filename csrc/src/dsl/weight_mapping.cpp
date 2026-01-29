@@ -18,13 +18,15 @@ namespace dsl {
 namespace {
 
 struct WeightSpec {
-    enum class Kind { Direct, Fuse, Transform, TiedTo, Split, Unknown };
+    enum class Kind { Direct, Fuse, Transform, TiedTo, Split, StackExperts, Unknown };
     Kind kind = Kind::Unknown;
     std::string source;
     std::vector<std::string> sources;
     std::string fn;
     int dim = 0;
     bool optional = false;
+    bool fuse_gate_up = false;  // For StackExperts: fuse gate+up into gate_up format
+    int num_experts = 0;        // For StackExperts: number of experts (0 = auto)
 };
 
 struct WeightEntry {
@@ -167,6 +169,26 @@ WeightSpec parse_weight_spec(const AttrValue& value) {
                         spec.sources.push_back(*src);
                     }
                 }
+            }
+        }
+        return spec;
+    }
+
+    if (type == "stack_experts") {
+        spec.kind = WeightSpec::Kind::StackExperts;
+        if (const auto* pattern_val = find_key(map, "pattern")) {
+            if (auto pattern = as_string(*pattern_val)) {
+                spec.source = *pattern;
+            }
+        }
+        if (const auto* fuse_val = find_key(map, "fuse_gate_up")) {
+            if (auto fuse = as_bool(*fuse_val)) {
+                spec.fuse_gate_up = *fuse;
+            }
+        }
+        if (const auto* num_val = find_key(map, "num_experts")) {
+            if (auto num = as_int(*num_val)) {
+                spec.num_experts = static_cast<int>(*num);
             }
         }
         return spec;
@@ -394,6 +416,30 @@ public:
                 case WeightSpec::Kind::Split:
                     // Split is export-only; ignore for import.
                     break;
+                case WeightSpec::Kind::StackExperts: {
+                    // stack_experts: loads per-expert HF tensors and stacks them into batched format.
+                    // The pattern has {expert} placeholder which add_expert_pattern handles.
+                    if (spec.source.empty()) {
+                        throw std::runtime_error("DSL weight mapping: missing pattern for stack_experts " + entry.internal_name);
+                    }
+                    if (spec.fuse_gate_up) {
+                        // For gate_up: register both gate_proj and up_proj patterns
+                        // The pattern is for gate_proj; derive up_proj by replacing gate_proj with up_proj
+                        std::string gate_pattern = spec.source;
+                        std::string up_pattern = spec.source;
+                        // Replace gate_proj with up_proj in the pattern
+                        std::size_t pos = up_pattern.find("gate_proj");
+                        if (pos != std::string::npos) {
+                            up_pattern.replace(pos, 9, "up_proj");
+                        }
+                        add_expert_pattern(gate_pattern, modules::TensorTarget::ExpertGate, nullptr, spec.optional);
+                        add_expert_pattern(up_pattern, modules::TensorTarget::ExpertUp, nullptr, spec.optional);
+                    } else {
+                        // For down_proj: single pattern
+                        add_expert_pattern(spec.source, modules::TensorTarget::ExpertDown, nullptr, spec.optional);
+                    }
+                    break;
+                }
                 default:
                     throw std::runtime_error("DSL weight mapping: unsupported mapping spec for " + entry.internal_name);
             }

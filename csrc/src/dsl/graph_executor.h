@@ -277,12 +277,6 @@ private:
     //   - Attention: ln1 -> qkv -> rope -> attention -> out_proj
     //   - FFN: ln2 -> mlp_up -> swiglu
     //
-    // The recompute level (from RuntimeOptions) determines which segments
-    // are recomputed vs saved:
-    //   - None: All activations saved, no recomputation
-    //   - Standard: Attention and FFN intermediates recomputed from checkpoints
-    //   - Aggressive: Everything recomputed except residuals and LSE
-    //
 
     // Execute attention segment recomputation for a layer
     void recompute_attention_segment(int layer_idx, long B, long T);

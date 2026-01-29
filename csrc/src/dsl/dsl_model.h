@@ -163,7 +163,7 @@ public:
     IRunState& get_run_state() const override;
 
     struct MappingSpec {
-        enum class Kind { Direct, Fuse, Split, Transform, TiedTo, Unknown };
+        enum class Kind { Direct, Fuse, Split, Transform, TiedTo, StackExperts, Unknown };
         Kind kind = Kind::Unknown;
         std::string source;
         std::vector<std::string> sources;
@@ -172,6 +172,8 @@ public:
         std::string target;
         int dim = 0;
         bool optional = false;
+        bool fuse_gate_up = false;  // For StackExperts: fuse gate+up into gate_up format
+        int num_experts = 0;        // For StackExperts: number of experts (0 = auto)
     };
 
 private:

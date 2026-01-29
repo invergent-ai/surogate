@@ -346,6 +346,9 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
 void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("step: ctx[{}].Model is null", i));
+        }
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
         auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
@@ -371,6 +374,7 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         try {
             ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
         } catch (const std::exception& e) {
+            std::cerr << "[DEBUG] step work lambda: backward threw: " << e.what() << std::endl;
             throw;
         }
     });
@@ -683,7 +687,6 @@ void MultiGPUPyTrainer::stop() {
 auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sThreadContext & ctx)> {
     std::lock_guard<std::mutex> lock(mGlobalMutex);
     if (!ctx.Work) {
-        std::this_thread::yield();
         return {};
     } else {
         auto work = std::move(ctx.Work);
@@ -706,6 +709,8 @@ auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sT
  * @throws Rethrows any exception encountered in worker threads.
  */
 void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext & ctx)> work, int idx) {
+    static int work_id = 0;
+    int current_work_id = work_id++;
     {
         std::lock_guard<std::mutex> lock(mGlobalMutex);
 
@@ -815,13 +820,20 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         if(mHasCrashed.load()) throw std::runtime_error("Another worker has crashed, exiting.");
     }
 
+    int loop_iteration = 0;
     while (mIsRunning.load()) {
         if (auto work = fetch_work(ctx); work) {
-            work(ctx);
+            try {
+                work(ctx);
+            } catch (const std::exception& e) {
+                std::cerr << "[DEBUG] main_loop: work threw exception: " << e.what() << std::endl;
+                throw;
+            }
             mWorkDone.fetch_add(1);
         } else {
             std::this_thread::yield();
         }
+        loop_iteration++;
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     comm.barrier();

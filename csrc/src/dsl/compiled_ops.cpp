@@ -163,6 +163,8 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"matmul_bias", CompiledOpType::MatmulBias},
         {"bias_add", CompiledOpType::BiasAdd},
         {"swiglu", CompiledOpType::SwiGLU},
+        {"silu", CompiledOpType::Silu},
+        {"mul", CompiledOpType::Mul},
         {"matmul_swiglu", CompiledOpType::MatmulSwiGLU},
         {"qkv_qk_norm_rope", CompiledOpType::QKVQKNormRoPE},
         {"rope", CompiledOpType::RoPE},
@@ -172,12 +174,22 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"cross_entropy_loss", CompiledOpType::CrossEntropyLoss},
         {"fused_lm_head_loss", CompiledOpType::FusedLMHeadLoss},
         {"lm_head_loss", CompiledOpType::FusedLMHeadLoss},
+        // MoE forward operations
+        {"moe_softmax", CompiledOpType::MoESoftmax},
+        {"moe_sigmoid", CompiledOpType::MoESigmoid},
+        {"moe_topk", CompiledOpType::MoETopK},
+        {"moe_permute", CompiledOpType::MoEPermute},
+        {"moe_grouped_gemm_gate_up", CompiledOpType::MoEGroupedGemmGateUp},
+        {"moe_grouped_gemm_down", CompiledOpType::MoEGroupedGemmDown},
+        {"moe_unpermute", CompiledOpType::MoEUnpermute},
         // Backward operations
         {"view_backward", CompiledOpType::ViewBackward},
         {"add_backward", CompiledOpType::AddBackward},
         {"matmul_backward", CompiledOpType::MatmulBackward},
         {"bias_add_backward", CompiledOpType::BiasAddBackward},
         {"swiglu_backward", CompiledOpType::SwiGLUBackward},
+        {"silu_backward", CompiledOpType::SiluBackward},
+        {"mul_backward", CompiledOpType::MulBackward},
         {"matmul_swiglu_backward", CompiledOpType::MatmulSwiGLUBackward},
         {"rope_backward", CompiledOpType::RoPEBackward},
         {"qkv_qk_norm_rope_backward", CompiledOpType::QKVQKNormRoPEBackward},
@@ -187,6 +199,14 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"embedding_backward", CompiledOpType::EmbeddingBackward},
         {"cross_entropy_backward", CompiledOpType::CrossEntropyLossBackward},
         {"fused_lm_head_loss_backward", CompiledOpType::FusedLMHeadLossBackward},
+        // MoE backward operations
+        {"moe_softmax_backward", CompiledOpType::MoESoftmaxBackward},
+        {"moe_sigmoid_backward", CompiledOpType::MoESigmoidBackward},
+        {"moe_topk_backward", CompiledOpType::MoETopKBackward},
+        {"moe_permute_backward", CompiledOpType::MoEPermuteBackward},
+        {"moe_grouped_gemm_gate_up_backward", CompiledOpType::MoEGroupedGemmGateUpBackward},
+        {"moe_grouped_gemm_down_backward", CompiledOpType::MoEGroupedGemmDownBackward},
+        {"moe_unpermute_backward", CompiledOpType::MoEUnpermuteBackward},
     };
 
     auto it = type_map.find(op_type);
@@ -204,17 +224,30 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MatmulBias: return "matmul_bias";
         case CompiledOpType::BiasAdd: return "bias_add";
         case CompiledOpType::SwiGLU: return "swiglu";
+        case CompiledOpType::Silu: return "silu";
+        case CompiledOpType::Mul: return "mul";
         case CompiledOpType::MatmulSwiGLU: return "matmul_swiglu";
         case CompiledOpType::QKVQKNormRoPE: return "qkv_qk_norm_rope";
         case CompiledOpType::RoPE: return "rope";
         case CompiledOpType::FlashAttention: return "flash_attention";
         case CompiledOpType::CrossEntropyLoss: return "cross_entropy_loss";
         case CompiledOpType::FusedLMHeadLoss: return "fused_lm_head_loss";
+        // MoE forward
+        case CompiledOpType::MoESoftmax: return "moe_softmax";
+        case CompiledOpType::MoESigmoid: return "moe_sigmoid";
+        case CompiledOpType::MoETopK: return "moe_topk";
+        case CompiledOpType::MoEPermute: return "moe_permute";
+        case CompiledOpType::MoEGroupedGemmGateUp: return "moe_grouped_gemm_gate_up";
+        case CompiledOpType::MoEGroupedGemmDown: return "moe_grouped_gemm_down";
+        case CompiledOpType::MoEUnpermute: return "moe_unpermute";
+        // Backward
         case CompiledOpType::ViewBackward: return "view_backward";
         case CompiledOpType::AddBackward: return "add_backward";
         case CompiledOpType::MatmulBackward: return "matmul_backward";
         case CompiledOpType::BiasAddBackward: return "bias_add_backward";
         case CompiledOpType::SwiGLUBackward: return "swiglu_backward";
+        case CompiledOpType::SiluBackward: return "silu_backward";
+        case CompiledOpType::MulBackward: return "mul_backward";
         case CompiledOpType::MatmulSwiGLUBackward: return "matmul_swiglu_backward";
         case CompiledOpType::RoPEBackward: return "rope_backward";
         case CompiledOpType::QKVQKNormRoPEBackward: return "qkv_qk_norm_rope_backward";
@@ -224,6 +257,14 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::EmbeddingBackward: return "embedding_backward";
         case CompiledOpType::CrossEntropyLossBackward: return "cross_entropy_backward";
         case CompiledOpType::FusedLMHeadLossBackward: return "fused_lm_head_loss_backward";
+        // MoE backward
+        case CompiledOpType::MoESoftmaxBackward: return "moe_softmax_backward";
+        case CompiledOpType::MoESigmoidBackward: return "moe_sigmoid_backward";
+        case CompiledOpType::MoETopKBackward: return "moe_topk_backward";
+        case CompiledOpType::MoEPermuteBackward: return "moe_permute_backward";
+        case CompiledOpType::MoEGroupedGemmGateUpBackward: return "moe_grouped_gemm_gate_up_backward";
+        case CompiledOpType::MoEGroupedGemmDownBackward: return "moe_grouped_gemm_down_backward";
+        case CompiledOpType::MoEUnpermuteBackward: return "moe_unpermute_backward";
         case CompiledOpType::Unknown: return "unknown";
     }
     return "unknown";
@@ -266,6 +307,22 @@ void GraphCompiler::update_dimensions(long B, long T) {
     mShapeEnv.values["Hkv"] = mConfig.NumKeyValHeads;
     mShapeEnv.values["QKV"] = mConfig.qkv_channels();
     mShapeEnv.values["AttnDim"] = mConfig.NumQueryHeads * mConfig.head_size();
+
+    // MoE dimensions
+    if (mConfig.NumExperts > 0) {
+        mShapeEnv.values["E"] = mConfig.NumExperts;
+    }
+    if (mConfig.NumExpertsPerTok > 0) {
+        mShapeEnv.values["K"] = mConfig.NumExpertsPerTok;
+    }
+    // Shared expert intermediate size (default to regular intermediate size)
+    if (mConfig.moe_config.has_value() && mConfig.moe_config->shared_expert_size > 0) {
+        mShapeEnv.values["SharedM"] = mConfig.moe_config->shared_expert_size;
+        mShapeEnv.values["SharedMUp"] = 2 * mConfig.moe_config->shared_expert_size;
+    } else {
+        mShapeEnv.values["SharedM"] = mConfig.IntermediateSize;
+        mShapeEnv.values["SharedMUp"] = 2 * mConfig.IntermediateSize;
+    }
 }
 
 CompiledOpType GraphCompiler::classify_op(const std::string& op_type) const {
@@ -626,6 +683,28 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // MoE-specific attributes
+    if (type == CompiledOpType::MoETopK || type == CompiledOpType::MoEPermute ||
+        type == CompiledOpType::MoEUnpermute || type == CompiledOpType::MoETopKBackward ||
+        type == CompiledOpType::MoEPermuteBackward || type == CompiledOpType::MoEUnpermuteBackward) {
+        // top_k attribute
+        if (auto* top_k_attr = find_attr(op.attrs, "top_k")) {
+            if (auto v = attr_int(*top_k_attr)) {
+                attrs.top_k = static_cast<int>(*v);
+            }
+        } else {
+            // Default from model config
+            attrs.top_k = static_cast<int>(mConfig.NumExpertsPerTok);
+        }
+
+        // normalize_weights attribute
+        if (auto* norm_attr = find_attr(op.attrs, "normalize")) {
+            if (auto v = attr_bool(*norm_attr)) {
+                attrs.normalize_weights = *v;
+            }
+        }
+    }
+
     return attrs;
 }
 
@@ -955,13 +1034,89 @@ void GraphCompiler::infer_output_shapes(
         }
 
         case CompiledOpType::FlashAttention: {
-            // FlashAttention outputs: attn_out [B, T, Hq, D] (or [B, T, Hq*D]), lse [B, Hq, T]
-            // For now, attn_out shape matches input qkv shape but with Hq instead of (Hq+2*Hkv)
+            // FlashAttention outputs: attn_out [B, T, Hq, D], lse [B, Hq, T]
+            // Cannot infer output shape from input qkv [B, T, Hq+2*Hkv, D] without
+            // knowing Hq and Hkv separately. Leave shapes uninferred.
+            break;
+        }
+
+        case CompiledOpType::FusedResidualRMSNorm: {
+            // Outputs: residual_out [B,T,C], y [B,T,C], rstd [B,T]
+            if (input_shapes.size() >= 2 && !input_shapes[0].empty() && !input_shapes[1].empty()) {
+                output_shapes.push_back(input_shapes[0]);  // residual_out same as input[0]
+                output_shapes.push_back(input_shapes[1]);  // y same as input[1]
+                // rstd drops the last dimension
+                auto rstd_shape = input_shapes[0];
+                if (!rstd_shape.empty()) {
+                    rstd_shape.pop_back();
+                }
+                output_shapes.push_back(rstd_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::Silu:
+        case CompiledOpType::Mul: {
+            // Element-wise ops preserve shape
             if (!input_shapes.empty() && !input_shapes[0].empty()) {
-                output_shapes.push_back(input_shapes[0]);  // Simplified: same shape as input
-                // LSE shape - hard to infer without model config, leave empty for now
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::QKVQKNormRoPE: {
+            // Output qkv_rope has same shape as input qkv
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);  // qkv_rope
+                // q_rstd and k_rstd shapes - hard to infer without config
+                output_shapes.push_back({});
                 output_shapes.push_back({});
             }
+            break;
+        }
+
+        case CompiledOpType::MoESigmoid:
+        case CompiledOpType::MoESoftmax: {
+            // Output same shape as input
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::MoETopK: {
+            // Output: routing_weights [B*T, K], routing_indices [B*T, K]
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                int top_k = 1;
+                if (auto* attr = find_attr(op.attrs, "top_k")) {
+                    if (auto v = attr_int(*attr)) {
+                        top_k = static_cast<int>(*v);
+                    }
+                }
+                std::vector<long> out_shape = {input_shapes[0][0], static_cast<long>(top_k)};
+                output_shapes.push_back(out_shape);  // routing_weights
+                output_shapes.push_back(out_shape);  // routing_indices
+            }
+            break;
+        }
+
+        case CompiledOpType::MoEPermute: {
+            // permuted_input shape depends on scatter_indices, hard to infer statically
+            break;
+        }
+
+        case CompiledOpType::MoEGroupedGemmGateUp: {
+            // Output shape is [total_tokens, 2*M] but total_tokens is dynamic
+            break;
+        }
+
+        case CompiledOpType::MoEGroupedGemmDown: {
+            // Output shape is [total_tokens, C] but total_tokens is dynamic
+            break;
+        }
+
+        case CompiledOpType::MoEUnpermute: {
+            // Output shape [B*T, C] - based on routing structure
             break;
         }
 
@@ -1135,9 +1290,7 @@ void GraphCompiler::validate_operation_shapes(
                 << "  Graph: " << mModule.name << "\n"
                 << "  Batch size (B): " << mB << "\n"
                 << "  Sequence length (T): " << mT << "\n"
-                << "  Hidden size: " << mConfig.HiddenSize << "\n\n"
-                << "To disable shape checking (not recommended):\n"
-                << "  export SUROGATE_NO_SHAPE_CHECK=1\n\n";
+                << "  Hidden size: " << mConfig.HiddenSize << "\n\n";
 
             throw std::runtime_error(oss.str());
         }
@@ -1246,7 +1399,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         } catch (const std::exception& e) {
             // Re-throw with additional context if validation fails
             std::cerr << "Shape validation failed during graph compilation.\n"
-                      << "To disable shape checking, set SUROGATE_NO_SHAPE_CHECK=1\n";
+                      << "Operation: " << op.name << " (id: " << op.id << ")\n"
+                      << "Error: " << e.what() << "\n"
+                      << "To disable shape checking (not recommended), set SUROGATE_NO_SHAPE_CHECK=1\n";
             throw;
         }
 
@@ -1505,6 +1660,205 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.dtype = compiled.inputs[0].dtype;
                     }
                     // Shape is set from attrs in resolve_attrs, not here
+                } else if (compiled.type == CompiledOpType::MoESigmoid ||
+                           compiled.type == CompiledOpType::MoESoftmax) {
+                    // Output dtype/shape matches input (router logits)
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                        if (ref.shape.empty()) {
+                            ref.shape = compiled.inputs[0].shape;
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::MoETopK) {
+                    // output[0] = routing_weights [B*T, K] (same dtype as input)
+                    // output[1] = routing_indices [B*T, K] INT32
+                    int top_k = 1;
+                    if (auto* attr = find_attr(op.attrs, "top_k")) {
+                        if (auto v = attr_int(*attr)) {
+                            top_k = static_cast<int>(*v);
+                        }
+                    }
+                    long BT = B * T;
+                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty()) {
+                        BT = compiled.inputs[0].shape[0];
+                    }
+                    if (i == 0) {
+                        // routing_weights - same dtype as input probs
+                        if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                        }
+                        ref.shape = {BT, static_cast<long>(top_k)};
+                    } else if (i == 1) {
+                        // routing_indices - INT32
+                        ref.dtype = ETensorDType::INT32;
+                        ref.shape = {BT, static_cast<long>(top_k)};
+                    }
+                } else if (compiled.type == CompiledOpType::MoEPermute) {
+                    // output[0] = permuted_input [total_tokens, C] (same dtype as input)
+                    // output[1] = scatter_indices [total_tokens] INT32
+                    int top_k = 1;
+                    if (auto* attr = find_attr(op.attrs, "top_k")) {
+                        if (auto v = attr_int(*attr)) {
+                            top_k = static_cast<int>(*v);
+                        }
+                    }
+                    long num_tokens = B * T;
+                    long hidden_size = C;
+                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty()) {
+                        num_tokens = compiled.inputs[0].shape[0];
+                        if (compiled.inputs[0].shape.size() > 1) {
+                            hidden_size = compiled.inputs[0].shape[1];
+                        }
+                    }
+                    long total_tokens = num_tokens * top_k;
+                    if (i == 0) {
+                        // permuted_input - same dtype as input
+                        if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                        }
+                        ref.shape = {total_tokens, hidden_size};
+                    } else if (i == 1) {
+                        // scatter_indices - INT32
+                        ref.dtype = ETensorDType::INT32;
+                        ref.shape = {total_tokens};
+                    }
+                } else if (compiled.type == CompiledOpType::MoEGroupedGemmGateUp) {
+                    // output[0] = gate_up_out [total_tokens, 2*intermediate] (same dtype as input)
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                    }
+                    // Shape is dynamic based on scatter_indices, leave empty for runtime
+                } else if (compiled.type == CompiledOpType::MoEGroupedGemmDown) {
+                    // output[0] = down_out [total_tokens, C] (same dtype as input)
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                    }
+                    // Shape is dynamic based on scatter_indices, leave empty for runtime
+                } else if (compiled.type == CompiledOpType::MoEUnpermute) {
+                    // output[0] = combined_out [B*T, C] (same dtype as input)
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                    }
+                    long num_tokens = B * T;
+                    if (!compiled.inputs.empty() && compiled.inputs.size() > 1 &&
+                        !compiled.inputs[1].shape.empty()) {
+                        // routing_weights shape is [B*T, K]
+                        num_tokens = compiled.inputs[1].shape[0];
+                    }
+                    ref.shape = {num_tokens, C};
+                } else if (compiled.type == CompiledOpType::MoESigmoidBackward ||
+                           compiled.type == CompiledOpType::MoESoftmaxBackward) {
+                    // inputs: d_out, saved.input
+                    // output: d_input (same shape/dtype as d_out, which is input[0])
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                        if (ref.shape.empty()) {
+                            ref.shape = compiled.inputs[0].shape;
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::MoETopKBackward) {
+                    // inputs: d_routing_weights, saved.probs, saved.indices
+                    // output: d_probs (same shape/dtype as saved.probs, which is input[1])
+                    if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                        ref.dtype = compiled.inputs[1].dtype;
+                        ref.shape = compiled.inputs[1].shape;
+                    } else if (!compiled.inputs.empty()) {
+                        // Fallback: use d_routing_weights dtype, derive probs shape
+                        ref.dtype = compiled.inputs[0].dtype;
+                        // probs is [num_tokens, num_experts], d_routing_weights is [num_tokens, top_k]
+                        // We need num_experts from config
+                        long num_tokens = B * T;
+                        if (!compiled.inputs[0].shape.empty()) {
+                            num_tokens = compiled.inputs[0].shape[0];
+                        }
+                        // Default from model config, then check for explicit attr override
+                        long num_experts = static_cast<long>(mConfig.NumExperts);
+                        if (auto* attr = find_attr(op.attrs, "num_experts")) {
+                            if (auto v = attr_int(*attr)) {
+                                num_experts = *v;
+                            }
+                        }
+                        ref.shape = {num_tokens, num_experts};
+                    }
+                } else if (compiled.type == CompiledOpType::MoEPermuteBackward) {
+                    // inputs: d_permuted, saved.scatter_indices
+                    // output: d_x (unpermuted gradient)
+                    // d_x shape is [num_tokens, hidden_size] where num_tokens = scatter_indices.size() / top_k
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                    }
+                    // Derive shape from scatter_indices and top_k
+                    int top_k = 1;
+                    if (auto* attr = find_attr(op.attrs, "top_k")) {
+                        if (auto v = attr_int(*attr)) {
+                            top_k = static_cast<int>(*v);
+                        }
+                    }
+                    long total_tokens = B * T * top_k;  // permuted size
+                    long hidden_size = C;
+                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty()) {
+                        total_tokens = compiled.inputs[0].shape[0];
+                        if (compiled.inputs[0].shape.size() > 1) {
+                            hidden_size = compiled.inputs[0].shape[1];
+                        }
+                    }
+                    long num_tokens = total_tokens / top_k;
+                    ref.shape = {num_tokens, hidden_size};
+                } else if (compiled.type == CompiledOpType::MoEUnpermuteBackward) {
+                    // inputs: d_out, saved.expert_out, saved.routing_weights, saved.scatter_indices
+                    // outputs[0]: d_expert_out (same shape as saved.expert_out, input[1])
+                    // outputs[1]: d_routing_weights (same shape as saved.routing_weights, input[2])
+                    if (i == 0) {
+                        // d_expert_out - same shape/dtype as saved.expert_out (input[1])
+                        if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                            ref.dtype = compiled.inputs[1].dtype;
+                            ref.shape = compiled.inputs[1].shape;
+                        } else if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                            // Fallback: expert_out is [total_tokens, C]
+                            int top_k = 1;
+                            if (auto* attr = find_attr(op.attrs, "top_k")) {
+                                if (auto v = attr_int(*attr)) {
+                                    top_k = static_cast<int>(*v);
+                                }
+                            }
+                            ref.shape = {B * T * top_k, C};
+                        }
+                    } else if (i == 1) {
+                        // d_routing_weights - same shape/dtype as saved.routing_weights (input[2])
+                        if (compiled.inputs.size() > 2 && !compiled.inputs[2].shape.empty()) {
+                            ref.dtype = compiled.inputs[2].dtype;
+                            ref.shape = compiled.inputs[2].shape;
+                        } else if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                            // Fallback: routing_weights is [num_tokens, top_k]
+                            int top_k = 1;
+                            if (auto* attr = find_attr(op.attrs, "top_k")) {
+                                if (auto v = attr_int(*attr)) {
+                                    top_k = static_cast<int>(*v);
+                                }
+                            }
+                            ref.shape = {B * T, static_cast<long>(top_k)};
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::MoEGroupedGemmGateUpBackward ||
+                           compiled.type == CompiledOpType::MoEGroupedGemmDownBackward) {
+                    // inputs: d_out, saved.inp, weights, saved.scatter_indices
+                    // output: d_inp (same shape/dtype as saved.inp, input[1])
+                    if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                        ref.dtype = compiled.inputs[1].dtype;
+                        ref.shape = compiled.inputs[1].shape;
+                    } else if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                        // Fallback: inp is permuted input [total_tokens, C]
+                        int top_k = 1;
+                        if (auto* attr = find_attr(op.attrs, "top_k")) {
+                            if (auto v = attr_int(*attr)) {
+                                top_k = static_cast<int>(*v);
+                            }
+                        }
+                        ref.shape = {B * T * top_k, C};
+                    }
                 } else {
                     // Default for activation tensors
                     ref.dtype = ETensorDType::BF16;
@@ -1571,6 +1925,24 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
     , mConfig(config)
     , mOptions(options)
 {}
+
+CompiledExecutor::~CompiledExecutor() {
+    // Free persistent GPU buffers
+    if (mMoEExpertOffsetsGPU) {
+        cudaFree(mMoEExpertOffsetsGPU);
+        mMoEExpertOffsetsGPU = nullptr;
+        mMoEExpertOffsetsGPUSize = 0;
+    }
+
+    // Free persistent MoE saved tensor buffers
+    for (auto& [name, buffer] : mMoESavedBuffers) {
+        if (buffer) {
+            cudaFree(buffer);
+        }
+    }
+    mMoESavedBuffers.clear();
+    mMoESavedSizes.clear();
+}
 
 void CompiledExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
                                       modules::ModularLoRAWeightsManager* weights,
@@ -1650,7 +2022,51 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         // First check the tensor map (intermediate tensors)
         auto it = mTensorMap.find(name);
         if (it != mTensorMap.end()) {
-            (*mSaved)[name] = it->second;
+            bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
+                                  name.find("scatter_indices") != std::string::npos ||
+                                  name.find("routing_weights") != std::string::npos ||
+                                  name.find("routing_indices") != std::string::npos ||
+                                  name.find("router_probs") != std::string::npos ||
+                                  name.find("permuted_input") != std::string::npos);
+
+            // For MoE tensors, copy to persistent buffer to prevent buffer reuse corruption
+            if (is_moe_tensor && mConfig.NumExperts > 0 && it->second.Data != nullptr) {
+                const Tensor& src = it->second;
+                const size_t bytes = src.bytes();
+
+                // Allocate or resize persistent buffer if needed
+                auto buf_it = mMoESavedBuffers.find(name);
+                if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+                    // Free old buffer if exists
+                    if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                        CUDA_CHECK(cudaFree(buf_it->second));
+                    }
+                    // Allocate new buffer
+                    void* new_buffer = nullptr;
+                    CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+                    mMoESavedBuffers[name] = new_buffer;
+                    mMoESavedSizes[name] = bytes;
+                }
+
+                // Copy data to persistent buffer
+                void* dst_buffer = mMoESavedBuffers[name];
+                CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+
+                // Create tensor struct pointing to persistent buffer
+                Tensor saved_tensor;
+                saved_tensor.DType = src.DType;
+                saved_tensor.Rank = src.Rank;
+                for (int i = 0; i < src.Rank; ++i) {
+                    saved_tensor.Sizes[i] = src.Sizes[i];
+                }
+                saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
+
+                (*mSaved)[name] = saved_tensor;
+            } else {
+                // Non-MoE tensor: just store reference (existing behavior)
+                (*mSaved)[name] = it->second;
+            }
             continue;
         }
 
@@ -1740,6 +2156,22 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             (*mSaved)[name] = mWeights.get(name);
         } else {
             throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
+        }
+    }
+
+    // For MoE models, copy expert_offsets data to persistent storage for backward pass
+    // The original tensor is stack-allocated and will be freed before backward runs
+    if (mConfig.NumExperts > 0) {
+        auto it = mTensorMap.find("moe_expert_offsets");
+        if (it != mTensorMap.end() && it->second.Data) {
+            const Tensor& src = it->second;
+            const int num_elements = static_cast<int>(src.nelem());
+            mMoEExpertOffsetsData.resize(num_elements);
+            CUDA_CHECK(cudaMemcpy(mMoEExpertOffsetsData.data(), src.Data,
+                                  num_elements * sizeof(int), cudaMemcpyDeviceToHost));
+            // Store metadata for reconstruction in backward
+            mMoEExpertOffsets = src;  // Copy the tensor metadata (shape, dtype, etc.)
+            mMoEExpertOffsets.Data = nullptr;  // Data will be restored from CPU storage
         }
     }
 }
@@ -1985,17 +2417,6 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             if (it != mTensorMap.end()) {
                 return it->second;
             }
-            // Debug: print similar tensor names
-            if (env_enabled("SUROGATE_DSL_DEBUG_TENSOR_MAP")) {
-                std::fprintf(stderr, "[DSL DEBUG] tensor not found: %s\n", ref.name.c_str());
-                std::fprintf(stderr, "[DSL DEBUG] available tensors with similar prefix:\n");
-                std::string prefix = ref.name.substr(0, std::min(size_t(15), ref.name.size()));
-                for (const auto& [name, t] : mTensorMap) {
-                    if (name.find(prefix.substr(0, 10)) != std::string::npos) {
-                        std::fprintf(stderr, "  %s\n", name.c_str());
-                    }
-                }
-            }
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
         case TensorSlot::Temporary:
@@ -2237,11 +2658,32 @@ void CompiledExecutor::dispatch_bias_add(const CompiledOp& op) {
 
 void CompiledExecutor::dispatch_swiglu(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
-    Tensor& out = ensure_output_tensor(op.outputs[0]);
 
-    const long D = inp.Sizes[2] / 2;
-    swiglu_forward(out, inp, nullptr, static_cast<int>(inp.Sizes[0]),
-                   static_cast<int>(inp.Sizes[1]), static_cast<int>(D), mRunState.MainStream);
+    // Handle both 3D [B, T, 2*D] and 2D [N, 2*D] tensors (MoE produces 2D)
+    if (inp.Rank == 2) {
+        // 2D input: [N, 2*D] -> [N, D] (used by MoE path)
+        const long N = inp.Sizes[0];
+        const long D = inp.Sizes[1] / 2;
+
+        // MoE output shape is dynamic, allocate with runtime shape
+        std::vector<long> out_shape = {N, D};
+        Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+        mTemps.push_back(out);
+
+        swiglu_forward(out, inp, nullptr, 1, static_cast<int>(N), static_cast<int>(D), mRunState.MainStream);
+
+        // Store output in tensor map for subsequent ops
+        mTensorMap[op.outputs[0].name] = out;
+    } else {
+        // 3D input: [B, T, 2*D] -> [B, T, D] (standard path)
+        Tensor& out = ensure_output_tensor(op.outputs[0]);
+
+        const long B = inp.Sizes[0];
+        const long T = inp.Sizes[1];
+        const long D = inp.Sizes[2] / 2;
+        swiglu_forward(out, inp, nullptr, static_cast<int>(B),
+                       static_cast<int>(T), static_cast<int>(D), mRunState.MainStream);
+    }
 }
 
 void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op) {
@@ -2514,6 +2956,311 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     }
 }
 
+// MoE forward dispatch implementations
+
+void CompiledExecutor::dispatch_silu(const CompiledOp& op) {
+    Tensor& inp = resolve_tensor(op.inputs[0]);
+    Tensor& out = ensure_output_tensor(op.outputs[0]);
+
+    const long N = static_cast<long>(inp.nelem());
+    silu_forward(out, inp, N, mRunState.MainStream);
+
+    mTensorMap[op.outputs[0].name] = out;
+}
+
+void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
+    // Element-wise multiplication kernel not yet implemented
+    // This is only needed for shared_expert path which is disabled by default
+    throw std::runtime_error("CompiledExecutor: element-wise mul operation not yet implemented. "
+                             "Set use_shared_expert=False in your model config.");
+}
+
+void CompiledExecutor::dispatch_moe_softmax(const CompiledOp& op) {
+    Tensor& inp = resolve_tensor(op.inputs[0]);
+
+    const int num_tokens = static_cast<int>(inp.Sizes[0]);
+    const int num_experts = static_cast<int>(inp.Sizes[1]);
+
+    // Allocate output with same shape as input (softmax doesn't change shape)
+    std::vector<long> out_shape = {static_cast<long>(num_tokens), static_cast<long>(num_experts)};
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    mTemps.push_back(out);
+
+    if (inp.DType == ETensorDType::BF16) {
+        moe_softmax_forward(out.get<nv_bfloat16>(),
+                            inp.get<nv_bfloat16>(),
+                            num_tokens, num_experts, mRunState.MainStream);
+    } else {
+        moe_softmax_forward(out.get<float>(),
+                            inp.get<float>(),
+                            num_tokens, num_experts, mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = out;
+}
+
+void CompiledExecutor::dispatch_moe_sigmoid(const CompiledOp& op) {
+    Tensor& inp = resolve_tensor(op.inputs[0]);
+
+    // Determine shape - input might have rank=0 if shape wasn't propagated at compile time
+    // In MoE context, the input is router logits with shape [num_tokens, num_experts]
+    std::vector<long> shape;
+    if (inp.Rank == 2) {
+        shape = {inp.Sizes[0], inp.Sizes[1]};
+    } else if (inp.Rank == 0 && mConfig.NumExperts > 0) {
+        // Infer shape from config and current dimensions
+        const long num_tokens = mB * mT;
+        const long num_experts = static_cast<long>(mConfig.NumExperts);
+        shape = {num_tokens, num_experts};
+        // Also fix the input tensor shape
+        inp.Rank = 2;
+        inp.Sizes[0] = num_tokens;
+        inp.Sizes[1] = num_experts;
+    } else {
+        // Fallback to input shape if available
+        for (int i = 0; i < inp.Rank; ++i) {
+            shape.push_back(inp.Sizes[i]);
+        }
+    }
+
+    // Allocate output with same shape as input
+    Tensor out = mRunState.temp_alloc(inp.DType, shape);
+    mTemps.push_back(out);
+
+    const int num_elements = static_cast<int>(out.nelem());
+
+    if (inp.DType == ETensorDType::BF16) {
+        moe_sigmoid_forward(out.get<nv_bfloat16>(),
+                            inp.get<nv_bfloat16>(),
+                            num_elements, mRunState.MainStream);
+    } else {
+        moe_sigmoid_forward(out.get<float>(),
+                            inp.get<float>(),
+                            num_elements, mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = out;
+}
+
+void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
+    Tensor& probs = resolve_tensor(op.inputs[0]);
+    Tensor& weights = ensure_output_tensor(op.outputs[0]);
+    Tensor& indices = ensure_output_tensor(op.outputs[1]);
+
+    const int num_tokens = static_cast<int>(probs.Sizes[0]);
+    const int num_experts = static_cast<int>(probs.Sizes[1]);
+    const int top_k = op.attrs.top_k;
+    const bool normalize = op.attrs.normalize_weights;
+
+    if (probs.DType == ETensorDType::BF16) {
+        moe_topk_forward(indices.get<int>(),
+                         weights.get<nv_bfloat16>(),
+                         probs.get<nv_bfloat16>(),
+                         num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+    } else {
+        moe_topk_forward(indices.get<int>(),
+                         weights.get<float>(),
+                         probs.get<float>(),
+                         num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = weights;
+    mTensorMap[op.outputs[1].name] = indices;
+}
+
+void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
+    Tensor& inp = resolve_tensor(op.inputs[0]);
+    Tensor& routing_indices = resolve_tensor(op.inputs[1]);
+    Tensor& permuted = ensure_output_tensor(op.outputs[0]);
+    Tensor& scatter_indices = ensure_output_tensor(op.outputs[1]);
+
+    const int num_tokens = static_cast<int>(inp.Sizes[0]);
+    const int hidden_size = static_cast<int>(inp.Sizes[1]);
+    const int top_k = op.attrs.top_k;
+    const int total_tokens = num_tokens * top_k;
+    const int num_experts = static_cast<int>(mConfig.NumExperts);
+
+    // Allocate temporary buffers for permutation indices
+    Tensor expert_counts = mRunState.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_counts");
+    // Allocate expert_offsets persistently (not on stack) so it survives to backward
+    // This tensor is needed by grouped GEMM backward ops
+    Tensor expert_offsets = mRunState.temp_alloc(ETensorDType::INT32, {num_experts + 1});
+    Tensor expert_positions = mRunState.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_positions");
+    Tensor gather_indices = mRunState.Stack.allocate(ETensorDType::INT32, {total_tokens}, "moe_gather_indices");
+
+    // Compute expert counts
+    moe_compute_expert_counts(expert_counts.get<int>(),
+                              routing_indices.get<int>(),
+                              num_tokens, top_k, num_experts, mRunState.MainStream);
+
+    // Compute expert offsets (prefix sum)
+    moe_compute_expert_offsets(expert_offsets.get<int>(),
+                               expert_counts.get<int>(),
+                               num_experts, mRunState.MainStream);
+
+    // Build gather and scatter indices
+    moe_build_indices(gather_indices.get<int>(),
+                      scatter_indices.get<int>(),
+                      routing_indices.get<int>(),
+                      expert_offsets.get<int>(),
+                      expert_positions.get<int>(),
+                      num_tokens, top_k, num_experts, mRunState.MainStream);
+
+    // Permute tokens
+    if (inp.DType == ETensorDType::BF16) {
+        moe_permute_tokens(permuted.get<nv_bfloat16>(),
+                           inp.get<nv_bfloat16>(),
+                           gather_indices.get<int>(),
+                           total_tokens, num_tokens, hidden_size, top_k, mRunState.MainStream);
+    } else {
+        moe_permute_tokens(permuted.get<float>(),
+                           inp.get<float>(),
+                           gather_indices.get<int>(),
+                           total_tokens, num_tokens, hidden_size, top_k, mRunState.MainStream);
+    }
+
+    // Store expert_offsets in scatter_indices output for later use
+    // Note: scatter_indices tensor is already populated by moe_build_indices
+
+    mTensorMap[op.outputs[0].name] = permuted;
+    mTensorMap[op.outputs[1].name] = scatter_indices;
+    // Store expert_offsets for use by grouped GEMM and unpermute
+    mTensorMap["moe_expert_offsets"] = expert_offsets;
+    mTensorMap["moe_gather_indices"] = gather_indices;
+
+    // Keep temps for later use
+    mTemps.push_back(expert_counts);
+    mTemps.push_back(expert_offsets);
+    mTemps.push_back(expert_positions);
+    mTemps.push_back(gather_indices);
+}
+
+void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
+    Tensor& inp = resolve_tensor(op.inputs[0]);
+    Tensor& weights = resolve_tensor(op.inputs[1]);  // Parameter name resolved by graph compiler
+    Tensor& scatter_indices = resolve_tensor(op.inputs[2]);
+    (void)scatter_indices;  // Used by kernel through expert_offsets
+
+    // Get expert offsets from stored state
+    auto it = mTensorMap.find("moe_expert_offsets");
+    if (it == mTensorMap.end()) {
+        throw std::runtime_error("moe_grouped_gemm_gate_up: expert_offsets not found");
+    }
+    Tensor& expert_offsets = it->second;
+
+    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+
+    // MoE output shape is dynamic: [total_tokens, 2 * intermediate_size]
+    // total_tokens = inp.Sizes[0] (permuted token count)
+    // Allocate output with correct runtime shape
+    const long total_tokens = inp.Sizes[0];
+    const long gate_up_dim = 2 * intermediate_size;
+    std::vector<long> out_shape = {total_tokens, gate_up_dim};
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    mTemps.push_back(out);
+
+    // Use weights dtype to determine compute precision (QLoRA may return FP32 dequantized weights)
+    if (weights.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_gate_up(out.get<nv_bfloat16>(),
+                                 inp.get<nv_bfloat16>(),
+                                 weights.get<nv_bfloat16>(),
+                                 expert_offsets.get<int>(),
+                                 num_experts, hidden_size, intermediate_size,
+                                 mRunState.cublas_handle(), mRunState.MainStream);
+    } else {
+        moe_grouped_gemm_gate_up(out.get<float>(),
+                                 inp.get<float>(),
+                                 weights.get<float>(),
+                                 expert_offsets.get<int>(),
+                                 num_experts, hidden_size, intermediate_size,
+                                 mRunState.cublas_handle(), mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = out;
+}
+
+void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
+    Tensor& inp = resolve_tensor(op.inputs[0]);
+    Tensor& weights = resolve_tensor(op.inputs[1]);  // Parameter name resolved by graph compiler
+    Tensor& scatter_indices = resolve_tensor(op.inputs[2]);
+    (void)scatter_indices;  // Used by kernel through expert_offsets
+
+    // Get expert offsets from stored state
+    auto it = mTensorMap.find("moe_expert_offsets");
+    if (it == mTensorMap.end()) {
+        throw std::runtime_error("moe_grouped_gemm_down: expert_offsets not found");
+    }
+    Tensor& expert_offsets = it->second;
+
+    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+
+    // MoE output shape is dynamic: [total_tokens, hidden_size]
+    // total_tokens = inp.Sizes[0] (permuted token count)
+    const long total_tokens = inp.Sizes[0];
+    std::vector<long> out_shape = {total_tokens, static_cast<long>(hidden_size)};
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    mTemps.push_back(out);
+
+    if (inp.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_down(out.get<nv_bfloat16>(),
+                              inp.get<nv_bfloat16>(),
+                              weights.get<nv_bfloat16>(),
+                              expert_offsets.get<int>(),
+                              num_experts, hidden_size, intermediate_size,
+                              mRunState.cublas_handle(), mRunState.MainStream);
+    } else {
+        moe_grouped_gemm_down(out.get<float>(),
+                              inp.get<float>(),
+                              weights.get<float>(),
+                              expert_offsets.get<int>(),
+                              num_experts, hidden_size, intermediate_size,
+                              mRunState.cublas_handle(), mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = out;
+}
+
+void CompiledExecutor::dispatch_moe_unpermute(const CompiledOp& op) {
+    Tensor& expert_out = resolve_tensor(op.inputs[0]);
+    Tensor& routing_weights = resolve_tensor(op.inputs[1]);
+    Tensor& scatter_indices = resolve_tensor(op.inputs[2]);
+
+    const int top_k = op.attrs.top_k;
+    const int num_tokens = static_cast<int>(routing_weights.Sizes[0]);
+    const int total_tokens = num_tokens * top_k;
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+
+    // MoE output shape is dynamic: [num_tokens, hidden_size]
+    // Use the preallocated mlp_down buffer to avoid stack allocation issues.
+    // The mlp_down buffer has shape (B, T, C) which equals [num_tokens, hidden_size]
+    // when viewed as 2D. This buffer survives layer boundary cleanup.
+    int layer_idx = mCurrentLayer >= 0 ? mCurrentLayer : 0;
+    auto& acts = mRunState.simplified_acts(layer_idx);
+    Tensor out = view_tensor(acts.mlp_down, {static_cast<long>(num_tokens), static_cast<long>(hidden_size)});
+
+    if (expert_out.DType == ETensorDType::BF16) {
+        moe_unpermute_and_combine(out.get<nv_bfloat16>(),
+                                  expert_out.get<nv_bfloat16>(),
+                                  routing_weights.get<nv_bfloat16>(),
+                                  scatter_indices.get<int>(),
+                                  num_tokens, total_tokens, hidden_size, top_k,
+                                  mRunState.MainStream);
+    } else {
+        moe_unpermute_and_combine(out.get<float>(),
+                                  expert_out.get<float>(),
+                                  routing_weights.get<float>(),
+                                  scatter_indices.get<int>(),
+                                  num_tokens, total_tokens, hidden_size, top_k,
+                                  mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = out;
+}
+
 // Backward dispatch implementations
 void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
@@ -2611,49 +3358,6 @@ void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
 void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // Addition backward: gradients pass through unchanged to both inputs
     Tensor& d_out = resolve_tensor(op.inputs[0]);
-
-    if (env_enabled("SUROGATE_DSL_DEBUG_ADD_BWD") || env_enabled("SUROGATE_DSL_DEBUG_RECOMPUTE_GRAD")) {
-        static int debug_add_count = 0;
-        static Tensor debug_add_norm_buf{};
-        if (!debug_add_norm_buf.Data && mRunState.Allocator && env_enabled("SUROGATE_DSL_DEBUG_RECOMPUTE_GRAD")) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            debug_add_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                                "debug_add_bwd_norm",
-                                                                EAllocationType::ON_DEVICE,
-                                                                {num_sums});
-        }
-        auto norm_of = [&](const Tensor& t) -> float {
-            if (!debug_add_norm_buf.Data) return 0.0f;
-            fill_zero(debug_add_norm_buf, mRunState.MainStream);
-            global_norm_squared(debug_add_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-            deterministic_sum(debug_add_norm_buf.template get<float>(),
-                              debug_add_norm_buf.template get<float>(),
-                              debug_add_norm_buf.nelem(),
-                              mRunState.MainStream);
-            float host_sum = 0.0f;
-            CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                       debug_add_norm_buf.template get<float>(),
-                                       sizeof(float),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            return std::sqrt(host_sum);
-        };
-        if (debug_add_count < 20) {
-            std::fprintf(stderr,
-                         "[DSL DEBUG ADD BWD] op_id=%s in=%s (norm=%g) out0=%s (slot=%d layer=%d) out1=%s (slot=%d layer=%d)\n",
-                         op.op_id.c_str(),
-                         op.inputs.size() > 0 ? op.inputs[0].name.c_str() : "",
-                         debug_add_norm_buf.Data ? norm_of(d_out) : 0.0f,
-                         op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "",
-                         op.outputs.size() > 0 ? static_cast<int>(op.outputs[0].slot) : -1,
-                         op.outputs.size() > 0 ? op.outputs[0].layer_idx : -1,
-                         op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "",
-                         op.outputs.size() > 1 ? static_cast<int>(op.outputs[1].slot) : -1,
-                         op.outputs.size() > 1 ? op.outputs[1].layer_idx : -1);
-        }
-        ++debug_add_count;
-    }
 
     // For pre-allocated gradient slots (like d_res_ffn, d_res_att), we must copy the
     // upstream gradient into the original simplified_grads buffer. Simply aliasing
@@ -2765,99 +3469,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
 
-    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
-    static bool debug_grad_norms = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
-    if (debug_recompute && layer_idx >= 0) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] matmul_backward layer=%d weight=%s a_ptr=%p last_recompute=%d\n",
-                     layer_idx, weight_name.c_str(), a.Data, mLastRecomputeLayer);
-    }
-
-    // Debug: compute input norms for gradient tracking
-    static Tensor mm_bwd_norm_buf{};
-    auto compute_norm_mm = [&](const Tensor& t) -> float {
-        if (!debug_grad_norms || !t.Data) return 0.0f;
-        if (!mm_bwd_norm_buf.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            mm_bwd_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32, "debug_mm_bwd_norm",
-                                                            EAllocationType::ON_DEVICE, {num_sums});
-        }
-        if (!mm_bwd_norm_buf.Data) return 0.0f;
-        fill_zero(mm_bwd_norm_buf, mRunState.MainStream);
-        global_norm_squared(mm_bwd_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-        deterministic_sum(mm_bwd_norm_buf.template get<float>(),
-                          mm_bwd_norm_buf.template get<float>(),
-                          mm_bwd_norm_buf.nelem(), mRunState.MainStream);
-        float host_sum = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&host_sum, mm_bwd_norm_buf.template get<float>(),
-                                   sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        return std::sqrt(host_sum);
-    };
-
-    if (debug_grad_norms && layer_idx >= 0) {
-        std::fprintf(stderr, "[GRAD NORM] matmul_bwd layer=%d weight=%s: d_out=%.6g a=%.6g\n",
-                     layer_idx, weight_name.c_str(), compute_norm_mm(d_out), compute_norm_mm(a));
-    }
-
-    if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
-        static int debug_matmul_count = 0;
-        static Tensor debug_norm_buf{};
-        if (!debug_norm_buf.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            debug_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                           "debug_matmul_bwd_norm",
-                                                           EAllocationType::ON_DEVICE,
-                                                           {num_sums});
-        }
-        const char* layer_env = std::getenv("SUROGATE_DSL_DEBUG_MATMUL_LAYER");
-        const int layer_filter = layer_env ? std::atoi(layer_env) : -999999;
-        const bool layer_match = !layer_env || layer_idx == layer_filter;
-        if (layer_match && debug_matmul_count < 20) {
-            std::string base_name;
-            if (!dB_name.empty()) {
-                if (auto base = base_param_from_grad(dB_name)) {
-                    base_name = *base;
-                }
-            }
-            bool grad_accum = false;
-            Tensor* grad = (!base_name.empty()) ? mGrads.get_param_grad(base_name, grad_accum) : nullptr;
-            std::fprintf(stderr,
-                         "[DSL DEBUG MATMUL] op_id=%s layer=%d matmul_op=%d d_out=%s a=%s weight=%s dB=%s base=%s grad=%p skip=%d\n",
-                         op.op_id.c_str(),
-                         layer_idx,
-                         static_cast<int>(op.attrs.matmul_op.value_or(modules::MatmulOp::LMHead)),
-                         op.inputs.size() > 0 ? op.inputs[0].name.c_str() : "",
-                         op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "",
-                         weight_name.c_str(),
-                         dB_name.c_str(),
-                         base_name.c_str(),
-                         grad ? grad->Data : nullptr,
-                         skip_weight_grad ? 1 : 0);
-            if (debug_norm_buf.Data && debug_matmul_count < 4) {
-                auto print_norm = [&](const char* name, const Tensor& t) {
-                    fill_zero(debug_norm_buf, mRunState.MainStream);
-                    global_norm_squared(debug_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                    deterministic_sum(debug_norm_buf.template get<float>(),
-                                      debug_norm_buf.template get<float>(),
-                                      debug_norm_buf.nelem(),
-                                      mRunState.MainStream);
-                    float host_sum = 0.0f;
-                    CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                               debug_norm_buf.template get<float>(),
-                                               sizeof(float),
-                                               cudaMemcpyDeviceToHost,
-                                               mRunState.MainStream));
-                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                    const float norm = std::sqrt(host_sum);
-                    std::fprintf(stderr, "  [DSL DEBUG MATMUL] %s norm=%g\n", name, norm);
-                };
-                print_norm("d_out", d_out);
-                print_norm("a_inp", a);
-            }
-            ++debug_matmul_count;
-        }
-    }
-
     // Now allocate output tensors - skip dB if weights are frozen
     Tensor* dA_ptr = nullptr;
     Tensor* dB_ptr = nullptr;
@@ -2931,55 +3542,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
 
         mRecipe->backward_matmul(ctx);
         used_recipe = true;
-
-        if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
-            static int debug_recipe_count = 0;
-            static Tensor debug_norm_buf_recipe{};
-            if (!debug_norm_buf_recipe.Data && mRunState.Allocator) {
-                const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-                debug_norm_buf_recipe = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                                      "debug_matmul_bwd_recipe_norm",
-                                                                      EAllocationType::ON_DEVICE,
-                                                                      {num_sums});
-            }
-            if (debug_norm_buf_recipe.Data && debug_recipe_count < 4) {
-                auto norm_of = [&](const Tensor& t) {
-                    fill_zero(debug_norm_buf_recipe, mRunState.MainStream);
-                    global_norm_squared(debug_norm_buf_recipe, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                    deterministic_sum(debug_norm_buf_recipe.template get<float>(),
-                                      debug_norm_buf_recipe.template get<float>(),
-                                      debug_norm_buf_recipe.nelem(),
-                                      mRunState.MainStream);
-                    float host_sum = 0.0f;
-                    CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                               debug_norm_buf_recipe.template get<float>(),
-                                               sizeof(float),
-                                               cudaMemcpyDeviceToHost,
-                                               mRunState.MainStream));
-                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                    return std::sqrt(host_sum);
-                };
-                if (dA_use) {
-                    std::fprintf(stderr, "  [DSL DEBUG MATMUL] recipe dA norm=%g ptr=%p\n",
-                                 norm_of(*dA_use), dA_use->Data);
-                }
-                if (dB_use) {
-                    std::fprintf(stderr,
-                                 "  [DSL DEBUG MATMUL] recipe dB norm=%g ptr=%p accum=%d skip=%d\n",
-                                 norm_of(*dB_use),
-                                 dB_use->Data,
-                                 do_accumulate ? 1 : 0,
-                                 ctx.skip_weight_grad ? 1 : 0);
-                }
-                if (dB_ptr && dB_ptr != dB_use) {
-                    std::fprintf(stderr,
-                                 "  [DSL DEBUG MATMUL] recipe dB_ptr ptr=%p (view=%s)\n",
-                                 dB_ptr->Data,
-                                 dB_ptr->Data == dB_use->Data ? "yes" : "no");
-                }
-            }
-            ++debug_recipe_count;
-        }
     }
 
     if (!used_recipe) {
@@ -3047,80 +3609,19 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             int M = 0, N = 0, K = 0;
             matmul_dims(*lhs, *rhs, mode_rm, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode_rm);
-            if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
-                static int debug_db_count = 0;
-                static Tensor debug_norm_buf_db{};
-                if (!debug_norm_buf_db.Data && mRunState.Allocator) {
-                    const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-                    debug_norm_buf_db = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                                      "debug_matmul_bwd_db_norm",
-                                                                      EAllocationType::ON_DEVICE,
-                                                                      {num_sums});
-                }
-                if (debug_norm_buf_db.Data && debug_db_count < 4) {
-                    auto norm_of = [&](const Tensor& t) {
-                        fill_zero(debug_norm_buf_db, mRunState.MainStream);
-                        global_norm_squared(debug_norm_buf_db, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                        deterministic_sum(debug_norm_buf_db.template get<float>(),
-                                          debug_norm_buf_db.template get<float>(),
-                                          debug_norm_buf_db.nelem(),
-                                          mRunState.MainStream);
-                        float host_sum = 0.0f;
-                        CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                                   debug_norm_buf_db.template get<float>(),
-                                                   sizeof(float),
-                                                   cudaMemcpyDeviceToHost,
-                                                   mRunState.MainStream));
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        return std::sqrt(host_sum);
-                    };
-                    const float norm_before = norm_of(*dB_ptr);
-                    std::fprintf(stderr,
-                                 "  [DSL DEBUG MATMUL] dB before norm=%g M=%d N=%d K=%d mode=%d accum=%d\n",
-                                 norm_before, M, N, K, static_cast<int>(mode_col), do_accumulate ? 1 : 0);
-                }
-                ++debug_db_count;
-            }
             matmul(*dB_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, do_accumulate, mRunState.MainStream);
-            if (env_enabled("SUROGATE_DSL_DEBUG_MATMUL_BWD")) {
-                static int debug_db_after_count = 0;
-                static Tensor debug_norm_buf_db_after{};
-                if (!debug_norm_buf_db_after.Data && mRunState.Allocator) {
-                    const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-                    debug_norm_buf_db_after = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                                            "debug_matmul_bwd_db_norm_after",
-                                                                            EAllocationType::ON_DEVICE,
-                                                                            {num_sums});
-                }
-                if (debug_norm_buf_db_after.Data && debug_db_after_count < 4) {
-                    auto norm_of = [&](const Tensor& t) {
-                        fill_zero(debug_norm_buf_db_after, mRunState.MainStream);
-                        global_norm_squared(debug_norm_buf_db_after, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                        deterministic_sum(debug_norm_buf_db_after.template get<float>(),
-                                          debug_norm_buf_db_after.template get<float>(),
-                                          debug_norm_buf_db_after.nelem(),
-                                          mRunState.MainStream);
-                        float host_sum = 0.0f;
-                        CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                                   debug_norm_buf_db_after.template get<float>(),
-                                                   sizeof(float),
-                                                   cudaMemcpyDeviceToHost,
-                                                   mRunState.MainStream));
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        return std::sqrt(host_sum);
-                    };
-                    const float norm_after = norm_of(*dB_ptr);
-                    std::fprintf(stderr, "  [DSL DEBUG MATMUL] dB after norm=%g\n", norm_after);
-                }
-                ++debug_db_after_count;
-            }
         }
     }
 
     // Hook invocation for LoRA backward
-    if (hook && *hook && op.attrs.backward_hook_point.has_value()) {
+    // Skip dense MLP hooks for MoE models - MoE has different backward path (grouped GEMM)
+    const bool is_moe = mConfig.NumExperts > 0;
+    const bool is_mlp_hook = op.attrs.matmul_op.has_value() &&
+        (*op.attrs.matmul_op == modules::MatmulOp::MLPUp ||
+         *op.attrs.matmul_op == modules::MatmulOp::MLPDown);
+    if (hook && *hook && op.attrs.backward_hook_point.has_value() && !(is_moe && is_mlp_hook)) {
         // Temporarily map grads to current backward tensors for LoRA hooks, then restore.
         struct GradPtrs {
             std::byte* d_swiglu{nullptr};
@@ -3269,11 +3770,21 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
         ? mRunState.simplified_quant_grads().d_mlp_up.abs_max()
         : nullptr;
 
-    const long D = d_out.Sizes[2];
-    swiglu_backward(d_inp, d_out, inp, abs_max_ptr,
-                    static_cast<int>(d_out.Sizes[0]),
-                    static_cast<int>(d_out.Sizes[1]),
-                    static_cast<int>(D), mRunState.MainStream);
+    // Handle both 3D [B, T, D] and 2D [N, D] tensors (MoE produces 2D)
+    if (d_out.Rank == 2) {
+        // 2D case for MoE: d_out is [N, D], inp is [N, 2*D]
+        const long N = d_out.Sizes[0];
+        const long D = d_out.Sizes[1];
+        swiglu_backward(d_inp, d_out, inp, abs_max_ptr,
+                        1, static_cast<int>(N), static_cast<int>(D), mRunState.MainStream);
+    } else {
+        // 3D case: d_out is [B, T, D]
+        const long D = d_out.Sizes[2];
+        swiglu_backward(d_inp, d_out, inp, abs_max_ptr,
+                        static_cast<int>(d_out.Sizes[0]),
+                        static_cast<int>(d_out.Sizes[1]),
+                        static_cast<int>(D), mRunState.MainStream);
+    }
 }
 
 void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
@@ -3426,7 +3937,9 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     }
 
     // Hook invocation for LoRA backward (MLP up/gate)
-    if (hook && *hook && op.attrs.backward_hook_point.has_value()) {
+    // Skip dense MLP hooks for MoE models - MoE has different backward path (grouped GEMM)
+    const bool is_moe = mConfig.NumExperts > 0;
+    if (hook && *hook && op.attrs.backward_hook_point.has_value() && !is_moe) {
         (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
     }
 }
@@ -3550,56 +4063,6 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     std::string field;
     parse_block_param(op.inputs[3].name, layer_idx, field);
 
-    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
-    static bool debug_grad_norms = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
-    if (debug_recompute) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] flash_attention_backward layer=%d qkv_ptr=%p out_ptr=%p lse_ptr=%p last_recompute=%d\n",
-                     layer_idx, qkv_ptr->Data, out_ptr->Data, lse_ptr->Data, mLastRecomputeLayer);
-    }
-
-    // Debug: compute input norms for gradient tracking
-    static Tensor attn_bwd_norm_buf{};
-    auto compute_norm_attn = [&](const Tensor& t) -> float {
-        if (!debug_grad_norms || !t.Data) return 0.0f;
-        if (!attn_bwd_norm_buf.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            attn_bwd_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32, "debug_attn_bwd_norm",
-                                                              EAllocationType::ON_DEVICE, {num_sums});
-        }
-        if (!attn_bwd_norm_buf.Data) return 0.0f;
-        fill_zero(attn_bwd_norm_buf, mRunState.MainStream);
-        global_norm_squared(attn_bwd_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-        deterministic_sum(attn_bwd_norm_buf.template get<float>(),
-                          attn_bwd_norm_buf.template get<float>(),
-                          attn_bwd_norm_buf.nelem(), mRunState.MainStream);
-        float host_sum = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&host_sum, attn_bwd_norm_buf.template get<float>(),
-                                   sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        return std::sqrt(host_sum);
-    };
-
-    if (debug_grad_norms) {
-        std::fprintf(stderr, "[GRAD NORM] attn_bwd layer=%d BEFORE:\n", layer_idx);
-        std::fprintf(stderr, "  d_out: norm=%.6g ptr=%p\n", compute_norm_attn(d_out), d_out.Data);
-        std::fprintf(stderr, "  out (att): norm=%.6g ptr=%p name=%s\n", compute_norm_attn(*out_ptr), out_ptr->Data, op.inputs[1].name.c_str());
-        std::fprintf(stderr, "  lse: norm=%.6g ptr=%p name=%s\n", compute_norm_attn(*lse_ptr), lse_ptr->Data, op.inputs[2].name.c_str());
-        std::fprintf(stderr, "  qkv: norm=%.6g ptr=%p name=%s\n", compute_norm_attn(*qkv_ptr), qkv_ptr->Data, op.inputs[3].name.c_str());
-        // Check expected values from simplified_acts
-        if (layer_idx >= 0) {
-            auto& acts = mRunState.simplified_acts(layer_idx);
-            std::fprintf(stderr, "  [expected] acts.att: ptr=%p norm=%.6g\n", acts.att.Data, compute_norm_attn(acts.att));
-            std::fprintf(stderr, "  [expected] acts.lse: ptr=%p norm=%.6g\n", acts.lse.Data, compute_norm_attn(acts.lse));
-            std::fprintf(stderr, "  [expected] acts.qkv: ptr=%p norm=%.6g\n", acts.qkv.Data, compute_norm_attn(acts.qkv));
-            if (out_ptr->Data != acts.att.Data) {
-                std::fprintf(stderr, "  WARNING: out_ptr != acts.att!\n");
-            }
-            if (lse_ptr->Data != acts.lse.Data) {
-                std::fprintf(stderr, "  WARNING: lse_ptr != acts.lse!\n");
-            }
-        }
-    }
-
     // FIX: Zero-initialize d_qkv before cuDNN attention backward to prevent NaN from uninitialized memory.
     // The d_qkv buffer may contain stale values from previous operations, and cuDNN attention backward
     // may read parts of this buffer even though it's expected to be output-only. Without this zero-init,
@@ -3621,10 +4084,6 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                  mRunState.CudnnHandle,
                                  static_cast<int>(mB), static_cast<int>(mT),
                                  Hq, Hkv, Hs, mRunState.MainStream);
-        if (debug_grad_norms) {
-            std::fprintf(stderr, "[GRAD NORM] attn_bwd layer=%d AFTER: d_qkv norm=%.6g\n",
-                         layer_idx, compute_norm_attn(d_qkv));
-        }
         return;
     }
 
@@ -3687,116 +4146,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
     Tensor& residual_out = *residual_out_ptr;
 
-    // Debug: FFT recompute verification
-    static bool debug_fft_recompute = env_enabled("SUROGATE_DEBUG_FFT_RECOMPUTE");
-    if (debug_fft_recompute && ln_layer_idx >= 0) {
-        static Tensor fft_norm_buf{};
-        if (!fft_norm_buf.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            fft_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                          "debug_fft_ln_bwd_norm",
-                                                          EAllocationType::ON_DEVICE,
-                                                          {num_sums});
-        }
-        auto norm_of = [&](const Tensor& t) -> float {
-            if (!fft_norm_buf.Data || !t.Data) return 0.0f;
-            fill_zero(fft_norm_buf, mRunState.MainStream);
-            global_norm_squared(fft_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-            deterministic_sum(fft_norm_buf.template get<float>(),
-                              fft_norm_buf.template get<float>(),
-                              fft_norm_buf.nelem(),
-                              mRunState.MainStream);
-            float host_sum = 0.0f;
-            CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                       fft_norm_buf.template get<float>(),
-                                       sizeof(float),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            return std::sqrt(host_sum);
-        };
-
-        std::fprintf(stderr, "[FFT LN BWD] layer=%d field=%s last_recompute=%d\n",
-                     ln_layer_idx, ln_field.c_str(), mLastRecomputeLayer);
-        std::fprintf(stderr, "  d_y: ptr=%p norm=%.6g\n", d_y.Data, norm_of(d_y));
-        std::fprintf(stderr, "  residual_out: ptr=%p norm=%.6g (input[2].name=%s slot=%d)\n",
-                     residual_out.Data, norm_of(residual_out),
-                     op.inputs[2].name.c_str(), static_cast<int>(op.inputs[2].slot));
-        std::fprintf(stderr, "  rstd: ptr=%p norm=%.6g\n", rstd.Data, norm_of(rstd));
-
-        // Check if residual_out matches the expected recomputed value
-        if (ln_field == "ln2_weight") {
-            // For LN2, residual_out should be residual_att from simplified_acts
-            auto& acts = mRunState.simplified_acts(ln_layer_idx);
-            std::fprintf(stderr, "  acts.residual_att: ptr=%p norm=%.6g\n",
-                         acts.residual_att.Data, norm_of(acts.residual_att));
-            if (residual_out.Data != acts.residual_att.Data) {
-                std::fprintf(stderr, "  WARNING: residual_out ptr != acts.residual_att ptr!\n");
-            }
-        }
-
-        // Check for NaN/Inf
-        float d_y_norm = norm_of(d_y);
-        float residual_norm = norm_of(residual_out);
-        float rstd_norm = norm_of(rstd);
-        if (!std::isfinite(d_y_norm) || !std::isfinite(residual_norm) || !std::isfinite(rstd_norm)) {
-            std::fprintf(stderr, "  ERROR: NaN/Inf detected in inputs!\n");
-        }
-    }
-
-    if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
-        static int debug_ln_count = 0;
-        static Tensor debug_ln_norm_buf{};
-        if (!debug_ln_norm_buf.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            debug_ln_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                              "debug_ln_bwd_norm",
-                                                              EAllocationType::ON_DEVICE,
-                                                              {num_sums});
-        }
-        const char* ln_layer_env = std::getenv("SUROGATE_DSL_DEBUG_LN_LAYER");
-        const int ln_layer_filter = ln_layer_env ? std::atoi(ln_layer_env) : -999999;
-        const bool ln_layer_match = !ln_layer_env || ln_layer_idx == ln_layer_filter;
-        if (ln_layer_match && debug_ln_count < 16) {
-            std::fprintf(stderr,
-                         "[DSL DEBUG LN BWD] layer=%d field=%s in0=%s in1=%s out0=%s slot0=%d out1=%s slot1=%d\n",
-                         ln_layer_idx,
-                         ln_field.c_str(),
-                         op.inputs.size() > 0 ? op.inputs[0].name.c_str() : "",
-                         op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "",
-                         op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "",
-                         op.outputs.size() > 0 ? static_cast<int>(op.outputs[0].slot) : -1,
-                         op.outputs.size() > 1 ? op.outputs[1].name.c_str() : "",
-                         op.outputs.size() > 1 ? static_cast<int>(op.outputs[1].slot) : -1);
-            auto norm_of = [&](const Tensor& t) {
-                fill_zero(debug_ln_norm_buf, mRunState.MainStream);
-                global_norm_squared(debug_ln_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                deterministic_sum(debug_ln_norm_buf.template get<float>(),
-                                  debug_ln_norm_buf.template get<float>(),
-                                  debug_ln_norm_buf.nelem(),
-                                  mRunState.MainStream);
-                float host_sum = 0.0f;
-                CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                           debug_ln_norm_buf.template get<float>(),
-                                           sizeof(float),
-                                           cudaMemcpyDeviceToHost,
-                                           mRunState.MainStream));
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                return std::sqrt(host_sum);
-            };
-            if (debug_ln_norm_buf.Data) {
-                // Print d_y (in0) norm - this is upstream gradient from MLPUp backward
-                std::fprintf(stderr, "  [DSL DEBUG LN BWD] in0 (d_y) norm=%g\n", norm_of(d_y));
-                // Print d_residual_next (in1) norm if present
-                if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
-                    Tensor& in1 = resolve_tensor(op.inputs[1]);
-                    std::fprintf(stderr, "  [DSL DEBUG LN BWD] in1 (d_residual_next) norm=%g\n", norm_of(in1));
-                }
-            }
-        }
-        ++debug_ln_count;
-    }
-
     // d_residual_next is the incoming gradient from the next layer (may be zero/empty)
     Tensor d_residual_zero{};
     Tensor* d_residual_next = nullptr;
@@ -3849,68 +4198,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
 
-    // Debug: gradient norm tracking
-    static bool debug_grad_norms_ln = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
-    if (debug_grad_norms_ln && ln_layer_idx >= 0) {
-        static Tensor grad_norm_buf_ln{};
-        if (!grad_norm_buf_ln.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            grad_norm_buf_ln = mRunState.Allocator->allocate(ETensorDType::FP32, "debug_ln_grad_norm",
-                                                              EAllocationType::ON_DEVICE, {num_sums});
-        }
-        auto norm_ln = [&](const Tensor& t) -> float {
-            if (!grad_norm_buf_ln.Data || !t.Data) return 0.0f;
-            fill_zero(grad_norm_buf_ln, mRunState.MainStream);
-            global_norm_squared(grad_norm_buf_ln, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-            deterministic_sum(grad_norm_buf_ln.template get<float>(),
-                              grad_norm_buf_ln.template get<float>(),
-                              grad_norm_buf_ln.nelem(), mRunState.MainStream);
-            float host_sum = 0.0f;
-            CUDA_CHECK(cudaMemcpyAsync(&host_sum, grad_norm_buf_ln.template get<float>(),
-                                       sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            return std::sqrt(host_sum);
-        };
-        std::fprintf(stderr, "[GRAD NORM] ln_bwd layer=%d field=%s: d_y=%.6g d_input=%.6g residual_out=%.6g\n",
-                     ln_layer_idx, ln_field.c_str(), norm_ln(d_y), norm_ln(d_input), norm_ln(residual_out));
-    }
-
-    // Debug: check output gradients after rmsnorm_backward
-    if (debug_fft_recompute && ln_layer_idx >= 0) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        static Tensor fft_out_norm_buf{};
-        if (!fft_out_norm_buf.Data && mRunState.Allocator) {
-            const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-            fft_out_norm_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                              "debug_fft_ln_out_norm",
-                                                              EAllocationType::ON_DEVICE,
-                                                              {num_sums});
-        }
-        auto norm_of_out = [&](const Tensor& t) -> float {
-            if (!fft_out_norm_buf.Data || !t.Data) return 0.0f;
-            fill_zero(fft_out_norm_buf, mRunState.MainStream);
-            global_norm_squared(fft_out_norm_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-            deterministic_sum(fft_out_norm_buf.template get<float>(),
-                              fft_out_norm_buf.template get<float>(),
-                              fft_out_norm_buf.nelem(),
-                              mRunState.MainStream);
-            float host_sum = 0.0f;
-            CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                       fft_out_norm_buf.template get<float>(),
-                                       sizeof(float),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            return std::sqrt(host_sum);
-        };
-        float d_input_norm = norm_of_out(d_input);
-        std::fprintf(stderr, "[FFT LN BWD] layer=%d field=%s OUTPUT: d_input norm=%.6g\n",
-                     ln_layer_idx, ln_field.c_str(), d_input_norm);
-        if (!std::isfinite(d_input_norm)) {
-            std::fprintf(stderr, "  ERROR: d_input has NaN/Inf after rmsnorm_backward!\n");
-        }
-    }
-
     // Copy d_input to d_residual if they're different outputs
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {
         Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
@@ -3930,80 +4217,9 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
         Tensor& d_mlp_down = mRunState.simplified_grads(ln_layer_idx).d_mlp_down;
 
-        if (env_enabled("SUROGATE_DSL_DEBUG_RECOMPUTE_GRAD")) {
-            static Tensor debug_norm_buf_rc{};
-            if (!debug_norm_buf_rc.Data && mRunState.Allocator) {
-                const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-                debug_norm_buf_rc = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                                   "debug_recompute_grad_norm",
-                                                                   EAllocationType::ON_DEVICE,
-                                                                   {num_sums});
-            }
-            if (debug_norm_buf_rc.Data) {
-                auto norm_of = [&](const Tensor& t) {
-                    fill_zero(debug_norm_buf_rc, mRunState.MainStream);
-                    global_norm_squared(debug_norm_buf_rc, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                    deterministic_sum(debug_norm_buf_rc.template get<float>(),
-                                      debug_norm_buf_rc.template get<float>(),
-                                      debug_norm_buf_rc.nelem(),
-                                      mRunState.MainStream);
-                    float host_sum = 0.0f;
-                    CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                               debug_norm_buf_rc.template get<float>(),
-                                               sizeof(float),
-                                               cudaMemcpyDeviceToHost,
-                                               mRunState.MainStream));
-                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                    return std::sqrt(host_sum);
-                };
-                std::fprintf(stderr,
-                             "[DSL DEBUG RECOMPUTE] LN2 bwd layer=%d: d_residual=%p norm=%g, d_mlp_down=%p norm=%g (bucket=%d)\n",
-                             ln_layer_idx,
-                             d_residual.Data, norm_of(d_residual),
-                             d_mlp_down.Data, d_mlp_down.Data ? norm_of(d_mlp_down) : 0.0f,
-                             ln_layer_idx % 2);
-            }
-        }
-
         if (d_mlp_down.Data && d_mlp_down.Data != d_residual.Data) {
             CUDA_CHECK(cudaMemcpyAsync(d_mlp_down.Data, d_residual.Data, d_residual.bytes(),
                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
-        }
-        if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
-            const char* ln_layer_env = std::getenv("SUROGATE_DSL_DEBUG_LN_LAYER");
-            const int ln_layer_filter = ln_layer_env ? std::atoi(ln_layer_env) : -999999;
-            if (!ln_layer_env || ln_layer_idx == ln_layer_filter) {
-                static Tensor debug_ln_out_buf{};
-                if (!debug_ln_out_buf.Data && mRunState.Allocator) {
-                    const int num_sums = get_max_num_block_sums(mRunState.DeviceProp);
-                    debug_ln_out_buf = mRunState.Allocator->allocate(ETensorDType::FP32,
-                                                                     "debug_ln_bwd_out_norm",
-                                                                     EAllocationType::ON_DEVICE,
-                                                                     {num_sums});
-                }
-                if (debug_ln_out_buf.Data) {
-                    auto norm_of = [&](const Tensor& t) {
-                        fill_zero(debug_ln_out_buf, mRunState.MainStream);
-                        global_norm_squared(debug_ln_out_buf, t, t.nelem(), mRunState.DeviceProp, mRunState.MainStream);
-                        deterministic_sum(debug_ln_out_buf.template get<float>(),
-                                          debug_ln_out_buf.template get<float>(),
-                                          debug_ln_out_buf.nelem(),
-                                          mRunState.MainStream);
-                        float host_sum = 0.0f;
-                        CUDA_CHECK(cudaMemcpyAsync(&host_sum,
-                                                   debug_ln_out_buf.template get<float>(),
-                                                   sizeof(float),
-                                                   cudaMemcpyDeviceToHost,
-                                                   mRunState.MainStream));
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        return std::sqrt(host_sum);
-                    };
-                    std::fprintf(stderr,
-                                 "[DSL DEBUG LN BWD] ln2 out0 norm=%g d_mlp_down norm=%g\n",
-                                 norm_of(d_residual),
-                                 d_mlp_down.Data ? norm_of(d_mlp_down) : 0.0f);
-                }
-            }
         }
     }
 
@@ -4016,16 +4232,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             if (d_res_ffn_prev.Data && d_res_ffn_prev.Data != d_input.Data) {
                 CUDA_CHECK(cudaMemcpyAsync(d_res_ffn_prev.Data, d_input.Data, d_input.bytes(),
                                            cudaMemcpyDeviceToDevice, mRunState.MainStream));
-            }
-            if (env_enabled("SUROGATE_DSL_DEBUG_LN_BWD")) {
-                static int debug_ln_copy_count = 0;
-                if (debug_ln_copy_count < 8) {
-                    std::fprintf(stderr,
-                                 "[DSL DEBUG LN BWD] copy to d_res_ffn_prev layer=%d ptr=%p\n",
-                                 prev_layer,
-                                 d_res_ffn_prev.Data);
-                }
-                ++debug_ln_copy_count;
             }
         }
     }
@@ -4084,11 +4290,11 @@ void CompiledExecutor::dispatch_cross_entropy_loss_backward(const CompiledOp& op
     const int V = static_cast<int>(logits.Sizes[1]);
     const int P = V;
 
+    // HuggingFace-style normalization: use reduction="sum" semantics.
+    // dloss = 1.0 means each valid token contributes equally to the gradient sum.
+    // The actual normalization by accumulated valid tokens happens in global_norm_sqrt.
     if (op.inputs[0].slot == TensorSlot::DLoss) {
-        const long total_tokens = mB * mT;
-        const int accum_steps = std::max(1, mRunState.GradAccumSteps);
-        const float dloss_val = 1.0f / static_cast<float>(total_tokens * accum_steps);
-        fill_constant(d_loss, dloss_val, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+        fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
     }
 
     Tensor logsumexp_view{};
@@ -4142,11 +4348,11 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         }
     }
 
+    // HuggingFace-style normalization: use reduction="sum" semantics.
+    // dloss = 1.0 means each valid token contributes equally to the gradient sum.
+    // The actual normalization by accumulated valid tokens happens in global_norm_sqrt.
     if (op.inputs[0].slot == TensorSlot::DLoss) {
-        const long total_tokens = mB * mT;
-        const int accum_steps = std::max(1, mRunState.GradAccumSteps);
-        const float dloss_val = 1.0f / static_cast<float>(total_tokens * accum_steps);
-        fill_constant(d_loss, dloss_val, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+        fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
     }
 
     const long BT = xF_flat.Sizes[0];
@@ -4248,6 +4454,286 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     }
 }
 
+// MoE backward dispatch implementations
+
+void CompiledExecutor::dispatch_silu_backward(const CompiledOp& op) {
+    Tensor& d_out = resolve_tensor(op.inputs[0]);
+    Tensor& inp = resolve_tensor(op.inputs[1]);
+    Tensor& d_inp = ensure_output_tensor(op.outputs[0]);
+
+    const long N = static_cast<long>(inp.nelem());
+    // Kernel signature: silu_backward(dinp, inp, dout, n, stream)
+    silu_backward(d_inp, inp, d_out, N, mRunState.MainStream);
+
+    mTensorMap[op.outputs[0].name] = d_inp;
+}
+
+void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
+    // Element-wise multiplication backward kernel not yet implemented
+    // This is only needed for shared_expert path which is disabled by default
+    throw std::runtime_error("CompiledExecutor: element-wise mul_backward operation not yet implemented. "
+                             "Set use_shared_expert=False in your model config.");
+}
+
+void CompiledExecutor::dispatch_moe_softmax_backward(const CompiledOp& op) {
+    Tensor& d_probs = resolve_tensor(op.inputs[0]);
+    Tensor& softmax_probs = resolve_tensor(op.inputs[1]);
+    Tensor& d_logits = ensure_output_tensor(op.outputs[0]);
+
+    const int num_tokens = static_cast<int>(d_probs.Sizes[0]);
+    const int num_experts = static_cast<int>(d_probs.Sizes[1]);
+
+    if (d_probs.DType == ETensorDType::BF16) {
+        moe_softmax_backward(d_logits.get<nv_bfloat16>(),
+                             d_probs.get<nv_bfloat16>(),
+                             softmax_probs.get<nv_bfloat16>(),
+                             num_tokens, num_experts, mRunState.MainStream);
+    } else {
+        moe_softmax_backward(d_logits.get<float>(),
+                             d_probs.get<float>(),
+                             softmax_probs.get<float>(),
+                             num_tokens, num_experts, mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_logits;
+}
+
+void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
+    Tensor& d_out = resolve_tensor(op.inputs[0]);
+    Tensor& sigmoid_out = resolve_tensor(op.inputs[1]);
+
+    // Allocate output with same shape as d_out (not from compile-time inference)
+    std::vector<long> d_inp_shape;
+    for (int i = 0; i < d_out.Rank; ++i) {
+        d_inp_shape.push_back(d_out.Sizes[i]);
+    }
+    Tensor d_inp = mRunState.temp_alloc(d_out.DType, d_inp_shape);
+    mTemps.push_back(d_inp);
+
+    const int num_elements = static_cast<int>(d_out.nelem());
+
+    if (d_out.DType == ETensorDType::BF16) {
+        moe_sigmoid_backward(d_inp.get<nv_bfloat16>(),
+                             d_out.get<nv_bfloat16>(),
+                             sigmoid_out.get<nv_bfloat16>(),
+                             num_elements, mRunState.MainStream);
+    } else {
+        moe_sigmoid_backward(d_inp.get<float>(),
+                             d_out.get<float>(),
+                             sigmoid_out.get<float>(),
+                             num_elements, mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_inp;
+}
+
+void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
+    Tensor& d_routing_weights = resolve_tensor(op.inputs[0]);
+    Tensor& probs = resolve_tensor(op.inputs[1]);
+    Tensor& expert_indices = resolve_tensor(op.inputs[2]);
+
+    const int num_tokens = static_cast<int>(probs.Sizes[0]);
+    const int num_experts = static_cast<int>(probs.Sizes[1]);
+    const int top_k = op.attrs.top_k;
+    const bool normalize = op.attrs.normalize_weights;
+
+    // Allocate output with correct shape derived from probs (not from compile-time inference)
+    // d_probs must have shape [num_tokens, num_experts] matching probs
+    std::vector<long> d_probs_shape = {static_cast<long>(num_tokens), static_cast<long>(num_experts)};
+    Tensor d_probs = mRunState.temp_alloc(d_routing_weights.DType, d_probs_shape);
+    mTemps.push_back(d_probs);
+
+    // TopK backward kernel only supports FP32
+    // If inputs are BF16, cast to FP32 temporaries and cast output back
+    if (probs.DType == ETensorDType::BF16) {
+        // Allocate FP32 temporaries
+        Tensor d_weights_f32 = mRunState.Stack.allocate(ETensorDType::FP32,
+            {static_cast<long>(num_tokens), static_cast<long>(top_k)}, "d_weights_f32");
+        Tensor probs_f32 = mRunState.Stack.allocate(ETensorDType::FP32,
+            {static_cast<long>(num_tokens), static_cast<long>(num_experts)}, "probs_f32");
+        Tensor d_probs_f32 = mRunState.Stack.allocate(ETensorDType::FP32,
+            {static_cast<long>(num_tokens), static_cast<long>(num_experts)}, "d_probs_f32");
+
+        // Cast inputs to FP32
+        convert_dtype(d_weights_f32.get<float>(), d_routing_weights.get<nv_bfloat16>(),
+                      d_routing_weights.nelem(), mRunState.MainStream);
+        convert_dtype(probs_f32.get<float>(), probs.get<nv_bfloat16>(),
+                      probs.nelem(), mRunState.MainStream);
+
+        // Run backward in FP32
+        moe_topk_backward(d_probs_f32.get<float>(),
+                          d_weights_f32.get<float>(),
+                          probs_f32.get<float>(),
+                          expert_indices.get<int>(),
+                          num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+
+        // Cast output back to BF16
+        convert_dtype(d_probs.get<nv_bfloat16>(), d_probs_f32.get<float>(),
+                      d_probs.nelem(), mRunState.MainStream);
+    } else {
+        // FP32 path
+        moe_topk_backward(d_probs.get<float>(),
+                          d_routing_weights.get<float>(),
+                          probs.get<float>(),
+                          expert_indices.get<int>(),
+                          num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_probs;
+}
+
+void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
+    Tensor& d_permuted = resolve_tensor(op.inputs[0]);
+    Tensor& gather_indices_saved = resolve_tensor(op.inputs[1]);  // Saved from forward
+    Tensor& d_input = ensure_output_tensor(op.outputs[0]);
+
+    // Get gather_indices from stored state
+    auto it = mTensorMap.find("moe_gather_indices");
+    Tensor* gather_indices = (it != mTensorMap.end()) ? &it->second : &gather_indices_saved;
+
+    const int top_k = op.attrs.top_k;
+    const int num_tokens = static_cast<int>(d_input.Sizes[0]);
+    const int hidden_size = static_cast<int>(d_input.Sizes[1]);
+    const int total_tokens = num_tokens * top_k;
+
+    if (d_permuted.DType == ETensorDType::BF16) {
+        moe_permute_backward(d_input.get<nv_bfloat16>(),
+                             d_permuted.get<nv_bfloat16>(),
+                             gather_indices->get<int>(),
+                             total_tokens, num_tokens, hidden_size, top_k,
+                             mRunState.MainStream);
+    } else {
+        moe_permute_backward(d_input.get<float>(),
+                             d_permuted.get<float>(),
+                             gather_indices->get<int>(),
+                             total_tokens, num_tokens, hidden_size, top_k,
+                             mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_input;
+}
+
+void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const CompiledOp& op) {
+    Tensor& d_gate_up = resolve_tensor(op.inputs[0]);
+    Tensor& inp = resolve_tensor(op.inputs[1]);
+    Tensor& weights = resolve_tensor(op.inputs[2]);
+    Tensor& d_input = ensure_output_tensor(op.outputs[0]);
+
+    // Get expert offsets from stored state
+    auto it = mTensorMap.find("moe_expert_offsets");
+    if (it == mTensorMap.end()) {
+        throw std::runtime_error("moe_grouped_gemm_gate_up_backward: expert_offsets not found");
+    }
+    Tensor& expert_offsets = it->second;
+
+    // Use the persistent buffer directly instead of tensorMap
+    const int* offsets_ptr = static_cast<const int*>(mMoEExpertOffsetsGPU);
+    (void)offsets_ptr;  // Used by kernel through expert_offsets
+
+    // Synchronize to ensure all previous async ops are done
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+
+    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+
+    if (d_gate_up.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_gate_up_backward(d_input.get<nv_bfloat16>(),
+                                          d_gate_up.get<nv_bfloat16>(),
+                                          weights.get<nv_bfloat16>(),
+                                          expert_offsets.get<int>(),
+                                          num_experts, hidden_size, intermediate_size,
+                                          mRunState.cublas_handle(), mRunState.MainStream);
+    } else {
+        moe_grouped_gemm_gate_up_backward(d_input.get<float>(),
+                                          d_gate_up.get<float>(),
+                                          weights.get<float>(),
+                                          expert_offsets.get<int>(),
+                                          num_experts, hidden_size, intermediate_size,
+                                          mRunState.cublas_handle(), mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_input;
+
+    // Weight gradient computation would go here if needed (for fine-tuning experts)
+}
+
+void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op) {
+    Tensor& d_output = resolve_tensor(op.inputs[0]);
+    Tensor& inp = resolve_tensor(op.inputs[1]);
+    Tensor& weights = resolve_tensor(op.inputs[2]);
+    Tensor& d_input = ensure_output_tensor(op.outputs[0]);
+    (void)inp;  // Used by weight gradient computation if enabled
+
+    // Use persistent expert_offsets buffer directly (survives stack restoration)
+    if (mMoEExpertOffsetsGPU == nullptr) {
+        throw std::runtime_error("moe_grouped_gemm_down_backward: mMoEExpertOffsetsGPU not allocated");
+    }
+    const int* expert_offsets_ptr = static_cast<const int*>(mMoEExpertOffsetsGPU);
+
+    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+
+    if (d_output.DType == ETensorDType::BF16) {
+        moe_grouped_gemm_down_backward(d_input.get<nv_bfloat16>(),
+                                       d_output.get<nv_bfloat16>(),
+                                       weights.get<nv_bfloat16>(),
+                                       expert_offsets_ptr,
+                                       num_experts, hidden_size, intermediate_size,
+                                       mRunState.cublas_handle(), mRunState.MainStream);
+    } else {
+        moe_grouped_gemm_down_backward(d_input.get<float>(),
+                                       d_output.get<float>(),
+                                       weights.get<float>(),
+                                       expert_offsets_ptr,
+                                       num_experts, hidden_size, intermediate_size,
+                                       mRunState.cublas_handle(), mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_input;
+
+    // Weight gradient computation would go here if needed (for fine-tuning experts)
+}
+
+void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
+    Tensor& d_output = resolve_tensor(op.inputs[0]);
+    Tensor& expert_out = resolve_tensor(op.inputs[1]);
+    Tensor& routing_weights = resolve_tensor(op.inputs[2]);
+    Tensor& scatter_indices = resolve_tensor(op.inputs[3]);
+
+    Tensor& d_expert_out = ensure_output_tensor(op.outputs[0]);
+    Tensor& d_routing_weights = ensure_output_tensor(op.outputs[1]);
+
+    const int top_k = op.attrs.top_k;
+    const int num_tokens = static_cast<int>(routing_weights.Sizes[0]);
+    const int total_tokens = num_tokens * top_k;
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+
+    if (d_output.DType == ETensorDType::BF16) {
+        moe_combine_backward(d_expert_out.get<nv_bfloat16>(),
+                             d_routing_weights.get<nv_bfloat16>(),
+                             d_output.get<nv_bfloat16>(),
+                             expert_out.get<nv_bfloat16>(),
+                             routing_weights.get<nv_bfloat16>(),
+                             scatter_indices.get<int>(),
+                             num_tokens, total_tokens, hidden_size, top_k,
+                             mRunState.MainStream);
+    } else {
+        moe_combine_backward(d_expert_out.get<float>(),
+                             d_routing_weights.get<float>(),
+                             d_output.get<float>(),
+                             expert_out.get<float>(),
+                             routing_weights.get<float>(),
+                             scatter_indices.get<int>(),
+                             num_tokens, total_tokens, hidden_size, top_k,
+                             mRunState.MainStream);
+    }
+
+    mTensorMap[op.outputs[0].name] = d_expert_out;
+    mTensorMap[op.outputs[1].name] = d_routing_weights;
+}
+
 void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
@@ -4287,6 +4773,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
             // Skip tensors that are needed for backward (in save list)
             if (mSaveSet.count(it->first) > 0) {
+                ++it;
+                continue;
+            }
+            // Skip MoE expert_offsets - needed for backward but not in autodiff save list
+            if (mConfig.NumExperts > 0 && (it->first == "moe_expert_offsets" || it->first == "moe_gather_indices")) {
                 ++it;
                 continue;
             }
@@ -4364,6 +4855,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::SwiGLU:
                     dispatch_swiglu(op);
                     break;
+                case CompiledOpType::Silu:
+                    dispatch_silu(op);
+                    break;
+                case CompiledOpType::Mul:
+                    dispatch_mul(op);
+                    break;
                 case CompiledOpType::MatmulSwiGLU:
                     dispatch_matmul_swiglu(op);
                     break;
@@ -4382,6 +4879,28 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::FusedLMHeadLoss:
                     dispatch_fused_lm_head_loss(op);
                     break;
+                // MoE operations
+                case CompiledOpType::MoESoftmax:
+                    dispatch_moe_softmax(op);
+                    break;
+                case CompiledOpType::MoESigmoid:
+                    dispatch_moe_sigmoid(op);
+                    break;
+                case CompiledOpType::MoETopK:
+                    dispatch_moe_topk(op);
+                    break;
+                case CompiledOpType::MoEPermute:
+                    dispatch_moe_permute(op);
+                    break;
+                case CompiledOpType::MoEGroupedGemmGateUp:
+                    dispatch_moe_grouped_gemm_gate_up(op);
+                    break;
+                case CompiledOpType::MoEGroupedGemmDown:
+                    dispatch_moe_grouped_gemm_down(op);
+                    break;
+                case CompiledOpType::MoEUnpermute:
+                    dispatch_moe_unpermute(op);
+                    break;
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
             }
@@ -4397,7 +4916,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // Note: Forward activation stats are not printed because with recompute_block=true,
             // the activation buffers are shared across layers, so they only contain the last
             // layer's data at this point, not the per-layer values.
-            if (op.layer_end < num_layers &&
+            // For MoE models, skip stack restore to preserve saved tensors for backward.
+            // MoE backward needs each layer's intermediate tensors (routing_weights, scatter_indices, etc.)
+            // and cannot recompute them. Without this, the saved tensors point to reused/stale memory.
+            // TODO: Implement proper tensor copying for MoE saved tensors to reduce memory usage.
+            if (mConfig.NumExperts == 0 && op.layer_end < num_layers &&
                 layer_active[static_cast<std::size_t>(op.layer_end)]) {
                 mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
                 if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
@@ -4469,8 +4992,57 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             fill_zero(grads.d_ln1, mRunState.MainStream);
         }
     };
-    auto prune_stack_tensors = [&]() {
+    auto prune_stack_tensors = [&](int current_layer) {
         for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
+            // Skip MoE expert_offsets - needed throughout backward for grouped GEMM ops
+            if (mConfig.NumExperts > 0 && it->first == "moe_expert_offsets") {
+                ++it;
+                continue;
+            }
+            // Skip cross-layer gradients - these are needed by the previous layer's backward
+            // Cross-layer gradients have names like "d_blocks[N].XXX" where N < current_layer
+            // They flow from one layer's backward to the previous layer's backward
+            if (current_layer >= 0 && it->first.rfind("d_blocks[", 0) == 0) {
+                // Parse the layer index from the gradient name
+                auto bracket_pos = it->first.find('[');
+                auto close_pos = it->first.find(']');
+                if (bracket_pos != std::string::npos && close_pos != std::string::npos) {
+                    std::string layer_str = it->first.substr(bracket_pos + 1, close_pos - bracket_pos - 1);
+                    try {
+                        int grad_layer = std::stoi(layer_str);
+                        // Preserve gradients for layers below the current one (they'll be needed)
+                        if (grad_layer < current_layer) {
+                            ++it;
+                            continue;
+                        }
+                    } catch (...) {
+                        // If parsing fails, skip this tensor to be safe
+                        ++it;
+                        continue;
+                    }
+                }
+            }
+            // Skip saved tensors for layers below current (needed for their backward)
+            // Saved tensors have names like "blocks[N].XXX" where N < current_layer
+            if (current_layer >= 0 && it->first.rfind("blocks[", 0) == 0) {
+                auto bracket_pos = it->first.find('[');
+                auto close_pos = it->first.find(']');
+                if (bracket_pos != std::string::npos && close_pos != std::string::npos) {
+                    std::string layer_str = it->first.substr(bracket_pos + 1, close_pos - bracket_pos - 1);
+                    try {
+                        int saved_layer = std::stoi(layer_str);
+                        // Preserve saved tensors for layers below the current one
+                        if (saved_layer < current_layer) {
+                            ++it;
+                            continue;
+                        }
+                    } catch (...) {
+                        // If parsing fails, skip this tensor to be safe
+                        ++it;
+                        continue;
+                    }
+                }
+            }
             if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
                 !mRunState.Stack.is_live(it->second.Data)) {
                 it = mTensorMap.erase(it);
@@ -4524,6 +5096,39 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             mTensorMap[grad_name] = mRunState.non_block_gradients().d_embeddings;
         }
 
+    }
+
+    // Restore MoE expert_offsets from persistent CPU storage
+    // This is needed by grouped GEMM backward ops for proper token routing
+    if (mConfig.NumExperts > 0 && !mMoEExpertOffsetsData.empty()) {
+        // Allocate PERSISTENT GPU buffer for expert_offsets (not stack-allocated)
+        // This ensures the memory won't be invalidated by stack restores or temp_free calls
+        const int num_elements = static_cast<int>(mMoEExpertOffsetsData.size());
+        const size_t needed_bytes = num_elements * sizeof(int);
+
+        // Allocate or resize GPU buffer if needed
+        if (mMoEExpertOffsetsGPU == nullptr || mMoEExpertOffsetsGPUSize < needed_bytes) {
+            if (mMoEExpertOffsetsGPU) {
+                CUDA_CHECK(cudaFree(mMoEExpertOffsetsGPU));
+            }
+            CUDA_CHECK(cudaMalloc(&mMoEExpertOffsetsGPU, needed_bytes));
+            mMoEExpertOffsetsGPUSize = needed_bytes;
+        }
+
+        // Copy data from CPU to GPU
+        CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsGPU, mMoEExpertOffsetsData.data(),
+                                   needed_bytes, cudaMemcpyHostToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+
+        // Create tensor wrapper pointing to persistent buffer
+        Tensor expert_offsets;
+        expert_offsets.DType = ETensorDType::INT32;
+        expert_offsets.Rank = 1;
+        expert_offsets.Sizes[0] = num_elements;
+        expert_offsets.Data = static_cast<std::byte*>(mMoEExpertOffsetsGPU);
+
+        mTensorMap["moe_expert_offsets"] = expert_offsets;
+        // Note: NOT adding to mTemps since this is persistent memory managed separately
     }
 
     // Also bind standard inputs that backward ops may reference
@@ -4674,19 +5279,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    // Debug logging for recompute diagnosis
-    static bool debug_recompute = env_enabled("SUROGATE_DEBUG_RECOMPUTE");
-    static int debug_step = 0;
-    int prev_layer_idx_debug = -1;
-    int layer_switches = 0;
-
-    if (debug_recompute) {
-        std::fprintf(stderr, "\n[RECOMPUTE DEBUG] === Backward pass step %d ===\n", debug_step);
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] recompute_enabled=%d, num_ops=%zu, num_layers=%d\n",
-                     mRecomputeEnabled ? 1 : 0, graph.ops.size(), num_layers);
-        ++debug_step;
-    }
-
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
@@ -4700,10 +5292,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                    if (debug_recompute) {
-                        std::fprintf(stderr, "[RECOMPUTE DEBUG] op[%zu] layer_start=%d triggers recompute (prev=%d)\n",
-                                     idx, layer_idx, mLastRecomputeLayer);
-                    }
                     if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
                         clear_shared_grads(layer_idx);
                         layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
@@ -4724,11 +5312,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             //   for layer N's late ops if we had already visited layer N earlier, causing
             //   those ops to read stale data from whatever layer was recomputed last
             if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                if (debug_recompute) {
-                    std::fprintf(stderr, "[RECOMPUTE DEBUG] op[%zu] %s (op_layer=%d) triggers recompute (prev=%d) [INTERLEAVE]\n",
-                                 idx, op_type_to_string(op.type), layer_idx, mLastRecomputeLayer);
-                    ++layer_switches;
-                }
                 if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
                     clear_shared_grads(layer_idx);
                     layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
@@ -4736,26 +5319,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
                 mLastRecomputeLayer = layer_idx;
             }
-        }
-
-        // Debug: log each op's layer assignment
-        if (debug_recompute) {
-            const int layer_any = op_layer_idx_any(op);
-            const int layer_non_grad = op_layer_idx(op);
-            if (layer_any != prev_layer_idx_debug || op.layer_start >= 0 || op.layer_end >= 0) {
-                std::fprintf(stderr, "[RECOMPUTE DEBUG] op[%zu] %s layer_any=%d layer_non_grad=%d layer_start=%d layer_end=%d id=%s\n",
-                             idx, op_type_to_string(op.type), layer_any, layer_non_grad,
-                             op.layer_start, op.layer_end, op.op_id.c_str());
-                prev_layer_idx_debug = layer_any;
-            }
-        }
-
-        // Debug: trace operation order and layers for gradient tracking
-        static bool debug_grad_norms = env_enabled("SUROGATE_DEBUG_GRAD_NORMS");
-        if (debug_grad_norms) {
-            const int layer_idx = op_layer_idx_any(op);
-            std::fprintf(stderr, "[OP TRACE] idx=%zu type=%s layer=%d id=%s\n",
-                         idx, op_type_to_string(op.type), layer_idx, op.op_id.c_str());
         }
 
         try {
@@ -4790,6 +5353,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::SwiGLUBackward:
                     dispatch_swiglu_backward(op);
+                    break;
+                case CompiledOpType::SiluBackward:
+                    dispatch_silu_backward(op);
+                    break;
+                case CompiledOpType::MulBackward:
+                    dispatch_mul_backward(op);
                     break;
                 case CompiledOpType::MatmulSwiGLUBackward:
                     dispatch_matmul_swiglu_backward(op, hook);
@@ -4828,6 +5397,42 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     dispatch_zeros_backward(op);
                     break;
 
+                // MoE backward operations
+                case CompiledOpType::MoESoftmaxBackward:
+                    dispatch_moe_softmax_backward(op);
+                    break;
+                case CompiledOpType::MoESigmoidBackward:
+                    dispatch_moe_sigmoid_backward(op);
+                    break;
+                case CompiledOpType::MoETopKBackward:
+                    dispatch_moe_topk_backward(op);
+                    break;
+                case CompiledOpType::MoEPermuteBackward:
+                    dispatch_moe_permute_backward(op);
+                    break;
+                case CompiledOpType::MoEGroupedGemmGateUpBackward:
+                    dispatch_moe_grouped_gemm_gate_up_backward(op);
+                    break;
+                case CompiledOpType::MoEGroupedGemmDownBackward:
+                    dispatch_moe_grouped_gemm_down_backward(op);
+                    break;
+                case CompiledOpType::MoEUnpermuteBackward:
+                    dispatch_moe_unpermute_backward(op);
+                    break;
+
+                // MoE forward ops that may appear in backward graph
+                case CompiledOpType::MoESoftmax:
+                case CompiledOpType::MoESigmoid:
+                case CompiledOpType::MoETopK:
+                case CompiledOpType::MoEPermute:
+                case CompiledOpType::MoEGroupedGemmGateUp:
+                case CompiledOpType::MoEGroupedGemmDown:
+                case CompiledOpType::MoEUnpermute:
+                case CompiledOpType::Silu:
+                case CompiledOpType::Mul:
+                    // These forward MoE ops may appear in backward graph due to autodiff
+                    throw std::runtime_error("CompiledExecutor: MoE forward op in backward graph not yet supported");
+
                 default: {
                     std::ostringstream oss;
                     oss << "CompiledExecutor: unsupported backward op type at idx " << idx
@@ -4839,18 +5444,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // Memory management - restore stack checkpoint periodically to free temporaries
             // This prevents memory accumulation during backward pass
             // Option 1: At layer boundaries if annotated
-            if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
-                // Debug: log layer completion
-                static bool debug_fft_layers = env_enabled("SUROGATE_DEBUG_FFT_RECOMPUTE");
-                if (debug_fft_layers) {
-                    std::fprintf(stderr, "[FFT BWD] Layer %d backward complete, restoring stack checkpoint\n",
-                                 op.layer_end);
-                }
-
+            // TEMPORARILY DISABLED for MoE models due to tensor corruption issues
+            // TODO: Fix proper tensor lifetime tracking for MoE backward
+            if (mConfig.NumExperts == 0 && op.layer_end >= 0 && op.layer_end != last_layer_restored) {
                 // Restore stack and clear temps
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
-                prune_stack_tensors();
+                prune_stack_tensors(op.layer_end);
                 // Note: cudnn_workspace is persistently allocated, no need to clear
                 // Clear stack-allocated tensor pointers in simplified_acts/grads for this layer.
                 // These pointers become stale after checkpoint restore.
@@ -4897,15 +5497,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     }
 
-    // Debug summary
-    if (debug_recompute) {
-        std::fprintf(stderr, "[RECOMPUTE DEBUG] === Backward pass complete: %d interleaved layer switches ===\n\n",
-                     layer_switches);
-    }
-
-    // Final cleanup
+    // Final cleanup - pass -1 to allow full pruning (backward complete)
     mRunState.Stack.restore(initial_checkpoint);
-    prune_stack_tensors();
+    prune_stack_tensors(-1);
     mTemps.clear();
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {

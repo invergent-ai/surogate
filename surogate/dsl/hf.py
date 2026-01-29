@@ -95,6 +95,38 @@ class TiedToMapping:
         return f'tied_to("{self.target}")'
 
 
+@dataclass(frozen=True)
+class StackExpertsMapping:
+    """Specification to stack per-expert HF tensors into a batched format.
+
+    Used for MoE models where HuggingFace stores expert weights individually:
+        model.layers.0.mlp.experts.0.down_proj.weight
+        model.layers.0.mlp.experts.1.down_proj.weight
+        ...
+
+    This mapping stacks them into a single tensor of shape [num_experts, ...].
+
+    Example:
+        stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+            num_experts=64
+        )
+
+        # Or auto-detect num_experts from config:
+        stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+        )
+    """
+    pattern: str  # Pattern with {expert} placeholder
+    num_experts: int = 0  # 0 = auto-detect from model config
+    fuse_gate_up: bool = False  # If True, fuse gate_proj and up_proj into gate_up
+
+    def __repr__(self) -> str:
+        if self.num_experts > 0:
+            return f'stack_experts("{self.pattern}", num_experts={self.num_experts})'
+        return f'stack_experts("{self.pattern}")'
+
+
 def fuse(*sources: str, dim: int = 0) -> FuseMapping:
     """Create a fuse mapping to combine multiple HF tensors.
 
@@ -179,13 +211,51 @@ def tied_to(target: str) -> TiedToMapping:
     return TiedToMapping(target=target)
 
 
+def stack_experts(
+    pattern: str,
+    *,
+    num_experts: int = 0,
+    fuse_gate_up: bool = False,
+) -> StackExpertsMapping:
+    """Create a mapping to stack per-expert HF tensors into batched format.
+
+    For MoE models where HuggingFace stores expert weights individually,
+    this loads and stacks them into a single tensor of shape [num_experts, ...].
+
+    Args:
+        pattern: HF checkpoint path pattern with {expert} placeholder
+        num_experts: Number of experts to stack (0 = auto-detect from model config)
+        fuse_gate_up: If True, pattern should be for gate_proj and this will
+                      also load up_proj and fuse them into gate_up format
+
+    Example:
+        # Stack individual expert down projections into batched tensor
+        experts_down=stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+            num_experts=64
+        )
+
+        # Auto-detect num_experts from config
+        experts_down=stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+        )
+
+        # Stack and fuse gate+up projections into batched gate_up tensor
+        experts_gate_up=stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+            fuse_gate_up=True
+        )
+    """
+    return StackExpertsMapping(pattern=pattern, num_experts=num_experts, fuse_gate_up=fuse_gate_up)
+
+
 # Type alias for any HF mapping spec
-HFMappingValue = str | FuseMapping | SplitMapping | TransformMapping | TiedToMapping
+HFMappingValue = str | FuseMapping | SplitMapping | TransformMapping | TiedToMapping | StackExpertsMapping
 
 
 def is_hf_mapping_spec(value: Any) -> bool:
     """Check if a value is an HF mapping specification."""
-    return isinstance(value, (str, FuseMapping, SplitMapping, TransformMapping, TiedToMapping))
+    return isinstance(value, (str, FuseMapping, SplitMapping, TransformMapping, TiedToMapping, StackExpertsMapping))
 
 
 def mapping_to_dict(mapping: HFMappingValue) -> dict[str, Any]:
@@ -200,5 +270,12 @@ def mapping_to_dict(mapping: HFMappingValue) -> dict[str, Any]:
         return {"kind": "transform", "source": mapping.source, "fn": mapping.fn}
     elif isinstance(mapping, TiedToMapping):
         return {"kind": "tied_to", "target": mapping.target}
+    elif isinstance(mapping, StackExpertsMapping):
+        return {
+            "kind": "stack_experts",
+            "pattern": mapping.pattern,
+            "num_experts": mapping.num_experts,
+            "fuse_gate_up": mapping.fuse_gate_up,
+        }
     else:
         raise TypeError(f"Unknown mapping type: {type(mapping)}")

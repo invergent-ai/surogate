@@ -101,6 +101,28 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     if (head_size && Hq > 0 && Hkv > 0) {
         env.values.emplace("QKV", (Hq + 2 * Hkv) * (*head_size));
     }
+
+    // MoE dimensions
+    auto num_experts = get_long("num_experts");
+    auto num_experts_per_tok = get_long("num_experts_per_tok");
+    if (!num_experts_per_tok) num_experts_per_tok = get_long("num_selected_experts");
+    auto shared_expert_intermediate = get_long("shared_expert_intermediate");
+    if (!shared_expert_intermediate) shared_expert_intermediate = get_long("shared_expert_intermediate_size");
+
+    if (num_experts) {
+        env.values.emplace("E", *num_experts);
+    }
+    if (num_experts_per_tok) {
+        env.values.emplace("K", *num_experts_per_tok);
+    }
+    if (shared_expert_intermediate && *shared_expert_intermediate > 0) {
+        env.values.emplace("SharedM", *shared_expert_intermediate);
+        env.values.emplace("SharedMUp", 2 * (*shared_expert_intermediate));
+    } else if (d_ff) {
+        // Default shared expert size to regular intermediate size if not specified
+        env.values.emplace("SharedM", *d_ff);
+        env.values.emplace("SharedMUp", 2 * (*d_ff));
+    }
 }
 
 } // namespace

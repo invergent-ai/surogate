@@ -755,6 +755,197 @@ std::vector<Operation> fused_lm_head_loss_backward(const BackwardRuleContext& ct
     return ops;
 }
 
+// -----------------------------------------------------------------------------
+// MoE Sigmoid backward rule
+// Forward: probs = moe_sigmoid(logits)
+// Backward: d_logits = d_probs * probs * (1 - probs)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_sigmoid_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string out = fwd.outputs.empty() ? "out" : fwd.outputs[0];
+
+        ops.push_back(make_operation(
+            "moe_sigmoid_backward_" + std::to_string(ctx.op_counter++),
+            "moe_sigmoid_backward",
+            "moe_sigmoid_backward",
+            {ctx.d_output, saved_ref(out)},
+            {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE Softmax backward rule
+// Forward: probs = moe_softmax(logits)
+// Backward: d_logits = softmax_backward(d_probs, probs)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_softmax_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string out = fwd.outputs.empty() ? "out" : fwd.outputs[0];
+
+        ops.push_back(make_operation(
+            "moe_softmax_backward_" + std::to_string(ctx.op_counter++),
+            "moe_softmax_backward",
+            "moe_softmax_backward",
+            {ctx.d_output, saved_ref(out)},
+            {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE TopK backward rule
+// Forward: weights, indices = moe_topk(probs, top_k, normalize)
+// Backward: d_probs = scatter d_weights to positions indicated by indices
+// Note: indices is not differentiable (discrete selection)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_topk_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string probs = fwd.inputs[0];
+        std::string indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "indices";
+
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize"});
+
+        ops.push_back(make_operation(
+            "moe_topk_backward_" + std::to_string(ctx.op_counter++),
+            "moe_topk_backward",
+            "moe_topk_backward",
+            {ctx.d_outputs[0], saved_ref(probs), saved_ref(indices)},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE Permute backward rule
+// Forward: permuted, scatter_indices = moe_permute(x, routing_indices, top_k)
+// Backward: d_x = moe_permute_backward(d_permuted, scatter_indices)
+// Note: routing_indices is not differentiable
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_permute_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string scatter_indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "scatter_indices";
+
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k"});
+
+        ops.push_back(make_operation(
+            "moe_permute_backward_" + std::to_string(ctx.op_counter++),
+            "moe_permute_backward",
+            "moe_permute_backward",
+            {ctx.d_outputs[0], saved_ref(scatter_indices)},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE Grouped GEMM Gate+Up backward rule
+// Forward: out = moe_grouped_gemm_gate_up(inp, weights, scatter_indices)
+// Backward: d_inp = moe_grouped_gemm_gate_up_backward(d_out, inp, weights, scatter_indices)
+// Note: weights gradient is computed but not propagated (frozen expert weights)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_grouped_gemm_gate_up_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string inp = fwd.inputs[0];
+        std::string weights = fwd.inputs[1];
+        std::string scatter_indices = fwd.inputs[2];
+
+        std::string inp_ref = ctx.is_param(inp) ? inp : saved_ref(inp);
+        std::string weights_ref = ctx.is_param(weights) ? weights : saved_ref(weights);
+        std::string scatter_ref = saved_ref(scatter_indices);
+
+        ops.push_back(make_operation(
+            "moe_grouped_gemm_gate_up_backward_" + std::to_string(ctx.op_counter++),
+            "moe_grouped_gemm_gate_up_backward",
+            "moe_grouped_gemm_gate_up_backward",
+            {ctx.d_output, inp_ref, weights_ref, scatter_ref},
+            {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE Grouped GEMM Down backward rule
+// Forward: out = moe_grouped_gemm_down(inp, weights, scatter_indices)
+// Backward: d_inp = moe_grouped_gemm_down_backward(d_out, inp, weights, scatter_indices)
+// Note: weights gradient is computed but not propagated (frozen expert weights)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_grouped_gemm_down_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string inp = fwd.inputs[0];
+        std::string weights = fwd.inputs[1];
+        std::string scatter_indices = fwd.inputs[2];
+
+        std::string inp_ref = ctx.is_param(inp) ? inp : saved_ref(inp);
+        std::string weights_ref = ctx.is_param(weights) ? weights : saved_ref(weights);
+        std::string scatter_ref = saved_ref(scatter_indices);
+
+        ops.push_back(make_operation(
+            "moe_grouped_gemm_down_backward_" + std::to_string(ctx.op_counter++),
+            "moe_grouped_gemm_down_backward",
+            "moe_grouped_gemm_down_backward",
+            {ctx.d_output, inp_ref, weights_ref, scatter_ref},
+            {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE Unpermute backward rule
+// Forward: out = moe_unpermute(expert_out, routing_weights, scatter_indices, top_k)
+// Backward: d_expert_out, d_routing_weights = moe_unpermute_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_unpermute_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string expert_out = fwd.inputs[0];
+    std::string routing_weights = fwd.inputs[1];
+    std::string scatter_indices = fwd.inputs[2];
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // d_expert_out
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // d_routing_weights
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"top_k"});
+
+    ops.push_back(make_operation(
+        "moe_unpermute_backward_" + std::to_string(ctx.op_counter++),
+        "moe_unpermute_backward",
+        "moe_unpermute_backward",
+        {ctx.d_output, saved_ref(expert_out), saved_ref(routing_weights), saved_ref(scatter_indices)},
+        outputs,
+        attrs));
+
+    return ops;
+}
+
 } // anonymous namespace
 
 // -----------------------------------------------------------------------------
@@ -805,6 +996,15 @@ void register_builtin_backward_rules() {
     reg.register_rule("cross_entropy_loss", cross_entropy_backward);
     reg.register_rule("fused_lm_head_loss", fused_lm_head_loss_backward);
     reg.register_rule("lm_head_loss", fused_lm_head_loss_backward);
+
+    // MoE ops
+    reg.register_rule("moe_sigmoid", moe_sigmoid_backward);
+    reg.register_rule("moe_softmax", moe_softmax_backward);
+    reg.register_rule("moe_topk", moe_topk_backward);
+    reg.register_rule("moe_permute", moe_permute_backward);
+    reg.register_rule("moe_grouped_gemm_gate_up", moe_grouped_gemm_gate_up_backward);
+    reg.register_rule("moe_grouped_gemm_down", moe_grouped_gemm_down_backward);
+    reg.register_rule("moe_unpermute", moe_unpermute_backward);
 
     // Compound ops (handled as units)
     reg.register_rule("StackedBlocks", stacked_blocks_backward);

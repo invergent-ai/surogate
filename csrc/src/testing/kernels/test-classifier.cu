@@ -260,7 +260,7 @@ TEST_CASE("chunked cross-entropy fp32 large vocab (V=128K)", "[kernels][classifi
                                    thrust::raw_pointer_cast(d_logsumexp.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                   BT, V, P, /*stream=*/0);
+                                                                      BT, V, P, /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses = from_device(d_losses);
@@ -323,7 +323,7 @@ TEST_CASE("chunked cross-entropy fp32 very large vocab (V=256K)", "[kernels][cla
                                    thrust::raw_pointer_cast(d_logsumexp.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                   BT, V, P, /*stream=*/0);
+                                                                      BT, V, P, /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses = from_device(d_losses);
@@ -388,7 +388,7 @@ TEST_CASE("chunked cross-entropy bf16 large vocab", "[kernels][classifier][chunk
                                    thrust::raw_pointer_cast(d_logsumexp.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                   BT, V, P, /*stream=*/0);
+                                                                      BT, V, P, /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses = from_device(d_losses);
@@ -454,7 +454,7 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                  thrust::raw_pointer_cast(d_logsumexp_fused.data()),
                                  thrust::raw_pointer_cast(d_dloss.data()),
                                  thrust::raw_pointer_cast(d_targets.data()),
-                                 BT, V, P, /*stream=*/0);
+                                                                  BT, V, P, /*stream=*/0);
 
     thrust::device_vector<float> d_logits_chunked = to_device(h_logits);
     thrust::device_vector<float> d_losses_chunked(BT, 0.0f);
@@ -477,7 +477,7 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                    thrust::raw_pointer_cast(d_logsumexp_chunked.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                   BT, V, P, /*stream=*/0);
+                                                                      BT, V, P, /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses_fused = from_device(d_losses_fused);

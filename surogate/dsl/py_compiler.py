@@ -23,7 +23,7 @@ from .specs import (
     HFTransformSpec,
 )
 from .graph_builder import GraphBuilder, GraphNode, GraphRef
-from .hf import FuseMapping, SplitMapping, TransformMapping
+from .hf import FuseMapping, SplitMapping, TransformMapping, StackExpertsMapping
 from .dim import Dim, DimExpr, ConcreteDimValue, dim_to_ir
 
 if TYPE_CHECKING:
@@ -249,6 +249,16 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["dim"] = spec.dim
         if spec.fn:
             payload["fn"] = spec.fn
+        return payload
+    if isinstance(spec, StackExpertsMapping):
+        payload = {
+            "type": "stack_experts",
+            "pattern": spec.pattern,
+        }
+        if spec.num_experts > 0:
+            payload["num_experts"] = spec.num_experts
+        if spec.fuse_gate_up:
+            payload["fuse_gate_up"] = spec.fuse_gate_up
         return payload
     return str(spec)
 

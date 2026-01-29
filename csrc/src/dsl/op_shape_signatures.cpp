@@ -755,18 +755,9 @@ void register_builtin_shape_signatures() {
             }
 
             // q_rstd/k_rstd can be flattened [B*T*H], [B*T, H], or [B, T, H]
-            if (q_rstd.empty()) {
-                ShapeValidationError err;
-                err.message = "qkv_qk_norm_rope: q_rstd shape is empty";
-                return std::make_optional(err);
-            }
-            if (k_rstd.empty()) {
-                ShapeValidationError err;
-                err.message = "qkv_qk_norm_rope: k_rstd shape is empty";
-                return std::make_optional(err);
-            }
+            // Skip validation if shapes weren't inferred (empty means "unknown")
             const auto rstd_rank_ok = [](const std::vector<long>& s) {
-                return s.size() == 1 || s.size() == 2 || s.size() == 3;
+                return s.empty() || s.size() == 1 || s.size() == 2 || s.size() == 3;
             };
             if (!rstd_rank_ok(q_rstd)) {
                 ShapeValidationError err;
@@ -845,17 +836,33 @@ void register_builtin_shape_signatures() {
             const auto& out = outputs[0];
             const auto& lse = outputs[1];
 
-            // Check qkv rank = 3
-            if (auto err = validators::check_rank(qkv, 3, "qkv", "flash_attention")) {
-                return err;
+            // Check qkv rank = 3 or 4 (DSL uses rank 4: [B, T, H, D])
+            if (qkv.size() < 3 || qkv.size() > 4) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "flash_attention: qkv has rank " << qkv.size() << " but expected 3 or 4";
+                err.message = oss.str();
+                return std::make_optional(err);
             }
 
-            // Check output rank = 3
-            if (auto err = validators::check_rank(out, 3, "out", "flash_attention")) {
-                return err;
+            // Skip output shape checks if output shapes are unknown (empty)
+            // FlashAttention output shape cannot be easily inferred from input
+            // since input is [B, T, Hq+2*Hkv, D] but output is [B, T, Hq, D]
+            if (out.empty()) {
+                return std::optional<ShapeValidationError>();  // Skip validation
             }
 
-            // Check first two dimensions match
+            // Check output rank matches qkv rank (when known)
+            if (out.size() != qkv.size()) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "flash_attention: out has rank " << out.size()
+                    << " but expected " << qkv.size() << " (same as qkv)";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+
+            // Check first two dimensions match (B, T)
             if (qkv.size() >= 2 && out.size() >= 2) {
                 if (qkv[0] != out[0] || qkv[1] != out[1]) {
                     ShapeValidationError err;
@@ -1606,6 +1613,291 @@ void register_builtin_shape_signatures() {
                 return std::make_optional(err);
             }
 
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Sigmoid: probs = moe_sigmoid(logits)
+    // Input: [num_tokens, num_experts], Output: [num_tokens, num_experts]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_sigmoid";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.empty() || outputs.empty()) {
+                return std::make_optional(ShapeValidationError{"moe_sigmoid: missing inputs/outputs"});
+            }
+            // Output should have same shape as input
+            if (inputs[0] != outputs[0]) {
+                ShapeValidationError err;
+                err.message = "moe_sigmoid: output shape must match input shape";
+                return std::make_optional(err);
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Softmax: probs = moe_softmax(logits)
+    // Input: [num_tokens, num_experts], Output: [num_tokens, num_experts]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_softmax";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.empty() || outputs.empty()) {
+                return std::make_optional(ShapeValidationError{"moe_softmax: missing inputs/outputs"});
+            }
+            if (inputs[0] != outputs[0]) {
+                ShapeValidationError err;
+                err.message = "moe_softmax: output shape must match input shape";
+                return std::make_optional(err);
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE TopK: (weights, indices) = moe_topk(probs, top_k)
+    // Input: [num_tokens, num_experts]
+    // Output[0]: weights [num_tokens, top_k]
+    // Output[1]: indices [num_tokens, top_k]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_topk";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 2;
+        sig.max_outputs = 2;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap& attrs, const ShapeEnv&) {
+            if (inputs.empty() || outputs.size() < 2) {
+                return std::make_optional(ShapeValidationError{"moe_topk: requires 1 input, 2 outputs"});
+            }
+            const auto& probs = inputs[0];
+            const auto& weights = outputs[0];
+            const auto& indices = outputs[1];
+
+            if (probs.size() != 2) {
+                return std::make_optional(ShapeValidationError{"moe_topk: probs must be 2D [num_tokens, num_experts]"});
+            }
+
+            // Get top_k from attrs
+            int top_k = 2;  // default
+            auto it = attrs.find("top_k");
+            if (it != attrs.end()) {
+                if (auto* v = std::get_if<long>(&it->second.value)) {
+                    top_k = static_cast<int>(*v);
+                }
+            }
+
+            // Check output shapes
+            if (!weights.empty()) {
+                if (weights.size() != 2 || weights[0] != probs[0] || weights[1] != top_k) {
+                    std::ostringstream oss;
+                    oss << "moe_topk: weights shape mismatch, expected [" << probs[0] << ", " << top_k << "]";
+                    return std::make_optional(ShapeValidationError{oss.str()});
+                }
+            }
+            if (!indices.empty()) {
+                if (indices.size() != 2 || indices[0] != probs[0] || indices[1] != top_k) {
+                    std::ostringstream oss;
+                    oss << "moe_topk: indices shape mismatch, expected [" << probs[0] << ", " << top_k << "]";
+                    return std::make_optional(ShapeValidationError{oss.str()});
+                }
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Permute: (permuted, scatter_indices) = moe_permute(x, routing_indices)
+    // Input[0]: x [num_tokens, hidden_size]
+    // Input[1]: routing_indices [num_tokens, top_k]
+    // Output[0]: permuted [num_tokens * top_k, hidden_size]
+    // Output[1]: scatter_indices [num_tokens * top_k]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_permute";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 2;
+        sig.max_outputs = 2;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap& attrs, const ShapeEnv&) {
+            if (inputs.size() < 2 || outputs.size() < 2) {
+                return std::make_optional(ShapeValidationError{"moe_permute: requires 2 inputs, 2 outputs"});
+            }
+            // Shape validation is complex due to dynamic routing; accept for now
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Grouped GEMM Gate+Up
+    // Input[0]: x [total_tokens, hidden_size]
+    // Input[1]: weights [num_experts, 2*intermediate, hidden_size]
+    // Input[2]: scatter_indices
+    // Output: [total_tokens, 2*intermediate]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_grouped_gemm_gate_up";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            // Complex grouped GEMM shapes; accept for now
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Grouped GEMM Down
+    // Input[0]: x [total_tokens, intermediate]
+    // Input[1]: weights [num_experts, hidden_size, intermediate]
+    // Input[2]: scatter_indices
+    // Output: [total_tokens, hidden_size]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_grouped_gemm_down";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            // Complex grouped GEMM shapes; accept for now
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Unpermute: out = moe_unpermute(expert_out, routing_weights, scatter_indices)
+    // Input[0]: expert_out [total_tokens, hidden_size]
+    // Input[1]: routing_weights [num_tokens, top_k]
+    // Input[2]: scatter_indices [total_tokens]
+    // Output: [num_tokens, hidden_size]
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_unpermute";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            // Dynamic routing shapes; accept for now
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE backward operations (accept all - shapes match forward counterparts)
+    // ------------------------------------------------------------------------
+    {
+        // moe_sigmoid_backward
+        OpShapeSignature sig;
+        sig.op_name = "moe_sigmoid_backward";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_softmax_backward";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_topk_backward";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_permute_backward";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_grouped_gemm_gate_up_backward";
+        sig.min_inputs = 4;
+        sig.max_inputs = 4;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_grouped_gemm_down_backward";
+        sig.min_inputs = 4;
+        sig.max_inputs = 4;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_unpermute_backward";
+        sig.min_inputs = 4;
+        sig.max_inputs = 4;
+        sig.min_outputs = 2;
+        sig.max_outputs = 2;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
             return std::optional<ShapeValidationError>();
         };
         reg.register_signature(sig);

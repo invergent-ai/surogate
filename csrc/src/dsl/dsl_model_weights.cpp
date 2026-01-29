@@ -6,6 +6,7 @@
 #include "dsl/dsl_model.h"
 
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <string_view>
 
@@ -112,6 +113,18 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
             if (mQLoRAConfig.moe_shared_expert_intermediate_size == 0 && moe.use_shared_expert) {
                 mQLoRAConfig.moe_shared_expert_intermediate_size = moe.shared_expert_size;
+            }
+        } else if (mModelConfig.NumExperts > 0) {
+            // Fallback: use ModelConfig fields directly when moe_config is not set
+            // This can happen if the PretrainedConfig wasn't dynamically cast to Qwen3MoEConfig
+            if (mQLoRAConfig.num_experts == 0) {
+                mQLoRAConfig.num_experts = mModelConfig.NumExperts;
+            }
+            if (mQLoRAConfig.num_experts_per_tok == 0) {
+                mQLoRAConfig.num_experts_per_tok = mModelConfig.NumExpertsPerTok;
+            }
+            if (mQLoRAConfig.moe_intermediate_size == 0) {
+                mQLoRAConfig.moe_intermediate_size = mModelConfig.MoeIntermediateSize;
             }
         }
 
@@ -341,6 +354,111 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                                            cudaMemcpyDeviceToDevice, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
+            continue;
+        }
+
+        if (spec->kind == MappingSpec::Kind::StackExperts) {
+            // Stack per-expert HF tensors into batched format [num_experts, ...]
+            // The pattern has {expert} placeholder that we replace for each expert.
+            if (spec->source.empty()) {
+                throw std::runtime_error("DSL model: stack_experts missing pattern for " + name);
+            }
+
+            // Get number of experts from spec or config
+            int num_experts = spec->num_experts;
+            if (num_experts <= 0 && mModelConfig.moe_config.has_value()) {
+                num_experts = mModelConfig.moe_config->num_experts;
+            }
+            if (num_experts <= 0) {
+                num_experts = mModelConfig.NumExperts;
+            }
+            if (num_experts <= 0) {
+                throw std::runtime_error("DSL model: stack_experts cannot determine num_experts for " + name);
+            }
+
+            // param shape is [num_experts, ...] for batched format
+            // Each expert tensor has shape [...]
+            if (param.Rank < 1 || param.Sizes[0] < num_experts) {
+                throw std::runtime_error("DSL model: stack_experts param rank/size mismatch for " + name);
+            }
+
+            const long expert_size = param.nelem() / param.Sizes[0];  // Elements per expert
+            const std::size_t elem_size = get_dtype_size(param.DType);
+            cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+
+            // Sharding: determine which experts this shard owns
+            const int experts_per_shard = param_sharded ? (num_experts / mNumShards) : num_experts;
+            const int expert_start = param_sharded ? (mShardIdx * experts_per_shard) : 0;
+            const int expert_end = param_sharded ? (expert_start + experts_per_shard) : num_experts;
+
+            if (spec->fuse_gate_up) {
+                // Load gate_proj and up_proj for each expert and fuse into gate_up format
+                // gate_up layout: [up; gate] per expert, so first D rows are up, next D rows are gate
+                std::string gate_pattern = spec->source;
+                std::string up_pattern = spec->source;
+                std::size_t pos = up_pattern.find("gate_proj");
+                if (pos != std::string::npos) {
+                    up_pattern.replace(pos, 9, "up_proj");
+                }
+
+                // Expert tensor shape: [2*D, C] where D = intermediate_size
+                // Each sub-tensor (gate/up) has shape [D, C]
+                const long fused_rows = param.Rank >= 2 ? param.Sizes[1] : 1;  // Assuming [E, 2*D, C]
+                const long D = fused_rows / 2;
+                const long C = param.Rank >= 3 ? param.Sizes[2] : 1;
+                const long sub_expert_elems = D * C;
+
+                for (int e = expert_start; e < expert_end; ++e) {
+                    const int local_e = e - expert_start;
+                    const std::size_t base_offset = static_cast<std::size_t>(local_e) * fused_rows * C * elem_size;
+
+                    // Load up_proj into first D rows
+                    std::string up_hf = internal::format_hf_name(up_pattern, layer_idx, e);
+                    const auto& up_entry = reader.find_entry(up_hf);
+                    if (up_entry.shape().empty()) {
+                        throw std::runtime_error("DSL model: stack_experts missing up_proj " + up_hf);
+                    }
+                    Tensor up_slice = param;
+                    up_slice.Rank = 2;
+                    up_slice.Sizes[0] = D;
+                    up_slice.Sizes[1] = C;
+                    up_slice.Data = param.Data + base_offset;
+                    up_entry.read_tensor(up_slice, allow_cast);
+
+                    // Load gate_proj into second D rows
+                    std::string gate_hf = internal::format_hf_name(gate_pattern, layer_idx, e);
+                    const auto& gate_entry = reader.find_entry(gate_hf);
+                    if (gate_entry.shape().empty()) {
+                        throw std::runtime_error("DSL model: stack_experts missing gate_proj " + gate_hf);
+                    }
+                    Tensor gate_slice = param;
+                    gate_slice.Rank = 2;
+                    gate_slice.Sizes[0] = D;
+                    gate_slice.Sizes[1] = C;
+                    gate_slice.Data = param.Data + base_offset + sub_expert_elems * elem_size;
+                    gate_entry.read_tensor(gate_slice, allow_cast);
+                }
+            } else {
+                // Load single tensor (e.g., down_proj) for each expert
+                for (int e = expert_start; e < expert_end; ++e) {
+                    const int local_e = e - expert_start;
+                    std::string hf_name = internal::format_hf_name(spec->source, layer_idx, e);
+                    const auto& entry = reader.find_entry(hf_name);
+                    if (entry.shape().empty()) {
+                        throw std::runtime_error("DSL model: stack_experts missing " + hf_name);
+                    }
+
+                    // Create slice for this expert
+                    Tensor slice = param;
+                    slice.Rank = param.Rank - 1;
+                    for (int d = 0; d < slice.Rank; ++d) {
+                        slice.Sizes[d] = param.Sizes[d + 1];
+                    }
+                    slice.Data = param.Data + static_cast<std::size_t>(local_e) * expert_size * elem_size;
+                    entry.read_tensor(slice, allow_cast);
+                }
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
             continue;
         }
 

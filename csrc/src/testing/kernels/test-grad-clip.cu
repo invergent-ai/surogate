@@ -107,7 +107,9 @@ TEST_CASE("global_norm_sqrt: clipping scale uses grad_clip / norm", "[kernels][g
     CUDA_CHECK(cudaFree(device_buf));
 }
 
-TEST_CASE("global_norm_sqrt: token scaling uses total_tokens / valid_tokens", "[kernels][grad-clip][gpu]") {
+TEST_CASE("global_norm_sqrt: HuggingFace-style token scaling uses 1/valid_tokens", "[kernels][grad-clip][gpu]") {
+    // HuggingFace-style normalization: scale by 1/valid_tokens (not total_tokens/valid_tokens)
+    // This ensures each TOKEN contributes equally to the gradient update.
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -128,7 +130,8 @@ TEST_CASE("global_norm_sqrt: token scaling uses total_tokens / valid_tokens", "[
     float n_squared = 0.25f;
     CUDA_CHECK(cudaMemcpy(device_buf, &n_squared, sizeof(float), cudaMemcpyHostToDevice));
 
-    // token_scale = total_tokens / valid_tokens = 8 / 2 = 4
+    // HuggingFace-style: token_scale = 1 / valid_tokens = 1 / 2 = 0.5
+    // (total_tokens is unused in this mode)
     int valid_tokens = 2;
     CUDA_CHECK(cudaMemcpy(device_valid, &valid_tokens, sizeof(int), cudaMemcpyHostToDevice));
 
@@ -138,15 +141,16 @@ TEST_CASE("global_norm_sqrt: token scaling uses total_tokens / valid_tokens", "[
     float scale = 0.0f;
     CUDA_CHECK(cudaMemcpy(&scale, device_buf + 1, sizeof(float), cudaMemcpyDeviceToHost));
 
-    REQUIRE(*host_norm == Catch::Approx(2.0f)); // scaled_norm = 0.5 * 4
-    REQUIRE(scale == Catch::Approx(4.0f));      // token_scale (no clipping)
+    REQUIRE(*host_norm == Catch::Approx(0.25f)); // scaled_norm = 0.5 * 0.5 = 0.25
+    REQUIRE(scale == Catch::Approx(0.5f));       // token_scale = 1/2 (no clipping)
 
     CUDA_CHECK(cudaFreeHost(host_norm));
     CUDA_CHECK(cudaFree(device_valid));
     CUDA_CHECK(cudaFree(device_buf));
 }
 
-TEST_CASE("global_norm_sqrt: clipping with token scaling returns combined multiplier", "[kernels][grad-clip][gpu]") {
+TEST_CASE("global_norm_sqrt: clipping with HuggingFace token scaling returns combined multiplier", "[kernels][grad-clip][gpu]") {
+    // HuggingFace-style: token_scale = 1/valid_tokens, clipping on scaled_norm
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
@@ -163,11 +167,12 @@ TEST_CASE("global_norm_sqrt: clipping with token scaling returns combined multip
     float* host_norm = nullptr;
     CUDA_CHECK(cudaMallocHost(&host_norm, sizeof(float)));
 
-    // raw norm = 0.5
-    float n_squared = 0.25f;
+    // raw norm = 4.0 (n_squared = 16)
+    float n_squared = 16.0f;
     CUDA_CHECK(cudaMemcpy(device_buf, &n_squared, sizeof(float), cudaMemcpyHostToDevice));
 
-    // token_scale = 8 / 2 = 4  => scaled_norm = 2.0 triggers clipping for grad_clip=1.0
+    // HuggingFace-style: token_scale = 1/2 = 0.5
+    // scaled_norm = 4.0 * 0.5 = 2.0 triggers clipping for grad_clip=1.0
     int valid_tokens = 2;
     CUDA_CHECK(cudaMemcpy(device_valid, &valid_tokens, sizeof(int), cudaMemcpyHostToDevice));
 
@@ -177,8 +182,11 @@ TEST_CASE("global_norm_sqrt: clipping with token scaling returns combined multip
     float scale = 0.0f;
     CUDA_CHECK(cudaMemcpy(&scale, device_buf + 1, sizeof(float), cudaMemcpyDeviceToHost));
 
-    REQUIRE(*host_norm == Catch::Approx(2.0f)); // scaled_norm (for logging/comparison against grad_clip)
-    REQUIRE(scale == Catch::Approx(2.0f));      // grad_clip / raw_norm = 1 / 0.5
+    // scaled_norm = 4.0 * 0.5 = 2.0
+    REQUIRE(*host_norm == Catch::Approx(2.0f));
+    // clip_scale = grad_clip / scaled_norm = 1.0 / 2.0 = 0.5
+    // total_scale = token_scale * clip_scale = 0.5 * 0.5 = 0.25
+    REQUIRE(scale == Catch::Approx(0.25f));
 
     CUDA_CHECK(cudaFreeHost(host_norm));
     CUDA_CHECK(cudaFree(device_valid));

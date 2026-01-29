@@ -124,7 +124,6 @@ void GraphExecutor::prime_fp8_weight_cache(const std::vector<char>& required) {
 }
 
 const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream) {
-    const bool debug_cache = env_enabled("SUROGATE_DEBUG_DSL_FP8_CACHE");
     if (!mRunState.has_fp8_forward()) {
         return nullptr;
     }

@@ -129,45 +129,61 @@ __global__ void deterministic_sum_kernel(float* out, const floatX* data, std::si
 }
 
 /**
- * @brief CUDA kernel to compute final gradient norm and clipping scale.
+ * @brief CUDA kernel to compute final gradient norm, apply token normalization, and gradient clipping.
  *
- * Takes the accumulated squared norm from out[0], computes the square root,
- * and determines the gradient clipping scale factor. Results are written to:
- * - out[1]: Clipping scale (grad_clip/norm if norm > grad_clip, else 1.0)
+ * Implements HuggingFace-style loss normalization: normalizes gradients by the total valid
+ * (non-masked) token count across the entire gradient accumulation cycle. This ensures each
+ * TOKEN contributes equally to the gradient update, not each accumulation step.
+ *
+ * Takes the accumulated squared norm from out[0], computes:
+ * 1. Token scale: 1.0 / valid_token_count (HuggingFace-style normalization)
+ * 2. Gradient norm after token scaling
+ * 3. Clipping scale if norm exceeds grad_clip
+ *
+ * Results are written to:
+ * - out[0]: The actual gradient norm (after token scaling, for logging)
+ * - out[1]: Total scale to apply to gradients (token_scale * clip_scale)
  * - out_cpu: The actual norm value (for logging/monitoring)
  *
  * @param[in,out] out GPU buffer where out[0] = squared norm, out[1] = scale output.
  * @param[out] out_cpu Pinned CPU memory for the computed norm value.
  * @param grad_clip Maximum allowed gradient norm (0 or negative to disable clipping).
+ * @param valid_token_count Accumulated count of non-masked tokens across all micro-batches.
+ * @param total_tokens Unused (kept for API compatibility).
  */
 __global__ void global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_clip,
                                         const int* valid_token_count, float total_tokens) {
+    (void)total_tokens;  // Unused in HuggingFace-style normalization
+
     float n_squared = out[0];
     float norm = std::sqrt(n_squared);
-    // Token-scale to convert gradients from "mean over (B*T*grad_accum)" to "mean over valid tokens".
-    // If masks are not present, valid_token_count ~= total_tokens and token_scale ~= 1.
-    float token_scale = 1.f;
-    if (valid_token_count && total_tokens > 0.f) {
+
+    // HuggingFace-style normalization: scale gradients by 1 / valid_token_count
+    // This ensures each TOKEN contributes equally, not each accumulation step.
+    float token_scale = 1.0f;
+    if (valid_token_count) {
         int valid = *valid_token_count;
         if (valid > 0) {
-            token_scale = total_tokens / static_cast<float>(valid);
+            token_scale = 1.0f / static_cast<float>(valid);
         }
     }
 
-    // We conceptually want to apply: g' = token_scale * g, then clip so that ||g'|| <= grad_clip.
-    // The combined multiplier is:
-    //   if (token_scale * norm > grad_clip)  =>  grad_clip / norm
-    //   else                                =>  token_scale
+    // The norm we report is the scaled norm (what the actual gradient magnitude will be)
     float scaled_norm = norm * token_scale;
-    float total_scale = token_scale;
-    if (grad_clip > 0.f && norm > 0.f && scaled_norm > grad_clip) {
-        total_scale = grad_clip / norm;
+
+    // Apply gradient clipping against the scaled norm
+    float clip_scale = 1.0f;
+    if (grad_clip > 0.f && scaled_norm > 0.f && scaled_norm > grad_clip) {
+        clip_scale = grad_clip / scaled_norm;
     }
-    out[0] = norm;
-    out[1] = total_scale;
-    // Log the raw (unscaled) norm so masks don't create large log spikes.
+
+    // Total scale combines token normalization and clipping
+    float total_scale = token_scale * clip_scale;
+
+    out[0] = scaled_norm;  // Report the scaled norm (actual gradient magnitude)
+    out[1] = total_scale;  // Total scale to apply to gradients
     if (out_cpu) {
-        *out_cpu = norm;
+        *out_cpu = scaled_norm;
     }
 }
 

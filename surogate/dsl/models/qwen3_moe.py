@@ -5,7 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor, Array
 from ..decorators import model, forward, hf_config, Param
 from ..graph_builder import graph
-from ..hf import fuse
+from ..hf import fuse, stack_experts
 
 
 @model
@@ -24,6 +24,8 @@ from ..hf import fuse
     use_qkv_bias="attention_bias",
     num_experts="num_experts",
     num_experts_per_tok="num_experts_per_tok",
+    # Shared expert config (optional in HF config)
+    shared_expert_intermediate="shared_expert_intermediate_size",
 )
 class Qwen3MoEModel:
     """Qwen3 Mixture of Experts model.
@@ -107,10 +109,15 @@ class Qwen3MoEModel:
         # Router
         "router_weight": "model.layers.{layer}.mlp.gate.weight",
 
-        # Experts (batched format)
+        # Experts (batched format) - stack individual expert weights from HF format
         # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
-        "experts_gate_up": "model.layers.{layer}.mlp.experts.gate_up_proj.weight",
-        "experts_down": "model.layers.{layer}.mlp.experts.down_proj.weight",
+        "experts_gate_up": stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+            fuse_gate_up=True,  # Also load up_proj and fuse into gate_up
+        ),
+        "experts_down": stack_experts(
+            "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+        ),
 
         # Shared expert (optional)
         # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp

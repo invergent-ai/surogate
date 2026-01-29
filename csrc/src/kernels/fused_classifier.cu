@@ -516,6 +516,8 @@ template <class floatX>
 __global__ void cross_entropy_backward_kernel(floatX* dlogits, const floatX* logits, const float* logsumexp,
                                               const float* dloss, const int* targets,
                                               int BT, int V, int P) {
+    // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
+    // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
     int idx = static_cast<int>(blockIdx.x);
     if (idx >= BT) {
         return;
@@ -633,6 +635,8 @@ template <class floatX>
 __global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits, const floatX* logits, const float* logsumexp,
                                                       const float* dloss, const int* targets,
                                                       int BT, int V, int P, int chunk_size) {
+    // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
+    // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
     int row_idx = static_cast<int>(blockIdx.x);
     int block_idx = static_cast<int>(blockIdx.y);
     int start = block_idx * chunk_size;
@@ -828,7 +832,8 @@ void chunked_cross_entropy_backward(float* dlogits, const float* logits, const f
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
     dim3 grid(BT, n_blocks);
     chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(
-        dlogits, logits, logsumexp, dloss, targets, BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+        dlogits, logits, logsumexp, dloss, targets,
+        BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -839,6 +844,7 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* log
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
     dim3 grid(BT, n_blocks);
     chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(
-        dlogits, logits, logsumexp, dloss, targets, BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+        dlogits, logits, logsumexp, dloss, targets,
+        BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
     CUDA_CHECK(cudaGetLastError());
 }

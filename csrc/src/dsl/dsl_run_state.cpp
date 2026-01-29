@@ -389,25 +389,6 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         g.d_ln1 = share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
 
-    // Debug: print gradient buffer pointers when SUROGATE_DSL_DEBUG_GRAD_BUFFERS is set
-    if (std::getenv("SUROGATE_DSL_DEBUG_GRAD_BUFFERS")) {
-        std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] share_grads=%d share_res_ffn=%d share_mlp_down=%d\n",
-                     share_grads, share_res_ffn, share_mlp_down);
-        if (share_res_ffn) {
-            std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] mSharedDResFFN[0]=%p mSharedDResFFN[1]=%p\n",
-                         mSharedDResFFN[0].Data, mSharedDResFFN[1].Data);
-        }
-        if (share_mlp_down) {
-            std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] mSharedDMlpDown[0]=%p mSharedDMlpDown[1]=%p\n",
-                         mSharedDMlpDown[0].Data, mSharedDMlpDown[1].Data);
-        }
-        for (int i = 0; i < cfg.NumLayers; ++i) {
-            auto& g = mSimplifiedGradients[i];
-            std::fprintf(stderr, "[DSL DEBUG GRAD BUFFERS] layer=%d d_res_ffn=%p d_mlp_down=%p (bucket=%d)\n",
-                         i, g.d_res_ffn.Data, g.d_mlp_down.Data, i % 2);
-        }
-    }
-
     // Preserve the original buffer pointers so we can restore them if the
     // compiled executor temporarily aliases gradients to stack-backed temps.
     mSimplifiedGradientsBase = mSimplifiedGradients;
@@ -660,9 +641,15 @@ void DslRunState::create_cuda_resources() {
     CUDA_CHECK(cudaStreamCreate(&mSideStream));
     CUDA_CHECK(cudaEventCreate(&mSideStreamEvent));
     CUDA_CHECK(cudaEventCreate(&mAllReduceDone));
+    CUBLAS_CHECK(cublasCreate(&mCublasHandle));
+    CUBLAS_CHECK(cublasSetMathMode(mCublasHandle, CUBLAS_TF32_TENSOR_OP_MATH));
 }
 
 void DslRunState::release_cuda_resources() noexcept {
+    if (mCublasHandle) {
+        cublasDestroy(mCublasHandle);
+        mCublasHandle = nullptr;
+    }
     if (mAllReduceDone) {
         cudaEventDestroy(mAllReduceDone);
         mAllReduceDone = nullptr;

@@ -94,10 +94,10 @@ class Qwen3MoEBlock:
     experts_gate_up = Param(Tensor["E", "MUp", "C"])
     experts_down = Param(Tensor["E", "C", "M"])
 
-    # Shared expert weights (optional)
-    shared_expert_gate = Param(Tensor["SharedM", "C"], when="use_shared_expert")
-    shared_expert_up = Param(Tensor["SharedM", "C"], when="use_shared_expert")
-    shared_expert_down = Param(Tensor["C", "SharedM"], when="use_shared_expert")
+    # Shared expert weights (optional - present when shared_expert_intermediate > 0)
+    shared_expert_gate = Param(Tensor["SharedM", "C"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)
+    shared_expert_up = Param(Tensor["SharedM", "C"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)
+    shared_expert_down = Param(Tensor["C", "SharedM"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)
 
     @forward
     def forward(
