@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-8B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -13,8 +13,6 @@ max_steps: 50
 
 learning_rate: 2e-4
 recipe: bf16
-use_cuda_graphs: false
-recompute: none
 
 lora: true
 lora_rank: 16

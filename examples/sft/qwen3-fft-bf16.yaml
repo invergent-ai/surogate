@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-1.7B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -9,8 +9,8 @@ max_steps: 20
 
 sample_packing: true
 sequence_len: 2048
-use_cuda_graphs: false
-recompute: none
+use_cuda_graphs: true
+recompute: true
 
 learning_rate: 1e-5
 

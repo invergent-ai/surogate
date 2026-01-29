@@ -19,22 +19,18 @@
 // ============================================================================
 // Recomputation levels for activation checkpointing
 // ============================================================================
-// These levels trade compute for memory by recomputing activations during backward.
-// The implementation uses segment-based recomputation with clearly defined checkpoint
-// boundaries to ensure numerical correctness.
+// Recomputation trades compute for memory by recomputing activations during backward.
+// Set via `recompute: true` or `recompute: false` in config.
 //
-// Level summary:
-//   - None:       Save all activations. Maximum memory, fastest training.
-//                 Guarantees identical gradients. Use for FFT or debugging.
-//   - Standard:   Recompute attention + FFN intermediates from checkpoints.
-//                 Saves: residuals and rstd values (attention LSE/out_proj are recomputed).
-//                 Good balance of memory and speed.
-//   - Aggressive: Recompute everything except residuals (maximum memory savings).
+// - false (None):    Save all activations. Maximum memory, fastest training.
+//                    Guarantees bit-exact gradients.
+// - true (Enabled):  Recompute intermediates from checkpoints (saves ~17% VRAM).
+//                    In FFT mode, saves ln1/ln2 rstd and recomputes bit-exactly.
+//                    In LoRA mode, fully recomputes attention and FFN segments.
 //
 enum class RecomputeLevel {
-    None = 0,       ///< No recomputation - save all activations
-    Standard = 1,   ///< Standard recomputation - save checkpoints, recompute intermediates
-    Aggressive = 2, ///< Aggressive recomputation - minimize memory, maximize recompute
+    None = 0,    ///< recompute: false - save all activations
+    Enabled = 1, ///< recompute: true - recompute intermediates from checkpoints
 };
 
 // Runtime/training options used by the CLI and python bindings.
@@ -47,7 +43,7 @@ struct RuntimeOptions {
     // ========================================================================
     // Controls activation checkpointing strategy for memory-compute tradeoff.
     // See RecomputeLevel enum above for level descriptions.
-    RecomputeLevel Recompute = RecomputeLevel::Standard;
+    RecomputeLevel Recompute = RecomputeLevel::None;
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;
@@ -207,33 +203,22 @@ struct RuntimeOptions {
         return Recompute != RecomputeLevel::None;
     }
 
-    /// Returns true if standard or aggressive recomputation is enabled
-    [[nodiscard]] bool recompute_standard_or_higher() const {
-        return Recompute >= RecomputeLevel::Standard;
-    }
-
-    /// Returns true if aggressive recomputation is enabled
-    [[nodiscard]] bool recompute_aggressive() const {
-        return Recompute == RecomputeLevel::Aggressive;
-    }
-
     /// Returns the recompute level as a string for logging
     [[nodiscard]] std::string_view recompute_level_name() const {
-        switch (Recompute) {
-            case RecomputeLevel::None: return "none";
-            case RecomputeLevel::Standard: return "standard";
-            case RecomputeLevel::Aggressive: return "aggressive";
-            default: return "unknown";
-        }
+        return Recompute == RecomputeLevel::Enabled ? "true" : "false";
     }
 
     /// Parse recompute level from string (for Python bindings)
+    /// Primary values: "true"/"false". Legacy values also accepted for backward compatibility.
     static RecomputeLevel parse_recompute_level(const std::string& level) {
-        if (level == "none" || level == "0") return RecomputeLevel::None;
-        if (level == "standard" || level == "1") return RecomputeLevel::Standard;
-        if (level == "aggressive" || level == "2") return RecomputeLevel::Aggressive;
+        if (level == "false" || level == "none" || level == "0") {
+            return RecomputeLevel::None;
+        }
+        if (level == "true" || level == "1" || level == "standard" || level == "aggressive" || level == "2") {
+            return RecomputeLevel::Enabled;
+        }
         throw std::invalid_argument("Invalid recompute level: " + level +
-                                    ". Valid values: none, standard, aggressive");
+                                    ". Valid values: true, false");
     }
 };
 

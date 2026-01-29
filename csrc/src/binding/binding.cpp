@@ -353,7 +353,7 @@ NB_MODULE(_surogate, m) {
                 .MasterDType = opt_dtype_from_str(master_dtype)
             };
         }, nb::kw_only(),
-             nb::arg("recompute") = "standard",
+             nb::arg("recompute") = "true",
              nb::arg("offload_residual") = false,
              nb::arg("use_cuda_graphs") = true,
              nb::arg("trigger_timing_events") = false,
@@ -384,10 +384,9 @@ NB_MODULE(_surogate, m) {
              nb::arg("use_dsl_ir") = false,
              "Create runtime/training options.\n\n"
              "Parameters:\n"
-             "- recompute: Recomputation level ('none', 'standard', 'aggressive').\n"
-             "  - 'none': Save all activations. Maximum memory, fastest training.\n"
-             "  - 'standard': Recompute intermediates from checkpoints. Good balance.\n"
-             "  - 'aggressive': Recompute everything except residuals/LSE. Minimum memory.\n"
+             "- recompute: Enable activation recomputation ('true' or 'false').\n"
+             "  - 'false': Save all activations. Maximum memory, fastest training.\n"
+             "  - 'true': Recompute intermediates from checkpoints. Saves ~17% VRAM.\n"
              "- offload_*: Offload specific buffers/states; may reduce VRAM at performance cost.\n"
              "- use_cuda_graphs: Enable CUDA graphs where supported.\n"
              "- trigger_timing_events: Log additional timing information.\n"
@@ -405,7 +404,7 @@ NB_MODULE(_surogate, m) {
         .def_prop_rw("recompute",
             [](const RuntimeOptions& self) { return std::string(self.recompute_level_name()); },
             [](RuntimeOptions& self, const std::string& level) { self.Recompute = RuntimeOptions::parse_recompute_level(level); },
-            "Recomputation level: 'none', 'standard', or 'aggressive'.")
+            "Enable activation recomputation: 'true' or 'false'.")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")

@@ -17,6 +17,7 @@ learning_rate: 2e-4
 
 recipe: fp8-hybrid
 qlora_fp8: true
+recompute: aggressive
 
 lora: true
 lora_rank: 16

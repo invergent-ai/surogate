@@ -3276,7 +3276,7 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
 
         RuntimeOptions options;
         options.UseCudaGraphs = false;
-        options.Recompute = recompute_block ? RecomputeLevel::Standard : RecomputeLevel::None;
+        options.Recompute = recompute_block ? RecomputeLevel::Enabled : RecomputeLevel::None;
         options.ModelType = cfg.DType;
         options.MatmulType = cfg.DType;
         options.GradientType = cfg.DType;

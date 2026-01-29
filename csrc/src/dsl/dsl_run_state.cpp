@@ -178,16 +178,14 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const auto dtype = mActivationDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Activation sharing logic - based on recompute level
-    // When recompute is enabled (Standard or Aggressive), intermediates can be shared
-    // because backward will recompute them from checkpoints.
+    // Activation sharing logic - based on recompute setting
+    // When recompute is enabled, intermediates can be shared because backward
+    // will recompute them from checkpoints.
     //
-    // Recompute levels:
-    //   - None: Save everything, no sharing (maximum memory, correct gradients)
-    //   - Standard: Share attention/FFN intermediates (recomputed from checkpoints)
-    //   - Aggressive: Share everything except residuals/LSE (maximum sharing)
+    // recompute: false - Save everything, no sharing (maximum memory)
+    // recompute: true  - Share intermediates, recompute from checkpoints (saves ~17% VRAM)
     //
-    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Standard;
+    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool lora_only = mLoraOnlyMode;
 
     // LN outputs can be shared when recompute is enabled
@@ -206,16 +204,17 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // Only share attention outputs in LoRA-only mode where we don't need bit-exact gradients.
     const bool share_att = recompute_enabled && lora_only;
 
-    // MLP intermediates are shared (recomputed) when recompute is enabled.
-    // The backward will recompute mlp_up and swiglu from ln2 using saved rstd values.
-    const bool share_mlp_up = recompute_enabled;
-    const bool share_swiglu = recompute_enabled;
+    // MLP intermediates sharing: In LoRA mode, we recompute mlp_up/swiglu during backward.
+    // In FFT mode, we save mlp_up/swiglu per-layer to avoid matmul non-determinism.
+    const bool share_mlp_up = recompute_enabled && lora_only;
+    const bool share_swiglu = recompute_enabled && lora_only;
 
-    // Residual intermediates can be shared when recompute is enabled
-    const bool share_residual_intermediates = recompute_enabled;
+    // Residual intermediates: In LoRA mode they can be shared. In FFT mode, save per-layer.
+    const bool share_residual_intermediates = recompute_enabled && lora_only;
 
-    // FFN temps go on stack when recompute is enabled (saves per-layer allocation).
-    const bool ffn_temps_on_stack = recompute_enabled;
+    // FFN temps go on stack only in LoRA mode (saves per-layer allocation).
+    // In FFT mode, we need per-layer buffers for bit-exact gradients.
+    const bool ffn_temps_on_stack = recompute_enabled && lora_only;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -326,7 +325,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     // the DSL backward graph structure differs from LoRA mode. The gradients may be needed
     // at different points in the backward pass, and sharing can cause corruption.
     // For safety, disable all gradient sharing in FFT mode.
-    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Standard;
+    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool share_grads = recompute_enabled && mLoraOnlyMode;
     const bool share_res_ffn = recompute_enabled && mLoraOnlyMode;
     const bool share_mlp_down = recompute_enabled && mLoraOnlyMode;
@@ -577,7 +576,7 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
 
     // Note: Stack simulation no longer needed for workspace since it's persistently allocated
     if (mStackSimulate) {
-        if (mRecomputeLevel >= RecomputeLevel::Standard) {
+        if (mRecomputeLevel >= RecomputeLevel::Enabled) {
             const long d_qkv_bytes = B * T * QKV * get_dtype_size(mGradDtype);
             auto* simulated_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
             Stack.free(simulated_d_qkv);

@@ -320,7 +320,7 @@ TEST_CASE("Modular dense model: FP8 matmul forward/backward/update runs", "[trai
         // Use FP8 Hybrid recipe: E4M3 for forward activations/weights, E5M2 for backward gradients
         opts.TrainingRecipe = std::make_shared<recipes::FP8HybridRecipe>();
         // FP8 requires recompute_block for proper stack allocation sizing
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
 
         auto allocator = std::make_shared<TensorAllocator>();
         auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
@@ -497,8 +497,8 @@ TEST_CASE("Modular: recompute flags + chunked head/attn backward run", "[trainin
 
         PretrainedConfig cfg = create_test_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
+        opts.Recompute = RecomputeLevel::Enabled;
         opts.LMHeadChunks = 2;
         opts.AttBwdChunks = 2;
 
@@ -533,7 +533,7 @@ TEST_CASE("Modular: offload optimizer states + recompute-block training step run
         PretrainedConfig cfg = create_test_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
         opts.OffloadOptimizer = true;
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
 
         auto allocator = std::make_shared<TensorAllocator>();
         auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
@@ -610,7 +610,7 @@ TEST_CASE("Modular recompute-block shares large activations across layers", "[tr
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(/*num_layers=*/3, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
 
         auto allocator = std::make_shared<TensorAllocator>();
         auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
@@ -643,7 +643,7 @@ TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[traini
 
         PretrainedConfig cfg = create_test_config(/*num_layers=*/2, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
         opts.UseCudaGraphs = true; // exercises the same config as train-lora.sh (graphs + LoRA hooks)
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -705,7 +705,7 @@ TEST_CASE("Modular leaf recompute flags affect activation sharing", "[training][
         // recompute-qkv: qkv shared, att not shared
         {
             RuntimeOptions opts = create_test_options();
-            opts.Recompute = RecomputeLevel::Standard;
+            opts.Recompute = RecomputeLevel::Enabled;
             auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
             model->allocate_run_state(opts, comm, /*B=*/1, /*T=*/64, /*allocate_optimizer=*/false);
             auto* dense = dynamic_cast<DenseModel*>(model.get());
@@ -719,7 +719,7 @@ TEST_CASE("Modular leaf recompute flags affect activation sharing", "[training][
         // recompute-swiglu: swiglu shared, mlp_up not shared
         {
             RuntimeOptions opts = create_test_options();
-            opts.Recompute = RecomputeLevel::Standard;
+            opts.Recompute = RecomputeLevel::Enabled;
             auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
             model->allocate_run_state(opts, comm, /*B=*/1, /*T=*/64, /*allocate_optimizer=*/false);
             auto* dense = dynamic_cast<DenseModel*>(model.get());
@@ -732,7 +732,7 @@ TEST_CASE("Modular leaf recompute flags affect activation sharing", "[training][
         // recompute-norm: ln1 + ln2 shared
         {
             RuntimeOptions opts = create_test_options();
-            opts.Recompute = RecomputeLevel::Standard;
+            opts.Recompute = RecomputeLevel::Enabled;
             auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
             model->allocate_run_state(opts, comm, /*B=*/1, /*T=*/64, /*allocate_optimizer=*/false);
             auto* dense = dynamic_cast<DenseModel*>(model.get());
@@ -1014,7 +1014,7 @@ TEST_CASE("Recompute-block: loss matches non-recompute on first forward", "[trai
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
 
         auto allocator = std::make_shared<TensorAllocator>();
         auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
@@ -1093,7 +1093,7 @@ TEST_CASE("Recompute-block: gradients match non-recompute after backward", "[tra
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
         opts.UseCudaGraphs = false;
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -1182,7 +1182,7 @@ TEST_CASE("Recompute-block: multi-step training divergence check", "[training][m
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
         opts.UseCudaGraphs = false;
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -1279,7 +1279,7 @@ TEST_CASE("Recompute-block: weights evolve identically over training", "[trainin
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
         opts.UseCudaGraphs = false;
 
         auto allocator = std::make_shared<TensorAllocator>();
@@ -1381,7 +1381,7 @@ TEST_CASE("Recompute-block: activation values match recomputed values", "[traini
 
         // Now, run with recompute-block enabled - activations will be recomputed before backward
         RuntimeOptions opts_recompute = create_test_options();
-        opts_recompute.Recompute = RecomputeLevel::Standard;
+        opts_recompute.Recompute = RecomputeLevel::Enabled;
         opts_recompute.UseCudaGraphs = false;
 
         auto allocator2 = std::make_shared<TensorAllocator>();
@@ -1476,7 +1476,7 @@ TEST_CASE("Recompute-block: longer training shows divergence pattern", "[trainin
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         PretrainedConfig cfg = create_test_config(num_layers, /*vocab_size=*/256);
         RuntimeOptions opts = create_test_options();
-        opts.Recompute = RecomputeLevel::Standard;
+        opts.Recompute = RecomputeLevel::Enabled;
         opts.UseCudaGraphs = false;
 
         auto allocator = std::make_shared<TensorAllocator>();

@@ -421,13 +421,51 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
     const int Bv = static_cast<int>(B);
     const int Tv = static_cast<int>(T);
     const int C = static_cast<int>(config.HiddenSize);
-    const int D = static_cast<int>(config.IntermediateSize);
-    const int MUp = 2 * D;
     const int BT = Bv * Tv;
-    const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState &&
-                              mLoRAConfig->enabled() && mLoRAWeights->enabled();
 
     auto& acts = rs.simplified_acts(layer_idx);
+
+    auto ensure_act = [&](Tensor& t) {
+        if (!t.Data) {
+            rs.temp_acquire(t);
+        }
+    };
+
+    auto block_name = [&](const char* field) {
+        return "blocks[" + std::to_string(layer_idx) + "]." + field;
+    };
+
+    // Get residual input: for FFN, this is residual + att_out
+    Tensor& res_in = (layer_idx == 0)
+        ? rs.non_block_activations().encoded
+        : rs.get_residual(layer_idx, rs.MainStream);
+
+    // In FFT mode (not LoRA-only), we save mlp_up/swiglu per-layer from the forward pass.
+    // We only need to recompute LN2 and residual_att (bit-exact from saved inputs).
+    // Skip mlp_up/swiglu recompute to avoid matmul non-determinism.
+    const bool skip_ffn_recompute = !rs.is_lora_only_mode();
+    if (skip_ffn_recompute) {
+        // Recompute LN2 and residual_att using saved inputs for bit-exact results
+        // ln2 buffer is shared, but we can recompute it bit-exactly from saved ln2_rstd
+        ensure_act(acts.ln2);
+        ensure_act(acts.residual_att);
+        Tensor& ln2_weight = mWeights.get(block_name("ln2_weight"));
+        fused_residual_rmsnorm_apply_saved(
+            acts.residual_att, acts.ln2,
+            res_in, acts.att_out, ln2_weight, acts.ln2_rstd, BT, C, rs.MainStream);
+
+        if (debug_fft_recompute) {
+            std::fprintf(stderr, "[FFT RECOMPUTE] layer=%d Recomputed ln2/residual_att (bit-exact), skipping mlp_up/swiglu recompute\n",
+                         layer_idx);
+        }
+        return;
+    }
+
+    // LoRA mode: full FFN segment recompute
+    const int D = static_cast<int>(config.IntermediateSize);
+    const int MUp = 2 * D;
+    const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState &&
+                              mLoRAConfig->enabled() && mLoRAWeights->enabled();
 
     // Helper for debug norm computation
     auto compute_norm = [&](const Tensor& t) -> float {
@@ -470,16 +508,6 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
     const bool allow_quant = allow_quant_layer(mOptions, config, layer_idx);
     const bool have_recipe = mOptions.TrainingRecipe != nullptr;
 
-    auto ensure_act = [&](Tensor& t) {
-        if (!t.Data) {
-            rs.temp_acquire(t);
-        }
-    };
-
-    auto block_name = [&](const char* field) {
-        return "blocks[" + std::to_string(layer_idx) + "]." + field;
-    };
-
     auto plan_for = [&](modules::MatmulOp op) -> const MatmulForwardPlan* {
         if (!fwd_plan) return nullptr;
         switch (op) {
@@ -489,17 +517,11 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
         }
     };
 
-    // Get residual input: for FFN, this is residual + att_out
-    Tensor& res_in = (layer_idx == 0)
-        ? rs.non_block_activations().encoded
-        : rs.get_residual(layer_idx, rs.MainStream);
-
     // ========================================================================
-    // Step 1: Recompute LN2 using saved rstd for bit-exact results
+    // Step 1: Recompute LN2 using saved rstd for bit-exact results (LoRA mode)
     // ========================================================================
     ensure_act(acts.ln2);
-    // Use fused_residual_rmsnorm_apply_saved to apply normalization with SAVED ln2_rstd.
-    // This ensures bit-exact results matching the original forward pass.
+    ensure_act(acts.residual_att);
     Tensor& ln2_weight = mWeights.get(block_name("ln2_weight"));
 
     // Debug: check inputs before fused_residual_rmsnorm_apply_saved

@@ -63,20 +63,15 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             If a value is passed, will limit the total amount of checkpoints. Deletes the older checkpoints in
             `output_dir`.
 
-        recompute (Literal['none', 'standard', 'aggressive'], defaults to 'standard'):
-            Activation recomputation level for trading compute for memory:
-            - 'none': Save all activations. Maximum memory, fastest training.
-                      Guarantees identical gradients to non-recompute path.
-                      Recommended for FFT or when debugging gradient issues.
-            - 'standard': Recompute attention and FFN intermediates from checkpoints.
-                          Saves residuals, LSE, rstd values, and att_out.
-                          Good balance of memory and speed. Default for most training.
-            - 'aggressive': Recompute everything except residuals and LSE.
-                            Minimum memory, ~1.3x compute overhead.
-                            Use for very large models where memory is critical.
+        recompute (bool, defaults to True):
+            Enable activation recomputation to trade compute for memory:
+            - False: Save all activations. Maximum memory, fastest training.
+                     Guarantees bit-exact gradients.
+            - True: Recompute intermediates from checkpoints. Saves ~17% VRAM.
+                    Recommended for most training scenarios.
         offload_residual (Optional[bool], defaults to False):
             Offload the residuals (of the ffn block; the only remaining part of the block that is not recomputed) to pinned host memory.
-            Combined with --recompute-block, the total activation memory consumption becomes independent of the network depth.
+            Combined with recompute, the total activation memory consumption becomes independent of the network depth.
             This saves GPU memory at the cost of increased data transfer overhead.
         offload_master (Optional[bool], defaults to False):
             Store master weights in pinned host memory.
@@ -265,7 +260,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     save_steps: Optional[int] = 50
     save_total_limit: Optional[int] = 5
 
-    recompute: Optional[Literal['none', 'standard', 'aggressive']] = 'standard'
+    recompute: Optional[bool] = True
 
     offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
@@ -367,24 +362,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.save_steps = cfg.get('save_steps', self.save_steps)
         self.save_total_limit = cfg.get('save_total_limit', self.save_total_limit)
 
-        # New unified recompute level
-        self.recompute = cfg.get('recompute', self.recompute)
-
-        # Backward compatibility: if old flags are present, derive level
-        old_flags_present = any(f'recompute_{x}' in cfg for x in [
-            'block', 'att', 'ffn', 'qkv', 'swiglu', 'rmsnorm', 'mlp_down', 'qk_norm', 'rope', 'out_proj'
-        ])
-        if old_flags_present and 'recompute' not in cfg:
-            logger = get_logger()
-            if cfg.get('recompute_block', False):
-                self.recompute = 'standard'
-                logger.warning("Deprecated: recompute_block=true is now recompute='standard'")
-            elif any(cfg.get(f'recompute_{x}', False) for x in ['att', 'ffn', 'qkv']):
-                self.recompute = 'standard'
-                logger.warning("Deprecated: Fine-grained recompute flags are now recompute='standard'")
+        # Parse recompute setting (accepts bool or legacy string values)
+        recompute_raw = cfg.get('recompute', self.recompute)
+        if isinstance(recompute_raw, bool):
+            self.recompute = recompute_raw
+        elif isinstance(recompute_raw, str):
+            if recompute_raw.lower() in ('false', 'none', '0'):
+                self.recompute = False
             else:
-                self.recompute = 'none'
-                logger.warning("Deprecated: All recompute flags disabled is now recompute='none'")
+                raise ValueError(f"recompute must be true or false, got '{recompute_raw}'")
+        else:
+            self.recompute = bool(recompute_raw)
 
         self.offload_residual = cfg.get('offload_residual', self.offload_residual)
         self.offload_master = cfg.get('offload_master', self.offload_master)
@@ -469,9 +457,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.aim_repo = cfg.get('aim_repo', self.aim_repo)
         self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
         
-        # Validate recompute level
-        if self.recompute not in ('none', 'standard', 'aggressive'):
-            raise ValueError(f"recompute must be 'none', 'standard', or 'aggressive', got '{self.recompute}'")
+        # Validate recompute is boolean
+        if not isinstance(self.recompute, bool):
+            raise ValueError(f"recompute must be true or false, got '{self.recompute}'")
 
         # Parse distributed config
         distributed_cfg = cfg.get('distributed', None)
@@ -615,16 +603,16 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             shard_weights = True
 
         if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
-            # QLoRA requires at least standard recompute level
-            if self.recompute == 'none':
-                self.recompute = 'standard'
+            # QLoRA requires recompute enabled
+            if not self.recompute:
+                self.recompute = True
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
 
-        if self.lora and self.recompute != 'none' and self.offload_residual:
+        if self.lora and self.recompute and self.offload_residual:
             self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
 
         self.runtime_config = _surogate.RuntimeOptions(
-            recompute=self.recompute,
+            recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,

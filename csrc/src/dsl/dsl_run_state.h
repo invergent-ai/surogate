@@ -61,7 +61,7 @@ public:
     bool has_residual_offloading() const { return mOffloadResiduals; }
 
     bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
-    bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Standard; }
+    bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Enabled; }
     bool is_lora_only_mode() const { return mLoraOnlyMode; }
 
     /// @brief Get the recompute level
@@ -69,9 +69,6 @@ public:
 
     /// @brief Check if any recomputation is enabled
     bool recompute_enabled() const { return mRecomputeLevel != RecomputeLevel::None; }
-
-    /// @brief Check if standard or higher recomputation is enabled
-    bool recompute_standard_or_higher() const { return mRecomputeLevel >= RecomputeLevel::Standard; }
 
     /// @brief Get temporary rstd buffer for recomputation (avoids overwriting saved values)
     Tensor& recompute_rstd() { return mRecomputeRstd; }
@@ -155,7 +152,7 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     Tensor mStackBuffer{};
     bool mStackSimulate = false;
-    RecomputeLevel mRecomputeLevel = RecomputeLevel::Standard;
+    RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;

@@ -664,13 +664,12 @@ struct ModelOptions {
     [[nodiscard]] RuntimeOptions to_runtime_options() const {
         RuntimeOptions opts;
         // Convert fine-grained recompute flags to RecomputeLevel
-        // If recompute_block is true, use Standard level
-        // Otherwise, if any recompute flag is set, use Standard level
-        // Otherwise, use None
+        // If any recompute flag is set, enable recomputation
+        // Otherwise, disable recomputation
         if (recompute_block) {
-            opts.Recompute = RecomputeLevel::Standard;
+            opts.Recompute = RecomputeLevel::Enabled;
         } else if (recompute_attention || recompute_ffn || recompute_qkv || recompute_swiglu || recompute_rmsnorm) {
-            opts.Recompute = RecomputeLevel::Standard;
+            opts.Recompute = RecomputeLevel::Enabled;
         } else {
             opts.Recompute = RecomputeLevel::None;
         }
