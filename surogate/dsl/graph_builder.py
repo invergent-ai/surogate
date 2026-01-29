@@ -19,8 +19,28 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence, TYPE_CHECKING
 from enum import Enum
 
+from .dim import Dim, DimExpr, ConcreteDimValue
+
 if TYPE_CHECKING:
     from .ir import GraphIR
+
+# Type alias for shape dimensions
+ShapeDim = str | int | Dim | DimExpr | ConcreteDimValue
+
+
+def _resolve_shape(shape: Sequence[ShapeDim]) -> list[str | int]:
+    """Convert shape dimensions to IR-compatible format."""
+    result: list[str | int] = []
+    for dim in shape:
+        if isinstance(dim, int):
+            result.append(dim)
+        elif isinstance(dim, ConcreteDimValue):
+            result.append(dim.value)
+        elif isinstance(dim, (Dim, DimExpr)):
+            result.append(dim.to_expr_string())
+        else:
+            result.append(str(dim))
+    return result
 
 
 class TransposeMode(str, Enum):
@@ -515,7 +535,7 @@ class GraphBuilder:
         self,
         x: str | GraphRef,
         *,
-        shape: Sequence[str | int],
+        shape: Sequence[ShapeDim],
         out_name: str | None = None,
     ) -> GraphRef:
         """Reshape tensor."""
@@ -524,7 +544,7 @@ class GraphBuilder:
             op="view",
             inputs=[self._resolve_input(x)],
             outputs=[out],
-            attrs={"shape": list(shape)},
+            attrs={"shape": _resolve_shape(shape)},
         ))
         return self._make_output(out)
 
@@ -684,7 +704,7 @@ class GraphBuilder:
     def zeros(
         self,
         *,
-        shape: Sequence[str | int],
+        shape: Sequence[ShapeDim],
         dtype: str = "bf16",
     ) -> GraphRef:
         """Create zero-filled tensor."""
@@ -693,14 +713,14 @@ class GraphBuilder:
             op="zeros",
             inputs=[],
             outputs=[out],
-            attrs={"shape": list(shape), "dtype": dtype},
+            attrs={"shape": _resolve_shape(shape), "dtype": dtype},
         ))
         return self._make_output(out)
 
     def ones(
         self,
         *,
-        shape: Sequence[str | int],
+        shape: Sequence[ShapeDim],
         dtype: str = "bf16",
     ) -> GraphRef:
         """Create one-filled tensor."""
@@ -709,14 +729,14 @@ class GraphBuilder:
             op="ones",
             inputs=[],
             outputs=[out],
-            attrs={"shape": list(shape), "dtype": dtype},
+            attrs={"shape": _resolve_shape(shape), "dtype": dtype},
         ))
         return self._make_output(out)
 
     def fill(
         self,
         *,
-        shape: Sequence[str | int],
+        shape: Sequence[ShapeDim],
         value: float,
         dtype: str = "bf16",
     ) -> GraphRef:
@@ -726,7 +746,7 @@ class GraphBuilder:
             op="fill",
             inputs=[],
             outputs=[out],
-            attrs={"shape": list(shape), "value": value, "dtype": dtype},
+            attrs={"shape": _resolve_shape(shape), "value": value, "dtype": dtype},
         ))
         return self._make_output(out)
 

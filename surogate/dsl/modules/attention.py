@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor
 from ..decorators import module, param, forward, save
 from ..graph_builder import graph
+from ..dim import Dim, B, T
 
 
 @module
@@ -27,13 +28,16 @@ class GQAAttention:
         self.max_seq = max_seq
         self.use_qkv_bias = use_qkv_bias
 
-        # Derived constants
-        self.C = d_model
-        self.Hq = num_query_heads
-        self.Hkv = num_kv_heads
-        self.D = head_size
-        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.AttnDim = num_query_heads * head_size
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.MaxSeq = Dim("MaxSeq")
+
+        # Derived dimensions (DimExpr)
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
+        self.AttnDim = self.Hq * self.D
 
     @param
     def qkv_weight(self) -> Tensor["QKV", "C"]:
@@ -51,7 +55,7 @@ class GQAAttention:
         ...
 
     @param(frozen=True)
-    def rope_freqs(self) -> Tensor["max_seq", "D // 2", 2, "fp32"]:
+    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
         """Precomputed RoPE frequencies."""
         ...
 
@@ -64,12 +68,12 @@ class GQAAttention:
     ) -> Tensor["B", "T", "C"]:
         with graph() as g:
             # QKV projection
-            x_flat = g.view(x, shape=["B * T", "C"])
+            x_flat = g.view(x, shape=[B * T, self.C])
             if self.use_qkv_bias:
                 qkv_flat = g.matmul_bias(x_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
                 qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
-            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D])
 
             # Apply RoPE
             qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, rotary_dim="D")
@@ -78,9 +82,9 @@ class GQAAttention:
             attn_out, _ = g.flash_attention(qkv_rope, causal=True)
 
             # Output projection
-            attn_flat = g.view(attn_out, shape=["B * T", "AttnDim"])
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
             out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
-            out = g.view(out_flat, shape=["B", "T", "C"])
+            out = g.view(out_flat, shape=[B, T, self.C])
 
             return out
 
@@ -109,13 +113,16 @@ class Qwen3Attention:
         self.use_qk_norm = use_qk_norm
         self.eps = eps
 
-        # Derived constants
-        self.C = d_model
-        self.Hq = num_query_heads
-        self.Hkv = num_kv_heads
-        self.D = head_size
-        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.AttnDim = num_query_heads * head_size
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.MaxSeq = Dim("MaxSeq")
+
+        # Derived dimensions (DimExpr)
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
+        self.AttnDim = self.Hq * self.D
 
     @param
     def qkv_weight(self) -> Tensor["QKV", "C"]:
@@ -138,7 +145,7 @@ class Qwen3Attention:
         ...
 
     @param(frozen=True)
-    def rope_freqs(self) -> Tensor["max_seq", "D // 2", 2, "fp32"]:
+    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
         ...
 
     @forward
@@ -148,12 +155,12 @@ class Qwen3Attention:
         position_ids: Tensor["T", "int32"],
     ) -> Tensor["B", "T", "C"]:
         with graph() as g:
-            x_flat = g.view(x, shape=["B * T", "C"])
+            x_flat = g.view(x, shape=[B * T, self.C])
             if self.use_qkv_bias:
                 qkv_flat = g.matmul_bias(x_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
                 qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
-            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D])
 
             if self.use_qk_norm:
                 qkv_rope, _, _ = g.qkv_qk_norm_rope(
@@ -169,8 +176,8 @@ class Qwen3Attention:
 
             attn_out, _ = g.flash_attention(qkv_rope, causal=True)
 
-            attn_flat = g.view(attn_out, shape=["B * T", "AttnDim"])
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
             out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
-            out = g.view(out_flat, shape=["B", "T", "C"])
+            out = g.view(out_flat, shape=[B, T, self.C])
 
             return out

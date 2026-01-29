@@ -45,6 +45,16 @@ from .types import (
     ShardStrategy,
 )
 
+# First-class dimension types
+from .dim import (
+    Dim,
+    DimExpr,
+    ConcreteDimValue,
+    B,
+    T,
+    dim_to_ir,
+)
+
 from .ir import (
     GraphIR,
     ModuleIR,
@@ -140,6 +150,13 @@ __all__ = [
     "HookPoint",
     "HookMode",
     "ShardStrategy",
+    # First-class dimensions
+    "Dim",
+    "DimExpr",
+    "ConcreteDimValue",
+    "B",
+    "T",
+    "dim_to_ir",
     # IR
     "GraphIR",
     "ModuleIR",

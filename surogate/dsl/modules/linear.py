@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor
 from ..decorators import module, param, forward, save
 from ..graph_builder import graph
+from ..dim import Dim, B, T
 
 
 @module
@@ -15,9 +16,10 @@ class Linear:
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.use_bias = use_bias
-        # Derived constants (like DSL let: section)
-        self.C = in_dim
-        self.O = out_dim
+
+        # Typed dimensions bound to config parameters
+        self.C = Dim("in_dim")
+        self.O = Dim("out_dim")
 
     @param
     def weight(self) -> Tensor["O", "C"]:
@@ -34,7 +36,7 @@ class Linear:
     def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "O"]:
         with graph() as g:
             # Flatten batch dimensions
-            x_flat = g.view(x, shape=["B * T", "C"])
+            x_flat = g.view(x, shape=[B * T, self.C])
 
             # Matrix multiply (optionally fused with bias)
             if self.use_bias:
@@ -43,6 +45,6 @@ class Linear:
                 y_flat = g.matmul(x_flat, "weight", transpose="NT")
 
             # Reshape back
-            y = g.view(y_flat, shape=["B", "T", "O"])
+            y = g.view(y_flat, shape=[B, T, self.O])
 
             return y

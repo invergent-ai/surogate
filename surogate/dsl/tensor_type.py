@@ -5,31 +5,43 @@ Provides Tensor[...] syntax for annotating tensor shapes and dtypes in Python.
 
 Example:
     from surogate.dsl.tensor_type import Tensor, Array
+    from surogate.dsl.dim import Dim, B, T
 
-    def forward(x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
-        ...
+    class MyBlock:
+        def __init__(self, d_model, num_heads):
+            # Define typed dimensions bound to config parameters
+            self.C = Dim("d_model")
+            self.H = Dim("num_heads")
+            self.D = self.C // self.H  # DimExpr for computed dimensions
 
-    # With explicit dtype
-    def f(x: Tensor["M", "K", "bf16"]) -> Tensor["M", "N", "fp32"]:
-        ...
+        # Annotations use strings (evaluated at class definition time)
+        @forward
+        def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
+            # Graph operations use Dim objects (evaluated at runtime)
+            with graph() as g:
+                x_flat = g.view(x, shape=[B * T, self.C])
+                ...
 
-    # Optional tensor
-    def g(bias: Tensor["O"] | None) -> ...:
-        ...
+        # With explicit dtype
+        @param
+        def weight(self) -> Tensor["C", "C", "fp32"]:
+            ...
 
-    # Computed dimensions
-    def h(qkv: Tensor["B", "T", "Hq + 2 * Hkv", "D"]) -> ...:
-        ...
+        # Computed dimensions use string expressions
+        @param
+        def qkv_weight(self) -> Tensor["QKV", "D"]:
+            ...
 
     # Array of modules
     blocks: Array["n_layers", "Qwen3Block"]
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any, Union, TYPE_CHECKING
-import re
 
+from dataclasses import dataclass
+from typing import Any, Union, TYPE_CHECKING
+
+from .dim import Dim, DimExpr, ConcreteDimValue
 from .types import (
     Dtype,
     Shape,
@@ -38,8 +50,10 @@ from .types import (
     ConcreteDim,
     ComputedDim,
     VariadicDim,
-    Dim,
 )
+
+if TYPE_CHECKING:
+    from .types import Dim as TypeDim
 
 
 # Known dtype strings
@@ -47,8 +61,9 @@ _DTYPE_STRINGS = frozenset({
     "bf16", "fp32", "fp16", "fp8_e4m3", "fp8_e5m2", "fp4_e2m1", "int8", "int32",
 })
 
-# Pattern for computed dimensions (contains operators)
-_COMPUTED_DIM_PATTERN = re.compile(r'[+\-*/%()\s]')
+# Type for dimension in TensorAnnotation
+# Supports: strings, Dim, DimExpr, ConcreteDimValue, or int
+DimType = str | Dim | DimExpr | ConcreteDimValue
 
 
 @dataclass(frozen=True)
@@ -58,12 +73,13 @@ class TensorAnnotation:
     This is what Tensor.__class_getitem__ returns. It carries shape and dtype
     information that can be extracted at decoration time.
     """
-    dims: tuple[str | int, ...]
+
+    dims: tuple[DimType, ...]
     dtype: str = "bf16"
     optional: bool = False
 
     def __repr__(self) -> str:
-        dims_str = ", ".join(repr(d) if isinstance(d, str) else str(d) for d in self.dims)
+        dims_str = ", ".join(str(d) for d in self.dims)
         dtype_str = f", {self.dtype}" if self.dtype != "bf16" else ""
         opt_str = "?" if self.optional else ""
         return f"Tensor[{dims_str}{dtype_str}]{opt_str}"
@@ -81,23 +97,22 @@ class TensorAnnotation:
         return NotImplemented
 
     def to_type_spec(self) -> TensorTypeSpec:
-        """Convert to the existing TensorTypeSpec format."""
-        parsed_dims: list[Dim] = []
+        """Convert to the TensorTypeSpec format."""
+        parsed_dims: list[SymbolicDim | ConcreteDim | ComputedDim | VariadicDim] = []
 
         for d in self.dims:
-            if d == "*":
-                parsed_dims.append(VariadicDim())
-            elif isinstance(d, int):
-                parsed_dims.append(ConcreteDim(d))
-            elif isinstance(d, str):
-                # Check if it's a computed dimension (contains operators)
-                if _COMPUTED_DIM_PATTERN.search(d):
-                    # Extract a name from the expression (first identifier)
-                    name_match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)', d)
-                    name = name_match.group(1) if name_match else "computed"
-                    parsed_dims.append(ComputedDim(name, d))
+            if isinstance(d, str):
+                # String dimension - could be symbolic like "C" or variadic like "..."
+                if d == "...":
+                    parsed_dims.append(VariadicDim())
                 else:
                     parsed_dims.append(SymbolicDim(d))
+            elif isinstance(d, Dim):
+                parsed_dims.append(SymbolicDim(d.name))
+            elif isinstance(d, DimExpr):
+                parsed_dims.append(ComputedDim(d.to_expr_string(), d.to_expr_string()))
+            elif isinstance(d, ConcreteDimValue):
+                parsed_dims.append(ConcreteDim(d.value))
             else:
                 raise TypeError(f"Invalid dimension type: {type(d)}")
 
@@ -109,14 +124,17 @@ class _TensorMeta(type):
     """Metaclass for Tensor to support subscript syntax."""
 
     def __getitem__(cls, params: Any) -> TensorAnnotation:
-        """Handle Tensor[dim1, dim2, ...] or Tensor[dim1, dim2, dtype]."""
+        """Handle Tensor[dim1, dim2, ...] or Tensor[dim1, dim2, dtype].
+
+        Dimensions must be Dim, DimExpr, ConcreteDimValue, or int.
+        """
         if not isinstance(params, tuple):
             params = (params,)
 
         if len(params) == 0:
             raise TypeError("Tensor requires at least one dimension")
 
-        # Check if last param is a dtype
+        # Check if last param is a dtype string
         dtype = "bf16"
         dims = params
 
@@ -124,12 +142,23 @@ class _TensorMeta(type):
             dtype = params[-1].lower()
             dims = params[:-1]
 
-        # Validate dimensions
+        # Process dimensions - str, Dim, DimExpr, ConcreteDimValue, or int allowed
+        processed_dims: list[DimType] = []
         for d in dims:
-            if not isinstance(d, (str, int)):
-                raise TypeError(f"Tensor dimensions must be str or int, got {type(d)}")
+            if isinstance(d, str):
+                # String dimensions for annotations (e.g., "B", "T", "C")
+                processed_dims.append(d)
+            elif isinstance(d, (Dim, DimExpr, ConcreteDimValue)):
+                processed_dims.append(d)
+            elif isinstance(d, int):
+                processed_dims.append(ConcreteDimValue(d))
+            else:
+                raise TypeError(
+                    f"Tensor dimensions must be str, Dim, DimExpr, or int, "
+                    f"got {type(d).__name__}: {d!r}"
+                )
 
-        return TensorAnnotation(dims=dims, dtype=dtype)
+        return TensorAnnotation(dims=tuple(processed_dims), dtype=dtype)
 
     def __instancecheck__(cls, instance: Any) -> bool:
         """Allow isinstance checks."""
@@ -139,22 +168,40 @@ class _TensorMeta(type):
 class Tensor(metaclass=_TensorMeta):
     """Tensor type annotation with symbolic shape support.
 
-    Use as a type hint to annotate tensor shapes:
+    Use as a type hint to annotate tensor shapes. Annotations use STRING dimensions
+    because Python evaluates type hints at class definition time (before `self` exists).
 
-        # Basic shapes
-        x: Tensor["B", "T", "C"]              # 3D tensor with symbolic dims
-        y: Tensor["M", 4096]                   # Mixed symbolic and concrete
-        z: Tensor["*", "C"]                    # Variadic batch dimensions
+        from surogate.dsl.dim import Dim, B, T
 
-        # With explicit dtype
-        w: Tensor["K", "N", "fp32"]           # Float32 tensor
-        q: Tensor["B", "T", "H", "D", "fp8_e4m3"]  # FP8 quantized
+        class MyBlock:
+            def __init__(self, d_model, num_heads):
+                # Define typed dimensions for graph operations
+                self.C = Dim("d_model")
+                self.H = Dim("num_heads")
+                self.D = self.C // self.H
 
-        # Computed dimensions
-        qkv: Tensor["B", "T", "Hq + 2 * Hkv", "D"]  # Arithmetic on dims
+            # Annotations use strings (resolved at compile time)
+            def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
+                # Graph operations use Dim objects (evaluated at runtime)
+                with graph() as g:
+                    x_flat = g.view(x, shape=[B * T, self.C])
+                    ...
 
-        # Optional tensors
-        bias: Tensor["O"] | None              # Can be None
+            # Concrete dimensions
+            def f(self, y: Tensor["C", 4096]) -> ...:
+                ...
+
+            # With explicit dtype
+            def g(self, w: Tensor["K", "N", "fp32"]) -> ...:
+                ...
+
+            # Computed dimensions use symbolic strings
+            def h(self, qkv: Tensor["B", "T", "QKV", "D"]) -> ...:
+                ...
+
+            # Optional tensors
+            def i(self, bias: Tensor["O"] | None) -> ...:
+                ...
 
     Supported dtypes: bf16, fp32, fp16, fp8_e4m3, fp8_e5m2, fp4_e2m1, int8, int32
     """
@@ -174,6 +221,7 @@ class ArrayAnnotation:
 
     Used for repeated elements like stacked transformer blocks.
     """
+
     size: str | int
     element_type: str
 

@@ -123,17 +123,23 @@ class ComputedDim:
     """A dimension computed from other dimensions.
 
     Example:
-        ComputedDim("d_head", "d_model // num_heads")
+        ComputedDim("d_model // num_heads")
+        ComputedDim("Hq + 2 * Hkv", "Hq + 2 * Hkv")  # With optional name
     """
 
-    name: str
     expression: str
+    name: str = ""  # Optional name, defaults to expression
+
+    def __post_init__(self) -> None:
+        # If name not provided, use expression as name
+        if not self.name:
+            object.__setattr__(self, "name", self.expression)
 
     def __str__(self) -> str:
-        return f"{self.name}={self.expression}"
+        return self.expression
 
     def __repr__(self) -> str:
-        return f"ComputedDim({self.name!r}, {self.expression!r})"
+        return f"ComputedDim({self.expression!r})"
 
 
 @dataclass(frozen=True)

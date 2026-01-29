@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor
 from ..decorators import module, param, forward, save
 from ..graph_builder import graph
+from ..dim import Dim, B, T
 
 
 @module
@@ -14,9 +15,13 @@ class SwiGLUMLP:
     def __init__(self, d_model: int, d_ff: int):
         self.d_model = d_model
         self.d_ff = d_ff
-        self.C = d_model
-        self.M = d_ff
-        self.MUp = 2 * d_ff  # gate + up concatenated
+
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.M = Dim("M")
+
+        # Derived dimensions (DimExpr)
+        self.MUp = 2 * self.M  # gate + up concatenated
 
     @param
     def up_weight(self) -> Tensor["MUp", "C"]:
@@ -33,19 +38,19 @@ class SwiGLUMLP:
     def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
         with graph() as g:
             # Flatten
-            x_flat = g.view(x, shape=["B * T", "C"])
+            x_flat = g.view(x, shape=[B * T, self.C])
 
             # Up projection (gate + up combined)
             up_flat = g.matmul(x_flat, "up_weight", transpose="NT")
-            up = g.view(up_flat, shape=["B", "T", "MUp"])
+            up = g.view(up_flat, shape=[B, T, self.MUp])
 
             # SwiGLU activation
             act = g.swiglu(up)
 
             # Down projection
-            act_flat = g.view(act, shape=["B * T", "M"])
+            act_flat = g.view(act, shape=[B * T, self.M])
             y_flat = g.matmul(act_flat, "down_weight", transpose="NT")
-            y = g.view(y_flat, shape=["B", "T", "C"])
+            y = g.view(y_flat, shape=[B, T, self.C])
 
             return y
 
@@ -63,8 +68,10 @@ class GatedMLP:
         self.d_model = d_model
         self.d_ff = d_ff
         self.activation = activation
-        self.C = d_model
-        self.M = d_ff
+
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.M = Dim("M")
 
     @param
     def gate_weight(self) -> Tensor["M", "C"]:
@@ -84,7 +91,7 @@ class GatedMLP:
     @forward
     def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
         with graph() as g:
-            x_flat = g.view(x, shape=["B * T", "C"])
+            x_flat = g.view(x, shape=[B * T, self.C])
 
             # Gate and up projections
             gate_flat = g.matmul(x_flat, "gate_weight", transpose="NT")
@@ -107,6 +114,6 @@ class GatedMLP:
 
             # Down projection
             y_flat = g.matmul(hidden, "down_weight", transpose="NT")
-            y = g.view(y_flat, shape=["B", "T", "C"])
+            y = g.view(y_flat, shape=[B, T, self.C])
 
             return y

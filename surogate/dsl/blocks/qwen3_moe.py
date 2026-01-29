@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor
 from ..decorators import block, param, forward
 from ..graph_builder import graph
+from ..dim import Dim, B, T
 
 
 @block
@@ -55,19 +56,24 @@ class Qwen3MoEBlock:
         self.use_shared_expert = use_shared_expert
         self.shared_expert_intermediate = shared_expert_intermediate if shared_expert_intermediate > 0 else d_ff
 
-        # Derived constants
-        self.C = d_model
-        self.Hq = num_query_heads
-        self.Hkv = num_kv_heads
-        self.D = head_size
-        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.AttnDim = num_query_heads * head_size
-        self.M = d_ff
-        self.MUp = 2 * d_ff  # gate + up fused
-        self.E = num_experts
-        self.K = num_experts_per_tok
-        self.SharedM = self.shared_expert_intermediate
-        self.SharedMUp = 2 * self.shared_expert_intermediate
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.M = Dim("M")
+        self.MaxSeq = Dim("MaxSeq")
+        self.E = Dim("E")
+        self.K = Dim("K")
+
+        # Derived dimensions (DimExpr)
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
+        self.AttnDim = self.Hq * self.D
+        self.MUp = 2 * self.M  # gate + up fused
+
+        # Shared expert dimensions
+        self.SharedM = Dim("SharedM")
+        self.SharedMUp = 2 * self.SharedM
 
     # LayerNorm weights
     @param
@@ -107,7 +113,7 @@ class Qwen3MoEBlock:
         ...
 
     @param(frozen=True)
-    def rope_freqs(self) -> Tensor["max_seq", "D // 2", 2, "fp32"]:
+    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
         """Precomputed RoPE frequencies."""
         ...
 
@@ -118,7 +124,6 @@ class Qwen3MoEBlock:
         ...
 
     # Expert weights (batched format: [num_experts, ...])
-    # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
     @param
     def experts_gate_up(self) -> Tensor["E", "MUp", "C"]:
         """Batched expert gate+up weights [num_experts, 2*d_ff, hidden_size]."""
@@ -130,7 +135,6 @@ class Qwen3MoEBlock:
         ...
 
     # Shared expert weights (optional)
-    # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
     @param(condition=lambda self: self.use_shared_expert)
     def shared_expert_gate(self) -> Tensor["SharedM", "C"]:
         """Shared expert gate projection."""
@@ -165,12 +169,12 @@ class Qwen3MoEBlock:
             # ================================================================
             # Attention
             # ================================================================
-            ln1_flat = g.view(ln1_out, shape=["B * T", "C"])
+            ln1_flat = g.view(ln1_out, shape=[B * T, self.C])
             if self.use_qkv_bias:
                 qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
                 qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
-            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"])
+            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D])
 
             # QK-Norm + RoPE (fused)
             if self.use_qk_norm:
@@ -189,9 +193,9 @@ class Qwen3MoEBlock:
             attn_out, _ = g.flash_attention(qkv_rope, causal=True)
 
             # Output projection
-            attn_flat = g.view(attn_out, shape=["B * T", "AttnDim"])
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
             att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
-            att_out = g.view(att_out_flat, shape=["B", "T", "C"])
+            att_out = g.view(att_out_flat, shape=[B, T, self.C])
 
             # ================================================================
             # Pre-MoE norm
@@ -203,7 +207,7 @@ class Qwen3MoEBlock:
             # ================================================================
             # MoE: Router -> Experts -> Combine
             # ================================================================
-            ln2_flat = g.view(ln2_out, shape=["B * T", "C"])
+            ln2_flat = g.view(ln2_out, shape=[B * T, self.C])
 
             # Router: compute routing logits and select top-k experts
             router_logits = g.matmul(ln2_flat, "router_weight", transpose="NT")
@@ -256,6 +260,6 @@ class Qwen3MoEBlock:
                 moe_out = g.add(moe_out, shared_out)
 
             # Reshape back to (B, T, C)
-            out = g.view(moe_out, shape=["B", "T", "C"])
+            out = g.view(moe_out, shape=[B, T, self.C])
 
             return out, residual_out

@@ -61,9 +61,16 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     if (!vocab) {
         vocab = get_long("vocab");
     }
+    auto max_seq = get_long("max_seq");
+    if (!max_seq) {
+        max_seq = get_long("max_position_embeddings");
+    }
 
     if (d_model) {
         env.values.emplace("C", *d_model);
+    }
+    if (max_seq) {
+        env.values.emplace("MaxSeq", *max_seq);
     }
     if (num_q) {
         env.values.emplace("Hq", *num_q);

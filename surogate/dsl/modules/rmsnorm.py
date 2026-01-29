@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor
 from ..decorators import module, param, forward
 from ..graph_builder import graph
+from ..dim import Dim, B, T
 
 
 @module
@@ -14,7 +15,9 @@ class RMSNorm:
     def __init__(self, d_model: int, eps: float = 1e-6):
         self.d_model = d_model
         self.eps = eps
-        self.C = d_model
+
+        # Typed dimension - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
 
     @param
     def weight(self) -> Tensor["C"]:
@@ -35,7 +38,9 @@ class FusedResidualRMSNorm:
     def __init__(self, d_model: int, eps: float = 1e-6):
         self.d_model = d_model
         self.eps = eps
-        self.C = d_model
+
+        # Typed dimension - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
 
     @param
     def weight(self) -> Tensor["C"]:

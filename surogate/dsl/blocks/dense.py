@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..tensor_type import Tensor
 from ..decorators import block, param, forward
 from ..graph_builder import graph
+from ..dim import Dim, B, T
 from .common import Activation
 
 
@@ -43,15 +44,20 @@ class DenseTransformerBlock:
         self.use_qk_norm = use_qk_norm
         self.activation = activation
 
-        # Derived constants
-        self.C = d_model
-        self.Hq = num_query_heads
-        self.Hkv = num_kv_heads
-        self.D = head_size
-        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.AttnDim = num_query_heads * head_size
-        self.M = d_ff
-        self.MUp = 2 * d_ff if activation == Activation.SwiGLU else d_ff
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.M = Dim("M")
+        self.MaxSeq = Dim("MaxSeq")
+
+        # Derived dimensions (DimExpr)
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
+        self.AttnDim = self.Hq * self.D
+        # MUp depends on activation type
+        self._mup_multiplier = 2 if activation == Activation.SwiGLU else 1
+        self.MUp = self._mup_multiplier * self.M
 
     # LayerNorm weights
     @param
@@ -91,7 +97,7 @@ class DenseTransformerBlock:
         ...
 
     @param(frozen=True)
-    def rope_freqs(self) -> Tensor["max_seq", "D // 2", 2, "fp32"]:
+    def rope_freqs(self) -> Tensor["MaxSeq", "D // 2", 2, "fp32"]:
         """Precomputed RoPE frequencies."""
         ...
 
@@ -124,12 +130,12 @@ class DenseTransformerBlock:
             )
 
             # QKV projection
-            ln1_flat = g.view(ln1_out, shape=["B * T", "C"])
+            ln1_flat = g.view(ln1_out, shape=[B * T, self.C])
             if self.use_qkv_bias:
                 qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT", out_name="qkv_flat")
             else:
                 qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT", out_name="qkv_flat")
-            qkv_packed = g.view(qkv_flat, shape=["B", "T", "Hq + 2 * Hkv", "D"], out_name="qkv")
+            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D], out_name="qkv")
 
             # RoPE (with optional QK-Norm)
             if self.use_qk_norm:
@@ -151,9 +157,9 @@ class DenseTransformerBlock:
             attn_out, lse = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")
 
             # Attention output projection
-            attn_flat = g.view(attn_out, shape=["B * T", "AttnDim"])
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
             att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT", out_name="att_out_flat")
-            att_out = g.view(att_out_flat, shape=["B", "T", "C"], out_name="att_out")
+            att_out = g.view(att_out_flat, shape=[B, T, self.C], out_name="att_out")
 
             # Pre-MLP LayerNorm (fused with residual)
             res_att, ln2_out, ln2_rstd = g.fused_residual_rmsnorm(
@@ -164,9 +170,9 @@ class DenseTransformerBlock:
             )
 
             # MLP
-            ln2_flat = g.view(ln2_out, shape=["B * T", "C"])
+            ln2_flat = g.view(ln2_out, shape=[B * T, self.C])
             mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", out_name="mlp_up_flat")
-            mlp_up = g.view(mlp_up_flat, shape=["B", "T", "MUp"], out_name="mlp_up")
+            mlp_up = g.view(mlp_up_flat, shape=[B, T, self.MUp], out_name="mlp_up")
 
             # Activation
             if self.activation == Activation.SwiGLU:
@@ -179,8 +185,8 @@ class DenseTransformerBlock:
                 mlp_act = g.gelu(mlp_up, out_name="swiglu")
 
             # MLP down projection
-            mlp_act_flat = g.view(mlp_act, shape=["B * T", "M"])
+            mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M])
             out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", out_name="mlp_down_flat")
-            out = g.view(out_flat, shape=["B", "T", "C"], out_name="mlp_down")
+            out = g.view(out_flat, shape=[B, T, self.C], out_name="mlp_down")
 
             return out, res_att

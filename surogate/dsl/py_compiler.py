@@ -24,6 +24,7 @@ from .specs import (
 )
 from .graph_builder import GraphBuilder, GraphNode, GraphRef
 from .hf import FuseMapping, SplitMapping, TransformMapping
+from .dim import Dim, DimExpr, ConcreteDimValue, dim_to_ir
 
 if TYPE_CHECKING:
     from .tensor_type import TensorAnnotation
@@ -97,9 +98,36 @@ def _parse_shape_dim(dim: Any) -> Any:
     """Convert a shape dimension to IR format."""
     if isinstance(dim, int):
         return dim
-    if isinstance(dim, str):
-        return dim
+    if isinstance(dim, ConcreteDimValue):
+        return dim.value
+    if isinstance(dim, (Dim, DimExpr)):
+        return dim.to_expr_string()
     return str(dim)
+
+
+def _build_dim_map(instance: Any) -> Dict[str, str]:
+    """Build a mapping from attribute names to their Dim expression strings.
+
+    This maps annotation strings like "C", "D", "QKV" to config parameter expressions
+    like "d_model", "head_size", "(num_query_heads + 2 * num_kv_heads) * head_size".
+
+    Args:
+        instance: An instance of a block/module class with Dim attributes.
+
+    Returns:
+        Dict mapping attribute name to its expression string.
+    """
+    dim_map: Dict[str, str] = {}
+    for attr_name in dir(instance):
+        if attr_name.startswith("_"):
+            continue
+        try:
+            attr = getattr(instance, attr_name)
+            if isinstance(attr, (Dim, DimExpr, ConcreteDimValue)):
+                dim_map[attr_name] = _parse_shape_dim(attr)
+        except Exception:
+            pass
+    return dim_map
 
 
 def _tensor_annotation_to_ref(
@@ -119,33 +147,62 @@ def _tensor_annotation_to_ref(
     )
 
 
-def _param_spec_to_ref(spec: ParamSpec, config: Dict[str, Any]) -> TensorRef:
-    """Convert a ParamSpec to a TensorRef."""
+def _substitute_dim_names(expr: str, dim_map: Dict[str, str]) -> str:
+    """Substitute dimension attribute names in an expression with their config names.
+
+    For example, "D // 2" with dim_map {"D": "head_size"} becomes "head_size // 2".
+    """
+    import re
+    # Sort dim_map keys by length (longest first) to avoid partial substitutions
+    sorted_names = sorted(dim_map.keys(), key=len, reverse=True)
+    result = expr
+    for name in sorted_names:
+        # Use word boundaries to avoid partial matches (e.g., "C" shouldn't match in "MUp")
+        pattern = r'\b' + re.escape(name) + r'\b'
+        result = re.sub(pattern, dim_map[name], result)
+    return result
+
+
+def _param_spec_to_ref(
+    spec: ParamSpec,
+    config: Dict[str, Any],
+    dim_map: Optional[Dict[str, str]] = None,
+) -> TensorRef:
+    """Convert a ParamSpec to a TensorRef.
+
+    Args:
+        spec: The ParamSpec to convert.
+        config: Config dictionary with values for dimension names.
+        dim_map: Optional mapping from annotation attribute names (like "C", "D")
+                 to their Dim expression strings (like "d_model", "head_size").
+                 If provided, annotation strings will be resolved through this map.
+    """
     shape = []
+
+    def resolve_dim(dim: Any) -> Any:
+        """Resolve a dimension through dim_map and config."""
+        parsed = _parse_shape_dim(dim)
+        if isinstance(parsed, str):
+            # First try to resolve through dim_map (annotation name -> Dim expression)
+            if dim_map:
+                if parsed in dim_map:
+                    # Direct match (e.g., "C" -> "d_model")
+                    parsed = dim_map[parsed]
+                else:
+                    # Expression with dimension names (e.g., "D // 2" -> "head_size // 2")
+                    parsed = _substitute_dim_names(parsed, dim_map)
+            # Then check if it's directly in config
+            if parsed in config:
+                return config[parsed]
+        return parsed
 
     # Handle ARRAY params (e.g., blocks: Array["n_layers", "BlockType"])
     if spec.kind == ParamKind.ARRAY and spec.array_size:
-        # Array size is the first dimension
-        size_dim = spec.array_size
-        if isinstance(size_dim, str):
-            # Resolve symbolic dim from config
-            if size_dim in config:
-                shape.append(config[size_dim])
-            else:
-                shape.append(size_dim)
-        else:
-            shape.append(size_dim)
+        shape.append(resolve_dim(spec.array_size))
     elif spec.shape:
         # Regular tensor params
         for dim in spec.shape:
-            if isinstance(dim, str):
-                # Resolve symbolic dims from config
-                if dim in config:
-                    shape.append(config[dim])
-                else:
-                    shape.append(dim)
-            else:
-                shape.append(dim)
+            shape.append(resolve_dim(dim))
 
     return TensorRef(
         shape=shape,
@@ -582,35 +639,40 @@ def compile_model_spec(
         for name, mapping in spec.hf_export.mappings.items():
             ir.hf_export_mapping[name] = _serialize_hf_spec(mapping)
 
-    # Params
+    # Create instance first so we can build dim_map for param resolution
+    instance = None
+    dim_map: Dict[str, str] = {}
+    if spec.python_class:
+        try:
+            instance = object.__new__(spec.python_class)
+            for key, value in config.items():
+                setattr(instance, key, value)
+            _init_instance_from_config(instance, spec.python_class, config)
+            dim_map = _build_dim_map(instance)
+        except Exception:
+            pass
+
+    # Params - use dim_map to resolve annotation strings to Dim expressions
     for name, param_spec in spec.params.items():
         # Check condition
         if param_spec.condition:
-            # Create mock instance to evaluate condition
             try:
-                mock = object.__new__(spec.python_class)
-                for key, value in config.items():
-                    setattr(mock, key, value)
+                mock = instance if instance else object.__new__(spec.python_class)
+                if not instance:
+                    for key, value in config.items():
+                        setattr(mock, key, value)
                 if not param_spec.condition(mock):
                     continue
             except Exception:
                 pass
 
-        ir.params[name] = _param_spec_to_ref(param_spec, config)
+        ir.params[name] = _param_spec_to_ref(param_spec, config, dim_map)
 
     # Forward graph
     if spec.forward:
         forward_fn = spec.forward.graph_fn
-        if forward_fn and spec.python_class:
+        if forward_fn and instance:
             try:
-                # Create instance
-                instance = object.__new__(spec.python_class)
-                for key, value in config.items():
-                    setattr(instance, key, value)
-
-                # Initialize derived values (ignore extra config keys)
-                _init_instance_from_config(instance, spec.python_class, config)
-
                 # Capture the graph by patching graph()
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
 
@@ -647,32 +709,40 @@ def compile_block_spec(
         config=config,
     )
 
-    # Params
+    # Create instance first so we can build dim_map for param resolution
+    instance = None
+    dim_map: Dict[str, str] = {}
+    if spec.python_class:
+        try:
+            instance = object.__new__(spec.python_class)
+            for key, value in config.items():
+                setattr(instance, key, value)
+            _init_instance_from_config(instance, spec.python_class, config)
+            dim_map = _build_dim_map(instance)
+        except Exception:
+            pass
+
+    # Params - use dim_map to resolve annotation strings to Dim expressions
     for name, param_spec in spec.params.items():
         # Check condition
         if param_spec.condition:
             try:
-                mock = object.__new__(spec.python_class)
-                for key, value in config.items():
-                    setattr(mock, key, value)
+                mock = instance if instance else object.__new__(spec.python_class)
+                if not instance:
+                    for key, value in config.items():
+                        setattr(mock, key, value)
                 if not param_spec.condition(mock):
                     continue
             except Exception:
                 pass
 
-        ir.params[name] = _param_spec_to_ref(param_spec, config)
+        ir.params[name] = _param_spec_to_ref(param_spec, config, dim_map)
 
     # Forward graph
     if spec.forward:
         forward_fn = spec.forward.graph_fn
-        if forward_fn and spec.python_class:
+        if forward_fn and instance:
             try:
-                instance = object.__new__(spec.python_class)
-                for key, value in config.items():
-                    setattr(instance, key, value)
-
-                _init_instance_from_config(instance, spec.python_class, config)
-
                 # Capture the graph by patching graph()
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
 
@@ -699,31 +769,39 @@ def compile_module_spec(
         config=config,
     )
 
-    # Params
+    # Create instance first so we can build dim_map for param resolution
+    instance = None
+    dim_map: Dict[str, str] = {}
+    if spec.python_class:
+        try:
+            instance = object.__new__(spec.python_class)
+            for key, value in config.items():
+                setattr(instance, key, value)
+            _init_instance_from_config(instance, spec.python_class, config)
+            dim_map = _build_dim_map(instance)
+        except Exception:
+            pass
+
+    # Params - use dim_map to resolve annotation strings to Dim expressions
     for name, param_spec in spec.params.items():
         if param_spec.condition:
             try:
-                mock = object.__new__(spec.python_class)
-                for key, value in config.items():
-                    setattr(mock, key, value)
+                mock = instance if instance else object.__new__(spec.python_class)
+                if not instance:
+                    for key, value in config.items():
+                        setattr(mock, key, value)
                 if not param_spec.condition(mock):
                     continue
             except Exception:
                 pass
 
-        ir.params[name] = _param_spec_to_ref(param_spec, config)
+        ir.params[name] = _param_spec_to_ref(param_spec, config, dim_map)
 
     # Forward graph
     if spec.forward:
         forward_fn = spec.forward.graph_fn
-        if forward_fn and spec.python_class:
+        if forward_fn and instance:
             try:
-                instance = object.__new__(spec.python_class)
-                for key, value in config.items():
-                    setattr(instance, key, value)
-
-                _init_instance_from_config(instance, spec.python_class, config)
-
                 # Capture the graph by patching graph()
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
 
