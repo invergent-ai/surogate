@@ -1077,6 +1077,52 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
 }
 
 /**
+ * @brief Performs Tensor-based matrix multiplication with explicit alpha/beta: C = alpha * (A @ B) + beta * C
+ *
+ * This overload allows fusing scaling into the matmul epilogue for better performance.
+ * Useful for LoRA backward pass where scaling factors need to be applied.
+ *
+ * @param c [in,out] Output tensor C.
+ * @param a [in] Input tensor A.
+ * @param b [in] Input tensor B.
+ * @param bias [in] Optional bias tensor.
+ * @param scale_a [in] Scaling factor for A (FP8 only).
+ * @param scale_b [in] Scaling factor for B (FP8 only).
+ * @param handle [in] cuBLASLt handle.
+ * @param workspace [in] Workspace tensor.
+ * @param M [in] Number of rows in C.
+ * @param N [in] Number of columns in C.
+ * @param K [in] Inner dimension.
+ * @param mode [in] Transpose mode.
+ * @param alpha [in] Output scaling factor.
+ * @param beta [in] Accumulation factor.
+ * @param stream [in] CUDA stream.
+ */
+void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
+            const float* scale_a, const float* scale_b,
+            cublasLtHandle_t handle, Tensor& workspace,
+            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream) {
+    std::byte* ws = workspace.get<std::byte>();
+    std::size_t ws_size = workspace.bytes();
+
+    // Currently only BF16 is supported with explicit alpha/beta
+    // (this is the primary use case for LoRA backward)
+    if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
+        nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
+        matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, alpha, beta, stream);
+    } else {
+        // For other dtypes, fall back to the accumulate-based API
+        // Note: this loses the ability to use non-1.0 alpha values
+        bool accumulate = (beta != 0.0f);
+        matmul(c, a, b, bias, scale_a, scale_b, handle, workspace, M, N, K, mode, accumulate, stream);
+        // If alpha != 1.0, we'd need a separate scale kernel, but this shouldn't happen in practice
+        if (alpha != 1.0f && alpha != 0.0f) {
+            fprintf(stderr, "[WARNING] matmul with alpha!=1.0 not supported for dtype %d, scaling skipped\n", (int)c.DType);
+        }
+    }
+}
+
+/**
  * @brief Performs a strided matrix multiplication operation (C = A * B + Bias) with optional accumulation and scaling.
  *
  * This function acts as a high-level dispatcher that selects the appropriate implementation based on the

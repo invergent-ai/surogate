@@ -64,31 +64,32 @@ inline void backward_lora_layer(
         dL_dy_offset = 0;
     }
 
-    // intermediate = x @ A^T (BT x rank)
+    // Fused scaling approach: instead of scaling intermediate tensors separately,
+    // we fuse the scaling factor into the matmul alpha parameter for the final outputs.
+    // This eliminates 2 separate scaling kernel launches per backward_lora_layer call.
+
+    // intermediate = x @ A^T (BT x rank) - no scaling here
     matmul(intermediate, A, x, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-    if (scaling != 1.0f) {
-        vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
-    }
 
-    // dB = (x @ A^T)^T @ dL_dy
+    // dB = scaling * (x @ A^T)^T @ dL_dy - fuse scaling into matmul alpha
+    float beta_dB = accumulate ? 1.0f : 0.0f;
     matmul(dB, intermediate, dL_dy_slice, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+           handle, workspace, rank, out_features, BT, EMMTranspose::NT, scaling, beta_dB, stream);
 
-    // intermediate = B @ dL_dy^T  => (BT x rank) view
+    // intermediate = B @ dL_dy^T  => (BT x rank) view - no scaling here
     matmul(intermediate, B, dL_dy_slice, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-    if (scaling != 1.0f) {
-        vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
-    }
 
-    // dA = x^T @ (dL_dy @ B)
+    // dA = scaling * x^T @ (dL_dy @ B) - fuse scaling into matmul alpha
+    float beta_dA = accumulate ? 1.0f : 0.0f;
     matmul(dA, x, intermediate, std::nullopt, nullptr, nullptr,
-           handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+           handle, workspace, in_features, rank, BT, EMMTranspose::NT, scaling, beta_dA, stream);
 
-    // dx += (dL_dy @ B) @ A
+    // dx += scaling * (dL_dy @ B) @ A - fuse scaling into matmul alpha
+    // Note: dx is always accumulated (beta=1), and we apply scaling via alpha
     matmul(dx, A, intermediate, std::nullopt, nullptr, nullptr,
-           handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+           handle, workspace, in_features, BT, rank, EMMTranspose::NN, scaling, 1.0f, stream);
 }
 
 /**
@@ -292,96 +293,81 @@ inline void backward_lora_qkv_fused(
     // =======================================================================
     // Phase 1 & 2: For each projection, compute x @ A^T, then dB
     // This reuses x across all projections
+    // Fused scaling: scale factors are fused into matmul alpha parameter
     // =======================================================================
+
+    float beta_accum = accumulate ? 1.0f : 0.0f;
 
     if (has_q) {
         Tensor dL_dy_q = extract_slice(q_offset, q_out_features);
 
-        // intermediate1 = x @ A_q^T (BT x rank)
+        // intermediate1 = x @ A_q^T (BT x rank) - no scaling
         matmul(intermediate1, lora_q.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
 
-        // dB_q = intermediate1^T @ dL_dy_q
+        // dB_q = scaling * intermediate1^T @ dL_dy_q - fused scaling
         matmul(dB_q, intermediate1, dL_dy_q, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, q_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, q_out_features, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // intermediate2 = B_q @ dL_dy_q^T (for dA_q and dx)
+        // intermediate2 = B_q @ dL_dy_q^T (for dA_q and dx) - no scaling
         matmul(intermediate2, lora_q.B, dL_dy_q, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, q_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
 
-        // dA_q = x^T @ intermediate2
+        // dA_q = scaling * x^T @ intermediate2 - fused scaling
         matmul(dA_q, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // dx += intermediate2 @ A_q
+        // dx += scaling * intermediate2 @ A_q - fused scaling
         matmul(dx, lora_q.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, scaling, 1.0f, stream);
     }
 
     if (has_k) {
         Tensor dL_dy_k = extract_slice(k_offset, kv_out_features);
 
-        // intermediate1 = x @ A_k^T (BT x rank)
+        // intermediate1 = x @ A_k^T (BT x rank) - no scaling
         matmul(intermediate1, lora_k.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
 
-        // dB_k = intermediate1^T @ dL_dy_k
+        // dB_k = scaling * intermediate1^T @ dL_dy_k - fused scaling
         matmul(dB_k, intermediate1, dL_dy_k, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // intermediate2 = B_k @ dL_dy_k^T
+        // intermediate2 = B_k @ dL_dy_k^T - no scaling
         matmul(intermediate2, lora_k.B, dL_dy_k, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
 
-        // dA_k = x^T @ intermediate2
+        // dA_k = scaling * x^T @ intermediate2 - fused scaling
         matmul(dA_k, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // dx += intermediate2 @ A_k
+        // dx += scaling * intermediate2 @ A_k - fused scaling
         matmul(dx, lora_k.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, scaling, 1.0f, stream);
     }
 
     if (has_v) {
         Tensor dL_dy_v = extract_slice(v_offset, kv_out_features);
 
-        // intermediate1 = x @ A_v^T (BT x rank)
+        // intermediate1 = x @ A_v^T (BT x rank) - no scaling
         matmul(intermediate1, lora_v.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
 
-        // dB_v = intermediate1^T @ dL_dy_v
+        // dB_v = scaling * intermediate1^T @ dL_dy_v - fused scaling
         matmul(dB_v, intermediate1, dL_dy_v, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // intermediate2 = B_v @ dL_dy_v^T
+        // intermediate2 = B_v @ dL_dy_v^T - no scaling
         matmul(intermediate2, lora_v.B, dL_dy_v, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
 
-        // dA_v = x^T @ intermediate2
+        // dA_v = scaling * x^T @ intermediate2 - fused scaling
         matmul(dA_v, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // dx += intermediate2 @ A_v
+        // dx += scaling * intermediate2 @ A_v - fused scaling
         matmul(dx, lora_v.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, scaling, 1.0f, stream);
     }
 }
 
@@ -460,66 +446,57 @@ inline void backward_lora_mlp_up_gate_fused(
         return packed;
     };
 
+    // Fused scaling: scale factors are fused into matmul alpha parameter
+    float beta_accum = accumulate ? 1.0f : 0.0f;
+
     // Process up projection
     if (has_up) {
         Tensor dL_dy_up = extract_slice(up_offset, out_features);
 
-        // intermediate1 = x @ A_up^T
+        // intermediate1 = x @ A_up^T - no scaling
         matmul(intermediate1, lora_up.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
 
-        // dB_up = intermediate1^T @ dL_dy_up
+        // dB_up = scaling * intermediate1^T @ dL_dy_up - fused scaling
         matmul(dB_up, intermediate1, dL_dy_up, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, out_features, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // intermediate2 = B_up @ dL_dy_up^T
+        // intermediate2 = B_up @ dL_dy_up^T - no scaling
         matmul(intermediate2, lora_up.B, dL_dy_up, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
 
-        // dA_up = x^T @ intermediate2
+        // dA_up = scaling * x^T @ intermediate2 - fused scaling
         matmul(dA_up, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // dx += intermediate2 @ A_up
+        // dx += scaling * intermediate2 @ A_up - fused scaling
         matmul(dx, lora_up.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, scaling, 1.0f, stream);
     }
 
     // Process gate projection
     if (has_gate) {
         Tensor dL_dy_gate = extract_slice(gate_offset, out_features);
 
-        // intermediate1 = x @ A_gate^T
+        // intermediate1 = x @ A_gate^T - no scaling
         matmul(intermediate1, lora_gate.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
 
-        // dB_gate = intermediate1^T @ dL_dy_gate
+        // dB_gate = scaling * intermediate1^T @ dL_dy_gate - fused scaling
         matmul(dB_gate, intermediate1, dL_dy_gate, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, rank, out_features, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // intermediate2 = B_gate @ dL_dy_gate^T
+        // intermediate2 = B_gate @ dL_dy_gate^T - no scaling
         matmul(intermediate2, lora_gate.B, dL_dy_gate, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
 
-        // dA_gate = x^T @ intermediate2
+        // dA_gate = scaling * x^T @ intermediate2 - fused scaling
         matmul(dA_gate, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+               handle, workspace, in_features, rank, BT, EMMTranspose::NT, scaling, beta_accum, stream);
 
-        // dx += intermediate2 @ A_gate
+        // dx += scaling * intermediate2 @ A_gate - fused scaling
         matmul(dx, lora_gate.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, scaling, 1.0f, stream);
     }
 }
 

@@ -161,9 +161,21 @@ void matmul(nv_bfloat16* c, const __nv_fp8_e4m3* a, const __nv_fp8_e5m2* b, cons
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
 
+// Matmul with explicit alpha/beta: C = alpha * (A @ B) + beta * C
+// Raw pointer overloads with alpha/beta for fused scaling
+void matmul(nv_bfloat16* c, const nv_bfloat16* a, const nv_bfloat16* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
+            cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream);
+
 void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, Tensor& workspace,
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+
+// Matmul with explicit alpha/beta: C = alpha * (A @ B) + beta * C
+// This allows fusing scaling into the matmul epilogue for better performance.
+void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias, const float* scale_a, const float* scale_b,
+            cublasLtHandle_t handle, Tensor& workspace,
+            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream);
 
 // Initialize fallback cuBLAS handle used when cuBLASLt matmul fails.
 // Call once during startup (before CUDA graph capture) to avoid cublasCreate in capture.
