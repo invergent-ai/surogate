@@ -86,10 +86,19 @@ void GraphExecutor::recompute_attention_segment(int layer_idx, long B, long T) {
         return "blocks[" + std::to_string(layer_idx) + "]." + field;
     };
 
-    // Get residual input to this layer
+    // When residual offloading is enabled, we need to fetch the residual back from CPU
+    // before recomputation can use it. This is critical for the combination of
+    // offload_residual + recompute + LoRA which needs residuals during backward.
+    // NOTE: The residual INPUT to layer L is res_ffn[L-1] (output of previous layer).
+    // So we fetch layer_idx - 1, not layer_idx.
+    if (layer_idx > 0 && rs.has_residual_offloading()) {
+        rs.fetch_residual(layer_idx - 1, rs.side_stream());
+    }
+
+    // Get residual input to this layer (res_ffn[layer_idx - 1] for layer > 0)
     Tensor& res_in = (layer_idx == 0)
         ? rs.non_block_activations().encoded
-        : rs.get_residual(layer_idx, rs.MainStream);
+        : rs.get_residual(layer_idx - 1, rs.MainStream);
 
     // In FFT mode (not LoRA-only), we save qkv/att/att_out/lse per-layer from the forward pass.
     // We only need to recompute LN1 (bit-exact from saved rstd) since ln1 buffer is shared.
@@ -435,10 +444,19 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
         return "blocks[" + std::to_string(layer_idx) + "]." + field;
     };
 
-    // Get residual input: for FFN, this is residual + att_out
+    // When residual offloading is enabled, we need to fetch the residual back from CPU
+    // before recomputation can use it. This is critical for the combination of
+    // offload_residual + recompute + LoRA which needs residuals during backward.
+    // NOTE: The residual INPUT to layer L is res_ffn[L-1] (output of previous layer).
+    // So we fetch layer_idx - 1, not layer_idx.
+    if (layer_idx > 0 && rs.has_residual_offloading()) {
+        rs.fetch_residual(layer_idx - 1, rs.side_stream());
+    }
+
+    // Get residual input: for FFN, this is residual + att_out (res_ffn[layer_idx - 1] for layer > 0)
     Tensor& res_in = (layer_idx == 0)
         ? rs.non_block_activations().encoded
-        : rs.get_residual(layer_idx, rs.MainStream);
+        : rs.get_residual(layer_idx - 1, rs.MainStream);
 
     // In FFT mode (not LoRA-only), we save mlp_up/swiglu per-layer from the forward pass.
     // We only need to recompute LN2 and residual_att (bit-exact from saved inputs).

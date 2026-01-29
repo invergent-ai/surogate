@@ -312,15 +312,27 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 auto& da = rs.simplified_grads(layer_idx);
 
                 // Get ln2 input: either from stored activation or recompute from residual stream
+                // LN2 input is residual_att = res_ffn[L-1] + att_out[L]
                 Tensor ln2_input;
                 if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
                         const std::string ln2_name = "blocks[" + std::to_string(layer_idx) + "].ln2_weight";
                         Tensor& ln2_weight = mParams->get(ln2_name);
-                        Tensor ln2_residual = a.residual_att.Data
-                            ? a.residual_att
-                            : (layer_idx == 0 ? rs.non_block_activations().encoded
-                                              : rs.get_residual(layer_idx, stream));
+                        // Prefer using recomputed residual_att from simplified_acts.
+                        // Fallback uses res_ffn[L-1], but this path shouldn't be hit
+                        // when recompute is working correctly since residual_att should be populated.
+                        Tensor ln2_residual;
+                        if (a.residual_att.Data) {
+                            ln2_residual = a.residual_att;
+                        } else if (layer_idx == 0) {
+                            ln2_residual = rs.non_block_activations().encoded;
+                        } else {
+                            // Ensure residual is fetched when offloading is enabled
+                            if (rs.has_residual_offloading()) {
+                                rs.fetch_residual(layer_idx - 1, rs.side_stream());
+                            }
+                            ln2_residual = rs.get_residual(layer_idx - 1, stream);
+                        }
                         ln2_input = recompute_lora_rmsnorm(*mLoRARunState, ln2_residual, ln2_weight,
                                                           mModelConfig.RmsNormEps, B, T, C, stream);
                     } else {
@@ -404,13 +416,22 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 auto& da = rs.simplified_grads(layer_idx);
 
                 // Get ln1 input: either from stored activation or recompute from residual
+                // LN1 input is res_ffn[L-1] (output of previous layer) for layer L > 0
                 Tensor ln1_input;
                 if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
                         const std::string ln1_name = "blocks[" + std::to_string(layer_idx) + "].ln1_weight";
                         Tensor& ln1_weight = mParams->get(ln1_name);
-                        Tensor ln1_residual = (layer_idx == 0) ? rs.non_block_activations().encoded
-                                                               : rs.get_residual(layer_idx, stream);
+                        Tensor ln1_residual;
+                        if (layer_idx == 0) {
+                            ln1_residual = rs.non_block_activations().encoded;
+                        } else {
+                            // Ensure residual is fetched when offloading is enabled
+                            if (rs.has_residual_offloading()) {
+                                rs.fetch_residual(layer_idx - 1, rs.side_stream());
+                            }
+                            ln1_residual = rs.get_residual(layer_idx - 1, stream);
+                        }
                         ln1_input = recompute_lora_rmsnorm(*mLoRARunState, ln1_residual, ln1_weight,
                                                           mModelConfig.RmsNormEps, B, T, C, stream);
                     } else {

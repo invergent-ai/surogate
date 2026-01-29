@@ -3664,11 +3664,18 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
     if (ln_layer_idx >= 0 && ln_field == "ln1_weight") {
         // LN1 backward expects residual_out from the forward fused residual op.
-        // In the DSL graphs, res_ffn is stored per-layer at index L.
+        // The residual INPUT to layer L is res_ffn[L-1] (output of previous layer).
+        // For layer 0, the input is encoded (embeddings + position encoding).
         if (ln_layer_idx == 0) {
             residual_out_ptr = &mRunState.non_block_activations().encoded;
         } else {
-            residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
+            // Ensure residual is fetched from CPU if offloading is enabled.
+            // The recompute function should have done this, but fetch again for safety
+            // (e.g., FFT mode where recompute may be skipped).
+            if (mRunState.has_residual_offloading()) {
+                mRunState.fetch_residual(ln_layer_idx - 1, mRunState.side_stream());
+            }
+            residual_out_ptr = &mRunState.get_residual(ln_layer_idx - 1, mRunState.MainStream);
         }
     }
     // FIX: LN2 backward needs the recomputed residual_att from simplified_acts.
