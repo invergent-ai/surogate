@@ -11,6 +11,7 @@
 #include "dsl/graph_executor_internal.h"
 #include "dsl/graph_executor_tensors.h"
 #include "dsl/graph_executor_utils.h"
+#include "dsl/recompute_plan.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -417,6 +418,13 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     // Initialize forward plan storage (one per layer)
     if (mForwardPlan.size() != static_cast<std::size_t>(mConfig.NumLayers)) {
         mForwardPlan.resize(static_cast<std::size_t>(mConfig.NumLayers));
+    }
+
+    // Initialize recompute plan from DSL activation layout (if present)
+    mRecomputePlan.reset();
+    if (mModule.activation_layout.has_value()) {
+        mRecomputePlan = std::make_unique<RecomputePlan>();
+        mRecomputePlan->init_from_layout(mModule.activation_layout.value(), mModule.config, mConfig);
     }
 
     // Initialize compiled execution

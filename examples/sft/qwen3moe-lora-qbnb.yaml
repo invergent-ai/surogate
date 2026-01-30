@@ -9,8 +9,9 @@ gradient_accumulation_steps: 4
 
 sample_packing: true
 sequence_len: 512
+gpus: 1
 
-num_epochs: 2
+max_steps: 5
 eval_steps: 25
 save_steps: 0
 
@@ -21,6 +22,7 @@ lmhead_chunks: 8
 warmup_steps: 20
 use_cuda_graphs: false
 use_dsl_ir: true
+recompute: false
 
 lora: true
 lora_rank: 16

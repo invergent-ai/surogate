@@ -1,11 +1,11 @@
-model: Qwen/Qwen3-1.7B
+model: Qwen/Qwen3-0.6B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
-max_steps: 20
+max_steps: 10
 
 sample_packing: true
 sequence_len: 2048

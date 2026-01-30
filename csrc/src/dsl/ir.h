@@ -126,6 +126,13 @@ struct ActivationSlotIR {
     std::string shares_with;                   ///< If memory_hint == Shared, slot to share with
     bool save_for_backward = false;            ///< Add to forward save list
     bool recompute_in_backward = false;        ///< Can be recomputed instead of saved
+    std::vector<std::string> recompute_from;   ///< Dependencies for recompute
+    std::string recompute_op;                  ///< Recompute op type (dispatch key)
+    AttrMap recompute_attrs;                   ///< Recompute op attributes
+    std::string recompute_policy;              ///< "always", "lora_only", "never"
+    std::string recompute_group;               ///< Group ID for multi-output ops
+    std::vector<std::string> recompute_outputs;///< Explicit recompute outputs
+    std::vector<std::string> lora_targets;     ///< LoRA targets for matmul recompute
     std::string gradient_of;                   ///< For gradient slots: corresponding forward activation
     std::string condition;                     ///< Condition expression (e.g., "use_qk_norm")
     std::string description;                   ///< Documentation

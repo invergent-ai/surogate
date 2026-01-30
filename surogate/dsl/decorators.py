@@ -462,6 +462,13 @@ class Activation:
         save: bool = False,
         recompute: bool = False,
         shares_with: str | None = None,
+        recompute_from: list[str] | None = None,
+        recompute_op: str | None = None,
+        recompute_attrs: dict[str, Any] | None = None,
+        recompute_policy: str = "always",
+        recompute_group: str | None = None,
+        recompute_outputs: list[str] | None = None,
+        lora_targets: list[str] | None = None,
         when: str | Callable[[Any], bool] | None = None,
         scope: str = "block",
         description: str | None = None,
@@ -478,6 +485,13 @@ class Activation:
         self.save = save
         self.recompute = recompute
         self.shares_with = shares_with
+        self.recompute_from = recompute_from or []
+        self.recompute_op = recompute_op
+        self.recompute_attrs = recompute_attrs or {}
+        self.recompute_policy = recompute_policy
+        self.recompute_group = recompute_group
+        self.recompute_outputs = recompute_outputs or []
+        self.lora_targets = lora_targets or []
         self.when = when
         self.scope = scope
         self.description = description
@@ -498,6 +512,20 @@ class Activation:
             parts.append(", save=True")
         if self.recompute:
             parts.append(", recompute=True")
+        if self.recompute_from:
+            parts.append(f", recompute_from={self.recompute_from!r}")
+        if self.recompute_op:
+            parts.append(f", recompute_op={self.recompute_op!r}")
+        if self.recompute_attrs:
+            parts.append(f", recompute_attrs={self.recompute_attrs!r}")
+        if self.recompute_policy != "always":
+            parts.append(f", recompute_policy={self.recompute_policy!r}")
+        if self.recompute_group:
+            parts.append(f", recompute_group={self.recompute_group!r}")
+        if self.recompute_outputs:
+            parts.append(f", recompute_outputs={self.recompute_outputs!r}")
+        if self.lora_targets:
+            parts.append(f", lora_targets={self.lora_targets!r}")
         if self.shares_with:
             parts.append(f", shares_with={self.shares_with!r}")
         if self.when:
@@ -530,9 +558,11 @@ class Activation:
 
         # Build condition lambda if needed
         condition = None
+        condition_expr = None
         if self.when is not None:
             if isinstance(self.when, str):
                 attr_name = self.when
+                condition_expr = attr_name
                 condition = lambda self, attr=attr_name: getattr(self, attr)
             else:
                 condition = self.when
@@ -547,7 +577,15 @@ class Activation:
             shares_with=self.shares_with,
             save_for_backward=self.save,
             recompute_in_backward=self.recompute,
+            recompute_from=list(self.recompute_from),
+            recompute_op=self.recompute_op,
+            recompute_attrs=dict(self.recompute_attrs),
+            recompute_policy=self.recompute_policy,
+            recompute_group=self.recompute_group,
+            recompute_outputs=list(self.recompute_outputs),
+            lora_targets=list(self.lora_targets),
             condition=condition,
+            condition_expr=condition_expr,
             description=self.description,
         )
 
@@ -620,9 +658,11 @@ class Gradient:
         memory_hint = ActivationMemoryHint.SHARED if self.shares_with else ActivationMemoryHint.PERSISTENT
 
         condition = None
+        condition_expr = None
         if self.when is not None:
             if isinstance(self.when, str):
                 attr_name = self.when
+                condition_expr = attr_name
                 condition = lambda self, attr=attr_name: getattr(self, attr)
             else:
                 condition = self.when
@@ -644,6 +684,7 @@ class Gradient:
             shares_with=self.shares_with,
             gradient_of=self.gradient_of,
             condition=condition,
+            condition_expr=condition_expr,
             description=self.description,
         )
 

@@ -22,6 +22,7 @@
 #include "dsl/forward_plan.h"
 #include "dsl/graph_executor_helpers.h"
 #include "dsl/graph_executor_utils.h"
+#include "dsl/recompute_plan.h"
 #include "kernels/kernels.h"
 #include "modules/lora/lora_model_utils.h"
 #include "modules/lora/lora_run_state.h"
@@ -561,10 +562,12 @@ void GraphExecutor::recompute_ffn_segment(int layer_idx, long B, long T) {
 
 void GraphExecutor::recompute_block(int layer_idx, long B, long T) {
     if (!mOptions.recompute_enabled()) return;
-
-    // Execute both segments in order
-    recompute_attention_segment(layer_idx, B, T);
-    recompute_ffn_segment(layer_idx, B, T);
+    if (!mRecomputePlan || mRecomputePlan->empty()) {
+        throw std::runtime_error("DSL recompute plan missing; hardcoded path removed");
+    }
+    mRecomputePlan->execute_layer(*this, layer_idx, B, T,
+                                  mRunState.is_lora_only_mode(),
+                                  mRunState.MainStream);
 }
 
 }  // namespace dsl

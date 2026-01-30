@@ -138,6 +138,13 @@ void TensorSlotRegistry::init_from_layout(const ActivationLayoutIR& layout) {
         entry.dtype = slot_ir.dtype;
         entry.save_for_backward = slot_ir.save_for_backward;
         entry.recompute_in_backward = slot_ir.recompute_in_backward;
+        entry.recompute_from = slot_ir.recompute_from;
+        entry.recompute_op = slot_ir.recompute_op;
+        entry.recompute_attrs = slot_ir.recompute_attrs;
+        entry.recompute_policy = slot_ir.recompute_policy;
+        entry.recompute_group = slot_ir.recompute_group;
+        entry.recompute_outputs = slot_ir.recompute_outputs;
+        entry.lora_targets = slot_ir.lora_targets;
         entry.memory_hint = slot_ir.memory_hint;
         entry.shares_with = slot_ir.shares_with;
         entry.condition = slot_ir.condition;

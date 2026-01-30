@@ -92,8 +92,16 @@ class ActivationSlotIR:
     shares_with: Optional[str] = None
     save_for_backward: bool = False
     recompute_in_backward: bool = False
+    recompute_from: List[str] = field(default_factory=list)
+    recompute_op: Optional[str] = None
+    recompute_attrs: Dict[str, Any] = field(default_factory=dict)
+    recompute_policy: str = "always"
+    recompute_group: Optional[str] = None
+    recompute_outputs: List[str] = field(default_factory=list)
+    lora_targets: List[str] = field(default_factory=list)
     gradient_of: Optional[str] = None
     slot_index: int = -1  # Index in the activation struct
+    condition: Optional[str] = None
     description: Optional[str] = None
 
 
@@ -345,8 +353,16 @@ def _compile_activation_slot(
         shares_with=slot.shares_with,
         save_for_backward=slot.save_for_backward,
         recompute_in_backward=slot.recompute_in_backward,
+        recompute_from=list(slot.recompute_from),
+        recompute_op=slot.recompute_op,
+        recompute_attrs=dict(slot.recompute_attrs),
+        recompute_policy=slot.recompute_policy,
+        recompute_group=slot.recompute_group,
+        recompute_outputs=list(slot.recompute_outputs),
+        lora_targets=list(slot.lora_targets),
         gradient_of=slot.gradient_of,
         slot_index=slot_index,
+        condition=slot.condition_expr,
         description=slot.description,
     )
 
@@ -1115,8 +1131,24 @@ def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
         result["save_for_backward"] = True
     if slot.recompute_in_backward:
         result["recompute_in_backward"] = True
+    if slot.recompute_from:
+        result["recompute_from"] = list(slot.recompute_from)
+    if slot.recompute_op:
+        result["recompute_op"] = slot.recompute_op
+    if slot.recompute_attrs:
+        result["recompute_attrs"] = slot.recompute_attrs
+    if slot.recompute_policy and slot.recompute_policy != "always":
+        result["recompute_policy"] = slot.recompute_policy
+    if slot.recompute_group:
+        result["recompute_group"] = slot.recompute_group
+    if slot.recompute_outputs:
+        result["recompute_outputs"] = list(slot.recompute_outputs)
+    if slot.lora_targets:
+        result["lora_targets"] = list(slot.lora_targets)
     if slot.gradient_of:
         result["gradient_of"] = slot.gradient_of
+    if slot.condition:
+        result["condition"] = slot.condition
     if slot.description:
         result["description"] = slot.description
     return result

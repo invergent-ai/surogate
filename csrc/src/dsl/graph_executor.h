@@ -45,6 +45,7 @@ class CompiledExecutor;
 struct CompiledGraph;
 struct FP8WeightCacheEntry;
 struct FP4WeightCacheEntry;
+class RecomputePlan;
 }
 
 namespace dsl {
@@ -154,6 +155,7 @@ public:
     bool internal_graphs_enabled() const override;
 
 private:
+    friend class RecomputePlan;
     void init(const GraphExecutorOptions& options);
     void reset_cuda_graphs();
     void reset_forward_plan();
@@ -213,6 +215,7 @@ private:
     Tensor mLastInputsCpu{};
     bool mFP8ScalingInitialized = false;
     std::vector<LayerForwardPlan> mForwardPlan;
+    std::unique_ptr<RecomputePlan> mRecomputePlan;
 
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
@@ -268,15 +271,10 @@ private:
     bool mPerLayerGraphsEnabled = false;
 
     // ========================================================================
-    // Segment-based recomputation system
+    // DSL-driven recomputation (plan-based)
     // ========================================================================
-    // Recomputation is organized into segments that can be executed atomically.
-    // This ensures correct dependency ordering and numerical consistency.
-    //
-    // Segments:
-    //   - Attention: ln1 -> qkv -> rope -> attention -> out_proj
-    //   - FFN: ln2 -> mlp_up -> swiglu
-    //
+    // Legacy segment-based helpers remain for reference but are no longer used
+    // once the recompute plan is wired into the backward path.
 
     // Execute attention segment recomputation for a layer
     void recompute_attention_segment(int layer_idx, long B, long T);

@@ -1997,6 +1997,18 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         return;
     }
 
+    auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
+        if (!mRecomputeEnabled || !mSlotRegistry) {
+            return false;
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(tensor_name, layer_idx, field)) {
+            return mSlotRegistry->can_recompute(strip_ssa_suffix(field));
+        }
+        return mSlotRegistry->can_recompute(strip_ssa_suffix(tensor_name));
+    };
+
     for (const auto& name : save_list) {
         // First check the tensor map (intermediate tensors)
         auto it = mTensorMap.find(name);
@@ -2042,6 +2054,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
 
                 (*mSaved)[name] = saved_tensor;
+            } else if (prefer_live_tensor(name)) {
+                // Recompute-enabled: keep metadata only, resolve live buffer at backward time.
+                Tensor meta = it->second;
+                meta.Data = nullptr;
+                (*mSaved)[name] = meta;
             } else {
                 // Non-MoE tensor: just store reference (existing behavior)
                 (*mSaved)[name] = it->second;
@@ -2051,11 +2068,23 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
 
         // Check special tensors
         if (name == "token_ids") {
-            (*mSaved)[name] = mRunState.Inputs;
+            if (prefer_live_tensor(name)) {
+                Tensor meta = mRunState.Inputs;
+                meta.Data = nullptr;
+                (*mSaved)[name] = meta;
+            } else {
+                (*mSaved)[name] = mRunState.Inputs;
+            }
             continue;
         }
         if (name == "position_ids") {
-            (*mSaved)[name] = mRunState.PositionIDs;
+            if (prefer_live_tensor(name)) {
+                Tensor meta = mRunState.PositionIDs;
+                meta.Data = nullptr;
+                (*mSaved)[name] = meta;
+            } else {
+                (*mSaved)[name] = mRunState.PositionIDs;
+            }
             continue;
         }
 
@@ -2068,48 +2097,81 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         if (parse_block_param(name, layer_idx, field)) {
             ref.layer_idx = layer_idx;
             // Map common saved fields
+            const bool prefer_live = prefer_live_tensor(name);
             if (field == "ln1_rstd") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).ln1_rstd;
+                Tensor t = mRunState.simplified_acts(layer_idx).ln1_rstd;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "ln2_rstd") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).ln2_rstd;
+                Tensor t = mRunState.simplified_acts(layer_idx).ln2_rstd;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "q_rstd") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).q_rstd;
+                Tensor t = mRunState.simplified_acts(layer_idx).q_rstd;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "k_rstd") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).k_rstd;
+                Tensor t = mRunState.simplified_acts(layer_idx).k_rstd;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "lse") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).lse;
+                Tensor t = mRunState.simplified_acts(layer_idx).lse;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "ln1" || field == "ln1_flat") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).ln1;
+                Tensor t = mRunState.simplified_acts(layer_idx).ln1;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "ln2" || field == "ln2_flat") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).ln2;
+                Tensor t = mRunState.simplified_acts(layer_idx).ln2;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "qkv" || field == "qkv_rope") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).qkv;
+                Tensor t = mRunState.simplified_acts(layer_idx).qkv;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "qkv_flat") {
                 // Save the flattened version for matmul backward shape resolution
                 Tensor qkv = mRunState.simplified_acts(layer_idx).qkv;
                 Tensor flat = view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+                if (prefer_live) flat.Data = nullptr;
                 (*mSaved)[name] = flat;
             } else if (field == "att" || field == "att_flat") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).att;
+                Tensor t = mRunState.simplified_acts(layer_idx).att;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "att_out" || field == "att_out_flat") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).att_out;
+                Tensor t = mRunState.simplified_acts(layer_idx).att_out;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "mlp_up" || field == "mlp_up_flat") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).mlp_up;
+                Tensor t = mRunState.simplified_acts(layer_idx).mlp_up;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "swiglu") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).swiglu;
+                Tensor t = mRunState.simplified_acts(layer_idx).swiglu;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "swiglu_flat") {
                 Tensor swiglu = mRunState.simplified_acts(layer_idx).swiglu;
                 Tensor flat = view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+                if (prefer_live) flat.Data = nullptr;
                 (*mSaved)[name] = flat;
             } else if (field == "mlp_down" || field == "mlp_down_flat") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).mlp_down;
+                Tensor t = mRunState.simplified_acts(layer_idx).mlp_down;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "res_att" || field == "residual_att") {
-                (*mSaved)[name] = mRunState.simplified_acts(layer_idx).residual_att;
+                Tensor t = mRunState.simplified_acts(layer_idx).residual_att;
+                if (prefer_live) t.Data = nullptr;
+                (*mSaved)[name] = t;
             } else if (field == "res_ffn" || field == "residual_ffn") {
                 // res_ffn is computed dynamically (residual_att + mlp_down), check mTensorMap
                 auto it = mTensorMap.find(name);
                 if (it != mTensorMap.end()) {
-                    (*mSaved)[name] = it->second;
+                    Tensor t = it->second;
+                    if (prefer_live) t.Data = nullptr;
+                    (*mSaved)[name] = t;
                 } else {
                     throw std::runtime_error("CompiledExecutor: res_ffn tensor not found in map: " + name);
                 }
@@ -2119,18 +2181,27 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
             }
         } else if (name == "ln_final" || name == "xF") {
-            (*mSaved)[name] = mRunState.non_block_activations().ln_final;
+            Tensor t = mRunState.non_block_activations().ln_final;
+            if (prefer_live_tensor(name)) t.Data = nullptr;
+            (*mSaved)[name] = t;
         } else if (name == "xF_flat") {
             // Save the flattened version for matmul backward
             Tensor ln_final = mRunState.non_block_activations().ln_final;
             Tensor flat = view_tensor(ln_final, {ln_final.Sizes[0] * ln_final.Sizes[1], ln_final.Sizes[2]});
+            if (prefer_live_tensor(name)) flat.Data = nullptr;
             (*mSaved)[name] = flat;
         } else if (name == "ln_final_rstd") {
-            (*mSaved)[name] = mRunState.non_block_activations().ln_final_rstd;
+            Tensor t = mRunState.non_block_activations().ln_final_rstd;
+            if (prefer_live_tensor(name)) t.Data = nullptr;
+            (*mSaved)[name] = t;
         } else if (name == "encoded" || name == "x0") {
-            (*mSaved)[name] = mRunState.non_block_activations().encoded;
+            Tensor t = mRunState.non_block_activations().encoded;
+            if (prefer_live_tensor(name)) t.Data = nullptr;
+            (*mSaved)[name] = t;
         } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-            (*mSaved)[name] = mRunState.non_block_activations().freq_cis;
+            Tensor t = mRunState.non_block_activations().freq_cis;
+            if (prefer_live_tensor(name)) t.Data = nullptr;
+            (*mSaved)[name] = t;
         } else if (mWeights.has(name)) {
             (*mSaved)[name] = mWeights.get(name);
         } else {
@@ -4135,19 +4206,12 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
     if (ln_layer_idx >= 0 && ln_field == "ln1_weight") {
         // LN1 backward expects residual_out from the forward fused residual op.
-        // The residual INPUT to layer L is res_ffn[L-1] (output of previous layer).
-        // For layer 0, the input is encoded (embeddings + position encoding).
-        if (ln_layer_idx == 0) {
-            residual_out_ptr = &mRunState.non_block_activations().encoded;
-        } else {
-            // Ensure residual is fetched from CPU if offloading is enabled.
-            // The recompute function should have done this, but fetch again for safety
-            // (e.g., FFT mode where recompute may be skipped).
-            if (mRunState.has_residual_offloading()) {
-                mRunState.fetch_residual(ln_layer_idx - 1, mRunState.side_stream());
-            }
-            residual_out_ptr = &mRunState.get_residual(ln_layer_idx - 1, mRunState.MainStream);
+        // In the DSL graph, residual_out is res_ffn for the SAME layer index.
+        // Ensure the correct per-layer residual buffer is used (especially with offloading).
+        if (mRunState.has_residual_offloading()) {
+            mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
         }
+        residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
     }
     // FIX: LN2 backward needs the recomputed residual_att from simplified_acts.
     // The backward graph may have wrong tensor names for the last layer (e.g., "StackedBlocks_N"

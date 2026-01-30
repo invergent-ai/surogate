@@ -86,11 +86,21 @@ class ActivationSlotSpec:
     # If memory_hint == RECOMPUTE, specifies when to recompute
     recompute_in_backward: bool = False
 
+    # Recompute metadata (optional)
+    recompute_from: list[str] = field(default_factory=list)
+    recompute_op: str | None = None
+    recompute_attrs: dict[str, Any] = field(default_factory=dict)
+    recompute_policy: str = "always"
+    recompute_group: str | None = None
+    recompute_outputs: list[str] = field(default_factory=list)
+    lora_targets: list[str] = field(default_factory=list)
+
     # For gradient slots, the corresponding forward activation
     gradient_of: str | None = None
 
     # Condition for optional slots (e.g., only allocate if use_qk_norm)
     condition: Callable[[Any], bool] | None = None
+    condition_expr: str | None = None
 
     # Documentation
     description: str | None = None

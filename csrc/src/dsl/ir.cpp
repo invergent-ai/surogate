@@ -235,6 +235,27 @@ ActivationSlotIR parse_activation_slot(const nlohmann::json& slot_json) {
     slot.shares_with = slot_json.value("shares_with", "");
     slot.save_for_backward = slot_json.value("save_for_backward", false);
     slot.recompute_in_backward = slot_json.value("recompute_in_backward", false);
+    if (slot_json.contains("recompute_from") && slot_json["recompute_from"].is_array()) {
+        for (const auto& dep : slot_json["recompute_from"]) {
+            slot.recompute_from.push_back(dep.get<std::string>());
+        }
+    }
+    slot.recompute_op = slot_json.value("recompute_op", "");
+    if (slot_json.contains("recompute_attrs") && slot_json["recompute_attrs"].is_object()) {
+        slot.recompute_attrs = parse_attr_map(slot_json["recompute_attrs"]);
+    }
+    slot.recompute_policy = slot_json.value("recompute_policy", "");
+    slot.recompute_group = slot_json.value("recompute_group", "");
+    if (slot_json.contains("recompute_outputs") && slot_json["recompute_outputs"].is_array()) {
+        for (const auto& out : slot_json["recompute_outputs"]) {
+            slot.recompute_outputs.push_back(out.get<std::string>());
+        }
+    }
+    if (slot_json.contains("lora_targets") && slot_json["lora_targets"].is_array()) {
+        for (const auto& target : slot_json["lora_targets"]) {
+            slot.lora_targets.push_back(target.get<std::string>());
+        }
+    }
     slot.gradient_of = slot_json.value("gradient_of", "");
     slot.condition = slot_json.value("condition", "");
     slot.description = slot_json.value("description", "");
