@@ -306,7 +306,14 @@ GraphCompiler::GraphCompiler(const Module& module,
     , mOptions(options)
     , mWeights(weights)
     , mGrads(grads)
-{}
+{
+    // Initialize slot registry from DSL layout (no built-in fallback - all slots must be
+    // explicitly declared in Python DSL)
+    if (mModule.activation_layout.has_value()) {
+        mSlotRegistry.init_from_layout(*mModule.activation_layout);
+    }
+    // If no layout, registry remains empty - all tensors will use Mapped slot
+}
 
 void GraphCompiler::update_dimensions(long B, long T) {
     mB = B;
@@ -379,91 +386,26 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         // The DSL IR generates unique tensor names with suffixes like _0, _7, _10, etc.
         const std::string base_field = strip_ssa_suffix(field);
 
-        // Map field to slot using the base field name (without SSA suffix)
-        if (base_field == "ln1" || base_field == "ln1_flat") {
-            ref.slot = TensorSlot::BlockLN1;
-        } else if (base_field == "ln1_rstd") {
-            ref.slot = TensorSlot::BlockLN1RSTD;
-        } else if (base_field == "ln2" || base_field == "ln2_flat") {
-            ref.slot = TensorSlot::BlockLN2;
-        } else if (base_field == "ln2_rstd") {
-            ref.slot = TensorSlot::BlockLN2RSTD;
-        } else if (base_field == "q_rstd") {
-            ref.slot = TensorSlot::BlockQRSTD;
-        } else if (base_field == "k_rstd") {
-            ref.slot = TensorSlot::BlockKRSTD;
-        } else if (base_field == "qkv" || base_field == "qkv_flat" || base_field == "qkv_biased") {
-            ref.slot = TensorSlot::BlockQKV;
-        } else if (base_field == "qkv_rope") {
-            ref.slot = TensorSlot::BlockQKVRoPE;
-        } else if (base_field == "lse") {
-            ref.slot = TensorSlot::BlockLSE;
-        } else if (base_field == "att" || base_field == "att_flat" || base_field == "attn") {
-            ref.slot = TensorSlot::BlockAtt;
-        } else if (base_field == "att_out" || base_field == "att_out_flat") {
-            ref.slot = TensorSlot::BlockAttOut;
-        } else if (base_field == "res_att") {
-            ref.slot = TensorSlot::BlockResidualAtt;
-        } else if (base_field == "mlp_up" || base_field == "mlp_up_flat") {
-            ref.slot = TensorSlot::BlockMLPUp;
-        } else if (base_field == "swiglu" || base_field == "swiglu_flat") {
-            ref.slot = TensorSlot::BlockSwiGLU;
-        } else if (base_field == "mlp_down" || base_field == "mlp_down_flat") {
-            ref.slot = TensorSlot::BlockMLPDown;
-        } else if (base_field == "res_ffn") {
-            ref.slot = TensorSlot::BlockResidualFFN;
-        } else if (base_field == "rope_freqs" || base_field == "freq_cis") {
-            // Block-indexed rope frequencies refer to global FreqCis tensor
-            ref.slot = TensorSlot::FreqCis;
-            ref.layer_idx = -1;  // Global, not layer-indexed
-            return ref;
+        // Map field to slot using the registry (supports both built-in and DSL-defined slots)
+        if (auto slot_entry = mSlotRegistry.lookup(base_field)) {
+            ref.slot = slot_entry->slot;
+
+            // Handle global slots that appear with block indices (e.g., rope_freqs)
+            if (slot_entry->scope == ActivationScope::Global) {
+                ref.layer_idx = -1;  // Global, not layer-indexed
+                return ref;
+            }
+
+            // Use shape from DSL if available
+            if (!slot_entry->shape.empty()) {
+                ref.shape = resolve_shape(slot_entry->shape, mShapeEnv);
+            }
         } else if (mWeights.has(name)) {
             // Block-indexed weight (e.g., blocks[0].ln1_weight)
             ref.slot = TensorSlot::Parameter;
             return ref;
         } else {
             ref.slot = TensorSlot::Mapped;
-        }
-
-        // Pre-compute shape based on base field (use base_field for consistent matching)
-        const long B = mB;
-        const long T = mT;
-        const long C = mConfig.HiddenSize;
-        const long D = mConfig.IntermediateSize;
-        const long Hq = mConfig.NumQueryHeads;
-        const long Hkv = mConfig.NumKeyValHeads;
-        const long Hs = mConfig.head_size();
-        const long QKV = mConfig.qkv_channels();
-
-        if (base_field == "ln1" || base_field == "ln2" || base_field == "att_out" || base_field == "mlp_down" ||
-            base_field == "res_att" || base_field == "res_ffn") {
-            ref.shape = {B, T, C};
-        } else if (base_field == "ln1_flat" || base_field == "ln2_flat" || base_field == "att_out_flat" || base_field == "mlp_down_flat") {
-            ref.shape = {B * T, C};
-        } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd") {
-            ref.shape = {B, T};
-        } else if (base_field == "qkv" || base_field == "qkv_rope") {
-            ref.shape = {B, T, QKV};
-        } else if (base_field == "qkv_flat" || base_field == "qkv_biased") {
-            ref.shape = {B * T, QKV};
-        } else if (base_field == "q_rstd") {
-            ref.shape = {B, T, Hq};
-        } else if (base_field == "k_rstd") {
-            ref.shape = {B, T, Hkv};
-        } else if (base_field == "att" || base_field == "attn") {
-            ref.shape = {B, T, Hq * Hs};
-        } else if (base_field == "att_flat") {
-            ref.shape = {B * T, Hq * Hs};
-        } else if (base_field == "lse") {
-            ref.shape = {B, Hq, T};
-        } else if (base_field == "mlp_up") {
-            ref.shape = {B, T, 2 * D};
-        } else if (base_field == "mlp_up_flat") {
-            ref.shape = {B * T, 2 * D};
-        } else if (base_field == "swiglu") {
-            ref.shape = {B, T, D};
-        } else if (base_field == "swiglu_flat") {
-            ref.shape = {B * T, D};
         }
 
         return ref;
@@ -475,63 +417,23 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         if (parse_block_param(base, layer_idx, field)) {
             ref.layer_idx = layer_idx;
 
-            if (field == "ln1" || field == "ln1_flat") {
-                ref.slot = TensorSlot::BlockDLN1;
-            } else if (field == "qkv" || field == "qkv_rope" || field == "qkv_flat" || field == "qkv_biased") {
-                ref.slot = TensorSlot::BlockDQKV;
-            } else if (field == "att" || field == "att_flat") {
-                ref.slot = TensorSlot::BlockDAtt;
-            } else if (field == "att_out" || field == "att_out_flat") {
-                // att_out gradients share storage with residual-att gradients
-                ref.slot = TensorSlot::BlockDResAtt;
-            } else if (field == "swiglu" || field == "swiglu_flat") {
-                ref.slot = TensorSlot::BlockDSwiGLU;
-            } else if (field == "mlp_up" || field == "mlp_up_flat") {
-                ref.slot = TensorSlot::BlockDMLPUp;
-            } else if (field == "mlp_down" || field == "mlp_down_flat") {
-                ref.slot = TensorSlot::BlockDMLPDown;
-            } else if (field == "ln2" || field == "ln2_flat") {
-                ref.slot = TensorSlot::BlockDLN2;
-            } else if (field == "res_att") {
-                ref.slot = TensorSlot::BlockDResAtt;
-            } else if (field == "res_ffn") {
-                ref.slot = TensorSlot::BlockDResFFN;
+            // Look up gradient slot using "d_<field>" name (e.g., "d_ln1", "d_qkv")
+            const std::string grad_name = "d_" + strip_ssa_suffix(field);
+            if (auto slot_entry = mSlotRegistry.lookup(grad_name)) {
+                ref.slot = slot_entry->slot;
+                // Use shape from DSL if available
+                if (!slot_entry->shape.empty()) {
+                    ref.shape = resolve_shape(slot_entry->shape, mShapeEnv);
+                }
             } else {
+                // Try looking up the activation slot and use its shape for the gradient
+                const std::string act_name = strip_ssa_suffix(field);
+                if (auto act_entry = mSlotRegistry.lookup(act_name)) {
+                    if (!act_entry->shape.empty()) {
+                        ref.shape = resolve_shape(act_entry->shape, mShapeEnv);
+                    }
+                }
                 ref.slot = TensorSlot::Mapped;
-            }
-
-            // Pre-compute shape for gradient tensors
-            // Gradient tensors have same shape as corresponding activation tensors
-            const long B = mB;
-            const long T = mT;
-            const long C = mConfig.HiddenSize;
-            const long D = mConfig.IntermediateSize;
-            const long Hq = mConfig.NumQueryHeads;
-            const long Hs = mConfig.head_size();
-            const long QKV = mConfig.qkv_channels();
-
-            if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" ||
-                field == "res_att" || field == "res_ffn") {
-                ref.shape = {B, T, C};
-            } else if (field == "ln1_flat" || field == "ln2_flat" || field == "att_out_flat" ||
-                       field == "mlp_down_flat") {
-                ref.shape = {B * T, C};
-            } else if (field == "qkv" || field == "qkv_rope") {
-                ref.shape = {B, T, QKV};
-            } else if (field == "qkv_flat" || field == "qkv_biased") {
-                ref.shape = {B * T, QKV};
-            } else if (field == "att") {
-                ref.shape = {B, T, Hq * Hs};
-            } else if (field == "att_flat") {
-                ref.shape = {B * T, Hq * Hs};
-            } else if (field == "swiglu") {
-                ref.shape = {B, T, D};
-            } else if (field == "swiglu_flat") {
-                ref.shape = {B * T, D};
-            } else if (field == "mlp_up") {
-                ref.shape = {B, T, 2 * D};
-            } else if (field == "mlp_up_flat") {
-                ref.shape = {B * T, 2 * D};
             }
 
             if (ref.shape.empty()) {
@@ -545,29 +447,15 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         }
     }
 
-    // Check for global tensors
-    if (name == "token_ids") {
-        ref.slot = TensorSlot::TokenIDs;
-    } else if (name == "position_ids") {
-        ref.slot = TensorSlot::PositionIDs;
-    } else if (name == "targets" || name == "labels") {
-        ref.slot = TensorSlot::Targets;
-        ref.dtype = ETensorDType::INT32;
-    } else if (name == "loss" || name == "losses") {
-        ref.slot = TensorSlot::Losses;
-        ref.dtype = ETensorDType::FP32;
-    } else if (name == "d_loss") {
-        ref.slot = TensorSlot::DLoss;
-        ref.dtype = ETensorDType::FP32;
-    } else if (name == "x0" || name == "encoded") {
-        ref.slot = TensorSlot::Encoded;
-    } else if (name == "ln_final" || name == "xF") {
-        ref.slot = TensorSlot::LNFinal;
-    } else if (name == "ln_final_rstd") {
-        ref.slot = TensorSlot::LNFinalRSTD;
-    } else if (name == "final_residual") {
-        ref.slot = TensorSlot::FinalResidual;
+    // Check for global tensors using registry (supports built-in and DSL-defined slots)
+    if (auto slot_entry = mSlotRegistry.lookup(name)) {
+        ref.slot = slot_entry->slot;
+        // Apply dtype override from registry if specified
+        if (slot_entry->dtype.has_value()) {
+            ref.dtype = *slot_entry->dtype;
+        }
     } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+        // Substring match for rope frequencies (handles qualified names)
         ref.slot = TensorSlot::FreqCis;
     } else if (mWeights.has(name)) {
         ref.slot = TensorSlot::Parameter;
@@ -5212,23 +5100,64 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     }
 
     // Bind gradient output buffers for final layer norm backward
-    Tensor d_ln_final_flat = view_tensor(mRunState.non_block_gradients().d_ln_final,
+    // DSL-driven: use slot registry to derive all mappings from gradient_of relationships
+    Tensor& d_ln_final_buf = mRunState.non_block_gradients().d_ln_final;
+    Tensor& d_embeddings_buf = mRunState.non_block_gradients().d_embeddings;
+
+    Tensor d_ln_final_flat = view_tensor(d_ln_final_buf,
                                          {mB * mT, static_cast<long>(mConfig.HiddenSize)});
+
+    // Helper to determine target buffer based on gradient_of field
+    auto get_target_buffer = [&](const std::string& grad_of) -> Tensor* {
+        // Final norm gradients (xF, ln_final, residual_final)
+        if (grad_of == "xF" || grad_of == "ln_final" || grad_of == "xF_flat" ||
+            grad_of == "residual_final" || grad_of == "final_residual") {
+            return &d_ln_final_buf;
+        }
+        // Embedding output gradients (x0, encoded)
+        if (grad_of == "x0" || grad_of == "encoded" || grad_of == "embeddings") {
+            if (!mRunState.is_lora_only_mode()) {
+                return &d_embeddings_buf;
+            }
+        }
+        // Note: d_xN, d_residualN don't map to persistent buffers - they're computed on-the-fly
+        return nullptr;
+    };
+
+    // Bind global gradient tensors - these are always needed regardless of DSL layout
+    // The DSL gradient slots declare shape/dtype but the actual buffers come from RunState
     mTensorMap["d_xF_flat"] = d_ln_final_flat;
-    mTensorMap["d_xF"] = mRunState.non_block_gradients().d_ln_final;
-    mTensorMap["d_ln_final"] = mRunState.non_block_gradients().d_ln_final;
+    mTensorMap["d_xF"] = d_ln_final_buf;
+    mTensorMap["d_ln_final"] = d_ln_final_buf;
+    mTensorMap["d_ln_final_flat"] = d_ln_final_flat;
 
-    // Bind embedding output gradients (skip in LoRA-only mode - embedding backward is skipped entirely)
     if (!mRunState.is_lora_only_mode()) {
-        mTensorMap["d_encoded"] = mRunState.non_block_gradients().d_embeddings;
-        mTensorMap["d_x0"] = mRunState.non_block_gradients().d_embeddings;
+        mTensorMap["d_encoded"] = d_embeddings_buf;
+        mTensorMap["d_x0"] = d_embeddings_buf;
+    }
 
-        // Also bind autodiff-generated gradient names (d_embed_1, etc.) from forward embedding outputs
+    // DSL-driven binding for any additional gradient slots declared in the Python model
+    if (mSlotRegistry && mSlotRegistry->has_dsl_layout()) {
+        mSlotRegistry->for_each([&](const std::string& slot_name,
+                                    const TensorSlotRegistry::SlotEntry& entry) {
+            if (entry.scope != ActivationScope::GlobalGradient) return;
+            // Skip if already bound above
+            if (mTensorMap.find(slot_name) != mTensorMap.end()) return;
+
+            Tensor* target_buf = get_target_buffer(entry.gradient_of);
+            if (target_buf && target_buf->Data) {
+                mTensorMap[slot_name] = *target_buf;
+            }
+        });
+    }
+
+    // Bind autodiff-generated gradient names (d_embed_1, etc.) from forward embedding outputs
+    // These are dynamically generated and not in the DSL layout
+    if (!mRunState.is_lora_only_mode()) {
         for (const auto& emb_out : mEmbeddingOutputs) {
             std::string grad_name = "d_" + emb_out;
-            mTensorMap[grad_name] = mRunState.non_block_gradients().d_embeddings;
+            mTensorMap[grad_name] = d_embeddings_buf;
         }
-
     }
 
     // Restore MoE expert_offsets from persistent CPU storage

@@ -53,6 +53,10 @@ from .specs import (
     HFConfigSpec,
     HFMappingSpec,
     HFTransformSpec,
+    ActivationSlotSpec,
+    ActivationLayoutSpec,
+    ActivationScope,
+    ActivationMemoryHint,
 )
 
 if TYPE_CHECKING:
@@ -173,6 +177,39 @@ def _extract_constraints(cls: type) -> list[ConstraintSpec]:
     return constraints
 
 
+def _extract_activation_layout(cls: type) -> ActivationLayoutSpec | None:
+    """Extract activation layout from Activation and Gradient class attributes.
+
+    Scans the class for Activation and Gradient descriptors and builds an
+    ActivationLayoutSpec containing all declared slots.
+    """
+    forward_slots = []
+    gradient_slots = []
+
+    for name in dir(cls):
+        if name.startswith("_"):
+            continue
+
+        attr = getattr(cls, name, None)
+        if attr is None:
+            continue
+
+        if isinstance(attr, Activation):
+            forward_slots.append(attr.to_spec(name))
+        elif isinstance(attr, Gradient):
+            gradient_slots.append(attr.to_spec(name))
+
+    # Only create layout if we have any slots
+    if not forward_slots and not gradient_slots:
+        return None
+
+    return ActivationLayoutSpec(
+        name=f"{cls.__name__}Activations",
+        slots=forward_slots,
+        gradient_slots=gradient_slots,
+    )
+
+
 def _process_module_class(cls: type, spec_class: type) -> Any:
     """Process a class decorated with @module, @block, or @model."""
 
@@ -212,6 +249,12 @@ def _process_module_class(cls: type, spec_class: type) -> Any:
             spec.pattern = cls._pattern_
         if hasattr(cls, "_pattern_config_"):
             spec.pattern_config = cls._pattern_config_
+
+    # Extract activation layout for blocks and models
+    if spec_class in (BlockSpec, ModelSpec):
+        activation_layout = _extract_activation_layout(cls)
+        if activation_layout:
+            spec.activations = activation_layout
 
     # Attach spec to class
     cls._dsl_spec = spec
@@ -377,6 +420,232 @@ class Param:
                 spec.condition = self.when
 
         return spec
+
+
+class Activation:
+    """Lightweight activation slot declaration for class attributes.
+
+    Allows declaring activation slots as class attributes in @block definitions.
+    These generate pre-allocated tensor buffers for forward/backward passes,
+    eliminating hardcoded tensor name → slot mappings in the C++ runtime.
+
+    Example:
+        @block
+        class TransformerBlock:
+            # Forward activation slots
+            ln1 = Activation(Tensor["B", "T", "C"])
+            ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True)
+            qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat", "qkv_biased"])
+            lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True)
+            att = Activation(Tensor["B", "T", "AttnDim"])
+            mlp_up = Activation(Tensor["B", "T", "MUp"])
+            swiglu = Activation(Tensor["B", "T", "M"])
+
+    Args:
+        tensor_type: A Tensor[...] annotation specifying the shape
+        dtype: Override dtype (default: inherit from runtime)
+        aliases: Alternative names that map to this slot (e.g., "qkv_flat" -> "qkv")
+        save: If True, save this tensor for backward pass
+        recompute: If True, this tensor can be recomputed in backward
+        shares_with: Name of another slot to share memory with
+        when: Condition for optional slots (e.g., "use_qk_norm")
+        scope: "block" (default), "global", "gradient", or "global_gradient"
+        description: Documentation for this slot
+    """
+
+    def __init__(
+        self,
+        tensor_type: TensorAnnotation,
+        *,
+        dtype: str | None = None,
+        aliases: list[str] | None = None,
+        save: bool = False,
+        recompute: bool = False,
+        shares_with: str | None = None,
+        when: str | Callable[[Any], bool] | None = None,
+        scope: str = "block",
+        description: str | None = None,
+    ):
+        if not isinstance(tensor_type, TensorAnnotation):
+            raise TypeError(
+                f"Activation() requires a Tensor[...] annotation, "
+                f"got {type(tensor_type).__name__}. "
+                f"Usage: Activation(Tensor[\"B\", \"T\", \"C\"])"
+            )
+        self.tensor_type = tensor_type
+        self.dtype = dtype
+        self.aliases = aliases or []
+        self.save = save
+        self.recompute = recompute
+        self.shares_with = shares_with
+        self.when = when
+        self.scope = scope
+        self.description = description
+        # Name will be set by __set_name__
+        self._name: str | None = None
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Called when the attribute is assigned to a class."""
+        self._name = name
+
+    def __repr__(self) -> str:
+        parts = [f"Activation({self.tensor_type!r}"]
+        if self.dtype:
+            parts.append(f", dtype={self.dtype!r}")
+        if self.aliases:
+            parts.append(f", aliases={self.aliases!r}")
+        if self.save:
+            parts.append(", save=True")
+        if self.recompute:
+            parts.append(", recompute=True")
+        if self.shares_with:
+            parts.append(f", shares_with={self.shares_with!r}")
+        if self.when:
+            parts.append(f", when={self.when!r}")
+        if self.scope != "block":
+            parts.append(f", scope={self.scope!r}")
+        parts.append(")")
+        return "".join(parts)
+
+    def to_spec(self, name: str) -> ActivationSlotSpec:
+        """Convert to ActivationSlotSpec for the compilation pipeline."""
+        # Map scope string to enum
+        scope_map = {
+            "block": ActivationScope.BLOCK,
+            "global": ActivationScope.GLOBAL,
+            "gradient": ActivationScope.GRADIENT,
+            "global_gradient": ActivationScope.GLOBAL_GRADIENT,
+        }
+        scope_enum = scope_map.get(self.scope, ActivationScope.BLOCK)
+
+        # Determine memory hint
+        if self.shares_with:
+            memory_hint = ActivationMemoryHint.SHARED
+        elif self.save:
+            memory_hint = ActivationMemoryHint.SAVE
+        elif self.recompute:
+            memory_hint = ActivationMemoryHint.RECOMPUTE
+        else:
+            memory_hint = ActivationMemoryHint.PERSISTENT
+
+        # Build condition lambda if needed
+        condition = None
+        if self.when is not None:
+            if isinstance(self.when, str):
+                attr_name = self.when
+                condition = lambda self, attr=attr_name: getattr(self, attr)
+            else:
+                condition = self.when
+
+        return ActivationSlotSpec(
+            name=name,
+            scope=scope_enum,
+            shape=self.tensor_type.dims or (),
+            dtype=self.dtype or self.tensor_type.dtype,
+            aliases=list(self.aliases),
+            memory_hint=memory_hint,
+            shares_with=self.shares_with,
+            save_for_backward=self.save,
+            recompute_in_backward=self.recompute,
+            condition=condition,
+            description=self.description,
+        )
+
+
+class Gradient:
+    """Lightweight gradient slot declaration for class attributes.
+
+    Similar to Activation but for gradient buffers. Use this in @block definitions
+    to declare gradient tensors needed during backward pass.
+
+    Example:
+        @block
+        class TransformerBlock:
+            # Gradient slots (typically match activation shapes)
+            d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
+            d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+            d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
+
+    Args:
+        tensor_type: A Tensor[...] annotation specifying the shape
+        gradient_of: Name of the forward activation this is the gradient of
+        dtype: Override dtype (default: inherit from runtime)
+        shares_with: Name of another slot to share memory with
+        when: Condition for optional slots
+        scope: "gradient" (default) or "global" for model-level gradient slots
+        description: Documentation for this slot
+    """
+
+    def __init__(
+        self,
+        tensor_type: TensorAnnotation,
+        *,
+        gradient_of: str,
+        dtype: str | None = None,
+        shares_with: str | None = None,
+        when: str | Callable[[Any], bool] | None = None,
+        scope: str = "gradient",
+        description: str | None = None,
+    ):
+        if not isinstance(tensor_type, TensorAnnotation):
+            raise TypeError(
+                f"Gradient() requires a Tensor[...] annotation, "
+                f"got {type(tensor_type).__name__}."
+            )
+        self.tensor_type = tensor_type
+        self.gradient_of = gradient_of
+        self.dtype = dtype
+        self.shares_with = shares_with
+        self.when = when
+        self.scope = scope
+        self.description = description
+        self._name: str | None = None
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._name = name
+
+    def __repr__(self) -> str:
+        parts = [f"Gradient({self.tensor_type!r}, gradient_of={self.gradient_of!r}"]
+        if self.dtype:
+            parts.append(f", dtype={self.dtype!r}")
+        if self.shares_with:
+            parts.append(f", shares_with={self.shares_with!r}")
+        if self.when:
+            parts.append(f", when={self.when!r}")
+        parts.append(")")
+        return "".join(parts)
+
+    def to_spec(self, name: str) -> ActivationSlotSpec:
+        """Convert to ActivationSlotSpec for the compilation pipeline."""
+        memory_hint = ActivationMemoryHint.SHARED if self.shares_with else ActivationMemoryHint.PERSISTENT
+
+        condition = None
+        if self.when is not None:
+            if isinstance(self.when, str):
+                attr_name = self.when
+                condition = lambda self, attr=attr_name: getattr(self, attr)
+            else:
+                condition = self.when
+
+        # Map scope string to enum
+        scope_map = {
+            "gradient": ActivationScope.GRADIENT,
+            "global": ActivationScope.GLOBAL_GRADIENT,
+            "global_gradient": ActivationScope.GLOBAL_GRADIENT,
+        }
+        scope_enum = scope_map.get(self.scope, ActivationScope.GRADIENT)
+
+        return ActivationSlotSpec(
+            name=name,
+            scope=scope_enum,
+            shape=self.tensor_type.dims or (),
+            dtype=self.dtype or self.tensor_type.dtype,
+            memory_hint=memory_hint,
+            shares_with=self.shares_with,
+            gradient_of=self.gradient_of,
+            condition=condition,
+            description=self.description,
+        )
 
 
 # =============================================================================

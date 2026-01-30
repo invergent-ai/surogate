@@ -265,6 +265,7 @@ target_sources(surogate-common PRIVATE
     src/dsl/autodiff.cpp
     src/dsl/autodiff_rules.cpp
     src/dsl/op_shape_signatures.cpp
+    src/dsl/tensor_slot_registry.cpp
 
     src/config/pretrained_config.cpp
     src/models/registry.cpp

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import block, forward, Param
+from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -55,6 +55,62 @@ class LlamaBlock:
     # MLP weights
     mlp_up_weight = Param(Tensor["MUp", "C"])
     mlp_down_weight = Param(Tensor["C", "M"])
+
+    # =========================================================================
+    # Activation slots (forward pass intermediate tensors)
+    # =========================================================================
+
+    # Pre-attention normalization
+    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"])
+    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
+                          description="RMSNorm reciprocal std for LN1")
+
+    # QKV projection and RoPE
+    qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat"])
+    qkv_rope = Activation(Tensor["B", "T", "QKV"],
+                          description="QKV after RoPE")
+
+    # Attention
+    att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat", "attn"],
+                     description="Attention output (pre out-proj)")
+    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True,
+                     description="Log-sum-exp from flash attention")
+    att_out = Activation(Tensor["B", "T", "C"], aliases=["att_out_flat"],
+                         description="After output projection")
+
+    # First residual
+    res_att = Activation(Tensor["B", "T", "C"], aliases=["residual_att"],
+                         description="Residual + attention")
+
+    # Pre-MLP normalization
+    ln2 = Activation(Tensor["B", "T", "C"], aliases=["ln2_flat"])
+    ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
+                          description="RMSNorm reciprocal std for LN2")
+
+    # MLP
+    mlp_up = Activation(Tensor["B", "T", "MUp"], aliases=["mlp_up_flat"])
+    swiglu = Activation(Tensor["B", "T", "M"], aliases=["swiglu_flat"],
+                        description="SwiGLU activation output")
+    mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"],
+                          description="MLP down projection output")
+
+    # Second residual
+    res_ffn = Activation(Tensor["B", "T", "C"], aliases=["residual_ffn"],
+                         description="Residual + MLP (block output)")
+
+    # =========================================================================
+    # Gradient slots (backward pass)
+    # =========================================================================
+
+    d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
+    d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+    d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
+    d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
+    d_mlp_up = Gradient(Tensor["B", "T", "MUp"], gradient_of="mlp_up")
+    d_swiglu = Gradient(Tensor["B", "T", "M"], gradient_of="swiglu")
+    d_mlp_down = Gradient(Tensor["B", "T", "C"], gradient_of="mlp_down")
+    d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
+    d_res_ffn = Gradient(Tensor["B", "T", "C"], gradient_of="res_ffn")
 
     @forward
     def forward(

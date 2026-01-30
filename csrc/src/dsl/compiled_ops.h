@@ -24,6 +24,8 @@
 #include "dsl/forward_plan.h"
 #include "dsl/graph_executor_internal.h"
 #include "dsl/ir.h"
+#include "dsl/tensor_slot.h"
+#include "dsl/tensor_slot_registry.h"
 #include "kernels/kernels.h"
 #include "utilities/tensor.h"
 
@@ -117,56 +119,7 @@ enum class CompiledOpType : std::uint8_t {
 // Pre-resolved tensor slots
 // ============================================================================
 
-// Tensor slot types for pre-resolution
-enum class TensorSlot : std::uint8_t {
-    // Activation slots (layer-indexed)
-    BlockLN1,
-    BlockLN1RSTD,
-    BlockLN2,
-    BlockLN2RSTD,
-    BlockQRSTD,
-    BlockKRSTD,
-    BlockQKV,
-    BlockQKVRoPE,
-    BlockLSE,
-    BlockAtt,
-    BlockAttOut,
-    BlockResidualAtt,
-    BlockMLPUp,
-    BlockSwiGLU,
-    BlockMLPDown,
-    BlockResidualFFN,
-    // Gradient slots (layer-indexed)
-    BlockDLN1,
-    BlockDQKV,
-    BlockDAtt,
-    BlockDSwiGLU,
-    BlockDMLPUp,
-    BlockDMLPDown,
-    BlockDLN2,
-    BlockDResAtt,
-    BlockDResFFN,
-    // Global activations
-    Encoded,
-    LNFinal,
-    LNFinalRSTD,
-    FinalResidual,
-    FreqCis,
-    // Inputs
-    TokenIDs,
-    PositionIDs,
-    Targets,
-    Losses,
-    DLoss,
-    // Named parameter (uses name lookup)
-    Parameter,
-    // Temporary (stack-allocated)
-    Temporary,
-    // Saved tensor (from forward pass)
-    Saved,
-    // Already in tensor map
-    Mapped,
-};
+// TensorSlot enum is defined in dsl/tensor_slot.h to break circular dependencies
 
 // Pre-resolved tensor reference
 struct TensorRef {
@@ -268,6 +221,9 @@ public:
     // Update batch/sequence dimensions for shape resolution
     void update_dimensions(long B, long T);
 
+    // Get the slot registry (for passing to CompiledExecutor)
+    const TensorSlotRegistry& slot_registry() const { return mSlotRegistry; }
+
 private:
     CompiledOpType classify_op(const std::string& op_type) const;
 
@@ -298,6 +254,7 @@ private:
     DslParamStore& mWeights;
     DslGradStore& mGrads;
     ShapeEnv mShapeEnv;
+    TensorSlotRegistry mSlotRegistry;  ///< Maps tensor names to slots (from DSL or built-in)
     long mB = 0;
     long mT = 0;
     std::unordered_map<std::string, std::vector<long>> mExtraShapes;
@@ -361,6 +318,9 @@ public:
 
     // Set embedding output names from forward graph (for binding d_embed_N to d_embeddings)
     void set_embedding_outputs(const std::vector<std::string>& names) { mEmbeddingOutputs = names; }
+
+    // Set slot registry for DSL-driven tensor mapping
+    void set_slot_registry(const TensorSlotRegistry* registry) { mSlotRegistry = registry; }
 
     // Set batch/sequence dimensions before execution
     void set_dimensions(long B, long T) { mB = B; mT = T; }
@@ -470,6 +430,7 @@ private:
     const Tensor* mLastInputsCpu = nullptr;
     std::function<unsigned int()> mRngSeedFn;
     std::vector<std::string> mEmbeddingOutputs;  // Forward graph embedding output names
+    const TensorSlotRegistry* mSlotRegistry = nullptr;  // DSL slot registry for global gradient binding
 
     // Execution state
     long mB = 0;

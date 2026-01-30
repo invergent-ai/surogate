@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import block, forward, Param
+from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
@@ -98,6 +98,108 @@ class Qwen3MoEBlock:
     shared_expert_gate = Param(Tensor["SharedM", "C"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)
     shared_expert_up = Param(Tensor["SharedM", "C"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)
     shared_expert_down = Param(Tensor["C", "SharedM"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)
+
+    # =========================================================================
+    # Activation slots (forward pass intermediate tensors)
+    # =========================================================================
+
+    # Pre-attention normalization
+    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"])
+    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
+                          description="RMSNorm reciprocal std for LN1")
+
+    # QKV projection and RoPE
+    qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat", "qkv_biased"])
+    qkv_rope = Activation(Tensor["B", "T", "QKV"],
+                          description="QKV after QK-Norm + RoPE")
+
+    # QK-norm RSTDs (conditional on use_qk_norm)
+    q_rstd = Activation(Tensor["B", "T", "Hq"], dtype="fp32", save=True,
+                        when="use_qk_norm", description="Q head RMSNorm rstd")
+    k_rstd = Activation(Tensor["B", "T", "Hkv"], dtype="fp32", save=True,
+                        when="use_qk_norm", description="K head RMSNorm rstd")
+
+    # Attention
+    att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat", "attn"],
+                     description="Attention output (pre out-proj)")
+    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True,
+                     description="Log-sum-exp from flash attention")
+    att_out = Activation(Tensor["B", "T", "C"], aliases=["att_out_flat"],
+                         description="After output projection")
+
+    # Mid residual (attention output added to residual)
+    residual_mid = Activation(Tensor["B", "T", "C"],
+                              description="Residual after attention")
+
+    # Pre-MoE normalization
+    ln2 = Activation(Tensor["B", "T", "C"], aliases=["ln2_flat"])
+    ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
+                          description="RMSNorm reciprocal std for LN2")
+
+    # Router
+    router_logits = Activation(Tensor["B * T", "E"],
+                               description="Router logits before softmax/sigmoid")
+    router_probs = Activation(Tensor["B * T", "E"],
+                              description="Router probabilities after normalization")
+
+    # Routing (top-k selection)
+    routing_weights = Activation(Tensor["B * T", "K"], save=True,
+                                 description="Routing weights for selected experts")
+    routing_indices = Activation(Tensor["B * T", "K"], dtype="int32", save=True,
+                                 description="Expert indices for each token")
+
+    # MoE permutation
+    permuted_input = Activation(Tensor["B * T * K", "C"],
+                                description="Permuted input for grouped GEMM")
+    scatter_indices = Activation(Tensor["B * T * K"], dtype="int32", save=True,
+                                 description="Indices for scattering back to original order")
+
+    # Expert computations
+    expert_gate_up = Activation(Tensor["B * T * K", "MUp"],
+                                description="Expert gate+up projection output")
+    expert_act = Activation(Tensor["B * T * K", "M"],
+                            description="Expert SwiGLU activation output")
+    expert_down = Activation(Tensor["B * T * K", "C"],
+                             description="Expert down projection output")
+
+    # MoE output
+    moe_out = Activation(Tensor["B * T", "C"], aliases=["moe_out_flat"],
+                         description="Combined MoE output")
+
+    # Shared expert (conditional)
+    shared_gate = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert",
+                             description="Shared expert gate projection")
+    shared_up = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert",
+                           description="Shared expert up projection")
+    shared_gate_act = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert",
+                                 description="Shared expert gate activation (SiLU)")
+    shared_hidden = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert",
+                               description="Shared expert hidden state (gate * up)")
+    shared_out = Activation(Tensor["B * T", "C"], when="use_shared_expert",
+                            description="Shared expert output")
+
+    # Final residual
+    res_ffn = Activation(Tensor["B", "T", "C"], aliases=["residual_ffn"],
+                         description="Residual + MoE (block output)")
+
+    # =========================================================================
+    # Gradient slots (backward pass)
+    # =========================================================================
+
+    d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
+    d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+    d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
+    d_att_out = Gradient(Tensor["B", "T", "C"], gradient_of="att_out")
+    d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
+    d_router_logits = Gradient(Tensor["B * T", "E"], gradient_of="router_logits")
+    d_permuted_input = Gradient(Tensor["B * T * K", "C"], gradient_of="permuted_input")
+    d_expert_gate_up = Gradient(Tensor["B * T * K", "MUp"], gradient_of="expert_gate_up")
+    d_expert_act = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_act")
+    d_expert_down = Gradient(Tensor["B * T * K", "C"], gradient_of="expert_down")
+    d_moe_out = Gradient(Tensor["B * T", "C"], gradient_of="moe_out")
+    d_shared_hidden = Gradient(Tensor["B * T", "SharedM"], gradient_of="shared_hidden",
+                               when="use_shared_expert")
+    d_res_ffn = Gradient(Tensor["B", "T", "C"], gradient_of="res_ffn")
 
     @forward
     def forward(

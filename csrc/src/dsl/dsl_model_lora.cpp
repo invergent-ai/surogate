@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -272,8 +273,19 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     Tensor& buf = mLoRARunState->norm_buffer;
     fill_zero(buf, stream);
 
-    auto norm_squared = [&](const Tensor& grad) {
+    static int grad_check_count = 0;
+    auto norm_squared = [&](const Tensor& grad, const char* name) {
         if (grad.Data) {
+            // Debug: check first few gradient tensors for NaN
+            if (grad_check_count < 20) {
+                float first_val = 0.0f;
+                CUDA_CHECK(cudaMemcpy(&first_val, grad.Data, sizeof(float), cudaMemcpyDeviceToHost));
+                if (std::isnan(first_val) || std::isinf(first_val)) {
+                    std::cerr << "[LoRA grad NaN] " << name << " first_val=" << first_val
+                              << " nelem=" << grad.nelem() << std::endl;
+                }
+                grad_check_count++;
+            }
             global_norm_squared(buf, grad, grad.nelem(), rs.DeviceProp, stream);
         }
     };
@@ -282,30 +294,39 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
         bool unused_acc = false;
         auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
 
-        if (g.attention.q.has_value()) { norm_squared(g.attention.q->A); norm_squared(g.attention.q->B); }
-        if (g.attention.k.has_value()) { norm_squared(g.attention.k->A); norm_squared(g.attention.k->B); }
-        if (g.attention.v.has_value()) { norm_squared(g.attention.v->A); norm_squared(g.attention.v->B); }
-        if (g.attention.o.has_value()) { norm_squared(g.attention.o->A); norm_squared(g.attention.o->B); }
-        if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A); norm_squared(g.mlp.gate->B); }
-        if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A); norm_squared(g.mlp.up->B); }
-        if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A); norm_squared(g.mlp.down->B); }
+        if (g.attention.q.has_value()) { norm_squared(g.attention.q->A, "attn.q.A"); norm_squared(g.attention.q->B, "attn.q.B"); }
+        if (g.attention.k.has_value()) { norm_squared(g.attention.k->A, "attn.k.A"); norm_squared(g.attention.k->B, "attn.k.B"); }
+        if (g.attention.v.has_value()) { norm_squared(g.attention.v->A, "attn.v.A"); norm_squared(g.attention.v->B, "attn.v.B"); }
+        if (g.attention.o.has_value()) { norm_squared(g.attention.o->A, "attn.o.A"); norm_squared(g.attention.o->B, "attn.o.B"); }
+        if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A, "mlp.gate.A"); norm_squared(g.mlp.gate->B, "mlp.gate.B"); }
+        if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A, "mlp.up.A"); norm_squared(g.mlp.up->B, "mlp.up.B"); }
+        if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A, "mlp.down.A"); norm_squared(g.mlp.down->B, "mlp.down.B"); }
 
         if (g.moe.use_grouped) {
-            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A); norm_squared(g.moe.grouped.gate->B); }
-            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A); norm_squared(g.moe.grouped.up->B); }
-            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A); norm_squared(g.moe.grouped.down->B); }
+            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A, "moe.gate.A"); norm_squared(g.moe.grouped.gate->B, "moe.gate.B"); }
+            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A, "moe.up.A"); norm_squared(g.moe.grouped.up->B, "moe.up.B"); }
+            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A, "moe.down.A"); norm_squared(g.moe.grouped.down->B, "moe.down.B"); }
         } else {
             for (const auto& expert : g.moe.experts) {
-                if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
-                if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
-                if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
+                if (expert.gate.has_value()) { norm_squared(expert.gate->A, "exp.gate.A"); norm_squared(expert.gate->B, "exp.gate.B"); }
+                if (expert.up.has_value()) { norm_squared(expert.up->A, "exp.up.A"); norm_squared(expert.up->B, "exp.up.B"); }
+                if (expert.down.has_value()) { norm_squared(expert.down->A, "exp.down.A"); norm_squared(expert.down->B, "exp.down.B"); }
             }
         }
 
-        if (g.router.has_value()) { norm_squared(g.router->A); norm_squared(g.router->B); }
+        if (g.router.has_value()) { norm_squared(g.router->A, "router.A"); norm_squared(g.router->B, "router.B"); }
     }
 
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);
+
+    // Debug: check accumulated norm squared before sqrt
+    static int norm_debug_count = 0;
+    if (norm_debug_count < 5) {
+        float norm_sq = 0.0f;
+        CUDA_CHECK(cudaMemcpy(&norm_sq, buf.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost));
+        std::cerr << "[LoRA norm debug #" << norm_debug_count << "] accumulated norm_sq=" << norm_sq << std::endl;
+        norm_debug_count++;
+    }
 
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))

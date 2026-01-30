@@ -21,6 +21,10 @@ from .specs import (
     HFConfigSpec,
     HFMappingSpec,
     HFTransformSpec,
+    ActivationSlotSpec,
+    ActivationLayoutSpec,
+    ActivationScope,
+    ActivationMemoryHint,
 )
 from .graph_builder import GraphBuilder, GraphNode, GraphRef
 from .hf import FuseMapping, SplitMapping, TransformMapping, StackExpertsMapping
@@ -70,6 +74,46 @@ class GraphIR:
 
 
 @dataclass
+class ActivationSlotIR:
+    """Activation slot in the IR.
+
+    This represents a pre-allocated tensor buffer used during forward/backward.
+    The C++ runtime uses this to:
+    - Generate TensorSlot enum entries
+    - Build shape inference tables
+    - Create save/restore mappings for backward pass
+    """
+    name: str
+    scope: str  # "block", "global", "gradient", "global_gradient"
+    shape: List[Any]  # Shape expression with symbolic dims
+    dtype: Optional[str] = None
+    aliases: List[str] = field(default_factory=list)
+    memory_hint: str = "persistent"  # "persistent", "save", "recompute", "temporary", "shared"
+    shares_with: Optional[str] = None
+    save_for_backward: bool = False
+    recompute_in_backward: bool = False
+    gradient_of: Optional[str] = None
+    slot_index: int = -1  # Index in the activation struct
+    description: Optional[str] = None
+
+
+@dataclass
+class ActivationLayoutIR:
+    """Complete activation layout in the IR.
+
+    This aggregates all activation slots for a block or model and provides:
+    - Ordered list of slots for C++ struct generation
+    - Name → slot index mapping
+    - Alias resolution table
+    """
+    name: str
+    slots: List[ActivationSlotIR] = field(default_factory=list)
+    gradient_slots: List[ActivationSlotIR] = field(default_factory=list)
+    alias_map: Dict[str, str] = field(default_factory=dict)  # alias -> canonical name
+    extends: Optional[str] = None
+
+
+@dataclass
 class ModuleIR:
     """Module IR output."""
     name: str
@@ -87,6 +131,8 @@ class ModuleIR:
     recompute_tensors: List[str] = field(default_factory=list)
     is_model: bool = False
     is_block: bool = False
+    # Activation layout for this module (block activations or global model activations)
+    activation_layout: Optional[ActivationLayoutIR] = None
 
 
 # =============================================================================
@@ -261,6 +307,82 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["fuse_gate_up"] = spec.fuse_gate_up
         return payload
     return str(spec)
+
+
+def _compile_activation_slot(
+    slot: ActivationSlotSpec,
+    config: Dict[str, Any],
+    dim_map: Optional[Dict[str, str]] = None,
+    slot_index: int = -1,
+) -> ActivationSlotIR:
+    """Compile an ActivationSlotSpec to ActivationSlotIR.
+
+    Args:
+        slot: The activation slot specification.
+        config: Config dictionary for dimension resolution.
+        dim_map: Optional mapping from annotation names to Dim expressions.
+        slot_index: Index of this slot in the activation struct.
+    """
+    # Resolve shape dimensions
+    shape = []
+    for dim in slot.shape:
+        parsed = _parse_shape_dim(dim)
+        if isinstance(parsed, str):
+            # Try to resolve through dim_map first
+            if dim_map and parsed in dim_map:
+                parsed = dim_map[parsed]
+            elif dim_map:
+                parsed = _substitute_dim_names(parsed, dim_map)
+        shape.append(parsed)
+
+    return ActivationSlotIR(
+        name=slot.name,
+        scope=slot.scope.value,
+        shape=shape,
+        dtype=slot.dtype,
+        aliases=list(slot.aliases),
+        memory_hint=slot.memory_hint.value,
+        shares_with=slot.shares_with,
+        save_for_backward=slot.save_for_backward,
+        recompute_in_backward=slot.recompute_in_backward,
+        gradient_of=slot.gradient_of,
+        slot_index=slot_index,
+        description=slot.description,
+    )
+
+
+def _compile_activation_layout(
+    layout: ActivationLayoutSpec,
+    config: Dict[str, Any],
+    dim_map: Optional[Dict[str, str]] = None,
+) -> ActivationLayoutIR:
+    """Compile an ActivationLayoutSpec to ActivationLayoutIR.
+
+    Args:
+        layout: The activation layout specification.
+        config: Config dictionary for dimension resolution.
+        dim_map: Optional mapping from annotation names to Dim expressions.
+    """
+    # Compile forward activation slots
+    slots = []
+    for i, slot in enumerate(layout.slots):
+        slots.append(_compile_activation_slot(slot, config, dim_map, slot_index=i))
+
+    # Compile gradient slots
+    gradient_slots = []
+    for i, slot in enumerate(layout.gradient_slots):
+        gradient_slots.append(_compile_activation_slot(slot, config, dim_map, slot_index=i))
+
+    # Build alias map
+    alias_map = layout.build_alias_map()
+
+    return ActivationLayoutIR(
+        name=layout.name,
+        slots=slots,
+        gradient_slots=gradient_slots,
+        alias_map=alias_map,
+        extends=layout.extends,
+    )
 
 
 def _compile_graph_builder(
@@ -525,6 +647,104 @@ def _evaluate_forward_for_graph(
     return None
 
 
+def _compile_merged_activation_layout(
+    spec: ModelSpec,
+    config: Dict[str, Any],
+    dim_map: Optional[Dict[str, str]] = None,
+) -> Optional[ActivationLayoutIR]:
+    """Compile and merge model's global activation slots with block activation slots.
+
+    For models with stacked blocks, the activation layout needs both:
+    1. Global slots declared at model level (e.g., token_ids, xF, loss)
+    2. Block-scoped slots declared in the block class (e.g., ln1, qkv, mlp_down)
+
+    The C++ runtime uses this merged layout to resolve tensor references like
+    "blocks[0].mlp_down" to the correct TensorSlot.
+
+    Args:
+        spec: The model specification.
+        config: Config dictionary for dimension resolution.
+        dim_map: Optional mapping from annotation names to Dim expressions.
+
+    Returns:
+        Merged ActivationLayoutIR containing both global and block-scoped slots,
+        or None if no activation slots are declared.
+    """
+    slots: List[ActivationSlotIR] = []
+    gradient_slots: List[ActivationSlotIR] = []
+    alias_map: Dict[str, str] = {}
+
+    # 1. Compile model's global activation slots
+    if spec.activations:
+        model_layout = _compile_activation_layout(spec.activations, config, dim_map)
+        slots.extend(model_layout.slots)
+        gradient_slots.extend(model_layout.gradient_slots)
+        alias_map.update(model_layout.alias_map)
+
+    # 2. Find block spec and compile its activation slots
+    # Look for the 'blocks' param (or similar array param that references a block type)
+    block_spec = None
+    for param_name, param_spec in spec.params.items():
+        if param_spec.kind == ParamKind.ARRAY and param_spec.element_type:
+            # This is an array of blocks - get the block spec
+            block_spec = get_block_spec(param_spec.element_type)
+            if block_spec is not None:
+                break
+
+    if block_spec and block_spec.activations:
+        # Build dim_map for the block if we have its python_class
+        block_dim_map: Dict[str, str] = {}
+        if block_spec.python_class:
+            try:
+                block_instance = object.__new__(block_spec.python_class)
+                for key, value in config.items():
+                    setattr(block_instance, key, value)
+                _init_instance_from_config(block_instance, block_spec.python_class, config)
+                block_dim_map = _build_dim_map(block_instance)
+            except Exception:
+                pass
+
+        # Compile block activation layout
+        block_layout = _compile_activation_layout(
+            block_spec.activations, config, block_dim_map or dim_map
+        )
+
+        # Add block slots with scope="block"
+        # The slot_index continues from where model slots ended
+        block_slot_start = len(slots)
+        for i, slot in enumerate(block_layout.slots):
+            # Ensure block slots have scope="block"
+            if slot.scope in ("block", ""):
+                slot.scope = "block"
+            slot.slot_index = block_slot_start + i
+            slots.append(slot)
+
+        # Add block gradient slots
+        block_grad_start = len(gradient_slots)
+        for i, slot in enumerate(block_layout.gradient_slots):
+            if slot.scope in ("gradient", ""):
+                slot.scope = "gradient"
+            slot.slot_index = block_grad_start + i
+            gradient_slots.append(slot)
+
+        # Merge alias maps
+        alias_map.update(block_layout.alias_map)
+
+    # If no slots at all, return None
+    if not slots and not gradient_slots:
+        return None
+
+    # Determine layout name
+    layout_name = spec.activations.name if spec.activations else f"{spec.name}Activations"
+
+    return ActivationLayoutIR(
+        name=layout_name,
+        slots=slots,
+        gradient_slots=gradient_slots,
+        alias_map=alias_map,
+    )
+
+
 def _capture_forward_graph(
     forward_fn: Any,
     instance: Any,
@@ -703,6 +923,9 @@ def compile_model_spec(
         ir.save_tensors = spec.forward.save
         ir.recompute_tensors = spec.forward.recompute
 
+    # Compile activation layout - merge model's global activations with block activations
+    ir.activation_layout = _compile_merged_activation_layout(spec, config, dim_map)
+
     return ir
 
 
@@ -763,6 +986,10 @@ def compile_block_spec(
 
             except Exception:
                 ir.forward_graph = GraphIR()
+
+    # Compile activation layout if present
+    if spec.activations:
+        ir.activation_layout = _compile_activation_layout(spec.activations, config, dim_map)
 
     return ir
 
@@ -867,6 +1094,49 @@ def _graph_ir_to_dict(graph: GraphIR) -> Dict[str, Any]:
     }
 
 
+def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
+    """Convert ActivationSlotIR to JSON-serializable dict."""
+    result = {
+        "name": slot.name,
+        "scope": slot.scope,
+        "shape": slot.shape,
+        "slot_index": slot.slot_index,
+    }
+    # Only include optional fields if they have non-default values
+    if slot.dtype:
+        result["dtype"] = slot.dtype
+    if slot.aliases:
+        result["aliases"] = slot.aliases
+    if slot.memory_hint != "persistent":
+        result["memory_hint"] = slot.memory_hint
+    if slot.shares_with:
+        result["shares_with"] = slot.shares_with
+    if slot.save_for_backward:
+        result["save_for_backward"] = True
+    if slot.recompute_in_backward:
+        result["recompute_in_backward"] = True
+    if slot.gradient_of:
+        result["gradient_of"] = slot.gradient_of
+    if slot.description:
+        result["description"] = slot.description
+    return result
+
+
+def _activation_layout_ir_to_dict(layout: ActivationLayoutIR) -> Dict[str, Any]:
+    """Convert ActivationLayoutIR to JSON-serializable dict."""
+    result = {
+        "name": layout.name,
+        "slots": [_activation_slot_ir_to_dict(s) for s in layout.slots],
+    }
+    if layout.gradient_slots:
+        result["gradient_slots"] = [_activation_slot_ir_to_dict(s) for s in layout.gradient_slots]
+    if layout.alias_map:
+        result["alias_map"] = layout.alias_map
+    if layout.extends:
+        result["extends"] = layout.extends
+    return result
+
+
 def _module_ir_to_dict(ir: ModuleIR) -> Dict[str, Any]:
     """Convert ModuleIR to JSON-serializable dict."""
     result = {
@@ -893,6 +1163,9 @@ def _module_ir_to_dict(ir: ModuleIR) -> Dict[str, Any]:
 
     if ir.recompute_tensors:
         result["recompute"] = ir.recompute_tensors
+
+    if ir.activation_layout:
+        result["activation_layout"] = _activation_layout_ir_to_dict(ir.activation_layout)
 
     return result
 

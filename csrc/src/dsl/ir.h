@@ -94,6 +94,63 @@ struct TensorInfo {
     bool is_output = false;
 };
 
+// ============================================================================
+// Activation Slot IR (generated from Python DSL)
+// ============================================================================
+
+/// @brief Scope of an activation slot
+enum class ActivationScope : std::uint8_t {
+    Block,           ///< Per-layer activation (in SimplifiedLayerActivations)
+    Global,          ///< Global activation (in NonBlockActivations)
+    Gradient,        ///< Per-layer gradient (in SimplifiedLayerGradients)
+    GlobalGradient,  ///< Global gradient (in NonBlockGradientBuffers)
+};
+
+/// @brief Memory management hints for activation slots
+enum class ActivationMemoryHint : std::uint8_t {
+    Persistent,      ///< Keep in memory across forward/backward
+    Save,            ///< Save for backward pass
+    Recompute,       ///< Can be recomputed in backward
+    Temporary,       ///< Stack-allocated, freed after use
+    Shared,          ///< Shares memory with another slot
+};
+
+/// @brief Specification for a single activation tensor slot
+struct ActivationSlotIR {
+    std::string name;                          ///< Canonical slot name (e.g., "ln1", "qkv")
+    ActivationScope scope = ActivationScope::Block;
+    std::vector<Dim> shape;                    ///< Shape expression using symbolic dims
+    std::optional<ETensorDType> dtype;         ///< Override dtype (nullopt = inherit)
+    std::vector<std::string> aliases;          ///< Alternative names mapping to this slot
+    ActivationMemoryHint memory_hint = ActivationMemoryHint::Persistent;
+    std::string shares_with;                   ///< If memory_hint == Shared, slot to share with
+    bool save_for_backward = false;            ///< Add to forward save list
+    bool recompute_in_backward = false;        ///< Can be recomputed instead of saved
+    std::string gradient_of;                   ///< For gradient slots: corresponding forward activation
+    std::string condition;                     ///< Condition expression (e.g., "use_qk_norm")
+    std::string description;                   ///< Documentation
+};
+
+/// @brief Complete activation layout for a block or model
+struct ActivationLayoutIR {
+    std::string name;                          ///< Layout name (e.g., "Qwen3BlockActivations")
+    std::vector<ActivationSlotIR> slots;       ///< Forward activation slots
+    std::vector<ActivationSlotIR> gradient_slots;  ///< Backward gradient slots
+    std::string extends;                       ///< Base layout to extend (optional)
+
+    /// @brief Get slot by name or alias (returns nullptr if not found)
+    const ActivationSlotIR* get_slot(const std::string& name) const;
+
+    /// @brief Get slot index by name or alias (-1 if not found)
+    int get_slot_index(const std::string& name) const;
+
+    /// @brief Build mapping from aliases to canonical slot names
+    std::unordered_map<std::string, std::string> build_alias_map() const;
+
+    /// @brief Get list of slots that should be saved for backward
+    std::vector<std::string> get_save_list() const;
+};
+
 struct Operation {
     std::string id;
     std::string name;
@@ -125,6 +182,7 @@ struct Module {
     std::unordered_map<std::string, TensorInfo> params;
     std::optional<Graph> forward;
     std::optional<Graph> backward;
+    std::optional<ActivationLayoutIR> activation_layout;  ///< Activation slots (from DSL)
 };
 
 struct IRFile {

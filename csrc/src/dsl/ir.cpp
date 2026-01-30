@@ -189,6 +189,75 @@ Graph parse_graph(const nlohmann::json& graph_json) {
     return graph;
 }
 
+// ============================================================================
+// Activation Layout Parsing
+// ============================================================================
+
+ActivationScope parse_activation_scope(const std::string& scope_str) {
+    if (scope_str == "block") return ActivationScope::Block;
+    if (scope_str == "global") return ActivationScope::Global;
+    if (scope_str == "gradient") return ActivationScope::Gradient;
+    if (scope_str == "global_gradient") return ActivationScope::GlobalGradient;
+    return ActivationScope::Block;  // Default
+}
+
+ActivationMemoryHint parse_memory_hint(const std::string& hint_str) {
+    if (hint_str == "persistent") return ActivationMemoryHint::Persistent;
+    if (hint_str == "save") return ActivationMemoryHint::Save;
+    if (hint_str == "recompute") return ActivationMemoryHint::Recompute;
+    if (hint_str == "temporary") return ActivationMemoryHint::Temporary;
+    if (hint_str == "shared") return ActivationMemoryHint::Shared;
+    return ActivationMemoryHint::Persistent;  // Default
+}
+
+ActivationSlotIR parse_activation_slot(const nlohmann::json& slot_json) {
+    ActivationSlotIR slot;
+    slot.name = slot_json.value("name", "");
+    if (slot_json.contains("scope") && !slot_json["scope"].is_null()) {
+        slot.scope = parse_activation_scope(slot_json["scope"].get<std::string>());
+    }
+    if (slot_json.contains("shape") && !slot_json["shape"].is_null()) {
+        for (const auto& dim_json : slot_json["shape"]) {
+            slot.shape.push_back(parse_dim(dim_json));
+        }
+    }
+    if (slot_json.contains("dtype") && !slot_json["dtype"].is_null()) {
+        slot.dtype = dtype_from_str(slot_json["dtype"].get<std::string>());
+    }
+    if (slot_json.contains("aliases") && slot_json["aliases"].is_array()) {
+        for (const auto& alias : slot_json["aliases"]) {
+            slot.aliases.push_back(alias.get<std::string>());
+        }
+    }
+    if (slot_json.contains("memory_hint") && !slot_json["memory_hint"].is_null()) {
+        slot.memory_hint = parse_memory_hint(slot_json["memory_hint"].get<std::string>());
+    }
+    slot.shares_with = slot_json.value("shares_with", "");
+    slot.save_for_backward = slot_json.value("save_for_backward", false);
+    slot.recompute_in_backward = slot_json.value("recompute_in_backward", false);
+    slot.gradient_of = slot_json.value("gradient_of", "");
+    slot.condition = slot_json.value("condition", "");
+    slot.description = slot_json.value("description", "");
+    return slot;
+}
+
+ActivationLayoutIR parse_activation_layout(const nlohmann::json& layout_json) {
+    ActivationLayoutIR layout;
+    layout.name = layout_json.value("name", "");
+    layout.extends = layout_json.value("extends", "");
+    if (layout_json.contains("slots") && layout_json["slots"].is_array()) {
+        for (const auto& slot_json : layout_json["slots"]) {
+            layout.slots.push_back(parse_activation_slot(slot_json));
+        }
+    }
+    if (layout_json.contains("gradient_slots") && layout_json["gradient_slots"].is_array()) {
+        for (const auto& slot_json : layout_json["gradient_slots"]) {
+            layout.gradient_slots.push_back(parse_activation_slot(slot_json));
+        }
+    }
+    return layout;
+}
+
 class ExprParser {
 public:
     ExprParser(std::string_view expr, const ShapeEnv& env)
@@ -372,6 +441,9 @@ IRFile load_ir_from_json(const nlohmann::json& root) {
             if (mod_json.contains("backward") && !mod_json["backward"].is_null()) {
                 mod.backward = parse_graph(mod_json["backward"]);
             }
+            if (mod_json.contains("activation_layout") && !mod_json["activation_layout"].is_null()) {
+                mod.activation_layout = parse_activation_layout(mod_json["activation_layout"]);
+            }
             ir.modules.push_back(std::move(mod));
         }
     }
@@ -434,6 +506,75 @@ std::vector<long> resolve_shape(const std::vector<Dim>& dims, const ShapeEnv& en
         resolved.push_back(resolve_dim(dim, env));
     }
     return resolved;
+}
+
+// ============================================================================
+// ActivationLayoutIR Methods
+// ============================================================================
+
+const ActivationSlotIR* ActivationLayoutIR::get_slot(const std::string& name) const {
+    // Check forward activation slots
+    for (const auto& slot : slots) {
+        if (slot.name == name) {
+            return &slot;
+        }
+        for (const auto& alias : slot.aliases) {
+            if (alias == name) {
+                return &slot;
+            }
+        }
+    }
+    // Check gradient slots
+    for (const auto& slot : gradient_slots) {
+        if (slot.name == name) {
+            return &slot;
+        }
+        for (const auto& alias : slot.aliases) {
+            if (alias == name) {
+                return &slot;
+            }
+        }
+    }
+    return nullptr;
+}
+
+int ActivationLayoutIR::get_slot_index(const std::string& name) const {
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].name == name) {
+            return static_cast<int>(i);
+        }
+        for (const auto& alias : slots[i].aliases) {
+            if (alias == name) {
+                return static_cast<int>(i);
+            }
+        }
+    }
+    return -1;
+}
+
+std::unordered_map<std::string, std::string> ActivationLayoutIR::build_alias_map() const {
+    std::unordered_map<std::string, std::string> alias_map;
+    for (const auto& slot : slots) {
+        for (const auto& alias : slot.aliases) {
+            alias_map[alias] = slot.name;
+        }
+    }
+    for (const auto& slot : gradient_slots) {
+        for (const auto& alias : slot.aliases) {
+            alias_map[alias] = slot.name;
+        }
+    }
+    return alias_map;
+}
+
+std::vector<std::string> ActivationLayoutIR::get_save_list() const {
+    std::vector<std::string> save_list;
+    for (const auto& slot : slots) {
+        if (slot.save_for_backward) {
+            save_list.push_back(slot.name);
+        }
+    }
+    return save_list;
 }
 
 } // namespace dsl

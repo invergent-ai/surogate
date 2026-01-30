@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor, Array
-from ..decorators import model, forward, hf_config, Param
+from ..decorators import model, forward, hf_config, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..hf import fuse, stack_experts
 
@@ -82,6 +82,62 @@ class Qwen3MoEModel:
     blocks = Param(Array["n_layers", "Qwen3MoEBlock"])
     final_norm = Param(Tensor["d_model"], hf_mapping="model.norm.weight")
     lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
+
+    # =========================================================================
+    # IO slots (runtime-provided inputs/outputs)
+    # =========================================================================
+
+    token_ids = Activation(Tensor["B", "T"], dtype="int32", scope="global",
+                           description="Input token IDs")
+    position_ids = Activation(Tensor["T"], dtype="int32", scope="global",
+                              description="Position IDs for RoPE")
+    targets = Activation(Tensor["B", "T"], dtype="int32", scope="global",
+                         aliases=["labels"], description="Target labels for loss")
+
+    # Precomputed constants
+    freq_cis = Activation(Tensor["max_seq", "D", 2], dtype="fp32", scope="global",
+                          aliases=["rope_freqs"], description="Precomputed RoPE frequencies")
+
+    # =========================================================================
+    # Global activation slots (model-level, not per-block)
+    # =========================================================================
+
+    # Embedding output
+    x0 = Activation(Tensor["B", "T", "d_model"], aliases=["encoded"], scope="global",
+                    description="Embedded input (after embedding lookup)")
+    residual0 = Activation(Tensor["B", "T", "d_model"], scope="global",
+                           description="Initial residual stream (zeros)")
+
+    # After stacked blocks
+    xN = Activation(Tensor["B", "T", "d_model"], scope="global",
+                    description="Output from stacked blocks")
+    residualN = Activation(Tensor["B", "T", "d_model"], scope="global",
+                           description="Residual after stacked blocks")
+
+    # Final normalization
+    residual_final = Activation(Tensor["B", "T", "d_model"], scope="global",
+                                description="Final residual (before norm)")
+    xF = Activation(Tensor["B", "T", "d_model"], aliases=["ln_final"],
+                    scope="global", description="After final layer norm")
+    xF_flat = Activation(Tensor["B * T", "d_model"], scope="global",
+                         description="Flattened for LM head")
+    ln_final_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
+                               scope="global", description="Final LN rstd")
+
+    # Loss
+    loss = Activation(Tensor["B * T"], dtype="fp32", scope="global",
+                      aliases=["losses"], description="Cross-entropy loss per token")
+
+    # =========================================================================
+    # Global gradient slots
+    # =========================================================================
+
+    d_loss = Gradient(Tensor["B * T"], dtype="fp32", gradient_of="loss", scope="global",
+                      description="Gradient seed for backward pass")
+    d_xF = Gradient(Tensor["B", "T", "d_model"], gradient_of="xF", scope="global")
+    d_xN = Gradient(Tensor["B", "T", "d_model"], gradient_of="xN", scope="global")
+    d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
+    d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
 
     # HF mappings for block parameters
     _hf_block_mappings_ = {

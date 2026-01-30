@@ -23,6 +23,149 @@ class ParamKind(str, Enum):
     TIED = "tied"               # Tied to another parameter
 
 
+class ActivationScope(str, Enum):
+    """Scope of an activation slot."""
+    BLOCK = "block"             # Per-layer activation (in SimplifiedLayerActivations)
+    GLOBAL = "global"           # Global activation (in NonBlockActivations)
+    GRADIENT = "gradient"       # Per-layer gradient (in SimplifiedLayerGradients)
+    GLOBAL_GRADIENT = "global_gradient"  # Global gradient (in NonBlockGradientBuffers)
+
+
+class ActivationMemoryHint(str, Enum):
+    """Memory management hints for activation slots."""
+    PERSISTENT = "persistent"   # Keep in memory across forward/backward
+    SAVE = "save"               # Save for backward pass
+    RECOMPUTE = "recompute"     # Can be recomputed in backward
+    TEMPORARY = "temporary"     # Stack-allocated, freed after use
+    SHARED = "shared"           # Shares memory with another slot
+
+
+@dataclass
+class ActivationSlotSpec:
+    """Specification for an activation tensor slot.
+
+    Activation slots define pre-allocated tensor buffers used during forward/backward
+    passes. By declaring them in the DSL, we eliminate hardcoded tensor name → slot
+    mappings in the C++ runtime.
+
+    Example usage in a block definition:
+        @block
+        class TransformerBlock:
+            # Activation slots
+            ln1: Activation["B", "T", "C"]
+            ln1_rstd: Activation["B", "T", dtype="fp32"]
+            qkv: Activation["B", "T", "QKV", aliases=["qkv_flat", "qkv_biased"]]
+
+    This generates:
+        - TensorSlot enum entries in C++
+        - Shape inference tables
+        - Save/restore mappings for backward pass
+    """
+
+    name: str
+    scope: ActivationScope = ActivationScope.BLOCK
+
+    # Shape specification using symbolic dimensions (e.g., ["B", "T", "C"])
+    shape: tuple[str | int, ...] = ()
+
+    # Data type (defaults to activation dtype from runtime)
+    dtype: str | None = None  # None = inherit from runtime config
+
+    # Alternative names that map to this slot (e.g., "qkv_flat" -> "qkv")
+    aliases: list[str] = field(default_factory=list)
+
+    # Memory management hints
+    memory_hint: ActivationMemoryHint = ActivationMemoryHint.PERSISTENT
+
+    # If memory_hint == SHARED, this specifies which slot to share with
+    shares_with: str | None = None
+
+    # If memory_hint == SAVE, this adds the tensor to forward save list
+    save_for_backward: bool = False
+
+    # If memory_hint == RECOMPUTE, specifies when to recompute
+    recompute_in_backward: bool = False
+
+    # For gradient slots, the corresponding forward activation
+    gradient_of: str | None = None
+
+    # Condition for optional slots (e.g., only allocate if use_qk_norm)
+    condition: Callable[[Any], bool] | None = None
+
+    # Documentation
+    description: str | None = None
+
+    # Custom attributes for special handling
+    attrs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ActivationLayoutSpec:
+    """Complete activation layout for a block or model.
+
+    This aggregates all activation slots and provides:
+    - Ordered list of slots for struct generation
+    - Name → slot index mapping
+    - Alias resolution table
+    - Memory layout hints for allocation
+
+    Example:
+        layout = ActivationLayoutSpec(
+            name="TransformerBlockActivations",
+            slots=[
+                ActivationSlotSpec("ln1_rstd", shape=("B", "T"), dtype="fp32"),
+                ActivationSlotSpec("ln1", shape=("B", "T", "C")),
+                ActivationSlotSpec("qkv", shape=("B", "T", "QKV"), aliases=["qkv_flat"]),
+                ...
+            ],
+        )
+    """
+
+    name: str
+
+    # Ordered list of activation slots
+    slots: list[ActivationSlotSpec] = field(default_factory=list)
+
+    # Gradient slots (separate list for clarity)
+    gradient_slots: list[ActivationSlotSpec] = field(default_factory=list)
+
+    # Base layout to extend (for inheritance)
+    extends: str | None = None
+
+    def get_slot(self, name: str) -> ActivationSlotSpec | None:
+        """Get slot by name or alias."""
+        for slot in self.slots:
+            if slot.name == name or name in slot.aliases:
+                return slot
+        for slot in self.gradient_slots:
+            if slot.name == name or name in slot.aliases:
+                return slot
+        return None
+
+    def get_slot_index(self, name: str) -> int:
+        """Get slot index by name or alias, or -1 if not found."""
+        for i, slot in enumerate(self.slots):
+            if slot.name == name or name in slot.aliases:
+                return i
+        return -1
+
+    def build_alias_map(self) -> dict[str, str]:
+        """Build mapping from aliases to canonical slot names."""
+        alias_map: dict[str, str] = {}
+        for slot in self.slots + self.gradient_slots:
+            for alias in slot.aliases:
+                alias_map[alias] = slot.name
+        return alias_map
+
+    def get_save_list(self) -> list[str]:
+        """Get list of slots that should be saved for backward."""
+        return [slot.name for slot in self.slots if slot.save_for_backward]
+
+    def get_recompute_list(self) -> list[str]:
+        """Get list of slots that can be recomputed in backward."""
+        return [slot.name for slot in self.slots if slot.recompute_in_backward]
+
+
 @dataclass
 class ParamSpec:
     """Specification for a module parameter (weight, bias, submodule, etc.)."""
@@ -190,6 +333,9 @@ class BlockSpec(BaseModuleSpec):
     pattern: str | None = None  # "sequential_residual", "parallel_residual"
     pattern_config: dict[str, Any] = field(default_factory=dict)
 
+    # Activation layout for this block (per-layer activations and gradients)
+    activations: ActivationLayoutSpec | None = None
+
 
 @dataclass
 class ModelSpec(BaseModuleSpec):
@@ -199,6 +345,12 @@ class ModelSpec(BaseModuleSpec):
     hf_config: HFConfigSpec | None = None
     hf_mapping: HFMappingSpec | None = None
     hf_export: HFMappingSpec | None = None
+
+    # Global activation layout (non-block activations like encoded, ln_final, etc.)
+    activations: ActivationLayoutSpec | None = None
+
+    # Reference to block activation layout (for per-layer tensors)
+    block_activations: str | None = None  # Name of BlockSpec with activation layout
 
 
 @dataclass

@@ -496,6 +496,7 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_last_inputs_cpu(&mLastInputsCpu);
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
     mCompiledExecutor->set_embedding_outputs(mEmbeddingOutputs);
+    mCompiledExecutor->set_slot_registry(&mCompiler->slot_registry());
 
     // Graphs will be compiled lazily on first forward when B/T are known
     mCompiledB = 0;
@@ -798,8 +799,11 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         grads.start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
     }
 
-    // Zero d_ln_final.
+    // Zero non-block gradient buffers
     fill_zero(rs.non_block_gradients().d_ln_final, rs.MainStream);
+    if (rs.non_block_gradients().d_embeddings.Data && !rs.is_lora_only_mode()) {
+        fill_zero(rs.non_block_gradients().d_embeddings, rs.MainStream);
+    }
     if (config.NumLayers > 0) {
         fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
     }
@@ -1028,8 +1032,11 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         grads.start_micro_step(rs.MainStream, micro_step, grad_accum_steps);
     }
 
-    // Zero d_ln_final.
+    // Zero non-block gradient buffers
     fill_zero(rs.non_block_gradients().d_ln_final, rs.MainStream);
+    if (rs.non_block_gradients().d_embeddings.Data && !rs.is_lora_only_mode()) {
+        fill_zero(rs.non_block_gradients().d_embeddings, rs.MainStream);
+    }
     if (config.NumLayers > 0) {
         fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
     }
