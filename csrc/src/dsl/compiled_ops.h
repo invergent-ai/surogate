@@ -372,6 +372,9 @@ public:
     void save_tensors(const std::vector<std::string>& save_list);
 
 private:
+    // Save MoE layer tensors to persistent storage at layer boundaries
+    void save_moe_layer_tensors(int layer_idx);
+
     // Direct dispatch functions (no string comparison)
     void dispatch_embedding(const CompiledOp& op);
     void dispatch_zeros(const CompiledOp& op);

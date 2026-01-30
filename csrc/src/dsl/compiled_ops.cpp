@@ -31,6 +31,28 @@
 namespace dsl {
 namespace {
 
+/// Strip trailing SSA-style numeric suffix (e.g., "qkv_rope_7" -> "qkv_rope")
+/// The DSL IR generates unique tensor names with suffixes like _0, _7, _10, etc.
+/// This function removes these suffixes for field name matching.
+std::string strip_ssa_suffix(const std::string& field) {
+    auto pos = field.rfind('_');
+    if (pos == std::string::npos || pos == 0) {
+        return field;
+    }
+    // Check if everything after the underscore is digits
+    bool all_digits = true;
+    for (std::size_t i = pos + 1; i < field.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(field[i]))) {
+            all_digits = false;
+            break;
+        }
+    }
+    if (all_digits && pos + 1 < field.size()) {
+        return field.substr(0, pos);
+    }
+    return field;
+}
+
 float env_float(const char* name, float fallback) {
     if (!name || !*name) {
         return fallback;
@@ -353,40 +375,44 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     if (parse_block_param(name, layer_idx, field)) {
         ref.layer_idx = layer_idx;
 
-        // Map field to slot
-        if (field == "ln1" || field == "ln1_flat") {
+        // Strip SSA-style numeric suffix (e.g., "qkv_rope_7" -> "qkv_rope")
+        // The DSL IR generates unique tensor names with suffixes like _0, _7, _10, etc.
+        const std::string base_field = strip_ssa_suffix(field);
+
+        // Map field to slot using the base field name (without SSA suffix)
+        if (base_field == "ln1" || base_field == "ln1_flat") {
             ref.slot = TensorSlot::BlockLN1;
-        } else if (field == "ln1_rstd") {
+        } else if (base_field == "ln1_rstd") {
             ref.slot = TensorSlot::BlockLN1RSTD;
-        } else if (field == "ln2" || field == "ln2_flat") {
+        } else if (base_field == "ln2" || base_field == "ln2_flat") {
             ref.slot = TensorSlot::BlockLN2;
-        } else if (field == "ln2_rstd") {
+        } else if (base_field == "ln2_rstd") {
             ref.slot = TensorSlot::BlockLN2RSTD;
-        } else if (field == "q_rstd") {
+        } else if (base_field == "q_rstd") {
             ref.slot = TensorSlot::BlockQRSTD;
-        } else if (field == "k_rstd") {
+        } else if (base_field == "k_rstd") {
             ref.slot = TensorSlot::BlockKRSTD;
-        } else if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased") {
+        } else if (base_field == "qkv" || base_field == "qkv_flat" || base_field == "qkv_biased") {
             ref.slot = TensorSlot::BlockQKV;
-        } else if (field == "qkv_rope") {
+        } else if (base_field == "qkv_rope") {
             ref.slot = TensorSlot::BlockQKVRoPE;
-        } else if (field == "lse") {
+        } else if (base_field == "lse") {
             ref.slot = TensorSlot::BlockLSE;
-        } else if (field == "att" || field == "att_flat") {
+        } else if (base_field == "att" || base_field == "att_flat" || base_field == "attn") {
             ref.slot = TensorSlot::BlockAtt;
-        } else if (field == "att_out" || field == "att_out_flat") {
+        } else if (base_field == "att_out" || base_field == "att_out_flat") {
             ref.slot = TensorSlot::BlockAttOut;
-        } else if (field == "res_att") {
+        } else if (base_field == "res_att") {
             ref.slot = TensorSlot::BlockResidualAtt;
-        } else if (field == "mlp_up" || field == "mlp_up_flat") {
+        } else if (base_field == "mlp_up" || base_field == "mlp_up_flat") {
             ref.slot = TensorSlot::BlockMLPUp;
-        } else if (field == "swiglu" || field == "swiglu_flat") {
+        } else if (base_field == "swiglu" || base_field == "swiglu_flat") {
             ref.slot = TensorSlot::BlockSwiGLU;
-        } else if (field == "mlp_down" || field == "mlp_down_flat") {
+        } else if (base_field == "mlp_down" || base_field == "mlp_down_flat") {
             ref.slot = TensorSlot::BlockMLPDown;
-        } else if (field == "res_ffn") {
+        } else if (base_field == "res_ffn") {
             ref.slot = TensorSlot::BlockResidualFFN;
-        } else if (field == "rope_freqs" || field == "freq_cis") {
+        } else if (base_field == "rope_freqs" || base_field == "freq_cis") {
             // Block-indexed rope frequencies refer to global FreqCis tensor
             ref.slot = TensorSlot::FreqCis;
             ref.layer_idx = -1;  // Global, not layer-indexed
@@ -399,7 +425,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             ref.slot = TensorSlot::Mapped;
         }
 
-        // Pre-compute shape based on field
+        // Pre-compute shape based on base field (use base_field for consistent matching)
         const long B = mB;
         const long T = mT;
         const long C = mConfig.HiddenSize;
@@ -409,34 +435,34 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         const long Hs = mConfig.head_size();
         const long QKV = mConfig.qkv_channels();
 
-        if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" ||
-            field == "res_att" || field == "res_ffn") {
+        if (base_field == "ln1" || base_field == "ln2" || base_field == "att_out" || base_field == "mlp_down" ||
+            base_field == "res_att" || base_field == "res_ffn") {
             ref.shape = {B, T, C};
-        } else if (field == "ln1_flat" || field == "ln2_flat" || field == "att_out_flat" || field == "mlp_down_flat") {
+        } else if (base_field == "ln1_flat" || base_field == "ln2_flat" || base_field == "att_out_flat" || base_field == "mlp_down_flat") {
             ref.shape = {B * T, C};
-        } else if (field == "ln1_rstd" || field == "ln2_rstd") {
+        } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd") {
             ref.shape = {B, T};
-        } else if (field == "qkv" || field == "qkv_rope") {
+        } else if (base_field == "qkv" || base_field == "qkv_rope") {
             ref.shape = {B, T, QKV};
-        } else if (field == "qkv_flat" || field == "qkv_biased") {
+        } else if (base_field == "qkv_flat" || base_field == "qkv_biased") {
             ref.shape = {B * T, QKV};
-        } else if (field == "q_rstd") {
+        } else if (base_field == "q_rstd") {
             ref.shape = {B, T, Hq};
-        } else if (field == "k_rstd") {
+        } else if (base_field == "k_rstd") {
             ref.shape = {B, T, Hkv};
-        } else if (field == "att") {
+        } else if (base_field == "att" || base_field == "attn") {
             ref.shape = {B, T, Hq * Hs};
-        } else if (field == "att_flat") {
+        } else if (base_field == "att_flat") {
             ref.shape = {B * T, Hq * Hs};
-        } else if (field == "lse") {
+        } else if (base_field == "lse") {
             ref.shape = {B, Hq, T};
-        } else if (field == "mlp_up") {
+        } else if (base_field == "mlp_up") {
             ref.shape = {B, T, 2 * D};
-        } else if (field == "mlp_up_flat") {
+        } else if (base_field == "mlp_up_flat") {
             ref.shape = {B * T, 2 * D};
-        } else if (field == "swiglu") {
+        } else if (base_field == "swiglu") {
             ref.shape = {B, T, D};
-        } else if (field == "swiglu_flat") {
+        } else if (base_field == "swiglu_flat") {
             ref.shape = {B * T, D};
         }
 
@@ -2013,6 +2039,71 @@ const Tensor* CompiledExecutor::try_get_tensor(const std::string& name) const {
     return &it->second;
 }
 
+void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
+    // Copy MoE tensors from this layer to persistent storage before stack restore.
+    // This allows stack memory to be reclaimed while preserving tensors for backward.
+    if (mConfig.NumExperts == 0) {
+        return;
+    }
+
+    // Build layer prefix pattern (e.g., "blocks[5].")
+    std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+
+    // Iterate through tensor map looking for MoE tensors from this layer
+    for (auto& [name, tensor] : mTensorMap) {
+        // Skip global MoE tensors - these are scratch space reused each layer
+        // and are NOT needed for backward (backward uses mMoEExpertOffsetsGPU).
+        if (name == "moe_expert_offsets" || name == "moe_gather_indices") {
+            continue;
+        }
+
+        // Check if tensor belongs to this layer
+        if (name.find(layer_prefix) != 0) {
+            continue;
+        }
+
+        // Check if this is an MoE-related tensor that needs persistent storage
+        bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
+                              name.find("scatter_indices") != std::string::npos ||
+                              name.find("routing_weights") != std::string::npos ||
+                              name.find("routing_indices") != std::string::npos ||
+                              name.find("router_") != std::string::npos ||
+                              name.find("permuted") != std::string::npos ||
+                              name.find("expert_") != std::string::npos);
+
+        if (!is_moe_tensor || tensor.Data == nullptr) {
+            continue;
+        }
+
+        const size_t bytes = tensor.bytes();
+        if (bytes == 0) {
+            continue;
+        }
+
+        // Allocate or resize persistent buffer if needed
+        auto buf_it = mMoESavedBuffers.find(name);
+        if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+            // Free old buffer if exists
+            if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                CUDA_CHECK(cudaFree(buf_it->second));
+            }
+            // Allocate new buffer
+            void* new_buffer = nullptr;
+            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+            mMoESavedBuffers[name] = new_buffer;
+            mMoESavedSizes[name] = bytes;
+        }
+
+        // Copy data to persistent buffer
+        void* dst_buffer = mMoESavedBuffers[name];
+        CUDA_CHECK(cudaMemcpyAsync(dst_buffer, tensor.Data, bytes,
+                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+
+        // Update tensor to point to persistent buffer (so backward finds it)
+        tensor.Data = static_cast<std::byte*>(dst_buffer);
+    }
+}
+
 void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     if (!mSaved) {
         return;
@@ -2275,9 +2366,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
-        // Check if we already have a view cached
+        // Check if we already have a tensor in the map (e.g., from MoE temp allocation)
         auto it = mTensorMap.find(ref.name);
-        if (it != mTensorMap.end()) {
+        if (it != mTensorMap.end() && it->second.Data) {
+            // For MoE operations, the tensor map may contain dynamically-shaped temps
+            // that differ from the statically-compiled shapes. Prioritize the map tensor
+            // if it has valid data, even if shapes differ.
             // Verify shape matches
             bool shape_matches = (it->second.Rank == static_cast<int>(ref.shape.size()));
             if (shape_matches) {
@@ -2288,7 +2382,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             if (shape_matches) {
                 return it->second;
             }
-            // Shape doesn't match, recreate view
+            // Shape doesn't match, but we have valid data - use it for MoE dynamic shapes
+            // This handles cases like swiglu output [total_tokens, D] vs expected [B, T, D]
+            return it->second;
         }
         // Need to create a view - get the base tensor and create view
         Tensor* base = nullptr;
@@ -2540,7 +2636,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
                                    op.attrs.eps, static_cast<int>(mB * mT),
                                    mConfig.HiddenSize, mRunState.MainStream);
-
 }
 
 void CompiledExecutor::dispatch_view(const CompiledOp& op) {
@@ -2707,12 +2802,14 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op) {
 }
 
 void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
-    Tensor& qkv = resolve_tensor(op.inputs[0]);
+    Tensor& qkv_in = resolve_tensor(op.inputs[0]);
     Tensor& q_norm = resolve_tensor(op.inputs[1]);
     Tensor& k_norm = resolve_tensor(op.inputs[2]);
     Tensor& freqs = resolve_tensor(op.inputs[3]);
     Tensor& pos_ids = resolve_tensor(op.inputs[4]);
 
+    // Get output tensor from pre-allocated slot if available
+    Tensor& qkv_out = ensure_output_tensor(op.outputs[0]);
     Tensor& q_rstd = ensure_output_tensor(op.outputs[1]);
     Tensor& k_rstd = ensure_output_tensor(op.outputs[2]);
 
@@ -2721,7 +2818,15 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     const int Hs = static_cast<int>(mConfig.head_size());
     const int qkv_channels = Hs * (Hq + 2 * Hkv);
 
-    Tensor qkv_view = (qkv.Rank == 4) ? view_tensor(qkv, {mB, mT, qkv_channels}) : qkv;
+    // If input and output are different buffers, copy input to output first
+    // The kernel operates in-place on the output buffer
+    if (qkv_in.Data != qkv_out.Data) {
+        cudaMemcpyAsync(qkv_out.Data, qkv_in.Data,
+                        qkv_in.bytes(),
+                        cudaMemcpyDeviceToDevice, mRunState.MainStream);
+    }
+
+    Tensor qkv_view = (qkv_out.Rank == 4) ? view_tensor(qkv_out, {mB, mT, qkv_channels}) : qkv_out;
     int rotary_dim = op.attrs.rotary_dim;
 
     const bool rope_fusable = (rotary_dim > 0)
@@ -2762,11 +2867,11 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
                                  op.attrs.eps,
                                  static_cast<int>(mB), static_cast<int>(mT),
                                  qkv_channels, Hkv, Hs, q_rows, mRunState.MainStream);
-        rope_forward(qkv, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
+        rope_forward(qkv_out, qkv_out, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
                      static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs, rotary_dim, mRunState.MainStream);
     }
 
-    mTensorMap[op.outputs[0].name] = qkv;
+    mTensorMap[op.outputs[0].name] = qkv_out;
 }
 
 void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
@@ -2812,6 +2917,16 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
     }
+
+    // cuDNN attention uses custom strides that map logical (B, Hq, T, HS) dims
+    // to (B, T, Hq, HS) contiguous memory layout:
+    //   Output strides: {Hq*HS*T, HS, Hq*HS, 1} for dims {B, Hq, T, HS}
+    //   This maps element [b,h,t,s] to offset: b*Hq*HS*T + t*Hq*HS + h*HS + s
+    //   Which is exactly (B, T, Hq, HS) contiguous layout.
+    // DSL allocates output as (B, T, Hq*HS) = (B, T, Hq, HS) contiguous, so
+    // we can pass it directly to cuDNN without any transpose.
+    //
+    // Similarly for QKV input: cuDNN expects (B, T, H, HS) contiguous where H = Hq + 2*Hkv.
 
     attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
                             mRunState.CudnnHandle, static_cast<int>(mB), static_cast<int>(mT),
@@ -3081,12 +3196,15 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     const int num_experts = static_cast<int>(mConfig.NumExperts);
 
     // Allocate temporary buffers for permutation indices
+    // Use Stack.allocate for small buffers that can be freed at layer boundaries
     Tensor expert_counts = mRunState.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_counts");
-    // Allocate expert_offsets persistently (not on stack) so it survives to backward
-    // This tensor is needed by grouped GEMM backward ops
-    Tensor expert_offsets = mRunState.temp_alloc(ETensorDType::INT32, {num_experts + 1});
+    Tensor expert_offsets = mRunState.Stack.allocate(ETensorDType::INT32, {num_experts + 1}, "moe_expert_offsets");
     Tensor expert_positions = mRunState.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_positions");
     Tensor gather_indices = mRunState.Stack.allocate(ETensorDType::INT32, {total_tokens}, "moe_gather_indices");
+
+    // Zero-initialize expert_positions before atomicAdd in build_indices
+    // Stack memory is reused across forward passes and contains stale values
+    fill_zero(expert_positions, mRunState.MainStream);
 
     // Compute expert counts
     moe_compute_expert_counts(expert_counts.get<int>(),
@@ -3150,7 +3268,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
 
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
-    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+    // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
+        ? static_cast<int>(mConfig.MoeIntermediateSize)
+        : static_cast<int>(mConfig.IntermediateSize);
 
     // MoE output shape is dynamic: [total_tokens, 2 * intermediate_size]
     // total_tokens = inp.Sizes[0] (permuted token count)
@@ -3196,7 +3317,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
-    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+    // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
+        ? static_cast<int>(mConfig.MoeIntermediateSize)
+        : static_cast<int>(mConfig.IntermediateSize);
 
     // MoE output shape is dynamic: [total_tokens, hidden_size]
     // total_tokens = inp.Sizes[0] (permuted token count)
@@ -4635,7 +4759,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
 
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
-    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+    // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
+        ? static_cast<int>(mConfig.MoeIntermediateSize)
+        : static_cast<int>(mConfig.IntermediateSize);
 
     if (d_gate_up.DType == ETensorDType::BF16) {
         moe_grouped_gemm_gate_up_backward(d_input.get<nv_bfloat16>(),
@@ -4673,7 +4800,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
 
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
-    const int intermediate_size = static_cast<int>(mConfig.IntermediateSize);
+    // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
+        ? static_cast<int>(mConfig.MoeIntermediateSize)
+        : static_cast<int>(mConfig.IntermediateSize);
 
     if (d_output.DType == ETensorDType::BF16) {
         moe_grouped_gemm_down_backward(d_input.get<nv_bfloat16>(),
@@ -4916,24 +5046,27 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // Note: Forward activation stats are not printed because with recompute_block=true,
             // the activation buffers are shared across layers, so they only contain the last
             // layer's data at this point, not the per-layer values.
-            // For MoE models, skip stack restore to preserve saved tensors for backward.
-            // MoE backward needs each layer's intermediate tensors (routing_weights, scatter_indices, etc.)
-            // and cannot recompute them. Without this, the saved tensors point to reused/stale memory.
-            // TODO: Implement proper tensor copying for MoE saved tensors to reduce memory usage.
-            if (mConfig.NumExperts == 0 && op.layer_end < num_layers &&
+            if (op.layer_end < num_layers &&
                 layer_active[static_cast<std::size_t>(op.layer_end)]) {
-                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
-                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
-                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
+                // For MoE models, skip stack restore because:
+                // 1. MoE backward needs forward activations (routing_weights, scatter_indices, etc.)
+                // 2. The recompute mechanism (recompute_block) doesn't support MoE ops
+                // 3. Without recompute, we must preserve all forward tensors for backward
+                // TODO: Implement MoE-specific recompute to enable memory savings
+                if (mConfig.NumExperts == 0) {
+                    mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
+                    if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
+                        mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
+                    }
+                    prune_stack_tensors();
+                    if (mRunState.ffn_temps_on_stack()) {
+                        auto& acts = mRunState.simplified_acts(op.layer_end);
+                        acts.mlp_up.Data = nullptr;
+                        acts.swiglu.Data = nullptr;
+                    }
+                    // Note: cudnn_workspace is persistently allocated, don't clear
+                    layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
                 }
-                prune_stack_tensors();
-                if (mRunState.ffn_temps_on_stack()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.mlp_up.Data = nullptr;
-                    acts.swiglu.Data = nullptr;
-                }
-                // Note: cudnn_workspace is persistently allocated, don't clear
-                layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
             }
             handle_layer_end(op.layer_end);
         }
