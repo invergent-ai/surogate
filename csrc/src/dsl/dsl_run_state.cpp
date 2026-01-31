@@ -188,14 +188,15 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool lora_only = mLoraOnlyMode;
 
-    // LN outputs can be shared when recompute is enabled
-    const bool share_ln1 = recompute_enabled;
-    const bool share_ln2 = recompute_enabled;
+    // LN outputs can be shared only when recompute is enabled AND we will actually recompute them.
+    // In LoRA mode we skip recompute for several ops, so LN outputs must be per-layer.
+    const bool share_ln1 = recompute_enabled && !lora_only;
+    const bool share_ln2 = recompute_enabled && !lora_only;
 
     // QKV sharing: only in LoRA mode where attention is recomputed.
     // In FFT mode, we skip attention recompute and need saved QKV per-layer for bit-exact gradients.
     // If QKV is shared, all layers would use the last layer's QKV data during backward!
-    const bool share_qkv = recompute_enabled && lora_only;
+    const bool share_qkv = false;
 
     // Attention output sharing:
     // IMPORTANT: att/att_out/lse must NEVER be shared when recompute is enabled.
@@ -212,8 +213,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const bool share_mlp_up = false;
     const bool share_swiglu = false;
 
-    // Residual intermediates: In LoRA mode they can be shared. In FFT mode, save per-layer.
-    const bool share_residual_intermediates = recompute_enabled && lora_only;
+    // Residual intermediates: must be per-layer in LoRA mode because we skip recompute.
+    const bool share_residual_intermediates = recompute_enabled && !lora_only;
 
     // FFN temps: Never use stack for mlp_up/swiglu when we need per-layer values.
     // - FFT mode: per-layer needed for bit-exact gradients
@@ -248,10 +249,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     if (share_residual_intermediates) {
         shared_residual_att = mAllocator->allocate(dtype, "residual_att_shared", kind, {B, T, C});
     }
-    // In lora_only mode, mlp_down can be shared (not needed for LoRA backward)
-    if (lora_only) {
-        shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
-    } else if (share_residual_intermediates) {
+    if (share_residual_intermediates) {
         shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
     }
 
@@ -303,8 +301,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.swiglu = share_swiglu ? shared_swiglu : mAllocator->allocate(dtype, "swiglu", kind, {B, T, M});
         }
 
-        // mlp_down can be shared in lora_only mode (not needed for LoRA backward)
-        if (lora_only || share_residual_intermediates) {
+        if (share_residual_intermediates) {
             acts.mlp_down = shared_mlp_down;
         } else {
             acts.mlp_down = mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
@@ -341,9 +338,12 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     // at different points in the backward pass, and sharing can cause corruption.
     // For safety, disable all gradient sharing in FFT mode.
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
-    const bool share_grads = recompute_enabled && mLoraOnlyMode;
-    const bool share_res_ffn = recompute_enabled && mLoraOnlyMode;
-    const bool share_mlp_down = recompute_enabled && mLoraOnlyMode;
+    // NOTE: LoRA + recompute uses backward hooks that rely on per-layer gradients.
+    // Sharing gradient buffers across layers corrupts those hooks in the DSL path.
+    // Disable gradient sharing in LoRA mode to keep per-layer grads stable.
+    const bool share_grads = false;
+    const bool share_res_ffn = false;
+    const bool share_mlp_down = false;
     const bool large_bwd_temps_on_stack = recompute_enabled;
 
     if (mStackSimulate && large_bwd_temps_on_stack) {

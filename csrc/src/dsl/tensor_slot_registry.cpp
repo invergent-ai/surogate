@@ -266,6 +266,10 @@ bool TensorSlotRegistry::will_recompute(const std::string& name, bool lora_only_
         // In FFT mode, use saved tensors (requires gradient_accumulation_steps=1 to avoid corruption)
         return lora_only_mode;
     }
+    if (policy == "fft_only") {
+        // Only recompute in FFT mode, not in LoRA mode
+        return !lora_only_mode;
+    }
     // "always" or empty (default) - always recompute
     return true;
 }

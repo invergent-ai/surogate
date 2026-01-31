@@ -26,6 +26,7 @@ class GraphExecutor;
 enum class RecomputePolicy : std::uint8_t {
     Always,
     LoraOnly,
+    FftOnly,
     Never,
 };
 

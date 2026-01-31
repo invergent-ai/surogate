@@ -65,6 +65,7 @@ bool is_global_ref(const std::string& name, std::string& global_name) {
 
 RecomputePolicy parse_policy(const std::string& policy) {
     if (policy == "lora_only") return RecomputePolicy::LoraOnly;
+    if (policy == "fft_only") return RecomputePolicy::FftOnly;
     if (policy == "never") return RecomputePolicy::Never;
     return RecomputePolicy::Always;
 }
@@ -1306,10 +1307,11 @@ void RecomputePlan::init_from_layout(const ActivationLayoutIR& layout,
     fflush(stderr);
     for (std::size_t i = 0; i < mPlan.topo_ops.size(); ++i) {
         const auto& op = mPlan.topo_ops[i];
-        const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
-                                  (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" : "never";
-        fprintf(stderr, "  [%zu] %s outputs=%zu policy=%s\n",
-                i, op.op_type.c_str(), op.outputs.size(), policy_str);
+            const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
+                                      (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" :
+                                      (op.policy == RecomputePolicy::FftOnly) ? "fft_only" : "never";
+            fprintf(stderr, "  [%zu] %s outputs=%zu policy=%s\n",
+                    i, op.op_type.c_str(), op.outputs.size(), policy_str);
         fflush(stderr);
     }
     fprintf(stderr, "[RECOMPUTE_PLAN] Done listing ops\n");
@@ -1419,15 +1421,19 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
     int op_idx = 0;
     for (const auto& op : mPlan.topo_ops) {
         if (layer_idx == 0) {
-            const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
-                                      (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" : "never";
-            fprintf(stderr, "[RECOMPUTE_OP] Layer %d idx=%d op=%s policy=%s\n",
-                    layer_idx, op_idx, op.op_type.c_str(), policy_str);
+        const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
+                                  (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" :
+                                  (op.policy == RecomputePolicy::FftOnly) ? "fft_only" : "never";
+        fprintf(stderr, "[RECOMPUTE_OP] Layer %d idx=%d op=%s policy=%s\n",
+                layer_idx, op_idx, op.op_type.c_str(), policy_str);
             fflush(stderr);
         }
         op_idx++;
 
         if (op.policy == RecomputePolicy::Never) {
+            continue;
+        }
+        if (op.policy == RecomputePolicy::FftOnly && lora_only_mode) {
             continue;
         }
         // FIX: In FFT mode, we MUST recompute all activations for each micro-step.

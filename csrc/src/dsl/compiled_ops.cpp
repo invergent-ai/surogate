@@ -2335,13 +2335,13 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         return;
     }
 
-    // Check if recompute mode is configured (mRecomputeFn set during init).
-    // Note: mRecomputeEnabled is only set to true during backward, so we use
-    // mRecomputeFn to detect if recompute is configured during forward/save.
-    const bool recompute_configured = (mRecomputeFn != nullptr);
+    // Recompute is only active when enabled in runtime options.
+    // Do NOT use mRecomputeFn here: it's always set when the graph is compiled,
+    // even for no-recompute runs, and would cause metadata-only saves.
+    const bool recompute_enabled = mOptions.recompute_enabled();
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
-        if (!recompute_configured || !mSlotRegistry) {
+        if (!recompute_enabled || !mSlotRegistry) {
             return false;
         }
         // Use will_recompute which checks the recompute_policy
@@ -2366,7 +2366,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             Tensor meta = src;
             meta.Data = nullptr;
             (*mSaved)[name] = meta;
-        } else if (recompute_configured && src.Data != nullptr) {
+        } else if (recompute_enabled && src.Data != nullptr) {
             // In recompute mode but tensor won't be recomputed (e.g., lora_only in FFT mode).
             // Copy data to persistent buffer since live buffers will be reused.
             const size_t bytes = src.bytes();

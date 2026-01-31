@@ -89,7 +89,7 @@ class DenseTransformerBlock:
         # Recompute LN1 directly from saved res_ffn + rstd to match implementation.
         recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
         recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
+        recompute_policy="fft_only",
     )
     ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN1")
