@@ -329,6 +329,16 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Nq, HS)
                              Tensor& workspace, cudnnHandle_t handle,
                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
+// Custom (non-cuDNN) attention forward using the in-tree kernel (supports FP32/BF16).
+void attention_forward_custom(Tensor& out,  // output: (B, T, Nq, HS)
+                              Tensor& stats, // output for backward pass: (B, Hq, T)
+                              const Tensor& inp,  // input: (B, T, Hq + 2Hkv, HS) QKV
+                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+// Custom (non-cuDNN) attention backward using the in-tree kernel (supports FP32/BF16).
+void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
+                               const Tensor& out, const Tensor& dout, const Tensor& qkv,
+                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+
 std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle);
 void attention_backward_cudnn(nv_bfloat16* dqkv, const float* stats,
                               const nv_bfloat16* out, const nv_bfloat16* dout, const nv_bfloat16* qkv,

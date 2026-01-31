@@ -633,9 +633,9 @@ void execute_matmul(RecomputeContext& ctx,
 
     const bool allow_quant = allow_quant_layer(ctx.options, cfg, layer_idx);
     const bool have_recipe = ctx.options.TrainingRecipe != nullptr;
-    // For FFT mode recompute, use direct matmul to ensure determinism
-    // The recipe matmul may have FP8 quantization that introduces small numerical differences
-    const bool use_recipe = false;  // plan ? (plan->use_recipe && have_recipe) : have_recipe;
+    // Match forward path: if the training recipe is enabled, use it during recompute.
+    // This ensures recompute activations match non-recompute forward (even with FP8).
+    const bool use_recipe = plan ? (plan->use_recipe && have_recipe) : have_recipe;
 
     const int C_in = (inp.Rank >= 3) ? static_cast<int>(inp.Sizes[2]) : static_cast<int>(inp.Sizes[1]);
     const int C_out = (out.Rank >= 3) ? static_cast<int>(out.Sizes[2]) : static_cast<int>(out.Sizes[1]);
@@ -760,19 +760,19 @@ void execute_fused_residual(RecomputeContext& ctx,
         rmsnorm_apply_saved(acts.ln1, res_ffn, *weight, acts.ln1_rstd,
                             static_cast<int>(B), static_cast<int>(T), C, ctx.rs.MainStream);
 
-        // DEBUG: Print data pointer and first values
+        // DEBUG: Print data pointer and values at position 3 (where tokens differ)
         if (layer_idx == 0) {
-            fprintf(stderr, "[RECOMPUTE] Layer %d ln1: Data=%p\n", layer_idx, acts.ln1.Data);
-            // Print first few values
             cudaStreamSynchronize(ctx.rs.MainStream);
             std::vector<float> vals(8);
-            cudaMemcpy(vals.data(), acts.ln1.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE] Layer %d ln1 values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
-            // Also check res_ffn values
-            cudaMemcpy(vals.data(), res_ffn.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE] Layer %d res_ffn values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+            const std::size_t pos3_offset = 3 * static_cast<std::size_t>(C);
+            // Print res_ffn at position 3 (input to rmsnorm)
+            cudaMemcpy(vals.data(), reinterpret_cast<float*>(res_ffn.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE_LN1] res_ffn[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                    res_ffn.Data, vals[0], vals[1], vals[2], vals[3]);
+            // Print ln1 output at position 3
+            cudaMemcpy(vals.data(), reinterpret_cast<float*>(acts.ln1.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE_LN1] ln1_out[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                    acts.ln1.Data, vals[0], vals[1], vals[2], vals[3]);
         }
 
         return;
@@ -861,6 +861,21 @@ void execute_rmsnorm(RecomputeContext& ctx,
     const int C = static_cast<int>(ctx.cfg.HiddenSize);
     rmsnorm_apply_saved(out, *input, *weight, *rstd, static_cast<int>(B), static_cast<int>(T),
                         C, ctx.rs.MainStream);
+
+    // DEBUG: Print values at position 3 (where tokens differ) for layers 0 and 25
+    if (layer_idx == 0 || layer_idx == 25) {
+        cudaStreamSynchronize(ctx.rs.MainStream);
+        std::vector<float> vals(8);
+        const std::size_t pos3_offset = 3 * static_cast<std::size_t>(C);
+        // Print input (res_ffn) at position 3
+        cudaMemcpy(vals.data(), reinterpret_cast<float*>(input->Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RECOMPUTE_LN1] Layer %d res_ffn[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, input->Data, vals[0], vals[1], vals[2], vals[3]);
+        // Print output (ln1) at position 3
+        cudaMemcpy(vals.data(), reinterpret_cast<float*>(out.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RECOMPUTE_LN1] Layer %d ln1_out[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, out.Data, vals[0], vals[1], vals[2], vals[3]);
+    }
 }
 
 void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
@@ -1015,6 +1030,7 @@ void execute_flash_attention(RecomputeContext& ctx,
     const int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
     const int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
     const int Hs = static_cast<int>(ctx.cfg.head_size());
+    const bool cudnn_gqa_ok = (Hq == Hkv);
 
     if (!ctx.rs.scratch().cudnn_workspace.Data) {
         ctx.rs.temp_acquire(ctx.rs.scratch().cudnn_workspace);
@@ -1026,9 +1042,15 @@ void execute_flash_attention(RecomputeContext& ctx,
         ? *qkv
         : view_tensor(*qkv, {B, T, Hq + 2 * Hkv, Hs});
 
-    attention_forward_cudnn(att_view, lse_view, qkv_view, ctx.rs.scratch().cudnn_workspace,
-                            ctx.rs.CudnnHandle, static_cast<int>(B), static_cast<int>(T),
-                            Hq, Hkv, Hs, ctx.rs.MainStream);
+    if (!cudnn_gqa_ok) {
+        attention_forward_custom(att_view, lse_view, qkv_view,
+                                 static_cast<int>(B), static_cast<int>(T),
+                                 Hq, Hkv, Hs, ctx.rs.MainStream);
+    } else {
+        attention_forward_cudnn(att_view, lse_view, qkv_view, ctx.rs.scratch().cudnn_workspace,
+                                ctx.rs.CudnnHandle, static_cast<int>(B), static_cast<int>(T),
+                                Hq, Hkv, Hs, ctx.rs.MainStream);
+    }
 }
 
 void execute_swiglu(RecomputeContext& ctx,
@@ -1408,10 +1430,26 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         if (op.policy == RecomputePolicy::Never) {
             continue;
         }
-        if (op.policy == RecomputePolicy::LoraOnly && !lora_only_mode) {
-            // In FFT mode, skip recompute for lora_only ops - use saved tensors instead
+        // FIX: In FFT mode, we MUST recompute all activations for each micro-step.
+        // The saved tensors contain micro-step 0's activations, which are WRONG for subsequent
+        // micro-steps during gradient accumulation. Skipping recompute causes flash attention
+        // backward to receive stale activations (from micro-step 0) with correct d_out (from
+        // current micro-step), resulting in gradient explosion.
+        //
+        // The original logic skipped lora_only ops in FFT mode to "use saved tensors instead",
+        // but this only works with gradient_accumulation_steps=1.
+        //
+        // if (op.policy == RecomputePolicy::LoraOnly && !lora_only_mode) {
+        //     continue;  // WRONG: causes gradient explosion with grad accum > 1
+        // }
+        // In LoRA mode, skip recompute for ops that produce values needed by LoRA backward hooks.
+        // These ops have lora_targets set (e.g., flash_attention for O proj, swiglu for down proj).
+        // We need the original forward values, not recomputed values, because:
+        // 1. cuDNN attention is non-deterministic (recomputed att != forward att)
+        // 2. Matmul rounding can differ between forward and recompute
+        if (lora_only_mode && !op.lora_targets.empty()) {
             if (layer_idx == 0) {
-                fprintf(stderr, "[RECOMPUTE_SKIP] Layer %d op=%s (lora_only policy, FFT mode)\n",
+                fprintf(stderr, "[RECOMPUTE_SKIP] Layer %d op=%s (has lora_targets, LoRA mode - use saved)\n",
                         layer_idx, op.op_type.c_str());
             }
             continue;

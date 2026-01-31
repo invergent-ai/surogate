@@ -19,6 +19,7 @@
  */
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <unordered_map>
 #include <vector>
 
@@ -372,6 +373,76 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
     if (sync_event) {
         CUDA_CHECK(cudaEventRecord(sync_event, copy_stream));
         CUDA_CHECK(cudaStreamWaitEvent(stream, sync_event, 0));
+    }
+
+    // Debug: scan dout for NaN/Inf before launching the kernel (low-frequency)
+    static int dout_scan_count = 0;
+    if (!capturing && dout_scan_count < 64) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::size_t total = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * static_cast<std::size_t>(C);
+        const std::size_t chunk = 1 << 20;
+        std::size_t nan_count = 0;
+        std::size_t inf_count = 0;
+        float max_abs = 0.0f;
+        std::size_t first_idx = 0;
+        bool found = false;
+
+        if constexpr (std::is_same_v<floatX, nv_bfloat16>) {
+            std::vector<nv_bfloat16> host(chunk);
+            for (std::size_t off = 0; off < total; off += chunk) {
+                const std::size_t n = std::min(chunk, total - off);
+                CUDA_CHECK(cudaMemcpy(host.data(), dout + off, n * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+                for (std::size_t i = 0; i < n; ++i) {
+                    const float v = static_cast<float>(host[i]);
+                    const float abs_v = std::fabs(v);
+                    if (abs_v > max_abs) {
+                        max_abs = abs_v;
+                    }
+                    if (std::isnan(v) || std::isinf(v)) {
+                        if (!found) {
+                            first_idx = off + i;
+                            found = true;
+                        }
+                        if (std::isnan(v)) {
+                            nan_count++;
+                        } else {
+                            inf_count++;
+                        }
+                    }
+                }
+            }
+        } else {
+            std::vector<float> host(chunk);
+            for (std::size_t off = 0; off < total; off += chunk) {
+                const std::size_t n = std::min(chunk, total - off);
+                CUDA_CHECK(cudaMemcpy(host.data(), dout + off, n * sizeof(float), cudaMemcpyDeviceToHost));
+                for (std::size_t i = 0; i < n; ++i) {
+                    const float v = host[i];
+                    const float abs_v = std::fabs(v);
+                    if (abs_v > max_abs) {
+                        max_abs = abs_v;
+                    }
+                    if (std::isnan(v) || std::isinf(v)) {
+                        if (!found) {
+                            first_idx = off + i;
+                            found = true;
+                        }
+                        if (std::isnan(v)) {
+                            nan_count++;
+                        } else {
+                            inf_count++;
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::size_t row = static_cast<std::size_t>(C) > 0 ? first_idx / static_cast<std::size_t>(C) : 0;
+        const std::size_t col = static_cast<std::size_t>(C) > 0 ? first_idx % static_cast<std::size_t>(C) : first_idx;
+        fprintf(stderr,
+                "[ENC_BWD_DOUT_SCAN] B=%d T=%d C=%d total=%zu nan=%zu inf=%zu max_abs=%.6e first_idx=%zu row=%zu col=%zu\n",
+                B, T, C, total, nan_count, inf_count, max_abs, first_idx, row, col);
+        dout_scan_count++;
     }
 
     // Launch wte kernel

@@ -61,7 +61,15 @@ class LlamaBlock:
     # =========================================================================
 
     # Pre-attention normalization
-    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"])
+    ln1 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln1_flat"],
+        recompute=True,
+        # Recompute LN1 directly from saved res_ffn + rstd to match implementation.
+        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
+        recompute_op="rmsnorm_apply_saved",
+        recompute_policy="always",
+    )
     ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN1")
 
@@ -104,6 +112,7 @@ class LlamaBlock:
 
     d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
     d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+    d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope")
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
     d_mlp_up = Gradient(Tensor["B", "T", "MUp"], gradient_of="mlp_up")
@@ -127,14 +136,14 @@ class LlamaBlock:
                 rstd_name="ln1_rstd",
             )
 
-            ln1_flat = g.view(ln1_out, shape=[B * T, self.C])
+            ln1_flat = g.view(ln1_out, shape=[B * T, self.C], out_name="ln1_flat")
             qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT", out_name="qkv_flat")
             qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D], out_name="qkv")
 
             qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, rotary_dim="D", out_name="qkv_rope")
             attn_out, lse = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")
 
-            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim], out_name="att_flat")
             att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT", out_name="att_out_flat")
             att_out = g.view(att_out_flat, shape=[B, T, self.C], out_name="att_out")
 
@@ -145,11 +154,11 @@ class LlamaBlock:
                 rstd_name="ln2_rstd",
             )
 
-            ln2_flat = g.view(ln2_out, shape=[B * T, self.C])
+            ln2_flat = g.view(ln2_out, shape=[B * T, self.C], out_name="ln2_flat")
             mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", out_name="mlp_up_flat")
             mlp_up = g.view(mlp_up_flat, shape=[B, T, self.MUp], out_name="mlp_up")
             mlp_act = g.swiglu(mlp_up, out_name="swiglu")
-            mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M])
+            mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M], out_name="swiglu_flat")
             out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", out_name="mlp_down_flat")
             out = g.view(out_flat, shape=[B, T, self.C], out_name="mlp_down")
 

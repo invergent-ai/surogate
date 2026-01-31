@@ -334,7 +334,7 @@ void ModularRunState<Block>::allocate_simplified_activations() {
     auto dtype = mConfig.activation_dtype;
     auto kind = EAllocationType::ON_DEVICE;
 
-    // Mirror legacy recompute dependencies:
+    // Recompute dependencies:
     // - LN1 can be reused if recompute-norm or recompute-att or recompute-block
     // - LN2 can be reused if recompute-norm or recompute-ffn or recompute-block
     // - QKV can be reused if recompute-qkv or recompute-att or recompute-block

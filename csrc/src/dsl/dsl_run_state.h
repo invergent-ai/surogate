@@ -47,6 +47,13 @@ public:
 
     void reset_simplified_gradients();
 
+    /// @brief Zero all activation gradient buffers (d_res_ffn, d_res_att) for all layers.
+    /// Call this at the start of each backward pass to prevent stale gradients from accumulating.
+    void zero_activation_gradients(cudaStream_t stream);
+
+    /// @brief Get the number of layers for gradient iteration
+    std::size_t num_gradient_layers() const { return mSimplifiedGradients.size(); }
+
     modules::NonBlockActivations& non_block_activations() { return mNonBlockActivations; }
     modules::NonBlockGradientBuffers& non_block_gradients() { return mNonBlockGradients; }
     modules::ScratchBuffers& scratch() { return mScratch; }

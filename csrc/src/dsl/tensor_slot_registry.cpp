@@ -48,6 +48,8 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     // Block gradients
     {"d_ln1", TensorSlot::BlockDLN1},
     {"d_qkv", TensorSlot::BlockDQKV},
+    {"d_qkv_rope", TensorSlot::BlockDQKV},
+    {"d_qkv_rope_flat", TensorSlot::BlockDQKV},
     {"d_att", TensorSlot::BlockDAtt},
     {"d_swiglu", TensorSlot::BlockDSwiGLU},
     {"d_mlp_up", TensorSlot::BlockDMLPUp},

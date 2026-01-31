@@ -10,7 +10,7 @@ use_cuda_graphs: false
 sample_packing: true
 sequence_len: 2048
 loss_scale: default
-num_epochs: 5
+max_steps: 3
 
 learning_rate: 2e-4
 recipe: bf16

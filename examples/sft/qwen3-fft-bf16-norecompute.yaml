@@ -1,0 +1,23 @@
+model: Qwen/Qwen3-0.6B
+output_dir: ./output
+merge_adapter: false
+apply_recommended_values: false
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+max_steps: 5
+
+sample_packing: true
+sequence_len: 2048
+use_cuda_graphs: false
+recompute: false
+
+learning_rate: 1e-5
+
+recipe: bf16
+lora: false
+
+dataloader_num_workers: 4
+datasets:
+  - path: "OpenLLM-Ro/ro_gsm8k"
+    type: auto

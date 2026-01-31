@@ -23,9 +23,223 @@
 
 #include "dsl/graph_executor_utils.h"
 
+#include <cuda_bf16.h>
+
 namespace dsl {
 
 using namespace internal;
+
+void DslModel::scan_embedding_weights_after_update(int step, cudaStream_t stream) {
+    static bool nan_found = false;
+    if (nan_found || !mParams) {
+        return;
+    }
+    if (stream_is_capturing(stream)) {
+        return;
+    }
+
+    const bool use_weight_manager = (mWeightManager != nullptr);
+    const bool sharded_weights = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1);
+
+    const long expected_hidden = mConfig ? mConfig->HiddenSize : 0;
+    long expected_rows = mConfig ? mConfig->VocabSize : 0;
+    if (sharded_weights && expected_rows > 0 && (expected_rows % mNumShards) == 0) {
+        expected_rows /= mNumShards;
+    }
+
+    Tensor* target = nullptr;
+    std::string target_name;
+    for (const auto& name : mParams->param_names()) {
+        Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
+        if (val.Rank != 2) {
+            continue;
+        }
+        if (expected_hidden > 0 && val.Sizes[1] != expected_hidden) {
+            continue;
+        }
+        if (expected_rows > 0 && val.Sizes[0] != expected_rows) {
+            continue;
+        }
+        if (!contains_ci(name, "embed") && !contains_ci(name, "wte") && !contains_ci(name, "word_embeddings")
+            && !contains_ci(name, "lm_head")) {
+            continue;
+        }
+        target = &val;
+        target_name = name;
+        break;
+    }
+
+    if (!target) {
+        static bool warned_missing = false;
+        if (!warned_missing) {
+            fprintf(stderr, "[EMB_WT_SCAN_UPDATE] embedding tensor not found; skipping scan\n");
+            warned_missing = true;
+        }
+        return;
+    }
+
+    const long hidden = target->Sizes[1];
+    long row_offset = 0;
+    if (sharded_weights && mConfig && mNumShards > 0) {
+        const long global_rows = mConfig->VocabSize;
+        if (global_rows > 0 && (global_rows % mNumShards) == 0) {
+            row_offset = (global_rows / mNumShards) * mShardIdx;
+        }
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    fprintf(stderr,
+            "[EMB_WT_SCAN_UPDATE] step=%d name=%s dtype=%s nelem=%zu hidden=%ld row_offset=%ld\n",
+            step, target_name.c_str(), dtype_to_str(target->DType), target->nelem(), hidden, row_offset);
+
+    const std::size_t total = static_cast<std::size_t>(target->nelem());
+    const std::size_t chunk = 1 << 20; // 1M elements per chunk
+    const std::size_t hidden_sz = hidden > 0 ? static_cast<std::size_t>(hidden) : 0;
+    const std::size_t row_base = row_offset > 0 ? static_cast<std::size_t>(row_offset) : 0;
+
+    if (target->DType == ETensorDType::BF16) {
+        std::vector<nv_bfloat16> host(chunk);
+        for (std::size_t off = 0; off < total; off += chunk) {
+            const std::size_t n = std::min(chunk, total - off);
+            cudaMemcpy(host.data(),
+                       target->Data + off * sizeof(nv_bfloat16),
+                       n * sizeof(nv_bfloat16),
+                       cudaMemcpyDeviceToHost);
+            for (std::size_t i = 0; i < n; ++i) {
+                const float v = static_cast<float>(host[i]);
+                if (std::isnan(v) || std::isinf(v)) {
+                    const std::size_t idx = off + i;
+                    const std::size_t row = hidden_sz ? (idx / hidden_sz + row_base) : row_base;
+                    const std::size_t col = hidden_sz ? (idx % hidden_sz) : idx;
+                    fprintf(stderr,
+                            "[EMB_WT_NAN_UPDATE] step=%d name=%s idx=%zu row=%zu col=%zu\n",
+                            step, target_name.c_str(), idx, row, col);
+                    nan_found = true;
+                    throw std::runtime_error("Embedding weights contain NaNs/Inf after optimizer update");
+                }
+            }
+        }
+    } else if (target->DType == ETensorDType::FP32) {
+        std::vector<float> host(chunk);
+        for (std::size_t off = 0; off < total; off += chunk) {
+            const std::size_t n = std::min(chunk, total - off);
+            cudaMemcpy(host.data(),
+                       target->Data + off * sizeof(float),
+                       n * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+            for (std::size_t i = 0; i < n; ++i) {
+                const float v = host[i];
+                if (std::isnan(v) || std::isinf(v)) {
+                    const std::size_t idx = off + i;
+                    const std::size_t row = hidden_sz ? (idx / hidden_sz + row_base) : row_base;
+                    const std::size_t col = hidden_sz ? (idx % hidden_sz) : idx;
+                    fprintf(stderr,
+                            "[EMB_WT_NAN_UPDATE] step=%d name=%s idx=%zu row=%zu col=%zu\n",
+                            step, target_name.c_str(), idx, row, col);
+                    nan_found = true;
+                    throw std::runtime_error("Embedding weights contain NaNs/Inf after optimizer update");
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "[EMB_WT_SCAN_UPDATE] step=%d name=%s skipped dtype=%s\n",
+                step, target_name.c_str(), dtype_to_str(target->DType));
+    }
+}
+
+namespace {
+
+struct EmbScanStats {
+    std::size_t nan_count = 0;
+    std::size_t inf_count = 0;
+    float max_abs = 0.0f;
+    std::size_t first_idx = 0;
+    bool has_bad = false;
+};
+
+EmbScanStats scan_tensor_for_bad(const Tensor& t, long hidden, long row_offset,
+                                 std::string_view tag, int step) {
+    EmbScanStats stats;
+    if (!t.Data || t.nelem() == 0) {
+        return stats;
+    }
+
+    const std::size_t total = static_cast<std::size_t>(t.nelem());
+    const std::size_t chunk = 1 << 20; // 1M elements per chunk
+    const std::size_t hidden_sz = hidden > 0 ? static_cast<std::size_t>(hidden) : 0;
+    const std::size_t row_base = row_offset > 0 ? static_cast<std::size_t>(row_offset) : 0;
+
+    auto record_bad = [&](std::size_t idx, bool is_nan) {
+        if (!stats.has_bad) {
+            stats.first_idx = idx;
+            const std::size_t row = hidden_sz ? (idx / hidden_sz + row_base) : row_base;
+            const std::size_t col = hidden_sz ? (idx % hidden_sz) : idx;
+            fprintf(stderr,
+                    "[EMB_SCAN_BAD] step=%d tag=%.*s idx=%zu row=%zu col=%zu nan=%d\n",
+                    step, static_cast<int>(tag.size()), tag.data(), idx, row, col, is_nan ? 1 : 0);
+        }
+        stats.has_bad = true;
+        if (is_nan) {
+            ++stats.nan_count;
+        } else {
+            ++stats.inf_count;
+        }
+    };
+
+    if (t.DType == ETensorDType::BF16) {
+        std::vector<nv_bfloat16> host(chunk);
+        for (std::size_t off = 0; off < total; off += chunk) {
+            const std::size_t n = std::min(chunk, total - off);
+            CUDA_CHECK(cudaMemcpy(host.data(),
+                                  t.Data + off * sizeof(nv_bfloat16),
+                                  n * sizeof(nv_bfloat16),
+                                  cudaMemcpyDeviceToHost));
+            for (std::size_t i = 0; i < n; ++i) {
+                const float v = static_cast<float>(host[i]);
+                const float abs_v = std::fabs(v);
+                if (abs_v > stats.max_abs) {
+                    stats.max_abs = abs_v;
+                }
+                if (std::isnan(v)) {
+                    record_bad(off + i, true);
+                } else if (std::isinf(v)) {
+                    record_bad(off + i, false);
+                }
+            }
+        }
+    } else if (t.DType == ETensorDType::FP32) {
+        std::vector<float> host(chunk);
+        for (std::size_t off = 0; off < total; off += chunk) {
+            const std::size_t n = std::min(chunk, total - off);
+            CUDA_CHECK(cudaMemcpy(host.data(),
+                                  t.Data + off * sizeof(float),
+                                  n * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            for (std::size_t i = 0; i < n; ++i) {
+                const float v = host[i];
+                const float abs_v = std::fabs(v);
+                if (abs_v > stats.max_abs) {
+                    stats.max_abs = abs_v;
+                }
+                if (std::isnan(v)) {
+                    record_bad(off + i, true);
+                } else if (std::isinf(v)) {
+                    record_bad(off + i, false);
+                }
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "[EMB_SCAN_STATS] step=%d tag=%.*s dtype=%s nelem=%zu hidden=%ld row_offset=%ld "
+            "nan=%zu inf=%zu max_abs=%.6e\n",
+            step, static_cast<int>(tag.size()), tag.data(), dtype_to_str(t.DType),
+            t.nelem(), hidden, row_offset, stats.nan_count, stats.inf_count, stats.max_abs);
+
+    return stats;
+}
+
+} // anonymous namespace
 
 void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon,
                       float weight_decay, float grad_clip) {
@@ -65,6 +279,15 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
+    if (!stream_is_capturing(stream)) {
+        float grad_scale_host = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (!std::isfinite(grad_scale_host)) {
+            throw std::runtime_error("DslModel::update: grad_scale is NaN/Inf");
+        }
+    }
 
     if (!mAdamW8BitState->initialized) {
         if (stream_is_capturing(stream)) {
@@ -80,6 +303,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
     std::unordered_set<void*> seen_grad_ptrs;
 
+    static int last_embed_scan_step = -1;
     for (const auto& name : mGrads->param_names()) {
         Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         bool accumulate = false;
@@ -102,6 +326,23 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
         if (param_sharded && grad_view.nelem() != val.nelem()) {
             throw std::runtime_error("DslModel::update: sharded grad size mismatch for " + name);
+        }
+
+        if (!stream_is_capturing(stream) && t != last_embed_scan_step &&
+            (contains_ci(name, "embed") || contains_ci(name, "wte") || contains_ci(name, "word_embeddings") ||
+             contains_ci(name, "lm_head"))) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const long hidden = val.Rank > 1 ? val.Sizes[1] : 0;
+            long row_offset = 0;
+            if (sharded_weights && mConfig && mNumShards > 0) {
+                const long global_rows = mConfig->VocabSize;
+                if (global_rows > 0 && (global_rows % mNumShards) == 0) {
+                    row_offset = (global_rows / mNumShards) * mShardIdx;
+                }
+            }
+            scan_tensor_for_bad(grad_view, hidden, row_offset, "EMB_GRAD_PRE", t);
+            scan_tensor_for_bad(val, hidden, row_offset, "EMB_WT_PRE", t);
+            last_embed_scan_step = t;
         }
 
         float wd = weight_decay;
@@ -175,6 +416,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         mWeightManager->invalidate();
     }
 
+    scan_embedding_weights_after_update(t, stream);
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
@@ -210,6 +452,15 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
+    if (!stream_is_capturing(stream)) {
+        float grad_scale_host = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (!std::isfinite(grad_scale_host)) {
+            throw std::runtime_error("DslModel::update_adamw_8bit_graph: grad_scale is NaN/Inf");
+        }
+    }
 
     if (!mAdamW8BitState->initialized) {
         init_optimizer_state(stream);
@@ -222,6 +473,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
     // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
     std::unordered_set<void*> seen_grad_ptrs_graph;
 
+    static int last_embed_scan_step = -1;
     for (const auto& name : mGrads->param_names()) {
         Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         bool accumulate = false;
@@ -244,6 +496,23 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
         Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
         if (param_sharded && grad_view.nelem() != val.nelem()) {
             throw std::runtime_error("DslModel::update_adamw_8bit_graph: sharded grad size mismatch for " + name);
+        }
+
+        if (!stream_is_capturing(stream) && last_embed_scan_step != -2 &&
+            (contains_ci(name, "embed") || contains_ci(name, "wte") || contains_ci(name, "word_embeddings") ||
+             contains_ci(name, "lm_head"))) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const long hidden = val.Rank > 1 ? val.Sizes[1] : 0;
+            long row_offset = 0;
+            if (sharded_weights && mConfig && mNumShards > 0) {
+                const long global_rows = mConfig->VocabSize;
+                if (global_rows > 0 && (global_rows % mNumShards) == 0) {
+                    row_offset = (global_rows / mNumShards) * mShardIdx;
+                }
+            }
+            scan_tensor_for_bad(grad_view, hidden, row_offset, "EMB_GRAD_PRE", -1);
+            scan_tensor_for_bad(val, hidden, row_offset, "EMB_WT_PRE", -1);
+            last_embed_scan_step = -2;
         }
 
         const float wd_scale = (is_norm_param_name(name) || is_bias_param_name(name)) ? 0.f : 1.f;
@@ -314,6 +583,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
         mWeightManager->invalidate();
     }
 
+    scan_embedding_weights_after_update(-1, stream);
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 

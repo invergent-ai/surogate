@@ -195,6 +195,7 @@ private:
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
     void initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);
     void update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
+    void scan_embedding_weights_after_update(int step, cudaStream_t stream);
 
     std::unique_ptr<PretrainedConfig> mConfig;
     modules::ModelConfig mModelConfig;

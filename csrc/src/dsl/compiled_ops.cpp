@@ -9,9 +9,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "dsl/dsl_runtime.h"
@@ -52,6 +55,328 @@ std::string strip_ssa_suffix(const std::string& field) {
         return field.substr(0, pos);
     }
     return field;
+}
+
+bool copy_tensor_sample_as_f32(const Tensor& t, std::size_t count, std::vector<float>& out) {
+    out.assign(count, 0.0f);
+    if (count == 0 || !t.Data) {
+        return false;
+    }
+    switch (t.DType) {
+    case ETensorDType::FP32:
+        cudaMemcpy(out.data(), t.Data, count * sizeof(float), cudaMemcpyDeviceToHost);
+        return true;
+    case ETensorDType::BF16: {
+        std::vector<nv_bfloat16> tmp(count);
+        cudaMemcpy(tmp.data(), t.Data, count * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(tmp[i]);
+        }
+        return true;
+    }
+    case ETensorDType::FP16: {
+        std::vector<half> tmp(count);
+        cudaMemcpy(tmp.data(), t.Data, count * sizeof(half), cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(tmp[i]);
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+double sample_mean_abs(const Tensor& t, std::size_t count) {
+    std::vector<float> vals;
+    if (!copy_tensor_sample_as_f32(t, count, vals)) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (float v : vals) {
+        sum += std::abs(static_cast<double>(v));
+    }
+    return vals.empty() ? 0.0 : (sum / static_cast<double>(vals.size()));
+}
+
+bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
+                                      std::size_t count, std::vector<float>& out) {
+    out.assign(count, 0.0f);
+    if (count == 0 || !t.Data) {
+        return false;
+    }
+    const std::size_t total = static_cast<std::size_t>(t.nelem());
+    if (elem_offset + count > total) {
+        return false;
+    }
+    const std::size_t byte_offset = elem_offset * get_dtype_size(t.DType);
+    const std::byte* base = static_cast<const std::byte*>(t.Data) + byte_offset;
+    switch (t.DType) {
+    case ETensorDType::FP32:
+        cudaMemcpy(out.data(), base, count * sizeof(float), cudaMemcpyDeviceToHost);
+        return true;
+    case ETensorDType::BF16: {
+        std::vector<nv_bfloat16> tmp(count);
+        cudaMemcpy(tmp.data(), base, count * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(tmp[i]);
+        }
+        return true;
+    }
+    case ETensorDType::FP16: {
+        std::vector<half> tmp(count);
+        cudaMemcpy(tmp.data(), base, count * sizeof(half), cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(tmp[i]);
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+bool copy_tensor_token_sample_as_f32(const Tensor& t, long token_idx,
+                                     std::size_t count, std::vector<float>& out) {
+    out.assign(count, 0.0f);
+    if (!t.Data || token_idx < 0 || t.Rank < 2) {
+        return false;
+    }
+    std::size_t row_width = 0;
+    if (t.Rank == 2) {
+        row_width = static_cast<std::size_t>(t.Sizes[1]);
+    } else if (t.Rank >= 3) {
+        row_width = 1;
+        for (int i = 2; i < t.Rank; ++i) {
+            row_width *= static_cast<std::size_t>(t.Sizes[i]);
+        }
+    }
+    if (row_width == 0) {
+        return false;
+    }
+    const std::size_t elem_offset = static_cast<std::size_t>(token_idx) * row_width;
+    return copy_tensor_sample_offset_as_f32(t, elem_offset, count, out);
+}
+
+bool sample_has_nan_or_inf(const std::vector<float>& vals) {
+    for (float v : vals) {
+        if (std::isnan(v) || std::isinf(v)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool tensor_sample_has_nan_or_inf(const Tensor& t, long token_idx) {
+    std::vector<float> vals(4);
+    const bool ok = copy_tensor_token_sample_as_f32(t, token_idx, vals.size(), vals);
+    if (!ok) {
+        return false;
+    }
+    return sample_has_nan_or_inf(vals);
+}
+
+void log_nan_sample(const char* tag,
+                    int layer_idx,
+                    const std::string& name,
+                    const Tensor& t,
+                    long token_idx) {
+    static int nan_log_count = 0;
+    static bool first_logged = false;
+    std::vector<float> vals(4);
+    const bool ok = copy_tensor_token_sample_as_f32(t, token_idx, vals.size(), vals);
+    if (!ok || !sample_has_nan_or_inf(vals)) {
+        return;
+    }
+    const char* prefix = first_logged ? "[NAN_DETECT]" : "[FIRST_NAN]";
+    if (!first_logged) {
+        first_logged = true;
+    }
+    if (nan_log_count < 100) {
+        fprintf(stderr,
+                "%s tag=%s layer=%d name=%s token=%ld ptr=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                prefix, tag, layer_idx, name.c_str(), token_idx, t.Data,
+                vals[0], vals[1], vals[2], vals[3]);
+        nan_log_count++;
+    }
+}
+
+void log_tensor_stats(const char* tag,
+                      int layer_idx,
+                      const std::string& name,
+                      const Tensor& t,
+                      std::size_t max_elems) {
+    static int stats_log_count = 0;
+    if (stats_log_count >= 32 || !t.Data) {
+        return;
+    }
+    const std::size_t total = static_cast<std::size_t>(t.nelem());
+    const std::size_t n = std::min(max_elems, total);
+    if (n == 0) {
+        return;
+    }
+    std::vector<float> vals;
+    if (!copy_tensor_sample_as_f32(t, n, vals)) {
+        return;
+    }
+    std::size_t nan_count = 0;
+    std::size_t inf_count = 0;
+    double sum_abs = 0.0;
+    float max_abs = 0.0f;
+    for (float v : vals) {
+        if (std::isnan(v)) {
+            nan_count++;
+            continue;
+        }
+        if (std::isinf(v)) {
+            inf_count++;
+            continue;
+        }
+        const float av = std::fabs(v);
+        sum_abs += static_cast<double>(av);
+        if (av > max_abs) {
+            max_abs = av;
+        }
+    }
+    const double mean_abs = (n > 0) ? (sum_abs / static_cast<double>(n)) : 0.0;
+    fprintf(stderr,
+            "[TENSOR_STATS] tag=%s layer=%d name=%s ptr=%p n=%zu total=%zu nan=%zu inf=%zu max_abs=%.6f mean_abs=%.6f\n",
+            tag, layer_idx, name.c_str(), t.Data, n, total, nan_count, inf_count, max_abs, mean_abs);
+    stats_log_count++;
+}
+
+void log_tensor_stats_ex(const char* tag,
+                         int layer_idx,
+                         const std::string& name,
+                         const Tensor& t,
+                         std::size_t max_elems,
+                         bool force) {
+    static int stats_log_count = 0;
+    static int forced_log_count = 0;
+    if (!t.Data) {
+        return;
+    }
+    if (!force && stats_log_count >= 16) {
+        return;
+    }
+    if (force && forced_log_count >= 16) {
+        return;
+    }
+    const std::size_t total = static_cast<std::size_t>(t.nelem());
+    const std::size_t n = std::min(max_elems, total);
+    if (n == 0) {
+        return;
+    }
+    std::vector<float> vals;
+    if (!copy_tensor_sample_as_f32(t, n, vals)) {
+        return;
+    }
+    std::size_t nan_count = 0;
+    std::size_t inf_count = 0;
+    std::size_t finite_count = 0;
+    double sum_abs = 0.0;
+    float max_abs = 0.0f;
+    float min_val = 0.0f;
+    float max_val = 0.0f;
+    bool has_finite = false;
+    for (float v : vals) {
+        if (std::isnan(v)) {
+            nan_count++;
+            continue;
+        }
+        if (std::isinf(v)) {
+            inf_count++;
+            continue;
+        }
+        if (!has_finite) {
+            min_val = v;
+            max_val = v;
+            has_finite = true;
+        } else {
+            if (v < min_val) {
+                min_val = v;
+            }
+            if (v > max_val) {
+                max_val = v;
+            }
+        }
+        finite_count++;
+        const float av = std::fabs(v);
+        sum_abs += static_cast<double>(av);
+        if (av > max_abs) {
+            max_abs = av;
+        }
+    }
+    const double mean_abs = (finite_count > 0) ? (sum_abs / static_cast<double>(finite_count)) : 0.0;
+    fprintf(stderr,
+            "[TENSOR_STATS_EX] tag=%s layer=%d name=%s ptr=%p n=%zu total=%zu nan=%zu inf=%zu "
+            "min=%.6f max=%.6f max_abs=%.6f mean_abs=%.6f\n",
+            tag, layer_idx, name.c_str(), t.Data, n, total, nan_count, inf_count,
+            min_val, max_val, max_abs, mean_abs);
+    if (force) {
+        forced_log_count++;
+    } else {
+        stats_log_count++;
+    }
+}
+
+void log_tensor_sample_stats(const char* tag,
+                             const Tensor& t,
+                             std::size_t elem_offset,
+                             std::size_t sample_elems) {
+    if (!t.Data) {
+        return;
+    }
+    const std::size_t total = static_cast<std::size_t>(t.nelem());
+    if (total == 0 || sample_elems == 0 || elem_offset >= total) {
+        return;
+    }
+    const std::size_t n = std::min(sample_elems, total - elem_offset);
+    std::vector<float> vals;
+    if (!copy_tensor_sample_offset_as_f32(t, elem_offset, n, vals)) {
+        return;
+    }
+    std::size_t nan_count = 0;
+    std::size_t inf_count = 0;
+    std::size_t finite_count = 0;
+    double sum_abs = 0.0;
+    float max_abs = 0.0f;
+    float min_val = 0.0f;
+    float max_val = 0.0f;
+    bool has_finite = false;
+    for (float v : vals) {
+        if (std::isnan(v)) {
+            nan_count++;
+            continue;
+        }
+        if (std::isinf(v)) {
+            inf_count++;
+            continue;
+        }
+        if (!has_finite) {
+            min_val = v;
+            max_val = v;
+            has_finite = true;
+        } else {
+            if (v < min_val) {
+                min_val = v;
+            }
+            if (v > max_val) {
+                max_val = v;
+            }
+        }
+        finite_count++;
+        const float av = std::fabs(v);
+        sum_abs += static_cast<double>(av);
+        if (av > max_abs) {
+            max_abs = av;
+        }
+    }
+    const double mean_abs = (finite_count > 0) ? (sum_abs / static_cast<double>(finite_count)) : 0.0;
+    fprintf(stderr,
+            "[TENSOR_SAMPLE_STATS] tag=%s offset=%zu n=%zu total=%zu nan=%zu inf=%zu "
+            "min=%.6f max=%.6f max_abs=%.6f mean_abs=%.6f\n",
+            tag, elem_offset, n, total, nan_count, inf_count, min_val, max_val, max_abs, mean_abs);
 }
 
 float env_float(const char* name, float fallback) {
@@ -365,9 +690,11 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     ref.name = name;
 
     // Check for saved tensor prefix
+    std::string effective_name = name;
     if (starts_with(name, kSavedPrefix)) {
+        const std::string stripped = std::string(name.substr(kSavedPrefix.size()));
         ref.slot = TensorSlot::Saved;
-        ref.name = std::string(name.substr(kSavedPrefix.size()));
+        ref.name = stripped;
         if (ref.shape.empty()) {
             auto it = mExtraShapes.find(ref.name);
             if (it != mExtraShapes.end()) {
@@ -380,7 +707,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     // Check for block-indexed tensors
     int layer_idx = -1;
     std::string field;
-    if (parse_block_param(name, layer_idx, field)) {
+    if (parse_block_param(effective_name, layer_idx, field)) {
         ref.layer_idx = layer_idx;
 
         // Strip SSA-style numeric suffix (e.g., "qkv_rope_7" -> "qkv_rope")
@@ -401,7 +728,11 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             if (!slot_entry->shape.empty()) {
                 ref.shape = resolve_shape(slot_entry->shape, mShapeEnv);
             }
-        } else if (mWeights.has(name)) {
+            // Override with extra shapes when present (e.g., view outputs with explicit shapes).
+            if (auto it = mExtraShapes.find(ref.name); it != mExtraShapes.end()) {
+                ref.shape = it->second;
+            }
+        } else if (mWeights.has(effective_name)) {
             // Block-indexed weight (e.g., blocks[0].ln1_weight)
             ref.slot = TensorSlot::Parameter;
             return ref;
@@ -2022,6 +2353,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         if (parse_block_param(tensor_name, layer_idx, field)) {
             return mSlotRegistry->will_recompute(strip_ssa_suffix(field), lora_only_mode);
         }
+        const std::string base_name = strip_ssa_suffix(tensor_name);
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
@@ -2112,6 +2444,17 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 (*mSaved)[name] = saved_tensor;
             } else {
                 // Non-MoE tensor: use standard policy-based saving
+                // DEBUG: Print res_ffn values being saved
+                static int map_save_trace = 0;
+                if (name.find("blocks[25].res_ffn") != std::string::npos && map_save_trace < 16) {
+                    map_save_trace++;
+                    cudaStreamSynchronize(mRunState.MainStream);
+                    std::vector<float> vals(4);
+                    cudaMemcpy(vals.data(), it->second.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+                    bool pl = prefer_live_tensor(name);
+                    fprintf(stderr, "[SAVE_MAP_RES_FFN] %s src.Data=%p vals=%.6f,%.6f,%.6f,%.6f prefer_live=%d\n",
+                            name.c_str(), it->second.Data, vals[0], vals[1], vals[2], vals[3], pl ? 1 : 0);
+                }
                 save_tensor_with_policy(name, it->second, prefer_live_tensor(name));
             }
             continue;
@@ -2183,6 +2526,16 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 // res_ffn is computed dynamically (residual_att + mlp_down), check mTensorMap
                 auto it = mTensorMap.find(name);
                 if (it != mTensorMap.end()) {
+                    // DEBUG: Print res_ffn values being saved for layer 25
+                    static int save_trace = 0;
+                    if (layer_idx == 25 && save_trace < 16) {
+                        save_trace++;
+                        cudaStreamSynchronize(mRunState.MainStream);
+                        std::vector<float> vals(4);
+                        cudaMemcpy(vals.data(), it->second.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+                        fprintf(stderr, "[SAVE_RES_FFN] %s src.Data=%p vals=%.6f,%.6f,%.6f,%.6f prefer_live=%d\n",
+                                name.c_str(), it->second.Data, vals[0], vals[1], vals[2], vals[3], prefer_live ? 1 : 0);
+                    }
                     save_tensor_with_policy(name, it->second, prefer_live);
                 } else {
                     throw std::runtime_error("CompiledExecutor: res_ffn tensor not found in map: " + name);
@@ -2284,15 +2637,9 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
             return nullptr;
         }
         auto& acts = mRunState.simplified_acts(layer_idx);
-        if (field == "ln1" || field == "ln1_flat" || field == "view_1") {
-            // view_1 is the flattened ln1 view used as input to qkv matmul
-            return map_view(acts.ln1);
-        }
+        if (field == "ln1" || field == "ln1_flat") return map_view(acts.ln1);
         if (field == "ln1_rstd") return map_view(acts.ln1_rstd);
-        if (field == "ln2" || field == "ln2_flat" || field == "view_3") {
-            // view_3 is the flattened ln2 view used as input to mlp_up matmul
-            return map_view(acts.ln2);
-        }
+        if (field == "ln2" || field == "ln2_flat") return map_view(acts.ln2);
         if (field == "ln2_rstd") return map_view(acts.ln2_rstd);
         if (field == "q_rstd") return map_view(acts.q_rstd);
         if (field == "k_rstd") return map_view(acts.k_rstd);
@@ -2302,17 +2649,11 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
             return map_view(*base);
         }
         if (field == "lse") return map_view(acts.lse);
-        if (field == "att" || field == "att_flat" || field == "view_2") {
-            // view_2 is the flattened att view used as input to att_out matmul
-            return map_view(acts.att);
-        }
+        if (field == "att" || field == "att_flat") return map_view(acts.att);
         if (field == "att_out" || field == "att_out_flat") return map_view(acts.att_out);
         if (field == "res_att" || field == "residual_att") return map_view(acts.residual_att);
         if (field == "mlp_up" || field == "mlp_up_flat") return map_view(acts.mlp_up);
-        if (field == "swiglu" || field == "swiglu_flat" || field == "view_4") {
-            // view_4 is the flattened swiglu view used as input to mlp_down matmul
-            return map_view(acts.swiglu);
-        }
+        if (field == "swiglu" || field == "swiglu_flat") return map_view(acts.swiglu);
         if (field == "mlp_down" || field == "mlp_down_flat") return map_view(acts.mlp_down);
         if (field == "res_ffn" || field == "residual_ffn") {
             Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
@@ -2345,14 +2686,28 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }
 
+    // DEBUG: Trace resolution for top-layer d_qkv_rope gradients
+    static int d_qkv_rope_resolve_trace = 0;
+    if (d_qkv_rope_resolve_trace < 8 &&
+        ref.name.find("d_blocks[") != std::string::npos &&
+        ref.name.find("qkv_rope") != std::string::npos &&
+        ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
+        fprintf(stderr,
+                "[RESOLVE_D_QKV_ROPE] name=%s slot=%d shape_rank=%zu\n",
+                ref.name.c_str(), static_cast<int>(ref.slot), ref.shape.size());
+        d_qkv_rope_resolve_trace++;
+    }
+
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
         // Check if we already have a tensor in the map (e.g., from MoE temp allocation)
         auto it = mTensorMap.find(ref.name);
-        // DEBUG: Trace mTensorMap lookup for d_ln1
+        // DEBUG: Trace mTensorMap lookup for top-layer d_ln1
         static int shape_trace_count = 0;
-        if (shape_trace_count < 5 && ref.name.find("d_blocks[26].ln1") != std::string::npos) {
+        if (shape_trace_count < 8 &&
+            ref.name.find(".ln1") != std::string::npos &&
+            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
             fprintf(stderr, "[RESOLVE_SHAPE] ref.name=%s, shape.size=%zu, found_in_map=%s, slot=%d\n",
                     ref.name.c_str(), ref.shape.size(),
                     (it != mTensorMap.end() && it->second.Data) ? "YES" : "NO",
@@ -2365,6 +2720,24 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                         it->second.Data, vals[0], vals[1], vals[2], vals[3]);
             }
             shape_trace_count++;
+        }
+        // DEBUG: Trace when top-layer d_qkv_rope is already in the map
+        static int qkv_rope_shape_trace = 0;
+        if (qkv_rope_shape_trace < 8 &&
+            ref.name.find("d_blocks[") != std::string::npos &&
+            ref.name.find("qkv_rope") != std::string::npos &&
+            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
+            fprintf(stderr, "[RESOLVE_SHAPE_QKV_ROPE] ref.name=%s shape.size=%zu found_in_map=%s slot=%d\n",
+                    ref.name.c_str(), ref.shape.size(),
+                    (it != mTensorMap.end() && it->second.Data) ? "YES" : "NO",
+                    static_cast<int>(ref.slot));
+            if (it != mTensorMap.end() && it->second.Data) {
+                fprintf(stderr,
+                        "[RESOLVE_SHAPE_QKV_ROPE] ptr=%p shape=%s\n",
+                        it->second.Data,
+                        tensor_shape_str(it->second).c_str());
+            }
+            qkv_rope_shape_trace++;
         }
         if (it != mTensorMap.end() && it->second.Data) {
             // For MoE operations, the tensor map may contain dynamically-shaped temps
@@ -2425,21 +2798,35 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     if (!ref.name.empty()) {
         auto it = mTensorMap.find(ref.name);
         if (it != mTensorMap.end() && it->second.Data) {
-            // DEBUG: Trace when mTensorMap lookup succeeds for d_ln1
+            // DEBUG: Trace when mTensorMap lookup succeeds for top-layer d_ln1
             static int trace_count = 0;
-            if (trace_count < 5 && ref.name.find("d_blocks[26].ln1") != std::string::npos) {
+            if (trace_count < 8 &&
+                ref.name.find(".ln1") != std::string::npos &&
+                ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
                 fprintf(stderr, "[RESOLVE_FIX] Found %s in mTensorMap, ptr=%p\n",
                         ref.name.c_str(), it->second.Data);
                 trace_count++;
             }
             return it->second;
         }
-        // DEBUG: Trace when mTensorMap lookup fails for d_ln1
+        // DEBUG: Trace when mTensorMap lookup fails for top-layer d_ln1
         static int miss_trace_count = 0;
-        if (miss_trace_count < 5 && ref.name.find("d_blocks[26].ln1") != std::string::npos) {
+        if (miss_trace_count < 8 &&
+            ref.name.find(".ln1") != std::string::npos &&
+            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
             fprintf(stderr, "[RESOLVE_FIX] NOT in mTensorMap: %s, slot=%d\n",
                     ref.name.c_str(), static_cast<int>(ref.slot));
             miss_trace_count++;
+        }
+        // DEBUG: Trace when mTensorMap lookup fails for top-layer d_qkv_rope
+        static int qkv_rope_miss_trace = 0;
+        if (qkv_rope_miss_trace < 8 &&
+            ref.name.find("d_blocks[") != std::string::npos &&
+            ref.name.find("qkv_rope") != std::string::npos &&
+            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
+            fprintf(stderr, "[RESOLVE_FIX_QKV_ROPE] NOT in mTensorMap: %s, slot=%d\n",
+                    ref.name.c_str(), static_cast<int>(ref.slot));
+            qkv_rope_miss_trace++;
         }
     }
 
@@ -2527,8 +2914,22 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                     // This is critical for FFT mode where tensors with lora_only recompute_policy
                     // are saved with actual data and should NOT use live buffers.
                     if (it->second.Data != nullptr) {
-                        fprintf(stderr, "[RESOLVE_SAVED] %s from mSaved (has data), Data=%p\n",
-                                ref.name.c_str(), it->second.Data);
+                        // DEBUG: Print actual values for layer 25 res_ffn to track per-micro-step
+                        static int res_ffn_trace = 0;
+                        if (ref.name.find("blocks[25].res_ffn") != std::string::npos && res_ffn_trace < 16) {
+                            res_ffn_trace++;
+                            cudaStreamSynchronize(mRunState.MainStream);
+                            const long sample_token = 3;
+                            std::vector<float> vals(4);
+                            const bool ok = copy_tensor_token_sample_as_f32(it->second, sample_token, vals.size(), vals);
+                            fprintf(stderr,
+                                    "[RESOLVE_SAVED] %s from mSaved, Data=%p token=%ld ok=%d vals=%.6f,%.6f,%.6f,%.6f\n",
+                                    ref.name.c_str(), it->second.Data, sample_token, ok ? 1 : 0,
+                                    vals[0], vals[1], vals[2], vals[3]);
+                        } else {
+                            fprintf(stderr, "[RESOLVE_SAVED] %s from mSaved (has data), Data=%p\n",
+                                    ref.name.c_str(), it->second.Data);
+                        }
                         return it->second;
                     }
                     // Metadata-only: try to resolve from live buffer or recompute
@@ -2603,6 +3004,21 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     }
 
     Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape);
+
+    // Zero gradient tensors to prevent stale values from accumulating.
+    // Gradient tensor names start with "d_" (e.g., "d_blocks[0].ln1").
+    // Many backward kernels accumulate (+=) to their outputs, so they
+    // need zeroed buffers to start with. Stack memory is reused across
+    // micro-batches and contains stale values from previous backward passes.
+    if (ref.name.size() >= 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
+        fill_zero(t, mRunState.MainStream);
+        static int zero_trace = 0;
+        if (zero_trace < 5) {
+            fprintf(stderr, "[ZERO_GRAD] Zeroed %s ptr=%p\n", ref.name.c_str(), t.Data);
+            zero_trace++;
+        }
+    }
+
     mTemps.push_back(t);
     auto [ins_it, inserted] = mTensorMap.emplace(ref.name, t);
     return ins_it->second;
@@ -2645,9 +3061,138 @@ void CompiledExecutor::dispatch_embedding(const CompiledOp& op) {
     Tensor& emb = op.inputs.size() > 1 ? resolve_tensor(op.inputs[1]) : mWeights.get("embedding");
     Tensor& out = ensure_output_tensor(op.outputs[0]);
 
+    // One-time embedding metadata log (shapes/dtypes/pointers).
+    static int emb_meta_count = 0;
+    if (emb_meta_count < 3) {
+        emb_meta_count++;
+        fprintf(stderr,
+                "[EMBED_META] token_ids: dtype=%s rank=%d sizes={%ld,%ld,%ld,%ld,%ld} ptr=%p bytes=%zu\n",
+                dtype_to_str(token_ids.DType), token_ids.Rank,
+                token_ids.Sizes[0], token_ids.Sizes[1], token_ids.Sizes[2], token_ids.Sizes[3], token_ids.Sizes[4],
+                token_ids.Data, token_ids.bytes());
+        fprintf(stderr,
+                "[EMBED_META] emb: dtype=%s rank=%d sizes={%ld,%ld,%ld,%ld,%ld} ptr=%p bytes=%zu\n",
+                dtype_to_str(emb.DType), emb.Rank,
+                emb.Sizes[0], emb.Sizes[1], emb.Sizes[2], emb.Sizes[3], emb.Sizes[4],
+                emb.Data, emb.bytes());
+        fprintf(stderr,
+                "[EMBED_META] out: dtype=%s rank=%d sizes={%ld,%ld,%ld,%ld,%ld} ptr=%p bytes=%zu\n",
+                dtype_to_str(out.DType), out.Rank,
+                out.Sizes[0], out.Sizes[1], out.Sizes[2], out.Sizes[3], out.Sizes[4],
+                out.Data, out.bytes());
+    }
+
+    // One-time embedding weight sample scan for NaN/Inf and magnitude stats
+    static int emb_weight_scan_count = 0;
+    if (emb_weight_scan_count < 1) {
+        emb_weight_scan_count++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        const std::size_t total = static_cast<std::size_t>(emb.nelem());
+        const std::size_t sample = std::min<std::size_t>(4096, total);
+        log_tensor_sample_stats("EMB_WT_SAMPLE0", emb, 0, sample);
+        if (total > sample) {
+            log_tensor_sample_stats("EMB_WT_SAMPLE_MID", emb, total / 2, sample);
+            log_tensor_sample_stats("EMB_WT_SAMPLE_END", emb, total - sample, sample);
+        }
+    }
+
+    // Token-ID bounds check and NaN-sample mapping
+    static int emb_token_check_count = 0;
+    if (emb_token_check_count < 5) {
+        emb_token_check_count++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        const long BT = static_cast<long>(token_ids.nelem());
+        if (BT > 0 && token_ids.Data) {
+            std::vector<std::int32_t> tokens(static_cast<std::size_t>(BT));
+            cudaMemcpy(tokens.data(), token_ids.Data, static_cast<std::size_t>(BT) * sizeof(std::int32_t),
+                       cudaMemcpyDeviceToHost);
+            std::int32_t min_tok = std::numeric_limits<std::int32_t>::max();
+            std::int32_t max_tok = std::numeric_limits<std::int32_t>::min();
+            int oob_count = 0;
+            int first_oob_idx = -1;
+            std::int32_t first_oob_val = 0;
+            const int vocab = static_cast<int>(mConfig.VocabSize);
+            for (long i = 0; i < BT; ++i) {
+                const std::int32_t v = tokens[static_cast<std::size_t>(i)];
+                if (v < min_tok) min_tok = v;
+                if (v > max_tok) max_tok = v;
+                if (v < 0 || v >= vocab) {
+                    oob_count++;
+                    if (first_oob_idx < 0) {
+                        first_oob_idx = static_cast<int>(i);
+                        first_oob_val = v;
+                    }
+                }
+            }
+            const std::int32_t tok3 = (BT > 3) ? tokens[3] : tokens[0];
+            fprintf(stderr,
+                    "[EMBED_TOKENS] BT=%ld vocab=%d min=%d max=%d oob=%d token3=%d\n",
+                    BT, vocab, min_tok, max_tok, oob_count, tok3);
+            if (oob_count > 0) {
+                fprintf(stderr,
+                        "[EMBED_TOKENS_OOB] first_idx=%d first_val=%d\n",
+                        first_oob_idx, first_oob_val);
+            }
+        }
+    }
+
+    // One-time prefill of embedding output with NaN pattern to detect unwritten elements
+    static int emb_prefill_count = 0;
+    if (emb_prefill_count < 1) {
+        emb_prefill_count++;
+        cudaMemsetAsync(out.Data, 0xFF, out.bytes(), mRunState.MainStream);
+        fprintf(stderr, "[EMBED_PREFILL] out.Data=%p bytes=%zu\n", out.Data, out.bytes());
+    }
+
+    // DEBUG: Print actual tokens being used by embedding
+    static int emb_debug_count = 0;
+    if (emb_debug_count < 20) {
+        emb_debug_count++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<std::int32_t> toks(4);
+        cudaMemcpy(toks.data(), token_ids.Data, 4 * sizeof(std::int32_t), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[EMBEDDING] token_ids.Data=%p (rs.Inputs=%p) tokens[0..3]=%d,%d,%d,%d\n",
+                token_ids.Data, mRunState.Inputs.Data, toks[0], toks[1], toks[2], toks[3]);
+    }
+
     encoder_forward(out, token_ids, emb, std::nullopt,
                     static_cast<int>(mB), static_cast<int>(mT),
                     mConfig.HiddenSize, mConfig.VocabSize, mRunState.MainStream);
+
+    // DEBUG: Print embedding output after encoder_forward
+    // Print at offset 3*C to see embedding of token[3] which varies across micro-steps
+    static int emb_out_count = 0;
+    if (emb_out_count < 20) {
+        emb_out_count++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> vals(4);
+        const std::size_t offset = 3 * static_cast<std::size_t>(mConfig.HiddenSize);
+        cudaMemcpy(vals.data(), reinterpret_cast<float*>(out.Data) + offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[EMBEDDING_OUT] out.Data=%p token[3] embed vals=%.6f,%.6f,%.6f,%.6f\n",
+                out.Data, vals[0], vals[1], vals[2], vals[3]);
+        const std::size_t row_elems = static_cast<std::size_t>(mConfig.HiddenSize);
+        const std::size_t row_sample = std::min<std::size_t>(row_elems, 256);
+        log_tensor_sample_stats("EMBED_OUT_ROW3", out, offset, row_sample);
+    }
+
+    // NaN detection for embedding output (token 3)
+    log_nan_sample("FWD_EMBED_OUT", -1, op.outputs[0].name, out, 3);
+    if (tensor_sample_has_nan_or_inf(out, 3)) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<std::int32_t> toks(4);
+        cudaMemcpy(toks.data(), token_ids.Data, 4 * sizeof(std::int32_t), cudaMemcpyDeviceToHost);
+        const std::int32_t tok3 = toks[3];
+        fprintf(stderr, "[EMBED_NAN_TOKEN] token3_id=%d\n", tok3);
+        // Log full-row stats for the embedding weight and output row at token3.
+        if (tok3 >= 0 && tok3 < static_cast<std::int32_t>(mConfig.VocabSize)) {
+            const std::size_t row_elems = static_cast<std::size_t>(mConfig.HiddenSize);
+            const std::size_t emb_offset = static_cast<std::size_t>(tok3) * row_elems;
+            const std::size_t out_offset = 3 * row_elems;
+            log_tensor_sample_stats("EMB_WT_ROW_TOK3", emb, emb_offset, row_elems);
+            log_tensor_sample_stats("EMB_OUT_ROW3_FULL", out, out_offset, row_elems);
+        }
+        throw std::runtime_error("Embedding output contains NaNs; aborting.");
+    }
 }
 
 void CompiledExecutor::dispatch_zeros(const CompiledOp& op) {
@@ -2678,6 +3223,24 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
                                    op.attrs.eps, static_cast<int>(mB * mT),
                                    mConfig.HiddenSize, mRunState.MainStream);
 
+    // NaN detection for LN1/LN2 forward (layer 25, token 3)
+    {
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(op.outputs[1].name, layer_idx, field)) {
+            const long sample_token = 3;
+            const std::string tag_prefix = (field == "ln1") ? "FWD_LN1" : "FWD_LN2";
+            log_nan_sample((tag_prefix + "_RESIDUAL_IN").c_str(), layer_idx, op.inputs[0].name, residual_in, sample_token);
+            log_nan_sample((tag_prefix + "_INPUT").c_str(), layer_idx, op.inputs[1].name, input, sample_token);
+            log_nan_sample((tag_prefix + "_RES_OUT").c_str(), layer_idx, op.outputs[0].name, residual_out, sample_token);
+            log_nan_sample((tag_prefix + "_OUT").c_str(), layer_idx, op.outputs[1].name, y, sample_token);
+            log_nan_sample((tag_prefix + "_RSTD").c_str(), layer_idx, op.outputs[2].name, rstd, sample_token);
+            if (layer_idx == 0 && field == "ln1") {
+                log_tensor_stats("FWD_LN1", layer_idx, op.outputs[1].name, y, 4096);
+            }
+        }
+    }
+
     // FIX: For LN2 output (res_att), copy to simplified_acts.residual_att when the
     // graph compiler assigned the wrong slot. This happens for the last layer where
     // the output is named "StackedBlocks_N" instead of "blocks[N].res_att".
@@ -2695,35 +3258,31 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
             }
         }
     }
-    if (op.outputs[1].name == "blocks[0].ln1" || op.outputs[1].name == "blocks[0].ln2") {
+    if (op.outputs[1].name == "blocks[0].ln1" || op.outputs[1].name == "blocks[25].ln1") {
         cudaStreamSynchronize(mRunState.MainStream);
         std::vector<float> vals(8);
-        cudaMemcpy(vals.data(), y.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[FWD_RMSNORM] %s values: %.6f, %.6f, %.6f, %.6f\n",
-                op.outputs[1].name.c_str(), vals[0], vals[1], vals[2], vals[3]);
-        cudaMemcpy(vals.data(), residual_out.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[FWD_RMSNORM] %s res_out values: %.6f, %.6f, %.6f, %.6f\n",
-                op.outputs[0].name.c_str(), vals[0], vals[1], vals[2], vals[3]);
-        // Also print rstd values and pointer for comparison with recompute
-        cudaMemcpy(vals.data(), rstd.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[FWD_RMSNORM] %s rstd ptr=%p, values: %.6f, %.6f, %.6f, %.6f\n",
-                op.outputs[2].name.c_str(), rstd.Data, vals[0], vals[1], vals[2], vals[3]);
-        // Also print input (att_out for ln2) values
-        cudaMemcpy(vals.data(), input.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[FWD_RMSNORM] %s input values: %.6f, %.6f, %.6f, %.6f\n",
-                op.inputs[1].name.c_str(), vals[0], vals[1], vals[2], vals[3]);
+        const long C = mConfig.HiddenSize;
+        // Trace at position 3 (where tokens differ) - offset by 3*C
+        const std::size_t pos3_offset = 3 * static_cast<std::size_t>(C);
+        int layer_idx = (op.outputs[1].name == "blocks[0].ln1") ? 0 : 25;
+        // Print residual_in at position 3
+        cudaMemcpy(vals.data(), reinterpret_cast<float*>(residual_in.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[FWD_LN1] Layer %d residual_in[pos3] name=%s data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, op.inputs[0].name.c_str(), residual_in.Data, vals[0], vals[1], vals[2], vals[3]);
+        // Print input at position 3
+        cudaMemcpy(vals.data(), reinterpret_cast<float*>(input.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[FWD_LN1] Layer %d input[pos3] name=%s data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, op.inputs[1].name.c_str(), input.Data, vals[0], vals[1], vals[2], vals[3]);
+        // Print y (ln output) at position 3
+        cudaMemcpy(vals.data(), reinterpret_cast<float*>(y.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[FWD_LN1] Layer %d ln1_out[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, y.Data, vals[0], vals[1], vals[2], vals[3]);
     }
 }
 
 void CompiledExecutor::dispatch_view(const CompiledOp& op) {
     Tensor& src = resolve_tensor(op.inputs[0]);
     Tensor view = view_tensor(src, op.attrs.shape);
-    // DEBUG: Print view creation for ln1-related views
-    if (op.outputs[0].name.find("view_1") != std::string::npos ||
-        op.inputs[0].name.find("ln1") != std::string::npos) {
-        fprintf(stderr, "[FWD_VIEW] %s = view(%s), src.Data=%p\n",
-                op.outputs[0].name.c_str(), op.inputs[0].name.c_str(), src.Data);
-    }
     mTensorMap[op.outputs[0].name] = view;
 }
 
@@ -2764,12 +3323,14 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
             ctx.stream = mRunState.MainStream;
             ctx.layer_idx = op.attrs.layer_idx;
             ctx.op = *op.attrs.matmul_op;
-            ctx.allow_fp8 = true;
-            ctx.allow_fp4 = true;
+            ctx.allow_fp8 = mRecipe->uses_fp8_forward();
+            ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
             // FP8/FP4 buffers would be set here via pre-resolved cache
-            ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
-            ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+            if (ctx.allow_fp8) {
+                ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
+                ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+            }
 
             mRecipe->forward_matmul(ctx);
             used_recipe = true;
@@ -2821,6 +3382,45 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
         (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
     }
+
+    // NaN detection for forward matmuls (token 3 sample)
+    if (op.attrs.matmul_op.has_value()) {
+        const long sample_token = 3;
+        switch (*op.attrs.matmul_op) {
+            case modules::MatmulOp::QKV:
+                log_nan_sample("FWD_QKV", op.attrs.layer_idx, op.outputs[0].name, out, sample_token);
+                if (op.attrs.layer_idx == 0) {
+                    log_tensor_stats("FWD_QKV", op.attrs.layer_idx, op.outputs[0].name, out, 4096);
+                    if (used_recipe) {
+                        const auto recipe_name = mRecipe ? mRecipe->name() : std::string_view("none");
+                        fprintf(stderr,
+                                "[MATMUL_RECIPE] op=QKV layer=%d recipe=%.*s allow_fp8=%d allow_fp4=%d use_fp8_cache=%d use_fp4_cache=%d\n",
+                                op.attrs.layer_idx,
+                                static_cast<int>(recipe_name.size()),
+                                recipe_name.data(),
+                                ctx_ptr ? (ctx_ptr->allow_fp8 ? 1 : 0) : 0,
+                                ctx_ptr ? (ctx_ptr->allow_fp4 ? 1 : 0) : 0,
+                                ctx_ptr ? (ctx_ptr->cached_weight && ctx_ptr->cached_weight->Data ? 1 : 0) : 0,
+                                ctx_ptr ? (ctx_ptr->cached_fp4_data && ctx_ptr->cached_fp4_scales ? 1 : 0) : 0);
+                    } else {
+                        fprintf(stderr, "[MATMUL_RECIPE] op=QKV layer=%d used_recipe=0\n",
+                                op.attrs.layer_idx);
+                    }
+                }
+                break;
+            case modules::MatmulOp::AttnOut:
+                log_nan_sample("FWD_ATTN_OUT", op.attrs.layer_idx, op.outputs[0].name, out, sample_token);
+                break;
+            case modules::MatmulOp::MLPUp:
+                log_nan_sample("FWD_MLP_UP", op.attrs.layer_idx, op.outputs[0].name, out, sample_token);
+                break;
+            case modules::MatmulOp::MLPDown:
+                log_nan_sample("FWD_MLP_DOWN", op.attrs.layer_idx, op.outputs[0].name, out, sample_token);
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 void CompiledExecutor::dispatch_bias_add(const CompiledOp& op) {
@@ -2861,6 +3461,14 @@ void CompiledExecutor::dispatch_swiglu(const CompiledOp& op) {
         const long D = inp.Sizes[2] / 2;
         swiglu_forward(out, inp, nullptr, static_cast<int>(B),
                        static_cast<int>(T), static_cast<int>(D), mRunState.MainStream);
+    }
+
+    int layer_idx = -1;
+    std::string field;
+    if (parse_block_param(op.outputs[0].name, layer_idx, field)) {
+        const long sample_token = 3;
+        Tensor& out = resolve_tensor(op.outputs[0]);
+        log_nan_sample("FWD_SWIGLU", layer_idx, op.outputs[0].name, out, sample_token);
     }
 }
 
@@ -2917,6 +3525,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
+    const bool cudnn_gqa_ok = (Hq == Hkv);
     const int qkv_channels = Hs * (Hq + 2 * Hkv);
 
     // If input and output are different buffers, copy input to output first
@@ -2946,7 +3555,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
             plan.valid = true;
             plan.use_qk_norm = true;
             plan.rope_fused = rope_fusable;
-            plan.use_cudnn = true;
+            plan.use_cudnn = cudnn_gqa_ok;
             plan.rotary_dim = rotary_dim;
             (*mForwardPlan)[static_cast<std::size_t>(layer_idx)].attn = plan;
         }
@@ -2985,6 +3594,36 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     }
 
     mTensorMap[op.outputs[0].name] = qkv_out;
+
+    // NaN detection for QKV after RoPE/QK-norm (layer 25, token 3)
+    int layer_idx = -1;
+    std::string field;
+    if (parse_block_param(op.outputs[0].name, layer_idx, field)) {
+        const long sample_token = 3;
+        log_nan_sample("FWD_QKV_ROPE", layer_idx, op.outputs[0].name, qkv_out, sample_token);
+        if (op.outputs.size() > 1) {
+            Tensor& q_rstd = resolve_tensor(op.outputs[1]);
+            log_nan_sample("FWD_Q_RSTD", layer_idx, op.outputs[1].name, q_rstd, sample_token);
+        }
+        if (op.outputs.size() > 2) {
+            Tensor& k_rstd = resolve_tensor(op.outputs[2]);
+            log_nan_sample("FWD_K_RSTD", layer_idx, op.outputs[2].name, k_rstd, sample_token);
+        }
+        if (layer_idx == 0) {
+            log_tensor_stats("FWD_QKV_IN", layer_idx, op.inputs[0].name, qkv_in, 4096);
+            log_tensor_stats("FWD_QKV_ROPE", layer_idx, op.outputs[0].name, qkv_out, 4096);
+            log_tensor_stats("FWD_Q_NORM_W", layer_idx, op.inputs[1].name, q_norm, 2048);
+            log_tensor_stats("FWD_K_NORM_W", layer_idx, op.inputs[2].name, k_norm, 2048);
+            if (op.outputs.size() > 1) {
+                Tensor& q_rstd = resolve_tensor(op.outputs[1]);
+                log_tensor_stats("FWD_Q_RSTD", layer_idx, op.outputs[1].name, q_rstd, 2048);
+            }
+            if (op.outputs.size() > 2) {
+                Tensor& k_rstd = resolve_tensor(op.outputs[2]);
+                log_tensor_stats("FWD_K_RSTD", layer_idx, op.outputs[2].name, k_rstd, 2048);
+            }
+        }
+    }
 }
 
 void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
@@ -3025,10 +3664,39 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
+    const bool cudnn_gqa_ok = (Hq == Hkv);
 
     if (!mRunState.scratch().cudnn_workspace.Data) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
+    }
+
+    // Debug: log workspace size vs required cuDNN size (limited)
+    {
+        static int ws_log_count = 0;
+        if (ws_log_count < 4) {
+            const std::size_t ws_bytes =
+                static_cast<std::size_t>(mRunState.scratch().cudnn_workspace.nelem()) *
+                static_cast<std::size_t>(get_dtype_size(mRunState.scratch().cudnn_workspace.DType));
+            const std::size_t ws_needed =
+                cudnn_get_workspace_size(static_cast<int>(mB), static_cast<int>(mT),
+                                         Hq, Hkv, Hs, mRunState.CudnnHandle);
+            fprintf(stderr,
+                    "[CUDNN_WS] B=%d T=%d Hq=%d Hkv=%d HS=%d ws_ptr=%p ws_bytes=%zu ws_needed=%zu\n",
+                    static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs,
+                    mRunState.scratch().cudnn_workspace.Data, ws_bytes, ws_needed);
+            ws_log_count++;
+        }
+    }
+
+    // NaN detection on flash-attention input (qkv) before cuDNN call.
+    {
+        const long sample_token = 3;
+        log_nan_sample("FWD_ATTN_IN", op.inputs[0].layer_idx, op.inputs[0].name, qkv, sample_token);
+    }
+    // One-time stats for layer 0 qkv input to detect large magnitudes or NaNs
+    if (op.inputs[0].layer_idx == 0) {
+        log_tensor_stats("FWD_ATTN_IN", op.inputs[0].layer_idx, op.inputs[0].name, qkv, 4096);
     }
 
     // cuDNN attention uses custom strides that map logical (B, Hq, T, HS) dims
@@ -3041,9 +3709,22 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     //
     // Similarly for QKV input: cuDNN expects (B, T, H, HS) contiguous where H = Hq + 2*Hkv.
 
-    attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
-                            mRunState.CudnnHandle, static_cast<int>(mB), static_cast<int>(mT),
-                            Hq, Hkv, Hs, mRunState.MainStream);
+    if (!cudnn_gqa_ok) {
+        static int cudnn_skip_count = 0;
+        if (cudnn_skip_count < 4) {
+            fprintf(stderr,
+                    "[CUDNN_ATTN_SKIP] Hq=%d Hkv=%d causal=1 reason=GQA\n",
+                    Hq, Hkv);
+            cudnn_skip_count++;
+        }
+        attention_forward_custom(out, lse, qkv,
+                                 static_cast<int>(mB), static_cast<int>(mT),
+                                 Hq, Hkv, Hs, mRunState.MainStream);
+    } else {
+        attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
+                                mRunState.CudnnHandle, static_cast<int>(mB), static_cast<int>(mT),
+                                Hq, Hkv, Hs, mRunState.MainStream);
+    }
 
     // DEBUG: Print first att values for layer 0
     if (op.outputs[0].layer_idx == 0) {
@@ -3052,6 +3733,29 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         cudaMemcpy(vals.data(), out.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
         fprintf(stderr, "[FWD_ATTN] Layer 0 att output ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
                 out.Data, vals[0], vals[1], vals[2], vals[3]);
+        log_tensor_stats_ex("FWD_ATTN_OUT", op.outputs[0].layer_idx, op.outputs[0].name, out, 4096, false);
+        log_tensor_stats_ex("FWD_LSE", op.outputs[0].layer_idx, op.outputs[1].name, lse, 4096, false);
+    }
+
+    // NaN detection for attention forward (layer 25, token 3)
+    {
+        const long sample_token = 3;
+        log_nan_sample("FWD_ATTN", op.outputs[0].layer_idx, op.outputs[0].name, out, sample_token);
+        log_nan_sample("FWD_LSE", op.outputs[0].layer_idx, op.outputs[1].name, lse, sample_token);
+        const bool out_nan = tensor_sample_has_nan_or_inf(out, sample_token);
+        const bool lse_nan = tensor_sample_has_nan_or_inf(lse, sample_token);
+        if (out_nan || lse_nan) {
+            log_tensor_stats_ex("FWD_ATTN_OUT_NAN", op.outputs[0].layer_idx, op.outputs[0].name, out, 4096, true);
+            log_tensor_stats_ex("FWD_LSE_NAN", op.outputs[0].layer_idx, op.outputs[1].name, lse, 4096, true);
+            log_tensor_stats_ex("FWD_ATTN_IN_NAN", op.inputs[0].layer_idx, op.inputs[0].name, qkv, 4096, true);
+            // Fallback: recompute attention using the custom kernel to isolate cuDNN issues.
+            fprintf(stderr, "[FWD_ATTN_FALLBACK] layer=%d using custom kernel\n", op.outputs[0].layer_idx);
+            attention_forward_custom(out, lse, qkv,
+                                     static_cast<int>(mB), static_cast<int>(mT),
+                                     Hq, Hkv, Hs, mRunState.MainStream);
+            log_tensor_stats_ex("FWD_ATTN_FALLBACK_OUT", op.outputs[0].layer_idx, op.outputs[0].name, out, 4096, true);
+            log_tensor_stats_ex("FWD_LSE_FALLBACK", op.outputs[0].layer_idx, op.outputs[1].name, lse, 4096, true);
+        }
     }
 }
 
@@ -3600,11 +4304,97 @@ void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
     Tensor view = view_tensor(d_out, shape);
     mTensorMap[op.outputs[0].name] = view;
 
-    // DEBUG: Trace view backward outputs for layer 26
+    // DEBUG: Trace when d_blocks[0].ln2 is produced via view backward
+    static int view_ln2_trace = 0;
+    if (view_ln2_trace < 8 && strip_ssa_suffix(op.outputs[0].name) == "d_blocks[0].ln2") {
+        int layer_any = -1;
+        if (!op.outputs.empty() && op.outputs[0].layer_idx >= 0) {
+            layer_any = op.outputs[0].layer_idx;
+        } else if (!op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
+            layer_any = op.inputs[0].layer_idx;
+        }
+        fprintf(stderr,
+                "[VIEW_BWD_LN2] id=%s in=%s out=%s\n",
+                op.op_id.c_str(), op.inputs[0].name.c_str(), op.outputs[0].name.c_str());
+        log_tensor_stats_ex("VIEW_BWD_LN2_IN", layer_any, op.inputs[0].name, d_out, 4096, true);
+        log_tensor_stats_ex("VIEW_BWD_LN2_OUT", layer_any, op.outputs[0].name, view, 4096, true);
+        view_ln2_trace++;
+    }
+
+    // DEBUG: Trace when top-layer d_ln1 is produced via view backward
+    static int view_ln1_top_trace = 0;
+    if (view_ln1_top_trace < 8) {
+        const std::string out_base = strip_ssa_suffix(op.outputs[0].name);
+        if (out_base.find(".ln1") != std::string::npos) {
+            int layer_idx = -1;
+            std::string field;
+            parse_block_param(out_base, layer_idx, field);
+            if (field == "ln1" && layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
+                fprintf(stderr,
+                        "[VIEW_BWD_LN1_TOP] id=%s in=%s out=%s ptr=%p\n",
+                        op.op_id.c_str(),
+                        op.inputs[0].name.c_str(),
+                        op.outputs[0].name.c_str(),
+                        view.Data);
+                log_tensor_stats_ex("VIEW_BWD_LN1_TOP_IN", layer_idx, op.inputs[0].name, d_out, 4096, true);
+                log_tensor_stats_ex("VIEW_BWD_LN1_TOP_OUT", layer_idx, op.outputs[0].name, view, 4096, true);
+                view_ln1_top_trace++;
+            }
+        }
+    }
+
+    // DEBUG: Trace view backward outputs for qkv_rope gradients
+    static int view_qkv_rope_trace = 0;
+    if (view_qkv_rope_trace < 12 &&
+        op.outputs[0].name.find("qkv_rope") != std::string::npos) {
+        fprintf(stderr,
+                "[VIEW_BWD_QKV_ROPE] id=%s in=%s out=%s in_shape=%s out_shape=%s out_ptr=%p\n",
+                op.op_id.c_str(),
+                op.inputs[0].name.c_str(),
+                op.outputs[0].name.c_str(),
+                tensor_shape_str(d_out).c_str(),
+                tensor_shape_str(view).c_str(),
+                view.Data);
+        log_tensor_stats_ex("VIEW_BWD_QKV_ROPE_IN", -1, op.inputs[0].name, d_out, 4096, true);
+        log_tensor_stats_ex("VIEW_BWD_QKV_ROPE_OUT", -1, op.outputs[0].name, view, 4096, true);
+        view_qkv_rope_trace++;
+    }
+
+    // DEBUG: Trace view backward outputs for mlp_down flat (layer 24)
+    static int view_mlp_down_trace = 0;
+    if (view_mlp_down_trace < 20 &&
+        op.outputs[0].name.find("d_blocks[24].mlp_down") != std::string::npos) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> in_vals(4, 0.0f), out_vals(4, 0.0f);
+        const bool ok_in = copy_tensor_sample_as_f32(d_out, in_vals.size(), in_vals);
+        const bool ok_out = copy_tensor_sample_as_f32(view, out_vals.size(), out_vals);
+        fprintf(stderr,
+                "[VIEW_BWD_MLP_DOWN] out=%s ptr=%p in=%s slot=%d ptr=%p ok_in=%d ok_out=%d "
+                "in_vals=%.6f,%.6f,%.6f,%.6f out_vals=%.6f,%.6f,%.6f,%.6f\n",
+                op.outputs[0].name.c_str(),
+                view.Data,
+                op.inputs[0].name.c_str(),
+                static_cast<int>(op.inputs[0].slot),
+                d_out.Data,
+                ok_in ? 1 : 0,
+                ok_out ? 1 : 0,
+                in_vals[0], in_vals[1], in_vals[2], in_vals[3],
+                out_vals[0], out_vals[1], out_vals[2], out_vals[3]);
+        view_mlp_down_trace++;
+    }
+
+    // DEBUG: Trace view backward outputs for swiglu gradients (all layers)
     static int view_trace_count = 0;
-    if (view_trace_count < 10 && op.outputs[0].name.find("d_blocks[26]") != std::string::npos) {
-        fprintf(stderr, "[VIEW_BWD] Stored %s in mTensorMap, ptr=%p, input=%s\n",
-                op.outputs[0].name.c_str(), view.Data, op.inputs[0].name.c_str());
+    if (view_trace_count < 100 && op.outputs[0].name.find(".swiglu") != std::string::npos) {
+        // Check the actual values in the buffer to diagnose gradient explosion
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> vals(4);
+        if (view.Data) {
+            cudaMemcpy(vals.data(), view.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+        fprintf(stderr, "[VIEW_BWD_SWIGLU] Stored %s in mTensorMap, ptr=%p, input=%s, vals=%.6f,%.6f,%.6f,%.6f\n",
+                op.outputs[0].name.c_str(), view.Data, op.inputs[0].name.c_str(),
+                vals[0], vals[1], vals[2], vals[3]);
         view_trace_count++;
     }
 }
@@ -3620,6 +4410,30 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // IMPORTANT: We must get the base tensor directly from simplified_grads(), not via
     // resolve_tensor(), because resolve_tensor() may return a view from mTensorMap.
     auto assign_output = [&](const TensorRef& ref) {
+        auto trace_mlp_down = [&](const Tensor& out_tensor, const char* tag) {
+            static int add_mlp_down_trace = 0;
+            if (add_mlp_down_trace < 20 &&
+                ref.name.find("d_blocks[24].mlp_down") != std::string::npos) {
+                cudaStreamSynchronize(mRunState.MainStream);
+                std::vector<float> in_vals(4, 0.0f), out_vals(4, 0.0f);
+                const bool ok_in = copy_tensor_sample_as_f32(d_out, in_vals.size(), in_vals);
+                const bool ok_out = copy_tensor_sample_as_f32(out_tensor, out_vals.size(), out_vals);
+                fprintf(stderr,
+                        "[ADD_BWD_MLP_DOWN] %s out=%s ptr=%p in=%s slot=%d ptr=%p ok_in=%d ok_out=%d "
+                        "in_vals=%.6f,%.6f,%.6f,%.6f out_vals=%.6f,%.6f,%.6f,%.6f\n",
+                        tag,
+                        ref.name.c_str(),
+                        out_tensor.Data,
+                        op.inputs[0].name.c_str(),
+                        static_cast<int>(op.inputs[0].slot),
+                        d_out.Data,
+                        ok_in ? 1 : 0,
+                        ok_out ? 1 : 0,
+                        in_vals[0], in_vals[1], in_vals[2], in_vals[3],
+                        out_vals[0], out_vals[1], out_vals[2], out_vals[3]);
+                add_mlp_down_trace++;
+            }
+        };
         Tensor* base_grad = nullptr;
         if (ref.layer_idx >= 0) {
             auto& grads = mRunState.simplified_grads(ref.layer_idx);
@@ -3647,6 +4461,7 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                                                cudaMemcpyDeviceToDevice, mRunState.MainStream));
                 }
                 mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+                trace_mlp_down(mTensorMap[ref.name], "copy");
                 return;
             }
             // For stack-allocated gradient temps, allocate proper storage instead of aliasing.
@@ -3663,15 +4478,18 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                 CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
                                            cudaMemcpyDeviceToDevice, mRunState.MainStream));
                 mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+                trace_mlp_down(mTensorMap[ref.name], "stack_copy");
                 return;
             }
             // Fall back to aliasing if the base grad has no storage yet (non-stack temps).
             base_grad->Data = d_out.Data;
             mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+            trace_mlp_down(mTensorMap[ref.name], "alias");
             return;
         }
         // Default: just expose d_out as-is.
         mTensorMap[ref.name] = d_out;
+        trace_mlp_down(mTensorMap[ref.name], "passthrough");
     };
 
     assign_output(op.outputs[0]);
@@ -3723,10 +4541,97 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
 
+    const bool trace_matmul_a = (std::getenv("SUROGATE_TRACE_MATMUL_A") != nullptr);
+    const bool assert_recompute_a = (std::getenv("SUROGATE_ASSERT_RECOMPUTE_A") != nullptr);
+    const bool is_qkv_op = op.attrs.matmul_op.has_value() &&
+        (*op.attrs.matmul_op == modules::MatmulOp::QKV);
+    const bool is_mlp_up_op = op.attrs.matmul_op.has_value() &&
+        (*op.attrs.matmul_op == modules::MatmulOp::MLPUp);
+    static int matmul_a_trace = 0;
+    if (trace_matmul_a && matmul_a_trace < 12 && (is_qkv_op || is_mlp_up_op)) {
+        const int top_layer = static_cast<int>(mConfig.NumLayers) - 1;
+        if (layer_idx == 0 || layer_idx == 26 || layer_idx == top_layer) {
+            matmul_a_trace++;
+            const long sample_token = 3;
+            std::vector<float> a_vals(4);
+            const bool a_ok = copy_tensor_token_sample_as_f32(a, sample_token, a_vals.size(), a_vals);
+            fprintf(stderr,
+                    "[MATMUL_BWD_A] micro_step=%d layer=%d op=%s kind=%s input=%s ptr=%p ok=%d vals=%.6f,%.6f,%.6f,%.6f\n",
+                    mMicroStep, layer_idx, op.op_id.c_str(),
+                    is_qkv_op ? "qkv" : "mlp_up",
+                    op.inputs[1].name.c_str(), a.Data, a_ok ? 1 : 0,
+                    a_vals[0], a_vals[1], a_vals[2], a_vals[3]);
+            log_tensor_stats_ex(is_qkv_op ? "MATMUL_BWD_A_QKV" : "MATMUL_BWD_A_MLP_UP",
+                                layer_idx, op.inputs[1].name, a, 4096, true);
+        }
+    }
+
+    if (assert_recompute_a && (is_qkv_op || is_mlp_up_op) &&
+        layer_idx >= 0 && layer_idx < static_cast<int>(mRecomputeSamples.size())) {
+        const auto& sample = mRecomputeSamples[static_cast<std::size_t>(layer_idx)];
+        const bool want_ln1 = is_qkv_op;
+        const bool valid = want_ln1 ? sample.ln1_valid : sample.ln2_valid;
+        if (valid && sample.micro_step == mMicroStep) {
+            const long sample_token = 3;
+            std::vector<float> a_vals;
+            if (copy_tensor_token_sample_as_f32(a, sample_token, 4, a_vals)) {
+                const std::array<float, 4>& ref = want_ln1 ? sample.ln1 : sample.ln2;
+                float max_diff = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    const float diff = std::fabs(a_vals[static_cast<std::size_t>(i)] - ref[static_cast<std::size_t>(i)]);
+                    if (diff > max_diff) max_diff = diff;
+                }
+                if (max_diff > 1e-2f) {
+                    fprintf(stderr,
+                            "[RECOMPUTE_A_MISMATCH] micro_step=%d layer=%d kind=%s input=%s max_diff=%.6f "
+                            "a=%.6f,%.6f,%.6f,%.6f ref=%.6f,%.6f,%.6f,%.6f\n",
+                            mMicroStep, layer_idx, want_ln1 ? "qkv" : "mlp_up",
+                            op.inputs[1].name.c_str(), max_diff,
+                            a_vals[0], a_vals[1], a_vals[2], a_vals[3],
+                            ref[0], ref[1], ref[2], ref[3]);
+                    throw std::runtime_error("Recompute A mismatch: matmul input does not match recomputed LN output");
+                }
+            }
+        }
+    }
+
+    static int matmul_ln2_trace = 0;
+    const bool outputs_ln2 = (!op.outputs.empty() &&
+                              !op.outputs[0].name.empty() &&
+                              strip_ssa_suffix(op.outputs[0].name) == "d_blocks[0].ln2");
+    if (outputs_ln2 && matmul_ln2_trace < 8) {
+        fprintf(stderr,
+                "[MATMUL_BWD_LN2] id=%s in=%s out=%s weight=%s\n",
+                op.op_id.c_str(),
+                op.inputs[0].name.c_str(),
+                op.outputs[0].name.c_str(),
+                op.inputs[2].name.c_str());
+        log_tensor_stats_ex("MATMUL_BWD_LN2_DOUT", layer_idx, op.inputs[0].name, d_out, 4096, true);
+        log_tensor_stats_ex("MATMUL_BWD_LN2_A", layer_idx, op.inputs[1].name, a, 4096, true);
+        log_tensor_stats_ex("MATMUL_BWD_LN2_W", layer_idx, op.inputs[2].name, b, 4096, true);
+        matmul_ln2_trace++;
+    }
+
     // DEBUG: Print matmul backward input/output for layer 26 QKV backward
     static int matmul_print_count = 0;
-    const bool is_qkv_backward = op.inputs[1].name.find("view_1") != std::string::npos;
-    if ((layer_idx == 26 && is_qkv_backward) && matmul_print_count < 3) {
+    // Trace Layer 25 and 26 QKV backward for explosion debugging
+    static int qkv_25_trace = 0;
+    if ((layer_idx == 25 || layer_idx == 26) && is_qkv_op && qkv_25_trace < 20) {
+        qkv_25_trace++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        const int N = static_cast<int>(std::min(static_cast<long>(d_out.nelem()), 10000L));
+        std::vector<float> dout_all(N);
+        cudaMemcpy(dout_all.data(), d_out.Data, N * sizeof(float), cudaMemcpyDeviceToHost);
+        float dout_sum_sq = 0.0f, dout_max = 0.0f;
+        for (int i = 0; i < N; ++i) {
+            dout_sum_sq += dout_all[i] * dout_all[i];
+            if (std::fabs(dout_all[i]) > dout_max) dout_max = std::fabs(dout_all[i]);
+        }
+        fprintf(stderr, "[MATMUL_BWD_QKV] Layer %d: d_out name='%s' slot=%d ptr=%p L2=%.6f max=%.6f vals=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, op.inputs[0].name.c_str(), static_cast<int>(op.inputs[0].slot), d_out.Data,
+                std::sqrt(dout_sum_sq), dout_max, dout_all[0], dout_all[1], dout_all[2], dout_all[3]);
+    }
+    if ((layer_idx == 26 && is_qkv_op) && matmul_print_count < 3) {
         matmul_print_count++;
         cudaStreamSynchronize(mRunState.MainStream);
         // Print the input tensor ref to see where d_out is coming from
@@ -3762,18 +4667,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     }
     if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         dB_ptr = &ensure_output_tensor(op.outputs[1]);
-    }
-
-    // DEBUG: Check initial values of dA_ptr before matmul for layer 26 QKV
-    static int init_trace_count = 0;
-    if (layer_idx == 26 && is_qkv_backward && init_trace_count < 5 && dA_ptr) {
-        init_trace_count++;
-        cudaStreamSynchronize(mRunState.MainStream);
-        std::vector<float> init_vals(4);
-        cudaMemcpy(init_vals.data(), dA_ptr->Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[MATMUL_BWD_INIT] Layer 26 QKV: dA_ptr slot=%d name=%s ptr=%p, init_vals=%.9f,%.9f,%.9f,%.9f\n",
-                static_cast<int>(op.outputs[0].slot), op.outputs[0].name.c_str(),
-                dA_ptr->Data, init_vals[0], init_vals[1], init_vals[2], init_vals[3]);
     }
 
     // FIX: Zero dA buffer before matmul to ensure consistent results regardless of initial values
@@ -3831,10 +4724,10 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         ctx.op = op.attrs.matmul_op.value_or(modules::MatmulOp::LMHead);
         ctx.accumulate = do_accumulate;
         ctx.skip_weight_grad = skip_weight_grad || !dB_ptr;
-        ctx.allow_fp8 = allow_quant;
-        ctx.allow_fp4 = allow_quant;
+        ctx.allow_fp8 = allow_quant && mRecipe->uses_fp8_hybrid_backward();
+        ctx.allow_fp4 = allow_quant && mRecipe->uses_fp4_forward();
 
-        if (allow_quant && op.attrs.matmul_op.has_value()) {
+        if (ctx.allow_fp8 && op.attrs.matmul_op.has_value()) {
             ctx.dout_quant = fp8_grad_buffer(mRunState, *op.attrs.matmul_op);
             if (!ctx.dout_quant || !ctx.dout_quant->Data) {
                 ctx.allow_fp8 = false;
@@ -3915,35 +4808,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             matmul(*dB_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    N, M, K, mode_col, do_accumulate, mRunState.MainStream);
-        }
-    }
-
-    // DEBUG: Print dA and dB output for layer 26 QKV backward
-    static int matmul_out_trace_count = 0;
-    if ((layer_idx == 26 && is_qkv_backward) && matmul_out_trace_count < 5) {
-        matmul_out_trace_count++;
-        cudaStreamSynchronize(mRunState.MainStream);
-        if (dA_ptr) {
-            std::vector<float> dA_vals(4);
-            cudaMemcpy(dA_vals.data(), dA_ptr->Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[MATMUL_BWD_OUT] Layer 26 QKV: dA output=%s ptr=%p, values=%.9f,%.9f,%.9f,%.9f used_recipe=%d\n",
-                    op.outputs[0].name.c_str(), dA_ptr->Data, dA_vals[0], dA_vals[1], dA_vals[2], dA_vals[3],
-                    static_cast<int>(used_recipe));
-        } else {
-            fprintf(stderr, "[MATMUL_BWD_OUT] Layer 26 QKV: dA_ptr is NULL!\n");
-        }
-        if (dB_ptr) {
-            // Compute L2 norm of dB (weight gradient)
-            const int N_dB = static_cast<int>(std::min(static_cast<long>(dB_ptr->nelem()), 50000L));
-            std::vector<float> dB_all(N_dB);
-            cudaMemcpy(dB_all.data(), dB_ptr->Data, N_dB * sizeof(float), cudaMemcpyDeviceToHost);
-            float dB_sum_sq = 0.0f, dB_max = 0.0f;
-            for (int i = 0; i < N_dB; ++i) {
-                dB_sum_sq += dB_all[i] * dB_all[i];
-                if (std::fabs(dB_all[i]) > dB_max) dB_max = std::fabs(dB_all[i]);
-            }
-            fprintf(stderr, "[MATMUL_BWD_OUT] Layer 26 QKV: dB (d_weight) L2=%.6f, max=%.6f (first 4: %.9f,%.9f,%.9f,%.9f)\n",
-                    std::sqrt(dB_sum_sq), dB_max, dB_all[0], dB_all[1], dB_all[2], dB_all[3]);
         }
     }
 
@@ -4108,8 +4972,9 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
         std::vector<float> d_out_vals(8), inp_vals(8);
         cudaMemcpy(d_out_vals.data(), d_out.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(inp_vals.data(), inp.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[SWIGLU_BWD] Layer 0: d_out=%.6f,%.6f,%.6f, inp(mlp_up)=%.6f,%.6f,%.6f ptr=%p\n",
-                d_out_vals[0], d_out_vals[1], d_out_vals[2],
+        fprintf(stderr, "[SWIGLU_BWD] Layer 0: d_out_name='%s' d_out=%.6f,%.6f,%.6f (ptr=%p), inp=%.6f,%.6f,%.6f (ptr=%p)\n",
+                op.inputs[0].name.c_str(),
+                d_out_vals[0], d_out_vals[1], d_out_vals[2], d_out.Data,
                 inp_vals[0], inp_vals[1], inp_vals[2], inp.Data);
     }
 
@@ -4345,6 +5210,44 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                 debug_layer_idx, d_out.Data, std::sqrt(d_out_sum_sq), d_out_max, d_out_all[0], d_out_all[1], d_out_all[2], d_out_all[3]);
     }
 
+    const int top_layer = static_cast<int>(mConfig.NumLayers) - 1;
+    // DEBUG: Trace top-layer inputs (qkv/rstd/freqs/pos_ids) to catch NaN sources.
+    static int qk_top_trace = 0;
+    if (debug_layer_idx == top_layer && qk_top_trace < 6) {
+        fprintf(stderr,
+                "[QK_NORM_ROPE_BWD_TOP] layer=%d qkv=%p d_out=%p q_rstd=%p k_rstd=%p freqs=%p pos_ids=%p qkv_shape=%s d_out_shape=%s\n",
+                debug_layer_idx,
+                qkv.Data,
+                d_out.Data,
+                q_rstd.Data,
+                k_rstd.Data,
+                freqs.Data,
+                pos_ids.Data,
+                tensor_shape_str(qkv).c_str(),
+                tensor_shape_str(d_out).c_str());
+        log_tensor_stats_ex("QK_BWD_TOP_QKV", debug_layer_idx, op.inputs[1].name, qkv, 4096, true);
+        log_tensor_stats_ex("QK_BWD_TOP_DOUT", debug_layer_idx, op.inputs[0].name, d_out, 4096, true);
+        log_tensor_stats_ex("QK_BWD_TOP_Q_RSTD", debug_layer_idx, op.inputs[4].name, q_rstd, 4096, true);
+        log_tensor_stats_ex("QK_BWD_TOP_K_RSTD", debug_layer_idx, op.inputs[5].name, k_rstd, 4096, true);
+        log_tensor_stats_ex("QK_BWD_TOP_FREQS", debug_layer_idx, op.inputs[6].name, freqs, 4096, true);
+        if (pos_ids.Data && pos_ids.nelem() > 0) {
+            const std::size_t n = std::min<std::size_t>(8, static_cast<std::size_t>(pos_ids.nelem()));
+            std::vector<int> ids(n, 0);
+            cudaMemcpy(ids.data(), pos_ids.Data, n * sizeof(int), cudaMemcpyDeviceToHost);
+            fprintf(stderr,
+                    "[QK_BWD_TOP_POS_IDS] first=%d,%d,%d,%d,%d,%d,%d,%d\n",
+                    ids.size() > 0 ? ids[0] : 0,
+                    ids.size() > 1 ? ids[1] : 0,
+                    ids.size() > 2 ? ids[2] : 0,
+                    ids.size() > 3 ? ids[3] : 0,
+                    ids.size() > 4 ? ids[4] : 0,
+                    ids.size() > 5 ? ids[5] : 0,
+                    ids.size() > 6 ? ids[6] : 0,
+                    ids.size() > 7 ? ids[7] : 0);
+        }
+        qk_top_trace++;
+    }
+
     Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
@@ -4398,7 +5301,22 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     // V doesn't have normalization - its gradients pass through unchanged
     // The d_out already contains the V gradients at the correct offset
 
-    // DEBUG: Print output with L2 norm
+    // DEBUG: Print output with L2 norm (include Layer 25 and top layer for debugging)
+    static int qk_25_trace = 0;
+    if ((debug_layer_idx == 25 || debug_layer_idx == top_layer) && qk_25_trace < 12) {
+        qk_25_trace++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        const int N = static_cast<int>(std::min(static_cast<long>(d_qkv.nelem()), 10000L));
+        std::vector<float> d_qkv_all(N);
+        cudaMemcpy(d_qkv_all.data(), d_qkv.Data, N * sizeof(float), cudaMemcpyDeviceToHost);
+        float sum_sq = 0.0f, max_val = 0.0f;
+        for (int i = 0; i < N; ++i) {
+            sum_sq += d_qkv_all[i] * d_qkv_all[i];
+            if (std::fabs(d_qkv_all[i]) > max_val) max_val = std::fabs(d_qkv_all[i]);
+        }
+        fprintf(stderr, "[QK_NORM_ROPE_BWD] Layer %d: d_qkv OUTPUT L2=%.6f, max=%.6f, vals=%.6f,%.6f,%.6f,%.6f\n",
+                debug_layer_idx, std::sqrt(sum_sq), max_val, d_qkv_all[0], d_qkv_all[1], d_qkv_all[2], d_qkv_all[3]);
+    }
     if ((debug_layer_idx == 0 || debug_layer_idx == 26) && qknorm_trace_count <= 10) {
         cudaStreamSynchronize(mRunState.MainStream);
         const int N = static_cast<int>(std::min(static_cast<long>(d_qkv.nelem()), 10000L));
@@ -4432,22 +5350,73 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[3]);
     Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
 
-    // DEBUG: Print attention backward inputs for layer 0 and 26
+    // DEBUG: Print attention backward inputs for layer 0, 25, and 26
     int debug_layer_idx = -1;
     std::string debug_field;
     parse_block_param(op.inputs[1].name, debug_layer_idx, debug_field);
-    if (debug_layer_idx == 0 || debug_layer_idx == 26) {
+
+    // Trace Layer 25 flash attention backward for explosion debugging
+    static int attn_25_trace = 0;
+    if (debug_layer_idx == 25 && attn_25_trace < 10) {
+        attn_25_trace++;
         cudaStreamSynchronize(mRunState.MainStream);
-        std::vector<float> vals(8), d_out_vals(8);
-        cudaMemcpy(vals.data(), qkv.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(d_out_vals.data(), d_out.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[ATTN_BWD] Layer %d qkv_rope ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
-                debug_layer_idx, qkv.Data, vals[0], vals[1], vals[2], vals[3]);
-        cudaMemcpy(vals.data(), out.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[ATTN_BWD] Layer %d att ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
-                debug_layer_idx, out.Data, vals[0], vals[1], vals[2], vals[3]);
-        fprintf(stderr, "[ATTN_BWD] Layer %d d_out(d_att) values=%.6f, %.6f, %.6f, %.6f\n",
-                debug_layer_idx, d_out_vals[0], d_out_vals[1], d_out_vals[2], d_out_vals[3]);
+        std::vector<float> d_out_vals(4);
+        cudaMemcpy(d_out_vals.data(), d_out.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        // Compute L2 norm of d_out
+        const int N = static_cast<int>(std::min(static_cast<long>(d_out.nelem()), 10000L));
+        std::vector<float> all(N);
+        cudaMemcpy(all.data(), d_out.Data, N * sizeof(float), cudaMemcpyDeviceToHost);
+        float sum_sq = 0.0f, max_val = 0.0f;
+        for (int i = 0; i < N; ++i) {
+            sum_sq += all[i] * all[i];
+            if (std::fabs(all[i]) > max_val) max_val = std::fabs(all[i]);
+        }
+        fprintf(stderr, "[FLASH_ATTN_BWD] Layer %d: d_out INPUT L2=%.6f max=%.6f vals=%.6f,%.6f,%.6f,%.6f\n",
+                debug_layer_idx, std::sqrt(sum_sq), max_val, d_out_vals[0], d_out_vals[1], d_out_vals[2], d_out_vals[3]);
+        // Also trace saved activations (qkv, out, lse) to check if they're corrupted
+        const long sample_token = 3;
+        std::vector<float> qkv_vals(4), out_vals(4), lse_vals(4);
+        const bool qkv_ok = copy_tensor_token_sample_as_f32(qkv, sample_token, qkv_vals.size(), qkv_vals);
+        const bool out_ok = copy_tensor_token_sample_as_f32(out, sample_token, out_vals.size(), out_vals);
+        const bool lse_ok = copy_tensor_token_sample_as_f32(lse, sample_token, lse_vals.size(), lse_vals);
+        fprintf(stderr,
+                "[FLASH_ATTN_BWD] Layer %d: token=%ld qkv ptr=%p ok=%d vals=%.6f,%.6f,%.6f,%.6f  "
+                "out ptr=%p ok=%d vals=%.6f,%.6f,%.6f,%.6f  lse ok=%d vals=%.6f,%.6f,%.6f,%.6f\n",
+                debug_layer_idx, sample_token, qkv.Data, qkv_ok ? 1 : 0,
+                qkv_vals[0], qkv_vals[1], qkv_vals[2], qkv_vals[3],
+                out.Data, out_ok ? 1 : 0,
+                out_vals[0], out_vals[1], out_vals[2], out_vals[3],
+                lse_ok ? 1 : 0,
+                lse_vals[0], lse_vals[1], lse_vals[2], lse_vals[3]);
+    }
+
+    const int top_layer = static_cast<int>(mConfig.NumLayers) - 1;
+    if (debug_layer_idx == 0 || debug_layer_idx == 26 || debug_layer_idx == top_layer) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        const long sample_token = 3;
+        std::vector<float> qkv_vals(4), out_vals(4), d_out_vals(4);
+        const bool qkv_ok = copy_tensor_token_sample_as_f32(qkv, sample_token, qkv_vals.size(), qkv_vals);
+        const bool out_ok = copy_tensor_token_sample_as_f32(out, sample_token, out_vals.size(), out_vals);
+        const bool d_out_ok = copy_tensor_token_sample_as_f32(d_out, sample_token, d_out_vals.size(), d_out_vals);
+        fprintf(stderr,
+                "[ATTN_BWD] Layer %d token=%ld qkv_rope ptr=%p ok=%d values=%.6f, %.6f, %.6f, %.6f\n",
+                debug_layer_idx, sample_token, qkv.Data, qkv_ok ? 1 : 0,
+                qkv_vals[0], qkv_vals[1], qkv_vals[2], qkv_vals[3]);
+        fprintf(stderr,
+                "[ATTN_BWD] Layer %d token=%ld att ptr=%p ok=%d values=%.6f, %.6f, %.6f, %.6f\n",
+                debug_layer_idx, sample_token, out.Data, out_ok ? 1 : 0,
+                out_vals[0], out_vals[1], out_vals[2], out_vals[3]);
+        fprintf(stderr,
+                "[ATTN_BWD] Layer %d token=%ld d_out(d_att) ok=%d values=%.6f, %.6f, %.6f, %.6f\n",
+                debug_layer_idx, sample_token, d_out_ok ? 1 : 0,
+                d_out_vals[0], d_out_vals[1], d_out_vals[2], d_out_vals[3]);
+        fprintf(stderr,
+                "[ATTN_BWD] Layer %d shapes: d_out=%s qkv=%s out=%s lse=%s\n",
+                debug_layer_idx,
+                tensor_shape_str(d_out).c_str(),
+                tensor_shape_str(qkv).c_str(),
+                tensor_shape_str(out).c_str(),
+                tensor_shape_str(lse).c_str());
     }
 
     Tensor* out_ptr = &out;
@@ -4457,6 +5426,14 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
+    const bool cudnn_gqa_ok = (Hq == Hkv);
+    const bool force_custom_bwd = (std::getenv("SUROGATE_ATTN_BWD_CUSTOM") != nullptr);
+    const bool force_cudnn_bwd = (std::getenv("SUROGATE_ATTN_BWD_FORCE_CUDNN") != nullptr);
+    const bool use_cudnn_bwd = force_cudnn_bwd || (cudnn_gqa_ok && !force_custom_bwd);
+    const bool gqa_fallback_full = !cudnn_gqa_ok;
+    auto shape_vec = [](const Tensor& t) {
+        return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
+    };
 
     if (!mRunState.scratch().cudnn_workspace.Data) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
@@ -4484,19 +5461,97 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
 
     // Signature: attention_backward_cudnn(dqkv, stats, out, dout, qkv, workspace, handle, B, T, Hq, Hkv, HS, stream)
     if (attn_chunks == 1) {
-        attention_backward_cudnn(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
-                                 mRunState.scratch().cudnn_workspace,
-                                 mRunState.CudnnHandle,
-                                 static_cast<int>(mB), static_cast<int>(mT),
-                                 Hq, Hkv, Hs, mRunState.MainStream);
+        if (!use_cudnn_bwd) {
+            static int bwd_skip_count = 0;
+            if (bwd_skip_count < 4) {
+                fprintf(stderr,
+                        "[CUDNN_ATTN_BWD_SKIP] Hq=%d Hkv=%d reason=%s\n",
+                        Hq, Hkv, force_custom_bwd ? "forced_custom" : "gqa");
+                bwd_skip_count++;
+            }
+            if (d_out.DType == ETensorDType::BF16) {
+                Tensor qkv_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(qkv), "qkv_f32");
+                Tensor out_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out), "attn_out_f32");
+                Tensor d_out_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_out), "d_attn_out_f32");
+                Tensor d_qkv_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_qkv), "d_qkv_f32");
+                convert_dtype(qkv_f32.get<float>(), qkv.get<nv_bfloat16>(), qkv.nelem(), mRunState.MainStream);
+                convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(), d_out.nelem(), mRunState.MainStream);
 
-        // DEBUG: Print d_qkv output for layer 0 and 26
-        if (debug_layer_idx == 0 || debug_layer_idx == 26) {
+                if (gqa_fallback_full) {
+                    Tensor lse_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse), "attn_lse_f32");
+                    attention_forward_custom(out_f32, lse_f32, qkv_f32,
+                                             static_cast<int>(mB), static_cast<int>(mT),
+                                             Hq, Hkv, Hs, mRunState.MainStream);
+                    attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
+                                              static_cast<int>(mB), static_cast<int>(mT),
+                                              Hq, Hkv, Hs, mRunState.MainStream);
+                } else {
+                    convert_dtype(out_f32.get<float>(), out.get<nv_bfloat16>(), out.nelem(), mRunState.MainStream);
+                    if (lse.DType == ETensorDType::BF16) {
+                        Tensor lse_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse), "attn_lse_f32");
+                        convert_dtype(lse_f32.get<float>(), lse.get<nv_bfloat16>(), lse.nelem(), mRunState.MainStream);
+                        attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
+                                                  static_cast<int>(mB), static_cast<int>(mT),
+                                                  Hq, Hkv, Hs, mRunState.MainStream);
+                    } else {
+                        attention_backward_custom(d_qkv_f32, *lse_ptr, out_f32, d_out_f32, qkv_f32,
+                                                  static_cast<int>(mB), static_cast<int>(mT),
+                                                  Hq, Hkv, Hs, mRunState.MainStream);
+                    }
+                }
+
+                convert_dtype(d_qkv.get<nv_bfloat16>(), d_qkv_f32.get<float>(), d_qkv.nelem(), mRunState.MainStream);
+            } else {
+                if (gqa_fallback_full) {
+                    Tensor out_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out), "attn_out_f32");
+                    Tensor lse_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse), "attn_lse_f32");
+                    attention_forward_custom(out_f32, lse_f32, *qkv_ptr,
+                                             static_cast<int>(mB), static_cast<int>(mT),
+                                             Hq, Hkv, Hs, mRunState.MainStream);
+                    attention_backward_custom(d_qkv, lse_f32, out_f32, d_out, *qkv_ptr,
+                                              static_cast<int>(mB), static_cast<int>(mT),
+                                              Hq, Hkv, Hs, mRunState.MainStream);
+                } else {
+                    attention_backward_custom(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
+                                              static_cast<int>(mB), static_cast<int>(mT),
+                                              Hq, Hkv, Hs, mRunState.MainStream);
+                }
+            }
+        } else {
+            static int bwd_force_count = 0;
+            if (force_cudnn_bwd && bwd_force_count < 4) {
+                fprintf(stderr,
+                        "[CUDNN_ATTN_BWD_FORCE] Hq=%d Hkv=%d\n",
+                        Hq, Hkv);
+                bwd_force_count++;
+            }
+            attention_backward_cudnn(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
+                                     mRunState.scratch().cudnn_workspace,
+                                     mRunState.CudnnHandle,
+                                     static_cast<int>(mB), static_cast<int>(mT),
+                                     Hq, Hkv, Hs, mRunState.MainStream);
+        }
+
+        // DEBUG: Print d_qkv output for layer 0, 25, and 26
+        if (debug_layer_idx == 25 && attn_25_trace <= 10) {
             cudaStreamSynchronize(mRunState.MainStream);
-            std::vector<float> vals(8);
-            cudaMemcpy(vals.data(), d_qkv.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[ATTN_BWD] Layer %d d_qkv OUTPUT ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
-                    debug_layer_idx, d_qkv.Data, vals[0], vals[1], vals[2], vals[3]);
+            const int N = static_cast<int>(std::min(static_cast<long>(d_qkv.nelem()), 10000L));
+            std::vector<float> all(N);
+            cudaMemcpy(all.data(), d_qkv.Data, N * sizeof(float), cudaMemcpyDeviceToHost);
+            float sum_sq = 0.0f, max_val = 0.0f;
+            for (int i = 0; i < N; ++i) {
+                sum_sq += all[i] * all[i];
+                if (std::fabs(all[i]) > max_val) max_val = std::fabs(all[i]);
+            }
+            fprintf(stderr, "[FLASH_ATTN_BWD] Layer %d: d_qkv OUTPUT L2=%.6f max=%.6f vals=%.6f,%.6f,%.6f,%.6f\n",
+                    debug_layer_idx, std::sqrt(sum_sq), max_val, all[0], all[1], all[2], all[3]);
+        }
+    if (debug_layer_idx == 0 || debug_layer_idx == 26 || debug_layer_idx == top_layer) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> vals(8);
+        cudaMemcpy(vals.data(), d_qkv.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[ATTN_BWD] Layer %d d_qkv OUTPUT ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
+                debug_layer_idx, d_qkv.Data, vals[0], vals[1], vals[2], vals[3]);
         }
         return;
     }
@@ -4510,11 +5565,69 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         Tensor qkv_chunk = slice(*qkv_ptr, 0, start, end);
         Tensor d_qkv_chunk = slice(d_qkv, 0, start, end);
 
-        attention_backward_cudnn(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
-                                 mRunState.scratch().cudnn_workspace,
-                                 mRunState.CudnnHandle,
-                                 chunk_B, static_cast<int>(mT),
-                                 Hq, Hkv, Hs, mRunState.MainStream);
+        if (!use_cudnn_bwd) {
+            if (d_out_chunk.DType == ETensorDType::BF16) {
+                Tensor qkv_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(qkv_chunk), "qkv_f32");
+                Tensor out_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out_chunk), "attn_out_f32");
+                Tensor d_out_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_out_chunk), "d_attn_out_f32");
+                Tensor d_qkv_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_qkv_chunk), "d_qkv_f32");
+                convert_dtype(qkv_f32.get<float>(), qkv_chunk.get<nv_bfloat16>(), qkv_chunk.nelem(), mRunState.MainStream);
+                convert_dtype(d_out_f32.get<float>(), d_out_chunk.get<nv_bfloat16>(), d_out_chunk.nelem(), mRunState.MainStream);
+
+                if (gqa_fallback_full) {
+                    Tensor lse_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse_chunk), "attn_lse_f32");
+                    attention_forward_custom(out_f32, lse_f32, qkv_f32,
+                                             chunk_B, static_cast<int>(mT),
+                                             Hq, Hkv, Hs, mRunState.MainStream);
+                    attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
+                                              chunk_B, static_cast<int>(mT),
+                                              Hq, Hkv, Hs, mRunState.MainStream);
+                } else {
+                    convert_dtype(out_f32.get<float>(), out_chunk.get<nv_bfloat16>(), out_chunk.nelem(), mRunState.MainStream);
+                    if (lse_chunk.DType == ETensorDType::BF16) {
+                        Tensor lse_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse_chunk), "attn_lse_f32");
+                        convert_dtype(lse_f32.get<float>(), lse_chunk.get<nv_bfloat16>(), lse_chunk.nelem(), mRunState.MainStream);
+                        attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
+                                                  chunk_B, static_cast<int>(mT),
+                                                  Hq, Hkv, Hs, mRunState.MainStream);
+                    } else {
+                        attention_backward_custom(d_qkv_f32, lse_chunk, out_f32, d_out_f32, qkv_f32,
+                                                  chunk_B, static_cast<int>(mT),
+                                                  Hq, Hkv, Hs, mRunState.MainStream);
+                    }
+                }
+
+                convert_dtype(d_qkv_chunk.get<nv_bfloat16>(), d_qkv_f32.get<float>(), d_qkv_chunk.nelem(), mRunState.MainStream);
+            } else {
+                if (gqa_fallback_full) {
+                    Tensor out_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out_chunk), "attn_out_f32");
+                    Tensor lse_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse_chunk), "attn_lse_f32");
+                    attention_forward_custom(out_f32, lse_f32, qkv_chunk,
+                                             chunk_B, static_cast<int>(mT),
+                                             Hq, Hkv, Hs, mRunState.MainStream);
+                    attention_backward_custom(d_qkv_chunk, lse_f32, out_f32, d_out_chunk, qkv_chunk,
+                                              chunk_B, static_cast<int>(mT),
+                                              Hq, Hkv, Hs, mRunState.MainStream);
+                } else {
+                    attention_backward_custom(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
+                                              chunk_B, static_cast<int>(mT),
+                                              Hq, Hkv, Hs, mRunState.MainStream);
+                }
+            }
+        } else {
+            static int bwd_force_count = 0;
+            if (force_cudnn_bwd && bwd_force_count < 4) {
+                fprintf(stderr,
+                        "[CUDNN_ATTN_BWD_FORCE] Hq=%d Hkv=%d\n",
+                        Hq, Hkv);
+                bwd_force_count++;
+            }
+            attention_backward_cudnn(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
+                                     mRunState.scratch().cudnn_workspace,
+                                     mRunState.CudnnHandle,
+                                     chunk_B, static_cast<int>(mT),
+                                     Hq, Hkv, Hs, mRunState.MainStream);
+        }
     }
 }
 
@@ -4535,6 +5648,58 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
 
     Tensor& d_y = resolve_tensor(op.inputs[0]);
+
+    const bool is_final_norm =
+        (op.inputs[3].name.find("final_norm") != std::string::npos ||
+         op.inputs[3].name.find("ln_final") != std::string::npos ||
+         op.inputs[3].name.find("ln_f") != std::string::npos);
+
+    // DEBUG: Trace final RMSNorm d_y input name/values (layer_idx == -1 / final_norm).
+    static int final_ln_trace_count = 0;
+    if (final_ln_trace_count < 5 &&
+        is_final_norm) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> vals(4, 0.0f);
+        const bool ok = copy_tensor_sample_as_f32(d_y, vals.size(), vals);
+        double l2_slice = 0.0;
+        std::size_t slice_offset = 0;
+        std::size_t slice_count = 0;
+        if (d_y.Data && d_y.nelem() > 0) {
+            const std::size_t n = static_cast<std::size_t>(d_y.nelem());
+            slice_offset = n / 2;
+            slice_count = std::min<std::size_t>(4096, n - slice_offset);
+            if (slice_count > 0) {
+                Tensor tmp = d_y;
+                tmp.Data = static_cast<std::byte*>(tmp.Data) +
+                           slice_offset * get_dtype_size(tmp.DType);
+                tmp.Sizes[0] = static_cast<long>(slice_count);
+                tmp.Rank = 1;
+                std::vector<float> buf;
+                if (copy_tensor_sample_as_f32(tmp, slice_count, buf)) {
+                    for (std::size_t i = 0; i < slice_count; ++i) {
+                        const double v = static_cast<double>(buf[i]);
+                        l2_slice += v * v;
+                    }
+                    l2_slice = std::sqrt(l2_slice);
+                }
+            }
+        }
+        fprintf(stderr,
+                "[RMSNORM_BWD_FINAL] weight=%s d_y_name=%s slot=%d layer_idx=%d ptr=%p dtype=%d ok=%d "
+                "mid_offset=%zu mid_count=%zu mid_l2=%.9e vals=%.9f,%.9f,%.9f,%.9f\n",
+                op.inputs[3].name.c_str(),
+                op.inputs[0].name.c_str(),
+                static_cast<int>(op.inputs[0].slot),
+                op.inputs[0].layer_idx,
+                d_y.Data,
+                static_cast<int>(d_y.DType),
+                ok ? 1 : 0,
+                slice_offset,
+                slice_count,
+                l2_slice,
+                vals[0], vals[1], vals[2], vals[3]);
+        final_ln_trace_count++;
+    }
 
     // DEBUG: Print d_y values for layer 26 LN1
     static int d_y_trace_count = 0;
@@ -4594,6 +5759,45 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     Tensor* d_residual_input = d_residual_next;
     Tensor* d_residual_stream = d_residual_next;
 
+    // DEBUG: Trace top-layer LN1 d_y and optional zeroing to isolate stale/NaN gradients.
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    static int ln1_top_trace = 0;
+    if (ln_field == "ln1_weight" && ln_layer_idx == num_layers - 1 && ln1_top_trace < 8) {
+        fprintf(stderr,
+                "[RMS_BWD_LN1_TOP] layer=%d d_y=%s slot=%d ptr=%p d_residual_next=%s ptr=%p\n",
+                ln_layer_idx,
+                op.inputs[0].name.c_str(),
+                static_cast<int>(op.inputs[0].slot),
+                d_y.Data,
+                op.inputs[1].name.c_str(),
+                d_residual_next ? d_residual_next->Data : nullptr);
+        log_tensor_stats_ex("RMS_BWD_LN1_TOP_DY", ln_layer_idx, op.inputs[0].name, d_y, 4096, true);
+        if (d_residual_next && d_residual_next->Data) {
+            log_tensor_stats_ex("RMS_BWD_LN1_TOP_DRES", ln_layer_idx, op.inputs[1].name, *d_residual_next, 4096, true);
+        }
+        ln1_top_trace++;
+    }
+    static int ln1_top_nan_logged = 0;
+    if (ln_field == "ln1_weight" && ln_layer_idx == num_layers - 1 && ln1_top_nan_logged < 4) {
+        if (tensor_sample_has_nan_or_inf(d_y, 3)) {
+            fprintf(stderr,
+                    "[RMS_BWD_LN1_TOP_NAN] layer=%d d_y=%s ptr=%p\n",
+                    ln_layer_idx,
+                    op.inputs[0].name.c_str(),
+                    d_y.Data);
+            ln1_top_nan_logged++;
+        }
+    }
+    static int ln1_top_zero = -1;
+    if (ln1_top_zero < 0) {
+        ln1_top_zero = (std::getenv("SUROGATE_DEBUG_ZERO_LN1_DY") != nullptr) ? 1 : 0;
+    }
+    if (ln1_top_zero && ln_field == "ln1_weight" && ln_layer_idx == num_layers - 1) {
+        fprintf(stderr, "[RMS_BWD_LN1_TOP_ZERO] layer=%d zeroing d_y ptr=%p\n",
+                ln_layer_idx, d_y.Data);
+        fill_zero(d_y, mRunState.MainStream);
+    }
+
     // DEBUG: Print d_residual_next and check for aliasing with d_input
     if (ln_layer_idx == 26) {
         cudaStreamSynchronize(mRunState.MainStream);
@@ -4605,6 +5809,19 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
 
     Tensor& d_input = ensure_output_tensor(op.outputs[1]);
+
+    const Tensor& d_emb_global = mRunState.non_block_gradients().d_embeddings;
+    const bool writes_to_embeddings = (d_emb_global.Data && d_input.Data == d_emb_global.Data);
+    auto matches_output = [&](std::string_view target) -> bool {
+        for (const auto& out_ref : op.outputs) {
+            if (out_ref.name.empty()) continue;
+            if (strip_ssa_suffix(out_ref.name) == target) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool targets_res_ffn = matches_output("d_blocks[0].res_ffn");
 
     // d_weight may be nullptr if weight is frozen
     Tensor dummy_weight{};
@@ -4636,7 +5853,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
 
     // DEBUG: Print rmsnorm backward inputs for all layers to trace divergence
-    const int num_layers = static_cast<int>(mConfig.NumLayers);
     static int step_count = 0;
     static int print_count = 0;
     if (ln_field == "ln1_weight" && ln_layer_idx == num_layers - 1) {
@@ -4662,11 +5878,110 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                 dy_vals[0], dy_vals[1], dy_vals[2]);
     }
 
+    static int emb_rms_trace = 0;
+    if (writes_to_embeddings && emb_rms_trace < 8) {
+        fprintf(stderr,
+                "[RMS_BWD_EMB] op_id=%s layer=%d field=%s d_y=%s d_res_next=%s\n",
+                op.op_id.c_str(), ln_layer_idx, ln_field.c_str(),
+                op.inputs[0].name.c_str(), op.inputs[1].name.c_str());
+        log_tensor_stats_ex("RMS_BWD_EMB_DY", ln_layer_idx, op.inputs[0].name, d_y, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_RES", ln_layer_idx, op.inputs[2].name, residual_out, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_RSTD", ln_layer_idx, op.inputs[4].name, rstd, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_W", ln_layer_idx, op.inputs[3].name, weight, 4096, true);
+        if (d_residual_next && d_residual_next->Data) {
+            log_tensor_stats_ex("RMS_BWD_EMB_DRES", ln_layer_idx, op.inputs[1].name, *d_residual_next, 4096, true);
+        }
+        emb_rms_trace++;
+    }
+
+    static int rms_resffn_trace = 0;
+    if (targets_res_ffn && rms_resffn_trace < 8) {
+        fprintf(stderr,
+                "[RMS_BWD_RESFFN] op_id=%s layer=%d field=%s d_y=%s d_res_next=%s\n",
+                op.op_id.c_str(), ln_layer_idx, ln_field.c_str(),
+                op.inputs[0].name.c_str(), op.inputs[1].name.c_str());
+        log_tensor_stats_ex("RMS_BWD_RESFFN_DY", ln_layer_idx, op.inputs[0].name, d_y, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_RES", ln_layer_idx, op.inputs[2].name, residual_out, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_RSTD", ln_layer_idx, op.inputs[4].name, rstd, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_W", ln_layer_idx, op.inputs[3].name, weight, 4096, true);
+        if (d_residual_next && d_residual_next->Data) {
+            log_tensor_stats_ex("RMS_BWD_RESFFN_DRES", ln_layer_idx, op.inputs[1].name, *d_residual_next, 4096, true);
+        }
+        rms_resffn_trace++;
+    }
+
     rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
                      *d_residual_input, d_y, residual_out, weight, rstd,
                      abs_max_ptr,
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
+
+    // DEBUG: One-time per-layer RMS stats to locate divergence between recompute/no-recompute.
+    static int rms_layer_trace_enabled = -1;
+    if (rms_layer_trace_enabled < 0) {
+        rms_layer_trace_enabled = (std::getenv("SUROGATE_TRACE_RMS_LAYER") != nullptr) ? 1 : 0;
+    }
+    if (rms_layer_trace_enabled && ln_layer_idx >= 0) {
+        static std::vector<int> rms_layer_seen;
+        const int num_layers = static_cast<int>(mConfig.NumLayers);
+        if (rms_layer_seen.empty() && num_layers > 0) {
+            rms_layer_seen.assign(static_cast<std::size_t>(num_layers * 2), 0);
+        }
+        const int field_idx = (ln_field == "ln2_weight") ? 1 : 0;
+        const int slot_idx = ln_layer_idx * 2 + field_idx;
+        if (slot_idx >= 0 && slot_idx < static_cast<int>(rms_layer_seen.size()) &&
+            rms_layer_seen[static_cast<std::size_t>(slot_idx)] == 0) {
+            rms_layer_seen[static_cast<std::size_t>(slot_idx)] = 1;
+            cudaStreamSynchronize(mRunState.MainStream);
+            const double dy_mean = sample_mean_abs(d_y, 4096);
+            const double din_mean = sample_mean_abs(d_input, 4096);
+            double dres_mean = 0.0;
+            if (d_residual_next && d_residual_next->Data) {
+                dres_mean = sample_mean_abs(*d_residual_next, 4096);
+            }
+            fprintf(stderr,
+                    "[RMS_LAYER_STAT] layer=%d field=%s dy_mean=%.6e din_mean=%.6e dres_mean=%.6e\n",
+                    ln_layer_idx, ln_field.c_str(), dy_mean, din_mean, dres_mean);
+        }
+    }
+
+    static int final_ln_out_trace = 0;
+    if (is_final_norm && final_ln_out_trace < 5) {
+        log_tensor_stats_ex("RMS_BWD_FINAL_DINPUT", ln_layer_idx, op.outputs[1].name, d_input, 4096, true);
+        final_ln_out_trace++;
+    }
+
+    static bool emb_rms_nan_logged = false;
+    if (writes_to_embeddings && !emb_rms_nan_logged && tensor_sample_has_nan_or_inf(d_input, 3)) {
+        fprintf(stderr,
+                "[RMS_BWD_EMB_NAN] op_id=%s layer=%d field=%s\n",
+                op.op_id.c_str(), ln_layer_idx, ln_field.c_str());
+        log_tensor_stats_ex("RMS_BWD_EMB_DINPUT", ln_layer_idx, op.outputs[1].name, d_input, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_DY_NAN", ln_layer_idx, op.inputs[0].name, d_y, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_RES_NAN", ln_layer_idx, op.inputs[2].name, residual_out, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_RSTD_NAN", ln_layer_idx, op.inputs[4].name, rstd, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_EMB_W_NAN", ln_layer_idx, op.inputs[3].name, weight, 4096, true);
+        if (d_residual_next && d_residual_next->Data) {
+            log_tensor_stats_ex("RMS_BWD_EMB_DRES_NAN", ln_layer_idx, op.inputs[1].name, *d_residual_next, 4096, true);
+        }
+        emb_rms_nan_logged = true;
+    }
+
+    static bool rms_resffn_nan_logged = false;
+    if (targets_res_ffn && !rms_resffn_nan_logged && tensor_sample_has_nan_or_inf(d_input, 3)) {
+        fprintf(stderr,
+                "[RMS_BWD_RESFFN_NAN] op_id=%s layer=%d field=%s\n",
+                op.op_id.c_str(), ln_layer_idx, ln_field.c_str());
+        log_tensor_stats_ex("RMS_BWD_RESFFN_DINPUT", ln_layer_idx, op.outputs[1].name, d_input, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_DY_NAN", ln_layer_idx, op.inputs[0].name, d_y, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_RES_NAN", ln_layer_idx, op.inputs[2].name, residual_out, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_RSTD_NAN", ln_layer_idx, op.inputs[4].name, rstd, 4096, true);
+        log_tensor_stats_ex("RMS_BWD_RESFFN_W_NAN", ln_layer_idx, op.inputs[3].name, weight, 4096, true);
+        if (d_residual_next && d_residual_next->Data) {
+            log_tensor_stats_ex("RMS_BWD_RESFFN_DRES_NAN", ln_layer_idx, op.inputs[1].name, *d_residual_next, 4096, true);
+        }
+        rms_resffn_nan_logged = true;
+    }
 
     // DEBUG: Print d_input OUTPUT for layer 26 to trace gradient flow
     if (ln_layer_idx == 26 && ln_field == "ln2_weight") {
@@ -4675,6 +5990,22 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         cudaMemcpy(dinp_vals.data(), d_input.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
         fprintf(stderr, "[RMSNORM_BWD_OUT] Layer %d %s: d_input OUTPUT ptr=%p, values=%.6f,%.6f,%.6f,%.6f\n",
                 ln_layer_idx, ln_field.c_str(), d_input.Data,
+                dinp_vals[0], dinp_vals[1], dinp_vals[2], dinp_vals[3]);
+    }
+
+    // DEBUG: Trace Layer 24 and 25 rmsnorm_backward for explosion debugging
+    static int ln_24_25_trace = 0;
+    if ((ln_layer_idx == 24 || ln_layer_idx == 25) && ln_24_25_trace < 20) {
+        ln_24_25_trace++;
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> dinp_vals(4), dy_vals(4), dres_vals(4);
+        cudaMemcpy(dinp_vals.data(), d_input.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(dy_vals.data(), d_y.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(dres_vals.data(), d_residual_next->Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RMSNORM_BWD_L24_25] Layer %d %s: d_y_in=%.6f,%.6f,%.6f,%.6f d_res_next=%.6f,%.6f,%.6f,%.6f d_input_out=%.6f,%.6f,%.6f,%.6f\n",
+                ln_layer_idx, ln_field.c_str(),
+                dy_vals[0], dy_vals[1], dy_vals[2], dy_vals[3],
+                dres_vals[0], dres_vals[1], dres_vals[2], dres_vals[3],
                 dinp_vals[0], dinp_vals[1], dinp_vals[2], dinp_vals[3]);
     }
 
@@ -4744,6 +6075,80 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
         throw std::runtime_error("CompiledExecutor: embedding_backward requires CPU inputs (set_last_inputs_cpu)");
     }
 
+    static int emb_bwd_log_count = 0;
+    const int vocab = mConfig.VocabSize;
+    const int total_tokens = static_cast<int>(mB * mT);
+    const long hidden = (d_emb.Rank > 1) ? d_emb.Sizes[1] : 0;
+
+    if (emb_bwd_log_count < 16) {
+        int cpu_min = std::numeric_limits<int>::max();
+        int cpu_max = std::numeric_limits<int>::min();
+        int cpu_oob = 0;
+        int cpu_oob_samples = 0;
+        int token0 = 0;
+        int token3 = 0;
+        if (mLastInputsCpu->DType == ETensorDType::INT32) {
+            const int* cpu = reinterpret_cast<const int*>(mLastInputsCpu->Data);
+            for (int i = 0; i < total_tokens; ++i) {
+                const int v = cpu[i];
+                if (i == 0) token0 = v;
+                if (i == 3) token3 = v;
+                cpu_min = std::min(cpu_min, v);
+                cpu_max = std::max(cpu_max, v);
+                if (v < 0 || v >= vocab) {
+                    if (cpu_oob_samples < 8) {
+                        fprintf(stderr, "[EMB_BWD_CPU_OOB] idx=%d val=%d vocab=%d\n", i, v, vocab);
+                        cpu_oob_samples++;
+                    }
+                    cpu_oob++;
+                }
+            }
+        } else {
+            fprintf(stderr, "[EMB_BWD_CPU_INPUTS] unsupported dtype=%s\n", dtype_to_str(mLastInputsCpu->DType));
+        }
+
+        fprintf(stderr,
+                "[EMB_BWD_CPU_INPUTS] B=%d T=%d vocab=%d min=%d max=%d oob=%d token0=%d token3=%d\n",
+                static_cast<int>(mB), static_cast<int>(mT), vocab,
+                cpu_min, cpu_max, cpu_oob, token0, token3);
+
+        if (mRunState.Inputs.Data && mRunState.Inputs.DType == ETensorDType::INT32 && total_tokens > 0) {
+            const int sample = std::min(total_tokens, 8);
+            std::vector<int> gpu(sample, 0);
+            CUDA_CHECK(cudaMemcpyAsync(gpu.data(), mRunState.Inputs.Data, sample * sizeof(int),
+                                       cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            int mismatch = 0;
+            if (mLastInputsCpu->DType == ETensorDType::INT32) {
+                const int* cpu = reinterpret_cast<const int*>(mLastInputsCpu->Data);
+                for (int i = 0; i < sample; ++i) {
+                    if (cpu[i] != gpu[i]) {
+                        mismatch++;
+                    }
+                }
+            }
+            fprintf(stderr, "[EMB_BWD_INPUTS_CMP] sample=%d mismatch=%d\n", sample, mismatch);
+        }
+
+        log_nan_sample("BWD_DOUT", op.inputs[0].layer_idx, op.inputs[0].name, d_out, 3);
+        if (tensor_sample_has_nan_or_inf(d_out, 3)) {
+            log_tensor_stats_ex("BWD_DOUT_NAN", op.inputs[0].layer_idx, op.inputs[0].name, d_out, 4096, true);
+        }
+
+        if (hidden > 0) {
+            if (tensor_sample_has_nan_or_inf(d_emb, 3)) {
+                const std::size_t off = static_cast<std::size_t>(3) * static_cast<std::size_t>(hidden);
+                log_tensor_sample_stats("EMB_DGRAD_PRE_ROW3", d_emb, off, static_cast<std::size_t>(hidden));
+            }
+            if (token3 >= 0 && token3 < vocab && tensor_sample_has_nan_or_inf(d_emb, token3)) {
+                const std::size_t off = static_cast<std::size_t>(token3) * static_cast<std::size_t>(hidden);
+                log_tensor_sample_stats("EMB_DGRAD_PRE_ROW_TOK3", d_emb, off, static_cast<std::size_t>(hidden));
+            }
+        }
+
+        emb_bwd_log_count++;
+    }
+
     unsigned int seed = mRngSeedFn ? mRngSeedFn() : 0;
 
     encoder_backward(d_emb,
@@ -4758,6 +6163,27 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
                      mRunState.MainStream,
                      mRunState.side_stream_event(),
                      mRunState.side_stream());
+
+    if (emb_bwd_log_count < 32 && hidden > 0) {
+        int token3 = 0;
+        if (mLastInputsCpu->DType == ETensorDType::INT32) {
+            const int* cpu = reinterpret_cast<const int*>(mLastInputsCpu->Data);
+            if (total_tokens > 3) {
+                token3 = cpu[3];
+            }
+        }
+        if (token3 >= 0 && token3 < vocab) {
+            if (tensor_sample_has_nan_or_inf(d_emb, token3)) {
+                const std::size_t off = static_cast<std::size_t>(token3) * static_cast<std::size_t>(hidden);
+                log_tensor_sample_stats("EMB_DGRAD_ROW_TOK3", d_emb, off, static_cast<std::size_t>(hidden));
+            }
+        }
+        if (tensor_sample_has_nan_or_inf(d_emb, 3)) {
+            const std::size_t off = static_cast<std::size_t>(3) * static_cast<std::size_t>(hidden);
+            log_tensor_sample_stats("EMB_DGRAD_ROW3", d_emb, off, static_cast<std::size_t>(hidden));
+        }
+        emb_bwd_log_count++;
+    }
 }
 
 void CompiledExecutor::dispatch_cross_entropy_loss_backward(const CompiledOp& op) {
@@ -4773,7 +6199,11 @@ void CompiledExecutor::dispatch_cross_entropy_loss_backward(const CompiledOp& op
     // HuggingFace-style normalization: use reduction="sum" semantics.
     // dloss = 1.0 means each valid token contributes equally to the gradient sum.
     // The actual normalization by accumulated valid tokens happens in global_norm_sqrt.
-    if (op.inputs[0].slot == TensorSlot::DLoss) {
+    // Robustly seed d_loss even if the name has SSA suffixes or mapped to loss/losses.
+    const std::string d_loss_name = strip_ssa_suffix(op.inputs[0].name);
+    if (op.inputs[0].slot == TensorSlot::DLoss ||
+        op.inputs[0].slot == TensorSlot::Losses ||
+        d_loss_name == "d_loss" || d_loss_name == "loss" || d_loss_name == "losses") {
         fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
     }
 
@@ -4831,8 +6261,38 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     // HuggingFace-style normalization: use reduction="sum" semantics.
     // dloss = 1.0 means each valid token contributes equally to the gradient sum.
     // The actual normalization by accumulated valid tokens happens in global_norm_sqrt.
-    if (op.inputs[0].slot == TensorSlot::DLoss) {
+    // Robustly seed d_loss even if the name has SSA suffixes or mapped to loss/losses.
+    const std::string d_loss_name = strip_ssa_suffix(op.inputs[0].name);
+    bool d_loss_seeded = false;
+    if (op.inputs[0].slot == TensorSlot::DLoss ||
+        op.inputs[0].slot == TensorSlot::Losses ||
+        d_loss_name == "d_loss" || d_loss_name == "loss" || d_loss_name == "losses") {
         fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+        d_loss_seeded = true;
+    }
+
+    // DEBUG: Trace loss backward input slot/name and d_loss values.
+    static int loss_bwd_trace_count = 0;
+    if (loss_bwd_trace_count < 5) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        std::vector<float> vals(4, 0.0f);
+        const std::size_t count = std::min<std::size_t>(4, static_cast<std::size_t>(d_loss.nelem()));
+        if (count > 0 && d_loss.Data) {
+            cudaMemcpy(vals.data(), d_loss.Data, count * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+        fprintf(stderr,
+                "[LM_HEAD_LOSS_BWD] d_loss input name='%s' base='%s' slot=%d layer_idx=%d seeded=%d ptr=%p "
+                "nelem=%ld dtype=%d vals=%.9f,%.9f,%.9f,%.9f\n",
+                op.inputs[0].name.c_str(),
+                d_loss_name.c_str(),
+                static_cast<int>(op.inputs[0].slot),
+                op.inputs[0].layer_idx,
+                d_loss_seeded ? 1 : 0,
+                d_loss.Data,
+                static_cast<long>(d_loss.nelem()),
+                static_cast<int>(d_loss.DType),
+                vals[0], vals[1], vals[2], vals[3]);
+        loss_bwd_trace_count++;
     }
 
     const long BT = xF_flat.Sizes[0];
@@ -4854,6 +6314,59 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     const std::size_t lse_stride = get_dtype_size(ETensorDType::FP32);
     const std::size_t dloss_stride = get_dtype_size(d_loss.DType);
 
+    // DEBUG: Full targets stats (ignore/oob/valid) and head/tail sample.
+    static int targets_full_trace_count = 0;
+    if (targets_full_trace_count < 3) {
+        cudaStreamSynchronize(mRunState.MainStream);
+        if (targets.DType == ETensorDType::INT32) {
+            const std::size_t n = static_cast<std::size_t>(targets.nelem());
+            std::size_t ignore = 0;
+            std::size_t oob = 0;
+            std::size_t valid = 0;
+            const std::size_t chunk = 1u << 20;  // 1M ints max per copy
+            const std::byte* base = static_cast<const std::byte*>(targets.Data);
+            std::vector<int> buf;
+            for (std::size_t offset = 0; offset < n; offset += chunk) {
+                const std::size_t count = std::min(chunk, n - offset);
+                buf.resize(count);
+                CUDA_CHECK(cudaMemcpy(buf.data(), base + offset * tgt_stride,
+                                      count * sizeof(int), cudaMemcpyDeviceToHost));
+                for (std::size_t i = 0; i < count; ++i) {
+                    const int v = buf[i];
+                    if (v == -100) {
+                        ignore++;
+                    } else if (v < 0 || v >= V) {
+                        oob++;
+                    } else {
+                        valid++;
+                    }
+                }
+            }
+
+            int head[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            int tail[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            if (n > 0) {
+                const std::size_t head_count = std::min<std::size_t>(8, n);
+                CUDA_CHECK(cudaMemcpy(head, base, head_count * sizeof(int), cudaMemcpyDeviceToHost));
+                const std::size_t tail_offset = (n > 8) ? (n - 8) : 0;
+                const std::size_t tail_count = std::min<std::size_t>(8, n);
+                CUDA_CHECK(cudaMemcpy(tail, base + tail_offset * tgt_stride,
+                                      tail_count * sizeof(int), cudaMemcpyDeviceToHost));
+            }
+
+            fprintf(stderr,
+                    "[LM_HEAD_TARGETS_FULL] nelem=%zu V=%d ignore=%zu oob=%zu valid=%zu "
+                    "head=%d,%d,%d,%d,%d,%d,%d,%d tail=%d,%d,%d,%d,%d,%d,%d,%d\n",
+                    n, V, ignore, oob, valid,
+                    head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+                    tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7]);
+        } else {
+            fprintf(stderr, "[LM_HEAD_TARGETS_FULL] dtype=%d nelem=%ld (unsupported)\n",
+                    static_cast<int>(targets.DType), static_cast<long>(targets.nelem()));
+        }
+        targets_full_trace_count++;
+    }
+
     for (int nano_step = 0; nano_step < lmhead_chunks; ++nano_step) {
         const long token_offset = static_cast<long>(nano_step) * nano_batch_size;
 
@@ -4870,6 +6383,52 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         tgt_slice.Sizes[0] = nano_batch_size;
         tgt_slice.Rank = 1;
 
+        // DEBUG: Trace targets for loss backward (ignore/oob counts + first values).
+        static int targets_trace_count = 0;
+        if (targets_trace_count < 5 && nano_step == 0) {
+            cudaStreamSynchronize(mRunState.MainStream);
+            const std::size_t sample = std::min<std::size_t>(
+                64, static_cast<std::size_t>(tgt_slice.nelem()));
+            if (tgt_slice.DType == ETensorDType::INT32 && sample > 0) {
+                std::vector<int> host(sample);
+                cudaMemcpy(host.data(), tgt_slice.Data, sample * sizeof(int), cudaMemcpyDeviceToHost);
+                int ignore = 0;
+                int oob = 0;
+                for (std::size_t i = 0; i < sample; ++i) {
+                    const int v = host[i];
+                    if (v == -100) {
+                        ignore++;
+                    } else if (v < 0 || v >= V) {
+                        oob++;
+                    }
+                }
+                int vals[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                const std::size_t vcount = std::min<std::size_t>(8, sample);
+                for (std::size_t i = 0; i < vcount; ++i) {
+                    vals[i] = host[i];
+                }
+                fprintf(stderr,
+                        "[LM_HEAD_TARGETS] token_offset=%ld dtype=%d nelem=%ld sample=%zu V=%d ignore=%d oob=%d "
+                        "vals=%d,%d,%d,%d,%d,%d,%d,%d\n",
+                        token_offset,
+                        static_cast<int>(tgt_slice.DType),
+                        static_cast<long>(tgt_slice.nelem()),
+                        sample,
+                        V,
+                        ignore,
+                        oob,
+                        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+            } else {
+                fprintf(stderr,
+                        "[LM_HEAD_TARGETS] token_offset=%ld dtype=%d nelem=%ld sample=%zu (unsupported dtype)\n",
+                        token_offset,
+                        static_cast<int>(tgt_slice.DType),
+                        static_cast<long>(tgt_slice.nelem()),
+                        sample);
+            }
+            targets_trace_count++;
+        }
+
         Tensor dloss_slice = d_loss;
         dloss_slice.Data = static_cast<std::byte*>(dloss_slice.Data) +
                            static_cast<std::size_t>(token_offset) * dloss_stride;
@@ -4885,6 +6444,22 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(C),
                swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        // DEBUG: Trace logits before CE backward.
+        static int logits_pre_trace_count = 0;
+        if (logits_pre_trace_count < 5 && nano_step == 0) {
+            cudaStreamSynchronize(mRunState.MainStream);
+            std::vector<float> vals(4, 0.0f);
+            const bool ok = copy_tensor_sample_as_f32(logits, vals.size(), vals);
+            fprintf(stderr,
+                    "[LM_HEAD_LOGITS_PRE] token_offset=%ld dtype=%d ptr=%p ok=%d vals=%.9f,%.9f,%.9f,%.9f\n",
+                    token_offset,
+                    static_cast<int>(logits.DType),
+                    logits.Data,
+                    ok ? 1 : 0,
+                    vals[0], vals[1], vals[2], vals[3]);
+            logits_pre_trace_count++;
+        }
 
         Tensor logsumexp_view{};
         Tensor* logsumexp = nullptr;
@@ -4903,6 +6478,22 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         } else {
             fused_cross_entropy_backward(logits, logits, logsumexp, dloss_slice, tgt_slice,
                                          static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
+
+        // DEBUG: Trace d_logits (stored in logits buffer) after CE backward.
+        static int dlogits_trace_count = 0;
+        if (dlogits_trace_count < 5 && nano_step == 0) {
+            cudaStreamSynchronize(mRunState.MainStream);
+            std::vector<float> vals(4, 0.0f);
+            const bool ok = copy_tensor_sample_as_f32(logits, vals.size(), vals);
+            fprintf(stderr,
+                    "[LM_HEAD_DLOGITS] token_offset=%ld dtype=%d ptr=%p ok=%d vals=%.9f,%.9f,%.9f,%.9f\n",
+                    token_offset,
+                    static_cast<int>(logits.DType),
+                    logits.Data,
+                    ok ? 1 : 0,
+                    vals[0], vals[1], vals[2], vals[3]);
+            dlogits_trace_count++;
         }
 
         if (d_weight_ptr) {
@@ -4926,6 +6517,49 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                    std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                    static_cast<int>(C), static_cast<int>(nano_batch_size), static_cast<int>(V),
                    swap_transpose(EMMTranspose::NN), false, mRunState.MainStream);
+
+            // DEBUG: Trace d_xF output values + L2 norm for loss backward.
+            static int d_xf_trace_count = 0;
+            if (d_xf_trace_count < 5 && nano_step == 0) {
+                cudaStreamSynchronize(mRunState.MainStream);
+                std::vector<float> vals(4, 0.0f);
+                const bool ok = copy_tensor_sample_as_f32(d_xF_slice, vals.size(), vals);
+                double l2_sum = 0.0;
+                if (ok) {
+                    const std::size_t n = static_cast<std::size_t>(d_xF_slice.nelem());
+                    const std::size_t chunk = 1u << 20;  // 1M elements per chunk
+                    std::vector<float> buf;
+                    for (std::size_t offset = 0; offset < n; offset += chunk) {
+                        const std::size_t count = std::min(chunk, n - offset);
+                        buf.resize(count);
+                        Tensor tmp = d_xF_slice;
+                        tmp.Data = static_cast<std::byte*>(tmp.Data) +
+                                   offset * get_dtype_size(tmp.DType);
+                        tmp.Sizes[0] = static_cast<long>(count);
+                        tmp.Rank = 1;
+                        if (!copy_tensor_sample_as_f32(tmp, count, buf)) {
+                            break;
+                        }
+                        for (std::size_t i = 0; i < count; ++i) {
+                            const double v = static_cast<double>(buf[i]);
+                            l2_sum += v * v;
+                        }
+                    }
+                }
+                const double l2 = std::sqrt(l2_sum);
+                fprintf(stderr,
+                        "[LM_HEAD_LOSS_BWD_OUT] d_xF name='%s' slot=%d ptr=%p nelem=%ld dtype=%d ok=%d l2=%.9e "
+                        "vals=%.9f,%.9f,%.9f,%.9f\n",
+                        op.outputs[0].name.c_str(),
+                        static_cast<int>(op.outputs[0].slot),
+                        d_xF_slice.Data,
+                        static_cast<long>(d_xF_slice.nelem()),
+                        static_cast<int>(d_xF_slice.DType),
+                        ok ? 1 : 0,
+                        l2,
+                        vals[0], vals[1], vals[2], vals[3]);
+                d_xf_trace_count++;
+            }
         }
     }
 
@@ -5428,6 +7062,80 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     }
 
+    // DEBUG: Summarize parameter gradient samples to spot divergence.
+    static int param_grad_trace_enabled = -1;
+    if (param_grad_trace_enabled < 0) {
+        param_grad_trace_enabled = (std::getenv("SUROGATE_TRACE_PARAM_GRADS") != nullptr) ? 1 : 0;
+    }
+    if (param_grad_trace_enabled) {
+        struct ParamSample {
+            std::string name;
+            double mean_abs{0.0};
+            double max_abs{0.0};
+            std::size_t count{0};
+        };
+        std::vector<ParamSample> samples;
+        double total_sum_sq = 0.0;
+        double total_sum_abs = 0.0;
+        std::size_t total_count = 0;
+        constexpr std::size_t kSampleN = 1024;
+        for (const auto& param_name : mGrads.param_names()) {
+            bool accumulate = false;
+            Tensor* grad_tensor = mGrads.get_param_grad(param_name, accumulate);
+            if (!grad_tensor || !grad_tensor->Data || grad_tensor->nelem() <= 0) {
+                continue;
+            }
+            const std::size_t n = std::min<std::size_t>(kSampleN, static_cast<std::size_t>(grad_tensor->nelem()));
+            std::vector<float> vals;
+            if (!copy_tensor_sample_as_f32(*grad_tensor, n, vals)) {
+                continue;
+            }
+            double sum_abs = 0.0;
+            double sum_sq = 0.0;
+            double max_abs = 0.0;
+            for (float v : vals) {
+                if (std::isnan(v) || std::isinf(v)) {
+                    continue;
+                }
+                const double av = std::abs(static_cast<double>(v));
+                sum_abs += av;
+                sum_sq += av * av;
+                if (av > max_abs) {
+                    max_abs = av;
+                }
+            }
+            if (!vals.empty()) {
+                ParamSample s;
+                s.name = param_name;
+                s.count = vals.size();
+                s.mean_abs = sum_abs / static_cast<double>(vals.size());
+                s.max_abs = max_abs;
+                samples.push_back(std::move(s));
+                total_sum_abs += sum_abs;
+                total_sum_sq += sum_sq;
+                total_count += vals.size();
+            }
+        }
+        if (!samples.empty()) {
+            std::sort(samples.begin(), samples.end(),
+                      [](const ParamSample& a, const ParamSample& b) { return a.mean_abs > b.mean_abs; });
+            const std::size_t top_n = std::min<std::size_t>(10, samples.size());
+            for (std::size_t i = 0; i < top_n; ++i) {
+                const auto& s = samples[i];
+                fprintf(stderr,
+                        "[PARAM_GRAD_SAMPLE] name=%s mean_abs=%.6e max_abs=%.6e n=%zu\n",
+                        s.name.c_str(), s.mean_abs, s.max_abs, s.count);
+            }
+            if (total_count > 0) {
+                const double mean_abs = total_sum_abs / static_cast<double>(total_count);
+                const double l2 = std::sqrt(total_sum_sq);
+                fprintf(stderr,
+                        "[PARAM_GRAD_SAMPLE_NORM] sample_l2=%.6e mean_abs=%.6e count=%zu\n",
+                        l2, mean_abs, total_count);
+            }
+        }
+    }
+
     // Free temporaries
     for (auto it = mTemps.rbegin(); it != mTemps.rend(); ++it) {
         mRunState.temp_free(*it);
@@ -5452,6 +7160,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mAccumulateTensors.clear();
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
+    mMicroStep = micro_step;
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
         mWeightManager->gather_final_norm(comm, mRunState.MainStream);
@@ -5604,6 +7313,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mTensorMap["d_x0"] = d_embeddings_buf;
     }
 
+    static bool emb_grad_initial_logged = false;
+    if (!emb_grad_initial_logged && d_embeddings_buf.Data) {
+        if (tensor_sample_has_nan_or_inf(d_embeddings_buf, 3)) {
+            fprintf(stderr, "[EMB_DOUT_NAN_INIT] micro_step=%d ptr=%p\n", micro_step, d_embeddings_buf.Data);
+            log_tensor_stats_ex("EMB_DOUT_INIT_NAN", -1, "d_embeddings", d_embeddings_buf, 4096, true);
+        }
+        emb_grad_initial_logged = true;
+    }
+
     // DSL-driven binding for any additional gradient slots declared in the Python model
     if (mSlotRegistry && mSlotRegistry->has_dsl_layout()) {
         mSlotRegistry->for_each([&](const std::string& slot_name,
@@ -5617,6 +7335,59 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 mTensorMap[slot_name] = *target_buf;
             }
         });
+    }
+
+    // Ensure global block outputs (xN/residualN) map to the last block's gradients.
+    // These gradients must survive layer-boundary stack restores in recompute mode.
+    if (mConfig.NumLayers > 0) {
+        const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
+        auto& last_grads = mRunState.simplified_grads(last_layer);
+        if (last_grads.d_mlp_down.Data) {
+            mTensorMap["d_xN"] = last_grads.d_mlp_down;
+        }
+        if (last_grads.d_res_att.Data) {
+            mTensorMap["d_residualN"] = last_grads.d_res_att;
+        }
+
+        // Heuristic aliasing for non-inlined StackedBlocks outputs (e.g., "StackedBlocks_4").
+        if (mSaved) {
+            std::vector<std::pair<int, std::string>> stacked;
+            stacked.reserve(2);
+            for (const auto& kv : *mSaved) {
+                const std::string& name = kv.first;
+                if (name.rfind("StackedBlocks_", 0) != 0) {
+                    continue;
+                }
+                int idx = -1;
+                const char* s = name.c_str() + std::strlen("StackedBlocks_");
+                if (*s) {
+                    char* end = nullptr;
+                    long parsed = std::strtol(s, &end, 10);
+                    if (end != s) {
+                        idx = static_cast<int>(parsed);
+                    }
+                }
+                if (idx >= 0) {
+                    stacked.emplace_back(idx, name);
+                }
+            }
+            if (!stacked.empty()) {
+                std::sort(stacked.begin(), stacked.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+                if (stacked.size() == 1) {
+                    if (last_grads.d_res_att.Data) {
+                        mTensorMap["d_" + stacked[0].second] = last_grads.d_res_att;
+                    }
+                } else {
+                    if (last_grads.d_mlp_down.Data) {
+                        mTensorMap["d_" + stacked[0].second] = last_grads.d_mlp_down;
+                    }
+                    if (last_grads.d_res_att.Data) {
+                        mTensorMap["d_" + stacked[1].second] = last_grads.d_res_att;
+                    }
+                }
+            }
+        }
     }
 
     // Bind autodiff-generated gradient names (d_embed_1, etc.) from forward embedding outputs
@@ -5801,6 +7572,36 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     };
 
     const int num_layers = static_cast<int>(mConfig.NumLayers);
+    const bool assert_recompute_a = (std::getenv("SUROGATE_ASSERT_RECOMPUTE_A") != nullptr);
+    if (assert_recompute_a) {
+        if (mRecomputeSamples.size() != static_cast<std::size_t>(num_layers)) {
+            mRecomputeSamples.assign(static_cast<std::size_t>(num_layers), RecomputeSample{});
+        }
+        for (auto& sample : mRecomputeSamples) {
+            sample.micro_step = mMicroStep;
+            sample.ln1_valid = false;
+            sample.ln2_valid = false;
+        }
+    }
+    auto record_recompute_sample = [&](int layer_idx) {
+        if (!assert_recompute_a) return;
+        if (layer_idx < 0 || layer_idx >= num_layers) return;
+        auto& sample = mRecomputeSamples[static_cast<std::size_t>(layer_idx)];
+        sample.micro_step = mMicroStep;
+        sample.ln1_valid = false;
+        sample.ln2_valid = false;
+        const long sample_token = 3;
+        std::vector<float> vals;
+        auto& acts = mRunState.simplified_acts(layer_idx);
+        if (acts.ln1.Data && copy_tensor_token_sample_as_f32(acts.ln1, sample_token, 4, vals)) {
+            for (int i = 0; i < 4; ++i) sample.ln1[static_cast<std::size_t>(i)] = vals[i];
+            sample.ln1_valid = true;
+        }
+        if (acts.ln2.Data && copy_tensor_token_sample_as_f32(acts.ln2, sample_token, 4, vals)) {
+            for (int i = 0; i < 4; ++i) sample.ln2[static_cast<std::size_t>(i)] = vals[i];
+            sample.ln2_valid = true;
+        }
+    };
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
     std::vector<bool> layer_seen_any(num_layers, false);
     for (const auto& op : graph.ops) {
@@ -5812,9 +7613,27 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
-
         if (skip_logits_grad && is_logits_grad_op(op)) {
             continue;
+        }
+
+        // DEBUG: Trace flash attention backward op order and layer indices.
+        static int flash_bwd_trace = 0;
+        if (op.type == CompiledOpType::FlashAttentionBackward && flash_bwd_trace < 12) {
+            int layer_idx_dbg = -1;
+            std::string field_dbg;
+            if (!op.inputs.empty()) {
+                parse_block_param(op.inputs[1].name, layer_idx_dbg, field_dbg);
+            }
+            fprintf(stderr,
+                    "[EXEC_FLASH_BWD] op=%zu layer_idx=%d in_out=%s in_lse=%s in_qkv=%s out=%s\n",
+                    idx,
+                    layer_idx_dbg,
+                    op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "<none>",
+                    op.inputs.size() > 2 ? op.inputs[2].name.c_str() : "<none>",
+                    op.inputs.size() > 3 ? op.inputs[3].name.c_str() : "<none>",
+                    op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "<none>");
+            flash_bwd_trace++;
         }
 
         if (op.layer_start >= 0) {
@@ -5822,14 +7641,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                        clear_shared_grads(layer_idx);
-                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                    }
-                    mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
-                    mLastRecomputeLayer = layer_idx;
+                if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
+                    clear_shared_grads(layer_idx);
+                    layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
                 }
+                mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                record_recompute_sample(layer_idx);
+                mLastRecomputeLayer = layer_idx;
             }
+        }
         }
 
         if (mRecomputeEnabled && mRecomputeFn) {
@@ -5861,6 +7681,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     recompute_call_count++;
                 }
                 mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
+                record_recompute_sample(effective_layer_idx);
                 mLastRecomputeLayer = effective_layer_idx;
             }
         }
@@ -5983,6 +7804,48 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
                     throw std::runtime_error(oss.str());
                 }
+            }
+
+            // Track when key gradients first spike or go NaN.
+            static std::unordered_map<std::string, int> watch_counts;
+            auto log_watch = [&](const TensorRef& ref) {
+                if (ref.name.empty()) return;
+                const std::string base = strip_ssa_suffix(ref.name);
+                if (base != "d_blocks[0].ln1" &&
+                    base != "d_blocks[0].ln2" &&
+                    base != "d_blocks[0].res_ffn" &&
+                    base != "d_blocks[0].mlp_up" &&
+                    base != "d_blocks[0].swiglu") {
+                    return;
+                }
+                int& count = watch_counts[base];
+                if (count >= 8) {
+                    return;
+                }
+                Tensor& t = resolve_tensor(ref);
+                fprintf(stderr,
+                        "[BWD_WATCH] op_idx=%zu type=%s id=%s name=%s\n",
+                        idx, op_type_to_string(op.type), op.op_id.c_str(), ref.name.c_str());
+                log_tensor_stats_ex("BWD_WATCH_OUT", op_layer_any, ref.name, t, 4096, true);
+                count++;
+            };
+            for (const auto& out_ref : op.outputs) {
+                log_watch(out_ref);
+            }
+
+            static bool emb_nan_logged = false;
+            if (!emb_nan_logged && d_embeddings_buf.Data && tensor_sample_has_nan_or_inf(d_embeddings_buf, 3)) {
+                fprintf(stderr,
+                        "[EMB_DOUT_NAN_AFTER] micro_step=%d op_idx=%zu type=%s id=%s\n",
+                        micro_step, idx, op_type_to_string(op.type), op.op_id.c_str());
+                log_tensor_stats_ex("EMB_DOUT_NAN_AFTER", -1, "d_embeddings", d_embeddings_buf, 4096, true);
+                const long hidden = d_embeddings_buf.Rank > 2 ? d_embeddings_buf.Sizes[2] : 0;
+                if (hidden > 0) {
+                    const std::size_t off = static_cast<std::size_t>(3) * static_cast<std::size_t>(hidden);
+                    log_tensor_sample_stats("EMB_DOUT_NAN_ROW3", d_embeddings_buf, off,
+                                            static_cast<std::size_t>(hidden));
+                }
+                emb_nan_logged = true;
             }
 
             // Memory management - restore stack checkpoint periodically to free temporaries

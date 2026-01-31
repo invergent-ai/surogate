@@ -10,6 +10,9 @@
 
 namespace fe = cudnn_frontend;
 
+// Forward declaration for workspace size helper (defined later in file)
+std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle);
+
 /**
  * @brief Checks a cuDNN status code and exits on error.
  * @param error The cuDNN status code to check.
@@ -301,6 +304,21 @@ void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Hq, HS)
     const void* devPtrV = (inp + (Hq + Hkv) * HS);
     float attn_scale_cpu = 1.0 / sqrtf(HS);
     void* devPtrO = out;
+
+    // DEBUG: Log cuDNN attention launch parameters (limited)
+    static int log_count = 0;
+    if (log_count < 4) {
+        const std::size_t ws_needed = cudnn_get_workspace_size(B, T, Hq, Hkv, HS, handle);
+        const std::size_t cudnn_ver = cudnnGetVersion();
+        fprintf(stderr,
+                "[CUDNN_ATTN_FWD] B=%d T=%d Hq=%d Hkv=%d HS=%d infer=%d ws_ptr=%p ws_needed=%zu cudnn_ver=%zu\n",
+                B, T, Hq, Hkv, HS, is_inference_only ? 1 : 0,
+                workspace, ws_needed, cudnn_ver);
+        fprintf(stderr,
+                "[CUDNN_ATTN_FWD] ptrs Q=%p K=%p V=%p O=%p Stats=%p\n",
+                devPtrQ, devPtrK, devPtrV, devPtrO, stats);
+        log_count++;
+    }
 
     // Build variant pack
     std::unordered_map<int64_t , void*> variant_pack = {

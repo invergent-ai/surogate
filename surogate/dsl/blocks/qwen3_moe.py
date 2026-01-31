@@ -188,6 +188,7 @@ class Qwen3MoEBlock:
 
     d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
     d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+    d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope")
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_att_out = Gradient(Tensor["B", "T", "C"], gradient_of="att_out")
     d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
@@ -220,12 +221,12 @@ class Qwen3MoEBlock:
             # ================================================================
             # Attention
             # ================================================================
-            ln1_flat = g.view(ln1_out, shape=[B * T, self.C])
+            ln1_flat = g.view(ln1_out, shape=[B * T, self.C], out_name="ln1_flat")
             if self.use_qkv_bias:
-                qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT")
+                qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT", out_name="qkv_flat")
             else:
-                qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
-            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D])
+                qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT", out_name="qkv_flat")
+            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D], out_name="qkv")
 
             # QK-Norm + RoPE (fused)
             if self.use_qk_norm:
@@ -236,17 +237,20 @@ class Qwen3MoEBlock:
                     "rope_freqs",
                     position_ids,
                     eps=self.eps,
+                    out_name="qkv_rope",
+                    q_rstd_name="q_rstd",
+                    k_rstd_name="k_rstd",
                 )
             else:
-                qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids)
+                qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, out_name="qkv_rope")
 
             # FlashAttention
-            attn_out, _ = g.flash_attention(qkv_rope, causal=True)
+            attn_out, _ = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")
 
             # Output projection
-            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
-            att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
-            att_out = g.view(att_out_flat, shape=[B, T, self.C])
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim], out_name="att_flat")
+            att_out_flat = g.matmul(attn_flat, "out_weight", transpose="NT", out_name="att_out_flat")
+            att_out = g.view(att_out_flat, shape=[B, T, self.C], out_name="att_out")
 
             # ================================================================
             # Pre-MoE norm
@@ -258,7 +262,7 @@ class Qwen3MoEBlock:
             # ================================================================
             # MoE: Router -> Experts -> Combine
             # ================================================================
-            ln2_flat = g.view(ln2_out, shape=[B * T, self.C])
+            ln2_flat = g.view(ln2_out, shape=[B * T, self.C], out_name="ln2_flat")
 
             # Router: compute routing logits and select top-k experts
             router_logits = g.matmul(ln2_flat, "router_weight", transpose="NT")
@@ -311,6 +315,6 @@ class Qwen3MoEBlock:
                 moe_out = g.add(moe_out, shared_out)
 
             # Reshape back to (B, T, C)
-            out = g.view(moe_out, shape=[B, T, self.C])
+            out = g.view(moe_out, shape=[B, T, self.C], out_name="res_ffn")
 
             return out, residual_out

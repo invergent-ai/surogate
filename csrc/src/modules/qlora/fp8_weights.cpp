@@ -6,10 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 #include <fmt/format.h>
+#include <cuda_bf16.h>
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
@@ -26,6 +29,64 @@ const SafeTensorEntry* find_entry_opt(const SafeTensorsReader& reader, std::stri
         }
     }
     return nullptr;
+}
+
+void scan_embedding_for_nan_once(const Tensor& t, cudaStream_t stream, long hidden, std::string_view tag) {
+    static bool scanned = false;
+    if (scanned || !t.Data || t.nelem() == 0) {
+        return;
+    }
+    scanned = true;
+    fprintf(stderr, "[EMB_WT_SCAN] tag=%.*s dtype=%s nelem=%zu hidden=%ld\n",
+            static_cast<int>(tag.size()), tag.data(),
+            dtype_to_str(t.DType), t.nelem(), hidden);
+
+    const std::size_t total = static_cast<std::size_t>(t.nelem());
+    const std::size_t chunk = 1 << 20; // 1M elements per chunk
+    if (t.DType == ETensorDType::BF16) {
+        std::vector<nv_bfloat16> host(chunk);
+        for (std::size_t off = 0; off < total; off += chunk) {
+            const std::size_t n = std::min(chunk, total - off);
+            cudaMemcpy(host.data(),
+                       t.Data + off * sizeof(nv_bfloat16),
+                       n * sizeof(nv_bfloat16),
+                       cudaMemcpyDeviceToHost);
+            for (std::size_t i = 0; i < n; ++i) {
+                const float v = static_cast<float>(host[i]);
+                if (std::isnan(v) || std::isinf(v)) {
+                    const std::size_t idx = off + i;
+                    const std::size_t row = hidden > 0 ? idx / static_cast<std::size_t>(hidden) : 0;
+                    const std::size_t col = hidden > 0 ? idx % static_cast<std::size_t>(hidden) : idx;
+                    fprintf(stderr, "[EMB_WT_NAN] tag=%.*s idx=%zu row=%zu col=%zu\n",
+                            static_cast<int>(tag.size()), tag.data(), idx, row, col);
+                    throw std::runtime_error("Embedding weights contain NaNs/Inf");
+                }
+            }
+        }
+    } else if (t.DType == ETensorDType::FP32) {
+        std::vector<float> host(chunk);
+        for (std::size_t off = 0; off < total; off += chunk) {
+            const std::size_t n = std::min(chunk, total - off);
+            cudaMemcpy(host.data(),
+                       t.Data + off * sizeof(float),
+                       n * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+            for (std::size_t i = 0; i < n; ++i) {
+                const float v = host[i];
+                if (std::isnan(v) || std::isinf(v)) {
+                    const std::size_t idx = off + i;
+                    const std::size_t row = hidden > 0 ? idx / static_cast<std::size_t>(hidden) : 0;
+                    const std::size_t col = hidden > 0 ? idx % static_cast<std::size_t>(hidden) : idx;
+                    fprintf(stderr, "[EMB_WT_NAN] tag=%.*s idx=%zu row=%zu col=%zu\n",
+                            static_cast<int>(tag.size()), tag.data(), idx, row, col);
+                    throw std::runtime_error("Embedding weights contain NaNs/Inf");
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "[EMB_WT_SCAN] tag=%.*s skipped unsupported dtype=%s\n",
+                static_cast<int>(tag.size()), tag.data(), dtype_to_str(t.DType));
+    }
 }
 
 } // anonymous namespace
@@ -240,6 +301,7 @@ void FP8WeightsManager::load_embeddings(SafeTensorsReader& reader, cudaStream_t 
     for (const auto& name : embed_names) {
         if (const auto* entry = find_entry_opt(reader, name)) {
             entry->read_tensor(mEmbeddings.embedding, /*allow_cast=*/true);
+            scan_embedding_for_nan_once(mEmbeddings.embedding, stream, mConfig.hidden_size, "embedding");
             break;
         }
     }

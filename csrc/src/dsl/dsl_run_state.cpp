@@ -198,23 +198,28 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const bool share_qkv = recompute_enabled && lora_only;
 
     // Attention output sharing:
-    // IMPORTANT: att/att_out/lse must NOT be shared when recompute is enabled for FFT.
-    // We need the original forward values for bit-exact gradients - skipping attention
-    // recompute avoids numerical differences from cuDNN non-determinism.
-    // Only share attention outputs in LoRA-only mode where we don't need bit-exact gradients.
-    const bool share_att = recompute_enabled && lora_only;
+    // IMPORTANT: att/att_out/lse must NEVER be shared when recompute is enabled.
+    // - FFT mode: Need original forward values for bit-exact gradients
+    // - LoRA mode: LoRA O proj backward hook needs original att values per-layer
+    //              cuDNN attention is non-deterministic, so recomputed att != forward att
+    // This matches modular model behavior (see run_state_impl.tpp:568-572).
+    const bool share_att = false;
 
-    // MLP intermediates sharing: In LoRA mode, we recompute mlp_up/swiglu during backward.
-    // In FFT mode, we save mlp_up/swiglu per-layer to avoid matmul non-determinism.
-    const bool share_mlp_up = recompute_enabled && lora_only;
-    const bool share_swiglu = recompute_enabled && lora_only;
+    // MLP intermediates sharing:
+    // - FFT mode: Need per-layer for bit-exact gradients
+    // - LoRA mode: LoRA down_proj backward hook needs original swiglu values per-layer
+    // This matches modular model behavior (lora_can_share_swiglu = !lora_only).
+    const bool share_mlp_up = false;
+    const bool share_swiglu = false;
 
     // Residual intermediates: In LoRA mode they can be shared. In FFT mode, save per-layer.
     const bool share_residual_intermediates = recompute_enabled && lora_only;
 
-    // FFN temps go on stack only in LoRA mode (saves per-layer allocation).
-    // In FFT mode, we need per-layer buffers for bit-exact gradients.
-    const bool ffn_temps_on_stack = recompute_enabled && lora_only;
+    // FFN temps: Never use stack for mlp_up/swiglu when we need per-layer values.
+    // - FFT mode: per-layer needed for bit-exact gradients
+    // - LoRA mode: per-layer needed for down_proj LoRA backward (swiglu input)
+    // This matches modular model behavior.
+    const bool ffn_temps_on_stack = false;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -430,6 +435,29 @@ void DslRunState::reset_simplified_gradients() {
         dst.d_mamba_B.Data = src.d_mamba_B.Data;
         dst.d_mamba_C.Data = src.d_mamba_C.Data;
         dst.d_mamba_conv_out.Data = src.d_mamba_conv_out.Data;
+    }
+}
+
+void DslRunState::zero_activation_gradients(cudaStream_t stream) {
+    // Zero ALL activation gradient buffers to prevent stale gradients from accumulating.
+    // Many backward kernels accumulate (+=) to their output buffers. If any buffer contains
+    // stale values from a previous micro-batch, gradients will explode.
+    // Zeroing ensures a clean slate for each backward pass.
+    for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
+        auto& g = mSimplifiedGradients[i];
+        // d_res_ffn: The last layer's is zeroed separately (receives gradient from loss).
+        if (i < mSimplifiedGradients.size() - 1 && g.d_res_ffn.Data) {
+            fill_zero(g.d_res_ffn, stream);
+        }
+        // Zero all other activation gradient buffers
+        if (g.d_res_att.Data) fill_zero(g.d_res_att, stream);
+        if (g.d_ln2.Data) fill_zero(g.d_ln2, stream);
+        if (g.d_mlp_up.Data) fill_zero(g.d_mlp_up, stream);
+        if (g.d_swiglu.Data) fill_zero(g.d_swiglu, stream);
+        if (g.d_mlp_down.Data) fill_zero(g.d_mlp_down, stream);
+        if (g.d_att.Data) fill_zero(g.d_att, stream);
+        if (g.d_qkv.Data) fill_zero(g.d_qkv, stream);
+        if (g.d_ln1.Data) fill_zero(g.d_ln1, stream);
     }
 }
 

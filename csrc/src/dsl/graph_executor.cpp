@@ -574,6 +574,11 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
 
     trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mForwardGraph, use_graphs,
                                            rs.Stack, mForwardCheckpoint);
+    // On CUDA graph replay, run_ops isn't executed, so saved tensors are stale.
+    // Refresh them here to reflect the current forward activations.
+    if (use_graphs && !capturing) {
+        mCompiledExecutor->save_tensors(mSaveList);
+    }
     mCompiledExecutor->set_capturing(false);
 }
 
@@ -633,6 +638,12 @@ void GraphExecutor::set_rng_state(const std::vector<std::byte>& state) {
 }
 
 void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
+    // DEBUG: Trace execution order
+    static int exec_trace = 0;
+    if (exec_trace < 20) {
+        exec_trace++;
+        fprintf(stderr, "[EXEC_ORDER] forward micro_step=%d\n", micro_step);
+    }
     auto& rs = mRunState;
 
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
@@ -669,6 +680,14 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     // Copy inputs and position ids to device.
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        // DEBUG: Print first few input tokens to verify different data per micro-step
+        static int debug_count = 0;
+        if (debug_count < 20) {
+            debug_count++;
+            const std::int32_t* tok = reinterpret_cast<const std::int32_t*>(inputs.Data);
+            fprintf(stderr, "[FWD_INPUT] micro_step=%d inputs.Data=%p tokens[0..3]=%d,%d,%d,%d\n",
+                    micro_step, inputs.Data, tok[0], tok[1], tok[2], tok[3]);
+        }
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
         if (position_ids.Device == -1) {
@@ -776,6 +795,12 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
 }
 
 void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
+    // DEBUG: Trace execution order
+    static int exec_trace = 0;
+    if (exec_trace < 20) {
+        exec_trace++;
+        fprintf(stderr, "[EXEC_ORDER] backward micro_step=%d\n", micro_step);
+    }
     auto& rs = mRunState;
     auto& grads = mGrads;
     const auto& config = mConfig;
@@ -815,6 +840,11 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     if (config.NumLayers > 0) {
         fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
     }
+
+    // Zero all activation gradient buffers to prevent stale gradients from accumulating.
+    // This is critical for FFT mode where rmsnorm_backward accumulates (+=) to dinp.
+    // Without zeroing, stale gradients from previous steps can cause gradient explosion.
+    rs.zero_activation_gradients(rs.MainStream);
 
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads && mLoRARunState) {
         mLoRARunState->micro_step = micro_step;
@@ -1048,6 +1078,11 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
     if (config.NumLayers > 0) {
         fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
     }
+
+    // Zero all activation gradient buffers to prevent stale gradients from accumulating.
+    // This is critical for FFT mode where rmsnorm_backward accumulates (+=) to dinp.
+    // Without zeroing, stale gradients from previous steps can cause gradient explosion.
+    rs.zero_activation_gradients(rs.MainStream);
 
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads && mLoRARunState) {
         mLoRARunState->micro_step = micro_step;
