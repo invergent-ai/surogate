@@ -6,6 +6,7 @@
 #include "dsl/recompute_plan.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <stdexcept>
@@ -272,9 +273,26 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
     if (name == "ln2_rstd") return get(acts.ln2_rstd);
     if (name == "q_rstd") return get(acts.q_rstd);
     if (name == "k_rstd") return get(acts.k_rstd);
-    if (name == "qkv" || name == "qkv_flat" || name == "qkv_biased") return get(acts.qkv);
+    if (name == "qkv" || name == "qkv_flat" || name == "qkv_biased") {
+        if (layer_idx == 0 && ctx.lora_only_mode == false) {
+            fprintf(stderr, "[RESOLVE_QKV] Layer %d qkv (FFT mode): Data=%p, Sizes=%ld,%ld,%ld,%ld\n",
+                    layer_idx, acts.qkv.Data,
+                    acts.qkv.Sizes[0], acts.qkv.Sizes[1], acts.qkv.Sizes[2], acts.qkv.Sizes[3]);
+            // Print first values to check if data is valid
+            cudaStreamSynchronize(ctx.rs.MainStream);
+            std::vector<float> vals(8);
+            cudaMemcpy(vals.data(), acts.qkv.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RESOLVE_QKV] Layer %d qkv values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+        }
+        return get(acts.qkv);
+    }
     if (name == "qkv_rope") {
         if (acts.qkv_rope.Data) return get(acts.qkv_rope);
+        if (layer_idx == 0) {
+            fprintf(stderr, "[RESOLVE_QKV_ROPE] Layer %d using qkv instead: Data=%p\n",
+                    layer_idx, acts.qkv.Data);
+        }
         return get(acts.qkv);
     }
     if (name == "lse") return get(acts.lse);
@@ -581,6 +599,16 @@ void execute_matmul(RecomputeContext& ctx,
 
     Tensor& weight = *inputs.tensors.at(weight_key);
     Tensor& inp = *inputs.tensors.at(input_key);
+
+    // DEBUG: Check att tensor when recomputing att_out
+    if (layer_idx == 0 && (input_key == "att" || input_key == "attn" || input_key == "att_flat")) {
+        cudaStreamSynchronize(ctx.rs.MainStream);
+        std::vector<float> vals(8);
+        cudaMemcpy(vals.data(), inp.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RECOMPUTE_MATMUL] Layer %d att_out recompute: att input ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
+                layer_idx, inp.Data, vals[0], vals[1], vals[2], vals[3]);
+    }
+
     if (op.outputs.empty()) {
         throw std::runtime_error("DSL recompute: matmul missing output");
     }
@@ -605,7 +633,9 @@ void execute_matmul(RecomputeContext& ctx,
 
     const bool allow_quant = allow_quant_layer(ctx.options, cfg, layer_idx);
     const bool have_recipe = ctx.options.TrainingRecipe != nullptr;
-    const bool use_recipe = plan ? (plan->use_recipe && have_recipe) : have_recipe;
+    // For FFT mode recompute, use direct matmul to ensure determinism
+    // The recipe matmul may have FP8 quantization that introduces small numerical differences
+    const bool use_recipe = false;  // plan ? (plan->use_recipe && have_recipe) : have_recipe;
 
     const int C_in = (inp.Rank >= 3) ? static_cast<int>(inp.Sizes[2]) : static_cast<int>(inp.Sizes[1]);
     const int C_out = (out.Rank >= 3) ? static_cast<int>(out.Sizes[2]) : static_cast<int>(out.Sizes[1]);
@@ -709,30 +739,46 @@ void execute_fused_residual(RecomputeContext& ctx,
 
     const int C = static_cast<int>(ctx.cfg.HiddenSize);
 
-    // FFT mode (not LoRA-only): handle recomputation matching graph_executor_backward.cpp.
+    // Both FFT mode and LoRA mode: handle recomputation for ln1_fused specially.
+    // In backward mode, @input:residual and @input:x refer to previous layer's outputs which
+    // are stored in shared buffers and contain garbage. Instead, we use the saved res_ffn
+    // (stored in get_residual during forward) and recompute ln1 only.
+    // This applies to BOTH FFT mode and LoRA mode because both have the shared buffer problem.
     const bool is_res_ffn_output = (res_out_name == "res_ffn" || res_out_name == "residual_ffn");
 
-    if (!ctx.lora_only_mode && is_res_ffn_output) {
-        // FFT mode with res_ffn output (ln1_fused group):
-        // Recompute ln1 only. Match graph_executor_backward.cpp:recompute_attention_segment EXACTLY:
-        // - Layer 0: input is encoded (x0)
-        // - Layer > 0: input is get_residual(layer_idx - 1) (previous layer's res_ffn)
-        // - Use acts.ln1 as output, acts.ln1_rstd as saved rstd
+    if (is_res_ffn_output) {
+        // ln1_fused group: Recompute ln1 only from saved res_ffn[layer_idx] and ln1_rstd[layer_idx].
+        // - res_ffn[layer_idx] = residual + x (stored in get_residual(layer_idx) during forward)
+        // - ln1 = rmsnorm(res_ffn) using saved ln1_rstd
         auto& acts = ctx.rs.simplified_acts(layer_idx);
         if (!acts.ln1.Data) {
             ctx.rs.temp_acquire(acts.ln1);
         }
-        Tensor& res_in = (layer_idx == 0)
-            ? ctx.rs.non_block_activations().encoded
-            : ctx.rs.get_residual(layer_idx - 1, ctx.rs.MainStream);
-        rmsnorm_apply_saved(acts.ln1, res_in, *weight, acts.ln1_rstd,
+        // Use the current layer's res_ffn (stored during forward pass)
+        Tensor& res_ffn = ctx.rs.get_residual(layer_idx, ctx.rs.MainStream);
+
+        rmsnorm_apply_saved(acts.ln1, res_ffn, *weight, acts.ln1_rstd,
                             static_cast<int>(B), static_cast<int>(T), C, ctx.rs.MainStream);
+
+        // DEBUG: Print data pointer and first values
+        if (layer_idx == 0) {
+            fprintf(stderr, "[RECOMPUTE] Layer %d ln1: Data=%p\n", layer_idx, acts.ln1.Data);
+            // Print first few values
+            cudaStreamSynchronize(ctx.rs.MainStream);
+            std::vector<float> vals(8);
+            cudaMemcpy(vals.data(), acts.ln1.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE] Layer %d ln1 values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+            // Also check res_ffn values
+            cudaMemcpy(vals.data(), res_ffn.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE] Layer %d res_ffn values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+        }
+
         return;
     }
 
-    const bool is_res_att_output = (res_out_name == "res_att" || res_out_name == "residual_att");
-
-    // LoRA mode or non-res_ffn output: use full fused op
+    // Use full fused op for ln2_fused cases
     if (!residual || !input) {
         throw std::runtime_error("DSL recompute: fused_residual_rmsnorm_apply_saved missing residual/input");
     }
@@ -741,8 +787,37 @@ void execute_fused_residual(RecomputeContext& ctx,
     }
 
     const int BT = static_cast<int>(B * T);
+
+    // Use apply_saved with saved rstd for all cases.
+    // In FFT mode: att is now saved (not recomputed due to cuDNN non-determinism),
+    // so att_out is recomputed from saved att (deterministic matmul), and res_att
+    // matches forward. This means saved ln2_rstd is valid and should be used.
+    // In LoRA mode: inputs match forward, so saved rstd is valid.
     fused_residual_rmsnorm_apply_saved(*res_out, *y_out, *residual, *input, *weight, *rstd,
                                        BT, C, ctx.rs.MainStream);
+
+    // DEBUG: Check ln2 recompute values
+    if (layer_idx == 0) {
+        const std::string res_out_name_check = (res_out_name.empty()) ? "res_att" : res_out_name;
+        if (res_out_name_check == "res_att" || res_out_name_check == "residual_att") {
+            cudaStreamSynchronize(ctx.rs.MainStream);
+            std::vector<float> vals(8);
+            cudaMemcpy(vals.data(), y_out->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE] Layer %d ln2 values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+            cudaMemcpy(vals.data(), res_out->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE] Layer %d res_att values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+            // Also print rstd values and pointer
+            cudaMemcpy(vals.data(), rstd->Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE] Layer %d ln2_rstd ptr=%p, values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, rstd->Data, vals[0], vals[1], vals[2], vals[3]);
+            // Print input att_out values
+            cudaMemcpy(vals.data(), input->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[RECOMPUTE] Layer %d att_out values: %.6f, %.6f, %.6f, %.6f\n",
+                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
+        }
+    }
 }
 
 void execute_rmsnorm(RecomputeContext& ctx,
@@ -901,6 +976,15 @@ void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
         rope_forward(qkv_rope, qkv_rope, *freqs, reinterpret_cast<int*>(pos_ids->Data), nullptr,
                      static_cast<int>(B), static_cast<int>(T),
                      Hq, Hkv, Hs, rotary_dim, ctx.rs.MainStream);
+    }
+
+    // DEBUG: Print recomputed qkv_rope values for layer 0
+    if (layer_idx == 0) {
+        cudaStreamSynchronize(ctx.rs.MainStream);
+        std::vector<float> vals(8);
+        cudaMemcpy(vals.data(), qkv_out->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RECOMPUTE_QKV_ROPE] Layer %d qkv_rope ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
+                layer_idx, qkv_out->Data, vals[0], vals[1], vals[2], vals[3]);
     }
 }
 
@@ -1194,6 +1278,20 @@ void RecomputePlan::init_from_layout(const ActivationLayoutIR& layout,
             mDependencies[out] = mPlan.topo_ops[i].inputs;
         }
     }
+
+    // DEBUG: Print all ops in the plan
+    fprintf(stderr, "[RECOMPUTE_PLAN] Built plan with %zu ops:\n", mPlan.topo_ops.size());
+    fflush(stderr);
+    for (std::size_t i = 0; i < mPlan.topo_ops.size(); ++i) {
+        const auto& op = mPlan.topo_ops[i];
+        const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
+                                  (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" : "never";
+        fprintf(stderr, "  [%zu] %s outputs=%zu policy=%s\n",
+                i, op.op_type.c_str(), op.outputs.size(), policy_str);
+        fflush(stderr);
+    }
+    fprintf(stderr, "[RECOMPUTE_PLAN] Done listing ops\n");
+    fflush(stderr);
 }
 
 bool RecomputePlan::can_recompute(const std::string& name) const {
@@ -1263,10 +1361,9 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
                 }
             }
         }
-        // In FFT mode, ln1_fused uses get_residual(layer_idx - 1)
-        // In LoRA mode, res_ffn input uses get_residual(layer_idx)
-        if (has_ln1_fused_group && !lora_only_mode && layer_idx > 0) {
-            executor.mRunState.fetch_residual(layer_idx - 1, executor.mRunState.side_stream());
+        // FFT mode and LoRA mode both use get_residual(layer_idx) for res_ffn
+        if (has_ln1_fused_group && !lora_only_mode) {
+            executor.mRunState.fetch_residual(layer_idx, executor.mRunState.side_stream());
         }
         if (needs_residual && lora_only_mode) {
             executor.mRunState.fetch_residual(layer_idx, executor.mRunState.side_stream());
@@ -1297,12 +1394,43 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
 
     RecomputeScratch scratch;
 
+    int op_idx = 0;
     for (const auto& op : mPlan.topo_ops) {
+        if (layer_idx == 0) {
+            const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
+                                      (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" : "never";
+            fprintf(stderr, "[RECOMPUTE_OP] Layer %d idx=%d op=%s policy=%s\n",
+                    layer_idx, op_idx, op.op_type.c_str(), policy_str);
+            fflush(stderr);
+        }
+        op_idx++;
+
         if (op.policy == RecomputePolicy::Never) {
             continue;
         }
         if (op.policy == RecomputePolicy::LoraOnly && !lora_only_mode) {
+            // In FFT mode, skip recompute for lora_only ops - use saved tensors instead
+            if (layer_idx == 0) {
+                fprintf(stderr, "[RECOMPUTE_SKIP] Layer %d op=%s (lora_only policy, FFT mode)\n",
+                        layer_idx, op.op_type.c_str());
+            }
             continue;
+        }
+
+        // DEBUG: Print which op is being executed
+        if (layer_idx == 0) {
+            std::string outputs_str;
+            for (const auto& o : op.outputs) {
+                if (!outputs_str.empty()) outputs_str += ", ";
+                outputs_str += o;
+            }
+            std::string inputs_str;
+            for (const auto& i : op.inputs) {
+                if (!inputs_str.empty()) inputs_str += ", ";
+                inputs_str += i;
+            }
+            fprintf(stderr, "[RECOMPUTE_EXEC] Layer %d op=%s outputs=[%s] inputs=[%s]\n",
+                    layer_idx, op.op_type.c_str(), outputs_str.c_str(), inputs_str.c_str());
         }
 
         const InputMap inputs = resolve_inputs(ctx, op, layer_idx, B, T, scratch);
@@ -1325,9 +1453,10 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         }
     }
 
-    for (auto& t : scratch.temps) {
-        executor.mRunState.temp_free(t);
-    }
+    // NOTE: We do NOT free scratch.temps here. The zero_residual and other scratch
+    // allocations will remain on the stack until the step ends. Trying to free them
+    // here would violate LIFO order since temp_acquire may have allocated activations
+    // on top of scratch allocations during the op execution loop.
 }
 
 }  // namespace dsl

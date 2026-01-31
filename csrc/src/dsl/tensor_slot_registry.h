@@ -83,6 +83,17 @@ public:
     /// @brief Check if a slot can be recomputed in backward
     bool can_recompute(const std::string& name) const;
 
+    /// @brief Check if a slot will actually be recomputed given the current mode
+    /// @param name Tensor name
+    /// @param lora_only_mode True if in LoRA-only mode (not FFT mode)
+    /// @return True if the tensor will be recomputed in the given mode
+    ///
+    /// This differs from can_recompute() by also checking the recompute_policy:
+    /// - "always": will recompute in any mode
+    /// - "lora_only": will only recompute in LoRA mode, not in FFT mode
+    /// - "never": will never recompute
+    bool will_recompute(const std::string& name, bool lora_only_mode) const;
+
     /// @brief Check if a slot shares memory with another slot
     bool is_shared(const std::string& name) const;
 

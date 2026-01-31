@@ -268,7 +268,17 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         }
 
         acts.qkv = share_qkv ? shared_qkv : mAllocator->allocate(dtype, "qkv", kind, {B, T, QKV});
-        acts.qkv_rope = {};
+        // In FFT mode with recompute enabled, we need BOTH qkv (original) and qkv_rope (transformed)
+        // because the qk_norm_rope backward kernel expects qkv_rope (the transformed output).
+        // The kernel applies inverse RoPE internally to compute the gradient.
+        // Without separate buffers, the in-place forward transform overwrites the qkv buffer,
+        // so we can't distinguish between original qkv and transformed qkv_rope.
+        // In LoRA mode, qkv_rope has lora_only policy so it gets recomputed during backward.
+        // In no-recompute mode, the qkv buffer contains qkv_rope after forward (in-place transform).
+        const bool need_separate_qkv_rope = recompute_enabled && !lora_only && use_qk_norm;
+        acts.qkv_rope = need_separate_qkv_rope
+            ? mAllocator->allocate(dtype, "qkv_rope", kind, {B, T, QKV})
+            : Tensor{};
 
         acts.lse = share_att ? shared_lse
                              : mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});

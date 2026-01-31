@@ -242,6 +242,32 @@ bool TensorSlotRegistry::can_recompute(const std::string& name) const {
                      entry->memory_hint == ActivationMemoryHint::Recompute);
 }
 
+bool TensorSlotRegistry::will_recompute(const std::string& name, bool lora_only_mode) const {
+    auto entry = lookup(name);
+    if (!entry) {
+        return false;
+    }
+
+    // Must be marked as recomputable
+    if (!entry->recompute_in_backward &&
+        entry->memory_hint != ActivationMemoryHint::Recompute) {
+        return false;
+    }
+
+    // Check policy
+    const std::string& policy = entry->recompute_policy;
+    if (policy == "never") {
+        return false;
+    }
+    if (policy == "lora_only") {
+        // Only recompute in LoRA mode, not in FFT mode
+        // In FFT mode, use saved tensors (requires gradient_accumulation_steps=1 to avoid corruption)
+        return lora_only_mode;
+    }
+    // "always" or empty (default) - always recompute
+    return true;
+}
+
 bool TensorSlotRegistry::is_shared(const std::string& name) const {
     auto entry = lookup(name);
     return entry && entry->memory_hint == ActivationMemoryHint::Shared;

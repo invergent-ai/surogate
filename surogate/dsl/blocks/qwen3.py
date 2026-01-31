@@ -74,18 +74,28 @@ class Qwen3Block:
                           description="RMSNorm reciprocal std for LN1")
 
     # QKV projection and RoPE
+    # NOTE: qkv uses lora_only policy to match qkv_rope, att, lse.
+    # In FFT mode, we save both qkv and qkv_rope to ensure the matmul backward
+    # and qk_norm_rope backward have consistent inputs.
     qkv = Activation(
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat", "qkv_biased"],
+        save=True,  # Save in FFT mode for consistency
         recompute=True,
         recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
-        recompute_policy="lora_only",
+        recompute_policy="lora_only",  # Match qkv_rope policy
         lora_targets=["q", "k", "v"],
     )
+    # NOTE: qkv_rope uses lora_only policy to match att and lse.
+    # In FFT mode, qkv_rope must be saved (not recomputed) because attention_backward
+    # requires qkv_rope to be consistent with the saved att and lse values.
+    # If qkv_rope is recomputed and differs even slightly from forward, the gradients
+    # will be incorrect because att and lse were computed from the ORIGINAL qkv_rope.
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],
+        save=True,  # Save in FFT mode for consistency with att/lse
         recompute=True,
         recompute_group="qk_norm_rope",
         recompute_outputs=["qkv_rope", "q_rstd", "k_rstd"],
@@ -98,18 +108,19 @@ class Qwen3Block:
         ],
         recompute_op="qkv_qk_norm_rope",
         recompute_attrs={"rotary_dim": "D"},
-        recompute_policy="lora_only",
+        recompute_policy="lora_only",  # Match att/lse - don't recompute in FFT mode
         description="QKV after QK-Norm + RoPE",
     )
 
     # QK-norm RSTDs (conditional on use_qk_norm)
+    # NOTE: Match qkv_rope policy - lora_only to stay consistent in FFT mode
     q_rstd = Activation(
         Tensor["B", "T", "Hq"],
         dtype="fp32",
         save=True,
         recompute=True,
         recompute_group="qk_norm_rope",
-        recompute_policy="lora_only",
+        recompute_policy="lora_only",  # Match qkv_rope policy
         when="use_qk_norm",
         description="Q head RMSNorm rstd",
     )
@@ -119,22 +130,26 @@ class Qwen3Block:
         save=True,
         recompute=True,
         recompute_group="qk_norm_rope",
-        recompute_policy="lora_only",
+        recompute_policy="lora_only",  # Match qkv_rope policy
         when="use_qk_norm",
         description="K head RMSNorm rstd",
     )
 
     # Attention
+    # NOTE: att and lse use lora_only policy because cuDNN flash attention is non-deterministic.
+    # In FFT mode, we save att/lse during forward and reuse them in backward.
+    # In LoRA mode, we recompute them (acceptable since only LoRA weights change).
     att = Activation(
         Tensor["B", "T", "AttnDim"],
         aliases=["att_flat", "attn"],
+        save=True,  # Save for FFT mode backward (needed by att_out backward AND attention backward)
         recompute=True,
         recompute_group="attn_fwd",
         recompute_outputs=["att", "lse"],
         recompute_from=["qkv_rope"],
         recompute_op="flash_attention",
         recompute_attrs={"attn_impl": "cudnn"},
-        recompute_policy="lora_only",
+        recompute_policy="lora_only",  # Don't recompute in FFT mode - cuDNN is non-deterministic
         description="Attention output (pre out-proj)",
     )
     lse = Activation(
@@ -143,7 +158,7 @@ class Qwen3Block:
         save=True,
         recompute=True,
         recompute_group="attn_fwd",
-        recompute_policy="lora_only",
+        recompute_policy="lora_only",  # Don't recompute in FFT mode - cuDNN is non-deterministic
         description="Log-sum-exp from flash attention",
     )
     att_out = Activation(
@@ -153,7 +168,7 @@ class Qwen3Block:
         recompute_from=["att", "@param:out_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="lora_only",
+        recompute_policy="always",
         lora_targets=["o"],
         description="After output projection",
     )
@@ -189,7 +204,7 @@ class Qwen3Block:
         recompute_from=["ln2", "@param:mlp_up_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
-        recompute_policy="lora_only",
+        recompute_policy="always",
         lora_targets=["up", "gate"],
     )
     swiglu = Activation(
@@ -199,7 +214,7 @@ class Qwen3Block:
         recompute_from=["mlp_up"],
         recompute_op="swiglu",
         recompute_attrs={"activation": "swiglu"},
-        recompute_policy="lora_only",
+        recompute_policy="always",
         description="SwiGLU activation output",
     )
     mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"],

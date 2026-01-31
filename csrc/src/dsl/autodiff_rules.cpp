@@ -520,7 +520,9 @@ std::vector<Operation> qkv_qk_norm_rope_backward(const BackwardRuleContext& ctx)
         return ops;
     }
 
-    std::string qkv_out = fwd.outputs[0];
+    // The backward kernel expects qkv_rope (the OUTPUT after QK-Norm + RoPE), NOT the original input.
+    // The kernel internally applies inverse RoPE to recover the pre-RoPE values for gradient computation.
+    std::string qkv_out = fwd.outputs[0];  // qkv_rope - output after QK-Norm + RoPE
     std::string q_rstd = fwd.outputs[1];
     std::string k_rstd = fwd.outputs[2];
 
@@ -534,7 +536,7 @@ std::vector<Operation> qkv_qk_norm_rope_backward(const BackwardRuleContext& ctx)
         "qkv_qk_norm_rope_backward",
         "qkv_qk_norm_rope_backward",
         {ctx.d_output,
-         saved_ref(qkv_out),
+         saved_ref(qkv_out),  // Use OUTPUT qkv_rope - kernel applies inverse RoPE internally
          fwd.inputs[1], fwd.inputs[2],
          saved_ref(q_rstd), saved_ref(k_rstd),
          fwd.inputs[3], fwd.inputs[4]},

@@ -431,9 +431,9 @@ __global__ void rmsnorm_apply_saved_kernel(floatX* __restrict__ out,
     out += row * C;
 
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
-        float inp_val = (float)inp[c];
-        float weight_val = (float)weight[c];
-        out[c] = (floatX)(inp_val * s * weight_val);
+        // Match forward kernel precision: normalize in FP32, then multiply in floatX
+        float n = s * (float)inp[c];  // normalize in FP32
+        out[c] = (floatX)n * weight[c];  // convert to floatX then multiply by floatX weight
     }
 }
 
@@ -482,7 +482,12 @@ __global__ void fused_residual_rmsnorm_apply_saved_kernel(floatX* __restrict__ r
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         float r = (float)inp1[c] + (float)inp2[c];
         residual[c] = (floatX)r;
-        normed[c] = (floatX)(r * s * (float)weight[c]);
+        // CRITICAL: Match forward kernel precision exactly.
+        // Forward stores residual as floatX then reads back, losing precision.
+        // We must do the same: read back the stored floatX value before normalization.
+        float res_back = (float)residual[c];  // Read back from floatX storage
+        float n = res_back * s;               // Normalize the rounded value
+        normed[c] = (floatX)n * weight[c];
     }
 }
 

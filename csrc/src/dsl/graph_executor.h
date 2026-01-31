@@ -273,15 +273,6 @@ private:
     // ========================================================================
     // DSL-driven recomputation (plan-based)
     // ========================================================================
-    // Legacy segment-based helpers remain for reference but are no longer used
-    // once the recompute plan is wired into the backward path.
-
-    // Execute attention segment recomputation for a layer
-    void recompute_attention_segment(int layer_idx, long B, long T);
-
-    // Execute FFN segment recomputation for a layer
-    void recompute_ffn_segment(int layer_idx, long B, long T);
-
     // Execute full block recomputation (both segments)
     void recompute_block(int layer_idx, long B, long T);
 
