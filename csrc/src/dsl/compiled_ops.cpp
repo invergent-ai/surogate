@@ -556,7 +556,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         return;
     }
 
-    const bool capturing = mCapturing;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool in_capture =
+        (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
+         capture_status != cudaStreamCaptureStatusNone);
+    const bool capturing = mCapturing || in_capture;
 
     // Recompute is only active when enabled in runtime options.
     // Do NOT use mRecomputeFn here: it's always set when the graph is compiled,
