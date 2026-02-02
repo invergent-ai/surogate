@@ -182,7 +182,9 @@ private:
 
     // Helper to get the allocation type for expert weights
     [[nodiscard]] EAllocationType expert_alloc_type() const {
-        return mConfig.offload_experts ? EAllocationType::PINNED : EAllocationType::ON_DEVICE;
+        // Use pageable host memory for offloaded experts to avoid mapped host pages
+        // being corrupted by stray device writes.
+        return mConfig.offload_experts ? EAllocationType::ON_HOST : EAllocationType::ON_DEVICE;
     }
 };
 

@@ -72,7 +72,7 @@ class Qwen3Block:
         # This matches implementation (res_ffn is retrieved from residual storage, not re-derived).
         recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
         recompute_op="rmsnorm_apply_saved",
-        recompute_policy="fft_only",
+        recompute_policy="always",  # Recompute in both FFT and LoRA modes
     )
     ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN1")
@@ -179,7 +179,7 @@ class Qwen3Block:
         recompute_outputs=["res_att", "ln2"],
         recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
         recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="fft_only",
+        recompute_policy="always",  # Recompute in both FFT and LoRA modes
         description="Residual + attention",
     )
 
@@ -189,7 +189,7 @@ class Qwen3Block:
         aliases=["ln2_flat"],
         recompute=True,
         recompute_group="ln2_fused",
-        recompute_policy="fft_only",
+        recompute_policy="always",  # Recompute in both FFT and LoRA modes
     )
     ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN2")

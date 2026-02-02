@@ -13,6 +13,7 @@
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "dsl/graph_executor.h"
 #include "dsl/graph_executor_helpers.h"
@@ -61,6 +62,50 @@ bool is_global_ref(const std::string& name, std::string& global_name) {
     }
     global_name = std::string(name.substr(kPrefix.size()));
     return true;
+}
+
+struct MoeCompactInfo {
+    std::vector<int> host_offsets;
+    std::vector<int> active_experts;
+    int num_active = 0;
+    bool weight_is_compact = false;
+};
+
+MoeCompactInfo build_moe_compact_info(const int* expert_offsets_dev,
+                                      int num_experts,
+                                      int weight_experts,
+                                      cudaStream_t stream) {
+    MoeCompactInfo info;
+    if (!expert_offsets_dev || num_experts <= 0 || weight_experts <= 0) {
+        return info;
+    }
+    info.weight_is_compact = (weight_experts != num_experts);
+    if (!info.weight_is_compact) {
+        return info;
+    }
+
+    info.host_offsets.resize(num_experts + 1, 0);
+    CUDA_CHECK(cudaMemcpyAsync(info.host_offsets.data(),
+                               expert_offsets_dev,
+                               static_cast<std::size_t>(num_experts + 1) * sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    info.active_experts.reserve(num_experts);
+    for (int e = 0; e < num_experts; ++e) {
+        if (info.host_offsets[e + 1] > info.host_offsets[e]) {
+            info.active_experts.push_back(e);
+        }
+    }
+    info.num_active = static_cast<int>(info.active_experts.size());
+
+    if (weight_experts > 0 && info.num_active > weight_experts) {
+        info.active_experts.resize(weight_experts);
+        info.num_active = weight_experts;
+    }
+
+    return info;
 }
 
 RecomputePolicy parse_policy(const std::string& policy) {
@@ -171,6 +216,49 @@ float resolve_eps(const AttrMap& attrs, const modules::ModelConfig& cfg) {
     return static_cast<float>(cfg.RmsNormEps);
 }
 
+int resolve_top_k(const AttrMap& attrs, const modules::ModelConfig& cfg) {
+    if (const auto* attr = find_attr(attrs, "top_k")) {
+        if (auto v = attr_int(*attr)) {
+            return static_cast<int>(*v);
+        }
+        if (auto s = attr_string(*attr)) {
+            if (*s == "K" || *s == "top_k") {
+                return cfg.NumExpertsPerTok > 0 ? cfg.NumExpertsPerTok : 1;
+            }
+            try {
+                return std::stoi(*s);
+            } catch (...) {
+                return cfg.NumExpertsPerTok > 0 ? cfg.NumExpertsPerTok : 1;
+            }
+        }
+        if (auto v = std::get_if<double>(&attr->value)) {
+            return static_cast<int>(*v);
+        }
+    }
+    return cfg.NumExpertsPerTok > 0 ? cfg.NumExpertsPerTok : 1;
+}
+
+bool resolve_norm_topk(const AttrMap& attrs, const modules::ModelConfig& cfg) {
+    if (const auto* attr = find_attr(attrs, "normalize")) {
+        if (auto v = attr_bool(*attr)) {
+            return *v;
+        }
+        if (auto v = attr_int(*attr)) {
+            return *v != 0;
+        }
+        if (auto s = attr_string(*attr)) {
+            if (*s == "norm_topk_prob") {
+                return cfg.moe_config.has_value() && cfg.moe_config->norm_topk_prob;
+            }
+            return *s == "true" || *s == "1" || *s == "yes";
+        }
+        if (auto v = std::get_if<double>(&attr->value)) {
+            return *v != 0.0;
+        }
+    }
+    return cfg.moe_config.has_value() && cfg.moe_config->norm_topk_prob;
+}
+
 modules::MatmulOp parse_matmul_op(const AttrMap& attrs,
                                   const std::string& weight_name) {
     if (const auto* attr = find_attr(attrs, "matmul_op")) {
@@ -208,6 +296,8 @@ struct RecomputeScratch {
     std::vector<Tensor> temps;
     Tensor zero_residual{};
     bool zero_ready = false;
+    Tensor moe_expert_offsets{};
+    Tensor moe_gather_indices{};
 };
 
 struct RecomputeContext {
@@ -218,6 +308,7 @@ struct RecomputeContext {
     const modules::ModularLoRAConfig* lora_config = nullptr;
     modules::ModularLoRAWeightsManager* lora_weights = nullptr;
     modules::LoRARunState* lora_run_state = nullptr;
+    const std::unordered_map<std::string, Tensor>* saved = nullptr;
     const LayerForwardPlan* layer_plan = nullptr;
     std::function<const Tensor*(const std::string&, Tensor&, cudaStream_t)> get_fp8_cached_weight;
     std::function<const FP4WeightCacheEntry*(const std::string&, Tensor&, cudaStream_t)> get_fp4_cached_weight;
@@ -256,6 +347,16 @@ Tensor& ensure_activation(RecomputeContext& ctx, int layer_idx, const std::strin
     if (name == "mlp_up" || name == "mlp_up_flat") return ensure(acts.mlp_up);
     if (name == "swiglu" || name == "swiglu_flat") return ensure(acts.swiglu);
     if (name == "mlp_down" || name == "mlp_down_flat") return ensure(acts.mlp_down);
+    if (name == "router_logits") return ensure(acts.router_logits);
+    if (name == "router_probs") return ensure(acts.router_probs);
+    if (name == "routing_weights") return ensure(acts.routing_weights);
+    if (name == "routing_indices") return ensure(acts.routing_indices);
+    if (name == "permuted_input") return ensure(acts.permuted_input);
+    if (name == "scatter_indices") return ensure(acts.scatter_indices);
+    if (name == "expert_gate_up") return ensure(acts.expert_gate_up);
+    if (name == "expert_act") return ensure(acts.expert_act);
+    if (name == "expert_down") return ensure(acts.expert_down);
+    if (name == "moe_out" || name == "moe_out_flat") return ensure(acts.moe_out);
     if (name == "res_ffn" || name == "residual_ffn") return rs.get_residual(layer_idx, stream);
     throw std::runtime_error("DSL recompute: unknown activation output: " + name);
 }
@@ -267,6 +368,28 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
     auto get = [&](Tensor& t) -> Tensor* {
         return t.Data ? &t : nullptr;
     };
+
+    auto try_saved = [&](const std::string& key) -> Tensor* {
+        if (!ctx.saved) {
+            return nullptr;
+        }
+        auto it = ctx.saved->find(key);
+        if (it != ctx.saved->end() && it->second.Data) {
+            return const_cast<Tensor*>(&it->second);
+        }
+        return nullptr;
+    };
+    if (ctx.lora_only_mode) {
+        if (Tensor* t = try_saved(name)) {
+            return t;
+        }
+        if (layer_idx >= 0) {
+            std::string scoped = "blocks[" + std::to_string(layer_idx) + "]." + name;
+            if (Tensor* t = try_saved(scoped)) {
+                return t;
+            }
+        }
+    }
 
     if (name == "ln1" || name == "ln1_flat") return get(acts.ln1);
     if (name == "ln1_rstd") return get(acts.ln1_rstd);
@@ -303,7 +426,26 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
     if (name == "mlp_up" || name == "mlp_up_flat") return get(acts.mlp_up);
     if (name == "swiglu" || name == "swiglu_flat") return get(acts.swiglu);
     if (name == "mlp_down" || name == "mlp_down_flat") return get(acts.mlp_down);
+    if (name == "router_logits") return get(acts.router_logits);
+    if (name == "router_probs") return get(acts.router_probs);
+    if (name == "routing_weights") return get(acts.routing_weights);
+    if (name == "routing_indices") return get(acts.routing_indices);
+    if (name == "permuted_input") return get(acts.permuted_input);
+    if (name == "scatter_indices") return get(acts.scatter_indices);
+    if (name == "expert_gate_up") return get(acts.expert_gate_up);
+    if (name == "expert_act") return get(acts.expert_act);
+    if (name == "expert_down") return get(acts.expert_down);
+    if (name == "moe_out" || name == "moe_out_flat") return get(acts.moe_out);
     if (name == "res_ffn" || name == "residual_ffn") return &rs.get_residual(layer_idx, rs.MainStream);
+    if (Tensor* t = try_saved(name)) {
+        return t;
+    }
+    if (layer_idx >= 0) {
+        std::string scoped = "blocks[" + std::to_string(layer_idx) + "]." + name;
+        if (Tensor* t = try_saved(scoped)) {
+            return t;
+        }
+    }
     return nullptr;
 }
 
@@ -629,14 +771,26 @@ void execute_matmul(RecomputeContext& ctx,
     }
 
     const std::string& weight_name = inputs.param_names.at(weight_key);
-    const modules::MatmulOp matmul_op = parse_matmul_op(op.attrs, weight_name);
-    const MatmulForwardPlan* plan = plan_for_matmul(ctx.layer_plan, matmul_op);
+    const bool force_basic_matmul =
+        (weight_name.find("router_weight") != std::string::npos) ||
+        (weight_name.find("shared_expert_") != std::string::npos);
+    std::optional<modules::MatmulOp> matmul_op;
+    const MatmulForwardPlan* plan = nullptr;
+
+    if (!force_basic_matmul) {
+        try {
+            matmul_op = parse_matmul_op(op.attrs, weight_name);
+            plan = plan_for_matmul(ctx.layer_plan, *matmul_op);
+        } catch (...) {
+            // Unknown matmul op (e.g., router weights) -> fall back to basic matmul.
+        }
+    }
 
     const bool allow_quant = allow_quant_layer(ctx.options, cfg, layer_idx);
     const bool have_recipe = ctx.options.TrainingRecipe != nullptr;
     // Match forward path: if the training recipe is enabled, use it during recompute.
     // This ensures recompute activations match non-recompute forward (even with FP8).
-    const bool use_recipe = plan ? (plan->use_recipe && have_recipe) : have_recipe;
+    const bool use_recipe = (matmul_op.has_value() && (plan ? (plan->use_recipe && have_recipe) : have_recipe));
 
     const int C_in = (inp.Rank >= 3) ? static_cast<int>(inp.Sizes[2]) : static_cast<int>(inp.Sizes[1]);
     const int C_out = (out.Rank >= 3) ? static_cast<int>(out.Sizes[2]) : static_cast<int>(out.Sizes[1]);
@@ -658,7 +812,7 @@ void execute_matmul(RecomputeContext& ctx,
         mm_ctx.run_state = &rs;
         mm_ctx.stream = rs.MainStream;
         mm_ctx.layer_idx = layer_idx;
-        mm_ctx.op = matmul_op;
+        mm_ctx.op = *matmul_op;
         mm_ctx.allow_fp8 = plan ? plan->allow_fp8 : allow_quant;
         mm_ctx.allow_fp4 = plan ? plan->allow_fp4 : (allow_quant && ctx.options.fp4_enabled());
         if (mm_ctx.allow_fp8) {
@@ -1004,6 +1158,72 @@ void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
     }
 }
 
+void execute_rope(RecomputeContext& ctx,
+                  const RecomputeOp& op,
+                  int layer_idx,
+                  long B,
+                  long T,
+                  const InputMap& inputs,
+                  const std::unordered_map<std::string, Tensor*>& outputs) {
+    (void)layer_idx;
+    Tensor* qkv_in = nullptr;
+    Tensor* freqs = nullptr;
+    Tensor* pos_ids = nullptr;
+
+    for (const auto& kv : inputs.tensors) {
+        const std::string& key = kv.first;
+        if (key == "qkv" || key == "qkv_rope") {
+            qkv_in = kv.second;
+        } else if (key == "freq_cis" || key == "rope_freqs") {
+            freqs = kv.second;
+        } else if (key == "position_ids") {
+            pos_ids = kv.second;
+        }
+    }
+
+    if (!qkv_in || !freqs || !pos_ids) {
+        throw std::runtime_error("DSL recompute: rope missing inputs (qkv, freq_cis, position_ids)");
+    }
+
+    auto it_qkv = outputs.find("qkv_rope");
+    Tensor* qkv_out = (it_qkv != outputs.end()) ? it_qkv->second : nullptr;
+    if (!qkv_out) {
+        auto it_qkv2 = outputs.find("qkv");
+        if (it_qkv2 != outputs.end()) {
+            qkv_out = it_qkv2->second;
+        }
+    }
+    if (!qkv_out) {
+        throw std::runtime_error("DSL recompute: rope missing qkv_rope output");
+    }
+
+    // Copy input to output if different buffers
+    if (qkv_in->Data != qkv_out->Data) {
+        cudaMemcpyAsync(qkv_out->Data, qkv_in->Data, qkv_in->bytes(),
+                        cudaMemcpyDeviceToDevice, ctx.rs.MainStream);
+    }
+
+    const int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
+    const int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
+    const int Hs = static_cast<int>(ctx.cfg.head_size());
+    int rotary_dim = resolve_rotary_dim(op.attrs, ctx.cfg);
+
+    // Check if forward plan has rotary_dim override
+    const LayerForwardPlan* fwd_plan = ctx.layer_plan;
+    if (fwd_plan && fwd_plan->attn.valid && fwd_plan->attn.rotary_dim > 0) {
+        rotary_dim = fwd_plan->attn.rotary_dim;
+    }
+
+    // Reshape to 4D if needed for rope_forward
+    Tensor qkv_rope = (qkv_out->Rank == 4)
+        ? *qkv_out
+        : view_tensor(*qkv_out, {B, T, Hq + 2 * Hkv, Hs});
+
+    rope_forward(qkv_rope, qkv_rope, *freqs, reinterpret_cast<int*>(pos_ids->Data), nullptr,
+                 static_cast<int>(B), static_cast<int>(T),
+                 Hq, Hkv, Hs, rotary_dim, ctx.rs.MainStream);
+}
+
 void execute_flash_attention(RecomputeContext& ctx,
                              long B,
                              long T,
@@ -1065,6 +1285,17 @@ void execute_swiglu(RecomputeContext& ctx,
         inp = it->second;
     } else if (auto it2 = inputs.tensors.find("mlp_up_flat"); it2 != inputs.tensors.end()) {
         inp = it2->second;
+    } else if (auto it3 = inputs.tensors.find("expert_gate_up"); it3 != inputs.tensors.end()) {
+        inp = it3->second;
+    } else if (auto it4 = inputs.tensors.find("expert_gate_up_flat"); it4 != inputs.tensors.end()) {
+        inp = it4->second;
+    } else {
+        for (const auto& kv : inputs.tensors) {
+            if (kv.second && kv.second->DType != ETensorDType::INT32) {
+                inp = kv.second;
+                break;
+            }
+        }
     }
     if (!inp) {
         throw std::runtime_error("DSL recompute: swiglu missing input");
@@ -1078,8 +1309,381 @@ void execute_swiglu(RecomputeContext& ctx,
         throw std::runtime_error("DSL recompute: swiglu missing output");
     }
     Tensor& out = *out_it->second;
-    const int D = static_cast<int>(ctx.cfg.IntermediateSize);
+    if (inp->Rank == 2) {
+        const long N = inp->Sizes[0];
+        const long D = inp->Sizes[1] / 2;
+        Tensor inp_view = view_tensor(*inp, {1, N, 2 * D});
+        Tensor out_view = (out.Rank == 2) ? view_tensor(out, {1, N, D}) : out;
+        swiglu_forward(out_view, inp_view, nullptr, 1, static_cast<int>(N), static_cast<int>(D), ctx.rs.MainStream);
+        return;
+    }
+    int D = static_cast<int>(ctx.cfg.IntermediateSize);
+    if (inp->Rank >= 3 && inp->Sizes[2] > 0) {
+        D = static_cast<int>(inp->Sizes[2] / 2);
+    }
     swiglu_forward(out, *inp, nullptr, static_cast<int>(B), static_cast<int>(T), D, ctx.rs.MainStream);
+}
+
+void execute_moe_router_probs(RecomputeContext& ctx,
+                              const InputMap& inputs,
+                              const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* logits = nullptr;
+    if (auto it = inputs.tensors.find("router_logits"); it != inputs.tensors.end()) {
+        logits = it->second;
+    } else if (!inputs.tensors.empty()) {
+        logits = inputs.tensors.begin()->second;
+    }
+    if (!logits) {
+        throw std::runtime_error("DSL recompute: moe_router_probs missing input");
+    }
+    if (outputs.empty()) {
+        throw std::runtime_error("DSL recompute: moe_router_probs missing output");
+    }
+    Tensor& out = *outputs.begin()->second;
+
+    const bool use_sigmoid = ctx.cfg.moe_config.has_value() && ctx.cfg.moe_config->norm_topk_prob;
+
+    if (use_sigmoid) {
+        const int num_elements = static_cast<int>(out.nelem());
+        if (logits->DType == ETensorDType::BF16) {
+            moe_sigmoid_forward(out.get<nv_bfloat16>(),
+                                logits->get<nv_bfloat16>(),
+                                num_elements, ctx.rs.MainStream);
+        } else {
+            moe_sigmoid_forward(out.get<float>(),
+                                logits->get<float>(),
+                                num_elements, ctx.rs.MainStream);
+        }
+        return;
+    }
+
+    const int num_tokens = static_cast<int>(logits->Sizes[0]);
+    const int num_experts = static_cast<int>(logits->Sizes[1]);
+    if (logits->DType == ETensorDType::BF16) {
+        moe_softmax_forward(out.get<nv_bfloat16>(),
+                            logits->get<nv_bfloat16>(),
+                            num_tokens, num_experts, ctx.rs.MainStream);
+    } else {
+        moe_softmax_forward(out.get<float>(),
+                            logits->get<float>(),
+                            num_tokens, num_experts, ctx.rs.MainStream);
+    }
+}
+
+void execute_moe_topk(RecomputeContext& ctx,
+                      const RecomputeOp& op,
+                      const InputMap& inputs,
+                      const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* probs = nullptr;
+    if (auto it = inputs.tensors.find("router_probs"); it != inputs.tensors.end()) {
+        probs = it->second;
+    } else if (!inputs.tensors.empty()) {
+        probs = inputs.tensors.begin()->second;
+    }
+    if (!probs) {
+        throw std::runtime_error("DSL recompute: moe_topk missing input");
+    }
+    auto out_w = outputs.find("routing_weights");
+    auto out_i = outputs.find("routing_indices");
+    if (out_w == outputs.end() || out_i == outputs.end()) {
+        throw std::runtime_error("DSL recompute: moe_topk missing outputs");
+    }
+    Tensor& weights = *out_w->second;
+    Tensor& indices = *out_i->second;
+
+    const int num_tokens = static_cast<int>(probs->Sizes[0]);
+    const int num_experts = static_cast<int>(probs->Sizes[1]);
+    const int top_k = resolve_top_k(op.attrs, ctx.cfg);
+    const bool normalize = resolve_norm_topk(op.attrs, ctx.cfg);
+
+    if (probs->DType == ETensorDType::BF16) {
+        moe_topk_forward(indices.get<int>(),
+                         weights.get<nv_bfloat16>(),
+                         probs->get<nv_bfloat16>(),
+                         num_tokens, num_experts, top_k, normalize, ctx.rs.MainStream);
+    } else {
+        moe_topk_forward(indices.get<int>(),
+                         weights.get<float>(),
+                         probs->get<float>(),
+                         num_tokens, num_experts, top_k, normalize, ctx.rs.MainStream);
+    }
+}
+
+void execute_moe_permute(RecomputeContext& ctx,
+                         RecomputeScratch& scratch,
+                         const RecomputeOp& op,
+                         const InputMap& inputs,
+                         const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* inp = nullptr;
+    if (auto it = inputs.tensors.find("ln2"); it != inputs.tensors.end()) {
+        inp = it->second;
+    } else if (auto it2 = inputs.tensors.find("ln2_flat"); it2 != inputs.tensors.end()) {
+        inp = it2->second;
+    } else if (!inputs.tensors.empty()) {
+        inp = inputs.tensors.begin()->second;
+    }
+    auto idx_it = inputs.tensors.find("routing_indices");
+    if (!inp || idx_it == inputs.tensors.end()) {
+        throw std::runtime_error("DSL recompute: moe_permute missing inputs");
+    }
+    Tensor& routing_indices = *idx_it->second;
+
+    auto out_p = outputs.find("permuted_input");
+    auto out_s = outputs.find("scatter_indices");
+    if (out_p == outputs.end() || out_s == outputs.end()) {
+        throw std::runtime_error("DSL recompute: moe_permute missing outputs");
+    }
+    Tensor& permuted = *out_p->second;
+    Tensor& scatter_indices = *out_s->second;
+
+    const int top_k = resolve_top_k(op.attrs, ctx.cfg);
+    const int num_tokens = static_cast<int>((inp->Rank == 2) ? inp->Sizes[0] : (inp->Sizes[0] * inp->Sizes[1]));
+    const int hidden_size = static_cast<int>((inp->Rank == 2) ? inp->Sizes[1] : inp->Sizes[2]);
+    const int total_tokens = num_tokens * top_k;
+    const int num_experts = static_cast<int>(ctx.cfg.NumExperts);
+
+    Tensor inp_flat = (inp->Rank == 2) ? *inp : view_tensor(*inp, {num_tokens, hidden_size});
+
+    Tensor expert_counts = ctx.rs.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_counts");
+    Tensor expert_offsets = ctx.rs.Stack.allocate(ETensorDType::INT32, {num_experts + 1}, "moe_expert_offsets");
+    Tensor expert_positions = ctx.rs.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_positions");
+    Tensor gather_indices = ctx.rs.Stack.allocate(ETensorDType::INT32, {total_tokens}, "moe_gather_indices");
+
+    fill_zero(expert_positions, ctx.rs.MainStream);
+
+    moe_compute_expert_counts(expert_counts.get<int>(),
+                              routing_indices.get<int>(),
+                              num_tokens, top_k, num_experts, ctx.rs.MainStream);
+
+    moe_compute_expert_offsets(expert_offsets.get<int>(),
+                               expert_counts.get<int>(),
+                               num_experts, ctx.rs.MainStream);
+
+    moe_build_indices(gather_indices.get<int>(),
+                      scatter_indices.get<int>(),
+                      routing_indices.get<int>(),
+                      expert_offsets.get<int>(),
+                      expert_positions.get<int>(),
+                      num_tokens, top_k, num_experts, ctx.rs.MainStream);
+
+    if (inp_flat.DType == ETensorDType::BF16) {
+        moe_permute_tokens(permuted.get<nv_bfloat16>(),
+                           inp_flat.get<nv_bfloat16>(),
+                           gather_indices.get<int>(),
+                           total_tokens, num_tokens, hidden_size, top_k, ctx.rs.MainStream);
+    } else {
+        moe_permute_tokens(permuted.get<float>(),
+                           inp_flat.get<float>(),
+                           gather_indices.get<int>(),
+                           total_tokens, num_tokens, hidden_size, top_k, ctx.rs.MainStream);
+    }
+
+    scratch.moe_expert_offsets = expert_offsets;
+    scratch.moe_gather_indices = gather_indices;
+}
+
+void execute_moe_grouped_gemm_gate_up(RecomputeContext& ctx,
+                                      RecomputeScratch& scratch,
+                                      const InputMap& inputs,
+                                      const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* inp = nullptr;
+    Tensor* weights = nullptr;
+    if (auto it = inputs.tensors.find("permuted_input"); it != inputs.tensors.end()) {
+        inp = it->second;
+    } else if (auto it = inputs.tensors.find("permuted_input_flat"); it != inputs.tensors.end()) {
+        inp = it->second;
+    }
+    for (const auto& kv : inputs.param_names) {
+        auto it = inputs.tensors.find(kv.first);
+        if (it != inputs.tensors.end()) {
+            weights = it->second;
+            break;
+        }
+    }
+    if (!inp) {
+        for (const auto& kv : inputs.tensors) {
+            if (inputs.param_names.count(kv.first)) {
+                continue;
+            }
+            if (kv.second && kv.second->DType != ETensorDType::INT32) {
+                inp = kv.second;
+                break;
+            }
+        }
+    }
+    if (!inp || !weights || !scratch.moe_expert_offsets.Data) {
+        throw std::runtime_error("DSL recompute: moe_grouped_gemm_gate_up missing inputs");
+    }
+    if (outputs.empty()) {
+        throw std::runtime_error("DSL recompute: moe_grouped_gemm_gate_up missing output");
+    }
+    Tensor& out = *outputs.begin()->second;
+
+    const int num_experts = static_cast<int>(ctx.cfg.NumExperts);
+    const int hidden_size = static_cast<int>(ctx.cfg.HiddenSize);
+    const int intermediate_size = (ctx.cfg.MoeIntermediateSize > 0)
+        ? static_cast<int>(ctx.cfg.MoeIntermediateSize)
+        : static_cast<int>(ctx.cfg.IntermediateSize);
+    const int weight_experts = (weights->Rank > 0) ? static_cast<int>(weights->Sizes[0]) : num_experts;
+    MoeCompactInfo compact = build_moe_compact_info(scratch.moe_expert_offsets.get<int>(),
+                                                    num_experts,
+                                                    weight_experts,
+                                                    ctx.rs.MainStream);
+    const int* host_offsets_ptr = compact.host_offsets.empty() ? nullptr : compact.host_offsets.data();
+    const int* active_ptr = compact.active_experts.empty() ? nullptr : compact.active_experts.data();
+    const int num_active = compact.active_experts.empty() ? -1 : compact.num_active;
+    const bool weight_is_compact = compact.weight_is_compact;
+
+    if (weight_is_compact && compact.active_experts.empty()) {
+        fill_zero(out, ctx.rs.MainStream);
+    } else if (weights->DType == ETensorDType::BF16) {
+        moe_grouped_gemm_gate_up(out.get<nv_bfloat16>(),
+                                 inp->get<nv_bfloat16>(),
+                                 weights->get<nv_bfloat16>(),
+                                 scratch.moe_expert_offsets.get<int>(),
+                                 num_experts, hidden_size, intermediate_size,
+                                 ctx.rs.cublas_handle(), ctx.rs.MainStream,
+                                 host_offsets_ptr,
+                                 active_ptr,
+                                 weight_is_compact,
+                                 num_active);
+    } else {
+        moe_grouped_gemm_gate_up(out.get<float>(),
+                                 inp->get<float>(),
+                                 weights->get<float>(),
+                                 scratch.moe_expert_offsets.get<int>(),
+                                 num_experts, hidden_size, intermediate_size,
+                                 ctx.rs.cublas_handle(), ctx.rs.MainStream,
+                                 host_offsets_ptr,
+                                 active_ptr,
+                                 weight_is_compact,
+                                 num_active);
+    }
+}
+
+void execute_moe_grouped_gemm_down(RecomputeContext& ctx,
+                                   RecomputeScratch& scratch,
+                                   const InputMap& inputs,
+                                   const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* inp = nullptr;
+    Tensor* weights = nullptr;
+    if (auto it = inputs.tensors.find("expert_act"); it != inputs.tensors.end()) {
+        inp = it->second;
+    } else if (auto it = inputs.tensors.find("expert_act_flat"); it != inputs.tensors.end()) {
+        inp = it->second;
+    }
+    for (const auto& kv : inputs.param_names) {
+        auto it = inputs.tensors.find(kv.first);
+        if (it != inputs.tensors.end()) {
+            weights = it->second;
+            break;
+        }
+    }
+    if (!inp) {
+        for (const auto& kv : inputs.tensors) {
+            if (inputs.param_names.count(kv.first)) {
+                continue;
+            }
+            if (kv.second && kv.second->DType != ETensorDType::INT32) {
+                inp = kv.second;
+                break;
+            }
+        }
+    }
+    if (!inp || !weights || !scratch.moe_expert_offsets.Data) {
+        throw std::runtime_error("DSL recompute: moe_grouped_gemm_down missing inputs");
+    }
+    if (outputs.empty()) {
+        throw std::runtime_error("DSL recompute: moe_grouped_gemm_down missing output");
+    }
+    Tensor& out = *outputs.begin()->second;
+
+    const int num_experts = static_cast<int>(ctx.cfg.NumExperts);
+    const int hidden_size = static_cast<int>(ctx.cfg.HiddenSize);
+    const int intermediate_size = (ctx.cfg.MoeIntermediateSize > 0)
+        ? static_cast<int>(ctx.cfg.MoeIntermediateSize)
+        : static_cast<int>(ctx.cfg.IntermediateSize);
+    const int weight_experts = (weights->Rank > 0) ? static_cast<int>(weights->Sizes[0]) : num_experts;
+    MoeCompactInfo compact = build_moe_compact_info(scratch.moe_expert_offsets.get<int>(),
+                                                    num_experts,
+                                                    weight_experts,
+                                                    ctx.rs.MainStream);
+    const int* host_offsets_ptr = compact.host_offsets.empty() ? nullptr : compact.host_offsets.data();
+    const int* active_ptr = compact.active_experts.empty() ? nullptr : compact.active_experts.data();
+    const int num_active = compact.active_experts.empty() ? -1 : compact.num_active;
+    const bool weight_is_compact = compact.weight_is_compact;
+
+    if (weight_is_compact && compact.active_experts.empty()) {
+        fill_zero(out, ctx.rs.MainStream);
+    } else if (inp->DType == ETensorDType::BF16) {
+        moe_grouped_gemm_down(out.get<nv_bfloat16>(),
+                              inp->get<nv_bfloat16>(),
+                              weights->get<nv_bfloat16>(),
+                              scratch.moe_expert_offsets.get<int>(),
+                              num_experts, hidden_size, intermediate_size,
+                              ctx.rs.cublas_handle(), ctx.rs.MainStream,
+                              host_offsets_ptr,
+                              active_ptr,
+                              weight_is_compact,
+                              num_active);
+    } else {
+        moe_grouped_gemm_down(out.get<float>(),
+                              inp->get<float>(),
+                              weights->get<float>(),
+                              scratch.moe_expert_offsets.get<int>(),
+                              num_experts, hidden_size, intermediate_size,
+                              ctx.rs.cublas_handle(), ctx.rs.MainStream,
+                              host_offsets_ptr,
+                              active_ptr,
+                              weight_is_compact,
+                              num_active);
+    }
+}
+
+void execute_moe_unpermute(RecomputeContext& ctx,
+                           const RecomputeOp& op,
+                           const InputMap& inputs,
+                           const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* expert_out = nullptr;
+    Tensor* routing_weights = nullptr;
+    Tensor* scatter_indices = nullptr;
+    for (const auto& kv : inputs.tensors) {
+        if (kv.first == "routing_weights") {
+            routing_weights = kv.second;
+        } else if (kv.first == "scatter_indices") {
+            scatter_indices = kv.second;
+        } else if (!expert_out) {
+            expert_out = kv.second;
+        }
+    }
+    if (!expert_out || !routing_weights || !scatter_indices) {
+        throw std::runtime_error("DSL recompute: moe_unpermute missing inputs");
+    }
+    if (outputs.empty()) {
+        throw std::runtime_error("DSL recompute: moe_unpermute missing output");
+    }
+    Tensor& out = *outputs.begin()->second;
+
+    const int top_k = resolve_top_k(op.attrs, ctx.cfg);
+    const int num_tokens = static_cast<int>(routing_weights->Sizes[0]);
+    const int total_tokens = num_tokens * top_k;
+    const int hidden_size = static_cast<int>(ctx.cfg.HiddenSize);
+
+    if (expert_out->DType == ETensorDType::BF16) {
+        moe_unpermute_and_combine(out.get<nv_bfloat16>(),
+                                  expert_out->get<nv_bfloat16>(),
+                                  routing_weights->get<nv_bfloat16>(),
+                                  scatter_indices->get<int>(),
+                                  num_tokens, total_tokens, hidden_size, top_k,
+                                  ctx.rs.MainStream);
+    } else {
+        moe_unpermute_and_combine(out.get<float>(),
+                                  expert_out->get<float>(),
+                                  routing_weights->get<float>(),
+                                  scatter_indices->get<int>(),
+                                  num_tokens, total_tokens, hidden_size, top_k,
+                                  ctx.rs.MainStream);
+    }
 }
 
 }  // namespace
@@ -1405,6 +2009,7 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         executor.mLoRAConfig,
         executor.mLoRAWeights,
         executor.mLoRARunState,
+        &executor.mSaved,
         executor.forward_plan(layer_idx),
         [&](const std::string& name, Tensor& weight, cudaStream_t s) {
             return executor.get_fp8_cached_weight(name, weight, s);
@@ -1486,8 +2091,22 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             execute_rmsnorm(ctx, op, inputs, outputs, layer_idx, B, T);
         } else if (op.op_type == "matmul") {
             execute_matmul(ctx, op, layer_idx, B, T, inputs, outputs);
+        } else if (op.op_type == "moe_router_probs") {
+            execute_moe_router_probs(ctx, inputs, outputs);
+        } else if (op.op_type == "moe_topk") {
+            execute_moe_topk(ctx, op, inputs, outputs);
+        } else if (op.op_type == "moe_permute") {
+            execute_moe_permute(ctx, scratch, op, inputs, outputs);
+        } else if (op.op_type == "moe_grouped_gemm_gate_up") {
+            execute_moe_grouped_gemm_gate_up(ctx, scratch, inputs, outputs);
+        } else if (op.op_type == "moe_grouped_gemm_down") {
+            execute_moe_grouped_gemm_down(ctx, scratch, inputs, outputs);
+        } else if (op.op_type == "moe_unpermute") {
+            execute_moe_unpermute(ctx, op, inputs, outputs);
         } else if (op.op_type == "qkv_qk_norm_rope") {
             execute_qkv_qk_norm_rope(ctx, op, layer_idx, B, T, inputs, outputs);
+        } else if (op.op_type == "rope") {
+            execute_rope(ctx, op, layer_idx, B, T, inputs, outputs);
         } else if (op.op_type == "flash_attention") {
             execute_flash_attention(ctx, B, T, inputs, outputs);
         } else if (op.op_type == "swiglu") {

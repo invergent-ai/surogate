@@ -328,6 +328,38 @@ public:
         with_provider([&](auto& provider) { provider.invalidate_cache(); });
     }
 
+    bool refresh_moe_experts(int layer_idx,
+                             const modules::SelectiveExpertInfo& selection,
+                             cudaStream_t stream) override {
+        if (!selection.enabled || selection.num_active == 0) {
+            return false;
+        }
+        if (mBnBProvider) {
+            if (!mBnBProvider->use_selective_dequant()) {
+                return false;
+            }
+            mBnBProvider->dequantize_selected_experts(layer_idx, selection, stream, true);
+            return true;
+        }
+        if (mFP4Provider) {
+            if (!mFP4Provider->use_selective_dequant()) {
+                return false;
+            }
+            mFP4Provider->dequantize_selected_experts(layer_idx, selection, stream, true);
+            return true;
+        }
+        // FP8 provider not yet wired for selective MoE refresh in DSL path.
+        return false;
+    }
+
+    bool debug_moe_gate_up_absmax(int layer_idx, int expert_id, int out_row,
+                                  cudaStream_t stream) override {
+        if (mBnBProvider) {
+            return mBnBProvider->debug_moe_gate_up_absmax(layer_idx, expert_id, out_row, stream);
+        }
+        return false;
+    }
+
     std::size_t quantized_weights_bytes() const override {
         return with_provider([&](const auto& provider) { return provider.quantized_weights_bytes(); });
     }
@@ -380,6 +412,17 @@ private:
             return;
         }
 
+        const bool force_full_moe_dequant =
+            mQLoRAConfig.is_moe() && mLoRAConfig.enabled() &&
+            (mOptions.SelectiveExpertDequant || mOptions.OffloadExperts);
+        if (force_full_moe_dequant) {
+            std::cerr << "[DSL QLoRA] MoE selective expert dequant disabled "
+                      << "(DSL path requires full expert weights for base MoE GEMM)\n";
+            if (mOptions.OffloadExperts) {
+                std::cerr << "[DSL QLoRA] Offload experts enabled; full expert dequant will stream all experts.\n";
+            }
+        }
+
         int device_id = 0;
         CUDA_CHECK(cudaGetDevice(&device_id));
         cudaDeviceProp device_props{};
@@ -426,8 +469,9 @@ private:
             cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
             cfg.shard_idx = comm.rank();
             cfg.num_shards = comm.world_size();
-            cfg.selective_expert_dequant = false;
-            cfg.offload_experts = false;
+            cfg.selective_expert_dequant = force_full_moe_dequant ? false : mOptions.SelectiveExpertDequant;
+            cfg.force_full_expert_dequant = force_full_moe_dequant;
+            cfg.offload_experts = mOptions.OffloadExperts;
             fill_mamba_config(cfg);
             mFP4Provider = std::make_unique<FP4Provider>(cfg, *mAllocator, device_props);
             return;
@@ -450,8 +494,9 @@ private:
             cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
             cfg.shard_idx = comm.rank();
             cfg.num_shards = comm.world_size();
-            cfg.selective_expert_dequant = false;
-            cfg.offload_experts = false;
+            cfg.selective_expert_dequant = force_full_moe_dequant ? false : mOptions.SelectiveExpertDequant;
+            cfg.force_full_expert_dequant = force_full_moe_dequant;
+            cfg.offload_experts = mOptions.OffloadExperts;
             fill_mamba_config(cfg);
             mBnBProvider = std::make_unique<BnBProvider>(cfg, *mAllocator, device_props);
             return;

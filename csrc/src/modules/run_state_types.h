@@ -36,6 +36,18 @@ struct SimplifiedLayerActivations {
     Tensor swiglu_scale;     ///< (B*T,) - per-row scale from scaled SwiGLU (nvfp4-simple recipe)
     Tensor mlp_down;         ///< (B, T, C) - down projection
 
+    // MoE activations
+    Tensor router_logits;    ///< (B*T, E) - router logits
+    Tensor router_probs;     ///< (B*T, E) - router probabilities
+    Tensor routing_weights;  ///< (B*T, K) - top-k routing weights
+    Tensor routing_indices;  ///< (B*T, K) - top-k expert indices (int32)
+    Tensor permuted_input;   ///< (B*T*K, C) - permuted inputs
+    Tensor scatter_indices;  ///< (B*T*K,) - scatter indices (int32)
+    Tensor expert_gate_up;   ///< (B*T*K, 2*MoeD) - expert gate+up output
+    Tensor expert_act;       ///< (B*T*K, MoeD) - expert activation output
+    Tensor expert_down;      ///< (B*T*K, C) - expert down output
+    Tensor moe_out;          ///< (B*T, C) - combined MoE output (view of mlp_down)
+
     // Mamba / SSM activations (Nemotron-H)
     Tensor mamba_gate;       ///< (B, T, D) - gate projection
     Tensor mamba_conv_in;    ///< (B, conv_dim, T) - input to conv1d (channel-first)
@@ -131,6 +143,12 @@ struct ScratchBuffers {
     Tensor cross_entropy_dloss;  ///< [B*T] per-token d_loss (filled with scalar)
     Tensor cross_entropy_logsumexp;       ///< [B*T] final logsumexp per token
     Tensor cross_entropy_chunk_logsumexp; ///< [B*T, n_chunks] intermediate logsumexp per chunk
+    // Attention fallback buffers (FP32). Used when cuDNN backward is unavailable (e.g., GQA).
+    Tensor attn_qkv_f32;
+    Tensor attn_out_f32;
+    Tensor attn_d_out_f32;
+    Tensor attn_d_qkv_f32;
+    Tensor attn_lse_f32;
     // cuDNN attention backward workspace.
     // Like legacy `LLamaRunState::CuDNNWorkspace`, this is a descriptor that is backed by the DeviceMemoryStack
     // via temp_acquire/temp_free, so it can overlap with other temporaries (e.g. output logits chunks).

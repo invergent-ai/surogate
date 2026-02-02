@@ -37,6 +37,15 @@ namespace dsl {
 void GraphExecutor::recompute_block(int layer_idx, long B, long T) {
     if (!mOptions.recompute_enabled()) return;
     if (!mRecomputePlan || mRecomputePlan->empty()) {
+        if (mRunState.is_lora_only_mode()) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr,
+                        "[WARN] DSL recompute plan missing; skipping recompute in LoRA mode.\n");
+                warned = true;
+            }
+            return;
+        }
         throw std::runtime_error("DSL recompute plan missing; hardcoded path removed");
     }
     mRecomputePlan->execute_layer(*this, layer_idx, B, T,

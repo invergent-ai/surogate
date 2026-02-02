@@ -104,67 +104,255 @@ class Qwen3MoEBlock:
     # =========================================================================
 
     # Pre-attention normalization
-    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"])
+    ln1 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln1_flat"],
+        recompute=True,
+        # Recompute LN1 directly from saved res_ffn + rstd.
+        # This matches implementation (res_ffn is retrieved from residual storage, not re-derived).
+        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
+        recompute_op="rmsnorm_apply_saved",
+        recompute_policy="fft_only",
+    )
     ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN1")
 
     # QKV projection and RoPE
-    qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat", "qkv_biased"])
-    qkv_rope = Activation(Tensor["B", "T", "QKV"],
-                          description="QKV after QK-Norm + RoPE")
+    qkv = Activation(
+        Tensor["B", "T", "QKV"],
+        aliases=["qkv_flat", "qkv_biased"],
+        save=True,
+        recompute=True,
+        recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
+        recompute_policy="fft_only",
+        lora_targets=["q", "k", "v"],
+    )
+    qkv_rope = Activation(
+        Tensor["B", "T", "QKV"],
+        save=True,
+        recompute=True,
+        recompute_group="qk_norm_rope",
+        recompute_outputs=["qkv_rope", "q_rstd", "k_rstd"],
+        recompute_from=[
+            "qkv",
+            "@global:freq_cis",
+            "@input:position_ids",
+            "?@param:q_norm_weight",
+            "?@param:k_norm_weight",
+        ],
+        recompute_op="qkv_qk_norm_rope",
+        recompute_attrs={"rotary_dim": "D"},
+        recompute_policy="fft_only",
+        description="QKV after QK-Norm + RoPE",
+    )
 
     # QK-norm RSTDs (conditional on use_qk_norm)
-    q_rstd = Activation(Tensor["B", "T", "Hq"], dtype="fp32", save=True,
-                        when="use_qk_norm", description="Q head RMSNorm rstd")
-    k_rstd = Activation(Tensor["B", "T", "Hkv"], dtype="fp32", save=True,
-                        when="use_qk_norm", description="K head RMSNorm rstd")
+    q_rstd = Activation(
+        Tensor["B", "T", "Hq"],
+        dtype="fp32",
+        save=True,
+        recompute=True,
+        recompute_group="qk_norm_rope",
+        recompute_policy="fft_only",
+        when="use_qk_norm",
+        description="Q head RMSNorm rstd",
+    )
+    k_rstd = Activation(
+        Tensor["B", "T", "Hkv"],
+        dtype="fp32",
+        save=True,
+        recompute=True,
+        recompute_group="qk_norm_rope",
+        recompute_policy="fft_only",
+        when="use_qk_norm",
+        description="K head RMSNorm rstd",
+    )
 
     # Attention
-    att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat", "attn"],
-                     description="Attention output (pre out-proj)")
-    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True,
-                     description="Log-sum-exp from flash attention")
-    att_out = Activation(Tensor["B", "T", "C"], aliases=["att_out_flat"],
-                         description="After output projection")
+    att = Activation(
+        Tensor["B", "T", "AttnDim"],
+        aliases=["att_flat", "attn"],
+        save=True,
+        recompute=True,
+        recompute_group="attn_fwd",
+        recompute_outputs=["att", "lse"],
+        recompute_from=["qkv_rope"],
+        recompute_op="flash_attention",
+        recompute_attrs={"attn_impl": "cudnn"},
+        recompute_policy="fft_only",
+        description="Attention output (pre out-proj)",
+    )
+    lse = Activation(
+        Tensor["B", "Hq", "T"],
+        dtype="fp32",
+        save=True,
+        recompute=True,
+        recompute_group="attn_fwd",
+        recompute_policy="fft_only",
+        description="Log-sum-exp from flash attention",
+    )
+    att_out = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["att_out_flat"],
+        recompute=True,
+        recompute_from=["att", "@param:out_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
+        recompute_policy="fft_only",
+        lora_targets=["o"],
+        description="After output projection",
+    )
 
-    # Mid residual (attention output added to residual)
-    residual_mid = Activation(Tensor["B", "T", "C"],
-                              description="Residual after attention")
+    # First residual (residual + input before attention)
+    res_ffn = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_ffn"],
+        # res_ffn is stored via residual manager; do not mark as recompute.
+        description="Residual + input (pre-attention)",
+    )
+
+    # Mid residual after attention + LN2
+    res_att = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_att"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_outputs=["res_att", "ln2"],
+        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
+        recompute_op="fused_residual_rmsnorm_apply_saved",
+        recompute_policy="fft_only",
+        description="Residual after attention (pre-MoE)",
+    )
 
     # Pre-MoE normalization
-    ln2 = Activation(Tensor["B", "T", "C"], aliases=["ln2_flat"])
+    ln2 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln2_flat"],
+        save=True,
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_policy="fft_only",
+    )
     ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN2")
 
     # Router
-    router_logits = Activation(Tensor["B * T", "E"],
-                               description="Router logits before softmax/sigmoid")
-    router_probs = Activation(Tensor["B * T", "E"],
-                              description="Router probabilities after normalization")
+    router_logits = Activation(
+        Tensor["B * T", "E"],
+        save=True,
+        recompute=True,
+        recompute_from=["ln2", "@param:router_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"transpose": "NT"},
+        # Router matmul uses quantized weights under QLoRA; skip recompute in LoRA mode.
+        recompute_policy="fft_only",
+        description="Router logits before softmax/sigmoid",
+    )
+    router_probs = Activation(
+        Tensor["B * T", "E"],
+        save=True,
+        recompute=True,
+        recompute_from=["router_logits"],
+        recompute_op="moe_router_probs",
+        # Depends on router_logits; skip recompute in LoRA mode.
+        recompute_policy="fft_only",
+        description="Router probabilities after normalization",
+    )
 
     # Routing (top-k selection)
-    routing_weights = Activation(Tensor["B * T", "K"], save=True,
-                                 description="Routing weights for selected experts")
-    routing_indices = Activation(Tensor["B * T", "K"], dtype="int32", save=True,
-                                 description="Expert indices for each token")
+    routing_weights = Activation(
+        Tensor["B * T", "K"],
+        save=True,
+        recompute=True,
+        recompute_group="moe_topk",
+        recompute_outputs=["routing_weights", "routing_indices"],
+        recompute_from=["router_probs"],
+        recompute_op="moe_topk",
+        recompute_attrs={"top_k": "K", "normalize": "norm_topk_prob"},
+        recompute_policy="fft_only",
+        description="Routing weights for selected experts",
+    )
+    routing_indices = Activation(
+        Tensor["B * T", "K"],
+        dtype="int32",
+        save=True,
+        recompute=True,
+        recompute_group="moe_topk",
+        recompute_policy="fft_only",
+        description="Expert indices for each token",
+    )
 
     # MoE permutation
-    permuted_input = Activation(Tensor["B * T * K", "C"],
-                                description="Permuted input for grouped GEMM")
-    scatter_indices = Activation(Tensor["B * T * K"], dtype="int32", save=True,
-                                 description="Indices for scattering back to original order")
+    permuted_input = Activation(
+        Tensor["B * T * K", "C"],
+        save=True,
+        recompute=True,
+        recompute_group="moe_permute",
+        recompute_outputs=["permuted_input", "scatter_indices"],
+        recompute_from=["ln2", "routing_indices"],
+        recompute_op="moe_permute",
+        recompute_attrs={"top_k": "K"},
+        # Recompute only in FFT mode; in LoRA/QLoRA use saved tensors to avoid
+        # recompute drift and quantized-weight path mismatches.
+        recompute_policy="fft_only",
+        description="Permuted input for grouped GEMM",
+    )
+    scatter_indices = Activation(
+        Tensor["B * T * K"],
+        dtype="int32",
+        save=True,
+        recompute=True,
+        recompute_group="moe_permute",
+        recompute_policy="fft_only",
+        description="Indices for scattering back to original order",
+    )
 
     # Expert computations
-    expert_gate_up = Activation(Tensor["B * T * K", "MUp"],
-                                description="Expert gate+up projection output")
-    expert_act = Activation(Tensor["B * T * K", "M"],
-                            description="Expert SwiGLU activation output")
-    expert_down = Activation(Tensor["B * T * K", "C"],
-                             description="Expert down projection output")
+    expert_gate_up = Activation(
+        Tensor["B * T * K", "MUp"],
+        save=True,
+        recompute=True,
+        recompute_from=["permuted_input", "@param:experts_gate_up", "scatter_indices"],
+        recompute_op="moe_grouped_gemm_gate_up",
+        # Expert GEMM uses quantized weights under QLoRA; skip recompute in LoRA mode.
+        recompute_policy="fft_only",
+        description="Expert gate+up projection output",
+    )
+    expert_act = Activation(
+        Tensor["B * T * K", "M"],
+        save=True,
+        recompute=True,
+        recompute_from=["expert_gate_up"],
+        recompute_op="swiglu",
+        recompute_attrs={"activation": "swiglu"},
+        recompute_policy="fft_only",
+        description="Expert SwiGLU activation output",
+    )
+    expert_down = Activation(
+        Tensor["B * T * K", "C"],
+        save=True,
+        recompute=True,
+        recompute_from=["expert_act", "@param:experts_down", "scatter_indices"],
+        recompute_op="moe_grouped_gemm_down",
+        # Expert GEMM uses quantized weights under QLoRA; skip recompute in LoRA mode.
+        recompute_policy="fft_only",
+        description="Expert down projection output",
+    )
 
     # MoE output
-    moe_out = Activation(Tensor["B * T", "C"], aliases=["moe_out_flat"],
-                         description="Combined MoE output")
+    moe_out = Activation(
+        Tensor["B * T", "C"],
+        aliases=["moe_out_flat"],
+        save=True,
+        recompute=True,
+        recompute_from=["expert_down", "routing_weights", "scatter_indices"],
+        recompute_op="moe_unpermute",
+        recompute_attrs={"top_k": "K"},
+        recompute_policy="fft_only",
+        description="Combined MoE output",
+    )
 
     # Shared expert (conditional)
     shared_gate = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert",
@@ -178,9 +366,9 @@ class Qwen3MoEBlock:
     shared_out = Activation(Tensor["B * T", "C"], when="use_shared_expert",
                             description="Shared expert output")
 
-    # Final residual
-    res_ffn = Activation(Tensor["B", "T", "C"], aliases=["residual_ffn"],
-                         description="Residual + MoE (block output)")
+    # Final output (MoE output in block output slot)
+    mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"],
+                          description="MoE output (block output)")
 
     # =========================================================================
     # Gradient slots (backward pass)
@@ -192,12 +380,16 @@ class Qwen3MoEBlock:
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_att_out = Gradient(Tensor["B", "T", "C"], gradient_of="att_out")
     d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
+    d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
     d_router_logits = Gradient(Tensor["B * T", "E"], gradient_of="router_logits")
-    d_permuted_input = Gradient(Tensor["B * T * K", "C"], gradient_of="permuted_input")
+    d_permuted_input = Gradient(Tensor["B * T * K", "C"], gradient_of="permuted_input",
+                                alias_of="permuted_input")
     d_expert_gate_up = Gradient(Tensor["B * T * K", "MUp"], gradient_of="expert_gate_up")
-    d_expert_act = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_act")
+    d_expert_act = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_act",
+                            alias_of="expert_act")
     d_expert_down = Gradient(Tensor["B * T * K", "C"], gradient_of="expert_down")
     d_moe_out = Gradient(Tensor["B * T", "C"], gradient_of="moe_out")
+    d_mlp_down = Gradient(Tensor["B", "T", "C"], gradient_of="mlp_down")
     d_shared_hidden = Gradient(Tensor["B * T", "SharedM"], gradient_of="shared_hidden",
                                when="use_shared_expert")
     d_res_ffn = Gradient(Tensor["B", "T", "C"], gradient_of="res_ffn")
@@ -214,8 +406,11 @@ class Qwen3MoEBlock:
             # ================================================================
             # Pre-attention norm
             # ================================================================
-            residual_mid, ln1_out, _ = g.fused_residual_rmsnorm(
-                residual, x, "ln1_weight", eps=self.eps
+            res_ffn, ln1_out, ln1_rstd = g.fused_residual_rmsnorm(
+                residual, x, "ln1_weight", eps=self.eps,
+                res_out_name="res_ffn",
+                y_name="ln1",
+                rstd_name="ln1_rstd",
             )
 
             # ================================================================
@@ -255,8 +450,11 @@ class Qwen3MoEBlock:
             # ================================================================
             # Pre-MoE norm
             # ================================================================
-            residual_out, ln2_out, _ = g.fused_residual_rmsnorm(
-                residual_mid, att_out, "ln2_weight", eps=self.eps
+            res_att, ln2_out, ln2_rstd = g.fused_residual_rmsnorm(
+                res_ffn, att_out, "ln2_weight", eps=self.eps,
+                res_out_name="res_att",
+                y_name="ln2",
+                rstd_name="ln2_rstd",
             )
 
             # ================================================================
@@ -265,40 +463,40 @@ class Qwen3MoEBlock:
             ln2_flat = g.view(ln2_out, shape=[B * T, self.C], out_name="ln2_flat")
 
             # Router: compute routing logits and select top-k experts
-            router_logits = g.matmul(ln2_flat, "router_weight", transpose="NT")
+            router_logits = g.matmul(ln2_flat, "router_weight", transpose="NT", out_name="router_logits")
 
-            # Softmax or sigmoid for routing probabilities
-            if self.norm_topk_prob:
-                router_probs = g.moe_sigmoid(router_logits)
-            else:
-                router_probs = g.moe_softmax(router_logits)
+            # Qwen3 MoE uses softmax routing; norm_topk_prob controls renormalization after top-k.
+            router_probs = g.moe_softmax(router_logits, out_name="router_probs")
 
             # Top-k selection
             routing_weights, routing_indices = g.moe_topk(
-                router_probs, top_k=self.num_experts_per_tok, normalize=self.norm_topk_prob
+                router_probs, top_k=self.num_experts_per_tok, normalize=self.norm_topk_prob,
+                weights_name="routing_weights", indices_name="routing_indices",
             )
 
             # Permute inputs for grouped expert computation
             permuted_input, scatter_indices = g.moe_permute(
-                ln2_flat, routing_indices, top_k=self.num_experts_per_tok
+                ln2_flat, routing_indices, top_k=self.num_experts_per_tok,
+                out_name="permuted_input", scatter_name="scatter_indices",
             )
 
             # Grouped GEMM for gate+up projection
             expert_gate_up = g.moe_grouped_gemm_gate_up(
-                permuted_input, "experts_gate_up", scatter_indices
+                permuted_input, "experts_gate_up", scatter_indices, out_name="expert_gate_up",
             )
 
             # SwiGLU activation
-            expert_act = g.swiglu(expert_gate_up)
+            expert_act = g.swiglu(expert_gate_up, out_name="expert_act")
 
             # Grouped GEMM for down projection
             expert_down = g.moe_grouped_gemm_down(
-                expert_act, "experts_down", scatter_indices
+                expert_act, "experts_down", scatter_indices, out_name="expert_down",
             )
 
             # Unpermute and combine with routing weights
             moe_out = g.moe_unpermute(
-                expert_down, routing_weights, scatter_indices, top_k=self.num_experts_per_tok
+                expert_down, routing_weights, scatter_indices, top_k=self.num_experts_per_tok,
+                out_name="moe_out",
             )
 
             # ================================================================
@@ -312,9 +510,10 @@ class Qwen3MoEBlock:
                 shared_hidden = g.mul(shared_gate_act, shared_up)
                 shared_out = g.matmul(shared_hidden, "shared_expert_down", transpose="NT")
                 # Add shared expert output to MoE output
-                moe_out = g.add(moe_out, shared_out)
+                # Write combined output into the persistent MoE output slot
+                moe_out = g.add(moe_out, shared_out, out_name="moe_out")
 
             # Reshape back to (B, T, C)
-            out = g.view(moe_out, shape=[B, T, self.C], out_name="res_ffn")
+            out = g.view(moe_out, shape=[B, T, self.C], out_name="mlp_down")
 
-            return out, residual_out
+            return out, res_att

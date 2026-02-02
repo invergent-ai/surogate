@@ -210,7 +210,9 @@ class Qwen3MoEModel:
             # Final norm - use explicit names for outputs to map to C++ activation slots
             residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
                 residualN, xN, "final_norm", eps=self.eps,
-                y_name="xF"  # Map to LNFinal slot in C++
+                res_out_name="residual_final",
+                y_name="xF",  # Map to LNFinal slot in C++
+                rstd_name="ln_final_rstd",
             )
 
             # Fused LM head + loss

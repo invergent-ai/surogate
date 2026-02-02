@@ -149,6 +149,7 @@ void TensorSlotRegistry::init_from_layout(const ActivationLayoutIR& layout) {
         entry.lora_targets = slot_ir.lora_targets;
         entry.memory_hint = slot_ir.memory_hint;
         entry.shares_with = slot_ir.shares_with;
+        entry.alias_of = slot_ir.alias_of;
         entry.condition = slot_ir.condition;
 
         // Map to TensorSlot enum for fast runtime dispatch
@@ -190,6 +191,7 @@ void TensorSlotRegistry::init_from_layout(const ActivationLayoutIR& layout) {
         entry.gradient_of = slot_ir.gradient_of;
         entry.memory_hint = slot_ir.memory_hint;
         entry.shares_with = slot_ir.shares_with;
+        entry.alias_of = slot_ir.alias_of;
         entry.condition = slot_ir.condition;
 
         // Map to TensorSlot enum for fast runtime dispatch

@@ -257,6 +257,7 @@ ActivationSlotIR parse_activation_slot(const nlohmann::json& slot_json) {
         }
     }
     slot.gradient_of = slot_json.value("gradient_of", "");
+    slot.alias_of = slot_json.value("alias_of", "");
     slot.condition = slot_json.value("condition", "");
     slot.description = slot_json.value("description", "");
     return slot;

@@ -186,6 +186,9 @@ void GraphExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
     mLoRAWeights = weights;
     mLoRAGrads = grads;
     mLoRARunState = run_state;
+    if (mCompiledExecutor) {
+        mCompiledExecutor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
+    }
 }
 
 void GraphExecutor::reset_cuda_graphs() {

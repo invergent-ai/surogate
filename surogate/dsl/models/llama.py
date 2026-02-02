@@ -19,6 +19,7 @@ from ..hf import fuse
     d_ff="intermediate_size",
     vocab_size="vocab_size",
     max_seq="max_position_embeddings",
+    head_size="head_dim",
     eps="rms_norm_eps",
 )
 class LlamaModel:
@@ -153,7 +154,9 @@ class LlamaModel:
             # Final norm - use explicit names for outputs to map to C++ activation slots
             residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
                 residualN, xN, "final_norm", eps=self.eps,
-                y_name="xF"  # Map to LNFinal slot in C++
+                res_out_name="residual_final",
+                y_name="xF",  # Map to LNFinal slot in C++
+                rstd_name="ln_final_rstd",
             )
 
             # Fused LM head + loss

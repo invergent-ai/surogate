@@ -6,9 +6,12 @@
 #include "dsl/dsl_run_state.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
+#include "dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "models/qwen3moe/config.h"
 #include "training/runtime_options.h"
 #include "modules/fp8_run_state.h"
 #include "modules/fp8_scaling_config.h"
@@ -173,6 +176,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
     const long MUp = 2 * M;
+    const auto* moe_cfg = cfg.is_moe() ? dynamic_cast<const Qwen3MoEConfig*>(&cfg) : nullptr;
+    const long NumExperts = moe_cfg ? moe_cfg->NumExperts : 0;
+    const long TopK = (moe_cfg && moe_cfg->NumExpertsPerTok > 0) ? moe_cfg->NumExpertsPerTok : 1;
+    const long MoeM = (moe_cfg && moe_cfg->MoeIntermediateSize > 0) ? moe_cfg->MoeIntermediateSize : cfg.IntermediateSize;
+    const long MoeMUp = 2 * MoeM;
     const bool use_qk_norm = cfg.UseQKNorm;
 
     const auto dtype = mActivationDtype;
@@ -305,6 +313,32 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.mlp_down = shared_mlp_down;
         } else {
             acts.mlp_down = mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
+        }
+
+        if (NumExperts > 0) {
+            const long num_tokens = B * T;
+            const long total_tokens = num_tokens * TopK;
+            acts.router_logits = mAllocator->allocate(dtype, "router_logits", kind, {num_tokens, NumExperts});
+            acts.router_probs = mAllocator->allocate(dtype, "router_probs", kind, {num_tokens, NumExperts});
+            acts.routing_weights = mAllocator->allocate(dtype, "routing_weights", kind, {num_tokens, TopK});
+            acts.routing_indices = mAllocator->allocate(ETensorDType::INT32, "routing_indices", kind, {num_tokens, TopK});
+            acts.permuted_input = mAllocator->allocate(dtype, "permuted_input", kind, {total_tokens, C});
+            acts.scatter_indices = mAllocator->allocate(ETensorDType::INT32, "scatter_indices", kind, {total_tokens});
+            acts.expert_gate_up = mAllocator->allocate(dtype, "expert_gate_up", kind, {total_tokens, MoeMUp});
+            acts.expert_act = mAllocator->allocate(dtype, "expert_act", kind, {total_tokens, MoeM});
+            acts.expert_down = mAllocator->allocate(dtype, "expert_down", kind, {total_tokens, C});
+            acts.moe_out = view_tensor(acts.mlp_down, {num_tokens, C});
+        } else {
+            acts.router_logits = {};
+            acts.router_probs = {};
+            acts.routing_weights = {};
+            acts.routing_indices = {};
+            acts.permuted_input = {};
+            acts.scatter_indices = {};
+            acts.expert_gate_up = {};
+            acts.expert_act = {};
+            acts.expert_down = {};
+            acts.moe_out = {};
         }
     }
 
@@ -524,6 +558,7 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long Hq = cfg.NumQueryHeads;
     const long Hkv = cfg.NumKeyValHeads;
     const long QKV = D * (Hq + 2 * Hkv);
+    const long C_attn = Hq * D;
 
     const long rmsnorm_scratch_bytes = static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(C), DeviceProp));
     mScratch.rmsnorm_scratch = mAllocator->allocate(
@@ -556,6 +591,20 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(
             ETensorDType::FP32, "cross_entropy_chunk_logsumexp", EAllocationType::ON_DEVICE,
             {BT, n_chunks});
+    }
+
+    const bool need_attn_fallback = (Hq != Hkv) || (std::getenv("SUROGATE_ATTN_BWD_CUSTOM") != nullptr);
+    if (need_attn_fallback) {
+        mScratch.attn_qkv_f32 = mAllocator->allocate(
+            ETensorDType::FP32, "attn_qkv_f32", EAllocationType::ON_DEVICE, {B, T, QKV});
+        mScratch.attn_out_f32 = mAllocator->allocate(
+            ETensorDType::FP32, "attn_out_f32", EAllocationType::ON_DEVICE, {B, T, C_attn});
+        mScratch.attn_d_out_f32 = mAllocator->allocate(
+            ETensorDType::FP32, "attn_d_out_f32", EAllocationType::ON_DEVICE, {B, T, C_attn});
+        mScratch.attn_d_qkv_f32 = mAllocator->allocate(
+            ETensorDType::FP32, "attn_d_qkv_f32", EAllocationType::ON_DEVICE, {B, T, QKV});
+        mScratch.attn_lse_f32 = mAllocator->allocate(
+            ETensorDType::FP32, "attn_lse_f32", EAllocationType::ON_DEVICE, {B, Hq, T});
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely

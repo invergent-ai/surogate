@@ -352,7 +352,10 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
     dim3 grid_dim{(unsigned)Hq, (unsigned)B, (unsigned)T};
     dim3 block_dim{512, 1, 1};
     size_t smem = Hs * sizeof(float) * block_dim.x / 16;
-    cudaMemsetAsync(dqkv, 0, sizeof(float)*B*T*(Hq + 2*Hkv) * Hs, stream);
+    const size_t dqkv_bytes =
+        static_cast<size_t>(B) * static_cast<size_t>(T) *
+        static_cast<size_t>(Hq + 2 * Hkv) * static_cast<size_t>(Hs) * sizeof(floatX);
+    cudaMemsetAsync(dqkv, 0, dqkv_bytes, stream);
     if (Hs == 128) {
         attention_backward_gpu_kernel<128><<<grid_dim, block_dim, smem, stream>>>(
             dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv);

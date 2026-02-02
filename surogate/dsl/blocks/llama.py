@@ -68,37 +68,114 @@ class LlamaBlock:
         # Recompute LN1 directly from saved res_ffn + rstd to match implementation.
         recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
         recompute_op="rmsnorm_apply_saved",
-        recompute_policy="fft_only",
+        recompute_policy="always",  # Recompute in both FFT and LoRA modes
     )
     ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN1")
 
     # QKV projection and RoPE
-    qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat"])
-    qkv_rope = Activation(Tensor["B", "T", "QKV"],
-                          description="QKV after RoPE")
+    qkv = Activation(
+        Tensor["B", "T", "QKV"],
+        aliases=["qkv_flat"],
+        save=True,
+        recompute=True,
+        recompute_from=["ln1", "@param:qkv_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
+        recompute_policy="fft_only",
+        lora_targets=["q", "k", "v"],
+    )
+    qkv_rope = Activation(
+        Tensor["B", "T", "QKV"],
+        save=True,
+        recompute=True,
+        recompute_from=["qkv", "@global:freq_cis", "@input:position_ids"],
+        recompute_op="rope",
+        recompute_attrs={"rotary_dim": "D"},
+        recompute_policy="fft_only",
+        description="QKV after RoPE",
+    )
 
     # Attention
-    att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat", "attn"],
-                     description="Attention output (pre out-proj)")
-    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True,
-                     description="Log-sum-exp from flash attention")
-    att_out = Activation(Tensor["B", "T", "C"], aliases=["att_out_flat"],
-                         description="After output projection")
+    att = Activation(
+        Tensor["B", "T", "AttnDim"],
+        aliases=["att_flat", "attn"],
+        save=True,
+        recompute=True,
+        recompute_group="attn_fwd",
+        recompute_outputs=["att", "lse"],
+        recompute_from=["qkv_rope"],
+        recompute_op="flash_attention",
+        recompute_attrs={"attn_impl": "cudnn"},
+        recompute_policy="fft_only",
+        description="Attention output (pre out-proj)",
+    )
+    lse = Activation(
+        Tensor["B", "Hq", "T"],
+        dtype="fp32",
+        save=True,
+        recompute=True,
+        recompute_group="attn_fwd",
+        recompute_policy="fft_only",
+        description="Log-sum-exp from flash attention",
+    )
+    att_out = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["att_out_flat"],
+        recompute=True,
+        recompute_from=["att", "@param:out_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
+        recompute_policy="fft_only",
+        lora_targets=["o"],
+        description="After output projection",
+    )
 
     # First residual
-    res_att = Activation(Tensor["B", "T", "C"], aliases=["residual_att"],
-                         description="Residual + attention")
+    res_att = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_att"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_outputs=["res_att", "ln2"],
+        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
+        recompute_op="fused_residual_rmsnorm_apply_saved",
+        recompute_policy="always",  # Recompute in both FFT and LoRA modes
+        description="Residual + attention",
+    )
 
     # Pre-MLP normalization
-    ln2 = Activation(Tensor["B", "T", "C"], aliases=["ln2_flat"])
+    ln2 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln2_flat"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_policy="always",  # Recompute in both FFT and LoRA modes
+    )
     ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
                           description="RMSNorm reciprocal std for LN2")
 
     # MLP
-    mlp_up = Activation(Tensor["B", "T", "MUp"], aliases=["mlp_up_flat"])
-    swiglu = Activation(Tensor["B", "T", "M"], aliases=["swiglu_flat"],
-                        description="SwiGLU activation output")
+    mlp_up = Activation(
+        Tensor["B", "T", "MUp"],
+        aliases=["mlp_up_flat"],
+        recompute=True,
+        recompute_from=["ln2", "@param:mlp_up_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
+        recompute_policy="fft_only",
+        lora_targets=["up", "gate"],
+    )
+    swiglu = Activation(
+        Tensor["B", "T", "M"],
+        aliases=["swiglu_flat"],
+        recompute=True,
+        recompute_from=["mlp_up"],
+        recompute_op="swiglu",
+        recompute_attrs={"activation": "swiglu"},
+        recompute_policy="fft_only",
+        description="SwiGLU activation output",
+    )
     mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"],
                           description="MLP down projection output")
 

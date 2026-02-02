@@ -62,6 +62,8 @@ public:
 
     /// Wire an external QLoRA weight provider (optional).
     void set_qlora_provider(QLoRAWeightProvider* provider) { mQLoRAProvider = provider; }
+    /// Access the QLoRA provider (if any).
+    [[nodiscard]] QLoRAWeightProvider* qlora_provider() const { return mQLoRAProvider; }
     /// Wire a DslWeightManager (optional).
     void set_weight_manager(DslWeightManager* manager) { mWeightManager = manager; }
     /// Set default stream for provider-backed resolution.

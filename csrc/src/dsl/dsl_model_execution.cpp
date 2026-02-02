@@ -593,10 +593,31 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const long QKV = mModelConfig.head_size() * (mModelConfig.NumQueryHeads + 2 * mModelConfig.NumKeyValHeads);
     const long MUp = static_cast<long>(mModelConfig.mlp_up_rows());
     const long extra_tmp = std::max({BT * C, BT * QKV, BT * MUp}) * dtype_bytes;
+    long attn_fallback_bytes = 0;
+    const bool gqa_fallback = (mModelConfig.NumQueryHeads != mModelConfig.NumKeyValHeads) ||
+                              (std::getenv("SUROGATE_ATTN_BWD_CUSTOM") != nullptr);
+    if (gqa_fallback) {
+        const long fp32_bytes = 4;
+        const long qkv_elems = BT * QKV;
+        const long out_elems = BT * C;
+        const long lse_elems = BT * mModelConfig.NumQueryHeads;
+        attn_fallback_bytes = fp32_bytes * (2 * qkv_elems + 2 * out_elems + lse_elems);
+    }
     const long safety_bytes = std::max(64L * 1024 * 1024, base_size / 8);
-    long required_size = std::max(1024L * 1024, base_size + base_size + moe_extra + safety_bytes + extra_tmp);
+    long required_size = std::max(1024L * 1024,
+                                  base_size + base_size + moe_extra + safety_bytes + extra_tmp + attn_fallback_bytes);
     required_size += 512L * 1024 * 1024;  // extra slack for unmodeled temps
-    required_size = std::max(required_size, 3L * 1024 * 1024 * 1024);  // 3GB minimum for full fine-tune stability
+    long moe_stack_slack = 0;
+    if (mModelConfig.NumExperts > 0) {
+        moe_stack_slack = 2048L * 1024 * 1024;  // MoE backward temps can spike beyond simulated high-water mark
+    }
+    if (const char* env = std::getenv("SUROGATE_STACK_SLACK_MB")) {
+        const long mb = std::max(0L, std::atol(env));
+        moe_stack_slack = std::max(moe_stack_slack, mb * 1024 * 1024);
+    }
+    required_size += moe_stack_slack;
+    const long min_stack_bytes = 3L * 1024 * 1024 * 1024 + attn_fallback_bytes + moe_stack_slack;
+    required_size = std::max(required_size, min_stack_bytes);  // 3GB+fallback minimum for full fine-tune stability
     const auto high_mark = mRunState->Stack.get_high_mark();
     Tensor stack_buffer = mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {required_size});
     mRunState->set_stack_buffer(std::move(stack_buffer), high_mark);

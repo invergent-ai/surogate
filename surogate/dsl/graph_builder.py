@@ -754,9 +754,9 @@ class GraphBuilder:
     # MoE Operations
     # =========================================================================
 
-    def moe_softmax(self, logits: str | GraphRef) -> GraphRef:
+    def moe_softmax(self, logits: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """MoE router softmax."""
-        out = self._fresh_name("moe_probs")
+        out = out_name or self._fresh_name("moe_probs")
         self._add_node(GraphNode(
             op="moe_softmax",
             inputs=[self._resolve_input(logits)],
@@ -764,9 +764,9 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def moe_sigmoid(self, logits: str | GraphRef) -> GraphRef:
+    def moe_sigmoid(self, logits: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """MoE router sigmoid."""
-        out = self._fresh_name("moe_probs")
+        out = out_name or self._fresh_name("moe_probs")
         self._add_node(GraphNode(
             op="moe_sigmoid",
             inputs=[self._resolve_input(logits)],
@@ -780,10 +780,12 @@ class GraphBuilder:
         *,
         top_k: int,
         normalize: bool = True,
+        weights_name: str | None = None,
+        indices_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
         """MoE top-k selection. Returns (weights, indices)."""
-        weights = self._fresh_name("moe_weights")
-        indices = self._fresh_name("moe_indices")
+        weights = weights_name or self._fresh_name("moe_weights")
+        indices = indices_name or self._fresh_name("moe_indices")
         self._add_node(GraphNode(
             op="moe_topk",
             inputs=[self._resolve_input(probs)],
@@ -798,10 +800,12 @@ class GraphBuilder:
         indices: str | GraphRef,
         *,
         top_k: int,
+        out_name: str | None = None,
+        scatter_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
         """MoE input permutation. Returns (permuted_input, scatter_indices)."""
-        permuted = self._fresh_name("moe_permuted")
-        scatter_indices = self._fresh_name("moe_scatter_indices")
+        permuted = out_name or self._fresh_name("moe_permuted")
+        scatter_indices = scatter_name or self._fresh_name("moe_scatter_indices")
         self._add_node(GraphNode(
             op="moe_permute",
             inputs=[self._resolve_input(x), self._resolve_input(indices)],
@@ -817,9 +821,10 @@ class GraphBuilder:
         indices: str | GraphRef,
         *,
         top_k: int,
+        out_name: str | None = None,
     ) -> GraphRef:
         """MoE output unpermutation and combination."""
-        out = self._fresh_name("moe_combined")
+        out = out_name or self._fresh_name("moe_combined")
         self._add_node(GraphNode(
             op="moe_unpermute",
             inputs=[
@@ -856,6 +861,7 @@ class GraphBuilder:
         x: str | GraphRef,
         weights: str,
         scatter_indices: str | GraphRef,
+        out_name: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM for gate+up projection.
 
@@ -867,7 +873,7 @@ class GraphBuilder:
         Returns:
             Output tensor (total_tokens, 2*intermediate_size)
         """
-        out = self._fresh_name("moe_gate_up")
+        out = out_name or self._fresh_name("moe_gate_up")
         self._add_node(GraphNode(
             op="moe_grouped_gemm_gate_up",
             inputs=[
@@ -884,6 +890,7 @@ class GraphBuilder:
         x: str | GraphRef,
         weights: str,
         scatter_indices: str | GraphRef,
+        out_name: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM for down projection.
 
@@ -895,7 +902,7 @@ class GraphBuilder:
         Returns:
             Output tensor (total_tokens, hidden_size)
         """
-        out = self._fresh_name("moe_down")
+        out = out_name or self._fresh_name("moe_down")
         self._add_node(GraphNode(
             op="moe_grouped_gemm_down",
             inputs=[

@@ -18,6 +18,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cublas_v2.h>
 #include <cfloat>
@@ -415,6 +416,9 @@ __global__ void moe_unpermute_and_combine_kernel(
         for (int k = 0; k < top_k; k++) {
             int assignment_idx = token_idx * top_k + k;
             int expert_pos = scatter_indices[assignment_idx];
+            if (expert_pos < 0 || expert_pos >= total_tokens) {
+                continue;
+            }
             float weight = static_cast<float>(weights[k]);
             float val = static_cast<float>(expert_out[expert_pos * hidden_size + d]);
             acc += weight * val;
@@ -1561,6 +1565,41 @@ void moe_grouped_gemm_gate_up_impl(
     const float beta = 0.0f;
     const int out_dim = 2 * intermediate_size;
 
+    // Optional debug: force per-expert GEMM loop to bypass grouped GEMM.
+    static int force_loop = -1;
+    if (force_loop < 0) {
+        force_loop = (std::getenv("SUROGATE_MOE_GEMM_LOOP") != nullptr) ? 1 : 0;
+    }
+    if (force_loop) {
+        static int force_default_algo = -1;
+        if (force_default_algo < 0) {
+            force_default_algo = (std::getenv("SUROGATE_MOE_GEMM_DEFAULT") != nullptr) ? 1 : 0;
+        }
+        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT
+                                                         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        for (int e = 0; e < n_active; ++e) {
+            int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+            int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
+            if (tokens_e == 0) continue;
+            const int weight_idx = weight_is_compact ? e : global_idx;
+            const T* A_ptr = weights + weight_idx * out_dim * hidden_size;
+            const T* B_ptr = input + h_offsets[global_idx] * hidden_size;
+            T* C_ptr = output + h_offsets[global_idx] * out_dim;
+
+            CUBLAS_CHECK(cublasGemmEx(
+                cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                out_dim, tokens_e, hidden_size,
+                &alpha,
+                A_ptr, cublas_dtype<T>(), hidden_size,
+                B_ptr, cublas_dtype<T>(), hidden_size,
+                &beta,
+                C_ptr, cublas_dtype<T>(), out_dim,
+                CUBLAS_COMPUTE_32F, algo));
+        }
+        return;
+    }
+
     // Use Grouped GEMM to submit all expert computations in a single call.
     // This significantly reduces CPU overhead and kernel launch latency compared to a loop.
     std::vector<int> m_vec, n_vec, k_vec;
@@ -1679,6 +1718,41 @@ void moe_grouped_gemm_down_impl(
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
+
+    // Optional debug: force per-expert GEMM loop to bypass grouped GEMM.
+    static int force_loop = -1;
+    if (force_loop < 0) {
+        force_loop = (std::getenv("SUROGATE_MOE_GEMM_LOOP") != nullptr) ? 1 : 0;
+    }
+    if (force_loop) {
+        static int force_default_algo = -1;
+        if (force_default_algo < 0) {
+            force_default_algo = (std::getenv("SUROGATE_MOE_GEMM_DEFAULT") != nullptr) ? 1 : 0;
+        }
+        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT
+                                                         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        for (int e = 0; e < n_active; ++e) {
+            int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+            int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
+            if (tokens_e == 0) continue;
+            const int weight_idx = weight_is_compact ? e : global_idx;
+            const T* A_ptr = weights + weight_idx * hidden_size * intermediate_size;
+            const T* B_ptr = input + h_offsets[global_idx] * intermediate_size;
+            T* C_ptr = output + h_offsets[global_idx] * hidden_size;
+
+            CUBLAS_CHECK(cublasGemmEx(
+                cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                hidden_size, tokens_e, intermediate_size,
+                &alpha,
+                A_ptr, cublas_dtype<T>(), intermediate_size,
+                B_ptr, cublas_dtype<T>(), intermediate_size,
+                &beta,
+                C_ptr, cublas_dtype<T>(), hidden_size,
+                CUBLAS_COMPUTE_32F, algo));
+        }
+        return;
+    }
 
     // Use Grouped GEMM to submit all expert computations in a single call.
     std::vector<int> m_vec, n_vec, k_vec;

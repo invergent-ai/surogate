@@ -65,6 +65,17 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         switch (point) {
             case ForwardHookPoint::MoEExpertGroupManual: {
                if (lora_block.moe.use_grouped && lora_block.moe.has_any() && context) {
+                    static int moe_lora_entry_trace = 0;
+                    if (std::getenv("SUROGATE_MOE_LORA_SPLIT_TRACE") && moe_lora_entry_trace < 8) {
+                        fprintf(stderr,
+                                "[MOE_LORA_SPLIT] enter layer=%d gated=%d use_grouped=%d has_any=%d ctx=%p\n",
+                                layer_idx,
+                                moe_gated ? 1 : 0,
+                                lora_block.moe.use_grouped ? 1 : 0,
+                                lora_block.moe.has_any() ? 1 : 0,
+                                context);
+                        moe_lora_entry_trace++;
+                    }
                     auto* moe_ctx = static_cast<MoEGroupedContext*>(context);
 
                     // Selective expert dequantization: only dequantize router-selected experts
@@ -126,7 +137,8 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                                     rs.CublasHandle,
                                     stream,
                                     moe_ctx->host_offsets,
-                                    selection_info.enabled ? &selection_info : nullptr
+                                    selection_info.enabled ? &selection_info : nullptr,
+                                    layer_idx
                                 );
                             } else {
                                 detail::grouped_fast_expert_lora_forward_nongated(
@@ -331,7 +343,8 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                                     rs.CublasHandle,
                                     stream,
                                     moe_ctx->host_offsets,
-                                    selection_info.enabled ? &selection_info : nullptr
+                                    selection_info.enabled ? &selection_info : nullptr,
+                                    layer_idx
                                 );
                             } else {
                                 detail::grouped_fast_expert_lora_forward_nongated(

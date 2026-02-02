@@ -6,9 +6,14 @@
 #define SUROGATE_SRC_MODULES_QLORA_BNB_WEIGHT_PROVIDER_H
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <vector>
 #include <iostream>
 
@@ -77,6 +82,10 @@ public:
         /// When enabled, only the experts selected by the router are dequantized,
         /// reducing memory usage from O(num_experts) to O(top_k) for dequant buffers.
         bool selective_expert_dequant = true;
+
+        /// Force full expert dequantization even when offload_experts is enabled.
+        /// Useful for DSL paths that don't provide selection info for compact indexing.
+        bool force_full_expert_dequant = false;
 
         /// Offload MoE expert NF4 weights to CPU pinned memory.
         /// When enabled, expert weights are stored in CPU memory and streamed to GPU
@@ -206,6 +215,12 @@ public:
      */
     [[nodiscard]] int num_experts() const { return mBnBWeights->num_experts(); }
 
+    /**
+     * @brief Debug helper: print absmax stats for a gate_up output row (MoE only)
+     */
+    bool debug_moe_gate_up_absmax(int layer_idx, int expert_id, int out_row,
+                                  cudaStream_t stream);
+
     // =========================================================================
     // MoE-specific methods
     // =========================================================================
@@ -235,7 +250,7 @@ public:
      * @param stream CUDA stream for dequantization
      */
     void dequantize_selected_experts(int layer_idx, const SelectiveExpertInfo& selection_info,
-                                     cudaStream_t stream);
+                                     cudaStream_t stream, bool force = false);
 
     /**
      * @brief Check if selective expert dequantization is enabled
@@ -281,6 +296,32 @@ private:
      * @param stream CUDA stream for dequantization
      */
     void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
+
+    template<typename T>
+    static bool copy_tensor_range_host(const Tensor& t, long offset, long count,
+                                       std::vector<T>& out) {
+        if (!t.Data || offset < 0 || count <= 0) {
+            return false;
+        }
+        const std::size_t total = t.nelem();
+        const std::size_t end = static_cast<std::size_t>(offset) + static_cast<std::size_t>(count);
+        if (end > total) {
+            return false;
+        }
+        if (t.DType != dtype_from_type<T>) {
+            return false;
+        }
+        out.resize(static_cast<std::size_t>(count));
+        const std::size_t byte_offset = static_cast<std::size_t>(offset) * sizeof(T);
+        const std::size_t byte_count = static_cast<std::size_t>(count) * sizeof(T);
+        const std::byte* src = t.Data + byte_offset;
+        if (t.Device < 0) {
+            std::memcpy(out.data(), src, byte_count);
+        } else {
+            CUDA_CHECK(cudaMemcpy(out.data(), src, byte_count, cudaMemcpyDeviceToHost));
+        }
+        return true;
+    }
 
     Config mConfig;
     TensorAllocator* mAllocator;
@@ -398,7 +439,7 @@ BnBWeightProvider<Block>::BnBWeightProvider(
     , mExpertsOffloaded(config.offload_experts && config.qlora_config.is_moe())
 {
     // If offload_experts is enabled, force selective_expert_dequant to true
-    if (mExpertsOffloaded && !mConfig.selective_expert_dequant) {
+    if (mExpertsOffloaded && !mConfig.selective_expert_dequant && !mConfig.force_full_expert_dequant) {
         mConfig.selective_expert_dequant = true;
     }
 
@@ -510,6 +551,115 @@ void BnBWeightProvider<Block>::setup_block_weights_structure() {
             }
         }
     }
+}
+
+template<typename Block>
+bool BnBWeightProvider<Block>::debug_moe_gate_up_absmax(int layer_idx, int expert_id, int out_row,
+                                                        cudaStream_t stream) {
+    (void)stream;
+    if (!mBnBWeights || !mBnBWeights->is_moe()) {
+        return false;
+    }
+    if (layer_idx < 0 || layer_idx >= mConfig.num_layers) {
+        return false;
+    }
+    const auto& moe_block = mBnBWeights->get_moe_block(layer_idx);
+    const int num_experts = moe_block.num_experts();
+    if (expert_id < 0 || expert_id >= num_experts) {
+        return false;
+    }
+    const auto& weight = moe_block.experts[expert_id].gate_up_proj;
+    if (!weight.is_valid()) {
+        return false;
+    }
+    if (out_row < 0 || out_row >= weight.M) {
+        return false;
+    }
+
+    const long K = weight.K;
+    const long start_elem = static_cast<long>(out_row) * K;
+    const long end_elem = start_elem + K - 1;
+    const long block_size = weight.block_size;
+    const long start_block = start_elem / block_size;
+    const long end_block = end_elem / block_size;
+    const long num_blocks = end_block - start_block + 1;
+    if (num_blocks <= 0) {
+        return false;
+    }
+
+    std::vector<float> absmax_vals;
+    std::vector<unsigned char> absmax_q;
+    std::vector<float> scales;
+    std::vector<float> offsets;
+    long group_start = 0;
+    if (weight.double_quant) {
+        if (!copy_tensor_range_host<unsigned char>(weight.absmax, start_block, num_blocks, absmax_q)) {
+            return false;
+        }
+        const long group_size = weight.double_quant_group_size;
+        group_start = start_block / group_size;
+        const long group_end = end_block / group_size;
+        const long group_count = group_end - group_start + 1;
+        if (!copy_tensor_range_host<float>(weight.absmax_scale, group_start, group_count, scales)) {
+            return false;
+        }
+        if (!copy_tensor_range_host<float>(weight.absmax_offset, group_start, group_count, offsets)) {
+            return false;
+        }
+        absmax_vals.resize(static_cast<std::size_t>(num_blocks));
+        for (long i = 0; i < num_blocks; ++i) {
+            const long block_idx = start_block + i;
+            const long group_idx = (block_idx / group_size) - group_start;
+            const float scale = scales[static_cast<std::size_t>(group_idx)];
+            const float offset = offsets[static_cast<std::size_t>(group_idx)];
+            absmax_vals[static_cast<std::size_t>(i)] =
+                (static_cast<float>(absmax_q[static_cast<std::size_t>(i)]) - 128.0f) * scale + offset;
+        }
+    } else {
+        if (!copy_tensor_range_host<float>(weight.absmax, start_block, num_blocks, absmax_vals)) {
+            return false;
+        }
+    }
+
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    float mean = 0.0f;
+    long max_block = start_block;
+    for (long i = 0; i < num_blocks; ++i) {
+        const float v = absmax_vals[static_cast<std::size_t>(i)];
+        if (std::isnan(v) || std::isinf(v)) {
+            continue;
+        }
+        min_v = std::min(min_v, v);
+        if (v > max_v) {
+            max_v = v;
+            max_block = start_block + i;
+        }
+        mean += v;
+    }
+    mean /= static_cast<float>(num_blocks);
+    const long max_group = weight.double_quant ? (max_block / weight.double_quant_group_size) : -1;
+
+    fprintf(stderr,
+            "[BNB_GATE_UP_ABSMAX] layer=%d expert=%d out_row=%d M=%d K=%d block=%d blocks=[%ld..%ld] "
+            "min=%.6f max=%.6f mean=%.6f max_block=%ld max_group=%ld absmax_dev=%d\n",
+            layer_idx, expert_id, out_row, weight.M, weight.K, weight.block_size,
+            start_block, end_block, min_v, max_v, mean, max_block, max_group,
+            weight.absmax.Device);
+
+    if (weight.double_quant && max_block >= start_block && max_block <= end_block) {
+        const std::size_t local_idx = static_cast<std::size_t>(max_block - start_block);
+        const long group_size = weight.double_quant_group_size;
+        const long local_group = (max_block / group_size) - group_start;
+        const float scale = scales[static_cast<std::size_t>(local_group)];
+        const float offset = offsets[static_cast<std::size_t>(local_group)];
+        const unsigned char q = absmax_q[local_idx];
+        fprintf(stderr,
+                "[BNB_GATE_UP_ABSMAX_Q] layer=%d expert=%d out_row=%d block=%ld q=%u scale=%.6e offset=%.6e\n",
+                layer_idx, expert_id, out_row, max_block, static_cast<unsigned int>(q), scale, offset);
+    }
+
+    return true;
 }
 
 template<typename Block>
@@ -873,6 +1023,16 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
         // because the LoRA hook won't run and dequantize_selected_experts() won't be called.
         // Without this check, the base model would use uninitialized expert weight buffers.
         const bool use_selective_path = mConfig.selective_expert_dequant && mConfig.lora_config.enabled();
+        // DEBUG: Trace selective dequantization decision for MoE.
+        static int moe_select_trace = 0;
+        if (moe_select_trace < 8 &&
+            (layer_idx == 0 || layer_idx == mConfig.num_layers - 1)) {
+            std::cerr << "[BnB MOE SELECTIVE] layer=" << layer_idx
+                      << " selective=" << mConfig.selective_expert_dequant
+                      << " lora=" << mConfig.lora_config.enabled()
+                      << " use_selective_path=" << use_selective_path << "\n";
+            moe_select_trace++;
+        }
 
         if (!use_selective_path) {
             // Dequantize ALL expert weights into batched buffers
@@ -884,6 +1044,104 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
 
             for (int e = 0; e < mNumMoEExperts; ++e) {
                 const auto& expert_weights = qblock.experts[e];
+                // DEBUG: inspect a specific expert quantization metadata to diagnose NaNs.
+                static int moe_expert_meta_trace = 0;
+                static int moe_debug_layer = []() {
+                    const char* v = std::getenv("SUROGATE_MOE_DEBUG_LAYER");
+                    return v ? std::atoi(v) : 2;
+                }();
+                static int moe_debug_expert = []() {
+                    const char* v = std::getenv("SUROGATE_MOE_DEBUG_EXPERT");
+                    return v ? std::atoi(v) : 122;
+                }();
+                if (layer_idx == moe_debug_layer && e == moe_debug_expert && moe_expert_meta_trace < 1) {
+                    const auto& w = expert_weights.gate_up_proj;
+                    const long num_blocks = w.num_blocks();
+                    const int num_groups = w.num_groups();
+                    std::cerr << "[BnB MOE EXPERT_META] layer=" << layer_idx
+                              << " expert=" << e
+                              << " M=" << w.M
+                              << " K=" << w.K
+                              << " block=" << w.block_size
+                              << " double_quant=" << (w.double_quant ? 1 : 0)
+                              << " blocks=" << num_blocks
+                              << " groups=" << num_groups
+                              << " data=" << (void*)w.data.Data
+                              << " absmax=" << (void*)w.absmax.Data
+                              << " scale=" << (void*)w.absmax_scale.Data
+                              << " offset=" << (void*)w.absmax_offset.Data << "\n";
+                    if (w.double_quant && w.absmax_scale.Data && w.absmax_offset.Data) {
+                        const float* scale = reinterpret_cast<const float*>(w.absmax_scale.Data);
+                        const float* offset = reinterpret_cast<const float*>(w.absmax_offset.Data);
+                        int nan_scale = 0;
+                        int nan_offset = 0;
+                        float min_scale = std::numeric_limits<float>::infinity();
+                        float max_scale = -std::numeric_limits<float>::infinity();
+                        float min_offset = std::numeric_limits<float>::infinity();
+                        float max_offset = -std::numeric_limits<float>::infinity();
+                        for (int i = 0; i < num_groups; ++i) {
+                            const float s = scale[i];
+                            const float o = offset[i];
+                            if (std::isnan(s) || std::isinf(s)) {
+                                nan_scale++;
+                            } else {
+                                min_scale = std::min(min_scale, s);
+                                max_scale = std::max(max_scale, s);
+                            }
+                            if (std::isnan(o) || std::isinf(o)) {
+                                nan_offset++;
+                            } else {
+                                min_offset = std::min(min_offset, o);
+                                max_offset = std::max(max_offset, o);
+                            }
+                        }
+                        std::cerr << "[BnB MOE EXPERT_SCALE] layer=" << layer_idx
+                                  << " expert=" << e
+                                  << " nan_scale=" << nan_scale
+                                  << " min_scale=" << min_scale
+                                  << " max_scale=" << max_scale
+                                  << " nan_offset=" << nan_offset
+                                  << " min_offset=" << min_offset
+                                  << " max_offset=" << max_offset << "\n";
+                    }
+                    if (!w.double_quant && w.absmax.Data) {
+                        const float* absmax = reinterpret_cast<const float*>(w.absmax.Data);
+                        int nan_abs = 0;
+                        float min_abs = std::numeric_limits<float>::infinity();
+                        float max_abs = -std::numeric_limits<float>::infinity();
+                        for (long i = 0; i < num_blocks; ++i) {
+                            const float v = absmax[i];
+                            if (std::isnan(v) || std::isinf(v)) {
+                                nan_abs++;
+                            } else {
+                                min_abs = std::min(min_abs, v);
+                                max_abs = std::max(max_abs, v);
+                            }
+                        }
+                        std::cerr << "[BnB MOE EXPERT_ABSMAX] layer=" << layer_idx
+                                  << " expert=" << e
+                                  << " nan=" << nan_abs
+                                  << " min=" << min_abs
+                                  << " max=" << max_abs << "\n";
+                    }
+                    if (w.absmax.Data && w.absmax.DType == ETensorDType::BYTE) {
+                        const unsigned char* absmax = reinterpret_cast<const unsigned char*>(w.absmax.Data);
+                        unsigned char min_abs = 255;
+                        unsigned char max_abs = 0;
+                        const long sample_n = std::min<long>(num_blocks, 1024);
+                        for (long i = 0; i < sample_n; ++i) {
+                            const unsigned char v = absmax[i];
+                            min_abs = std::min(min_abs, v);
+                            max_abs = std::max(max_abs, v);
+                        }
+                        std::cerr << "[BnB MOE EXPERT_ABSMAX_Q] layer=" << layer_idx
+                                  << " expert=" << e
+                                  << " sample=" << sample_n
+                                  << " min=" << static_cast<int>(min_abs)
+                                  << " max=" << static_cast<int>(max_abs) << "\n";
+                    }
+                    moe_expert_meta_trace++;
+                }
 
                 // Create slice views into the batched buffers for this expert
                 // gate_up_proj slice: offset by e * (moe_M * hidden) bytes
@@ -912,6 +1170,86 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
                 } else {
                     dequantize_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
                     dequantize_weight(expert_weights.down_proj, down_slice, stream);
+                }
+                // DEBUG: sample dequantized gate_up output for a specific expert to see if NaNs appear immediately.
+                static int moe_expert_dequant_trace = 0;
+                if (layer_idx == moe_debug_layer && e == moe_debug_expert && moe_expert_dequant_trace < 4) {
+                    const auto& src = expert_weights.gate_up_proj;
+                    if (src.double_quant) {
+                        const int num_groups = src.num_groups();
+                        const int sample_groups = std::min(num_groups, 64);
+                        int nan_scale = 0;
+                        int nan_offset = 0;
+                        float max_abs_scale = 0.0f;
+                        float max_abs_offset = 0.0f;
+                        for (int i = 0; i < sample_groups; ++i) {
+                            const float s = src.absmax_scale.get<float>()[i];
+                            const float o = src.absmax_offset.get<float>()[i];
+                            if (std::isnan(s) || std::isinf(s)) {
+                                nan_scale++;
+                            } else {
+                                max_abs_scale = std::max(max_abs_scale, std::fabs(s));
+                            }
+                            if (std::isnan(o) || std::isinf(o)) {
+                                nan_offset++;
+                            } else {
+                                max_abs_offset = std::max(max_abs_offset, std::fabs(o));
+                            }
+                        }
+                        std::cerr << "[BnB MOE EXPERT_SRC] layer=" << layer_idx
+                                  << " expert=" << e
+                                  << " dq=1 groups=" << num_groups
+                                  << " nan_scale=" << nan_scale
+                                  << " nan_offset=" << nan_offset
+                                  << " max_abs_scale=" << max_abs_scale
+                                  << " max_abs_offset=" << max_abs_offset
+                                  << "\n";
+                    } else {
+                        const long num_blocks = src.num_blocks();
+                        const long sample_blocks = std::min<long>(num_blocks, 64);
+                        int nan_absmax = 0;
+                        float max_abs_absmax = 0.0f;
+                        const float* absmax_ptr = src.absmax.get<float>();
+                        for (long i = 0; i < sample_blocks; ++i) {
+                            const float v = absmax_ptr[i];
+                            if (std::isnan(v) || std::isinf(v)) {
+                                nan_absmax++;
+                            } else {
+                                max_abs_absmax = std::max(max_abs_absmax, std::fabs(v));
+                            }
+                        }
+                        std::cerr << "[BnB MOE EXPERT_SRC] layer=" << layer_idx
+                                  << " expert=" << e
+                                  << " dq=0 blocks=" << num_blocks
+                                  << " nan_absmax=" << nan_absmax
+                                  << " max_abs_absmax=" << max_abs_absmax
+                                  << "\n";
+                    }
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    std::vector<nv_bfloat16> sample(16);
+                    CUDA_CHECK(cudaMemcpy(sample.data(),
+                                          gate_up_slice.Data,
+                                          sample.size() * sizeof(nv_bfloat16),
+                                          cudaMemcpyDeviceToHost));
+                    int nan = 0;
+                    float max_abs = 0.0f;
+                    for (const auto& v : sample) {
+                        const float fv = static_cast<float>(v);
+                        if (std::isnan(fv) || std::isinf(fv)) {
+                            nan++;
+                        } else {
+                            max_abs = std::max(max_abs, std::fabs(fv));
+                        }
+                    }
+                    std::cerr << "[BnB MOE EXPERT_DEQUANT] layer=" << layer_idx
+                              << " expert=" << e
+                              << " nan=" << nan
+                              << " max_abs=" << max_abs
+                              << " vals=" << static_cast<float>(sample[0]) << ","
+                              << static_cast<float>(sample[1]) << ","
+                              << static_cast<float>(sample[2]) << ","
+                              << static_cast<float>(sample[3]) << "\n";
+                    moe_expert_dequant_trace++;
                 }
             }
         }
@@ -957,10 +1295,26 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
 
 template<typename Block>
 void BnBWeightProvider<Block>::dequantize_selected_experts(
-    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream)
+    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream, bool force)
 {
     if (!selection_info.enabled || selection_info.num_active == 0) {
         return;
+    }
+    // DEBUG: Trace selected experts for a few calls.
+    static int moe_selected_trace = 0;
+    if (moe_selected_trace < 8 &&
+        (layer_idx == 0 || layer_idx == mConfig.num_layers - 1)) {
+        std::ostringstream os;
+        os << "[BnB MOE SELECTED] layer=" << layer_idx
+           << " num_active=" << selection_info.num_active
+           << " experts=";
+        const int max_show = std::min(selection_info.num_active, 8);
+        for (int i = 0; i < max_show; ++i) {
+            os << selection_info.active_experts[i];
+            if (i + 1 < max_show) os << ",";
+        }
+        std::cerr << os.str() << "\n";
+        moe_selected_trace++;
     }
 
     const auto& qblock = mBnBWeights->get_moe_block(layer_idx);
@@ -990,32 +1344,24 @@ void BnBWeightProvider<Block>::dequantize_selected_experts(
         }
     }
 
-    if (selection_matches) {
+    if (!force && selection_matches) {
         // Cache hit - buffers already contain the right experts
         return;
     }
 
-    // Dequantize selected experts into COMPACT index positions in the buffer.
-    // When selective mode is enabled, grouped_fast_expert_lora_forward uses compact indexing:
-    //   - gemm_num_experts = num_active (not num_total)
-    //   - compact_host_offsets maps compact indices to token ranges
-    //   - GEMM loop iterates e from 0 to num_active-1 and indexes weights at position e
-    // So we must place dequantized weights at compact positions (i) not global positions.
     const int num_to_dequant = selection_info.num_active;
 
     for (int i = 0; i < num_to_dequant; ++i) {
         const int global_expert_idx = selection_info.active_experts[i];
+        if (global_expert_idx < 0 || global_expert_idx >= mNumMoEExperts) {
+            continue;
+        }
         const auto& expert_weights = qblock.experts[global_expert_idx];
 
-        // Create slice views at the COMPACT index position (i, not global_expert_idx)
-        // The grouped GEMM in fast_expert_lora.h uses compact indexing when selective mode is on:
-        //   - gemm_num_experts = num_active
-        //   - effective_host_offsets maps compact indices to token ranges
-        //   - GEMM loop iterates e from 0 to num_active-1 and indexes weights at position e
-        // So we must place dequantized weights at compact positions to match.
+        // Create slice views at the GLOBAL expert index to avoid compact-index mismatch.
         Tensor gate_up_slice = Tensor::from_pointer(
             static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
-                static_cast<size_t>(i) * moe_M * hidden * sizeof(nv_bfloat16),
+                static_cast<size_t>(global_expert_idx) * moe_M * hidden * sizeof(nv_bfloat16),
             mBatchedExpertGateUp.Device,
             ETensorDType::BF16,
             std::array<long, 2>{moe_M, hidden}
@@ -1023,7 +1369,7 @@ void BnBWeightProvider<Block>::dequantize_selected_experts(
 
         Tensor down_slice = Tensor::from_pointer(
             static_cast<std::byte*>(mBatchedExpertDown.Data) +
-                static_cast<size_t>(i) * hidden * moe_inter * sizeof(nv_bfloat16),
+                static_cast<size_t>(global_expert_idx) * hidden * moe_inter * sizeof(nv_bfloat16),
             mBatchedExpertDown.Device,
             ETensorDType::BF16,
             std::array<long, 2>{hidden, moe_inter}
@@ -1049,21 +1395,19 @@ void BnBWeightProvider<Block>::dequantize_selected_experts(
     mCurrentExpertLayer = layer_idx;  // Track which layer these experts are from
     mNumActiveExperts = num_to_dequant;
 
-    // Update the expert weights tensor shapes
-    // Note: We use compact indexing, so shape is (num_active, ...) not (num_total_experts, ...)
-    // The grouped GEMM iterates from 0 to num_active-1 and indexes weights at position e
+    // Update the expert weights tensor shapes (global indexing).
     if constexpr (has_moe_weights<BlockWeights>::value) {
         mDequantBlock.experts.gate_up_proj = Tensor::from_pointer(
             mBatchedExpertGateUp.Data,
             mBatchedExpertGateUp.Device,
             ETensorDType::BF16,
-            std::array<long, 3>{(long)num_to_dequant, (long)moe_M, (long)hidden}
+            std::array<long, 3>{(long)mNumMoEExperts, (long)moe_M, (long)hidden}
         );
         mDequantBlock.experts.down_proj = Tensor::from_pointer(
             mBatchedExpertDown.Data,
             mBatchedExpertDown.Device,
             ETensorDType::BF16,
-            std::array<long, 3>{(long)num_to_dequant, (long)hidden, (long)moe_inter}
+            std::array<long, 3>{(long)mNumMoEExperts, (long)hidden, (long)moe_inter}
         );
         mDequantBlock.experts.use_batched = true;
         mDequantBlock.experts.num_active_experts = num_to_dequant;

@@ -75,6 +75,10 @@ public:
         /// reducing memory usage from O(num_experts) to O(top_k) for dequant buffers.
         bool selective_expert_dequant = true;
 
+        /// Force full expert dequantization even when offload_experts is enabled.
+        /// Useful for DSL paths that don't provide selection info for compact indexing.
+        bool force_full_expert_dequant = false;
+
         /// Offload MoE expert FP4 weights to CPU pinned memory.
         /// When enabled, expert weights are stored in CPU memory and streamed to GPU
         /// on-demand when selected by the router. Saves ~10GB for 128-expert models.
@@ -216,7 +220,7 @@ public:
      * @param stream CUDA stream for dequantization
      */
     void dequantize_selected_experts(int layer_idx, const SelectiveExpertInfo& selection_info,
-                                     cudaStream_t stream);
+                                     cudaStream_t stream, bool force = false);
 
     /**
      * @brief Check if selective expert dequantization is enabled
@@ -365,7 +369,7 @@ FP4WeightProvider<Block>::FP4WeightProvider(
     , mExpertsOffloaded(config.offload_experts && config.qlora_config.is_moe())
 {
     // If offload_experts is enabled, force selective_expert_dequant to true
-    if (mExpertsOffloaded && !mConfig.selective_expert_dequant) {
+    if (mExpertsOffloaded && !mConfig.selective_expert_dequant && !mConfig.force_full_expert_dequant) {
         mConfig.selective_expert_dequant = true;
     }
 
@@ -997,7 +1001,7 @@ void FP4WeightProvider<Block>::stream_and_dequantize_expert(
 
 template<typename Block>
 void FP4WeightProvider<Block>::dequantize_selected_experts(
-    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream)
+    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream, bool force)
 {
     if (!selection_info.enabled || selection_info.num_active == 0) {
         return;
@@ -1025,22 +1029,24 @@ void FP4WeightProvider<Block>::dequantize_selected_experts(
         }
     }
 
-    if (selection_matches) {
+    if (!force && selection_matches) {
         // Cache hit - buffers already contain the right experts
         return;
     }
 
-    // Dequantize selected experts into COMPACT index positions in the buffer
     const int num_to_dequant = selection_info.num_active;
 
     for (int i = 0; i < num_to_dequant; ++i) {
         const int global_expert_idx = selection_info.active_experts[i];
+        if (global_expert_idx < 0 || global_expert_idx >= mNumMoEExperts) {
+            continue;
+        }
         const auto& expert_weights = qblock.experts[global_expert_idx];
 
-        // Create slice views at the COMPACT index position (i, not global_expert_idx)
+        // Create slice views at the GLOBAL expert index to avoid compact-index mismatch.
         Tensor gate_up_slice = Tensor::from_pointer(
             static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
-                static_cast<size_t>(i) * moe_M * hidden * sizeof(nv_bfloat16),
+                static_cast<size_t>(global_expert_idx) * moe_M * hidden * sizeof(nv_bfloat16),
             mBatchedExpertGateUp.Device,
             ETensorDType::BF16,
             std::array<long, 2>{moe_M, hidden}
@@ -1048,7 +1054,7 @@ void FP4WeightProvider<Block>::dequantize_selected_experts(
 
         Tensor down_slice = Tensor::from_pointer(
             static_cast<std::byte*>(mBatchedExpertDown.Data) +
-                static_cast<size_t>(i) * hidden * moe_inter * sizeof(nv_bfloat16),
+                static_cast<size_t>(global_expert_idx) * hidden * moe_inter * sizeof(nv_bfloat16),
             mBatchedExpertDown.Device,
             ETensorDType::BF16,
             std::array<long, 2>{hidden, moe_inter}
@@ -1069,19 +1075,19 @@ void FP4WeightProvider<Block>::dequantize_selected_experts(
     mCurrentExpertLayer = layer_idx;  // Track which layer these experts are from
     mNumActiveExperts = num_to_dequant;
 
-    // Update the expert weights tensor shapes (compact indexing)
+    // Update the expert weights tensor shapes (global indexing).
     if constexpr (has_moe_weights<BlockWeights>::value) {
         mDequantBlock.experts.gate_up_proj = Tensor::from_pointer(
             mBatchedExpertGateUp.Data,
             mBatchedExpertGateUp.Device,
             ETensorDType::BF16,
-            std::array<long, 3>{(long)num_to_dequant, (long)moe_M, (long)hidden}
+            std::array<long, 3>{(long)mNumMoEExperts, (long)moe_M, (long)hidden}
         );
         mDequantBlock.experts.down_proj = Tensor::from_pointer(
             mBatchedExpertDown.Data,
             mBatchedExpertDown.Device,
             ETensorDType::BF16,
-            std::array<long, 3>{(long)num_to_dequant, (long)hidden, (long)moe_inter}
+            std::array<long, 3>{(long)mNumMoEExperts, (long)hidden, (long)moe_inter}
         );
         mDequantBlock.experts.use_batched = true;
         mDequantBlock.experts.num_active_experts = num_to_dequant;

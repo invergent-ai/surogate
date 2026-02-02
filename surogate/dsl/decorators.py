@@ -609,6 +609,7 @@ class Gradient:
         gradient_of: Name of the forward activation this is the gradient of
         dtype: Override dtype (default: inherit from runtime)
         shares_with: Name of another slot to share memory with
+        alias_of: Name of an existing activation slot to alias (reuse) at runtime
         when: Condition for optional slots
         scope: "gradient" (default) or "global" for model-level gradient slots
         description: Documentation for this slot
@@ -621,6 +622,7 @@ class Gradient:
         gradient_of: str,
         dtype: str | None = None,
         shares_with: str | None = None,
+        alias_of: str | None = None,
         when: str | Callable[[Any], bool] | None = None,
         scope: str = "gradient",
         description: str | None = None,
@@ -634,6 +636,7 @@ class Gradient:
         self.gradient_of = gradient_of
         self.dtype = dtype
         self.shares_with = shares_with
+        self.alias_of = alias_of
         self.when = when
         self.scope = scope
         self.description = description
@@ -648,6 +651,8 @@ class Gradient:
             parts.append(f", dtype={self.dtype!r}")
         if self.shares_with:
             parts.append(f", shares_with={self.shares_with!r}")
+        if self.alias_of:
+            parts.append(f", alias_of={self.alias_of!r}")
         if self.when:
             parts.append(f", when={self.when!r}")
         parts.append(")")
@@ -682,6 +687,7 @@ class Gradient:
             dtype=self.dtype or self.tensor_type.dtype,
             memory_hint=memory_hint,
             shares_with=self.shares_with,
+            alias_of=self.alias_of,
             gradient_of=self.gradient_of,
             condition=condition,
             condition_expr=condition_expr,

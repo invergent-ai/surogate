@@ -49,6 +49,7 @@ public:
         ActivationMemoryHint memory_hint = ActivationMemoryHint::Persistent;
         std::string shares_with;             ///< Slot to share memory with (if hint == Shared)
         std::string gradient_of;             ///< For gradient slots
+        std::string alias_of;                ///< Optional alias target (reuse existing buffer)
         std::string condition;               ///< Condition expression
     };
 

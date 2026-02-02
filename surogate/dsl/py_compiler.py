@@ -100,6 +100,7 @@ class ActivationSlotIR:
     recompute_outputs: List[str] = field(default_factory=list)
     lora_targets: List[str] = field(default_factory=list)
     gradient_of: Optional[str] = None
+    alias_of: Optional[str] = None
     slot_index: int = -1  # Index in the activation struct
     condition: Optional[str] = None
     description: Optional[str] = None
@@ -361,6 +362,7 @@ def _compile_activation_slot(
         recompute_outputs=list(slot.recompute_outputs),
         lora_targets=list(slot.lora_targets),
         gradient_of=slot.gradient_of,
+        alias_of=slot.alias_of,
         slot_index=slot_index,
         condition=slot.condition_expr,
         description=slot.description,
@@ -401,6 +403,79 @@ def _compile_activation_layout(
     )
 
 
+def _infer_output_names_from_graph(
+    builder: GraphBuilder,
+    num_outputs: int,
+) -> Optional[List[str]]:
+    """Infer output tensor names from graph by finding terminal tensors.
+
+    For transformer blocks, we know the typical pattern:
+    - First output: final MLP output (e.g., "mlp_down", "out", "mlp_output")
+    - Second output: residual after attention (e.g., "res_att", "residual_att")
+
+    We first try pattern matching, then fall back to graph structure analysis.
+    """
+    if not builder.nodes:
+        return None
+
+    # Collect all produced tensors and consumed tensors
+    produced: List[str] = []  # Ordered list of produced tensors
+    consumed: set = set()
+
+    for node in builder.nodes:
+        if isinstance(node, GraphNode):
+            for inp in node.inputs:
+                consumed.add(inp)
+            for out in node.outputs:
+                produced.append(out)
+
+    # Find terminal tensors (produced but not consumed)
+    terminals = set(t for t in produced if t not in consumed)
+
+    # For 2-output blocks (common transformer pattern), look for known names
+    if num_outputs == 2:
+        # Common names for first output (final MLP/block output)
+        first_candidates = ["mlp_down", "out", "mlp_output", "block_out", "ffn_out"]
+        # Common names for second output (residual after attention)
+        second_candidates = ["res_att", "residual_att", "residual_attention", "res_attn"]
+
+        first_out = None
+        second_out = None
+
+        # Find first output (MLP output)
+        for name in first_candidates:
+            if name in terminals:
+                first_out = name
+                break
+
+        # Find second output (residual)
+        for name in second_candidates:
+            if name in terminals:
+                second_out = name
+                break
+
+        if first_out and second_out:
+            return [first_out, second_out]
+
+    # Fallback: find the last operation that produces unused outputs
+    # and use those as the block outputs
+    if num_outputs == 1:
+        # Single output: look for the last terminal tensor
+        for t in reversed(produced):
+            if t in terminals:
+                return [t]
+
+    # For multiple outputs, try to find the last N terminals in produced order
+    # But filter to only include actual terminal tensors
+    terminal_list = [t for t in produced if t in terminals]
+    if len(terminal_list) >= num_outputs:
+        # Take last N, but this may not preserve the return order
+        # At least we're getting actual tensor names
+        return terminal_list[-num_outputs:]
+
+    return None
+
+
 def _compile_graph_builder(
     builder: GraphBuilder,
     spec: ForwardSpec,
@@ -418,6 +493,13 @@ def _compile_graph_builder(
     # Add outputs - use actual tensor names from graph if available
     # The returned outputs from forward() are stored in builder._returned_outputs
     returned_outputs = getattr(builder, '_returned_outputs', None)
+
+    # If _returned_outputs wasn't captured, try to infer from graph structure
+    if not returned_outputs and len(spec.outputs) > 0:
+        inferred = _infer_output_names_from_graph(builder, len(spec.outputs))
+        if inferred:
+            returned_outputs = inferred
+
     for i, io_spec in enumerate(spec.outputs):
         ann = io_spec.tensor_type
         # Use the actual tensor name from the graph operations if available
@@ -817,23 +899,32 @@ def _capture_forward_graph(
 
         # Call forward and capture the return value (GraphRef or tuple of GraphRefs)
         returned_outputs = None
+        forward_exception = None
         try:
             returned_outputs = forward_fn(instance, *mock_inputs)
-        except Exception:
-            pass
+        except Exception as e:
+            forward_exception = e
+            # Continue - we may still have captured graph nodes even if return failed
 
         # Store the returned output tensor names on the builder for later use
-        if captured_builder is not None and returned_outputs is not None:
+        if captured_builder is not None:
             from .graph_builder import GraphRef
-            if isinstance(returned_outputs, GraphRef):
-                captured_builder._returned_outputs = [returned_outputs.name]
-            elif isinstance(returned_outputs, tuple):
-                captured_builder._returned_outputs = [
-                    ref.name if isinstance(ref, GraphRef) else str(ref)
-                    for ref in returned_outputs
-                ]
-            else:
-                captured_builder._returned_outputs = []
+            if returned_outputs is not None:
+                if isinstance(returned_outputs, GraphRef):
+                    captured_builder._returned_outputs = [returned_outputs.name]
+                elif isinstance(returned_outputs, tuple):
+                    captured_builder._returned_outputs = [
+                        ref.name if isinstance(ref, GraphRef) else str(ref)
+                        for ref in returned_outputs
+                    ]
+                else:
+                    captured_builder._returned_outputs = []
+            elif forward_exception is not None:
+                # If forward raised an exception but we captured nodes,
+                # try to infer outputs from the graph builder
+                # This helps when the exception happens during return value processing
+                # but the graph was already built
+                pass  # _compile_graph_builder will try to infer
 
         return captured_builder
     finally:
@@ -1147,6 +1238,8 @@ def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
         result["lora_targets"] = list(slot.lora_targets)
     if slot.gradient_of:
         result["gradient_of"] = slot.gradient_of
+    if slot.alias_of:
+        result["alias_of"] = slot.alias_of
     if slot.condition:
         result["condition"] = slot.condition
     if slot.description:

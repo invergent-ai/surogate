@@ -134,6 +134,7 @@ struct ActivationSlotIR {
     std::vector<std::string> recompute_outputs;///< Explicit recompute outputs
     std::vector<std::string> lora_targets;     ///< LoRA targets for matmul recompute
     std::string gradient_of;                   ///< For gradient slots: corresponding forward activation
+    std::string alias_of;                      ///< Optional alias target (reuse existing buffer)
     std::string condition;                     ///< Condition expression (e.g., "use_qk_norm")
     std::string description;                   ///< Documentation
 };

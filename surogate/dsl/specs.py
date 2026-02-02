@@ -80,6 +80,9 @@ class ActivationSlotSpec:
     # If memory_hint == SHARED, this specifies which slot to share with
     shares_with: str | None = None
 
+    # Optional alias target (for reusing an existing buffer at runtime)
+    alias_of: str | None = None
+
     # If memory_hint == SAVE, this adds the tensor to forward save list
     save_for_backward: bool = False
 
