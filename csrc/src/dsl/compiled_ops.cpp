@@ -486,6 +486,9 @@ const Tensor* CompiledExecutor::try_get_tensor(const std::string& name) const {
 void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
     // Copy MoE tensors from this layer to persistent storage before stack restore.
     // This allows stack memory to be reclaimed while preserving tensors for backward.
+    if (mCapturing) {
+        return;
+    }
     if (mConfig.NumExperts == 0) {
         return;
     }
@@ -553,6 +556,8 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         return;
     }
 
+    const bool capturing = mCapturing;
+
     // Recompute is only active when enabled in runtime options.
     // Do NOT use mRecomputeFn here: it's always set when the graph is compiled,
     // even for no-recompute runs, and would cause metadata-only saves.
@@ -579,6 +584,10 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     // Returns true if tensor was copied to persistent storage, false if metadata-only save.
     auto save_tensor_with_policy = [&](const std::string& name, const Tensor& src,
                                         bool prefer_live) -> void {
+        if (capturing) {
+            (*mSaved)[name] = src;
+            return;
+        }
         if (prefer_live) {
             // Save metadata only - will resolve from live buffer or recompute
             Tensor meta = src;
@@ -634,6 +643,10 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 if (prefer_live) {
                     // Recompute mode: store metadata only and recompute later.
                     save_tensor_with_policy(name, it->second, true);
+                    continue;
+                }
+                if (capturing) {
+                    (*mSaved)[name] = it->second;
                     continue;
                 }
                 const Tensor& src = it->second;
