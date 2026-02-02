@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #include "dsl/compiled_ops_helpers.h"
@@ -102,6 +103,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
         ? static_cast<int>(mConfig.MoeIntermediateSize)
         : static_cast<int>(mConfig.IntermediateSize);
     const int weight_experts = (weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts;
+    static int moe_weight_scale_trace = 0;
+    if (moe_weight_scale_trace < 6 && std::getenv("SUROGATE_MOE_WEIGHT_TRACE") != nullptr) {
+        log_tensor_stats_ex("MOE_GATE_UP_W_STATS", layer_idx_any, op.inputs[1].name, weights, 4096, true);
+        moe_weight_scale_trace++;
+    }
     log_moe_gate_up_weight_sample("PRE_MOE_DOWN", layer_idx_any, mMicroStep, mWeights, mConfig);
     log_moe_gate_up_weight_sample("PRE_MOE_GATE_UP", layer_idx_any, mMicroStep, mWeights, mConfig);
     const bool offsets_owned = mRunState.Stack.owns(expert_offsets.Data);
@@ -1437,6 +1443,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
         log_tensor_mag("MOE_GATE_UP_BWD_DOUT", layer_idx, op.inputs[0].name, d_gate_up, 4096);
         log_tensor_mag("MOE_GATE_UP_BWD_INP", layer_idx, op.inputs[1].name, inp, 4096);
         moe_gate_up_mag++;
+    }
+    static std::unordered_set<int> moe_gate_up_grad_layers;
+    if (std::getenv("SUROGATE_MOE_GRAD_TRACE") != nullptr) {
+        if (moe_gate_up_grad_layers.insert(layer_idx).second) {
+            log_tensor_mag_unbounded("MOE_GATE_UP_BWD_GRAD", layer_idx, op.inputs[0].name, d_gate_up, 4096);
+        }
     }
     log_moe_gate_up_weight_sample("PRE_MOE_DOWN_BWD", layer_idx, mMicroStep, mWeights, mConfig);
     if (layer_idx >= 0) {

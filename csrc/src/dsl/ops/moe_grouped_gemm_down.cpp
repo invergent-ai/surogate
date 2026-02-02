@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #include "dsl/compiled_ops_helpers.h"
@@ -743,6 +744,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         log_tensor_mag("MOE_DOWN_BWD_DOUT", layer_idx, op.inputs[0].name, d_output, 4096);
         log_tensor_mag("MOE_DOWN_BWD_INP", layer_idx, op.inputs[1].name, inp, 4096);
         moe_down_mag++;
+    }
+    static std::unordered_set<int> moe_down_grad_layers;
+    if (std::getenv("SUROGATE_MOE_GRAD_TRACE") != nullptr) {
+        if (moe_down_grad_layers.insert(layer_idx).second) {
+            log_tensor_mag_unbounded("MOE_DOWN_BWD_GRAD", layer_idx, op.inputs[0].name, d_output, 4096);
+        }
     }
 
     // DEBUG: Trace MoE down backward inputs to locate explosion source.
