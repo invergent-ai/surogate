@@ -1240,6 +1240,10 @@ NB_MODULE(_surogate, m) {
              nb::arg("step"), nb::arg("gpu_id"), nb::arg("gpu_util"),
              "Log GPU utilization state.\n\n"
              "Parameters:\n- step: Global step.\n- gpu_id: GPU index.\n- gpu_util: GPUUtilInfo snapshot.")
+        .def("log_message", &TrainingRunLogger::log_message,
+             nb::arg("step"), nb::arg("msg"),
+             "Log a free-form message.\n\n"
+             "Parameters:\n- step: Global step.\n- msg: Message string.")
         .def("log_allocator", [](TrainingRunLogger* logger, const nb::dict& stats) {
             std::vector<std::pair<std::string, sSegmentMemory>> cpp_stats;
             std::vector<std::pair<std::string, long>> cpp_stack;

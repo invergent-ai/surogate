@@ -34,13 +34,13 @@ class SurogateSFT(TokenizeDatasets):
         # Setup data loaders
         output_path = Path(self.config.output_dir)
         train_files = sorted([str(p) for p in output_path.glob("train-*.bin")])
-        eval_files = sorted([str(p) for p in output_path.glob("eval.bin")])
+        eval_files = sorted([str(p) for p in output_path.glob("eval*.bin")])
 
         if not train_files:
             logger.error(f"No training files found matching '{self.config.output_dir}/train-*.bin'")
             return
         if not eval_files:
-            logger.warning(f"No eval files found matching '{self.config.output_dir}/eval.bin'")
+            logger.warning(f"No eval files found matching '{self.config.output_dir}/eval*.bin'")
 
         logger.info(f"Starting training run '{self.config.run_name}'...")
 

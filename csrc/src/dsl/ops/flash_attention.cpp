@@ -28,7 +28,11 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
-    const bool cudnn_gqa_ok = (Hq == Hkv);
+    const bool is_decode = (mT <= 1);
+    const bool gqa_divisible = (Hkv > 0) ? (Hq % Hkv == 0) : false;
+    const bool allow_gqa_cudnn = (!is_decode && gqa_divisible);
+    const bool cudnn_gqa_ok = (Hq == Hkv) || allow_gqa_cudnn;
+    const bool force_custom_fwd = (std::getenv("SUROGATE_ATTN_FWD_CUSTOM") != nullptr);
 
     if (!mRunState.scratch().cudnn_workspace.Data) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
@@ -46,7 +50,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     //
     // Similarly for QKV input: cuDNN expects (B, T, H, HS) contiguous where H = Hq + 2*Hkv.
 
-    if (!cudnn_gqa_ok) {
+    if (!cudnn_gqa_ok || force_custom_fwd) {
         attention_forward_custom(out, lse, qkv,
                                  static_cast<int>(mB), static_cast<int>(mT),
                                  Hq, Hkv, Hs, mRunState.MainStream);
@@ -72,7 +76,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
-    const bool cudnn_gqa_ok = (Hq == Hkv);
+    const bool is_decode = (mT <= 1);
+    const bool gqa_divisible = (Hkv > 0) ? (Hq % Hkv == 0) : false;
+    const bool allow_gqa_cudnn = (!is_decode && gqa_divisible);
+    const bool cudnn_gqa_ok = (Hq == Hkv) || allow_gqa_cudnn;
     const bool force_custom_bwd = (std::getenv("SUROGATE_ATTN_BWD_CUSTOM") != nullptr);
     const bool force_cudnn_bwd = (std::getenv("SUROGATE_ATTN_BWD_FORCE_CUDNN") != nullptr);
     const bool use_cudnn_bwd = force_cudnn_bwd || (cudnn_gqa_ok && !force_custom_bwd);
