@@ -262,11 +262,38 @@ target_sources(surogate-common PRIVATE
     src/dsl/graph_executor_helpers.cpp
     src/dsl/recompute_plan.cpp
     src/dsl/compiled_ops.cpp
+    src/dsl/graph_compiler.cpp
     src/dsl/weight_mapping.cpp
     src/dsl/autodiff.cpp
     src/dsl/autodiff_rules.cpp
     src/dsl/op_shape_signatures.cpp
     src/dsl/tensor_slot_registry.cpp
+
+    src/dsl/ops/embedding.cpp
+    src/dsl/ops/zeros.cpp
+    src/dsl/ops/fused_residual_rmsnorm.cpp
+    src/dsl/ops/view.cpp
+    src/dsl/ops/add.cpp
+    src/dsl/ops/bias_add.cpp
+    src/dsl/ops/matmul.cpp
+    src/dsl/ops/swiglu.cpp
+    src/dsl/ops/matmul_swiglu.cpp
+    src/dsl/ops/qkv_qk_norm_rope.cpp
+    src/dsl/ops/rope.cpp
+    src/dsl/ops/flash_attention.cpp
+    src/dsl/ops/cross_entropy_loss.cpp
+    src/dsl/ops/fused_lm_head_loss.cpp
+    src/dsl/ops/silu.cpp
+    src/dsl/ops/mul.cpp
+    src/dsl/ops/moe_softmax.cpp
+    src/dsl/ops/moe_sigmoid.cpp
+    src/dsl/ops/moe_topk.cpp
+    src/dsl/ops/moe_permute.cpp
+    src/dsl/ops/moe_grouped_gemm_gate_up.cpp
+    src/dsl/ops/moe_grouped_gemm_down.cpp
+    src/dsl/ops/moe_unpermute.cpp
+
+
 
     src/config/pretrained_config.cpp
     src/models/registry.cpp
