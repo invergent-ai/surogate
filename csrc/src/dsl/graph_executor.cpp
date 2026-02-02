@@ -641,12 +641,6 @@ void GraphExecutor::set_rng_state(const std::vector<std::byte>& state) {
 }
 
 void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
-    // DEBUG: Trace execution order
-    static int exec_trace = 0;
-    if (exec_trace < 20) {
-        exec_trace++;
-        fprintf(stderr, "[EXEC_ORDER] forward micro_step=%d\n", micro_step);
-    }
     auto& rs = mRunState;
 
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
@@ -683,14 +677,6 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     // Copy inputs and position ids to device.
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
-        // DEBUG: Print first few input tokens to verify different data per micro-step
-        static int debug_count = 0;
-        if (debug_count < 20) {
-            debug_count++;
-            const std::int32_t* tok = reinterpret_cast<const std::int32_t*>(inputs.Data);
-            fprintf(stderr, "[FWD_INPUT] micro_step=%d inputs.Data=%p tokens[0..3]=%d,%d,%d,%d\n",
-                    micro_step, inputs.Data, tok[0], tok[1], tok[2], tok[3]);
-        }
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
         if (position_ids.Device == -1) {
@@ -798,12 +784,6 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
 }
 
 void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
-    // DEBUG: Trace execution order
-    static int exec_trace = 0;
-    if (exec_trace < 20) {
-        exec_trace++;
-        fprintf(stderr, "[EXEC_ORDER] backward micro_step=%d\n", micro_step);
-    }
     auto& rs = mRunState;
     auto& grads = mGrads;
     const auto& config = mConfig;

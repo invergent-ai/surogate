@@ -24,78 +24,6 @@
 
 namespace dsl {
 
-namespace {
-
-bool is_embedding_hf_name(const std::string& name) {
-    return internal::contains_ci(name, "embed_tokens.weight") ||
-           internal::contains_ci(name, "embeddings.weight") ||
-           internal::contains_ci(name, "wte.weight") ||
-           internal::contains_ci(name, "word_embeddings.weight");
-}
-
-void scan_embedding_for_nan_once(const Tensor& t, long hidden, long row_offset, std::string_view tag) {
-    static bool scanned = false;
-    if (scanned || !t.Data || t.nelem() == 0) {
-        return;
-    }
-    scanned = true;
-    fprintf(stderr, "[EMB_WT_SCAN] tag=%.*s dtype=%s nelem=%zu hidden=%ld row_offset=%ld\n",
-            static_cast<int>(tag.size()), tag.data(), dtype_to_str(t.DType),
-            t.nelem(), hidden, row_offset);
-
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    const std::size_t chunk = 1 << 20; // 1M elements per chunk
-    const std::size_t hidden_sz = hidden > 0 ? static_cast<std::size_t>(hidden) : 0;
-    const std::size_t row_base = row_offset > 0 ? static_cast<std::size_t>(row_offset) : 0;
-
-    if (t.DType == ETensorDType::BF16) {
-        std::vector<nv_bfloat16> host(chunk);
-        for (std::size_t off = 0; off < total; off += chunk) {
-            const std::size_t n = std::min(chunk, total - off);
-            cudaMemcpy(host.data(),
-                       t.Data + off * sizeof(nv_bfloat16),
-                       n * sizeof(nv_bfloat16),
-                       cudaMemcpyDeviceToHost);
-            for (std::size_t i = 0; i < n; ++i) {
-                const float v = static_cast<float>(host[i]);
-                if (std::isnan(v) || std::isinf(v)) {
-                    const std::size_t idx = off + i;
-                    const std::size_t row = hidden_sz ? (idx / hidden_sz + row_base) : row_base;
-                    const std::size_t col = hidden_sz ? (idx % hidden_sz) : idx;
-                    fprintf(stderr, "[EMB_WT_NAN] tag=%.*s idx=%zu row=%zu col=%zu\n",
-                            static_cast<int>(tag.size()), tag.data(), idx, row, col);
-                    throw std::runtime_error("Embedding weights contain NaNs/Inf");
-                }
-            }
-        }
-    } else if (t.DType == ETensorDType::FP32) {
-        std::vector<float> host(chunk);
-        for (std::size_t off = 0; off < total; off += chunk) {
-            const std::size_t n = std::min(chunk, total - off);
-            cudaMemcpy(host.data(),
-                       t.Data + off * sizeof(float),
-                       n * sizeof(float),
-                       cudaMemcpyDeviceToHost);
-            for (std::size_t i = 0; i < n; ++i) {
-                const float v = host[i];
-                if (std::isnan(v) || std::isinf(v)) {
-                    const std::size_t idx = off + i;
-                    const std::size_t row = hidden_sz ? (idx / hidden_sz + row_base) : row_base;
-                    const std::size_t col = hidden_sz ? (idx % hidden_sz) : idx;
-                    fprintf(stderr, "[EMB_WT_NAN] tag=%.*s idx=%zu row=%zu col=%zu\n",
-                            static_cast<int>(tag.size()), tag.data(), idx, row, col);
-                    throw std::runtime_error("Embedding weights contain NaNs/Inf");
-                }
-            }
-        }
-    } else {
-        fprintf(stderr, "[EMB_WT_SCAN] tag=%.*s skipped unsupported dtype=%s\n",
-                static_cast<int>(tag.size()), tag.data(), dtype_to_str(t.DType));
-    }
-}
-
-} // anonymous namespace
-
 std::vector<std::byte> DslModel::rng_state() const {
     if (mExecutor) {
         return mExecutor->rng_state();
@@ -276,13 +204,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
             const auto& entry = *entry_ptr;
             const std::string entry_name = entry.name();
-            const bool is_embedding = is_embedding_hf_name(hf_name) || is_embedding_hf_name(entry_name);
             if (!param_sharded) {
                 entry.read_tensor(param, allow_cast);
-                if (is_embedding) {
-                    const long hidden = (param.Rank > 1) ? param.Sizes[1] : 0;
-                    scan_embedding_for_nan_once(param, hidden, 0, entry_name);
-                }
             } else {
                 const Tensor& global = mParams->template_tensor(name);
                 const long global_rows = global.Sizes[0];
@@ -290,10 +213,6 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 const long stride = row_stride(entry.shape());
                 (void)end;
                 entry.read_raw(param, static_cast<std::ptrdiff_t>(start) * stride, param.nelem(), allow_cast);
-                if (is_embedding) {
-                    const long hidden = (param.Rank > 1) ? param.Sizes[1] : 0;
-                    scan_embedding_for_nan_once(param, hidden, start, entry_name);
-                }
             }
             continue;
         }

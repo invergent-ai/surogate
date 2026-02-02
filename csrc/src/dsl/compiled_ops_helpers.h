@@ -41,64 +41,17 @@ MoeCompactInfo build_moe_compact_info_from_host(const int* host_offsets,
                                                 int layer_idx,
                                                 const char* tag);
 
-
-// Tensor sampling and statistics logging
-void log_tensor_sample_stats(const char* tag,
-                             const Tensor& t,
-                             std::size_t elem_offset,
-                             std::size_t sample_elems);
-
-void log_tensor_stats(const char* tag,
-                      int layer_idx,
-                      const std::string& name,
-                      const Tensor& t,
-                      std::size_t max_elems);
-
-void log_tensor_stats_ex(const char* tag,
-                         int layer_idx,
-                         const std::string& name,
-                         const Tensor& t,
-                         std::size_t max_elems,
-                         bool force);
-void log_tensor_mag_unbounded(const char* tag,
-                              int layer_idx,
-                              const std::string& name,
-                              const Tensor& t,
-                              std::size_t max_elems);
-bool log_tensor_token_row_stats(const char* tag, const Tensor& t, long token_idx);
-bool log_tensor_scalar_at(const char* tag, const Tensor& t, long elem_idx);
-bool log_tensor_row_stats(const char* tag, const Tensor& t, long row_idx);
-void log_tensor_mag(const char* tag,
-                    int layer_idx,
-                    const std::string& name,
-                    const Tensor& t,
-                    std::size_t max_elems);
 void log_moe_gate_up_weight_sample(const char* tag,
                                    int layer_idx,
                                    int micro_step,
                                    DslParamStore& weights,
                                    const modules::ModelConfig& cfg);
-void log_cuda_ptr_attr(const char* tag, const void* ptr, int layer_idx, const char* name);
-
-// NaN/Inf detection for tensor samples
-bool tensor_sample_has_nan_or_inf(const Tensor& t, long token_idx);
-
-// Log NaN detection in tensor samples
-void log_nan_sample(const char* tag,
-                   int layer_idx,
-                   const std::string& name,
-                   const Tensor& t,
-                   long token_idx);
-bool sample_has_nan_or_inf(const std::vector<float>& vals);
-double sample_mean_abs(const Tensor& t, std::size_t count);
-bool should_trace_moe_layer(int layer_idx, int& counter);
 
 int env_int(const char* name, int fallback);
 float env_float(const char* name, float fallback);
 
 bool copy_tensor_token_sample_as_f32(const Tensor& t, long token_idx,
                                      std::size_t count, std::vector<float>& out);
-bool copy_tensor_sample_as_f32(const Tensor& t, std::size_t count, std::vector<float>& out);
 bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
                                       std::size_t count, std::vector<float>& out);
 

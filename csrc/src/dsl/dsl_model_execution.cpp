@@ -253,11 +253,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
     auto hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream, modules::BackwardHookPoint point, void* context) {
         (void)context;
-        static int hook_call_count = 0;
-        if (hook_call_count < 10) {
-            std::cerr << "[LoRA hook] called, layer=" << layer_idx << " point=" << static_cast<int>(point) << std::endl;
-            hook_call_count++;
-        }
         const auto& cfg = mModelConfig;
         auto& rs = *mRunState;
         const int B = (int)rs.B;
@@ -398,23 +393,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
 
-                // Debug: check if tensors are valid
-                static int attn_debug_count = 0;
-                if (attn_debug_count < 5) {
-                    cudaStreamSynchronize(stream);
-                    float d_att_val = 0.0f, att_val = 0.0f;
-                    if (da.d_att.Data) {
-                        cudaMemcpy(&d_att_val, da.d_att.Data, sizeof(float), cudaMemcpyDeviceToHost);
-                    }
-                    if (a.att.Data) {
-                        cudaMemcpy(&att_val, a.att.Data, sizeof(float), cudaMemcpyDeviceToHost);
-                    }
-                    std::cerr << "[AttnO hook L" << layer_idx << "] da.d_att.Data=" << da.d_att.Data
-                              << " d_att_val=" << d_att_val << " a.att.Data=" << a.att.Data
-                              << " att_val=" << att_val << std::endl;
-                    attn_debug_count++;
-                }
-
                 // Projection type 3 = O
                 const unsigned int dropout_seed = get_dropout_seed(3);
 
@@ -486,23 +464,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 if (!dA_q.Data && !dA_k.Data && !dA_v.Data) break;
 
-                // Debug: check if tensors are valid
-                static int qkv_debug_count = 0;
-                if (qkv_debug_count < 5) {
-                    cudaStreamSynchronize(stream);
-                    float d_qkv_val = 0.0f, ln1_val = 0.0f;
-                    if (da.d_qkv.Data) {
-                        cudaMemcpy(&d_qkv_val, da.d_qkv.Data, sizeof(float), cudaMemcpyDeviceToHost);
-                    }
-                    if (ln1_input.Data) {
-                        cudaMemcpy(&ln1_val, ln1_input.Data, sizeof(float), cudaMemcpyDeviceToHost);
-                    }
-                    std::cerr << "[QKV hook L" << layer_idx << "] da.d_qkv.Data=" << da.d_qkv.Data
-                              << " d_qkv_val=" << d_qkv_val << " ln1_input.Data=" << ln1_input.Data
-                              << " ln1_val=" << ln1_val << std::endl;
-                    qkv_debug_count++;
-                }
-
                 // Projection types: 0=Q, 1=K, 2=V
                 modules::detail::backward_lora_qkv_fused(
                     dA_q, dB_q,
@@ -533,12 +494,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 break;
         }
     };
-
-    static int bwd_hook_count = 0;
-    if (bwd_hook_count < 5) {
-        std::cerr << "[DslModel::backward] calling backward_with_hook, bwd_hook_count=" << bwd_hook_count << std::endl;
-        bwd_hook_count++;
-    }
 
     mExecutor->backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, hook);
 

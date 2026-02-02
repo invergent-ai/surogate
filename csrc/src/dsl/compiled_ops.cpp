@@ -71,13 +71,6 @@ MoeCompactInfo build_moe_compact_info(const int* expert_offsets_dev,
     info.num_active = static_cast<int>(info.active_experts.size());
 
     if (weight_experts > 0 && info.num_active != weight_experts) {
-        static int warn_count = 0;
-        if (warn_count < 8) {
-            fprintf(stderr,
-                    "[MOE_COMPACT_WARN] tag=%s layer=%d num_active=%d weight_experts=%d num_experts=%d\n",
-                    tag, layer_idx, info.num_active, weight_experts, num_experts);
-            warn_count++;
-        }
         if (info.num_active > weight_experts) {
             info.active_experts.resize(weight_experts);
             info.num_active = weight_experts;
@@ -110,13 +103,6 @@ MoeCompactInfo build_moe_compact_info_from_host(const int* host_offsets,
     info.num_active = static_cast<int>(info.active_experts.size());
 
     if (weight_experts > 0 && info.num_active != weight_experts) {
-        static int warn_count = 0;
-        if (warn_count < 8) {
-            fprintf(stderr,
-                    "[MOE_COMPACT_WARN] tag=%s layer=%d num_active=%d weight_experts=%d num_experts=%d\n",
-                    tag, layer_idx, info.num_active, weight_experts, num_experts);
-            warn_count++;
-        }
         if (info.num_active > weight_experts) {
             info.active_experts.resize(weight_experts);
             info.num_active = weight_experts;
@@ -124,109 +110,6 @@ MoeCompactInfo build_moe_compact_info_from_host(const int* host_offsets,
     }
 
     return info;
-}
-
-int moe_trace_layer() {
-    static int layer = -2;
-    if (layer == -2) {
-        const char* env = std::getenv("SUROGATE_MOE_TRACE_LAYER");
-        layer = env ? std::atoi(env) : -1;
-    }
-    return layer;
-}
-
-
-int moe_trace_limit() {
-    static int limit = -2;
-    if (limit == -2) {
-        const char* env = std::getenv("SUROGATE_MOE_TRACE_LIMIT");
-        limit = env ? std::atoi(env) : 8;
-    }
-    return limit;
-}
-
-bool should_trace_moe_layer(int layer_idx, int& counter) {
-    const int target = moe_trace_layer();
-    if (target < 0 || layer_idx != target) {
-        return false;
-    }
-    const int limit = moe_trace_limit();
-    if (limit >= 0 && counter >= limit) {
-        return false;
-    }
-    counter++;
-    return true;
-}
-
-
-// Helper functions that need to be accessible from split op files
-void log_cuda_ptr_attr(const char* tag, const void* ptr, int layer_idx, const char* name) {
-    if (!ptr) {
-        fprintf(stderr, "[%s] layer=%d name=%s ptr=null\n", tag, layer_idx, name ? name : "<unnamed>");
-        return;
-    }
-    cudaPointerAttributes attr{};
-    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "[%s] layer=%d name=%s ptr=%p attr_err=%s\n",
-                tag, layer_idx, name ? name : "<unnamed>", ptr, cudaGetErrorString(err));
-        cudaGetLastError();
-        return;
-    }
-#if CUDART_VERSION >= 10000
-    fprintf(stderr,
-            "[%s] layer=%d name=%s ptr=%p type=%d device=%d\n",
-            tag, layer_idx, name ? name : "<unnamed>", ptr,
-            static_cast<int>(attr.type), attr.device);
-#else
-    fprintf(stderr,
-            "[%s] layer=%d name=%s ptr=%p type=%d device=%d\n",
-            tag, layer_idx, name ? name : "<unnamed>", ptr,
-            static_cast<int>(attr.memoryType), attr.device);
-#endif
-}
-
-bool copy_tensor_sample_as_f32(const Tensor& t, std::size_t count, std::vector<float>& out) {
-    out.assign(count, 0.0f);
-    if (count == 0 || !t.Data) {
-        return false;
-    }
-    switch (t.DType) {
-    case ETensorDType::FP32:
-        cudaMemcpy(out.data(), t.Data, count * sizeof(float), cudaMemcpyDeviceToHost);
-        return true;
-    case ETensorDType::BF16: {
-        std::vector<nv_bfloat16> tmp(count);
-        cudaMemcpy(tmp.data(), t.Data, count * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-        for (std::size_t i = 0; i < count; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
-    }
-    case ETensorDType::FP16: {
-        std::vector<half> tmp(count);
-        cudaMemcpy(tmp.data(), t.Data, count * sizeof(half), cudaMemcpyDeviceToHost);
-        for (std::size_t i = 0; i < count; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
-    }
-    default:
-        return false;
-    }
-}
-
-double sample_mean_abs(const Tensor& t, std::size_t count) {
-    std::vector<float> vals;
-    if (!copy_tensor_sample_as_f32(t, count, vals)) {
-        return 0.0;
-    }
-    double sum = 0.0;
-    for (float v : vals) {
-        sum += std::abs(static_cast<double>(v));
-    }
-    return vals.empty() ? 0.0 : (sum / static_cast<double>(vals.size()));
 }
 
 bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
@@ -264,72 +147,6 @@ bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
     default:
         return false;
     }
-}
-
-void log_moe_gate_up_weight_sample(const char* tag,
-                                   int layer_idx,
-                                   int micro_step,
-                                   DslParamStore& weights,
-                                   const modules::ModelConfig& cfg) {
-    if (layer_idx != 2) {
-        return;
-    }
-    static int trace_count = 0;
-    if (trace_count >= 64) {
-        return;
-    }
-    const std::string wname = "blocks[" + std::to_string(layer_idx) + "].experts_gate_up";
-    if (!weights.has(wname)) {
-        fprintf(stderr,
-                "[MOE_W_SAMPLE_MISS] tag=%s micro_step=%d layer=%d name=%s\n",
-                tag ? tag : "<null>", micro_step, layer_idx, wname.c_str());
-        trace_count++;
-        return;
-    }
-    Tensor& gw = weights.get(wname);
-    const int hidden_size = static_cast<int>(cfg.HiddenSize);
-    const int intermediate_size = (cfg.MoeIntermediateSize > 0)
-        ? static_cast<int>(cfg.MoeIntermediateSize)
-        : static_cast<int>(cfg.IntermediateSize);
-    const int expert_id = 122;
-    const std::size_t stride = static_cast<std::size_t>(2 * intermediate_size) *
-                               static_cast<std::size_t>(hidden_size);
-    const std::size_t offset = stride * static_cast<std::size_t>(expert_id);
-    if (gw.nelem() < static_cast<long>(offset + 1)) {
-        fprintf(stderr,
-                "[MOE_W_SAMPLE_OOR] tag=%s micro_step=%d layer=%d name=%s nelem=%ld offset=%zu\n",
-                tag ? tag : "<null>", micro_step, layer_idx, wname.c_str(),
-                static_cast<long>(gw.nelem()), offset);
-        trace_count++;
-        return;
-    }
-    const std::size_t sample = std::min<std::size_t>(stride, 512);
-    std::vector<float> wvals;
-    if (!copy_tensor_sample_offset_as_f32(gw, offset, sample, wvals)) {
-        fprintf(stderr,
-                "[MOE_W_SAMPLE_FAIL] tag=%s micro_step=%d layer=%d name=%s\n",
-                tag ? tag : "<null>", micro_step, layer_idx, wname.c_str());
-        trace_count++;
-        return;
-    }
-    int nan = 0;
-    float max_abs = 0.0f;
-    float min_v = std::numeric_limits<float>::infinity();
-    float max_v = -std::numeric_limits<float>::infinity();
-    for (float v : wvals) {
-        if (std::isnan(v) || std::isinf(v)) {
-            nan++;
-            continue;
-        }
-        max_abs = std::max(max_abs, std::fabs(v));
-        min_v = std::min(min_v, v);
-        max_v = std::max(max_v, v);
-    }
-    fprintf(stderr,
-            "[MOE_W_SAMPLE] tag=%s micro_step=%d layer=%d expert=%d nan=%d min=%.6f max=%.6f max_abs=%.6f dtype=%s ptr=%p\n",
-            tag ? tag : "<null>", micro_step, layer_idx, expert_id, nan,
-            min_v, max_v, max_abs, dtype_to_str(gw.DType), static_cast<void*>(gw.Data));
-    trace_count++;
 }
 
 bool build_selective_info_from_offsets(const int* host_offsets,
@@ -375,14 +192,6 @@ bool refresh_moe_experts_if_needed(int layer_idx,
         return false;
     }
     const bool refreshed = provider->refresh_moe_experts(layer_idx, selection, stream);
-    static int moe_refresh_trace = 0;
-    if (layer_idx == 2 && moe_refresh_trace < 8) {
-        const int first = selection.active_experts.empty() ? -1 : selection.active_experts[0];
-        fprintf(stderr,
-                "[MOE_REFRESH] layer=%d num_active=%d first=%d refreshed=%d\n",
-                layer_idx, selection.num_active, first, refreshed ? 1 : 0);
-        moe_refresh_trace++;
-    }
     return refreshed;
 }
 
@@ -408,164 +217,7 @@ bool copy_tensor_token_sample_as_f32(const Tensor& t, long token_idx,
     return copy_tensor_sample_offset_as_f32(t, elem_offset, count, out);
 }
 
-bool sample_has_nan_or_inf(const std::vector<float>& vals) {
-    for (float v : vals) {
-        if (std::isnan(v) || std::isinf(v)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool tensor_sample_has_nan_or_inf(const Tensor& t, long token_idx) {
-    std::vector<float> vals(4);
-    const bool ok = copy_tensor_token_sample_as_f32(t, token_idx, vals.size(), vals);
-    if (!ok) {
-        return false;
-    }
-    return sample_has_nan_or_inf(vals);
-}
-
-bool log_tensor_scalar_at(const char* tag, const Tensor& t, long elem_idx) {
-    if (!tag || !t.Data || elem_idx < 0) {
-        return false;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    if (static_cast<std::size_t>(elem_idx) >= total) {
-        return false;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_sample_offset_as_f32(t, static_cast<std::size_t>(elem_idx), 1, vals)) {
-        return false;
-    }
-    const float v = vals.empty() ? 0.0f : vals[0];
-    fprintf(stderr, "[%s] idx=%ld val=%.6f dtype=%s\n", tag, elem_idx, v, dtype_to_str(t.DType));
-    return true;
-}
-
-bool log_tensor_token_row_stats(const char* tag, const Tensor& t, long token_idx) {
-    if (!tag || !t.Data || token_idx < 0) {
-        return false;
-    }
-    std::size_t row_width = 0;
-    if (t.Rank == 1) {
-        if (static_cast<std::size_t>(token_idx) >= static_cast<std::size_t>(t.nelem())) {
-            return false;
-        }
-        row_width = 1;
-    } else if (t.Rank == 2) {
-        row_width = static_cast<std::size_t>(t.Sizes[1]);
-    } else if (t.Rank >= 3) {
-        row_width = 1;
-        for (int i = 2; i < t.Rank; ++i) {
-            row_width *= static_cast<std::size_t>(t.Sizes[i]);
-        }
-    }
-    if (row_width == 0) {
-        return false;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_token_sample_as_f32(t, token_idx, row_width, vals)) {
-        return false;
-    }
-    std::size_t nan = 0;
-    std::size_t inf = 0;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    float max_abs = 0.0f;
-    double sum_abs = 0.0;
-    bool has_finite = false;
-    std::size_t max_idx = 0;
-    for (std::size_t i = 0; i < vals.size(); ++i) {
-        const float v = vals[i];
-        if (std::isnan(v)) {
-            nan++;
-            continue;
-        }
-        if (std::isinf(v)) {
-            inf++;
-            continue;
-        }
-        if (!has_finite) {
-            min_val = v;
-            max_val = v;
-            has_finite = true;
-        } else {
-            if (v < min_val) min_val = v;
-            if (v > max_val) max_val = v;
-        }
-        const float av = std::fabs(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-            max_idx = i;
-        }
-    }
-    const double mean_abs = vals.empty() ? 0.0 : (sum_abs / static_cast<double>(vals.size()));
-    fprintf(stderr,
-            "[%s] token=%ld n=%zu nan=%zu inf=%zu min=%.6f max=%.6f max_abs=%.6f max_idx=%zu mean_abs=%.6f\n",
-            tag, token_idx, vals.size(), nan, inf, min_val, max_val, max_abs, max_idx, mean_abs);
-    return true;
-}
-
 std::size_t tensor_row_width(const Tensor& t);
-
-bool log_tensor_row_stats(const char* tag, const Tensor& t, long row_idx) {
-    if (!tag || !t.Data || row_idx < 0) {
-        return false;
-    }
-    const std::size_t row_width = tensor_row_width(t);
-    if (row_width == 0) {
-        return false;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    const std::size_t elem_offset = static_cast<std::size_t>(row_idx) * row_width;
-    if (elem_offset + row_width > total) {
-        return false;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_sample_offset_as_f32(t, elem_offset, row_width, vals)) {
-        return false;
-    }
-    std::size_t nan = 0;
-    std::size_t inf = 0;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    float max_abs = 0.0f;
-    double sum_abs = 0.0;
-    bool has_finite = false;
-    std::size_t max_idx = 0;
-    for (std::size_t i = 0; i < vals.size(); ++i) {
-        const float v = vals[i];
-        if (std::isnan(v)) {
-            nan++;
-            continue;
-        }
-        if (std::isinf(v)) {
-            inf++;
-            continue;
-        }
-        if (!has_finite) {
-            min_val = v;
-            max_val = v;
-            has_finite = true;
-        } else {
-            if (v < min_val) min_val = v;
-            if (v > max_val) max_val = v;
-        }
-        const float av = std::fabs(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-            max_idx = i;
-        }
-    }
-    const double mean_abs = vals.empty() ? 0.0 : (sum_abs / static_cast<double>(vals.size()));
-    fprintf(stderr,
-            "[%s] row=%ld n=%zu nan=%zu inf=%zu min=%.6f max=%.6f max_abs=%.6f max_idx=%zu mean_abs=%.6f\n",
-            tag, row_idx, vals.size(), nan, inf, min_val, max_val, max_abs, max_idx, mean_abs);
-    return true;
-}
 
 std::size_t tensor_row_width(const Tensor& t) {
     if (t.Rank <= 1) {
@@ -626,290 +278,9 @@ bool find_first_nan_row(const Tensor& t, long* out_row, float* out_min, float* o
     return false;
 }
 
-void log_tensor_mag(const char* tag,
-                    int layer_idx,
-                    const std::string& name,
-                    const Tensor& t,
-                    std::size_t max_elems) {
-    static int mag_log_count = 0;
-    if (!t.Data || mag_log_count >= 64) {
-        return;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    const std::size_t n = std::min(max_elems, total);
-    if (n == 0) {
-        return;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_sample_as_f32(t, n, vals)) {
-        return;
-    }
-    double sum_sq = 0.0;
-    double sum_abs = 0.0;
-    float max_abs = 0.0f;
-    for (float v : vals) {
-        if (std::isnan(v) || std::isinf(v)) {
-            continue;
-        }
-        const float av = std::fabs(v);
-        sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-        }
-    }
-    const double mean_abs = (n > 0) ? (sum_abs / static_cast<double>(n)) : 0.0;
-    fprintf(stderr,
-            "[TENSOR_MAG] tag=%s layer=%d name=%s ptr=%p n=%zu total=%zu l2=%.6e max_abs=%.6e mean_abs=%.6e dtype=%s\n",
-            tag, layer_idx, name.c_str(), t.Data, n, total,
-            std::sqrt(sum_sq), max_abs, mean_abs, dtype_to_str(t.DType));
-    mag_log_count++;
-}
-
-void log_tensor_mag_unbounded(const char* tag,
-                              int layer_idx,
-                              const std::string& name,
-                              const Tensor& t,
-                              std::size_t max_elems) {
-    if (!t.Data) {
-        return;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    const std::size_t n = std::min(max_elems, total);
-    if (n == 0) {
-        return;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_sample_as_f32(t, n, vals)) {
-        return;
-    }
-    double sum_sq = 0.0;
-    double sum_abs = 0.0;
-    float max_abs = 0.0f;
-    for (float v : vals) {
-        if (std::isnan(v) || std::isinf(v)) {
-            continue;
-        }
-        const float av = std::fabs(v);
-        sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-        }
-    }
-    const double mean_abs = (n > 0) ? (sum_abs / static_cast<double>(n)) : 0.0;
-    fprintf(stderr,
-            "[TENSOR_MAG_EX] tag=%s layer=%d name=%s ptr=%p n=%zu total=%zu l2=%.6e max_abs=%.6e mean_abs=%.6e dtype=%s\n",
-            tag, layer_idx, name.c_str(), t.Data, n, total,
-            std::sqrt(sum_sq), max_abs, mean_abs, dtype_to_str(t.DType));
-}
-
 // Global state for QKV gradient tracking (shared across split op files)
 std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
 std::vector<int> g_qkv_dA_micro_by_layer;
-
-void log_nan_sample(const char* tag,
-                    int layer_idx,
-                    const std::string& name,
-                    const Tensor& t,
-                    long token_idx) {
-    static int nan_log_count = 0;
-    static bool first_logged = false;
-    std::vector<float> vals(4);
-    const bool ok = copy_tensor_token_sample_as_f32(t, token_idx, vals.size(), vals);
-    if (!ok || !sample_has_nan_or_inf(vals)) {
-        return;
-    }
-    const char* prefix = first_logged ? "[NAN_DETECT]" : "[FIRST_NAN]";
-    if (!first_logged) {
-        first_logged = true;
-    }
-    if (nan_log_count < 100) {
-        fprintf(stderr,
-                "%s tag=%s layer=%d name=%s token=%ld ptr=%p vals=%.6f,%.6f,%.6f,%.6f\n",
-                prefix, tag, layer_idx, name.c_str(), token_idx, t.Data,
-                vals[0], vals[1], vals[2], vals[3]);
-        nan_log_count++;
-    }
-}
-
-void log_tensor_stats(const char* tag,
-                      int layer_idx,
-                      const std::string& name,
-                      const Tensor& t,
-                      std::size_t max_elems) {
-    static int stats_log_count = 0;
-    if (stats_log_count >= 32 || !t.Data) {
-        return;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    const std::size_t n = std::min(max_elems, total);
-    if (n == 0) {
-        return;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_sample_as_f32(t, n, vals)) {
-        return;
-    }
-    std::size_t nan_count = 0;
-    std::size_t inf_count = 0;
-    double sum_abs = 0.0;
-    float max_abs = 0.0f;
-    for (float v : vals) {
-        if (std::isnan(v)) {
-            nan_count++;
-            continue;
-        }
-        if (std::isinf(v)) {
-            inf_count++;
-            continue;
-        }
-        const float av = std::fabs(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-        }
-    }
-    const double mean_abs = (n > 0) ? (sum_abs / static_cast<double>(n)) : 0.0;
-    fprintf(stderr,
-            "[TENSOR_STATS] tag=%s layer=%d name=%s ptr=%p n=%zu total=%zu nan=%zu inf=%zu max_abs=%.6f mean_abs=%.6f\n",
-            tag, layer_idx, name.c_str(), t.Data, n, total, nan_count, inf_count, max_abs, mean_abs);
-    stats_log_count++;
-}
-
-void log_tensor_stats_ex(const char* tag,
-                         int layer_idx,
-                         const std::string& name,
-                         const Tensor& t,
-                         std::size_t max_elems,
-                         bool force) {
-    static int stats_log_count = 0;
-    static int forced_log_count = 0;
-    if (!t.Data) {
-        return;
-    }
-    if (!force && stats_log_count >= 16) {
-        return;
-    }
-    if (force && forced_log_count >= 16) {
-        return;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    const std::size_t n = std::min(max_elems, total);
-    if (n == 0) {
-        return;
-    }
-    std::vector<float> vals;
-    if (!copy_tensor_sample_as_f32(t, n, vals)) {
-        return;
-    }
-    std::size_t nan_count = 0;
-    std::size_t inf_count = 0;
-    std::size_t finite_count = 0;
-    double sum_abs = 0.0;
-    float max_abs = 0.0f;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    bool has_finite = false;
-    for (float v : vals) {
-        if (std::isnan(v)) {
-            nan_count++;
-            continue;
-        }
-        if (std::isinf(v)) {
-            inf_count++;
-            continue;
-        }
-        if (!has_finite) {
-            min_val = v;
-            max_val = v;
-            has_finite = true;
-        } else {
-            if (v < min_val) {
-                min_val = v;
-            }
-            if (v > max_val) {
-                max_val = v;
-            }
-        }
-        finite_count++;
-        const float av = std::fabs(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-        }
-    }
-    const double mean_abs = (finite_count > 0) ? (sum_abs / static_cast<double>(finite_count)) : 0.0;
-    fprintf(stderr,
-            "[TENSOR_STATS_EX] tag=%s layer=%d name=%s ptr=%p n=%zu total=%zu nan=%zu inf=%zu "
-            "min=%.6f max=%.6f max_abs=%.6f mean_abs=%.6f\n",
-            tag, layer_idx, name.c_str(), t.Data, n, total, nan_count, inf_count,
-            min_val, max_val, max_abs, mean_abs);
-    if (force) {
-        forced_log_count++;
-    } else {
-        stats_log_count++;
-    }
-}
-
-void log_tensor_sample_stats(const char* tag,
-                             const Tensor& t,
-                             std::size_t elem_offset,
-                             std::size_t sample_elems) {
-    if (!t.Data) {
-        return;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    if (total == 0 || sample_elems == 0 || elem_offset >= total) {
-        return;
-    }
-    const std::size_t n = std::min(sample_elems, total - elem_offset);
-    std::vector<float> vals;
-    if (!copy_tensor_sample_offset_as_f32(t, elem_offset, n, vals)) {
-        return;
-    }
-    std::size_t nan_count = 0;
-    std::size_t inf_count = 0;
-    std::size_t finite_count = 0;
-    double sum_abs = 0.0;
-    float max_abs = 0.0f;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    bool has_finite = false;
-    for (float v : vals) {
-        if (std::isnan(v)) {
-            nan_count++;
-            continue;
-        }
-        if (std::isinf(v)) {
-            inf_count++;
-            continue;
-        }
-        if (!has_finite) {
-            min_val = v;
-            max_val = v;
-            has_finite = true;
-        } else {
-            if (v < min_val) {
-                min_val = v;
-            }
-            if (v > max_val) {
-                max_val = v;
-            }
-        }
-        finite_count++;
-        const float av = std::fabs(v);
-        sum_abs += static_cast<double>(av);
-        if (av > max_abs) {
-            max_abs = av;
-        }
-    }
-    const double mean_abs = (finite_count > 0) ? (sum_abs / static_cast<double>(finite_count)) : 0.0;
-    fprintf(stderr,
-            "[TENSOR_SAMPLE_STATS] tag=%s offset=%zu n=%zu total=%zu nan=%zu inf=%zu "
-            "min=%.6f max=%.6f max_abs=%.6f mean_abs=%.6f\n",
-            tag, elem_offset, n, total, nan_count, inf_count, min_val, max_val, max_abs, mean_abs);
-}
 
 float env_float(const char* name, float fallback) {
     if (!name || !*name) {
@@ -1072,12 +443,6 @@ void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool
 void CompiledExecutor::set_recompute_enabled(bool enabled) {
     mRecomputeEnabled = enabled;
     mLastRecomputeLayer = -1;
-    static int set_count = 0;
-    if (set_count < 5) {
-        fprintf(stderr, "[SET_RECOMPUTE_ENABLED] enabled=%d, mRecomputeFn=%p\n",
-                enabled, mRecomputeFn ? (void*)1 : nullptr);
-        set_count++;
-    }
 }
 
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {
@@ -1305,17 +670,6 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 (*mSaved)[name] = saved_tensor;
             } else {
                 // Non-MoE tensor: use standard policy-based saving
-                // DEBUG: Print res_ffn values being saved
-                static int map_save_trace = 0;
-                if (name.find("blocks[25].res_ffn") != std::string::npos && map_save_trace < 16) {
-                    map_save_trace++;
-                    cudaStreamSynchronize(mRunState.MainStream);
-                    std::vector<float> vals(4);
-                    cudaMemcpy(vals.data(), it->second.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-                    bool pl = prefer_live;
-                    fprintf(stderr, "[SAVE_MAP_RES_FFN] %s src.Data=%p vals=%.6f,%.6f,%.6f,%.6f prefer_live=%d\n",
-                            name.c_str(), it->second.Data, vals[0], vals[1], vals[2], vals[3], pl ? 1 : 0);
-                }
                 save_tensor_with_policy(name, it->second, prefer_live);
             }
             continue;
@@ -1387,16 +741,6 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 // res_ffn is computed dynamically (residual_att + mlp_down), check mTensorMap
                 auto it = mTensorMap.find(name);
                 if (it != mTensorMap.end()) {
-                    // DEBUG: Print res_ffn values being saved for layer 25
-                    static int save_trace = 0;
-                    if (layer_idx == 25 && save_trace < 16) {
-                        save_trace++;
-                        cudaStreamSynchronize(mRunState.MainStream);
-                        std::vector<float> vals(4);
-                        cudaMemcpy(vals.data(), it->second.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-                        fprintf(stderr, "[SAVE_RES_FFN] %s src.Data=%p vals=%.6f,%.6f,%.6f,%.6f prefer_live=%d\n",
-                                name.c_str(), it->second.Data, vals[0], vals[1], vals[2], vals[3], prefer_live ? 1 : 0);
-                    }
                     save_tensor_with_policy(name, it->second, prefer_live);
                 } else {
                     throw std::runtime_error("CompiledExecutor: res_ffn tensor not found in map: " + name);
@@ -1460,14 +804,6 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
             return &base;
         }
         if (shape_nelem(shape) != base.nelem()) {
-            // DEBUG: Log when element count mismatch
-            int layer_idx = -1;
-            std::string field;
-            parse_block_param(name, layer_idx, field);
-            if (layer_idx == 0) {
-                fprintf(stderr, "[MAP_VIEW_FAIL] %s: nelem mismatch base=%ld vs shape=%ld\n",
-                        name.c_str(), base.nelem(), shape_nelem(shape));
-            }
             return nullptr;
         }
         auto [it, _] = mTensorMap.insert_or_assign(name, view_tensor(base, shape));
@@ -1562,59 +898,11 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }
 
-    // DEBUG: Trace resolution for top-layer d_qkv_rope gradients
-    static int d_qkv_rope_resolve_trace = 0;
-    if (d_qkv_rope_resolve_trace < 8 &&
-        ref.name.find("d_blocks[") != std::string::npos &&
-        ref.name.find("qkv_rope") != std::string::npos &&
-        ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
-        fprintf(stderr,
-                "[RESOLVE_D_QKV_ROPE] name=%s slot=%d shape_rank=%zu\n",
-                ref.name.c_str(), static_cast<int>(ref.slot), ref.shape.size());
-        d_qkv_rope_resolve_trace++;
-    }
-
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
         // Check if we already have a tensor in the map (e.g., from MoE temp allocation)
         auto it = mTensorMap.find(ref.name);
-        // DEBUG: Trace mTensorMap lookup for top-layer d_ln1
-        static int shape_trace_count = 0;
-        if (shape_trace_count < 8 &&
-            ref.name.find(".ln1") != std::string::npos &&
-            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
-            fprintf(stderr, "[RESOLVE_SHAPE] ref.name=%s, shape.size=%zu, found_in_map=%s, slot=%d\n",
-                    ref.name.c_str(), ref.shape.size(),
-                    (it != mTensorMap.end() && it->second.Data) ? "YES" : "NO",
-                    static_cast<int>(ref.slot));
-            if (it != mTensorMap.end() && it->second.Data) {
-                cudaStreamSynchronize(mRunState.MainStream);
-                std::vector<float> vals(4);
-                cudaMemcpy(vals.data(), it->second.Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-                fprintf(stderr, "[RESOLVE_SHAPE] d_ln1 ptr=%p, values=%.9f,%.9f,%.9f,%.9f\n",
-                        it->second.Data, vals[0], vals[1], vals[2], vals[3]);
-            }
-            shape_trace_count++;
-        }
-        // DEBUG: Trace when top-layer d_qkv_rope is already in the map
-        static int qkv_rope_shape_trace = 0;
-        if (qkv_rope_shape_trace < 8 &&
-            ref.name.find("d_blocks[") != std::string::npos &&
-            ref.name.find("qkv_rope") != std::string::npos &&
-            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
-            fprintf(stderr, "[RESOLVE_SHAPE_QKV_ROPE] ref.name=%s shape.size=%zu found_in_map=%s slot=%d\n",
-                    ref.name.c_str(), ref.shape.size(),
-                    (it != mTensorMap.end() && it->second.Data) ? "YES" : "NO",
-                    static_cast<int>(ref.slot));
-            if (it != mTensorMap.end() && it->second.Data) {
-                fprintf(stderr,
-                        "[RESOLVE_SHAPE_QKV_ROPE] ptr=%p shape=%s\n",
-                        it->second.Data,
-                        tensor_shape_str(it->second).c_str());
-            }
-            qkv_rope_shape_trace++;
-        }
         if (it != mTensorMap.end() && it->second.Data) {
             // For MoE operations, the tensor map may contain dynamically-shaped temps
             // that differ from the statically-compiled shapes. Prioritize the map tensor
@@ -1666,7 +954,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }
 
-    // FIX: Always check mTensorMap first for gradient slots before falling back to simplified_grads.
+    // Always check mTensorMap first for gradient slots before falling back to simplified_grads.
     // This is critical because view_backward stores aliases in mTensorMap, and subsequent ops
     // (like rmsnorm_backward) must use that aliased tensor, not the pre-allocated simplified_grads buffer.
     // Without this check, the gradient chain can break when view_backward creates an alias that
@@ -1675,25 +963,6 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         auto it = mTensorMap.find(ref.name);
         if (it != mTensorMap.end() && it->second.Data) {
             return it->second;
-        }
-        // DEBUG: Trace when mTensorMap lookup fails for top-layer d_ln1
-        static int miss_trace_count = 0;
-        if (miss_trace_count < 8 &&
-            ref.name.find(".ln1") != std::string::npos &&
-            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
-            fprintf(stderr, "[RESOLVE_FIX] NOT in mTensorMap: %s, slot=%d\n",
-                    ref.name.c_str(), static_cast<int>(ref.slot));
-            miss_trace_count++;
-        }
-        // DEBUG: Trace when mTensorMap lookup fails for top-layer d_qkv_rope
-        static int qkv_rope_miss_trace = 0;
-        if (qkv_rope_miss_trace < 8 &&
-            ref.name.find("d_blocks[") != std::string::npos &&
-            ref.name.find("qkv_rope") != std::string::npos &&
-            ref.layer_idx == static_cast<int>(mConfig.NumLayers) - 1) {
-            fprintf(stderr, "[RESOLVE_FIX_QKV_ROPE] NOT in mTensorMap: %s, slot=%d\n",
-                    ref.name.c_str(), static_cast<int>(ref.slot));
-            qkv_rope_miss_trace++;
         }
     }
 
@@ -1856,27 +1125,6 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                     try {
                         Tensor& base = resolve_tensor(alias_ref);
                         Tensor view = ref.shape.empty() ? base : view_tensor(base, ref.shape);
-                        if (std::getenv("SUROGATE_TRACE_MOE_ALLOC") &&
-                            ref.name.find("permuted_input") != std::string::npos) {
-                            std::ostringstream oss;
-                            oss << "[MOE_ALIAS] name=" << ref.name << " alias=" << alias_name << " ref_shape=[";
-                            for (std::size_t i = 0; i < ref.shape.size(); ++i) {
-                                if (i) oss << ",";
-                                oss << ref.shape[i];
-                            }
-                            oss << "] base_shape=[";
-                            for (int i = 0; i < base.Rank; ++i) {
-                                if (i) oss << ",";
-                                oss << base.Sizes[i];
-                            }
-                            oss << "] view_shape=[";
-                            for (int i = 0; i < view.Rank; ++i) {
-                                if (i) oss << ",";
-                                oss << view.Sizes[i];
-                            }
-                            oss << "]\n";
-                            std::fputs(oss.str().c_str(), stderr);
-                        }
                         auto [it, _] = mTensorMap.insert_or_assign(ref.name, view);
                         return it->second;
                     } catch (const std::exception&) {
@@ -1908,37 +1156,10 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     // For mapped/temporary tensors, allocate if needed
     auto it = mTensorMap.find(ref.name);
     if (it != mTensorMap.end()) {
-        if (std::getenv("SUROGATE_TRACE_MOE_ALLOC") &&
-            ref.name.find("permuted_input") != std::string::npos) {
-            std::ostringstream oss;
-            oss << "[MOE_ALLOC_HIT] name=" << ref.name << " shape=[";
-            for (int i = 0; i < it->second.Rank; ++i) {
-                if (i) oss << ",";
-                oss << it->second.Sizes[i];
-            }
-            oss << "]\n";
-            std::fputs(oss.str().c_str(), stderr);
-        }
         return it->second;
     }
 
     Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape);
-    if (std::getenv("SUROGATE_TRACE_MOE_ALLOC") &&
-        ref.name.find("permuted_input") != std::string::npos) {
-        std::ostringstream oss;
-        oss << "[MOE_ALLOC_NEW] name=" << ref.name << " ref_shape=[";
-        for (std::size_t i = 0; i < ref.shape.size(); ++i) {
-            if (i) oss << ",";
-            oss << ref.shape[i];
-        }
-        oss << "] alloc_shape=[";
-        for (int i = 0; i < t.Rank; ++i) {
-            if (i) oss << ",";
-            oss << t.Sizes[i];
-        }
-        oss << "]\n";
-        std::fputs(oss.str().c_str(), stderr);
-    }
 
     // Zero gradient tensors to prevent stale values from accumulating.
     // Gradient tensor names start with "d_" (e.g., "d_blocks[0].ln1").
@@ -1947,11 +1168,6 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     // micro-batches and contains stale values from previous backward passes.
     if (ref.name.size() >= 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
         fill_zero(t, mRunState.MainStream);
-        static int zero_trace = 0;
-        if (zero_trace < 5) {
-            fprintf(stderr, "[ZERO_GRAD] Zeroed %s ptr=%p\n", ref.name.c_str(), t.Data);
-            zero_trace++;
-        }
     }
 
     mTemps.push_back(t);
@@ -1977,14 +1193,6 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
 
     mCurrentLayer = layer_idx;
 
-    // DEBUG: Check previous layer MLP output for NaNs at layer boundary.
-    static int pre_ln1_nan_trace = 0;
-    if (pre_ln1_nan_trace < 4 && layer_idx == 3) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        auto& prev_acts = mRunState.simplified_acts(layer_idx - 1);
-        log_nan_sample("PRE_LN1_MLP_DOWN", layer_idx - 1, "blocks[2].mlp_down", prev_acts.mlp_down, 3);
-        pre_ln1_nan_trace++;
-    }
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
@@ -2209,80 +1417,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     }
 
-    // DEBUG: Summarize parameter gradient samples to spot divergence.
-    static int param_grad_trace_enabled = -1;
-    if (param_grad_trace_enabled < 0) {
-        param_grad_trace_enabled = (std::getenv("SUROGATE_TRACE_PARAM_GRADS") != nullptr) ? 1 : 0;
-    }
-    if (param_grad_trace_enabled) {
-        struct ParamSample {
-            std::string name;
-            double mean_abs{0.0};
-            double max_abs{0.0};
-            std::size_t count{0};
-        };
-        std::vector<ParamSample> samples;
-        double total_sum_sq = 0.0;
-        double total_sum_abs = 0.0;
-        std::size_t total_count = 0;
-        constexpr std::size_t kSampleN = 1024;
-        for (const auto& param_name : mGrads.param_names()) {
-            bool accumulate = false;
-            Tensor* grad_tensor = mGrads.get_param_grad(param_name, accumulate);
-            if (!grad_tensor || !grad_tensor->Data || grad_tensor->nelem() <= 0) {
-                continue;
-            }
-            const std::size_t n = std::min<std::size_t>(kSampleN, static_cast<std::size_t>(grad_tensor->nelem()));
-            std::vector<float> vals;
-            if (!copy_tensor_sample_as_f32(*grad_tensor, n, vals)) {
-                continue;
-            }
-            double sum_abs = 0.0;
-            double sum_sq = 0.0;
-            double max_abs = 0.0;
-            for (float v : vals) {
-                if (std::isnan(v) || std::isinf(v)) {
-                    continue;
-                }
-                const double av = std::abs(static_cast<double>(v));
-                sum_abs += av;
-                sum_sq += av * av;
-                if (av > max_abs) {
-                    max_abs = av;
-                }
-            }
-            if (!vals.empty()) {
-                ParamSample s;
-                s.name = param_name;
-                s.count = vals.size();
-                s.mean_abs = sum_abs / static_cast<double>(vals.size());
-                s.max_abs = max_abs;
-                samples.push_back(std::move(s));
-                total_sum_abs += sum_abs;
-                total_sum_sq += sum_sq;
-                total_count += vals.size();
-            }
-        }
-        if (!samples.empty()) {
-            std::sort(samples.begin(), samples.end(),
-                      [](const ParamSample& a, const ParamSample& b) { return a.mean_abs > b.mean_abs; });
-            const std::size_t top_n = std::min<std::size_t>(10, samples.size());
-            for (std::size_t i = 0; i < top_n; ++i) {
-                const auto& s = samples[i];
-                fprintf(stderr,
-                        "[PARAM_GRAD_SAMPLE] name=%s mean_abs=%.6e max_abs=%.6e n=%zu\n",
-                        s.name.c_str(), s.mean_abs, s.max_abs, s.count);
-            }
-            if (total_count > 0) {
-                const double mean_abs = total_sum_abs / static_cast<double>(total_count);
-                const double l2 = std::sqrt(total_sum_sq);
-                fprintf(stderr,
-                        "[PARAM_GRAD_SAMPLE_NORM] sample_l2=%.6e mean_abs=%.6e count=%zu\n",
-                        l2, mean_abs, total_count);
-            }
-        }
-    }
-
     // Free temporaries
     for (auto it = mTemps.rbegin(); it != mTemps.rend(); ++it) {
         mRunState.temp_free(*it);
@@ -2470,15 +1604,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (!mRunState.is_lora_only_mode()) {
         mTensorMap["d_encoded"] = d_embeddings_buf;
         mTensorMap["d_x0"] = d_embeddings_buf;
-    }
-
-    static bool emb_grad_initial_logged = false;
-    if (!emb_grad_initial_logged && d_embeddings_buf.Data) {
-        if (tensor_sample_has_nan_or_inf(d_embeddings_buf, 3)) {
-            fprintf(stderr, "[EMB_DOUT_NAN_INIT] micro_step=%d ptr=%p\n", micro_step, d_embeddings_buf.Data);
-            log_tensor_stats_ex("EMB_DOUT_INIT_NAN", -1, "d_embeddings", d_embeddings_buf, 4096, true);
-        }
-        emb_grad_initial_logged = true;
     }
 
     // DSL-driven binding for any additional gradient slots declared in the Python model
@@ -2776,93 +1901,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             continue;
         }
 
-        // DEBUG: Trace flash attention backward op order and layer indices.
-        static int flash_bwd_trace = 0;
-        if (op.type == CompiledOpType::FlashAttentionBackward && flash_bwd_trace < 12) {
-            int layer_idx_dbg = -1;
-            std::string field_dbg;
-            if (!op.inputs.empty()) {
-                parse_block_param(op.inputs[1].name, layer_idx_dbg, field_dbg);
-            }
-            fprintf(stderr,
-                    "[EXEC_FLASH_BWD] op=%zu layer_idx=%d in_out=%s in_lse=%s in_qkv=%s out=%s\n",
-                    idx,
-                    layer_idx_dbg,
-                    op.inputs.size() > 1 ? op.inputs[1].name.c_str() : "<none>",
-                    op.inputs.size() > 2 ? op.inputs[2].name.c_str() : "<none>",
-                    op.inputs.size() > 3 ? op.inputs[3].name.c_str() : "<none>",
-                    op.outputs.size() > 0 ? op.outputs[0].name.c_str() : "<none>");
-            flash_bwd_trace++;
-        }
-
         if (op.layer_start >= 0) {
             handle_layer_start(op.layer_start);
-            // Optional trace: watch a specific layer's res_ffn buffer to catch corruption.
-            if (std::getenv("SUROGATE_TRACE_RESFFN_LAYER")) {
-                const int target_layer = env_int("SUROGATE_TRACE_RESFFN_LAYER", 27);
-                static int resffn_trace_count = 0;
-                if (target_layer >= 0 && target_layer < num_layers && resffn_trace_count < 64) {
-                    Tensor& res = mRunState.get_residual(target_layer, mRunState.MainStream);
-                    fprintf(stderr, "[BWD_RESFFN_TRACE] at_layer=%d target=%d res_ptr=%p\n",
-                            op.layer_start, target_layer, res.Data);
-                    std::vector<float> vals;
-                    const std::size_t total = static_cast<std::size_t>(res.nelem());
-                    const std::size_t n = std::min<std::size_t>(4096, total);
-                    if (copy_tensor_sample_as_f32(res, n, vals)) {
-                        std::size_t nan = 0;
-                        std::size_t inf = 0;
-                        float min_v = std::numeric_limits<float>::infinity();
-                        float max_v = -std::numeric_limits<float>::infinity();
-                        double sum_abs = 0.0;
-                        for (float v : vals) {
-                            if (std::isnan(v)) {
-                                nan++;
-                                continue;
-                            }
-                            if (std::isinf(v)) {
-                                inf++;
-                                continue;
-                            }
-                            min_v = std::min(min_v, v);
-                            max_v = std::max(max_v, v);
-                            sum_abs += std::fabs(v);
-                        }
-                        const double mean_abs = n ? (sum_abs / static_cast<double>(n)) : 0.0;
-                        fprintf(stderr,
-                                "[BWD_RESFFN_TRACE_STATS] target=%d n=%zu total=%zu nan=%zu inf=%zu min=%.6f max=%.6f mean_abs=%.6f\n",
-                                target_layer, n, total, nan, inf,
-                                std::isfinite(min_v) ? min_v : 0.0f,
-                                std::isfinite(max_v) ? max_v : 0.0f,
-                                static_cast<float>(mean_abs));
-                    }
-                    resffn_trace_count++;
-                }
-            }
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
                 if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
                     clear_shared_grads(layer_idx);
                     layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                }
-                // DEBUG: Check MoE expert gate_up weights before recompute at layer start.
-                static int moe_w_pre_recompute_start_trace = 0;
-                if (layer_idx == 2 && moe_w_pre_recompute_start_trace < 1) {
-                    const std::string w_name = "blocks[2].experts_gate_up";
-                    if (mWeights.has(w_name)) {
-                        Tensor& w = mWeights.get(w_name);
-                        float w_min = 0.0f, w_max = 0.0f;
-                        const bool w_nan = tensor_row_has_nan_or_inf(w, 122, &w_min, &w_max);
-                        fprintf(stderr,
-                                "[MOE_W_PRE_RECOMP_START] layer=%d name=%s ptr=%p device=%d nan=%d min=%.6f max=%.6f\n",
-                                layer_idx, w_name.c_str(),
-                                w.Data, w.Device,
-                                w_nan ? 1 : 0, w_min, w_max);
-                    } else {
-                        fprintf(stderr, "[MOE_W_PRE_RECOMP_START] layer=%d name=%s missing\n",
-                                layer_idx, w_name.c_str());
-                    }
-                    moe_w_pre_recompute_start_trace++;
                 }
                 mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
                 record_recompute_sample(layer_idx);
@@ -2881,42 +1927,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // - The old check (missing_start || op_before_start) would skip recomputation
             //   for layer N's late ops if we had already visited layer N earlier, causing
             //   those ops to read stale data from whatever layer was recomputed last
-            static int debug_op_count = 0;
-            if (debug_op_count < 10) {
-                fprintf(stderr, "[DEBUG_LAYER] op=%d layer_idx=%d layer_idx_any=%d mLastRecompute=%d op_type=%s\n",
-                        static_cast<int>(idx), layer_idx, layer_idx_any, mLastRecomputeLayer, op_type_to_string(op.type));
-                debug_op_count++;
-            }
             // Use layer_idx_any as fallback when layer_idx is -1
             const int effective_layer_idx = (layer_idx >= 0) ? layer_idx : layer_idx_any;
             if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
                 if (effective_layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
                     clear_shared_grads(effective_layer_idx);
                     layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
-                }
-                // DEBUG: Check MoE expert gate_up weights before recompute for layer 2.
-                static int moe_w_pre_recompute_trace = 0;
-                if (effective_layer_idx == 2 && moe_w_pre_recompute_trace < 1) {
-                    const std::string w_name = "blocks[2].experts_gate_up";
-                    if (mWeights.has(w_name)) {
-                        Tensor& w = mWeights.get(w_name);
-                        float w_min = 0.0f, w_max = 0.0f;
-                        const bool w_nan = tensor_row_has_nan_or_inf(w, 122, &w_min, &w_max);
-                        fprintf(stderr,
-                                "[MOE_W_PRE_RECOMP] layer=%d name=%s ptr=%p device=%d nan=%d min=%.6f max=%.6f\n",
-                                effective_layer_idx, w_name.c_str(),
-                                w.Data, w.Device,
-                                w_nan ? 1 : 0, w_min, w_max);
-                    } else {
-                        fprintf(stderr, "[MOE_W_PRE_RECOMP] layer=%d name=%s missing\n",
-                                effective_layer_idx, w_name.c_str());
-                    }
-                    moe_w_pre_recompute_trace++;
-                }
-                static int recompute_call_count = 0;
-                if (recompute_call_count < 5) {
-                    fprintf(stderr, "[CALLING_RECOMPUTE] layer_idx=%d (effective=%d) num_layers=%d\n", layer_idx, effective_layer_idx, num_layers);
-                    recompute_call_count++;
                 }
                 mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
                 record_recompute_sample(effective_layer_idx);
@@ -3044,133 +2060,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 }
             }
 
-            // Optional: detect the first op that corrupts a target res_ffn buffer.
-            if (std::getenv("SUROGATE_TRACE_RESFFN_WATCH")) {
-                const int target_layer = env_int("SUROGATE_TRACE_RESFFN_LAYER", 27);
-                const int watch_layer = env_int("SUROGATE_TRACE_RESFFN_WATCH_LAYER", target_layer);
-                static bool res_ok = true;
-                static int res_watch_count = 0;
-                if (op.layer_start >= 0 && op.layer_start == watch_layer) {
-                    res_ok = true;
-                    res_watch_count = 0;
-                }
-                const int op_layer = op_layer_idx_any(op);
-                if (res_ok && op_layer == watch_layer && target_layer >= 0 && target_layer < num_layers) {
-                    Tensor& res = mRunState.get_residual(target_layer, mRunState.MainStream);
-                    std::vector<float> vals;
-                    const std::size_t total = static_cast<std::size_t>(res.nelem());
-                    const std::size_t n = std::min<std::size_t>(4096, total);
-                    bool corrupt = false;
-                    float max_abs = 0.0f;
-                    std::size_t nan = 0;
-                    if (copy_tensor_sample_as_f32(res, n, vals)) {
-                        for (float v : vals) {
-                            if (std::isnan(v) || std::isinf(v)) {
-                                nan++;
-                                corrupt = true;
-                                continue;
-                            }
-                            max_abs = std::max(max_abs, std::fabs(v));
-                        }
-                        const float thresh = env_float("SUROGATE_TRACE_RESFFN_THRESH", 1e6f);
-                        if (max_abs > thresh) {
-                            corrupt = true;
-                        }
-                    }
-                    if (corrupt && res_watch_count < 4) {
-                        fprintf(stderr,
-                                "[RESFFN_CORRUPT] watch_layer=%d target=%d op=%s op_id=%s max_abs=%.3e nan=%zu\n",
-                                watch_layer, target_layer,
-                                op_type_to_string(op.type), op.op_id.c_str(),
-                                static_cast<double>(max_abs), nan);
-                        res_watch_count++;
-                        res_ok = false;
-                    }
-                }
-            }
-
-            // Trace first writers for layer-8 residual gradients to pinpoint the spike source.
-            static int res_writer_trace_enabled = -1;
-            if (res_writer_trace_enabled < 0) {
-                res_writer_trace_enabled = (std::getenv("SUROGATE_TRACE_RES_WRITERS") != nullptr) ? 1 : 0;
-            }
-            if (res_writer_trace_enabled) {
-                struct ResWriterState {
-                    int micro_step = -1;
-                    int res_att_count = 0;
-                    int res_ffn_count = 0;
-                };
-                static ResWriterState res_state;
-                if (res_state.micro_step != mMicroStep) {
-                    res_state = {};
-                    res_state.micro_step = mMicroStep;
-                }
-                auto log_res_writer = [&](const TensorRef& ref, int& counter) {
-                    if (counter >= 12) {
-                        return;
-                    }
-                    Tensor& t = resolve_tensor(ref);
-                    fprintf(stderr,
-                            "[RES_WRITER] micro_step=%d op_idx=%zu type=%s id=%s name=%s\n",
-                            mMicroStep,
-                            idx,
-                            op_type_to_string(op.type),
-                            op.op_id.c_str(),
-                            ref.name.c_str());
-                    log_tensor_mag_unbounded("RES_WRITER_TENSOR", op_layer_any, ref.name, t, 4096);
-                    counter++;
-                };
-                for (const auto& out_ref : op.outputs) {
-                    const std::string base = strip_ssa_suffix(out_ref.name);
-                    if (base == "d_blocks[8].res_att") {
-                        log_res_writer(out_ref, res_state.res_att_count);
-                    } else if (base == "d_blocks[8].res_ffn") {
-                        log_res_writer(out_ref, res_state.res_ffn_count);
-                    }
-                }
-            }
-
-            // Track when key gradients first spike or go NaN.
-            static std::unordered_map<std::string, int> watch_counts;
-            auto log_watch = [&](const TensorRef& ref) {
-                if (ref.name.empty()) return;
-                const std::string base = strip_ssa_suffix(ref.name);
-                if (base != "d_blocks[0].ln1" &&
-                    base != "d_blocks[0].ln2" &&
-                    base != "d_blocks[0].res_ffn" &&
-                    base != "d_blocks[0].mlp_up" &&
-                    base != "d_blocks[0].swiglu") {
-                    return;
-                }
-                int& count = watch_counts[base];
-                if (count >= 8) {
-                    return;
-                }
-                Tensor& t = resolve_tensor(ref);
-                fprintf(stderr,
-                        "[BWD_WATCH] op_idx=%zu type=%s id=%s name=%s\n",
-                        idx, op_type_to_string(op.type), op.op_id.c_str(), ref.name.c_str());
-                log_tensor_stats_ex("BWD_WATCH_OUT", op_layer_any, ref.name, t, 4096, true);
-                count++;
-            };
-            for (const auto& out_ref : op.outputs) {
-                log_watch(out_ref);
-            }
-
-            static bool emb_nan_logged = false;
-            if (!emb_nan_logged && d_embeddings_buf.Data && tensor_sample_has_nan_or_inf(d_embeddings_buf, 3)) {
-                fprintf(stderr,
-                        "[EMB_DOUT_NAN_AFTER] micro_step=%d op_idx=%zu type=%s id=%s\n",
-                        micro_step, idx, op_type_to_string(op.type), op.op_id.c_str());
-                log_tensor_stats_ex("EMB_DOUT_NAN_AFTER", -1, "d_embeddings", d_embeddings_buf, 4096, true);
-                const long hidden = d_embeddings_buf.Rank > 2 ? d_embeddings_buf.Sizes[2] : 0;
-                if (hidden > 0) {
-                    const std::size_t off = static_cast<std::size_t>(3) * static_cast<std::size_t>(hidden);
-                    log_tensor_sample_stats("EMB_DOUT_NAN_ROW3", d_embeddings_buf, off,
-                                            static_cast<std::size_t>(hidden));
-                }
-                emb_nan_logged = true;
-            }
 
             // Memory management - restore stack checkpoint periodically to free temporaries
             // This prevents memory accumulation during backward pass
@@ -3198,7 +2087,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 }
                 last_layer_restored = op.layer_end;
             }
-            // Option 2: Every N ops as fallback (catches non-annotated layers)
+            // Every N ops as fallback (catches non-annotated layers)
             // NOTE: When recompute is disabled, we cannot aggressively prune tensors because
             // the backward graph may reference intermediate tensors (like d_blocks[N].view_K)
             // that were produced earlier but are still needed. The stack restore + prune

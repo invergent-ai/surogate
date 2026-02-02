@@ -305,21 +305,6 @@ void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Hq, HS)
     float attn_scale_cpu = 1.0 / sqrtf(HS);
     void* devPtrO = out;
 
-    // DEBUG: Log cuDNN attention launch parameters (limited)
-    static int log_count = 0;
-    if (log_count < 4) {
-        const std::size_t ws_needed = cudnn_get_workspace_size(B, T, Hq, Hkv, HS, handle);
-        const std::size_t cudnn_ver = cudnnGetVersion();
-        fprintf(stderr,
-                "[CUDNN_ATTN_FWD] B=%d T=%d Hq=%d Hkv=%d HS=%d infer=%d ws_ptr=%p ws_needed=%zu cudnn_ver=%zu\n",
-                B, T, Hq, Hkv, HS, is_inference_only ? 1 : 0,
-                workspace, ws_needed, cudnn_ver);
-        fprintf(stderr,
-                "[CUDNN_ATTN_FWD] ptrs Q=%p K=%p V=%p O=%p Stats=%p\n",
-                devPtrQ, devPtrK, devPtrV, devPtrO, stats);
-        log_count++;
-    }
-
     // Build variant pack
     std::unordered_map<int64_t , void*> variant_pack = {
         {Q_UID, (void*)devPtrQ}, {K_UID, (void*)devPtrK}, {V_UID, (void*)devPtrV}, {Attn_scale_UID, &attn_scale_cpu}, {O_UID, devPtrO}};

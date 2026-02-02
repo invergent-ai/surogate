@@ -53,15 +53,6 @@ void CompiledExecutor::dispatch_moe_sigmoid(const CompiledOp& op) {
                             num_elements, mRunState.MainStream);
     }
 
-    const bool moe_route_trace = (std::getenv("SUROGATE_MOE_ROUTE_TRACE") != nullptr);
-    static int moe_route_trace_count = 0;
-    if (moe_route_trace && moe_route_trace_count < 4) {
-        const std::size_t total = static_cast<std::size_t>(out.nelem());
-        const std::size_t sample = std::min<std::size_t>(4096, total);
-        log_tensor_sample_stats("MOE_ROUTER_PROBS", out, 0, sample);
-        moe_route_trace_count++;
-    }
-
     mTensorMap[op.outputs[0].name] = out;
 }
 

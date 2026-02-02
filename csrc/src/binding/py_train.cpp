@@ -374,7 +374,7 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         try {
             ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
         } catch (const std::exception& e) {
-            std::cerr << "[DEBUG] step work lambda: backward threw: " << e.what() << std::endl;
+            std::cerr << "backward threw: " << e.what() << std::endl;
             throw;
         }
     });
@@ -826,7 +826,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             try {
                 work(ctx);
             } catch (const std::exception& e) {
-                std::cerr << "[DEBUG] main_loop: work threw exception: " << e.what() << std::endl;
+                std::cerr << "work threw exception: " << e.what() << std::endl;
                 throw;
             }
             mWorkDone.fetch_add(1);

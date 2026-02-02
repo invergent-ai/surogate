@@ -290,7 +290,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     skip_quant_last_layers: Optional[int] = 0
 
     gpus: Optional[int] = 1
-    use_cuda_graphs: Optional[bool] = False
+    use_cuda_graphs: Optional[bool] = True
     use_dsl_ir: Optional[bool] = True
 
     optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'

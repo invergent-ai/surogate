@@ -273,19 +273,8 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     Tensor& buf = mLoRARunState->norm_buffer;
     fill_zero(buf, stream);
 
-    static int grad_check_count = 0;
     auto norm_squared = [&](const Tensor& grad, const char* name) {
         if (grad.Data) {
-            // Debug: check first few gradient tensors for NaN
-            if (grad_check_count < 20) {
-                float first_val = 0.0f;
-                CUDA_CHECK(cudaMemcpy(&first_val, grad.Data, sizeof(float), cudaMemcpyDeviceToHost));
-                if (std::isnan(first_val) || std::isinf(first_val)) {
-                    std::cerr << "[LoRA grad NaN] " << name << " first_val=" << first_val
-                              << " nelem=" << grad.nelem() << std::endl;
-                }
-                grad_check_count++;
-            }
             global_norm_squared(buf, grad, grad.nelem(), rs.DeviceProp, stream);
         }
     };
@@ -318,15 +307,6 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     }
 
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);
-
-    // Debug: check accumulated norm squared before sqrt
-    static int norm_debug_count = 0;
-    if (norm_debug_count < 5) {
-        float norm_sq = 0.0f;
-        CUDA_CHECK(cudaMemcpy(&norm_sq, buf.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost));
-        std::cerr << "[LoRA norm debug #" << norm_debug_count << "] accumulated norm_sq=" << norm_sq << std::endl;
-        norm_debug_count++;
-    }
 
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))

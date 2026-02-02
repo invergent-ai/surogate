@@ -352,14 +352,6 @@ public:
         return false;
     }
 
-    bool debug_moe_gate_up_absmax(int layer_idx, int expert_id, int out_row,
-                                  cudaStream_t stream) override {
-        if (mBnBProvider) {
-            return mBnBProvider->debug_moe_gate_up_absmax(layer_idx, expert_id, out_row, stream);
-        }
-        return false;
-    }
-
     std::size_t quantized_weights_bytes() const override {
         return with_provider([&](const auto& provider) { return provider.quantized_weights_bytes(); });
     }

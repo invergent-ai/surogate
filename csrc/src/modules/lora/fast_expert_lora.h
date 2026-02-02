@@ -10,9 +10,6 @@
  * @brief Fast LoRA fusion for MoE experts.
  */
 
-#include <algorithm>
-#include <cmath>
-#include <cstdlib>
 #include <vector>
 
 #include <fmt/core.h>
@@ -22,8 +19,6 @@
 #include "modules/moe/moe_types.h"
 #include "modules/model_config.h"
 #include "utilities/dtype.h"
-#include "utilities/utils.h"
-
 namespace modules {
 namespace detail {
 
@@ -38,119 +33,6 @@ struct FastExpertLoRAState {
     int C = 0;          ///< Hidden size
     int D = 0;          ///< Intermediate size
 };
-
-inline bool sample_tensor_to_f32(const Tensor& t,
-                                 std::size_t elem_offset,
-                                 std::size_t count,
-                                 std::vector<float>& out,
-                                 cudaStream_t stream) {
-    if (!t.Data) {
-        return false;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    if (total == 0 || elem_offset >= total) {
-        return false;
-    }
-    const std::size_t n = std::min(count, total - elem_offset);
-    out.assign(n, 0.0f);
-    if (t.DType == ETensorDType::BF16) {
-        std::vector<nv_bfloat16> tmp(n);
-        CUDA_CHECK(cudaMemcpyAsync(tmp.data(),
-                                   reinterpret_cast<const nv_bfloat16*>(t.Data) + elem_offset,
-                                   n * sizeof(nv_bfloat16),
-                                   cudaMemcpyDeviceToHost,
-                                   stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (std::size_t i = 0; i < n; ++i) {
-            out[i] = __bfloat162float(tmp[i]);
-        }
-        return true;
-    }
-    if (t.DType == ETensorDType::FP16) {
-        std::vector<half> tmp(n);
-        CUDA_CHECK(cudaMemcpyAsync(tmp.data(),
-                                   reinterpret_cast<const half*>(t.Data) + elem_offset,
-                                   n * sizeof(half),
-                                   cudaMemcpyDeviceToHost,
-                                   stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (std::size_t i = 0; i < n; ++i) {
-            out[i] = __half2float(tmp[i]);
-        }
-        return true;
-    }
-    if (t.DType == ETensorDType::FP32) {
-        CUDA_CHECK(cudaMemcpyAsync(out.data(),
-                                   reinterpret_cast<const float*>(t.Data) + elem_offset,
-                                   n * sizeof(float),
-                                   cudaMemcpyDeviceToHost,
-                                   stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        return true;
-    }
-    return false;
-}
-
-inline void log_sample_stats(const char* tag,
-                             int layer_idx,
-                             const std::vector<float>& vals) {
-    if (vals.empty()) {
-        return;
-    }
-    double sum_abs = 0.0;
-    double sum_sq = 0.0;
-    float max_abs = 0.0f;
-    for (float v : vals) {
-        const float av = std::fabs(v);
-        sum_abs += av;
-        sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        if (av > max_abs) {
-            max_abs = av;
-        }
-    }
-    const float mean_abs = static_cast<float>(sum_abs / vals.size());
-    const float l2 = static_cast<float>(std::sqrt(sum_sq));
-    fprintf(stderr,
-            "[MOE_LORA_SPLIT] layer=%d tag=%s n=%zu l2=%.6f max_abs=%.6f mean_abs=%.6f\n",
-            layer_idx,
-            tag ? tag : "<none>",
-            vals.size(),
-            l2,
-            max_abs,
-            mean_abs);
-}
-
-inline void log_sample_delta(const char* tag,
-                             int layer_idx,
-                             const std::vector<float>& base,
-                             const std::vector<float>& post) {
-    if (base.empty() || post.empty()) {
-        return;
-    }
-    const std::size_t n = std::min(base.size(), post.size());
-    double sum_abs = 0.0;
-    double sum_sq = 0.0;
-    float max_abs = 0.0f;
-    for (std::size_t i = 0; i < n; ++i) {
-        const float d = post[i] - base[i];
-        const float ad = std::fabs(d);
-        sum_abs += ad;
-        sum_sq += static_cast<double>(d) * static_cast<double>(d);
-        if (ad > max_abs) {
-            max_abs = ad;
-        }
-    }
-    const float mean_abs = static_cast<float>(sum_abs / n);
-    const float l2 = static_cast<float>(std::sqrt(sum_sq));
-    fprintf(stderr,
-            "[MOE_LORA_SPLIT] layer=%d tag=%s n=%zu l2=%.6f max_abs=%.6f mean_abs=%.6f\n",
-            layer_idx,
-            tag ? tag : "<none>",
-            n,
-            l2,
-            max_abs,
-            mean_abs);
-}
 
 /**
  * @brief Forward pass for a SINGLE expert using cuBLASLt.
@@ -385,22 +267,6 @@ inline void grouped_fast_expert_lora_forward(
 
     split_gate_up(gate_up_buffer, total_up, total_gate, total_tokens, D, stream);
 
-    const bool moe_lora_split_trace = (std::getenv("SUROGATE_MOE_LORA_SPLIT_TRACE") != nullptr);
-    static int moe_lora_split_count = 0;
-    const bool do_trace = moe_lora_split_trace && (moe_lora_split_count < 4);
-    const std::size_t sample_count = 1024;
-    std::vector<float> base_gate_sample;
-    std::vector<float> base_up_sample;
-    std::vector<float> base_out_sample;
-    if (do_trace) {
-        if (sample_tensor_to_f32(total_gate, 0, sample_count, base_gate_sample, stream)) {
-            log_sample_stats("GATE_BASE", layer_idx, base_gate_sample);
-        }
-        if (sample_tensor_to_f32(total_up, 0, sample_count, base_up_sample, stream)) {
-            log_sample_stats("UP_BASE", layer_idx, base_up_sample);
-        }
-    }
-
     // 3. Apply Grouped LoRA for Gate and Up projections
     if (lora.gate.has_value() && lora.gate->has_value()) {
         dispatch_grouped_gemm(lora_intermediate, permuted_input, lora.gate->A, lora_rank, C, 1.0f, 0.0f, EMMTranspose::TN, false);
@@ -410,19 +276,6 @@ inline void grouped_fast_expert_lora_forward(
     if (lora.up.has_value() && lora.up->has_value()) {
         dispatch_grouped_gemm(lora_intermediate, permuted_input, lora.up->A, lora_rank, C, 1.0f, 0.0f, EMMTranspose::TN, false);
         dispatch_grouped_gemm(total_up, lora_intermediate, lora.up->B, D, lora_rank, scaling, 1.0f, EMMTranspose::TN, false);
-    }
-
-    if (do_trace) {
-        std::vector<float> post_gate_sample;
-        std::vector<float> post_up_sample;
-        if (sample_tensor_to_f32(total_gate, 0, sample_count, post_gate_sample, stream)) {
-            log_sample_stats("GATE_POST", layer_idx, post_gate_sample);
-            log_sample_delta("GATE_DELTA", layer_idx, base_gate_sample, post_gate_sample);
-        }
-        if (sample_tensor_to_f32(total_up, 0, sample_count, post_up_sample, stream)) {
-            log_sample_stats("UP_POST", layer_idx, post_up_sample);
-            log_sample_delta("UP_DELTA", layer_idx, base_up_sample, post_up_sample);
-        }
     }
 
     // 4. Compute h = silu(gate) * up
@@ -452,25 +305,11 @@ inline void grouped_fast_expert_lora_forward(
         );
     }
 
-    if (do_trace) {
-        if (sample_tensor_to_f32(total_output, 0, sample_count, base_out_sample, stream)) {
-            log_sample_stats("DOWN_BASE", layer_idx, base_out_sample);
-        }
-    }
-
     if (lora.down.has_value() && lora.down->has_value()) {
         dispatch_grouped_gemm(lora_intermediate, h_buffer, lora.down->A, lora_rank, D, 1.0f, 0.0f, EMMTranspose::TN, false);
         dispatch_grouped_gemm(total_output, lora_intermediate, lora.down->B, C, lora_rank, scaling, 1.0f, EMMTranspose::TN, false);
     }
 
-    if (do_trace) {
-        std::vector<float> post_out_sample;
-        if (sample_tensor_to_f32(total_output, 0, sample_count, post_out_sample, stream)) {
-            log_sample_stats("DOWN_POST", layer_idx, post_out_sample);
-            log_sample_delta("DOWN_DELTA", layer_idx, base_out_sample, post_out_sample);
-        }
-        moe_lora_split_count++;
-    }
 }
 
 /**

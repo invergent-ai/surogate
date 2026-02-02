@@ -53,16 +53,6 @@ public:
         return false;
     }
 
-    /// Debug helper for MoE QLoRA: log quantization scales for gate_up row (if supported).
-    virtual bool debug_moe_gate_up_absmax(int layer_idx, int expert_id, int out_row,
-                                          cudaStream_t stream) {
-        (void)layer_idx;
-        (void)expert_id;
-        (void)out_row;
-        (void)stream;
-        return false;
-    }
-
     /// Total bytes used by quantized weights (for memory stats).
     virtual std::size_t quantized_weights_bytes() const = 0;
 

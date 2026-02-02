@@ -397,26 +397,9 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
     if (name == "ln2_rstd") return get(acts.ln2_rstd);
     if (name == "q_rstd") return get(acts.q_rstd);
     if (name == "k_rstd") return get(acts.k_rstd);
-    if (name == "qkv" || name == "qkv_flat" || name == "qkv_biased") {
-        if (layer_idx == 0 && ctx.lora_only_mode == false) {
-            fprintf(stderr, "[RESOLVE_QKV] Layer %d qkv (FFT mode): Data=%p, Sizes=%ld,%ld,%ld,%ld\n",
-                    layer_idx, acts.qkv.Data,
-                    acts.qkv.Sizes[0], acts.qkv.Sizes[1], acts.qkv.Sizes[2], acts.qkv.Sizes[3]);
-            // Print first values to check if data is valid
-            cudaStreamSynchronize(ctx.rs.MainStream);
-            std::vector<float> vals(8);
-            cudaMemcpy(vals.data(), acts.qkv.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RESOLVE_QKV] Layer %d qkv values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
-        }
-        return get(acts.qkv);
-    }
+    if (name == "qkv" || name == "qkv_flat" || name == "qkv_biased") return get(acts.qkv);
     if (name == "qkv_rope") {
         if (acts.qkv_rope.Data) return get(acts.qkv_rope);
-        if (layer_idx == 0) {
-            fprintf(stderr, "[RESOLVE_QKV_ROPE] Layer %d using qkv instead: Data=%p\n",
-                    layer_idx, acts.qkv.Data);
-        }
         return get(acts.qkv);
     }
     if (name == "lse") return get(acts.lse);
@@ -743,15 +726,6 @@ void execute_matmul(RecomputeContext& ctx,
     Tensor& weight = *inputs.tensors.at(weight_key);
     Tensor& inp = *inputs.tensors.at(input_key);
 
-    // DEBUG: Check att tensor when recomputing att_out
-    if (layer_idx == 0 && (input_key == "att" || input_key == "attn" || input_key == "att_flat")) {
-        cudaStreamSynchronize(ctx.rs.MainStream);
-        std::vector<float> vals(8);
-        cudaMemcpy(vals.data(), inp.Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RECOMPUTE_MATMUL] Layer %d att_out recompute: att input ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
-                layer_idx, inp.Data, vals[0], vals[1], vals[2], vals[3]);
-    }
-
     if (op.outputs.empty()) {
         throw std::runtime_error("DSL recompute: matmul missing output");
     }
@@ -915,21 +889,6 @@ void execute_fused_residual(RecomputeContext& ctx,
         rmsnorm_apply_saved(acts.ln1, res_ffn, *weight, acts.ln1_rstd,
                             static_cast<int>(B), static_cast<int>(T), C, ctx.rs.MainStream);
 
-        // DEBUG: Print data pointer and values at position 3 (where tokens differ)
-        if (layer_idx == 0) {
-            cudaStreamSynchronize(ctx.rs.MainStream);
-            std::vector<float> vals(8);
-            const std::size_t pos3_offset = 3 * static_cast<std::size_t>(C);
-            // Print res_ffn at position 3 (input to rmsnorm)
-            cudaMemcpy(vals.data(), reinterpret_cast<float*>(res_ffn.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE_LN1] res_ffn[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
-                    res_ffn.Data, vals[0], vals[1], vals[2], vals[3]);
-            // Print ln1 output at position 3
-            cudaMemcpy(vals.data(), reinterpret_cast<float*>(acts.ln1.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE_LN1] ln1_out[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
-                    acts.ln1.Data, vals[0], vals[1], vals[2], vals[3]);
-        }
-
         return;
     }
 
@@ -951,28 +910,6 @@ void execute_fused_residual(RecomputeContext& ctx,
     fused_residual_rmsnorm_apply_saved(*res_out, *y_out, *residual, *input, *weight, *rstd,
                                        BT, C, ctx.rs.MainStream);
 
-    // DEBUG: Check ln2 recompute values
-    if (layer_idx == 0) {
-        const std::string res_out_name_check = (res_out_name.empty()) ? "res_att" : res_out_name;
-        if (res_out_name_check == "res_att" || res_out_name_check == "residual_att") {
-            cudaStreamSynchronize(ctx.rs.MainStream);
-            std::vector<float> vals(8);
-            cudaMemcpy(vals.data(), y_out->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE] Layer %d ln2 values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
-            cudaMemcpy(vals.data(), res_out->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE] Layer %d res_att values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
-            // Also print rstd values and pointer
-            cudaMemcpy(vals.data(), rstd->Data, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE] Layer %d ln2_rstd ptr=%p, values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, rstd->Data, vals[0], vals[1], vals[2], vals[3]);
-            // Print input att_out values
-            cudaMemcpy(vals.data(), input->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[RECOMPUTE] Layer %d att_out values: %.6f, %.6f, %.6f, %.6f\n",
-                    layer_idx, vals[0], vals[1], vals[2], vals[3]);
-        }
-    }
 }
 
 void execute_rmsnorm(RecomputeContext& ctx,
@@ -1017,20 +954,6 @@ void execute_rmsnorm(RecomputeContext& ctx,
     rmsnorm_apply_saved(out, *input, *weight, *rstd, static_cast<int>(B), static_cast<int>(T),
                         C, ctx.rs.MainStream);
 
-    // DEBUG: Print values at position 3 (where tokens differ) for layers 0 and 25
-    if (layer_idx == 0 || layer_idx == 25) {
-        cudaStreamSynchronize(ctx.rs.MainStream);
-        std::vector<float> vals(8);
-        const std::size_t pos3_offset = 3 * static_cast<std::size_t>(C);
-        // Print input (res_ffn) at position 3
-        cudaMemcpy(vals.data(), reinterpret_cast<float*>(input->Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RECOMPUTE_LN1] Layer %d res_ffn[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
-                layer_idx, input->Data, vals[0], vals[1], vals[2], vals[3]);
-        // Print output (ln1) at position 3
-        cudaMemcpy(vals.data(), reinterpret_cast<float*>(out.Data) + pos3_offset, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RECOMPUTE_LN1] Layer %d ln1_out[pos3] data=%p vals=%.6f,%.6f,%.6f,%.6f\n",
-                layer_idx, out.Data, vals[0], vals[1], vals[2], vals[3]);
-    }
 }
 
 void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
@@ -1148,14 +1071,6 @@ void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
                      Hq, Hkv, Hs, rotary_dim, ctx.rs.MainStream);
     }
 
-    // DEBUG: Print recomputed qkv_rope values for layer 0
-    if (layer_idx == 0) {
-        cudaStreamSynchronize(ctx.rs.MainStream);
-        std::vector<float> vals(8);
-        cudaMemcpy(vals.data(), qkv_out->Data, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RECOMPUTE_QKV_ROPE] Layer %d qkv_rope ptr=%p, values=%.6f, %.6f, %.6f, %.6f\n",
-                layer_idx, qkv_out->Data, vals[0], vals[1], vals[2], vals[3]);
-    }
 }
 
 void execute_rope(RecomputeContext& ctx,
@@ -1906,20 +1821,6 @@ void RecomputePlan::init_from_layout(const ActivationLayoutIR& layout,
         }
     }
 
-    // DEBUG: Print all ops in the plan
-    fprintf(stderr, "[RECOMPUTE_PLAN] Built plan with %zu ops:\n", mPlan.topo_ops.size());
-    fflush(stderr);
-    for (std::size_t i = 0; i < mPlan.topo_ops.size(); ++i) {
-        const auto& op = mPlan.topo_ops[i];
-            const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
-                                      (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" :
-                                      (op.policy == RecomputePolicy::FftOnly) ? "fft_only" : "never";
-            fprintf(stderr, "  [%zu] %s outputs=%zu policy=%s\n",
-                    i, op.op_type.c_str(), op.outputs.size(), policy_str);
-        fflush(stderr);
-    }
-    fprintf(stderr, "[RECOMPUTE_PLAN] Done listing ops\n");
-    fflush(stderr);
 }
 
 bool RecomputePlan::can_recompute(const std::string& name) const {
@@ -2023,18 +1924,7 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
 
     RecomputeScratch scratch;
 
-    int op_idx = 0;
     for (const auto& op : mPlan.topo_ops) {
-        if (layer_idx == 0) {
-        const char* policy_str = (op.policy == RecomputePolicy::Always) ? "always" :
-                                  (op.policy == RecomputePolicy::LoraOnly) ? "lora_only" :
-                                  (op.policy == RecomputePolicy::FftOnly) ? "fft_only" : "never";
-        fprintf(stderr, "[RECOMPUTE_OP] Layer %d idx=%d op=%s policy=%s\n",
-                layer_idx, op_idx, op.op_type.c_str(), policy_str);
-            fflush(stderr);
-        }
-        op_idx++;
-
         if (op.policy == RecomputePolicy::Never) {
             continue;
         }
@@ -2059,27 +1949,7 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         // 1. cuDNN attention is non-deterministic (recomputed att != forward att)
         // 2. Matmul rounding can differ between forward and recompute
         if (lora_only_mode && !op.lora_targets.empty()) {
-            if (layer_idx == 0) {
-                fprintf(stderr, "[RECOMPUTE_SKIP] Layer %d op=%s (has lora_targets, LoRA mode - use saved)\n",
-                        layer_idx, op.op_type.c_str());
-            }
             continue;
-        }
-
-        // DEBUG: Print which op is being executed
-        if (layer_idx == 0) {
-            std::string outputs_str;
-            for (const auto& o : op.outputs) {
-                if (!outputs_str.empty()) outputs_str += ", ";
-                outputs_str += o;
-            }
-            std::string inputs_str;
-            for (const auto& i : op.inputs) {
-                if (!inputs_str.empty()) inputs_str += ", ";
-                inputs_str += i;
-            }
-            fprintf(stderr, "[RECOMPUTE_EXEC] Layer %d op=%s outputs=[%s] inputs=[%s]\n",
-                    layer_idx, op.op_type.c_str(), outputs_str.c_str(), inputs_str.c_str());
         }
 
         const InputMap inputs = resolve_inputs(ctx, op, layer_idx, B, T, scratch);
