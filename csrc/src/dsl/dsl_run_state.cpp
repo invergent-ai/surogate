@@ -6,8 +6,12 @@
 #include "dsl/dsl_run_state.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -28,15 +32,20 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          const std::shared_ptr<TensorAllocator>& allocator,
                          bool lora_only_mode,
                          std::size_t stack_bytes,
-                         bool allocate_stack)
+                         bool allocate_stack,
+                         const ActivationLayoutIR* activation_layout)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
       mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
+      mRecomputeLora(options.RecomputeLoRA),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
     if (!mAllocator) {
         throw std::runtime_error("DslRunState: allocator is null");
+    }
+    if (activation_layout) {
+        mSlotRegistry.init_from_layout(*activation_layout);
     }
 
     mActivationDtype = options.ModelType.value_or(config.DType);
@@ -172,6 +181,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
     const long Hkv = cfg.NumKeyValHeads;
+    // Derive attention output channels directly from Hq * head_size to avoid
+    // config mismatches (e.g. attn_out_channels not reflecting GQA layout).
     const long AttnDim = Hq * D;
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
@@ -195,40 +206,118 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     //
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool lora_only = mLoraOnlyMode;
+    const bool allow_lora_recompute = mRecomputeLora;
+    const bool has_layout = mSlotRegistry.has_dsl_layout();
 
-    // LN outputs can be shared only when recompute is enabled AND we will actually recompute them.
-    // In LoRA mode we skip recompute for several ops, so LN outputs must be per-layer.
-    const bool share_ln1 = recompute_enabled && !lora_only;
-    const bool share_ln2 = recompute_enabled && !lora_only;
+    auto lookup_slot = [&](const char* name) -> std::optional<TensorSlotRegistry::SlotEntry> {
+        if (!has_layout) {
+            return std::nullopt;
+        }
+        return mSlotRegistry.lookup(name);
+    };
 
-    // QKV sharing: only in LoRA mode where attention is recomputed.
-    // In FFT mode, we skip attention recompute and need saved QKV per-layer for bit-exact gradients.
-    // If QKV is shared, all layers would use the last layer's QKV data during backward!
-    const bool share_qkv = false;
+    auto will_recompute_slot = [&](const char* name) -> bool {
+        if (!recompute_enabled) {
+            return false;
+        }
+        if (!has_layout) {
+            return recompute_enabled;
+        }
+        auto entry = lookup_slot(name);
+        if (!entry) {
+            return recompute_enabled;
+        }
+        if (lora_only && !allow_lora_recompute && !entry->lora_targets.empty()) {
+            return false;
+        }
+        bool will = mSlotRegistry.will_recompute(name, lora_only);
+        if (!will && lora_only && allow_lora_recompute && entry->recompute_in_backward) {
+            if (entry->recompute_policy == "fft_only") {
+                will = true;
+            }
+        }
+        return will;
+    };
 
-    // Attention output sharing:
-    // IMPORTANT: att/att_out/lse must NEVER be shared when recompute is enabled.
-    // - FFT mode: Need original forward values for bit-exact gradients
-    // - LoRA mode: LoRA O proj backward hook needs original att values per-layer
-    //              cuDNN attention is non-deterministic, so recomputed att != forward att
-    // This matches modular model behavior (see run_state_impl.tpp:568-572).
-    const bool share_att = false;
+    bool share_ln1 = false;
+    bool share_ln2 = false;
+    bool share_qkv = false;
+    bool share_att = false;
+    bool share_att_out = false;
+    bool share_mlp_up = false;
+    bool share_swiglu = false;
+    bool share_residual_intermediates = false;
+    bool share_mlp_down = false;
+    bool share_qk_rstd = false;
 
-    // MLP intermediates sharing:
-    // - FFT mode: Need per-layer for bit-exact gradients
-    // - LoRA mode: LoRA down_proj backward hook needs original swiglu values per-layer
-    // This matches modular model behavior (lora_can_share_swiglu = !lora_only).
-    const bool share_mlp_up = false;
-    const bool share_swiglu = false;
+    if (recompute_enabled && lora_only) {
+        // Mirror modular recompute_block behavior in LoRA-only mode.
+        const bool lora_can_share_ln = !lora_only || allow_lora_recompute;
+        const bool lora_can_share_att = !lora_only;
+        const bool lora_can_share_swiglu = !lora_only;
 
-    // Residual intermediates: must be per-layer in LoRA mode because we skip recompute.
-    const bool share_residual_intermediates = recompute_enabled && !lora_only;
+        share_ln1 = lora_can_share_ln;
+        share_ln2 = lora_can_share_ln;
+        share_qkv = true;
+        share_att = lora_can_share_att;
+        // att_out is not needed for LoRA backward; share it across layers.
+        share_att_out = true;
+        share_mlp_up = true;
+        share_swiglu = lora_can_share_swiglu;
+        share_residual_intermediates = true;
+        share_mlp_down = share_residual_intermediates;
+        share_qk_rstd = use_qk_norm;
+    } else if (has_layout) {
+        share_ln1 = will_recompute_slot("ln1");
+        share_ln2 = will_recompute_slot("ln2");
+        share_qkv = will_recompute_slot("qkv");
+        share_att = will_recompute_slot("att");
+        // In LoRA-only mode, only share outputs if we will recompute them.
+        share_att_out = share_att || (lora_only && allow_lora_recompute);
+        share_mlp_up = will_recompute_slot("mlp_up");
+        share_swiglu = will_recompute_slot("swiglu");
+        share_residual_intermediates = will_recompute_slot("res_att");
+        // In LoRA-only mode, only share MLP down when recompute is allowed.
+        share_mlp_down = share_residual_intermediates || (lora_only && allow_lora_recompute);
+        share_qk_rstd = will_recompute_slot("q_rstd") || (lora_only && allow_lora_recompute && use_qk_norm);
+    } else {
+        // Fallback to legacy behavior when no DSL layout is available.
+        // LN outputs can be shared only when recompute is enabled AND we will actually recompute them.
+        // In LoRA mode we skip recompute for several ops, so LN outputs must be per-layer.
+        const bool lora_can_share_ln = !lora_only || allow_lora_recompute;
+        share_ln1 = recompute_enabled && lora_can_share_ln;
+        share_ln2 = recompute_enabled && lora_can_share_ln;
 
-    // FFN temps: Never use stack for mlp_up/swiglu when we need per-layer values.
-    // - FFT mode: per-layer needed for bit-exact gradients
-    // - LoRA mode: per-layer needed for down_proj LoRA backward (swiglu input)
-    // This matches modular model behavior.
-    const bool ffn_temps_on_stack = false;
+        // QKV sharing: only in LoRA mode where attention is recomputed.
+        // In FFT mode, we skip attention recompute and need saved QKV per-layer for bit-exact gradients.
+        // If QKV is shared, all layers would use the last layer's QKV data during backward!
+        share_qkv = recompute_enabled && (allow_lora_recompute || !lora_only);
+
+        // Attention output sharing:
+        // IMPORTANT: att/att_out/lse must NEVER be shared when recompute is enabled.
+        // - FFT mode: Need original forward values for bit-exact gradients
+        // - LoRA mode: LoRA O proj backward hook needs original att values per-layer
+        //              cuDNN attention is non-deterministic, so recomputed att != forward att
+        // This matches modular model behavior (see run_state_impl.tpp:568-572).
+        share_att = recompute_enabled && !lora_only;
+        share_att_out = share_att || (lora_only && allow_lora_recompute);
+
+        // MLP intermediates sharing:
+        // - FFT mode: Need per-layer for bit-exact gradients
+        // - LoRA mode: LoRA down_proj backward hook needs original swiglu values per-layer
+        // This matches modular model behavior (lora_can_share_swiglu = !lora_only).
+        share_mlp_up = recompute_enabled && (allow_lora_recompute || !lora_only);
+        share_swiglu = recompute_enabled && (allow_lora_recompute || !lora_only);
+
+        // Residual intermediates: must be per-layer in LoRA mode because we skip recompute.
+        share_residual_intermediates = recompute_enabled && !lora_only;
+        share_mlp_down = share_residual_intermediates || (lora_only && allow_lora_recompute);
+        share_qk_rstd = use_qk_norm && (recompute_enabled || (lora_only && allow_lora_recompute));
+    }
+
+    // FFN temps: Use stack-backed temps only when we explicitly allow LoRA recompute.
+    // This keeps FFT behavior unchanged while enabling QLoRA memory savings.
+    const bool ffn_temps_on_stack = recompute_enabled && lora_only && allow_lora_recompute;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -240,15 +329,47 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     }
 
     Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_att{}, shared_att_out{}, shared_lse{};
+    Tensor shared_q_rstd{}, shared_k_rstd{};
     Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};
 
     if (share_ln1) shared_ln1 = mAllocator->allocate(dtype, "ln1_shared", kind, {B, T, C});
     if (share_ln2) shared_ln2 = mAllocator->allocate(dtype, "ln2_shared", kind, {B, T, C});
-    if (share_qkv) shared_qkv = mAllocator->allocate(dtype, "qkv_shared", kind, {B, T, QKV});
+    if (share_qkv) {
+        const char* canary_env = std::getenv("SUROGATE_QKV_CANARY");
+        const bool use_canary = canary_env && *canary_env && std::atoi(canary_env) != 0;
+        if (use_canary) {
+            const char* guard_env = std::getenv("SUROGATE_QKV_CANARY_BYTES");
+            std::size_t guard_bytes = guard_env && *guard_env ? std::strtoull(guard_env, nullptr, 10) : 4096ULL;
+            const std::size_t qkv_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T)
+                                          * static_cast<std::size_t>(QKV) * static_cast<std::size_t>(get_dtype_size(dtype));
+            if (guard_bytes == 0) {
+                guard_bytes = 4096ULL;
+            }
+            const std::size_t total_bytes = qkv_bytes + 2 * guard_bytes;
+            Tensor raw = mAllocator->allocate(ETensorDType::BYTE, "qkv_shared_canary", kind,
+                                              {static_cast<long>(total_bytes)});
+            mQkvCanaryEnabled = true;
+            mQkvCanaryRaw = raw;
+            mQkvCanaryGuardBytes = guard_bytes;
+            shared_qkv = Tensor::from_pointer(raw.Data + guard_bytes, raw.Device, dtype,
+                                              std::vector<long>{B, T, QKV});
+            CUDA_CHECK(cudaMemsetAsync(raw.Data, static_cast<int>(mQkvCanaryPattern), guard_bytes, MainStream));
+            CUDA_CHECK(cudaMemsetAsync(raw.Data + guard_bytes + qkv_bytes,
+                                       static_cast<int>(mQkvCanaryPattern), guard_bytes, MainStream));
+        } else {
+            shared_qkv = mAllocator->allocate(dtype, "qkv_shared", kind, {B, T, QKV});
+        }
+    }
+    if (share_qk_rstd && use_qk_norm) {
+        shared_q_rstd = mAllocator->allocate(ETensorDType::FP32, "q_rstd_shared", kind, {B, T, Hq});
+        shared_k_rstd = mAllocator->allocate(ETensorDType::FP32, "k_rstd_shared", kind, {B, T, Hkv});
+    }
     // LSE sharing: only in lora_only mode. FFT needs per-layer LSE for bit-exact gradients.
     if (share_att) shared_lse = mAllocator->allocate(ETensorDType::FP32, "lse_shared", kind, {B, Hq, T});
     if (share_att) {
         shared_att = mAllocator->allocate(dtype, "att_shared", kind, {B, T, AttnDim});
+    }
+    if (share_att_out) {
         shared_att_out = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
     }
     // att_out sharing is handled by share_att when recompute is enabled.
@@ -257,8 +378,70 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     if (share_residual_intermediates) {
         shared_residual_att = mAllocator->allocate(dtype, "residual_att_shared", kind, {B, T, C});
     }
-    if (share_residual_intermediates) {
+    if (share_mlp_down) {
         shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
+    }
+
+    auto overlap_check_enabled = []() {
+        static int enabled = []() {
+            const char* value = std::getenv("SUROGATE_SHARED_OVERLAP_CHECK");
+            if (!value || !*value) {
+                return 0;
+            }
+            return std::atoi(value) != 0 ? 1 : 0;
+        }();
+        return enabled != 0;
+    };
+
+    if (overlap_check_enabled()) {
+        struct Range {
+            std::string name;
+            const std::byte* ptr = nullptr;
+            std::size_t bytes = 0;
+        };
+        std::vector<Range> ranges;
+        ranges.reserve(16);
+        auto add_range = [&](const char* name, const Tensor& t) {
+            if (!t.Data) {
+                return;
+            }
+            const std::size_t bytes = t.bytes();
+            if (bytes == 0) {
+                return;
+            }
+            ranges.push_back({name, static_cast<const std::byte*>(t.Data), bytes});
+        };
+        add_range("ln1_shared", shared_ln1);
+        add_range("ln2_shared", shared_ln2);
+        add_range("qkv_shared", shared_qkv);
+        add_range("q_rstd_shared", shared_q_rstd);
+        add_range("k_rstd_shared", shared_k_rstd);
+        add_range("lse_shared", shared_lse);
+        add_range("att_shared", shared_att);
+        add_range("att_out_shared", shared_att_out);
+        add_range("mlp_up_shared", shared_mlp_up);
+        add_range("swiglu_shared", shared_swiglu);
+        add_range("residual_att_shared", shared_residual_att);
+        add_range("mlp_down_shared", shared_mlp_down);
+
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            const auto& a = ranges[i];
+            const auto* a_end = a.ptr + a.bytes;
+            for (std::size_t j = i + 1; j < ranges.size(); ++j) {
+                const auto& b = ranges[j];
+                const auto* b_end = b.ptr + b.bytes;
+                const bool overlap = (a.ptr < b_end) && (a_end > b.ptr);
+                if (overlap) {
+                    std::cerr << "[SHARED_OVERLAP] "
+                              << a.name << " ptr=" << static_cast<const void*>(a.ptr)
+                              << " bytes=" << a.bytes
+                              << " overlaps "
+                              << b.name << " ptr=" << static_cast<const void*>(b.ptr)
+                              << " bytes=" << b.bytes
+                              << std::endl;
+                }
+            }
+        }
     }
 
     mSimplifiedActivations.resize(cfg.NumLayers);
@@ -271,8 +454,10 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         acts.ln2 = share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, "ln2", kind, {B, T, C});
 
         if (use_qk_norm) {
-            acts.q_rstd = mAllocator->allocate(ETensorDType::FP32, "q_rstd", kind, {B, T, Hq});
-            acts.k_rstd = mAllocator->allocate(ETensorDType::FP32, "k_rstd", kind, {B, T, Hkv});
+            acts.q_rstd = share_qk_rstd ? shared_q_rstd
+                                        : mAllocator->allocate(ETensorDType::FP32, "q_rstd", kind, {B, T, Hq});
+            acts.k_rstd = share_qk_rstd ? shared_k_rstd
+                                        : mAllocator->allocate(ETensorDType::FP32, "k_rstd", kind, {B, T, Hkv});
         } else {
             acts.q_rstd = {};
             acts.k_rstd = {};
@@ -295,7 +480,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
                              : mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
         acts.att = share_att ? shared_att : mAllocator->allocate(dtype, "att", kind, {B, T, AttnDim});
         // When recompute is enabled, att_out can be shared across layers.
-        acts.att_out = share_att ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
+        acts.att_out = share_att_out ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
 
         // residual_att can be shared when recompute_block=true
         acts.residual_att = share_residual_intermediates ? shared_residual_att
@@ -309,11 +494,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.swiglu = share_swiglu ? shared_swiglu : mAllocator->allocate(dtype, "swiglu", kind, {B, T, M});
         }
 
-        if (share_residual_intermediates) {
-            acts.mlp_down = shared_mlp_down;
-        } else {
-            acts.mlp_down = mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
-        }
+        acts.mlp_down = share_mlp_down ? shared_mlp_down
+                                       : mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;
@@ -358,6 +540,8 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
     const long Hkv = cfg.NumKeyValHeads;
+    // Derive attention output channels directly from Hq * head_size to avoid
+    // config mismatches (e.g. attn_out_channels not reflecting GQA layout).
     const long AttnDim = Hq * D;
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
@@ -441,6 +625,54 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     // Preserve the original buffer pointers so we can restore them if the
     // compiled executor temporarily aliases gradients to stack-backed temps.
     mSimplifiedGradientsBase = mSimplifiedGradients;
+}
+
+bool DslRunState::check_qkv_canary(cudaStream_t stream,
+                                   const char* tag,
+                                   int layer_idx,
+                                   int micro_step,
+                                   const char* op_id) const {
+    if (!mQkvCanaryEnabled || !mQkvCanaryRaw.Data || mQkvCanaryGuardBytes == 0) {
+        return true;
+    }
+    const std::size_t guard_bytes = mQkvCanaryGuardBytes;
+    const std::size_t total_bytes = mQkvCanaryRaw.bytes();
+    if (total_bytes < guard_bytes * 2) {
+        return true;
+    }
+    const std::size_t qkv_bytes = total_bytes - guard_bytes * 2;
+    const std::size_t check_bytes = guard_bytes;
+    std::vector<std::byte> front(check_bytes);
+    std::vector<std::byte> back(check_bytes);
+    CUDA_CHECK(cudaMemcpyAsync(front.data(), mQkvCanaryRaw.Data,
+                               check_bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(back.data(), mQkvCanaryRaw.Data + guard_bytes + qkv_bytes,
+                               check_bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto check_region = [&](const std::vector<std::byte>& buf, const char* region) {
+        for (std::size_t i = 0; i < buf.size(); ++i) {
+            if (buf[i] != mQkvCanaryPattern) {
+                std::cerr << "[QKV_CANARY_HIT] tag=" << (tag ? tag : "<none>")
+                          << " layer=" << layer_idx
+                          << " micro=" << micro_step
+                          << " op_id=" << (op_id ? op_id : "<none>")
+                          << " region=" << region
+                          << " idx=" << i
+                          << " value=" << static_cast<int>(buf[i])
+                          << " expected=" << static_cast<int>(mQkvCanaryPattern)
+                          << " guard_bytes=" << guard_bytes
+                          << std::endl;
+                return false;
+            }
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok &= check_region(front, "front");
+    ok &= check_region(back, "back");
+    return ok;
 }
 
 void DslRunState::reset_simplified_gradients() {
@@ -558,7 +790,7 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long Hq = cfg.NumQueryHeads;
     const long Hkv = cfg.NumKeyValHeads;
     const long QKV = D * (Hq + 2 * Hkv);
-    const long C_attn = Hq * D;
+    const long C_attn = static_cast<long>(cfg.attn_out_channels());
 
     const long rmsnorm_scratch_bytes = static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(C), DeviceProp));
     mScratch.rmsnorm_scratch = mAllocator->allocate(
@@ -591,20 +823,6 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(
             ETensorDType::FP32, "cross_entropy_chunk_logsumexp", EAllocationType::ON_DEVICE,
             {BT, n_chunks});
-    }
-
-    const bool need_attn_fallback = (Hq != Hkv) || (std::getenv("SUROGATE_ATTN_BWD_CUSTOM") != nullptr);
-    if (need_attn_fallback) {
-        mScratch.attn_qkv_f32 = mAllocator->allocate(
-            ETensorDType::FP32, "attn_qkv_f32", EAllocationType::ON_DEVICE, {B, T, QKV});
-        mScratch.attn_out_f32 = mAllocator->allocate(
-            ETensorDType::FP32, "attn_out_f32", EAllocationType::ON_DEVICE, {B, T, C_attn});
-        mScratch.attn_d_out_f32 = mAllocator->allocate(
-            ETensorDType::FP32, "attn_d_out_f32", EAllocationType::ON_DEVICE, {B, T, C_attn});
-        mScratch.attn_d_qkv_f32 = mAllocator->allocate(
-            ETensorDType::FP32, "attn_d_qkv_f32", EAllocationType::ON_DEVICE, {B, T, QKV});
-        mScratch.attn_lse_f32 = mAllocator->allocate(
-            ETensorDType::FP32, "attn_lse_f32", EAllocationType::ON_DEVICE, {B, Hq, T});
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely

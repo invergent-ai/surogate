@@ -6,6 +6,7 @@
 #include "dsl/dsl_model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include "dsl/graph_executor.h"
 #include "dsl/dsl_runtime.h"
 #include "dsl/qlora_provider.h"
+#include "dsl/compiled_ops_helpers.h"
 #include "dsl/dsl_weight_manager.h"
 #include "dsl/dsl_model_internal.h"
 #include "kernels/kernels.h"
@@ -127,14 +129,72 @@ public:
         }
 
         const std::string_view clean = trim_optional(name);
+        auto trace_nan = [&](Tensor& t, std::string_view param_name, int layer_idx) {
+            const int trace = env_int("SUROGATE_QLORA_NAN_TRACE", 0);
+            if (!trace || !t.Data) {
+                return;
+            }
+            if (internal::stream_is_capturing(stream)) {
+                return;
+            }
+            const int trace_layer = env_int("SUROGATE_QLORA_NAN_LAYER", -1);
+            if (trace_layer >= 0 && trace_layer != layer_idx) {
+                return;
+            }
+            static std::atomic<int> nan_count{0};
+            const int limit = env_int("SUROGATE_QLORA_NAN_LIMIT", 8);
+            if (limit > 0) {
+                const int idx = nan_count.fetch_add(1);
+                if (idx >= limit) {
+                    return;
+                }
+            }
+            const int full_scan = env_int("SUROGATE_QLORA_NAN_FULL", 0);
+            const long rows = (t.Rank > 0) ? static_cast<long>(t.Sizes[0]) : 1;
+            bool has_nan = false;
+            long row = -1;
+            float min_val = 0.0f;
+            float max_val = 0.0f;
+            if (full_scan) {
+                has_nan = find_first_nan_row(t, &row, &min_val, &max_val);
+            } else {
+                const long sample_rows[3] = {0, rows > 0 ? rows / 2 : 0, rows > 0 ? rows - 1 : 0};
+                for (long r : sample_rows) {
+                    if (r < 0 || r >= rows) {
+                        continue;
+                    }
+                    if (tensor_row_has_nan_or_inf(t, r, &min_val, &max_val)) {
+                        row = r;
+                        has_nan = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_nan) {
+                return;
+            }
+            std::cerr << fmt::format("[QLORA_NAN_WEIGHT] name={} layer={} row={} min={} max={} dtype={}\n",
+                                     param_name, layer_idx, row, min_val, max_val,
+                                     static_cast<int>(t.DType));
+            if (env_int("SUROGATE_QLORA_NAN_ABORT", 0)) {
+                throw std::runtime_error("QLoRA weight contains NaN/Inf");
+            }
+        };
+        auto trace_return = [&](Tensor& t, std::string_view param_name, int layer_idx) -> Tensor& {
+            trace_nan(t, param_name, layer_idx);
+            return t;
+        };
         if (clean == "embedding" || clean == "embeddings" || clean == "embed_tokens") {
-            return with_provider([&](auto& provider) -> Tensor& { return provider.get_embeddings(stream); });
+            Tensor& t = with_provider([&](auto& provider) -> Tensor& { return provider.get_embeddings(stream); });
+            return trace_return(t, clean, -1);
         }
         if (clean == "final_norm" || clean == "final_norm_weight" || clean == "norm") {
-            return with_provider([&](auto& provider) -> Tensor& { return provider.get_final_norm(stream); });
+            Tensor& t = with_provider([&](auto& provider) -> Tensor& { return provider.get_final_norm(stream); });
+            return trace_return(t, clean, -1);
         }
         if (clean == "lm_head" || clean == "lm_head_weight") {
-            return with_provider([&](auto& provider) -> Tensor& { return provider.get_lm_head(stream); });
+            Tensor& t = with_provider([&](auto& provider) -> Tensor& { return provider.get_lm_head(stream); });
+            return trace_return(t, clean, -1);
         }
 
         int layer_idx = -1;
@@ -151,33 +211,33 @@ public:
         });
 
         if (field == "ln1_weight") {
-            return block.ln1.weight;
+            return trace_return(block.ln1.weight, clean, layer_idx);
         }
         if (field == "ln2_weight") {
-            return block.ln2.weight;
+            return trace_return(block.ln2.weight, clean, layer_idx);
         }
         if (field == "qkv_weight") {
-            return block.attention.qkv_weight;
+            return trace_return(block.attention.qkv_weight, clean, layer_idx);
         }
         if (field == "out_weight" || field == "o_proj_weight") {
-            return block.attention.out_weight;
+            return trace_return(block.attention.out_weight, clean, layer_idx);
         }
         if (field == "mlp_up_weight") {
             if constexpr (requires { block.mlp_up_weight; }) {
-                return block.mlp_up_weight;
+                return trace_return(block.mlp_up_weight, clean, layer_idx);
             }
             throw std::runtime_error("DSL QLoRA provider: mlp_up_weight not available for " + std::string(name));
         }
         if (field == "mlp_down_weight") {
             if constexpr (requires { block.mlp_down_weight; }) {
-                return block.mlp_down_weight;
+                return trace_return(block.mlp_down_weight, clean, layer_idx);
             }
             throw std::runtime_error("DSL QLoRA provider: mlp_down_weight not available for " + std::string(name));
         }
         if (field == "q_norm_weight") {
             if constexpr (requires { block.attention.q_norm_weight; }) {
                 if (block.attention.q_norm_weight.has_value()) {
-                    return block.attention.q_norm_weight.value();
+                    return trace_return(block.attention.q_norm_weight.value(), clean, layer_idx);
                 }
             }
             throw std::runtime_error("DSL QLoRA provider: q_norm_weight not available for " + std::string(name));
@@ -185,7 +245,7 @@ public:
         if (field == "k_norm_weight") {
             if constexpr (requires { block.attention.k_norm_weight; }) {
                 if (block.attention.k_norm_weight.has_value()) {
-                    return block.attention.k_norm_weight.value();
+                    return trace_return(block.attention.k_norm_weight.value(), clean, layer_idx);
                 }
             }
             throw std::runtime_error("DSL QLoRA provider: k_norm_weight not available for " + std::string(name));
@@ -193,26 +253,26 @@ public:
 
         if (field == "router_weight") {
             if constexpr (requires { block.router.gate; }) {
-                return block.router.gate;
+                return trace_return(block.router.gate, clean, layer_idx);
             }
             throw std::runtime_error("DSL QLoRA provider: router_weight not available for " + std::string(name));
         }
         if (field == "experts_gate_up") {
             if constexpr (requires { block.experts.gate_up_proj; }) {
-                return block.experts.gate_up_proj;
+                return trace_return(block.experts.gate_up_proj, clean, layer_idx);
             }
             throw std::runtime_error("DSL QLoRA provider: experts_gate_up not available for " + std::string(name));
         }
         if (field == "experts_down") {
             if constexpr (requires { block.experts.down_proj; }) {
-                return block.experts.down_proj;
+                return trace_return(block.experts.down_proj, clean, layer_idx);
             }
             throw std::runtime_error("DSL QLoRA provider: experts_down not available for " + std::string(name));
         }
         if (field == "shared_expert_gate") {
             if constexpr (requires { block.shared_expert; }) {
                 if (block.shared_expert.has_value()) {
-                    return block.shared_expert->gate_proj;
+                    return trace_return(block.shared_expert->gate_proj, clean, layer_idx);
                 }
             }
             throw std::runtime_error("DSL QLoRA provider: shared_expert_gate not available for " + std::string(name));
@@ -220,7 +280,7 @@ public:
         if (field == "shared_expert_up") {
             if constexpr (requires { block.shared_expert; }) {
                 if (block.shared_expert.has_value()) {
-                    return block.shared_expert->up_proj;
+                    return trace_return(block.shared_expert->up_proj, clean, layer_idx);
                 }
             }
             throw std::runtime_error("DSL QLoRA provider: shared_expert_up not available for " + std::string(name));
@@ -228,7 +288,7 @@ public:
         if (field == "shared_expert_down") {
             if constexpr (requires { block.shared_expert; }) {
                 if (block.shared_expert.has_value()) {
-                    return block.shared_expert->down_proj;
+                    return trace_return(block.shared_expert->down_proj, clean, layer_idx);
                 }
             }
             throw std::runtime_error("DSL QLoRA provider: shared_expert_down not available for " + std::string(name));

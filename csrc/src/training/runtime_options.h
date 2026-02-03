@@ -44,6 +44,9 @@ struct RuntimeOptions {
     // Controls activation checkpointing strategy for memory-compute tradeoff.
     // See RecomputeLevel enum above for level descriptions.
     RecomputeLevel Recompute = RecomputeLevel::None;
+    // Allow recomputation of activations marked "fft_only" in LoRA-only mode.
+    // This enables more activation sharing for LoRA/QLoRA memory savings.
+    bool RecomputeLoRA = false;
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;

@@ -6,6 +6,7 @@
 #include "allocator.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <unordered_map>
 
@@ -200,7 +201,8 @@ template<typename Container>
 Tensor TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAllocationType kind, const Container& shape) {
     try {
         Tensor allocated = allocate_tensor(dtype, kind, shape);
-        m_Pointers.emplace_back(kind, allocated.Data, allocated.bytes());
+        const char* safe_name = name ? name : "<unnamed>";
+        m_Pointers.emplace_back(sAllocationData{kind, allocated.Data, narrow<long>(allocated.bytes()), safe_name, m_Stats->Context});
         record_stats(m_Stats->TensorStats, name, kind, allocated.bytes());
         if (!m_Stats->Context.empty()){
             record_stats(m_Stats->ContextStats, m_Stats->Context, kind, allocated.bytes());
@@ -328,16 +330,16 @@ struct MemoryCategory {
 static MemoryCategory categorize_tensor(const std::string& name) {
     // Optimizer state (momentum/variance)
     if (name.find("opt_m_") == 0 || name.find("opt_v_") == 0) {
-        return {"optimizer", "--offload-optimizer"};
+        return {"optimizer", "enable 'offload-optimizer'"};
     }
     // Gradients (d_ prefix)
     if (name.find("d_") == 0) {
-        return {"gradients", "--shard-gradients, --offload-gradients"};
+        return {"gradients", "enable 'shard-gradients' and 'offload-gradients'"};
     }
     // FP8/quantization buffers
     if (name.find("fp8_") == 0 || name.find("fp4_") == 0 || name.find("quant") != std::string::npos ||
         name.find("_q") == name.size() - 2 || name.find("_scales") != std::string::npos) {
-        return {"quants", "--offload-quants, --persistent-quants"};
+        return {"quants", "enable 'offload-quants' and 'persistent-quants'"};
     }
     // Workspace buffers
     if (name.find("_ws") != std::string::npos || name.find("workspace") != std::string::npos) {
@@ -346,10 +348,10 @@ static MemoryCategory categorize_tensor(const std::string& name) {
     // Activations
     if (name.find("act_") == 0 || name.find("cache") != std::string::npos ||
         name.find("residual") != std::string::npos || name.find("logits") != std::string::npos) {
-        return {"activations", "--recompute-swiglu, --recompute-ffn, --recompute-block"};
+        return {"activations", "enable 'recompute'"};
     }
     // Model weights
-    return {"weights", "--offload-master"};
+    return {"weights", "enable 'offload-master'"};
 }
 
 /**
@@ -450,6 +452,55 @@ void TensorAllocator::set_context(const std::string& ctx) {
  */
 const std::string& TensorAllocator::get_context() const {
     return m_Stats->Context;
+}
+
+void TensorAllocator::debug_log_allocation_for_ptr(const void* ptr, const char* tag) const {
+    const char* tag_str = tag ? tag : "<none>";
+    if (!ptr) {
+        std::cerr << fmt::format("[ALLOC_PTR] tag={} ptr=<null>\n", tag_str);
+        return;
+    }
+    const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+    const sAllocationData* match = nullptr;
+    std::uintptr_t match_base = 0;
+    std::size_t matches = 0;
+    for (const auto& alloc : m_Pointers) {
+        const auto base = reinterpret_cast<std::uintptr_t>(alloc.Pointer);
+        const auto size = static_cast<std::uintptr_t>(alloc.Size);
+        if (addr >= base && addr < base + size) {
+            if (!match) {
+                match = &alloc;
+                match_base = base;
+            }
+            ++matches;
+        }
+    }
+    if (!match) {
+        std::cerr << fmt::format("[ALLOC_PTR] tag={} ptr={} owner=<none>\n", tag_str, ptr);
+        return;
+    }
+    const char* kind_str = "unknown";
+    switch (match->Kind) {
+        case EAllocationType::ON_DEVICE: kind_str = "device"; break;
+        case EAllocationType::MANAGED: kind_str = "managed"; break;
+        case EAllocationType::PINNED: kind_str = "pinned"; break;
+        case EAllocationType::WRITE_CMB: kind_str = "write-combined"; break;
+        case EAllocationType::ON_HOST: kind_str = "host"; break;
+    }
+    const auto offset = static_cast<std::size_t>(addr - match_base);
+    const bool is_base = addr == match_base;
+    std::cerr << fmt::format(
+        "[ALLOC_PTR] tag={} ptr={} owner={} ctx={} kind={} base={} size={} offset={} is_base={} matches={}\n",
+        tag_str,
+        ptr,
+        match->Name.empty() ? "<unnamed>" : match->Name,
+        match->Context.empty() ? "<none>" : match->Context,
+        kind_str,
+        static_cast<const void*>(match->Pointer),
+        match->Size,
+        offset,
+        is_base ? 1 : 0,
+        matches);
 }
 
 /**

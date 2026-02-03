@@ -1,6 +1,7 @@
 #include "dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,14 +10,18 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "dsl/compiled_ops_helpers.h"
 #include "dsl/graph_executor_helpers.h"
 #include "dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
+#include "utilities/utils.h"
 
 namespace dsl {
 
@@ -28,36 +33,73 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
-    const bool is_decode = (mT <= 1);
-    const bool gqa_divisible = (Hkv > 0) ? (Hq % Hkv == 0) : false;
-    const bool allow_gqa_cudnn = (!is_decode && gqa_divisible);
-    const bool cudnn_gqa_ok = (Hq == Hkv) || allow_gqa_cudnn;
-    const bool force_custom_fwd = (std::getenv("SUROGATE_ATTN_FWD_CUSTOM") != nullptr);
 
     if (!mRunState.scratch().cudnn_workspace.Data) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
     }
 
+    // Mirror modular path: always use cuDNN attention.
+    attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
+                            mRunState.CudnnHandle, static_cast<int>(mB), static_cast<int>(mT),
+                            Hq, Hkv, Hs, mRunState.MainStream);
 
-    // cuDNN attention uses custom strides that map logical (B, Hq, T, HS) dims
-    // to (B, T, Hq, HS) contiguous memory layout:
-    //   Output strides: {Hq*HS*T, HS, Hq*HS, 1} for dims {B, Hq, T, HS}
-    //   This maps element [b,h,t,s] to offset: b*Hq*HS*T + t*Hq*HS + h*HS + s
-    //   Which is exactly (B, T, Hq, HS) contiguous layout.
-    // DSL allocates output as (B, T, Hq*HS) = (B, T, Hq, HS) contiguous, so
-    // we can pass it directly to cuDNN without any transpose.
-    //
-    // Similarly for QKV input: cuDNN expects (B, T, H, HS) contiguous where H = Hq + 2*Hkv.
-
-    if (!cudnn_gqa_ok || force_custom_fwd) {
-        attention_forward_custom(out, lse, qkv,
-                                 static_cast<int>(mB), static_cast<int>(mT),
-                                 Hq, Hkv, Hs, mRunState.MainStream);
-    } else {
-        attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
-                                mRunState.CudnnHandle, static_cast<int>(mB), static_cast<int>(mT),
-                                Hq, Hkv, Hs, mRunState.MainStream);
+    int layer_idx = op.attrs.layer_idx;
+    if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
+        layer_idx = op.inputs[0].layer_idx;
+    }
+    if (layer_idx < 0 && !op.inputs.empty()) {
+        std::string field;
+        parse_block_param(op.inputs[0].name, layer_idx, field);
+    }
+    const int kernel_trace = env_int("SUROGATE_ATTN_FWD_KERNEL_TRACE", 0);
+    const int kernel_layer = env_int("SUROGATE_ATTN_FWD_KERNEL_LAYER", -1);
+    const int kernel_b = env_int("SUROGATE_ATTN_FWD_KERNEL_B", 0);
+    const int kernel_h = env_int("SUROGATE_ATTN_FWD_KERNEL_H", 0);
+    const int kernel_t = env_int("SUROGATE_ATTN_FWD_KERNEL_T", 0);
+    const int kernel_l = env_int("SUROGATE_ATTN_FWD_KERNEL_L", 0);
+    const bool do_kernel_trace = kernel_trace && !mCapturing &&
+        (kernel_layer < 0 || kernel_layer == layer_idx);
+    if (do_kernel_trace) {
+        AttnFwdDebugConfig cfg;
+        cfg.enabled = 1;
+        cfg.layer = layer_idx;
+        cfg.target_b = kernel_b;
+        cfg.target_h = kernel_h;
+        cfg.target_t = kernel_t;
+        cfg.target_l = kernel_l;
+        attention_forward_debug(qkv, lse,
+                                static_cast<int>(mB), static_cast<int>(mT),
+                                Hq, Hkv, Hs, cfg, mRunState.MainStream);
+    }
+    const int nan_trace = env_int("SUROGATE_ATTN_FWD_NAN_TRACE", 0);
+    const int nan_layer = env_int("SUROGATE_ATTN_FWD_NAN_LAYER", -1);
+    if (nan_trace && !mCapturing && (nan_layer < 0 || nan_layer == layer_idx)) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        auto trace_nan = [&](const Tensor& t, const char* tag) -> bool {
+            if (!t.Data) {
+                return false;
+            }
+            long row = -1;
+            float min_val = 0.0f;
+            float max_val = 0.0f;
+            if (!find_first_nan_row(t, &row, &min_val, &max_val)) {
+                return false;
+            }
+            std::cerr << fmt::format("[ATTN_FWD_NAN] layer={} tag={} row={} min={} max={} dtype={}\n",
+                                     layer_idx,
+                                     tag ? tag : "<unnamed>",
+                                     row,
+                                     min_val,
+                                     max_val,
+                                     static_cast<int>(t.DType));
+            return true;
+        };
+        const bool out_nan = trace_nan(out, "out");
+        if (out_nan) {
+            trace_nan(lse, "lse");
+            trace_nan(qkv, "qkv");
+        }
     }
 }
 
@@ -69,34 +111,24 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[3]);
     Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
 
-    Tensor* out_ptr = &out;
-    Tensor* lse_ptr = &lse;
-    Tensor* qkv_ptr = &qkv;
-
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
-    const bool is_decode = (mT <= 1);
-    const bool gqa_divisible = (Hkv > 0) ? (Hq % Hkv == 0) : false;
-    const bool allow_gqa_cudnn = (!is_decode && gqa_divisible);
-    const bool cudnn_gqa_ok = (Hq == Hkv) || allow_gqa_cudnn;
-    const bool force_custom_bwd = (std::getenv("SUROGATE_ATTN_BWD_CUSTOM") != nullptr);
-    const bool force_cudnn_bwd = (std::getenv("SUROGATE_ATTN_BWD_FORCE_CUDNN") != nullptr);
-    const bool use_cudnn_bwd = force_cudnn_bwd || (cudnn_gqa_ok && !force_custom_bwd);
-    const bool gqa_fallback_full = !cudnn_gqa_ok;
-    auto shape_vec = [](const Tensor& t) {
-        return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
-    };
+    int layer_idx = op.attrs.layer_idx;
+    if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
+        layer_idx = op.inputs[0].layer_idx;
+    }
+    if (layer_idx < 0 && op.inputs.size() > 3) {
+        std::string field;
+        parse_block_param(op.inputs[3].name, layer_idx, field);
+    }
 
     if (!mRunState.scratch().cudnn_workspace.Data) {
         mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
     }
 
-    // Zero-initialize d_qkv before cuDNN attention backward to prevent NaN from uninitialized memory.
-    // The d_qkv buffer may contain stale values from previous operations, and cuDNN attention backward
-    // may read parts of this buffer even though it's expected to be output-only. Without this zero-init,
-    // NaN values can appear in the gradient computation and propagate through the backward pass.
+    // Zero-initialize d_qkv to avoid stale values.
     fill_zero(d_qkv, mRunState.MainStream);
 
     const int attn_chunks = mOptions.AttBwdChunks;
@@ -107,121 +139,116 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         ? static_cast<int>(mB)
         : static_cast<int>(div_exact(mB, static_cast<long>(attn_chunks)));
 
-    // Signature: attention_backward_cudnn(dqkv, stats, out, dout, qkv, workspace, handle, B, T, Hq, Hkv, HS, stream)
+    const int kernel_trace = env_int("SUROGATE_ATTN_BWD_KERNEL_TRACE", 0);
+    const int kernel_layer = env_int("SUROGATE_ATTN_BWD_KERNEL_LAYER", -1);
+    const int kernel_b = env_int("SUROGATE_ATTN_BWD_KERNEL_B", 0);
+    const int kernel_h = env_int("SUROGATE_ATTN_BWD_KERNEL_H", 0);
+    const int kernel_t = env_int("SUROGATE_ATTN_BWD_KERNEL_T", 0);
+    const int kernel_l = env_int("SUROGATE_ATTN_BWD_KERNEL_L", 0);
+    const bool do_kernel_trace = kernel_trace && !mCapturing &&
+        (kernel_layer < 0 || kernel_layer == layer_idx);
+    if (do_kernel_trace) {
+        AttnBwdDebugConfig cfg;
+        cfg.enabled = 1;
+        cfg.layer = layer_idx;
+        cfg.micro = mMicroStep;
+        cfg.target_b = kernel_b;
+        cfg.target_h = kernel_h;
+        cfg.target_t = kernel_t;
+        cfg.target_l = kernel_l;
+        attention_backward_debug(out, d_out, qkv, lse,
+                                 static_cast<int>(mB), static_cast<int>(mT),
+                                 Hq, Hkv, Hs, cfg, mRunState.MainStream);
+    }
+
+    auto trace_nan = [&](const Tensor& t, const char* tag) -> bool {
+        if (!t.Data) {
+            return false;
+        }
+        long row = -1;
+        float min_val = 0.0f;
+        float max_val = 0.0f;
+        if (!find_first_nan_row(t, &row, &min_val, &max_val)) {
+            return false;
+        }
+        std::cerr << fmt::format("[ATTN_BWD_NAN] layer={} tag={} row={} min={} max={} dtype={}\n",
+                                 layer_idx,
+                                 tag ? tag : "<unnamed>",
+                                 row,
+                                 min_val,
+                                 max_val,
+                                 static_cast<int>(t.DType));
+        return true;
+    };
+    const int nan_trace = env_int("SUROGATE_ATTN_BWD_NAN_TRACE", 0);
+    const int nan_layer = env_int("SUROGATE_ATTN_BWD_NAN_LAYER", -1);
+    const int trace = env_int("SUROGATE_ATTN_BWD_TRACE", 0);
+    const int trace_layer = env_int("SUROGATE_ATTN_BWD_TRACE_LAYER", -1);
+    const int trace_limit = env_int("SUROGATE_ATTN_BWD_TRACE_LIMIT", 8);
+    const int trace_samples = env_int("SUROGATE_ATTN_BWD_TRACE_SAMPLES", 8);
+    static std::atomic<int> trace_count{0};
+
+    auto trace_sample = [&](const Tensor& t, const char* tag) {
+        if (!t.Data) {
+            std::cerr << fmt::format("[ATTN_BWD_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr=<null>\n",
+                                     layer_idx, mMicroStep, tag ? tag : "<unnamed>",
+                                     static_cast<int>(t.DType), tensor_shape_str(t));
+            return;
+        }
+        std::vector<float> vals;
+        if (!copy_tensor_token_sample_as_f32(t, 0, static_cast<std::size_t>(trace_samples), vals) || vals.empty()) {
+            std::cerr << fmt::format("[ATTN_BWD_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr={} sample=<unavailable>\n",
+                                     layer_idx, mMicroStep, tag ? tag : "<unnamed>",
+                                     static_cast<int>(t.DType), tensor_shape_str(t),
+                                     static_cast<const void*>(t.Data));
+            return;
+        }
+        float min_v = vals[0];
+        float max_v = vals[0];
+        float max_abs = std::abs(vals[0]);
+        double mean_abs = 0.0;
+        for (float v : vals) {
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+            max_abs = std::max(max_abs, std::abs(v));
+            mean_abs += static_cast<double>(std::abs(v));
+        }
+        mean_abs /= static_cast<double>(vals.size());
+        std::cerr << fmt::format(
+            "[ATTN_BWD_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr={} min={:.6g} max={:.6g} max_abs={:.6g} mean_abs={:.6g}\n",
+            layer_idx, mMicroStep, tag ? tag : "<unnamed>", static_cast<int>(t.DType),
+            tensor_shape_str(t), static_cast<const void*>(t.Data),
+            min_v, max_v, max_abs, mean_abs);
+    };
+
+    const bool do_trace = trace && !mCapturing &&
+        (trace_layer < 0 || trace_layer == layer_idx) &&
+        (trace_limit <= 0 || trace_count.fetch_add(1) < trace_limit);
+
     if (attn_chunks == 1) {
-        if (!use_cudnn_bwd) {
-            if (d_out.DType == ETensorDType::BF16) {
-                auto& scratch = mRunState.scratch();
-                bool have_fallback_bufs =
-                    scratch.attn_qkv_f32.Data && scratch.attn_out_f32.Data &&
-                    scratch.attn_d_out_f32.Data && scratch.attn_d_qkv_f32.Data;
-                if (have_fallback_bufs) {
-                    const std::size_t need_qkv = static_cast<std::size_t>(qkv.nelem());
-                    const std::size_t need_out = static_cast<std::size_t>(out.nelem());
-                    const std::size_t need_d_out = static_cast<std::size_t>(d_out.nelem());
-                    const std::size_t need_d_qkv = static_cast<std::size_t>(d_qkv.nelem());
-                    const std::size_t have_qkv = static_cast<std::size_t>(scratch.attn_qkv_f32.nelem());
-                    const std::size_t have_out = static_cast<std::size_t>(scratch.attn_out_f32.nelem());
-                    const std::size_t have_d_out = static_cast<std::size_t>(scratch.attn_d_out_f32.nelem());
-                    const std::size_t have_d_qkv = static_cast<std::size_t>(scratch.attn_d_qkv_f32.nelem());
-                    const bool too_small =
-                        (have_qkv < need_qkv) || (have_out < need_out) ||
-                        (have_d_out < need_d_out) || (have_d_qkv < need_d_qkv);
-                    if (too_small) {
-                        if (mRunState.Allocator) {
-                            if (have_qkv < need_qkv) {
-                                scratch.attn_qkv_f32 = mRunState.Allocator->allocate(
-                                    ETensorDType::FP32, "attn_qkv_f32", EAllocationType::ON_DEVICE, shape_vec(qkv));
-                            }
-                            if (have_out < need_out) {
-                                scratch.attn_out_f32 = mRunState.Allocator->allocate(
-                                    ETensorDType::FP32, "attn_out_f32", EAllocationType::ON_DEVICE, shape_vec(out));
-                            }
-                            if (have_d_out < need_d_out) {
-                                scratch.attn_d_out_f32 = mRunState.Allocator->allocate(
-                                    ETensorDType::FP32, "attn_d_out_f32", EAllocationType::ON_DEVICE, shape_vec(d_out));
-                            }
-                            if (have_d_qkv < need_d_qkv) {
-                                scratch.attn_d_qkv_f32 = mRunState.Allocator->allocate(
-                                    ETensorDType::FP32, "attn_d_qkv_f32", EAllocationType::ON_DEVICE, shape_vec(d_qkv));
-                            }
-                        }
-                        have_fallback_bufs =
-                            scratch.attn_qkv_f32.nelem() >= static_cast<long>(need_qkv) &&
-                            scratch.attn_out_f32.nelem() >= static_cast<long>(need_out) &&
-                            scratch.attn_d_out_f32.nelem() >= static_cast<long>(need_d_out) &&
-                            scratch.attn_d_qkv_f32.nelem() >= static_cast<long>(need_d_qkv);
-                        if (!have_fallback_bufs) {
-                        }
-                    }
-                }
-                Tensor qkv_f32 = have_fallback_bufs ? view_tensor(scratch.attn_qkv_f32, shape_vec(qkv))
-                                                    : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(qkv), "qkv_f32");
-                Tensor out_f32 = have_fallback_bufs ? view_tensor(scratch.attn_out_f32, shape_vec(out))
-                                                    : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out), "attn_out_f32");
-                Tensor d_out_f32 = have_fallback_bufs ? view_tensor(scratch.attn_d_out_f32, shape_vec(d_out))
-                                                      : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_out), "d_attn_out_f32");
-                Tensor d_qkv_f32 = have_fallback_bufs ? view_tensor(scratch.attn_d_qkv_f32, shape_vec(d_qkv))
-                                                      : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_qkv), "d_qkv_f32");
-                convert_dtype(qkv_f32.get<float>(), qkv.get<nv_bfloat16>(), qkv.nelem(), mRunState.MainStream);
-                convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(), d_out.nelem(), mRunState.MainStream);
-                // attention_backward_custom uses atomicAdd into d_qkv_f32; ensure it's zeroed.
-                fill_zero(d_qkv_f32, mRunState.MainStream);
-
-                if (gqa_fallback_full) {
-                    Tensor lse_f32 = have_fallback_bufs && scratch.attn_lse_f32.Data
-                        ? view_tensor(scratch.attn_lse_f32, shape_vec(lse))
-                        : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse), "attn_lse_f32");
-                    attention_forward_custom(out_f32, lse_f32, qkv_f32,
-                                             static_cast<int>(mB), static_cast<int>(mT),
-                                             Hq, Hkv, Hs, mRunState.MainStream);
-                    attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
-                                              static_cast<int>(mB), static_cast<int>(mT),
-                                              Hq, Hkv, Hs, mRunState.MainStream);
-                } else {
-                    convert_dtype(out_f32.get<float>(), out.get<nv_bfloat16>(), out.nelem(), mRunState.MainStream);
-                    if (lse.DType == ETensorDType::BF16) {
-                        Tensor lse_f32 = have_fallback_bufs && scratch.attn_lse_f32.Data
-                            ? view_tensor(scratch.attn_lse_f32, shape_vec(lse))
-                            : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse), "attn_lse_f32");
-                        convert_dtype(lse_f32.get<float>(), lse.get<nv_bfloat16>(), lse.nelem(), mRunState.MainStream);
-                        attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
-                                                  static_cast<int>(mB), static_cast<int>(mT),
-                                                  Hq, Hkv, Hs, mRunState.MainStream);
-                    } else {
-                        attention_backward_custom(d_qkv_f32, *lse_ptr, out_f32, d_out_f32, qkv_f32,
-                                                  static_cast<int>(mB), static_cast<int>(mT),
-                                                  Hq, Hkv, Hs, mRunState.MainStream);
-                    }
-                }
-
-                convert_dtype(d_qkv.get<nv_bfloat16>(), d_qkv_f32.get<float>(), d_qkv.nelem(), mRunState.MainStream);
-            } else {
-                if (gqa_fallback_full) {
-                    auto& scratch = mRunState.scratch();
-                    const bool have_fallback_bufs = scratch.attn_out_f32.Data && scratch.attn_lse_f32.Data;
-                    Tensor out_f32 = have_fallback_bufs ? view_tensor(scratch.attn_out_f32, shape_vec(out))
-                                                        : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out), "attn_out_f32");
-                    Tensor lse_f32 = have_fallback_bufs ? view_tensor(scratch.attn_lse_f32, shape_vec(lse))
-                                                        : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse), "attn_lse_f32");
-                    attention_forward_custom(out_f32, lse_f32, *qkv_ptr,
-                                             static_cast<int>(mB), static_cast<int>(mT),
-                                             Hq, Hkv, Hs, mRunState.MainStream);
-                    attention_backward_custom(d_qkv, lse_f32, out_f32, d_out, *qkv_ptr,
-                                              static_cast<int>(mB), static_cast<int>(mT),
-                                              Hq, Hkv, Hs, mRunState.MainStream);
-                } else {
-                    attention_backward_custom(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
-                                              static_cast<int>(mB), static_cast<int>(mT),
-                                              Hq, Hkv, Hs, mRunState.MainStream);
-                }
+        if (do_trace) {
+            trace_sample(d_out, "d_out_pre");
+            trace_sample(out, "out_pre");
+            trace_sample(lse, "lse_pre");
+            trace_sample(qkv, "qkv_pre");
+        }
+        attention_backward_cudnn(d_qkv, lse, out, d_out, qkv,
+                                 mRunState.scratch().cudnn_workspace,
+                                 mRunState.CudnnHandle,
+                                 static_cast<int>(mB), static_cast<int>(mT),
+                                 Hq, Hkv, Hs, mRunState.MainStream);
+        if (do_trace) {
+            trace_sample(d_qkv, "d_qkv_post");
+        }
+        if (nan_trace && !mCapturing && (nan_layer < 0 || nan_layer == layer_idx)) {
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            const bool d_qkv_nan = trace_nan(d_qkv, "d_qkv");
+            if (d_qkv_nan) {
+                trace_nan(d_out, "d_out");
+                trace_nan(out, "out");
+                trace_nan(lse, "lse");
+                trace_nan(qkv, "qkv");
             }
-        } else {
-            attention_backward_cudnn(d_qkv, *lse_ptr, *out_ptr, d_out, *qkv_ptr,
-                                     mRunState.scratch().cudnn_workspace,
-                                     mRunState.CudnnHandle,
-                                     static_cast<int>(mB), static_cast<int>(mT),
-                                     Hq, Hkv, Hs, mRunState.MainStream);
         }
         return;
     }
@@ -230,82 +257,35 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         const long start = static_cast<long>(chunk) * static_cast<long>(chunk_B);
         const long end = start + static_cast<long>(chunk_B);
         Tensor d_out_chunk = slice(d_out, 0, start, end);
-        Tensor out_chunk = slice(*out_ptr, 0, start, end);
-        Tensor lse_chunk = slice(*lse_ptr, 0, start, end);
-        Tensor qkv_chunk = slice(*qkv_ptr, 0, start, end);
+        Tensor out_chunk = slice(out, 0, start, end);
+        Tensor lse_chunk = slice(lse, 0, start, end);
+        Tensor qkv_chunk = slice(qkv, 0, start, end);
         Tensor d_qkv_chunk = slice(d_qkv, 0, start, end);
 
-        if (!use_cudnn_bwd) {
-            if (d_out_chunk.DType == ETensorDType::BF16) {
-                auto& scratch = mRunState.scratch();
-                const bool have_fallback_bufs =
-                    scratch.attn_qkv_f32.Data && scratch.attn_out_f32.Data &&
-                    scratch.attn_d_out_f32.Data && scratch.attn_d_qkv_f32.Data;
-                Tensor qkv_f32 = have_fallback_bufs ? slice(scratch.attn_qkv_f32, 0, start, end)
-                                                    : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(qkv_chunk), "qkv_f32");
-                Tensor out_f32 = have_fallback_bufs ? slice(scratch.attn_out_f32, 0, start, end)
-                                                    : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out_chunk), "attn_out_f32");
-                Tensor d_out_f32 = have_fallback_bufs ? slice(scratch.attn_d_out_f32, 0, start, end)
-                                                      : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_out_chunk), "d_attn_out_f32");
-                Tensor d_qkv_f32 = have_fallback_bufs ? slice(scratch.attn_d_qkv_f32, 0, start, end)
-                                                      : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_qkv_chunk), "d_qkv_f32");
-                convert_dtype(qkv_f32.get<float>(), qkv_chunk.get<nv_bfloat16>(), qkv_chunk.nelem(), mRunState.MainStream);
-                convert_dtype(d_out_f32.get<float>(), d_out_chunk.get<nv_bfloat16>(), d_out_chunk.nelem(), mRunState.MainStream);
+        if (do_trace && chunk == 0) {
+            trace_sample(d_out_chunk, "d_out_pre");
+            trace_sample(out_chunk, "out_pre");
+            trace_sample(lse_chunk, "lse_pre");
+            trace_sample(qkv_chunk, "qkv_pre");
+        }
+        attention_backward_cudnn(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
+                                 mRunState.scratch().cudnn_workspace,
+                                 mRunState.CudnnHandle,
+                                 static_cast<int>(chunk_B), static_cast<int>(mT),
+                                 Hq, Hkv, Hs, mRunState.MainStream);
+        if (do_trace && chunk == 0) {
+            trace_sample(d_qkv_chunk, "d_qkv_post");
+        }
+    }
 
-                if (gqa_fallback_full) {
-                    Tensor lse_f32 = have_fallback_bufs && scratch.attn_lse_f32.Data
-                        ? slice(scratch.attn_lse_f32, 0, start, end)
-                        : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse_chunk), "attn_lse_f32");
-                    attention_forward_custom(out_f32, lse_f32, qkv_f32,
-                                             chunk_B, static_cast<int>(mT),
-                                             Hq, Hkv, Hs, mRunState.MainStream);
-                    attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
-                                              chunk_B, static_cast<int>(mT),
-                                              Hq, Hkv, Hs, mRunState.MainStream);
-                } else {
-                    convert_dtype(out_f32.get<float>(), out_chunk.get<nv_bfloat16>(), out_chunk.nelem(), mRunState.MainStream);
-                    if (lse_chunk.DType == ETensorDType::BF16) {
-                        Tensor lse_f32 = have_fallback_bufs && scratch.attn_lse_f32.Data
-                            ? slice(scratch.attn_lse_f32, 0, start, end)
-                            : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse_chunk), "attn_lse_f32");
-                        convert_dtype(lse_f32.get<float>(), lse_chunk.get<nv_bfloat16>(), lse_chunk.nelem(), mRunState.MainStream);
-                        attention_backward_custom(d_qkv_f32, lse_f32, out_f32, d_out_f32, qkv_f32,
-                                                  chunk_B, static_cast<int>(mT),
-                                                  Hq, Hkv, Hs, mRunState.MainStream);
-                    } else {
-                        attention_backward_custom(d_qkv_f32, lse_chunk, out_f32, d_out_f32, qkv_f32,
-                                                  chunk_B, static_cast<int>(mT),
-                                                  Hq, Hkv, Hs, mRunState.MainStream);
-                    }
-                }
-
-                convert_dtype(d_qkv_chunk.get<nv_bfloat16>(), d_qkv_f32.get<float>(), d_qkv_chunk.nelem(), mRunState.MainStream);
-            } else {
-                if (gqa_fallback_full) {
-                    auto& scratch = mRunState.scratch();
-                    const bool have_fallback_bufs = scratch.attn_out_f32.Data && scratch.attn_lse_f32.Data;
-                    Tensor out_f32 = have_fallback_bufs ? slice(scratch.attn_out_f32, 0, start, end)
-                                                        : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(out_chunk), "attn_out_f32");
-                    Tensor lse_f32 = have_fallback_bufs ? slice(scratch.attn_lse_f32, 0, start, end)
-                                                        : mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(lse_chunk), "attn_lse_f32");
-                    attention_forward_custom(out_f32, lse_f32, qkv_chunk,
-                                             chunk_B, static_cast<int>(mT),
-                                             Hq, Hkv, Hs, mRunState.MainStream);
-                    attention_backward_custom(d_qkv_chunk, lse_f32, out_f32, d_out_chunk, qkv_chunk,
-                                              chunk_B, static_cast<int>(mT),
-                                              Hq, Hkv, Hs, mRunState.MainStream);
-                } else {
-                    attention_backward_custom(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
-                                              chunk_B, static_cast<int>(mT),
-                                              Hq, Hkv, Hs, mRunState.MainStream);
-                }
-            }
-        } else {
-            attention_backward_cudnn(d_qkv_chunk, lse_chunk, out_chunk, d_out_chunk, qkv_chunk,
-                                     mRunState.scratch().cudnn_workspace,
-                                     mRunState.CudnnHandle,
-                                     chunk_B, static_cast<int>(mT),
-                                     Hq, Hkv, Hs, mRunState.MainStream);
+    if (nan_trace && !mCapturing && (nan_layer < 0 || nan_layer == layer_idx)) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        const bool d_qkv_nan = trace_nan(d_qkv, "d_qkv");
+        if (d_qkv_nan) {
+            trace_nan(d_out, "d_out");
+            trace_nan(out, "out");
+            trace_nan(lse, "lse");
+            trace_nan(qkv, "qkv");
         }
     }
 }

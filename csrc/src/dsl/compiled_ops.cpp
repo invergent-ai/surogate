@@ -6,6 +6,7 @@
 #include "dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,8 +15,12 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#include <fmt/core.h>
 
 #include "dsl/compiled_ops_helpers.h"
 #include "dsl/dsl_runtime.h"
@@ -139,6 +144,22 @@ bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
     case ETensorDType::FP16: {
         std::vector<half> tmp(count);
         cudaMemcpy(tmp.data(), base, count * sizeof(half), cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(tmp[i]);
+        }
+        return true;
+    }
+    case ETensorDType::FP8_E4M3: {
+        std::vector<__nv_fp8_e4m3> tmp(count);
+        cudaMemcpy(tmp.data(), base, count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(tmp[i]);
+        }
+        return true;
+    }
+    case ETensorDType::FP8_E5M2: {
+        std::vector<__nv_fp8_e5m2> tmp(count);
+        cudaMemcpy(tmp.data(), base, count * sizeof(__nv_fp8_e5m2), cudaMemcpyDeviceToHost);
         for (std::size_t i = 0; i < count; ++i) {
             out[i] = static_cast<float>(tmp[i]);
         }
@@ -281,6 +302,148 @@ bool find_first_nan_row(const Tensor& t, long* out_row, float* out_min, float* o
 // Global state for QKV gradient tracking (shared across split op files)
 std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
 std::vector<int> g_qkv_dA_micro_by_layer;
+
+namespace {
+
+struct QkvGuardKey {
+    const void* ptr = nullptr;
+    int layer = -1;
+    int micro = -1;
+};
+
+struct QkvGuardKeyHash {
+    std::size_t operator()(const QkvGuardKey& k) const noexcept {
+        const auto h1 = std::hash<const void*>{}(k.ptr);
+        const auto h2 = std::hash<int>{}(k.layer);
+        const auto h3 = std::hash<int>{}(k.micro);
+        return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2))
+               ^ (h3 + 0x9e3779b9 + (h2 << 6) + (h2 >> 2));
+    }
+};
+
+struct QkvGuardKeyEq {
+    bool operator()(const QkvGuardKey& a, const QkvGuardKey& b) const noexcept {
+        return a.ptr == b.ptr && a.layer == b.layer && a.micro == b.micro;
+    }
+};
+
+std::unordered_map<QkvGuardKey, QkvGuardSample, QkvGuardKeyHash, QkvGuardKeyEq> g_qkv_guard_samples;
+std::unordered_map<const void*, QkvLastWriter> g_qkv_last_writer_by_ptr;
+std::unordered_map<const void*, QkvKernelWriter> g_qkv_kernel_writer_by_ptr;
+std::atomic<const void*> g_qkv_watch_ptr{nullptr};
+std::mutex g_qkv_guard_mutex;
+
+}  // namespace
+
+void record_qkv_guard_sample(const void* ptr,
+                             int layer_idx,
+                             int micro_step,
+                             std::uint16_t op_idx,
+                             const std::string& op_id,
+                             const std::array<float, 8>& vals) {
+    if (!ptr || layer_idx < 0 || micro_step < 0) {
+        return;
+    }
+    const QkvGuardKey key{ptr, layer_idx, micro_step};
+    QkvGuardSample sample;
+    sample.vals = vals;
+    sample.op_idx = op_idx;
+    sample.op_id = op_id;
+    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
+    g_qkv_guard_samples[key] = std::move(sample);
+
+    if (env_int("SUROGATE_QKV_PTR_WATCH_ANY", 0)) {
+        const void* expected = nullptr;
+        g_qkv_watch_ptr.compare_exchange_strong(expected, ptr);
+    }
+}
+
+bool fetch_qkv_guard_sample(const void* ptr,
+                            int layer_idx,
+                            int micro_step,
+                            QkvGuardSample& out) {
+    if (!ptr || layer_idx < 0 || micro_step < 0) {
+        return false;
+    }
+    const QkvGuardKey key{ptr, layer_idx, micro_step};
+    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
+    auto it = g_qkv_guard_samples.find(key);
+    if (it == g_qkv_guard_samples.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+void record_qkv_last_writer(const void* ptr,
+                            int layer_idx,
+                            int micro_step,
+                            std::uint16_t op_idx,
+                            const std::string& op_id,
+                            const char* op_type,
+                            const std::string& out_name) {
+    if (!ptr) {
+        return;
+    }
+    QkvLastWriter writer;
+    writer.layer = layer_idx;
+    writer.micro = micro_step;
+    writer.op_idx = op_idx;
+    writer.op_id = op_id;
+    writer.op_type = op_type ? op_type : "";
+    writer.out_name = out_name;
+    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
+    g_qkv_last_writer_by_ptr[ptr] = std::move(writer);
+}
+
+bool fetch_qkv_last_writer(const void* ptr,
+                           QkvLastWriter& out) {
+    if (!ptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
+    auto it = g_qkv_last_writer_by_ptr.find(ptr);
+    if (it == g_qkv_last_writer_by_ptr.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+void record_qkv_kernel_writer(const void* ptr,
+                              int layer_idx,
+                              int micro_step,
+                              std::uint16_t op_idx,
+                              const std::string& op_id,
+                              const char* op_type,
+                              const std::string& out_name) {
+    if (!ptr) {
+        return;
+    }
+    QkvKernelWriter writer;
+    writer.layer = layer_idx;
+    writer.micro = micro_step;
+    writer.op_idx = op_idx;
+    writer.op_id = op_id;
+    writer.op_type = op_type ? op_type : "";
+    writer.out_name = out_name;
+    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
+    g_qkv_kernel_writer_by_ptr[ptr] = std::move(writer);
+}
+
+bool fetch_qkv_kernel_writer(const void* ptr,
+                             QkvKernelWriter& out) {
+    if (!ptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
+    auto it = g_qkv_kernel_writer_by_ptr.find(ptr);
+    if (it == g_qkv_kernel_writer_by_ptr.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
 
 float env_float(const char* name, float fallback) {
     if (!name || !*name) {
@@ -551,6 +714,253 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
     }
 }
 
+void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list) {
+    // Only needed when recompute is enabled or MoE tensors require persistence.
+    if (!mSaved) {
+        return;
+    }
+
+    const bool recompute_enabled = mOptions.recompute_enabled();
+
+    auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
+        if (!recompute_enabled || !mSlotRegistry) {
+            return false;
+        }
+        const bool lora_only_mode = mRunState.is_lora_only_mode();
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(tensor_name, layer_idx, field)) {
+            return mSlotRegistry->will_recompute(strip_ssa_suffix(field), lora_only_mode);
+        }
+        return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
+    };
+
+    auto is_shared_slot = [&](const std::string& name) -> std::optional<bool> {
+        if (!mSlotRegistry) {
+            return std::nullopt;
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            return mSlotRegistry->is_shared(strip_ssa_suffix(field));
+        }
+        return mSlotRegistry->is_shared(strip_ssa_suffix(name));
+    };
+
+    auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
+        if (force_persist) {
+            return true;
+        }
+        if (!recompute_enabled || prefer_live) {
+            return false;
+        }
+        auto shared = is_shared_slot(name);
+        if (shared.has_value()) {
+            return shared.value();
+        }
+        // Unknown tensors (not in slot registry) are treated as needing persistence.
+        return true;
+    };
+
+    auto ensure_buffer = [&](const std::string& name, size_t bytes) {
+        if (bytes == 0) {
+            return;
+        }
+        auto buf_it = mMoESavedBuffers.find(name);
+        if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+            if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                CUDA_CHECK(cudaFree(buf_it->second));
+            }
+            void* new_buffer = nullptr;
+            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+            mMoESavedBuffers[name] = new_buffer;
+            mMoESavedSizes[name] = bytes;
+        }
+    };
+
+    auto resolve_source = [&](const std::string& name) -> std::optional<Tensor> {
+        auto it = mTensorMap.find(name);
+        if (it != mTensorMap.end()) {
+            return it->second;
+        }
+        if (name == "token_ids") {
+            return mRunState.Inputs;
+        }
+        if (name == "position_ids") {
+            return mRunState.PositionIDs;
+        }
+
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
+                return std::nullopt;
+            }
+            const std::string base_field = strip_ssa_suffix(field);
+            auto& acts = mRunState.simplified_acts(layer_idx);
+            if (base_field == "ln1_rstd") return acts.ln1_rstd;
+            if (base_field == "ln2_rstd") return acts.ln2_rstd;
+            if (base_field == "q_rstd") return acts.q_rstd;
+            if (base_field == "k_rstd") return acts.k_rstd;
+            if (base_field == "lse") return acts.lse;
+            if (base_field == "ln1" || base_field == "ln1_flat") return acts.ln1;
+            if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
+            if (base_field == "qkv") return acts.qkv;
+            if (base_field == "qkv_rope") {
+                Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+                return src;
+            }
+            if (base_field == "qkv_flat") {
+                Tensor qkv = acts.qkv;
+                return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+            }
+            if (base_field == "att" || base_field == "att_flat") return acts.att;
+            if (base_field == "att_out" || base_field == "att_out_flat") return acts.att_out;
+            if (base_field == "mlp_up" || base_field == "mlp_up_flat") return acts.mlp_up;
+            if (base_field == "swiglu") return acts.swiglu;
+            if (base_field == "swiglu_flat") {
+                Tensor swiglu = acts.swiglu;
+                return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+            }
+            if (base_field == "mlp_down" || base_field == "mlp_down_flat") return acts.mlp_down;
+            if (base_field == "res_att" || base_field == "residual_att") return acts.residual_att;
+            if (base_field == "res_ffn" || base_field == "residual_ffn") {
+                auto it2 = mTensorMap.find(name);
+                if (it2 != mTensorMap.end()) {
+                    return it2->second;
+                }
+                return std::nullopt;
+            }
+            if (base_field == "router_logits") return acts.router_logits;
+            if (base_field == "router_probs") return acts.router_probs;
+            if (base_field == "routing_weights") return acts.routing_weights;
+            if (base_field == "routing_indices") return acts.routing_indices;
+            if (base_field == "permuted_input") return acts.permuted_input;
+            if (base_field == "scatter_indices") return acts.scatter_indices;
+            if (base_field == "expert_gate_up") return acts.expert_gate_up;
+            if (base_field == "expert_act") return acts.expert_act;
+            if (base_field == "expert_down") return acts.expert_down;
+            if (base_field == "moe_out" || base_field == "moe_out_flat") return acts.moe_out;
+        } else if (name == "ln_final" || name == "xF") {
+            return mRunState.non_block_activations().ln_final;
+        } else if (name == "final_residual" || name == "residual_final") {
+            return mRunState.get_final_residual();
+        } else if (name == "xF_flat") {
+            Tensor ln_final = mRunState.non_block_activations().ln_final;
+            return view_tensor(ln_final, {ln_final.Sizes[0] * ln_final.Sizes[1], ln_final.Sizes[2]});
+        } else if (name == "ln_final_rstd") {
+            return mRunState.non_block_activations().ln_final_rstd;
+        } else if (name == "encoded" || name == "x0") {
+            return mRunState.non_block_activations().encoded;
+        } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+            return mRunState.non_block_activations().freq_cis;
+        }
+
+        return std::nullopt;
+    };
+
+    auto infer_block_bytes = [&](const std::string& name, std::size_t& out_bytes) -> bool {
+        int layer_idx = -1;
+        std::string field;
+        if (!parse_block_param(name, layer_idx, field)) {
+            return false;
+        }
+        const std::string base_field = strip_ssa_suffix(field);
+        const long B = (mB > 0) ? mB : mRunState.B;
+        const long T = (mT > 0) ? mT : mRunState.T;
+        if (B <= 0 || T <= 0) {
+            return false;
+        }
+        const long C = mConfig.HiddenSize;
+        const long D = mConfig.IntermediateSize;
+        const long Hq = mConfig.NumQueryHeads;
+        const long Hkv = mConfig.NumKeyValHeads;
+        const long Hs = mConfig.head_size();
+        const long QKV = Hs * (Hq + 2 * Hkv);
+        const long AttnDim = Hq * Hs;
+        const long MUp = 2 * D;
+
+        std::vector<long> shape;
+        if (base_field == "qkv_flat" || base_field == "qkv_biased") {
+            shape = {B * T, QKV};
+        } else if (base_field == "ln1_flat" || base_field == "ln2_flat") {
+            shape = {B * T, C};
+        } else if (base_field == "att_out_flat") {
+            shape = {B * T, C};
+        } else if (base_field == "att_flat") {
+            shape = {B * T, AttnDim};
+        } else if (base_field == "mlp_up_flat") {
+            shape = {B * T, MUp};
+        } else if (base_field == "mlp_down_flat") {
+            shape = {B * T, C};
+        } else if (base_field == "ln1" || base_field == "ln2" || base_field == "res_att" ||
+                   base_field == "res_ffn" || base_field == "att_out" || base_field == "mlp_down") {
+            shape = {B, T, C};
+        } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd") {
+            shape = {B, T};
+        } else if (base_field == "mlp_up") {
+            shape = {B, T, MUp};
+        } else if (base_field == "swiglu") {
+            shape = {B, T, D};
+        } else if (base_field == "qkv" || base_field == "qkv_rope") {
+            shape = {B, T, QKV};
+        } else if (base_field == "att") {
+            shape = {B, T, AttnDim};
+        } else if (base_field == "q_rstd") {
+            shape = {B, T, Hq};
+        } else if (base_field == "k_rstd") {
+            shape = {B, T, Hkv};
+        } else if (base_field == "lse") {
+            shape = {B, Hq, T};
+        } else {
+            return false;
+        }
+
+        ETensorDType dtype = ETensorDType::BF16;
+        if (mConfig.NumLayers > 0) {
+            dtype = mRunState.simplified_acts(0).ln1.DType;
+        }
+        if (base_field == "ln1_rstd" || base_field == "ln2_rstd" || base_field == "q_rstd" ||
+            base_field == "k_rstd" || base_field == "lse") {
+            dtype = ETensorDType::FP32;
+        }
+        const std::size_t nelem = shape_nelem(shape);
+        out_bytes = nelem * static_cast<std::size_t>(get_dtype_size(dtype));
+        return out_bytes > 0;
+    };
+
+    for (const auto& name : save_list) {
+        if (mWeights.has(name)) {
+            continue;
+        }
+
+        const bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
+                                    name.find("scatter_indices") != std::string::npos ||
+                                    name.find("routing_weights") != std::string::npos ||
+                                    name.find("routing_indices") != std::string::npos ||
+                                    name.find("router_probs") != std::string::npos ||
+                                    name.find("router_logits") != std::string::npos ||
+                                    name.find("permuted_input") != std::string::npos ||
+                                    name.find("expert_") != std::string::npos);
+        const bool prefer_live = prefer_live_tensor(name);
+        const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
+        const bool need_persist = should_persist(name, prefer_live, force_persist);
+        if (!need_persist) {
+            continue;
+        }
+
+        auto src_opt = resolve_source(name);
+        if (src_opt.has_value() && src_opt->Data) {
+            ensure_buffer(name, src_opt->bytes());
+            continue;
+        }
+        std::size_t inferred_bytes = 0;
+        if (infer_block_bytes(name, inferred_bytes)) {
+            ensure_buffer(name, inferred_bytes);
+        }
+    }
+}
+
 void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     if (!mSaved) {
         return;
@@ -586,23 +996,51 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
 
     // Helper to copy tensor to persistent buffer when needed in recompute mode.
     // Returns true if tensor was copied to persistent storage, false if metadata-only save.
-    auto save_tensor_with_policy = [&](const std::string& name, const Tensor& src,
-                                        bool prefer_live) -> void {
-        if (capturing) {
-            (*mSaved)[name] = src;
-            return;
+    auto is_shared_slot = [&](const std::string& name) -> std::optional<bool> {
+        if (!mSlotRegistry) {
+            return std::nullopt;
         }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            return mSlotRegistry->is_shared(strip_ssa_suffix(field));
+        }
+        return mSlotRegistry->is_shared(strip_ssa_suffix(name));
+    };
+
+    auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
+        if (force_persist) {
+            return true;
+        }
+        if (!recompute_enabled || prefer_live) {
+            return false;
+        }
+        auto shared = is_shared_slot(name);
+        if (shared.has_value()) {
+            return shared.value();
+        }
+        return true;
+    };
+
+    auto save_tensor_with_policy = [&](const std::string& name, const Tensor& src,
+                                       bool prefer_live, bool force_persist) -> void {
         if (prefer_live) {
             // Save metadata only - will resolve from live buffer or recompute
             Tensor meta = src;
             meta.Data = nullptr;
             (*mSaved)[name] = meta;
-        } else if (recompute_enabled && src.Data != nullptr) {
-            // In recompute mode but tensor won't be recomputed (e.g., lora_only in FFT mode).
-            // Copy data to persistent buffer since live buffers will be reused.
+            return;
+        }
+
+        const bool need_persist = should_persist(name, prefer_live, force_persist) && src.Data != nullptr;
+        if (need_persist && src.Data != nullptr) {
             const size_t bytes = src.bytes();
             auto buf_it = mMoESavedBuffers.find(name);
             if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+                if (capturing) {
+                    throw std::runtime_error("CompiledExecutor: missing preallocated save buffer for '" + name +
+                                             "' during CUDA graph capture");
+                }
                 if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
@@ -622,10 +1060,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             }
             saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
             (*mSaved)[name] = saved_tensor;
-        } else {
-            // Non-recompute mode: just store reference
-            (*mSaved)[name] = src;
+            return;
         }
+
+        // Non-recompute mode: just store reference
+        (*mSaved)[name] = src;
     };
 
     for (const auto& name : save_list) {
@@ -641,64 +1080,18 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                                         name.find("permuted_input") != std::string::npos ||
                                         name.find("expert_") != std::string::npos);
             const bool prefer_live = prefer_live_tensor(name);
-
-            // For MoE tensors, copy to persistent buffer to prevent buffer reuse corruption
-            if (is_moe_tensor && mConfig.NumExperts > 0 && it->second.Data != nullptr) {
-                if (prefer_live) {
-                    // Recompute mode: store metadata only and recompute later.
-                    save_tensor_with_policy(name, it->second, true);
-                    continue;
-                }
-                if (capturing) {
-                    (*mSaved)[name] = it->second;
-                    continue;
-                }
-                const Tensor& src = it->second;
-                const size_t bytes = src.bytes();
-
-                // Allocate or resize persistent buffer if needed
-                auto buf_it = mMoESavedBuffers.find(name);
-                if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
-                    // Free old buffer if exists
-                    if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
-                        CUDA_CHECK(cudaFree(buf_it->second));
-                    }
-                    // Allocate new buffer
-                    void* new_buffer = nullptr;
-                    CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                    mMoESavedBuffers[name] = new_buffer;
-                    mMoESavedSizes[name] = bytes;
-                }
-
-                // Copy data to persistent buffer
-                void* dst_buffer = mMoESavedBuffers[name];
-                CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
-
-                // Create tensor struct pointing to persistent buffer
-                Tensor saved_tensor;
-                saved_tensor.DType = src.DType;
-                saved_tensor.Rank = src.Rank;
-                for (int i = 0; i < src.Rank; ++i) {
-                    saved_tensor.Sizes[i] = src.Sizes[i];
-                }
-                saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
-
-                (*mSaved)[name] = saved_tensor;
-            } else {
-                // Non-MoE tensor: use standard policy-based saving
-                save_tensor_with_policy(name, it->second, prefer_live);
-            }
+            const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
+            save_tensor_with_policy(name, it->second, prefer_live, force_persist);
             continue;
         }
 
         // Check special tensors
         if (name == "token_ids") {
-            save_tensor_with_policy(name, mRunState.Inputs, prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.Inputs, prefer_live_tensor(name), false);
             continue;
         }
         if (name == "position_ids") {
-            save_tensor_with_policy(name, mRunState.PositionIDs, prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.PositionIDs, prefer_live_tensor(name), false);
             continue;
         }
 
@@ -713,52 +1106,52 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             // Map common saved fields
             const bool prefer_live = prefer_live_tensor(name);
             if (field == "ln1_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1_rstd, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1_rstd, prefer_live, false);
             } else if (field == "ln2_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2_rstd, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2_rstd, prefer_live, false);
             } else if (field == "q_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).q_rstd, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).q_rstd, prefer_live, false);
             } else if (field == "k_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).k_rstd, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).k_rstd, prefer_live, false);
             } else if (field == "lse") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).lse, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).lse, prefer_live, false);
             } else if (field == "ln1" || field == "ln1_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1, prefer_live, false);
             } else if (field == "ln2" || field == "ln2_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2, prefer_live, false);
             } else if (field == "qkv") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).qkv, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).qkv, prefer_live, false);
             } else if (field == "qkv_rope") {
                 // qkv_rope has RoPE applied - save it if available, otherwise fall back to qkv
                 auto& acts = mRunState.simplified_acts(layer_idx);
                 Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                save_tensor_with_policy(name, src, prefer_live);
+                save_tensor_with_policy(name, src, prefer_live, false);
             } else if (field == "qkv_flat") {
                 // Save the flattened version for matmul backward shape resolution
                 Tensor qkv = mRunState.simplified_acts(layer_idx).qkv;
                 Tensor flat = view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
-                save_tensor_with_policy(name, flat, prefer_live);
+                save_tensor_with_policy(name, flat, prefer_live, false);
             } else if (field == "att" || field == "att_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att, prefer_live, false);
             } else if (field == "att_out" || field == "att_out_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att_out, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att_out, prefer_live, false);
             } else if (field == "mlp_up" || field == "mlp_up_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_up, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_up, prefer_live, false);
             } else if (field == "swiglu") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).swiglu, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).swiglu, prefer_live, false);
             } else if (field == "swiglu_flat") {
                 Tensor swiglu = mRunState.simplified_acts(layer_idx).swiglu;
                 Tensor flat = view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
-                save_tensor_with_policy(name, flat, prefer_live);
+                save_tensor_with_policy(name, flat, prefer_live, false);
             } else if (field == "mlp_down" || field == "mlp_down_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_down, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_down, prefer_live, false);
             } else if (field == "res_att" || field == "residual_att") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).residual_att, prefer_live);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).residual_att, prefer_live, false);
             } else if (field == "res_ffn" || field == "residual_ffn") {
                 // res_ffn is computed dynamically (residual_att + mlp_down), check mTensorMap
                 auto it = mTensorMap.find(name);
                 if (it != mTensorMap.end()) {
-                    save_tensor_with_policy(name, it->second, prefer_live);
+                    save_tensor_with_policy(name, it->second, prefer_live, false);
                 } else {
                     throw std::runtime_error("CompiledExecutor: res_ffn tensor not found in map: " + name);
                 }
@@ -768,20 +1161,20 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
             }
         } else if (name == "ln_final" || name == "xF") {
-            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final, prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final, prefer_live_tensor(name), false);
         } else if (name == "final_residual" || name == "residual_final") {
-            save_tensor_with_policy(name, mRunState.get_final_residual(), prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.get_final_residual(), prefer_live_tensor(name), false);
         } else if (name == "xF_flat") {
             // Save the flattened version for matmul backward
             Tensor ln_final = mRunState.non_block_activations().ln_final;
             Tensor flat = view_tensor(ln_final, {ln_final.Sizes[0] * ln_final.Sizes[1], ln_final.Sizes[2]});
-            save_tensor_with_policy(name, flat, prefer_live_tensor(name));
+            save_tensor_with_policy(name, flat, prefer_live_tensor(name), false);
         } else if (name == "ln_final_rstd") {
-            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final_rstd, prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final_rstd, prefer_live_tensor(name), false);
         } else if (name == "encoded" || name == "x0") {
-            save_tensor_with_policy(name, mRunState.non_block_activations().encoded, prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.non_block_activations().encoded, prefer_live_tensor(name), false);
         } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-            save_tensor_with_policy(name, mRunState.non_block_activations().freq_cis, prefer_live_tensor(name));
+            save_tensor_with_policy(name, mRunState.non_block_activations().freq_cis, prefer_live_tensor(name), false);
         } else if (mWeights.has(name)) {
             (*mSaved)[name] = mWeights.get(name);
         } else {
@@ -1094,6 +1487,45 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
+    const char* watch_env = std::getenv("SUROGATE_PTR_WATCH");
+    const bool auto_watch_qkv = (watch_env &&
+                                 (std::strcmp(watch_env, "auto_qkv") == 0 ||
+                                  std::strcmp(watch_env, "qkv") == 0));
+    static void* auto_watch_ptr = nullptr;
+    static bool auto_watch_set = false;
+    void* watch_ptr = nullptr;
+    if (!auto_watch_qkv && watch_env && *watch_env) {
+        char* end = nullptr;
+        const unsigned long long raw = std::strtoull(watch_env, &end, 0);
+        if (end != watch_env) {
+            watch_ptr = reinterpret_cast<void*>(raw);
+        }
+    }
+    auto watch = [&](Tensor& t) -> Tensor& {
+        if (auto_watch_qkv && !auto_watch_set && t.Data && !ref.name.empty()) {
+            if (ref.name.find(".qkv") != std::string::npos) {
+                auto_watch_ptr = t.Data;
+                auto_watch_set = true;
+                std::cerr << "[PTR_WATCH_SET] name=" << ref.name
+                          << " layer=" << ref.layer_idx
+                          << " ptr=" << t.Data
+                          << " dtype=" << static_cast<int>(t.DType)
+                          << " shape=" << tensor_shape_str(t)
+                          << std::endl;
+            }
+        }
+        void* effective_watch_ptr = auto_watch_qkv ? auto_watch_ptr : watch_ptr;
+        if (effective_watch_ptr && t.Data == effective_watch_ptr) {
+            std::cerr << "[PTR_WATCH] name=" << ref.name
+                      << " layer=" << ref.layer_idx
+                      << " ptr=" << t.Data
+                      << " dtype=" << static_cast<int>(t.DType)
+                      << " shape=" << tensor_shape_str(t)
+                      << std::endl;
+        }
+        return t;
+    };
+
     if (!ref.name.empty()) {
         if (auto base = base_param_from_grad(ref.name)) {
             bool accum = false;
@@ -1101,10 +1533,10 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                 if (grad->Data) {
                     if (!ref.shape.empty()) {
                         auto [it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*grad, ref.shape));
-                        return it->second;
+                        return watch(it->second);
                     }
                     auto [it, _] = mTensorMap.insert_or_assign(ref.name, *grad);
-                    return it->second;
+                    return watch(it->second);
                 }
             }
         }
@@ -1143,7 +1575,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                         Tensor& base = resolve_tensor(alias_ref);
                         Tensor view = ref.shape.empty() ? base : view_tensor(base, ref.shape);
                         auto [it, _] = mTensorMap.insert_or_assign(ref.name, view);
-                        return it->second;
+                        return watch(it->second);
                     } catch (const std::exception&) {
                         // Fall through to normal allocation if alias resolution fails.
                     }
@@ -1165,15 +1597,15 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
             if (!inserted) {
                 it->second = view_tensor(t, ref.shape);
             }
-            return it->second;
+            return watch(it->second);
         }
-        return t;
+        return watch(t);
     }
 
     // For mapped/temporary tensors, allocate if needed
     auto it = mTensorMap.find(ref.name);
     if (it != mTensorMap.end()) {
-        return it->second;
+        return watch(it->second);
     }
 
     Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape);
@@ -1189,7 +1621,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 
     mTemps.push_back(t);
     auto [ins_it, inserted] = mTensorMap.emplace(ref.name, t);
-    return ins_it->second;
+    return watch(ins_it->second);
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
@@ -1260,6 +1692,15 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         layer_checkpoints.resize(static_cast<std::size_t>(num_layers));
         layer_temp_marks.resize(static_cast<std::size_t>(num_layers));
         layer_active.assign(static_cast<std::size_t>(num_layers), 0);
+    }
+    const bool lora_b_watch = env_int("SUROGATE_LORA_B_FIRST_WRITER", 0) != 0;
+    const int lora_b_watch_layer = env_int("SUROGATE_LORA_B_FIRST_WRITER_LAYER", -1);
+    const int lora_b_watch_limit = env_int("SUROGATE_LORA_B_FIRST_WRITER_LIMIT", 1000000);
+    const bool lora_b_watch_abort = env_int("SUROGATE_LORA_B_FIRST_WRITER_ABORT", 1) != 0;
+    static std::atomic<int> lora_b_watch_count{0};
+    static std::atomic<int> lora_b_watch_tripped{0};
+    if (lora_b_watch && mLoRAWeights && mConfig.NumLayers > 0 && mLoraBSeenClean.empty()) {
+        mLoraBSeenClean.assign(static_cast<std::size_t>(mConfig.NumLayers), 0);
     }
     auto prune_stack_tensors = [&]() {
         for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
@@ -1401,6 +1842,198 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             oss << "CompiledExecutor forward op " << idx << " (type=" << op_type_to_string(op.type)
                 << ", id=" << op.op_id << "): " << e.what();
             throw std::runtime_error(oss.str());
+        }
+
+        if (env_int("SUROGATE_QKV_GUARD", 0)) {
+            const char* op_type_name = op_type_to_string(op.type);
+            for (const auto& out_ref : op.outputs) {
+                auto it = mTensorMap.find(out_ref.name);
+                if (it == mTensorMap.end()) {
+                    continue;
+                }
+                const Tensor& t = it->second;
+                if (!t.Data) {
+                    continue;
+                }
+                int layer_idx = op.attrs.layer_idx;
+                if (layer_idx < 0 && out_ref.layer_idx >= 0) {
+                    layer_idx = out_ref.layer_idx;
+                }
+                record_qkv_last_writer(t.Data, layer_idx, mMicroStep,
+                                       op.original_idx, op.op_id,
+                                       op_type_name, out_ref.name);
+            }
+        }
+
+        if (env_int("SUROGATE_QKV_PTR_WATCH_ANY", 0)) {
+            const void* watch_ptr = g_qkv_watch_ptr.load(std::memory_order_relaxed);
+            if (watch_ptr) {
+                const int watch_limit = env_int("SUROGATE_QKV_PTR_WATCH_ANY_LIMIT", 64);
+                static std::atomic<int> watch_count{0};
+                const char* op_type_name = op_type_to_string(op.type);
+                for (const auto& out_ref : op.outputs) {
+                    auto it = mTensorMap.find(out_ref.name);
+                    if (it == mTensorMap.end()) {
+                        continue;
+                    }
+                    const Tensor& t = it->second;
+                    if (!t.Data || t.Data != watch_ptr) {
+                        continue;
+                    }
+                    int layer_idx = op.attrs.layer_idx;
+                    if (layer_idx < 0 && out_ref.layer_idx >= 0) {
+                        layer_idx = out_ref.layer_idx;
+                    }
+                    if (watch_limit <= 0 || watch_count.fetch_add(1) < watch_limit) {
+                        std::cerr << "[QKV_PTR_WATCH_ANY] layer=" << layer_idx
+                                  << " micro=" << mMicroStep
+                                  << " op_idx=" << op.original_idx
+                                  << " op_id=" << op.op_id
+                                  << " type=" << op_type_name
+                                  << " out=" << out_ref.name
+                                  << " ptr=" << t.Data
+                                  << std::endl;
+                    }
+                }
+            }
+        }
+
+        if (env_int("SUROGATE_QKV_WRITE_WATCH", 0) && op.type != CompiledOpType::View) {
+            const int watch_layer = env_int("SUROGATE_QKV_WRITE_WATCH_LAYER", -1);
+            const int watch_limit = env_int("SUROGATE_QKV_WRITE_WATCH_LIMIT", 32);
+            static std::atomic<int> watch_count{0};
+            const char* op_type_name = op_type_to_string(op.type);
+            for (const auto& out_ref : op.outputs) {
+                auto it = mTensorMap.find(out_ref.name);
+                if (it == mTensorMap.end()) {
+                    continue;
+                }
+                const Tensor& t = it->second;
+                if (!t.Data) {
+                    continue;
+                }
+                int layer_idx = op.attrs.layer_idx;
+                if (layer_idx < 0 && out_ref.layer_idx >= 0) {
+                    layer_idx = out_ref.layer_idx;
+                }
+                if (watch_layer >= 0 && layer_idx != watch_layer) {
+                    continue;
+                }
+                QkvGuardSample guard_sample;
+                if (!fetch_qkv_guard_sample(t.Data, layer_idx, mMicroStep, guard_sample)) {
+                    continue;
+                }
+                record_qkv_kernel_writer(t.Data, layer_idx, mMicroStep,
+                                         op.original_idx, op.op_id,
+                                         op_type_name, out_ref.name);
+                if (watch_limit <= 0 || watch_count.fetch_add(1) < watch_limit) {
+                    std::cerr << "[QKV_WRITE_WATCH] layer=" << layer_idx
+                              << " micro=" << mMicroStep
+                              << " op_idx=" << op.original_idx
+                              << " op_id=" << op.op_id
+                              << " type=" << op_type_name
+                              << " out=" << out_ref.name
+                              << " ptr=" << t.Data
+                              << " guard_op_idx=" << guard_sample.op_idx
+                              << " guard_op_id=" << guard_sample.op_id
+                              << std::endl;
+                }
+            }
+        }
+
+        if (lora_b_watch && mLoRAWeights && mLoRAConfig && !mCapturing &&
+            !lora_b_watch_tripped.load(std::memory_order_relaxed)) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(mRunState.MainStream, &status) == cudaSuccess &&
+                status == cudaStreamCaptureStatusNone) {
+                if (lora_b_watch_limit <= 0 ||
+                    lora_b_watch_count.fetch_add(1) < lora_b_watch_limit) {
+                    auto resolve_layer_idx = [&](const CompiledOp& op_ref) -> int {
+                        int layer_idx = op_ref.attrs.layer_idx;
+                        if (layer_idx < 0) {
+                            for (const auto& out_ref : op_ref.outputs) {
+                                if (out_ref.layer_idx >= 0) {
+                                    layer_idx = out_ref.layer_idx;
+                                    break;
+                                }
+                            }
+                        }
+                        return layer_idx;
+                    };
+                    const int layer_idx = resolve_layer_idx(op);
+                    if (layer_idx >= 0 &&
+                        (lora_b_watch_layer < 0 || lora_b_watch_layer == layer_idx) &&
+                        layer_idx < static_cast<int>(mLoraBSeenClean.size())) {
+                        auto& block = mLoRAWeights->peek_block(layer_idx);
+                        auto sample_nan = [&](const std::optional<modules::LoRALayerWeights<Tensor>>& lw,
+                                              std::array<float, 4>& sample) -> bool {
+                            sample = {0.0f, 0.0f, 0.0f, 0.0f};
+                            if (!lw.has_value() || !lw->B.Data) {
+                                return false;
+                            }
+                            std::vector<float> vals;
+                            if (!copy_tensor_sample_offset_as_f32(lw->B, 0, 8, vals)) {
+                                return false;
+                            }
+                            bool has_nan = false;
+                            for (std::size_t i = 0; i < vals.size(); ++i) {
+                                if (std::isnan(vals[i]) || std::isinf(vals[i])) {
+                                    has_nan = true;
+                                }
+                                if (i < 4) {
+                                    sample[i] = vals[i];
+                                }
+                            }
+                            return has_nan;
+                        };
+                        std::array<float, 4> q_sample{};
+                        std::array<float, 4> k_sample{};
+                        std::array<float, 4> v_sample{};
+                        const bool q_nan = sample_nan(block.attention.q, q_sample);
+                        const bool k_nan = sample_nan(block.attention.k, k_sample);
+                        const bool v_nan = sample_nan(block.attention.v, v_sample);
+                        const bool any_nan = q_nan || k_nan || v_nan;
+                        if (!any_nan) {
+                            mLoraBSeenClean[static_cast<std::size_t>(layer_idx)] = 1;
+                        } else {
+                            const bool seen_clean = mLoraBSeenClean[static_cast<std::size_t>(layer_idx)] != 0;
+                            auto join_refs = [](const std::vector<TensorRef>& refs) {
+                                std::string out;
+                                for (std::size_t i = 0; i < refs.size(); ++i) {
+                                    out += refs[i].name;
+                                    if (i + 1 < refs.size()) {
+                                        out += ",";
+                                    }
+                                }
+                                return out;
+                            };
+                            const std::string inputs_str = join_refs(op.inputs);
+                            const std::string outputs_str = join_refs(op.outputs);
+                            std::cerr << fmt::format(
+                                "[LORA_B_FIRST_WRITER] layer={} micro={} op_idx={} op_id={} type={} seen_clean={} inputs=[{}] outputs=[{}] "
+                                "q_nan={} k_nan={} v_nan={} q={:.6g},{:.6g},{:.6g},{:.6g} k={:.6g},{:.6g},{:.6g},{:.6g} v={:.6g},{:.6g},{:.6g},{:.6g}\n",
+                                layer_idx,
+                                mMicroStep,
+                                op.original_idx,
+                                op.op_id,
+                                op_type_to_string(op.type),
+                                seen_clean ? 1 : 0,
+                                inputs_str,
+                                outputs_str,
+                                q_nan ? 1 : 0,
+                                k_nan ? 1 : 0,
+                                v_nan ? 1 : 0,
+                                q_sample[0], q_sample[1], q_sample[2], q_sample[3],
+                                k_sample[0], k_sample[1], k_sample[2], k_sample[3],
+                                v_sample[0], v_sample[1], v_sample[2], v_sample[3]);
+                            lora_b_watch_tripped.store(1, std::memory_order_relaxed);
+                            if (lora_b_watch_abort) {
+                                throw std::runtime_error("LoRA B became NaN (first-writer watchdog)");
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Handle layer end

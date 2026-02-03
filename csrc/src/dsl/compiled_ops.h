@@ -129,6 +129,9 @@ public:
 
     // Save specified tensors to the saved map (for backward use)
     void save_tensors(const std::vector<std::string>& save_list);
+    // Preallocate persistent buffers for saved tensors before CUDA graph capture.
+    // This avoids cudaMalloc during capture when recompute requires persistent saves.
+    void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list);
 
 private:
     // Save MoE layer tensors to persistent storage at layer boundaries
@@ -207,6 +210,7 @@ private:
     modules::ModularLoRAWeightsManager* mLoRAWeights = nullptr;
     modules::ModularLoRAGradsManager* mLoRAGrads = nullptr;
     modules::LoRARunState* mLoRARunState = nullptr;
+    std::vector<char> mLoraBSeenClean;
     DslWeightManager* mWeightManager = nullptr;
     const recipes::Recipe* mRecipe = nullptr;
     void* mHookContext = nullptr;

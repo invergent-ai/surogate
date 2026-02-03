@@ -339,6 +339,33 @@ void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
                                const Tensor& out, const Tensor& dout, const Tensor& qkv,
                                int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
+struct AttnBwdDebugConfig {
+    int enabled = 0;
+    int layer = -1;
+    int micro = -1;
+    int target_b = 0;
+    int target_h = 0;
+    int target_t = 0;
+    int target_l = 0;
+};
+
+struct AttnFwdDebugConfig {
+    int enabled = 0;
+    int layer = -1;
+    int target_b = 0;
+    int target_h = 0;
+    int target_t = 0;
+    int target_l = 0;
+};
+
+void attention_backward_debug(const Tensor& out, const Tensor& dout, const Tensor& qkv,
+                              const Tensor& stats, int B, int T, int Hq, int Hkv, int HS,
+                              const AttnBwdDebugConfig& cfg, cudaStream_t stream);
+
+void attention_forward_debug(const Tensor& qkv, const Tensor& stats,
+                             int B, int T, int Hq, int Hkv, int HS,
+                             const AttnFwdDebugConfig& cfg, cudaStream_t stream);
+
 std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle);
 void attention_backward_cudnn(nv_bfloat16* dqkv, const float* stats,
                               const nv_bfloat16* out, const nv_bfloat16* dout, const nv_bfloat16* qkv,

@@ -88,7 +88,7 @@ class Qwen3Block:
         recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         lora_targets=["q", "k", "v"],
     )
     # NOTE: qkv_rope is safe to recompute in FFT mode (cuDNN attention is deterministic).
@@ -107,7 +107,7 @@ class Qwen3Block:
         ],
         recompute_op="qkv_qk_norm_rope",
         recompute_attrs={"rotary_dim": "D"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         description="QKV after QK-Norm + RoPE",
     )
 
@@ -119,7 +119,7 @@ class Qwen3Block:
         save=True,
         recompute=True,
         recompute_group="qk_norm_rope",
-        recompute_policy="fft_only",
+        recompute_policy="always",
         when="use_qk_norm",
         description="Q head RMSNorm rstd",
     )
@@ -129,7 +129,7 @@ class Qwen3Block:
         save=True,
         recompute=True,
         recompute_group="qk_norm_rope",
-        recompute_policy="fft_only",
+        recompute_policy="always",
         when="use_qk_norm",
         description="K head RMSNorm rstd",
     )
@@ -165,7 +165,7 @@ class Qwen3Block:
         recompute_from=["att", "@param:out_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         lora_targets=["o"],
         description="After output projection",
     )
@@ -202,7 +202,7 @@ class Qwen3Block:
         recompute_from=["ln2", "@param:mlp_up_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         lora_targets=["up", "gate"],
     )
     swiglu = Activation(
@@ -212,11 +212,20 @@ class Qwen3Block:
         recompute_from=["mlp_up"],
         recompute_op="swiglu",
         recompute_attrs={"activation": "swiglu"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         description="SwiGLU activation output",
     )
-    mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"],
-                          description="MLP down projection output")
+    mlp_down = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["mlp_down_flat"],
+        recompute=True,
+        recompute_from=["swiglu", "@param:mlp_down_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["down"],
+        description="MLP down projection output",
+    )
 
     # Second residual
     res_ffn = Activation(

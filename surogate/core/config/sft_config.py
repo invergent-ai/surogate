@@ -69,6 +69,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                      Guarantees bit-exact gradients.
             - True: Recompute intermediates from checkpoints. Saves ~17% VRAM.
                     Recommended for most training scenarios.
+        recompute_lora (Optional[bool], defaults to None):
+            Allow recomputation of FFT-only activations in LoRA-only mode to reduce VRAM.
+            If None, auto-enables for QLoRA and disables otherwise.
         offload_residual (Optional[bool], defaults to False):
             Offload the residuals (of the ffn block; the only remaining part of the block that is not recomputed) to pinned host memory.
             Combined with recompute, the total activation memory consumption becomes independent of the network depth.
@@ -261,6 +264,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     save_total_limit: Optional[int] = 5
 
     recompute: Optional[bool] = True
+    recompute_lora: Optional[bool] = None
 
     offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
@@ -373,6 +377,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 raise ValueError(f"recompute must be true or false, got '{recompute_raw}'")
         else:
             self.recompute = bool(recompute_raw)
+        self.recompute_lora = cfg.get('recompute_lora', self.recompute_lora)
 
         self.offload_residual = cfg.get('offload_residual', self.offload_residual)
         self.offload_master = cfg.get('offload_master', self.offload_master)
@@ -607,6 +612,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             if not self.recompute:
                 self.recompute = True
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
+            if self.recompute_lora is None:
+                self.recompute_lora = True
+        elif self.recompute_lora is None:
+            self.recompute_lora = False
+
 
         if self.lora and self.recompute and self.offload_residual:
             self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
@@ -641,6 +651,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         )
         self.runtime_config.use_zero_copy = self.use_zero_copy
         self.runtime_config.use_write_combined = self.use_write_combined
+        self.runtime_config.recompute_lora = bool(self.recompute_lora)
         self.runtime_config.selective_expert_dequant = self.qlora_selective_expert_dequant
         self.runtime_config.offload_experts = self.qlora_offload_experts
         # MoE loss coefficients (None means use model config default)

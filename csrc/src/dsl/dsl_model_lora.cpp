@@ -7,6 +7,7 @@
 #include "dsl/dsl_model_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,7 @@
 #include "modules/optimizers/normuon.h"
 #include "modules/fp8_scaling_state.h"
 #include "kernels/kernels.h"
+#include "dsl/compiled_ops_helpers.h"
 #include "utilities/comm.h"
 #include "utilities/safetensors.h"
 
@@ -270,8 +272,35 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
 
     internal::wait_event_if_not_capturing(stream, rs.BackwardDone);
 
+    const bool capturing = internal::stream_is_capturing(stream);
+    const int nan_trace = env_int("SUROGATE_LORA_NAN_TRACE", 0);
+    const int nan_abort = env_int("SUROGATE_LORA_NAN_ABORT", 0);
+
     Tensor& buf = mLoRARunState->norm_buffer;
     fill_zero(buf, stream);
+
+    auto maybe_report_nan = [&](const Tensor& grad, const char* name, int layer) {
+        if (!nan_trace || capturing || !grad.Data) {
+            return false;
+        }
+        long row = -1;
+        float min_val = 0.0f;
+        float max_val = 0.0f;
+        if (!find_first_nan_row(grad, &row, &min_val, &max_val)) {
+            return false;
+        }
+        std::cerr << fmt::format("[LORA_NAN] layer={} tensor={} row={} min={} max={} dtype={}\n",
+                                 layer,
+                                 name ? name : "<unnamed>",
+                                 row,
+                                 min_val,
+                                 max_val,
+                                 static_cast<int>(grad.DType));
+        if (nan_abort) {
+            throw std::runtime_error("LoRA gradient contains NaN/Inf");
+        }
+        return true;
+    };
 
     auto norm_squared = [&](const Tensor& grad, const char* name) {
         if (grad.Data) {
@@ -283,27 +312,41 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
         bool unused_acc = false;
         auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
 
-        if (g.attention.q.has_value()) { norm_squared(g.attention.q->A, "attn.q.A"); norm_squared(g.attention.q->B, "attn.q.B"); }
-        if (g.attention.k.has_value()) { norm_squared(g.attention.k->A, "attn.k.A"); norm_squared(g.attention.k->B, "attn.k.B"); }
-        if (g.attention.v.has_value()) { norm_squared(g.attention.v->A, "attn.v.A"); norm_squared(g.attention.v->B, "attn.v.B"); }
-        if (g.attention.o.has_value()) { norm_squared(g.attention.o->A, "attn.o.A"); norm_squared(g.attention.o->B, "attn.o.B"); }
-        if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A, "mlp.gate.A"); norm_squared(g.mlp.gate->B, "mlp.gate.B"); }
-        if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A, "mlp.up.A"); norm_squared(g.mlp.up->B, "mlp.up.B"); }
-        if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A, "mlp.down.A"); norm_squared(g.mlp.down->B, "mlp.down.B"); }
+        if (g.attention.q.has_value()) { maybe_report_nan(g.attention.q->A, "attn.q.A", l); norm_squared(g.attention.q->A, "attn.q.A");
+                                        maybe_report_nan(g.attention.q->B, "attn.q.B", l); norm_squared(g.attention.q->B, "attn.q.B"); }
+        if (g.attention.k.has_value()) { maybe_report_nan(g.attention.k->A, "attn.k.A", l); norm_squared(g.attention.k->A, "attn.k.A");
+                                        maybe_report_nan(g.attention.k->B, "attn.k.B", l); norm_squared(g.attention.k->B, "attn.k.B"); }
+        if (g.attention.v.has_value()) { maybe_report_nan(g.attention.v->A, "attn.v.A", l); norm_squared(g.attention.v->A, "attn.v.A");
+                                        maybe_report_nan(g.attention.v->B, "attn.v.B", l); norm_squared(g.attention.v->B, "attn.v.B"); }
+        if (g.attention.o.has_value()) { maybe_report_nan(g.attention.o->A, "attn.o.A", l); norm_squared(g.attention.o->A, "attn.o.A");
+                                        maybe_report_nan(g.attention.o->B, "attn.o.B", l); norm_squared(g.attention.o->B, "attn.o.B"); }
+        if (g.mlp.gate.has_value()) { maybe_report_nan(g.mlp.gate->A, "mlp.gate.A", l); norm_squared(g.mlp.gate->A, "mlp.gate.A");
+                                     maybe_report_nan(g.mlp.gate->B, "mlp.gate.B", l); norm_squared(g.mlp.gate->B, "mlp.gate.B"); }
+        if (g.mlp.up.has_value()) { maybe_report_nan(g.mlp.up->A, "mlp.up.A", l); norm_squared(g.mlp.up->A, "mlp.up.A");
+                                   maybe_report_nan(g.mlp.up->B, "mlp.up.B", l); norm_squared(g.mlp.up->B, "mlp.up.B"); }
+        if (g.mlp.down.has_value()) { maybe_report_nan(g.mlp.down->A, "mlp.down.A", l); norm_squared(g.mlp.down->A, "mlp.down.A");
+                                     maybe_report_nan(g.mlp.down->B, "mlp.down.B", l); norm_squared(g.mlp.down->B, "mlp.down.B"); }
 
         if (g.moe.use_grouped) {
-            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A, "moe.gate.A"); norm_squared(g.moe.grouped.gate->B, "moe.gate.B"); }
-            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A, "moe.up.A"); norm_squared(g.moe.grouped.up->B, "moe.up.B"); }
-            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A, "moe.down.A"); norm_squared(g.moe.grouped.down->B, "moe.down.B"); }
+            if (g.moe.grouped.gate.has_value()) { maybe_report_nan(g.moe.grouped.gate->A, "moe.gate.A", l); norm_squared(g.moe.grouped.gate->A, "moe.gate.A");
+                                                 maybe_report_nan(g.moe.grouped.gate->B, "moe.gate.B", l); norm_squared(g.moe.grouped.gate->B, "moe.gate.B"); }
+            if (g.moe.grouped.up.has_value()) { maybe_report_nan(g.moe.grouped.up->A, "moe.up.A", l); norm_squared(g.moe.grouped.up->A, "moe.up.A");
+                                               maybe_report_nan(g.moe.grouped.up->B, "moe.up.B", l); norm_squared(g.moe.grouped.up->B, "moe.up.B"); }
+            if (g.moe.grouped.down.has_value()) { maybe_report_nan(g.moe.grouped.down->A, "moe.down.A", l); norm_squared(g.moe.grouped.down->A, "moe.down.A");
+                                                 maybe_report_nan(g.moe.grouped.down->B, "moe.down.B", l); norm_squared(g.moe.grouped.down->B, "moe.down.B"); }
         } else {
             for (const auto& expert : g.moe.experts) {
-                if (expert.gate.has_value()) { norm_squared(expert.gate->A, "exp.gate.A"); norm_squared(expert.gate->B, "exp.gate.B"); }
-                if (expert.up.has_value()) { norm_squared(expert.up->A, "exp.up.A"); norm_squared(expert.up->B, "exp.up.B"); }
-                if (expert.down.has_value()) { norm_squared(expert.down->A, "exp.down.A"); norm_squared(expert.down->B, "exp.down.B"); }
+                if (expert.gate.has_value()) { maybe_report_nan(expert.gate->A, "exp.gate.A", l); norm_squared(expert.gate->A, "exp.gate.A");
+                                               maybe_report_nan(expert.gate->B, "exp.gate.B", l); norm_squared(expert.gate->B, "exp.gate.B"); }
+                if (expert.up.has_value()) { maybe_report_nan(expert.up->A, "exp.up.A", l); norm_squared(expert.up->A, "exp.up.A");
+                                            maybe_report_nan(expert.up->B, "exp.up.B", l); norm_squared(expert.up->B, "exp.up.B"); }
+                if (expert.down.has_value()) { maybe_report_nan(expert.down->A, "exp.down.A", l); norm_squared(expert.down->A, "exp.down.A");
+                                              maybe_report_nan(expert.down->B, "exp.down.B", l); norm_squared(expert.down->B, "exp.down.B"); }
             }
         }
 
-        if (g.router.has_value()) { norm_squared(g.router->A, "router.A"); norm_squared(g.router->B, "router.B"); }
+        if (g.router.has_value()) { maybe_report_nan(g.router->A, "router.A", l); norm_squared(g.router->A, "router.A");
+                                    maybe_report_nan(g.router->B, "router.B", l); norm_squared(g.router->B, "router.B"); }
     }
 
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);
@@ -312,7 +355,6 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
 
-    const bool capturing = internal::stream_is_capturing(stream);
     global_norm_sqrt(buf.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
@@ -459,9 +501,66 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
     }
     auto& rs = *mRunState;
     cudaStream_t stream = rs.MainStream;
+    const bool capturing = internal::stream_is_capturing(stream);
+
+    const int weight_nan_trace = env_int("SUROGATE_LORA_WEIGHT_NAN_TRACE", 0);
+    const int weight_nan_layer = env_int("SUROGATE_LORA_WEIGHT_NAN_LAYER", -1);
+    const int weight_nan_limit = env_int("SUROGATE_LORA_WEIGHT_NAN_LIMIT", 8);
+    const int weight_nan_abort = env_int("SUROGATE_LORA_WEIGHT_NAN_ABORT", 0);
+    static std::atomic<int> weight_nan_count{0};
+
+    auto maybe_report_weight_nan = [&](const Tensor& w, const char* name, int layer, const char* phase) {
+        if (!weight_nan_trace || capturing || !w.Data) {
+            return;
+        }
+        if (weight_nan_layer >= 0 && weight_nan_layer != layer) {
+            return;
+        }
+        long row = -1;
+        float min_val = 0.0f;
+        float max_val = 0.0f;
+        if (!find_first_nan_row(w, &row, &min_val, &max_val)) {
+            return;
+        }
+        int idx = weight_nan_count.fetch_add(1);
+        if (weight_nan_limit > 0 && idx >= weight_nan_limit) {
+            return;
+        }
+        std::cerr << fmt::format("[LORA_WEIGHT_NAN] phase={} layer={} tensor={} row={} min={} max={} dtype={}\n",
+                                 phase, layer, name ? name : "<unnamed>", row, min_val, max_val,
+                                 static_cast<int>(w.DType));
+        if (weight_nan_abort) {
+            throw std::runtime_error("LoRA weight contains NaN/Inf");
+        }
+    };
+
+    auto scan_lora_weights = [&](const char* phase) {
+        if (!weight_nan_trace || capturing) {
+            return;
+        }
+        for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+            auto& w = mLoRAWeights->get_master_block(l, stream);
+            if (w.attention.q.has_value()) { maybe_report_weight_nan(w.attention.q->A, "attn.q.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.q->B, "attn.q.B", l, phase); }
+            if (w.attention.k.has_value()) { maybe_report_weight_nan(w.attention.k->A, "attn.k.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.k->B, "attn.k.B", l, phase); }
+            if (w.attention.v.has_value()) { maybe_report_weight_nan(w.attention.v->A, "attn.v.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.v->B, "attn.v.B", l, phase); }
+            if (w.attention.o.has_value()) { maybe_report_weight_nan(w.attention.o->A, "attn.o.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.o->B, "attn.o.B", l, phase); }
+            if (w.mlp.gate.has_value()) { maybe_report_weight_nan(w.mlp.gate->A, "mlp.gate.A", l, phase);
+                                          maybe_report_weight_nan(w.mlp.gate->B, "mlp.gate.B", l, phase); }
+            if (w.mlp.up.has_value()) { maybe_report_weight_nan(w.mlp.up->A, "mlp.up.A", l, phase);
+                                        maybe_report_weight_nan(w.mlp.up->B, "mlp.up.B", l, phase); }
+            if (w.mlp.down.has_value()) { maybe_report_weight_nan(w.mlp.down->A, "mlp.down.A", l, phase);
+                                          maybe_report_weight_nan(w.mlp.down->B, "mlp.down.B", l, phase); }
+        }
+    };
 
     calculate_lora_gradient_norm(comm, grad_clip);
     const float* grad_scale = mLoRARunState->norm_buffer.template get<float>() + 1;
+
+    scan_lora_weights("pre");
 
     if (!mLoRAAdamW8BitState->initialized) {
         if (internal::stream_is_capturing(stream)) {
@@ -520,6 +619,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
 
+    scan_lora_weights("post");
+
     if (rs.has_fp8_delayed_scaling()) {
         if (auto* fp8_state = rs.get_fp8_scaling_state()) {
             delayed_scaling_update(*fp8_state, stream);
@@ -536,9 +637,66 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
     }
     auto& rs = *mRunState;
     cudaStream_t stream = rs.MainStream;
+    const bool capturing = internal::stream_is_capturing(stream);
+
+    const int weight_nan_trace = env_int("SUROGATE_LORA_WEIGHT_NAN_TRACE", 0);
+    const int weight_nan_layer = env_int("SUROGATE_LORA_WEIGHT_NAN_LAYER", -1);
+    const int weight_nan_limit = env_int("SUROGATE_LORA_WEIGHT_NAN_LIMIT", 8);
+    const int weight_nan_abort = env_int("SUROGATE_LORA_WEIGHT_NAN_ABORT", 0);
+    static std::atomic<int> weight_nan_count{0};
+
+    auto maybe_report_weight_nan = [&](const Tensor& w, const char* name, int layer, const char* phase) {
+        if (!weight_nan_trace || capturing || !w.Data) {
+            return;
+        }
+        if (weight_nan_layer >= 0 && weight_nan_layer != layer) {
+            return;
+        }
+        long row = -1;
+        float min_val = 0.0f;
+        float max_val = 0.0f;
+        if (!find_first_nan_row(w, &row, &min_val, &max_val)) {
+            return;
+        }
+        int idx = weight_nan_count.fetch_add(1);
+        if (weight_nan_limit > 0 && idx >= weight_nan_limit) {
+            return;
+        }
+        std::cerr << fmt::format("[LORA_WEIGHT_NAN] phase={} layer={} tensor={} row={} min={} max={} dtype={}\n",
+                                 phase, layer, name ? name : "<unnamed>", row, min_val, max_val,
+                                 static_cast<int>(w.DType));
+        if (weight_nan_abort) {
+            throw std::runtime_error("LoRA weight contains NaN/Inf");
+        }
+    };
+
+    auto scan_lora_weights = [&](const char* phase) {
+        if (!weight_nan_trace || capturing) {
+            return;
+        }
+        for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+            auto& w = mLoRAWeights->get_master_block(l, stream);
+            if (w.attention.q.has_value()) { maybe_report_weight_nan(w.attention.q->A, "attn.q.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.q->B, "attn.q.B", l, phase); }
+            if (w.attention.k.has_value()) { maybe_report_weight_nan(w.attention.k->A, "attn.k.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.k->B, "attn.k.B", l, phase); }
+            if (w.attention.v.has_value()) { maybe_report_weight_nan(w.attention.v->A, "attn.v.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.v->B, "attn.v.B", l, phase); }
+            if (w.attention.o.has_value()) { maybe_report_weight_nan(w.attention.o->A, "attn.o.A", l, phase);
+                                             maybe_report_weight_nan(w.attention.o->B, "attn.o.B", l, phase); }
+            if (w.mlp.gate.has_value()) { maybe_report_weight_nan(w.mlp.gate->A, "mlp.gate.A", l, phase);
+                                          maybe_report_weight_nan(w.mlp.gate->B, "mlp.gate.B", l, phase); }
+            if (w.mlp.up.has_value()) { maybe_report_weight_nan(w.mlp.up->A, "mlp.up.A", l, phase);
+                                        maybe_report_weight_nan(w.mlp.up->B, "mlp.up.B", l, phase); }
+            if (w.mlp.down.has_value()) { maybe_report_weight_nan(w.mlp.down->A, "mlp.down.A", l, phase);
+                                          maybe_report_weight_nan(w.mlp.down->B, "mlp.down.B", l, phase); }
+        }
+    };
 
     calculate_lora_gradient_norm(comm, grad_clip);
     const float* grad_scale = mLoRARunState->norm_buffer.template get<float>() + 1;
+
+    scan_lora_weights("pre");
 
     if (!mLoRAAdamW8BitState->initialized) {
         if (internal::stream_is_capturing(stream)) {
@@ -600,6 +758,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
+
+    scan_lora_weights("post");
 
     if (rs.has_fp8_delayed_scaling()) {
         if (auto* fp8_state = rs.get_fp8_scaling_state()) {

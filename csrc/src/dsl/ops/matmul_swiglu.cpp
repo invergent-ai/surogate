@@ -1,6 +1,7 @@
 #include "dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,8 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "dsl/compiled_ops_helpers.h"
 #include "dsl/graph_executor_helpers.h"
@@ -49,6 +52,53 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     Tensor mlp_up = resolve_tensor(op.inputs[3]);
 
     const int layer_idx = op.attrs.layer_idx;
+    const int trace = env_int("SUROGATE_MLP_BWD_TRACE", 0);
+    const int trace_layer = env_int("SUROGATE_MLP_BWD_TRACE_LAYER", -1);
+    const int trace_limit = env_int("SUROGATE_MLP_BWD_TRACE_LIMIT", 8);
+    const int trace_samples = env_int("SUROGATE_MLP_BWD_TRACE_SAMPLES", 8);
+    static std::atomic<int> trace_count{0};
+    const bool do_trace = trace && !mCapturing &&
+        (trace_layer < 0 || trace_layer == layer_idx) &&
+        (trace_limit <= 0 || trace_count.fetch_add(1) < trace_limit);
+
+    auto trace_sample = [&](const Tensor& t, const char* tag) {
+        if (!t.Data) {
+            std::cerr << fmt::format("[MLP_BWD_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr=<null>\n",
+                                     layer_idx, mMicroStep, tag ? tag : "<unnamed>",
+                                     static_cast<int>(t.DType), tensor_shape_str(t));
+            return;
+        }
+        std::vector<float> vals;
+        if (!copy_tensor_token_sample_as_f32(t, 0, static_cast<std::size_t>(trace_samples), vals) || vals.empty()) {
+            std::cerr << fmt::format("[MLP_BWD_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr={} sample=<unavailable>\n",
+                                     layer_idx, mMicroStep, tag ? tag : "<unnamed>",
+                                     static_cast<int>(t.DType), tensor_shape_str(t),
+                                     static_cast<const void*>(t.Data));
+            return;
+        }
+        float min_v = vals[0];
+        float max_v = vals[0];
+        float max_abs = std::abs(vals[0]);
+        double mean_abs = 0.0;
+        for (float v : vals) {
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+            max_abs = std::max(max_abs, std::abs(v));
+            mean_abs += static_cast<double>(std::abs(v));
+        }
+        mean_abs /= static_cast<double>(vals.size());
+        std::cerr << fmt::format(
+            "[MLP_BWD_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr={} min={:.6g} max={:.6g} max_abs={:.6g} mean_abs={:.6g}\n",
+            layer_idx, mMicroStep, tag ? tag : "<unnamed>", static_cast<int>(t.DType),
+            tensor_shape_str(t), static_cast<const void*>(t.Data),
+            min_v, max_v, max_abs, mean_abs);
+    };
+
+    if (do_trace) {
+        trace_sample(d_out, "d_swiglu_out");
+        trace_sample(inp, "ln2_in");
+        trace_sample(mlp_up, "mlp_up_pre");
+    }
 
     // Recompute mlp_up if the saved tensor was stack-allocated and freed
     bool recomputed_mlp_up = false;
@@ -99,6 +149,10 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
                     static_cast<int>(d_out.Sizes[0]),
                     static_cast<int>(d_out.Sizes[1]),
                     static_cast<int>(D), mRunState.MainStream);
+
+    if (do_trace) {
+        trace_sample(d_mlp_up, "d_mlp_up");
+    }
 
     // Then: matmul backward
     Tensor d_mlp_up_flat = view_tensor(d_mlp_up, {mB * mT, 2 * D});

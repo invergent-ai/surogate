@@ -17,6 +17,8 @@
 #include <vector>
 #include <iostream>
 
+#include <cuda_runtime_api.h>
+
 #include <fmt/core.h>
 
 #include "qlora_config.h"
@@ -858,6 +860,145 @@ typename BnBWeightProvider<Block>::BlockWeights& BnBWeightProvider<Block>::get_b
         mBufferVersion = mStepVersion;
     }
     // else: cache hit - skip dequantization, reuse existing buffer contents
+
+    // Optional debug trace: check QKV dequant output for NaNs/Infs.
+    {
+        static const int qkv_trace_enabled = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE");
+            return (v && std::atoi(v) != 0) ? 1 : 0;
+        }();
+        static const int qkv_trace_layer = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE_LAYER");
+            return v ? std::atoi(v) : -1;
+        }();
+        static const int qkv_trace_limit = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE_LIMIT");
+            return v ? std::max(1, std::atoi(v)) : 4;
+        }();
+        static const int qkv_trace_samples = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE_SAMPLES");
+            return v ? std::max(1, std::atoi(v)) : 4096;
+        }();
+        static int qkv_trace_count = 0;
+        if (qkv_trace_enabled &&
+            qkv_trace_count < qkv_trace_limit &&
+            (qkv_trace_layer < 0 || qkv_trace_layer == layer_idx)) {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture_status) != cudaSuccess ||
+                capture_status != cudaStreamCaptureStatusNone) {
+                if (qkv_trace_count == 0) {
+                    std::cerr << "[QLORA_QKV_DEQUANT] stream capture active; skipping trace\n";
+                }
+            } else {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const long total = static_cast<long>(mDequantQKV.nelem());
+                const long sample = std::min<long>(total, qkv_trace_samples);
+                std::vector<nv_bfloat16> vals;
+                if (sample > 0 && copy_tensor_range_host<nv_bfloat16>(mDequantQKV, 0, sample, vals)) {
+                    int nan = 0;
+                    int inf = 0;
+                    float min_v = std::numeric_limits<float>::infinity();
+                    float max_v = -std::numeric_limits<float>::infinity();
+                    float mean_abs = 0.0f;
+                    for (const auto& v : vals) {
+                        const float fv = static_cast<float>(v);
+                        if (std::isnan(fv)) {
+                            nan++;
+                            continue;
+                        }
+                        if (std::isinf(fv)) {
+                            inf++;
+                            continue;
+                        }
+                        min_v = std::min(min_v, fv);
+                        max_v = std::max(max_v, fv);
+                        mean_abs += std::fabs(fv);
+                    }
+                    if (!vals.empty()) {
+                        mean_abs /= static_cast<float>(vals.size());
+                    }
+                    std::cerr << "[QLORA_QKV_DEQUANT] layer=" << layer_idx
+                              << " ptr=" << static_cast<const void*>(mDequantQKV.Data)
+                              << " nelem=" << total
+                              << " sample=" << sample
+                              << " nan=" << nan
+                              << " inf=" << inf
+                              << " min=" << min_v
+                              << " max=" << max_v
+                              << " mean_abs=" << mean_abs << "\n";
+
+                    if ((nan > 0 || inf > 0) && qblock.qkv_proj.absmax.Data) {
+                        const long num_blocks = qblock.qkv_proj.num_blocks();
+                        const long meta_sample = std::min<long>(num_blocks, 1024);
+                        if (qblock.qkv_proj.double_quant) {
+                            std::vector<unsigned char> absmax_q;
+                            std::vector<float> scales;
+                            std::vector<float> offsets;
+                            const long num_groups = qblock.qkv_proj.num_groups();
+                            if (copy_tensor_range_host<unsigned char>(qblock.qkv_proj.absmax, 0, meta_sample, absmax_q) &&
+                                copy_tensor_range_host<float>(qblock.qkv_proj.absmax_scale, 0, num_groups, scales) &&
+                                copy_tensor_range_host<float>(qblock.qkv_proj.absmax_offset, 0, num_groups, offsets)) {
+                                int nan_scale = 0;
+                                int nan_offset = 0;
+                                float min_scale = std::numeric_limits<float>::infinity();
+                                float max_scale = -std::numeric_limits<float>::infinity();
+                                float min_offset = std::numeric_limits<float>::infinity();
+                                float max_offset = -std::numeric_limits<float>::infinity();
+                                for (long i = 0; i < num_groups; ++i) {
+                                    const float s = scales[static_cast<std::size_t>(i)];
+                                    const float o = offsets[static_cast<std::size_t>(i)];
+                                    if (std::isnan(s) || std::isinf(s)) {
+                                        nan_scale++;
+                                    } else {
+                                        min_scale = std::min(min_scale, s);
+                                        max_scale = std::max(max_scale, s);
+                                    }
+                                    if (std::isnan(o) || std::isinf(o)) {
+                                        nan_offset++;
+                                    } else {
+                                        min_offset = std::min(min_offset, o);
+                                        max_offset = std::max(max_offset, o);
+                                    }
+                                }
+                                std::cerr << "[QLORA_QKV_META] layer=" << layer_idx
+                                          << " double_quant=1"
+                                          << " blocks=" << num_blocks
+                                          << " groups=" << num_groups
+                                          << " nan_scale=" << nan_scale
+                                          << " min_scale=" << min_scale
+                                          << " max_scale=" << max_scale
+                                          << " nan_offset=" << nan_offset
+                                          << " min_offset=" << min_offset
+                                          << " max_offset=" << max_offset << "\n";
+                            }
+                        } else {
+                            std::vector<float> absmax_vals;
+                            if (copy_tensor_range_host<float>(qblock.qkv_proj.absmax, 0, meta_sample, absmax_vals)) {
+                                int nan_abs = 0;
+                                float min_abs = std::numeric_limits<float>::infinity();
+                                float max_abs = -std::numeric_limits<float>::infinity();
+                                for (const float v : absmax_vals) {
+                                    if (std::isnan(v) || std::isinf(v)) {
+                                        nan_abs++;
+                                    } else {
+                                        min_abs = std::min(min_abs, v);
+                                        max_abs = std::max(max_abs, v);
+                                    }
+                                }
+                                std::cerr << "[QLORA_QKV_META] layer=" << layer_idx
+                                          << " double_quant=0"
+                                          << " blocks=" << num_blocks
+                                          << " nan_absmax=" << nan_abs
+                                          << " min_absmax=" << min_abs
+                                          << " max_absmax=" << max_abs << "\n";
+                            }
+                        }
+                    }
+                }
+            }
+            qkv_trace_count++;
+        }
+    }
 
     // Always update layer norm pointers (they're just references, not cached data)
     mDequantBlock.ln1.weight = qblock.ln1_weight;

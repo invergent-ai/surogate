@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <string>
 
 #include "tensor.h"
 
@@ -59,6 +60,8 @@ public:
     void set_context(const std::string& ctx);
     const std::string& get_context() const;
 
+    void debug_log_allocation_for_ptr(const void* ptr, const char* tag) const;
+
     class AllocationMonitor {
     public:
         AllocationMonitor(const std::string& name, TensorAllocator*);
@@ -94,6 +97,8 @@ private:
         EAllocationType Kind;
         std::byte* Pointer;
         long Size;
+        std::string Name;
+        std::string Context;
     };
 
     std::vector<sAllocationData> m_Pointers;

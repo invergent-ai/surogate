@@ -7,10 +7,16 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cmath>
+#include <limits>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <vector>
 #include <iostream>
+
+#include <cuda_runtime_api.h>
 
 #include "qlora_config.h"
 #include "fp8_weights.h"
@@ -301,6 +307,32 @@ private:
      */
     void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
     void load_mamba_weights(const std::string& file_name);
+
+    template<typename T>
+    static bool copy_tensor_range_host(const Tensor& t, long offset, long count,
+                                       std::vector<T>& out) {
+        if (!t.Data || offset < 0 || count <= 0) {
+            return false;
+        }
+        const std::size_t total = t.nelem();
+        const std::size_t end = static_cast<std::size_t>(offset) + static_cast<std::size_t>(count);
+        if (end > total) {
+            return false;
+        }
+        if (t.DType != dtype_from_type<T>) {
+            return false;
+        }
+        out.resize(static_cast<std::size_t>(count));
+        const std::size_t byte_offset = static_cast<std::size_t>(offset) * sizeof(T);
+        const std::size_t byte_count = static_cast<std::size_t>(count) * sizeof(T);
+        const std::byte* src = t.Data + byte_offset;
+        if (t.Device < 0) {
+            std::memcpy(out.data(), src, byte_count);
+        } else {
+            CUDA_CHECK(cudaMemcpy(out.data(), src, byte_count, cudaMemcpyDeviceToHost));
+        }
+        return true;
+    }
 
     Config mConfig;
     TensorAllocator* mAllocator;
@@ -828,6 +860,109 @@ typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_b
         mBufferVersion = mStepVersion;
     }
     // else: cache hit - skip conversion, reuse existing buffer contents
+
+    // Optional debug trace: check QKV dequant output or FP8 scales for NaNs/Infs.
+    {
+        static const int qkv_trace_enabled = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE");
+            return (v && std::atoi(v) != 0) ? 1 : 0;
+        }();
+        static const int qkv_trace_layer = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE_LAYER");
+            return v ? std::atoi(v) : -1;
+        }();
+        static const int qkv_trace_limit = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE_LIMIT");
+            return v ? std::max(1, std::atoi(v)) : 4;
+        }();
+        static const int qkv_trace_samples = []() {
+            const char* v = std::getenv("SUROGATE_QLORA_QKV_TRACE_SAMPLES");
+            return v ? std::max(1, std::atoi(v)) : 4096;
+        }();
+        static int qkv_trace_count = 0;
+        if (qkv_trace_enabled &&
+            qkv_trace_count < qkv_trace_limit &&
+            (qkv_trace_layer < 0 || qkv_trace_layer == layer_idx)) {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture_status) != cudaSuccess ||
+                capture_status != cudaStreamCaptureStatusNone) {
+                if (qkv_trace_count == 0) {
+                    std::cerr << "[QLORA_QKV_DEQUANT_FP8] stream capture active; skipping trace\n";
+                }
+            } else {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (use_fp8_path) {
+                    const long total = static_cast<long>(mFP8ScaleQKV.nelem());
+                    const long sample = std::min<long>(total, qkv_trace_samples);
+                    std::vector<float> scales;
+                    if (sample > 0 && copy_tensor_range_host<float>(mFP8ScaleQKV, 0, sample, scales)) {
+                        int nan = 0;
+                        int inf = 0;
+                        float min_v = std::numeric_limits<float>::infinity();
+                        float max_v = -std::numeric_limits<float>::infinity();
+                        for (const float v : scales) {
+                            if (std::isnan(v)) {
+                                nan++;
+                                continue;
+                            }
+                            if (std::isinf(v)) {
+                                inf++;
+                                continue;
+                            }
+                            min_v = std::min(min_v, v);
+                            max_v = std::max(max_v, v);
+                        }
+                        std::cerr << "[QLORA_QKV_FP8_SCALE] layer=" << layer_idx
+                                  << " ptr=" << static_cast<const void*>(mFP8ScaleQKV.Data)
+                                  << " nelem=" << total
+                                  << " sample=" << sample
+                                  << " nan=" << nan
+                                  << " inf=" << inf
+                                  << " min=" << min_v
+                                  << " max=" << max_v << "\n";
+                    }
+                } else {
+                    const long total = static_cast<long>(mDequantQKV.nelem());
+                    const long sample = std::min<long>(total, qkv_trace_samples);
+                    std::vector<nv_bfloat16> vals;
+                    if (sample > 0 && copy_tensor_range_host<nv_bfloat16>(mDequantQKV, 0, sample, vals)) {
+                        int nan = 0;
+                        int inf = 0;
+                        float min_v = std::numeric_limits<float>::infinity();
+                        float max_v = -std::numeric_limits<float>::infinity();
+                        float mean_abs = 0.0f;
+                        for (const auto& v : vals) {
+                            const float fv = static_cast<float>(v);
+                            if (std::isnan(fv)) {
+                                nan++;
+                                continue;
+                            }
+                            if (std::isinf(fv)) {
+                                inf++;
+                                continue;
+                            }
+                            min_v = std::min(min_v, fv);
+                            max_v = std::max(max_v, fv);
+                            mean_abs += std::fabs(fv);
+                        }
+                        if (!vals.empty()) {
+                            mean_abs /= static_cast<float>(vals.size());
+                        }
+                        std::cerr << "[QLORA_QKV_DEQUANT_FP8] layer=" << layer_idx
+                                  << " ptr=" << static_cast<const void*>(mDequantQKV.Data)
+                                  << " nelem=" << total
+                                  << " sample=" << sample
+                                  << " nan=" << nan
+                                  << " inf=" << inf
+                                  << " min=" << min_v
+                                  << " max=" << max_v
+                                  << " mean_abs=" << mean_abs << "\n";
+                    }
+                }
+            }
+            qkv_trace_count++;
+        }
+    }
 
     // Always update layer norm pointers (they're just references, not cached data)
     if (use_fp8_path) {

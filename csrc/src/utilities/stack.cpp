@@ -6,6 +6,50 @@
 #include "stack.h"
 #include "utilities/utils.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+
+namespace {
+
+std::atomic<const std::byte*> g_stack_watch_ptr{nullptr};
+std::atomic<std::size_t> g_stack_watch_bytes{0};
+std::mutex g_stack_watch_mutex;
+std::string g_stack_watch_tag;
+
+bool stack_watch_enabled() {
+    static int enabled = []() -> int {
+        const char* value = std::getenv("SUROGATE_QKV_STACK_WATCH");
+        if (!value || !*value) {
+            return 0;
+        }
+        return std::atoi(value) != 0 ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+}  // namespace
+
+void set_stack_watch_range(const std::byte* ptr, std::size_t bytes, const char* tag) {
+    if (!stack_watch_enabled()) {
+        return;
+    }
+    g_stack_watch_ptr.store(ptr, std::memory_order_relaxed);
+    g_stack_watch_bytes.store(bytes, std::memory_order_relaxed);
+    if (tag) {
+        std::lock_guard<std::mutex> lock(g_stack_watch_mutex);
+        g_stack_watch_tag = tag;
+    }
+}
+
+void clear_stack_watch_range() {
+    g_stack_watch_ptr.store(nullptr, std::memory_order_relaxed);
+    g_stack_watch_bytes.store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_stack_watch_mutex);
+    g_stack_watch_tag.clear();
+}
+
 /**
  * @brief Construct a stack allocator over a pre-allocated device memory region.
  *
@@ -47,6 +91,34 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
             fprintf(stderr, "  - %s: %zu MB\n", mAlloc[i].Name, mAlloc[i].Amount / (1024*1024));
         }
         throw std::bad_alloc();
+    }
+
+    if (stack_watch_enabled()) {
+        const std::byte* watch_ptr = g_stack_watch_ptr.load(std::memory_order_relaxed);
+        const std::size_t watch_bytes = g_stack_watch_bytes.load(std::memory_order_relaxed);
+        if (watch_ptr && watch_bytes > 0) {
+            const std::byte* alloc_start = mTop;
+            const std::byte* alloc_end = new_top;
+            const std::byte* watch_start = watch_ptr;
+            const std::byte* watch_end = watch_ptr + watch_bytes;
+            const bool overlap = (alloc_start < watch_end) && (alloc_end > watch_start);
+            if (overlap) {
+                std::string tag_copy;
+                {
+                    std::lock_guard<std::mutex> lock(g_stack_watch_mutex);
+                    tag_copy = g_stack_watch_tag;
+                }
+                fprintf(stderr,
+                        "[STACK_WATCH_OVERLAP] tag=%s alloc='%s' ptr=%p bytes=%zu alloc_range=[%p,%p) watch_range=[%p,%p)\n",
+                        tag_copy.empty() ? "<none>" : tag_copy.c_str(),
+                        name ? name : "<unnamed>",
+                        static_cast<void*>(mTop), aligned_amount,
+                        static_cast<const void*>(alloc_start),
+                        static_cast<const void*>(alloc_end),
+                        static_cast<const void*>(watch_start),
+                        static_cast<const void*>(watch_end));
+            }
+        }
     }
 
     mAlloc.emplace_back(mTop, aligned_amount, name);

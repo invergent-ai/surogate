@@ -405,6 +405,8 @@ NB_MODULE(_surogate, m) {
             [](const RuntimeOptions& self) { return std::string(self.recompute_level_name()); },
             [](RuntimeOptions& self, const std::string& level) { self.Recompute = RuntimeOptions::parse_recompute_level(level); },
             "Enable activation recomputation: 'true' or 'false'.")
+        .def_rw("recompute_lora", &RuntimeOptions::RecomputeLoRA,
+                "Allow recomputation of FFT-only activations in LoRA-only mode (saves memory).")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")

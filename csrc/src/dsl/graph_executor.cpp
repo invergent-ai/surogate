@@ -566,6 +566,12 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mSaved.clear();
         reset_forward_plan();
     }
+    if (capturing) {
+        // Preallocate persistent save buffers before CUDA graph capture to avoid cudaMalloc
+        // inside save_tensors (which is not allowed during capture).
+        mCompiledExecutor->set_dimensions(B, T);
+        mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList);
+    }
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);

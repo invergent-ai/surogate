@@ -60,6 +60,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(USE_CUFILE "Enable cuFile support for optimized file I/O" ON)
 option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
+option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 FetchContent_Declare(
         json
@@ -70,7 +71,7 @@ FetchContent_Declare(
 FetchContent_Declare(
         cudnn-fe
         GIT_REPOSITORY https://github.com/NVIDIA/cudnn-frontend.git
-        GIT_TAG v1.17.0
+        GIT_TAG v1.18.0
         EXCLUDE_FROM_ALL
 )
 
@@ -84,7 +85,7 @@ FetchContent_Declare(
         nanobind
         QUIET
         GIT_REPOSITORY https://github.com/wjakob/nanobind.git
-        GIT_TAG v2.9.2
+        GIT_TAG v2.11.0
 )
 
 # we could use fmt only if std::format is not available, but (e.g., g++-12), but
@@ -127,7 +128,7 @@ set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "N
 FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v4.3.4
+        GIT_TAG v4.3.5
         EXCLUDE_FROM_ALL
 )
 
@@ -413,6 +414,15 @@ target_compile_options(surogate-common PUBLIC
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-omit-frame-pointer>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
     $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>)
+
+# AddressSanitizer and UndefinedBehaviorSanitizer (C++ host code only, not CUDA)
+if(ENABLE_SANITIZERS)
+    message(STATUS "Sanitizers enabled (ASan + UBSan) for C++ files only")
+    target_compile_options(surogate-common PUBLIC
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=undefined>)
+    target_link_options(surogate-common PUBLIC -fsanitize=address -fsanitize=undefined)
+endif()
 
 if (NOT SKBUILD)
     install(TARGETS surogate-common

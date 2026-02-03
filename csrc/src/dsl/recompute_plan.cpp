@@ -1929,7 +1929,14 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             continue;
         }
         if (op.policy == RecomputePolicy::FftOnly && lora_only_mode) {
-            continue;
+            if (!ctx.options.RecomputeLoRA) {
+                continue;
+            }
+            // Even with recompute_lora enabled, avoid recomputing attention outputs in LoRA mode.
+            // LoRA O-proj backward expects the original forward attention activations.
+            if (op.op_type == "flash_attention") {
+                continue;
+            }
         }
         // FIX: In FFT mode, we MUST recompute all activations for each micro-step.
         // The saved tensors contain micro-step 0's activations, which are WRONG for subsequent
@@ -1948,7 +1955,7 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         // We need the original forward values, not recomputed values, because:
         // 1. cuDNN attention is non-deterministic (recomputed att != forward att)
         // 2. Matmul rounding can differ between forward and recompute
-        if (lora_only_mode && !op.lora_targets.empty()) {
+        if (lora_only_mode && !op.lora_targets.empty() && !ctx.options.RecomputeLoRA) {
             continue;
         }
 

@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include "dsl/tensor_slot_registry.h"
 #include "utilities/stack.h"
 #include "modules/run_state_types.h"
 #include "modules/residual_manager.h"
@@ -35,7 +36,8 @@ public:
                 const std::shared_ptr<TensorAllocator>& allocator,
                 bool lora_only_mode = false,
                 std::size_t stack_bytes = kDefaultStackBytes,
-                bool allocate_stack = true);
+                bool allocate_stack = true,
+                const ActivationLayoutIR* activation_layout = nullptr);
     ~DslRunState();
 
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
@@ -83,6 +85,11 @@ public:
 
     /// @brief Get temporary LSE buffer for recomputation (avoids overwriting saved values)
     Tensor& recompute_lse() { return mRecomputeLSE; }
+
+    /// @brief Check QKV canary guards for shared buffer corruption.
+    bool check_qkv_canary(cudaStream_t stream, const char* tag,
+                          int layer_idx, int micro_step,
+                          const char* op_id) const;
 
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
@@ -163,6 +170,7 @@ private:
     bool mStackSimulate = false;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
+    bool mRecomputeLora = false;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;
@@ -176,6 +184,7 @@ private:
     modules::NonBlockActivations mNonBlockActivations;
     modules::NonBlockGradientBuffers mNonBlockGradients;
     modules::ScratchBuffers mScratch;
+    TensorSlotRegistry mSlotRegistry;
 
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
@@ -192,6 +201,12 @@ private:
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     Tensor mFP8ForwardStats{};
     Tensor mGradQuantStats{};
+
+    // QKV shared buffer canary (debug)
+    bool mQkvCanaryEnabled = false;
+    Tensor mQkvCanaryRaw{};
+    std::size_t mQkvCanaryGuardBytes = 0;
+    std::byte mQkvCanaryPattern{0xA5};
 
     // Temporary buffers for recomputation (to avoid overwriting saved activations)
     Tensor mRecomputeRstd{};  ///< Temp buffer for rstd during recomputation [B, T]

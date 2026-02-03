@@ -82,7 +82,7 @@ class LlamaBlock:
         recompute_from=["ln1", "@param:qkv_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         lora_targets=["q", "k", "v"],
     )
     qkv_rope = Activation(
@@ -92,7 +92,7 @@ class LlamaBlock:
         recompute_from=["qkv", "@global:freq_cis", "@input:position_ids"],
         recompute_op="rope",
         recompute_attrs={"rotary_dim": "D"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         description="QKV after RoPE",
     )
 
@@ -126,7 +126,7 @@ class LlamaBlock:
         recompute_from=["att", "@param:out_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         lora_targets=["o"],
         description="After output projection",
     )
@@ -163,7 +163,7 @@ class LlamaBlock:
         recompute_from=["ln2", "@param:mlp_up_weight"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         lora_targets=["up", "gate"],
     )
     swiglu = Activation(
@@ -173,11 +173,20 @@ class LlamaBlock:
         recompute_from=["mlp_up"],
         recompute_op="swiglu",
         recompute_attrs={"activation": "swiglu"},
-        recompute_policy="fft_only",
+        recompute_policy="always",
         description="SwiGLU activation output",
     )
-    mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"],
-                          description="MLP down projection output")
+    mlp_down = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["mlp_down_flat"],
+        recompute=True,
+        recompute_from=["swiglu", "@param:mlp_down_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["down"],
+        description="MLP down projection output",
+    )
 
     # Second residual
     res_ffn = Activation(Tensor["B", "T", "C"], aliases=["residual_ffn"],

@@ -6,7 +6,9 @@
 #ifndef SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H
 #define SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
@@ -17,6 +19,61 @@ namespace dsl {
 // Global state for QKV gradient tracking (shared across split op files)
 extern std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
 extern std::vector<int> g_qkv_dA_micro_by_layer;
+
+struct QkvGuardSample {
+    std::array<float, 8> vals{};
+    std::uint16_t op_idx = 0;
+    std::string op_id;
+};
+
+struct QkvLastWriter {
+    int layer = -1;
+    int micro = -1;
+    std::uint16_t op_idx = 0;
+    std::string op_id;
+    std::string op_type;
+    std::string out_name;
+};
+
+struct QkvKernelWriter {
+    int layer = -1;
+    int micro = -1;
+    std::uint16_t op_idx = 0;
+    std::string op_id;
+    std::string op_type;
+    std::string out_name;
+};
+
+void record_qkv_guard_sample(const void* ptr,
+                             int layer_idx,
+                             int micro_step,
+                             std::uint16_t op_idx,
+                             const std::string& op_id,
+                             const std::array<float, 8>& vals);
+bool fetch_qkv_guard_sample(const void* ptr,
+                            int layer_idx,
+                            int micro_step,
+                            QkvGuardSample& out);
+
+void record_qkv_last_writer(const void* ptr,
+                            int layer_idx,
+                            int micro_step,
+                            std::uint16_t op_idx,
+                            const std::string& op_id,
+                            const char* op_type,
+                            const std::string& out_name);
+bool fetch_qkv_last_writer(const void* ptr,
+                           QkvLastWriter& out);
+
+void record_qkv_kernel_writer(const void* ptr,
+                              int layer_idx,
+                              int micro_step,
+                              std::uint16_t op_idx,
+                              const std::string& op_id,
+                              const char* op_type,
+                              const std::string& out_name);
+bool fetch_qkv_kernel_writer(const void* ptr,
+                             QkvKernelWriter& out);
 
 // MoE compact weight information
 struct MoeCompactInfo {

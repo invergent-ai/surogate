@@ -64,4 +64,8 @@ private:
     std::vector<sAllocRecord> mHighMark;
 };
 
+// Debug: watch a specific stack memory range and log overlapping allocations.
+void set_stack_watch_range(const std::byte* ptr, std::size_t bytes, const char* tag = nullptr);
+void clear_stack_watch_range();
+
 #endif //SUROGATE_SRC_UTILITIES_STACK_H
