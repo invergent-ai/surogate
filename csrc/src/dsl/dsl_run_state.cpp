@@ -38,7 +38,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
       mAllocator(allocator),
       mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
-      mRecomputeLora(options.RecomputeLoRA),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
     if (!mAllocator) {
@@ -202,11 +201,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // will recompute them from checkpoints.
     //
     // recompute: false - Save everything, no sharing (maximum memory)
-    // recompute: true  - Share intermediates, recompute from checkpoints (saves ~17% VRAM)
+    // recompute: true  - Share intermediates, recompute from checkpoints
     //
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool lora_only = mLoraOnlyMode;
-    const bool allow_lora_recompute = mRecomputeLora;
+    const bool allow_lora_recompute = recompute_enabled && lora_only;
     const bool has_layout = mSlotRegistry.has_dsl_layout();
 
     auto lookup_slot = [&](const char* name) -> std::optional<TensorSlotRegistry::SlotEntry> {

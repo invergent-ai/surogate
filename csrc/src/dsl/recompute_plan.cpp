@@ -1929,16 +1929,13 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             continue;
         }
         if (op.policy == RecomputePolicy::FftOnly && lora_only_mode) {
-            if (!ctx.options.RecomputeLoRA) {
-                continue;
-            }
-            // Even with recompute_lora enabled, avoid recomputing attention outputs in LoRA mode.
+            // Avoid recomputing attention outputs in LoRA mode.
             // LoRA O-proj backward expects the original forward attention activations.
             if (op.op_type == "flash_attention") {
                 continue;
             }
         }
-        // FIX: In FFT mode, we MUST recompute all activations for each micro-step.
+        // In FFT mode, we MUST recompute all activations for each micro-step.
         // The saved tensors contain micro-step 0's activations, which are WRONG for subsequent
         // micro-steps during gradient accumulation. Skipping recompute causes flash attention
         // backward to receive stale activations (from micro-step 0) with correct d_out (from
@@ -1950,12 +1947,9 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         // if (op.policy == RecomputePolicy::LoraOnly && !lora_only_mode) {
         //     continue;  // WRONG: causes gradient explosion with grad accum > 1
         // }
-        // In LoRA mode, skip recompute for ops that produce values needed by LoRA backward hooks.
-        // These ops have lora_targets set (e.g., flash_attention for O proj, swiglu for down proj).
-        // We need the original forward values, not recomputed values, because:
-        // 1. cuDNN attention is non-deterministic (recomputed att != forward att)
-        // 2. Matmul rounding can differ between forward and recompute
-        if (lora_only_mode && !op.lora_targets.empty() && !ctx.options.RecomputeLoRA) {
+        // In LoRA mode, only skip recompute for non-deterministic ops that must reuse
+        // the original forward activations (e.g., flash_attention outputs for O-proj).
+        if (lora_only_mode && !op.lora_targets.empty() && op.op_type == "flash_attention") {
             continue;
         }
 
