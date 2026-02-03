@@ -205,15 +205,6 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             }
         }
     }
-    // Optional debug: zero output to detect unwritten rows.
-    static int moe_zero_gate_up = -1;
-    if (moe_zero_gate_up < 0) {
-        moe_zero_gate_up = (std::getenv("SUROGATE_MOE_ZERO_OUT") != nullptr) ? 1 : 0;
-    }
-    if (moe_zero_gate_up) {
-        fill_zero(out, mRunState.MainStream);
-    }
-
     // Use weights dtype to determine compute precision (QLoRA may return FP32 dequantized weights)
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);

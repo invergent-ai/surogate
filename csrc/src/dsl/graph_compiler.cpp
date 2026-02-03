@@ -399,21 +399,6 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                     ref.shape = it->second;
                 }
             }
-            if (std::getenv("SUROGATE_TRACE_MOE_SHAPES") &&
-                (base.find("permuted_input") != std::string::npos ||
-                 base.find("expert_gate_up") != std::string::npos ||
-                 base.find("expert_act") != std::string::npos ||
-                 base.find("expert_down") != std::string::npos ||
-                 base.find("moe_out") != std::string::npos)) {
-                std::ostringstream oss;
-                oss << "[MOE_SHAPE_REF] name=" << name << " shape=[";
-                for (std::size_t i = 0; i < ref.shape.size(); ++i) {
-                    if (i) oss << ",";
-                    oss << ref.shape[i];
-                }
-                oss << "] slot=" << static_cast<int>(ref.slot) << "\n";
-                std::fputs(oss.str().c_str(), stderr);
-            }
             return ref;
         }
     }

@@ -1709,11 +1709,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 ++it;
                 continue;
             }
-            // Skip MoE expert_offsets - needed for backward but not in autodiff save list
-            if (mConfig.NumExperts > 0 && (it->first == "moe_expert_offsets" || it->first == "moe_gather_indices")) {
-                ++it;
-                continue;
-            }
             if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
                 !mRunState.Stack.is_live(it->second.Data)) {
                 it = mTensorMap.erase(it);
@@ -2043,25 +2038,21 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // layer's data at this point, not the per-layer values.
             if (op.layer_end < num_layers &&
                 layer_active[static_cast<std::size_t>(op.layer_end)]) {
-                // For MoE models, skip stack restore because:
-                // 1. MoE backward needs forward activations (routing_weights, scatter_indices, etc.)
-                // 2. The recompute mechanism (recompute_block) doesn't support MoE ops
-                // 3. Without recompute, we must preserve all forward tensors for backward
-                // TODO: Implement MoE-specific recompute to enable memory savings
-                if (mConfig.NumExperts == 0) {
-                    mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
-                    if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
-                        mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
-                    }
-                    prune_stack_tensors();
-                    if (mRunState.ffn_temps_on_stack()) {
-                        auto& acts = mRunState.simplified_acts(op.layer_end);
-                        acts.mlp_up.Data = nullptr;
-                        acts.swiglu.Data = nullptr;
-                    }
-                    // Note: cudnn_workspace is persistently allocated, don't clear
-                    layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
+                if (mConfig.NumExperts > 0) {
+                    save_moe_layer_tensors(op.layer_end);
                 }
+                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
+                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
+                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
+                }
+                prune_stack_tensors();
+                if (mRunState.ffn_temps_on_stack()) {
+                    auto& acts = mRunState.simplified_acts(op.layer_end);
+                    acts.mlp_up.Data = nullptr;
+                    acts.swiglu.Data = nullptr;
+                }
+                // Note: cudnn_workspace is persistently allocated, don't clear
+                layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
             }
             handle_layer_end(op.layer_end);
         }
@@ -2505,6 +2496,59 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return false;
     };
 
+    // Build last-use map for backward tensors to enable safe pruning/stack restores.
+    // Conservative: includes all ops in the backward graph (even if some are skipped).
+    std::unordered_map<std::string, std::size_t> last_use;
+    if (!graph.ops.empty()) {
+        for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+            const auto& op = graph.ops[i];
+            for (const auto& ref : op.inputs) {
+                if (!ref.name.empty()) {
+                    last_use[ref.name] = i;
+                }
+            }
+            for (const auto& ref : op.outputs) {
+                if (!ref.name.empty()) {
+                    last_use[ref.name] = i;
+                }
+            }
+        }
+    }
+    std::vector<std::vector<std::string>> last_use_names(graph.ops.size());
+    for (const auto& [name, idx] : last_use) {
+        if (idx < last_use_names.size()) {
+            last_use_names[idx].push_back(name);
+        }
+    }
+    auto prune_by_last_use = [&](std::size_t idx) {
+        if (idx >= last_use_names.size()) {
+            return;
+        }
+        for (const auto& name : last_use_names[idx]) {
+            auto it = mTensorMap.find(name);
+            if (it == mTensorMap.end()) {
+                continue;
+            }
+            // Saved tensors can be re-resolved from mSaved/mMoESavedBuffers if needed.
+            mTensorMap.erase(it);
+        }
+    };
+    auto can_restore_stack = [&](std::size_t idx) -> bool {
+        for (const auto& [name, tensor] : mTensorMap) {
+            if (!tensor.Data) {
+                continue;
+            }
+            if (!mRunState.Stack.owns(tensor.Data)) {
+                continue;
+            }
+            auto it = last_use.find(name);
+            if (it != last_use.end() && it->second > idx) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     const bool assert_recompute_a = (std::getenv("SUROGATE_ASSERT_RECOMPUTE_A") != nullptr);
     if (assert_recompute_a) {
@@ -2711,12 +2755,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
 
 
-            // Memory management - restore stack checkpoint periodically to free temporaries
-            // This prevents memory accumulation during backward pass
-            // Option 1: At layer boundaries if annotated
-            // TEMPORARILY DISABLED for MoE models due to tensor corruption issues
-            // TODO: Fix proper tensor lifetime tracking for MoE backward
-            if (mConfig.NumExperts == 0 && op.layer_end >= 0 && op.layer_end != last_layer_restored) {
+            // Memory management - prune tensors after last use, then restore stack at layer boundaries
+            // when no live stack tensors remain. This is safe for MoE as well.
+            prune_by_last_use(idx);
+            if (op.layer_end >= 0 &&
+                op.layer_end != last_layer_restored &&
+                can_restore_stack(idx)) {
                 // Restore stack and clear temps
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
@@ -2744,7 +2788,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // would remove these tensors from mTensorMap, causing "tensor not found" errors.
             // For now, skip periodic cleanup when recompute is disabled to preserve correctness.
             // Memory usage will be higher but the backward pass will complete successfully.
-            // TODO: Implement proper tensor lifetime tracking to enable safe pruning.
         } catch (const std::exception& e) {
             std::ostringstream oss;
             oss << "CompiledExecutor backward op " << idx << " (type=" << op_type_to_string(op.type)
