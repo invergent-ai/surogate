@@ -9,7 +9,7 @@
 #include <cuda_bf16.h>
 
 #include "kernels/kernels.h"
-#include "training/model.h"
+#include "runtime/training/model.h"
 
 namespace recipes {
 

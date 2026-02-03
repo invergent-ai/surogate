@@ -239,73 +239,73 @@ target_sources(surogate-common PRIVATE
     src/utilities/system_info.cpp
     src/utilities/crash_handler.cpp
 
-    src/training/dataloader.cpp
-    src/training/logging.cpp
-    src/training/checkpoint.cpp
-    src/training/model.cpp
+    src/runtime/training/dataloader.cpp
+    src/runtime/training/logging.cpp
+    src/runtime/training/checkpoint.cpp
+    src/runtime/training/model.cpp
 
-    src/dsl/ir.cpp
-    src/dsl/dsl_model.cpp
-    src/dsl/dsl_model_execution.cpp
-    src/dsl/dsl_model_helpers.cpp
-    src/dsl/dsl_model_lora.cpp
-    src/dsl/dsl_model_optimizer.cpp
-    src/dsl/dsl_model_weights.cpp
-    src/dsl/dsl_param_store.cpp
-    src/dsl/dsl_grad_store.cpp
-    src/dsl/dsl_run_state.cpp
-    src/dsl/dsl_weight_manager.cpp
-    src/dsl/graph_executor.cpp
-    src/dsl/graph_executor_utils.cpp
-    src/dsl/graph_executor_tensors.cpp
-    src/dsl/graph_executor_weight_cache.cpp
-    src/dsl/graph_executor_backward.cpp
-    src/dsl/graph_executor_helpers.cpp
-    src/dsl/recompute_plan.cpp
-    src/dsl/compiled_ops.cpp
-    src/dsl/graph_compiler.cpp
-    src/dsl/weight_mapping.cpp
-    src/dsl/autodiff.cpp
-    src/dsl/autodiff_rules.cpp
-    src/dsl/op_shape_signatures.cpp
-    src/dsl/tensor_slot_registry.cpp
+    src/runtime/dsl/ir.cpp
+    src/runtime/dsl/dsl_model.cpp
+    src/runtime/dsl/dsl_model_execution.cpp
+    src/runtime/dsl/dsl_model_helpers.cpp
+    src/runtime/dsl/dsl_model_lora.cpp
+    src/runtime/dsl/dsl_model_optimizer.cpp
+    src/runtime/dsl/dsl_model_weights.cpp
+    src/runtime/dsl/dsl_param_store.cpp
+    src/runtime/dsl/dsl_grad_store.cpp
+    src/runtime/dsl/dsl_run_state.cpp
+    src/runtime/dsl/dsl_weight_manager.cpp
+    src/runtime/dsl/graph_executor.cpp
+    src/runtime/dsl/graph_executor_utils.cpp
+    src/runtime/dsl/graph_executor_tensors.cpp
+    src/runtime/dsl/graph_executor_weight_cache.cpp
+    src/runtime/dsl/graph_executor_backward.cpp
+    src/runtime/dsl/graph_executor_helpers.cpp
+    src/runtime/dsl/recompute_plan.cpp
+    src/runtime/dsl/compiled_ops.cpp
+    src/runtime/dsl/graph_compiler.cpp
+    src/runtime/dsl/weight_mapping.cpp
+    src/runtime/dsl/autodiff.cpp
+    src/runtime/dsl/autodiff_rules.cpp
+    src/runtime/dsl/op_shape_signatures.cpp
+    src/runtime/dsl/tensor_slot_registry.cpp
 
-    src/dsl/ops/embedding.cpp
-    src/dsl/ops/zeros.cpp
-    src/dsl/ops/fused_residual_rmsnorm.cpp
-    src/dsl/ops/view.cpp
-    src/dsl/ops/add.cpp
-    src/dsl/ops/bias_add.cpp
-    src/dsl/ops/matmul.cpp
-    src/dsl/ops/swiglu.cpp
-    src/dsl/ops/matmul_swiglu.cpp
-    src/dsl/ops/qkv_qk_norm_rope.cpp
-    src/dsl/ops/rope.cpp
-    src/dsl/ops/flash_attention.cpp
-    src/dsl/ops/cross_entropy_loss.cpp
-    src/dsl/ops/fused_lm_head_loss.cpp
-    src/dsl/ops/silu.cpp
-    src/dsl/ops/mul.cpp
-    src/dsl/ops/moe_softmax.cpp
-    src/dsl/ops/moe_sigmoid.cpp
-    src/dsl/ops/moe_topk.cpp
-    src/dsl/ops/moe_permute.cpp
-    src/dsl/ops/moe_grouped_gemm_gate_up.cpp
-    src/dsl/ops/moe_grouped_gemm_down.cpp
-    src/dsl/ops/moe_unpermute.cpp
+    src/runtime/ops/embedding.cpp
+    src/runtime/ops/zeros.cpp
+    src/runtime/ops/fused_residual_rmsnorm.cpp
+    src/runtime/ops/view.cpp
+    src/runtime/ops/add.cpp
+    src/runtime/ops/bias_add.cpp
+    src/runtime/ops/matmul.cpp
+    src/runtime/ops/swiglu.cpp
+    src/runtime/ops/matmul_swiglu.cpp
+    src/runtime/ops/qkv_qk_norm_rope.cpp
+    src/runtime/ops/rope.cpp
+    src/runtime/ops/flash_attention.cpp
+    src/runtime/ops/cross_entropy_loss.cpp
+    src/runtime/ops/fused_lm_head_loss.cpp
+    src/runtime/ops/silu.cpp
+    src/runtime/ops/mul.cpp
+    src/runtime/ops/moe_softmax.cpp
+    src/runtime/ops/moe_sigmoid.cpp
+    src/runtime/ops/moe_topk.cpp
+    src/runtime/ops/moe_permute.cpp
+    src/runtime/ops/moe_grouped_gemm_gate_up.cpp
+    src/runtime/ops/moe_grouped_gemm_down.cpp
+    src/runtime/ops/moe_unpermute.cpp
 
 
 
     src/config/pretrained_config.cpp
 
-    src/modules/qlora/fp8_weights.cpp
-    src/modules/qlora/fp4_weights.cpp
-    src/modules/qlora/bnb_weights.cpp
+    src/runtime/qlora/fp8_weights.cpp
+    src/runtime/qlora/fp4_weights.cpp
+    src/runtime/qlora/bnb_weights.cpp
 
-    src/modules/lora/lora_weights_manager.cpp
-    src/modules/lora/lora_grads_manager.cpp
-    src/modules/lora/lora_optimizer_state.cpp
-    src/modules/lora/lora_utils.cpp
+    src/runtime/lora/lora_weights_manager.cpp
+    src/runtime/lora/lora_grads_manager.cpp
+    src/runtime/lora/lora_optimizer_state.cpp
+    src/runtime/lora/lora_utils.cpp
 
     # Recipe system
     src/recipes/recipe.cpp
@@ -330,9 +330,9 @@ target_sources(surogate-common PRIVATE
     src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu
-    src/modules/optimizers/adamw_8bit.cu
-    src/modules/optimizers/polar_express.cu
-    src/modules/optimizers/normuon.cu
+    src/runtime/optimizers/adamw_8bit.cu
+    src/runtime/optimizers/polar_express.cu
+    src/runtime/optimizers/normuon.cu
     src/kernels/attention.cu
     src/kernels/fused_classifier.cu
     src/kernels/transpose.cu
@@ -376,7 +376,7 @@ target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
 target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
-target_include_directories(surogate-common PUBLIC src src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
+target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
 
 # backward-cpp for stack traces
 if(BACKWARD_HAS_DW)

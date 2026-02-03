@@ -21,8 +21,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
-#include "modules/optimizers/polar_express.h"
-#include "modules/optimizers/normuon.h"
+#include "runtime/optimizers/polar_express.h"
+#include "runtime/optimizers/normuon.h"
 #include "utilities/utils.h"
 #include "../utilities/test_config.h"
 #include "../utilities/test_utils.h"

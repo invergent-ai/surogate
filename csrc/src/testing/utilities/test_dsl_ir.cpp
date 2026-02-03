@@ -8,7 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
-#include "dsl/ir.h"
+#include "runtime/dsl/ir.h"
 
 TEST_CASE("DSL IR loader parses module and resolves shapes") {
     const char* kJson = R"JSON(

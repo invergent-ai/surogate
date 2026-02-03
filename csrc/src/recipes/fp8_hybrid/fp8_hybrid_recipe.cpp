@@ -7,10 +7,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include "modules/fp8_scaling_config.h"  // QuantizerIndex
-#include "modules/fp8_scaling_state.h"   // FP8ScalingState (must be before training/model.h)
+#include "runtime/core/fp8_scaling_config.h"  // QuantizerIndex
+#include "runtime/core/fp8_scaling_state.h"   // FP8ScalingState (must be before runtime/training/model.h)
 #include "kernels/kernels.h"
-#include "training/model.h"
+#include "runtime/training/model.h"
 
 namespace recipes {
 

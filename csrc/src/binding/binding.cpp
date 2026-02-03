@@ -14,10 +14,10 @@
 #include <fmt/format.h>
 
 #include "py_train.h"
-#include "training/dataloader.h"
-#include "training/checkpoint.h"
-#include "training/logging.h"
-#include "training/matmul_backend.h"
+#include "runtime/training/dataloader.h"
+#include "runtime/training/checkpoint.h"
+#include "runtime/training/logging.h"
+#include "runtime/training/matmul_backend.h"
 #include "utilities/gpu_info.h"
 #include "utilities/safetensors.h"
 #include "utilities/sol.h"
@@ -25,7 +25,7 @@
 #include "utilities/crash_handler.h"
 #include "config/lora_adapter_config.h"
 #include "recipes/recipe_factory.h"
-#include "modules/qlora/qlora_config.h"
+#include "runtime/qlora/qlora_config.h"
 
 namespace nb = nanobind;
 

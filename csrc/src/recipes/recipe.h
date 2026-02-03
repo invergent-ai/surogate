@@ -9,8 +9,8 @@
 #include <string_view>
 #include <cuda_runtime.h>
 
-#include "modules/matmul_context.h"
-#include "training/matmul_backend.h"  // For EMatmulBackend
+#include "runtime/core/matmul_context.h"
+#include "runtime/training/matmul_backend.h"  // For EMatmulBackend
 #include "utilities/tensor.h"
 
 namespace recipes {

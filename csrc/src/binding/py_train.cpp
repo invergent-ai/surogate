@@ -14,17 +14,17 @@
 #include <fmt/format.h>
 
 #include "utilities/gpu_info.h"
-#include "training/checkpoint.h"
-#include "training/dataloader.h"
-#include "training/logging.h"
+#include "runtime/training/checkpoint.h"
+#include "runtime/training/dataloader.h"
+#include "runtime/training/logging.h"
 #include "utilities/comm.h"
 #include "kernels/kernels.h"
-#include "training/model.h"
-#include "modules/model_factory.h"
-#include "modules/lora/lora_config.h"
-#include "dsl/dsl_model.h"
-#include "dsl/dsl_grad_store.h"
-#include "dsl/dsl_runtime.h"
+#include "runtime/training/model.h"
+#include "runtime/core/model_factory.h"
+#include "runtime/lora/lora_config.h"
+#include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dsl_grad_store.h"
+#include "runtime/dsl/dsl_runtime.h"
 
 namespace {
 bool env_enabled(const char* name) {

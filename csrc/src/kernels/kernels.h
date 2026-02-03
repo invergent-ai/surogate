@@ -464,9 +464,9 @@ void deterministic_sum(float* out, const float* values, std::size_t count, cudaS
 void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count, cudaStream_t stream);
 
 
-// 8-bit AdamW optimizer - functions moved to modules/optimizers/adamw_8bit.h
+// 8-bit AdamW optimizer - functions moved to runtime/adamw_8bit.h
 // Bring them into global namespace for backward compatibility
-#include "modules/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/adamw_8bit.h"
 
 using optimizers::adamw_update_8bit;
 using optimizers::adamw_update_8bit_multi_tensor;

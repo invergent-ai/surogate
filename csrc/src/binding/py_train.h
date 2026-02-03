@@ -14,10 +14,10 @@
 #include <cuda_runtime.h>
 
 #include "config/pretrained_config.h"
-#include "training/runtime_options.h"
+#include "runtime/training/runtime_options.h"
 #include "config/lora_adapter_config.h"
-#include "modules/qlora/qlora_config.h"
-#include "modules/optimizers/optimizer_config.h"
+#include "runtime/qlora/qlora_config.h"
+#include "runtime/optimizers/optimizer_config.h"
 
 class DataLoader;
 class IModel;

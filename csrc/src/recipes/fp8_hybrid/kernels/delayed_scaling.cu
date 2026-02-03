@@ -20,8 +20,8 @@
 #include <cuda_runtime.h>
 
 #include "kernels/kernel_utils.cuh"
-#include "modules/fp8_scaling_config.h"
-#include "modules/fp8_scaling_state.h"
+#include "runtime/core/fp8_scaling_config.h"
+#include "runtime/core/fp8_scaling_state.h"
 
 namespace {
 

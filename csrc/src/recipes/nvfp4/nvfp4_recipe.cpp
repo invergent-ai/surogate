@@ -9,10 +9,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include "modules/matmul_context.h"
+#include "runtime/core/matmul_context.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
-#include "training/model.h"
+#include "runtime/training/model.h"
 
 namespace recipes {
 

@@ -13,7 +13,7 @@
 #include <cuda_bf16.h>
 
 #include "kernels/kernels.h"
-#include "modules/qlora/qlora_config.h"
+#include "runtime/qlora/qlora_config.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
