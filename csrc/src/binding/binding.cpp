@@ -285,9 +285,9 @@ NB_MODULE(_surogate, m) {
             }
             return cfg.release();  // Transfer ownership of polymorphic object
         }, nb::arg("name"), nb::arg("dtype"),
-           "Create a configuration from a known model name.\n\n"
+           "Load a configuration from a config.json path or directory.\n\n"
            "Parameters:\n"
-           "- name: Model name.\n"
+           "- name: Path to config.json or a directory containing it.\n"
            "- dtype: Desired dtype.\n\n"
            "Returns: PretrainedConfig")
         ;
@@ -381,7 +381,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("fp4_backend") = "cutlass",
              nb::arg("skip_quant_first_layers") = 0,
              nb::arg("skip_quant_last_layers") = 0,
-             nb::arg("use_dsl_ir") = false,
+             nb::arg("use_dsl_ir") = true,
              "Create runtime/training options.\n\n"
              "Parameters:\n"
              "- recompute: Enable activation recomputation ('true' or 'false').\n"
@@ -400,7 +400,7 @@ NB_MODULE(_surogate, m) {
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
              "- skip_quant_last_layers: Skip quantization for last N layers.\n"
-             "- use_dsl_ir: Enable DSL IR backend.")
+             "- use_dsl_ir: Deprecated (DSL backend is always enabled).")
         .def_prop_rw("recompute",
             [](const RuntimeOptions& self) { return std::string(self.recompute_level_name()); },
             [](RuntimeOptions& self, const std::string& level) { self.Recompute = RuntimeOptions::parse_recompute_level(level); },
@@ -425,7 +425,7 @@ NB_MODULE(_surogate, m) {
         .def_rw("init_projections_to_zero", &RuntimeOptions::InitProjectionsToZero, "Initialize certain projections to zero (for experiments).")
         .def_rw("debug_memory_breakdown", &RuntimeOptions::DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation.")
         .def_rw("use_fused_rope", &RuntimeOptions::UseFusedRope, "Use fused RoPE kernel with on-the-fly cos/sin computation.")
-        .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Enable DSL IR backend (validation-only placeholder).")
+        .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Deprecated (DSL backend is always enabled).")
         .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
         .def_rw("router_z_loss_coef", &RuntimeOptions::RouterZLossCoef, "MoE z-loss coefficient (-1 = use model config).")

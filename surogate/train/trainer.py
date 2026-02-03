@@ -31,11 +31,9 @@ class SurogateTrainerWrapper():
 
         model_weights_path = get_model_weights_path(config.model_dir)
 
-        if config.use_dsl_ir:
-            from surogate.dsl.ir_builder import build_dsl_ir_for_model
-            ir_json = build_dsl_ir_for_model(config.model_dir)
-            config.runtime_config.use_dsl_ir = True
-            config.runtime_config.dsl_ir_json = ir_json
+        from surogate.dsl.ir_builder import build_dsl_ir_for_model
+        ir_json = build_dsl_ir_for_model(config.model_dir)
+        config.runtime_config.dsl_ir_json = ir_json
         
         # Setup data loaders
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
@@ -257,7 +255,7 @@ class SurogateTrainerWrapper():
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
 
     def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
-        use_full_step_graphs = bool(self.config.use_dsl_ir)
+        use_full_step_graphs = True
         if use_full_step_graphs and self.config.optimizer != "adamw_8bit":
             raise RuntimeError("DSL training requires optimizer 'adamw_8bit' for full-step execution.")
         if use_full_step_graphs and not self.config.use_cuda_graphs:

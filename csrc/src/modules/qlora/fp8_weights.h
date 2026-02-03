@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "block_quantized_tensor.h"
+#include "hf_mapping.h"
 #include "moe_weights.h"
 #include "qlora_config.h"
 #include "utilities/allocator.h"
@@ -49,6 +50,7 @@ public:
         bool tied_embeddings = true;  ///< Whether lm_head is tied to embeddings
         int shard_idx = 0;
         int num_shards = 1;
+        const HfMapping* hf_mapping = nullptr;
     };
 
     FP8WeightsManager(const Config& config, TensorAllocator& allocator,
@@ -139,6 +141,7 @@ private:
     Config mConfig;
     TensorAllocator* mAllocator;
     const cudaDeviceProp* mDeviceProps;
+    const HfMapping* mHfMapping = nullptr;
 
     // Quantized base model weights for dense models (FP8 + per-block scales)
     std::vector<QLoRABlockWeights> mQuantizedBlocks;

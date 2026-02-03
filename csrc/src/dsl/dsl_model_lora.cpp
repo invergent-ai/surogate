@@ -209,7 +209,8 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
 
     const int rank = mLoRAConfig->rank;
     const int BT = B * T;
-    const int max_features = std::max(mModelConfig.HiddenSize, mModelConfig.IntermediateSize);
+    const int qkv_features = std::max(0, mModelConfig.qkv_channels());
+    const int max_features = std::max({mModelConfig.HiddenSize, mModelConfig.IntermediateSize, qkv_features});
     const ETensorDType work_dtype = mModelConfig.DType;
 
     mLoRARunState->intermediate = mAllocator->allocate(

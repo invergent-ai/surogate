@@ -90,12 +90,12 @@ std::vector<long> infer_fuse_slices(const std::string& name, const PretrainedCon
 
 // QLoRA provider factory (DSL)
 std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
-    const PretrainedConfig& config,
     const modules::ModelConfig& model_cfg,
     const RuntimeOptions& options,
     const modules::ModularLoRAConfig& lora_cfg,
     const modules::QLoRAConfig& qlora_cfg,
-    const std::shared_ptr<TensorAllocator>& allocator);
+    const std::shared_ptr<TensorAllocator>& allocator,
+    const modules::HfMapping* hf_mapping);
 
 }  // namespace internal
 }  // namespace dsl

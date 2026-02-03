@@ -11,7 +11,6 @@
 #include <string>
 #include "modules/model_config.h"
 #include "lora_config.h"
-#include "modules/weights/weight_manager_types.h"
 #include "utilities/tensor_container.h"
 
 namespace modules {

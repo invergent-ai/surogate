@@ -22,15 +22,9 @@
 #include "fp8_weights.h"
 #include "block_quantized_tensor.h"
 #include "moe_weights.h"
-#include "modules/composite/transformer_block.h"
-#include "modules/weights/weight_manager_types.h"
-#include "modules/weights/weight_manager.h"
-#include "modules/weights/weight_manager_helpers.h"
-#include "modules/weights/weight_manager_allocation.h"
-#include "modules/weights/weight_manager_gather.h"
-#include "modules/weights/weight_manager_optimizer.h"
-#include "modules/weights/weight_manager_io.h"
-#include "modules/weights/weight_manager_quantization.h"
+#include "hf_mapping.h"
+#include "dsl_block_weights.h"
+#include "weight_provider_types.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 #include "modules/moe/moe_types.h"
@@ -84,6 +78,7 @@ public:
         int num_shards = 1;
         bool enable_fp8_forward = false;  ///< Use FP8 for forward pass (skip dequant)
         bool enable_fp8_hybrid = false;   ///< Use FP8 hybrid mode (skip dequant)
+        const HfMapping* hf_mapping = nullptr;
 
         // Mamba / SSM config (optional; used by Nemotron-H hybrid blocks)
         bool has_mamba = false;
@@ -264,16 +259,11 @@ public:
     }
 
     /**
-     * @brief Type alias for compatibility with ModularWeightManager
-     */
-    using FP8WeightCache = typename ModularWeightManager<Block>::FP8WeightCache;
-
-    /**
      * @brief Get the FP8 weight cache for the current layer
      *
      * Returns a reference to an FP8WeightCache structure that points to the
      * FP8 weights that were prepared during get_block().
-     * This is compatible with ModularWeightManager's fp8_weight_cache() interface.
+     * This preserves the legacy fp8_weight_cache() interface shape.
      * Valid only after get_block() is called for the same layer.
      */
     [[nodiscard]] FP8WeightCache& get_fp8_cache() {
@@ -307,6 +297,17 @@ private:
      */
     void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
     void load_mamba_weights(const std::string& file_name);
+    const HfMappingSpec* resolve_hf_spec(const std::string& internal_name,
+                                         int& layer_idx,
+                                         std::string& resolved_name) const;
+    bool load_tensor_from_spec(const SafeTensorsReader& reader,
+                               const HfMappingSpec& spec,
+                               std::string_view internal_name,
+                               int layer_idx,
+                               int expert_idx,
+                               Tensor& target,
+                               cudaStream_t stream,
+                               std::string_view warn_tag) const;
 
     template<typename T>
     static bool copy_tensor_range_host(const Tensor& t, long offset, long count,
@@ -454,7 +455,8 @@ FP8WeightProvider<Block>::FP8WeightProvider(
         .use_qk_norm = config.use_qk_norm,
         .tied_embeddings = config.tied_embeddings,
         .shard_idx = config.shard_idx,
-        .num_shards = config.num_shards
+        .num_shards = config.num_shards,
+        .hf_mapping = config.hf_mapping
     };
     mFP8Weights = std::make_unique<FP8WeightsManager>(qw_config, allocator, device_props);
 
@@ -614,24 +616,36 @@ void FP8WeightProvider<Block>::import_and_quantize(
 
     // Load final norm weight from file (not quantized)
     SafeTensorsReader reader(file_name);
-    const std::vector<std::string> final_norm_names = {
-        "model.norm.weight",
-        "model.norm_f.weight",
-        "backbone.norm.weight",
-        "backbone.norm_f.weight",
-        "transformer.ln_f.weight",
-        "model.final_layernorm.weight"
-    };
-    for (const auto& name : final_norm_names) {
-        bool found = false;
-        for (const auto& entry : reader.entries()) {
-            if (entry.name() == name) {
-                entry.read_tensor(mFinalNormWeight, /*allow_cast=*/true);
-                found = true;
-                break;
-            }
+    bool final_norm_loaded = false;
+    if (mConfig.hf_mapping) {
+        int map_layer = -1;
+        std::string resolved_name;
+        if (const auto* spec = resolve_hf_spec("final_norm", map_layer, resolved_name)) {
+            final_norm_loaded = load_tensor_from_spec(reader, *spec, resolved_name,
+                                                     map_layer, -1, mFinalNormWeight,
+                                                     stream, "FP8");
         }
-        if (found) break;
+    }
+    if (!final_norm_loaded) {
+        const std::vector<std::string> final_norm_names = {
+            "model.norm.weight",
+            "model.norm_f.weight",
+            "backbone.norm.weight",
+            "backbone.norm_f.weight",
+            "transformer.ln_f.weight",
+            "model.final_layernorm.weight"
+        };
+        for (const auto& name : final_norm_names) {
+            bool found = false;
+            for (const auto& entry : reader.entries()) {
+                if (entry.name() == name) {
+                    entry.read_tensor(mFinalNormWeight, /*allow_cast=*/true);
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
     }
 }
 
@@ -656,6 +670,7 @@ void FP8WeightProvider<Block>::load_mamba_weights(const std::string& file_name) 
             }
             return nullptr;
         };
+        cudaStream_t mapping_stream = cudaStreamDefault;
 
         const int hidden = mConfig.hidden_size;
         const int mamba_dim = (mConfig.mamba_intermediate_size > 0)
@@ -665,11 +680,30 @@ void FP8WeightProvider<Block>::load_mamba_weights(const std::string& file_name) 
         const int conv_dim = mamba_dim + 2 * groups * mConfig.mamba_ssm_state_size;
         const int proj_size = mamba_dim + conv_dim + mConfig.mamba_num_heads;
 
-        const auto load_tensor = [&](const std::string& name, Tensor& tensor, bool required) {
-            if (const auto* entry = find_entry_opt(name)) {
-                entry->read_tensor(tensor, /*allow_cast=*/true);
-            } else if (required) {
-                std::cerr << "[FP8 WARN] missing Mamba weight: " << name << "\n";
+        const auto load_tensor = [&](const std::string& name,
+                                     std::string_view internal_suffix,
+                                     Tensor& tensor,
+                                     bool required,
+                                     int layer_idx) {
+            bool loaded = false;
+            if (mConfig.hf_mapping && !internal_suffix.empty()) {
+                int map_layer = -1;
+                std::string resolved_name;
+                const std::string internal_name = std::string("blocks[") + std::to_string(layer_idx) +
+                                                  "].mamba." + std::string(internal_suffix);
+                if (const auto* spec = resolve_hf_spec(internal_name, map_layer, resolved_name)) {
+                    loaded = load_tensor_from_spec(reader, *spec, resolved_name,
+                                                   map_layer, -1, tensor,
+                                                   mapping_stream, "FP8");
+                }
+            }
+            if (!loaded) {
+                if (const auto* entry = find_entry_opt(name)) {
+                    entry->read_tensor(tensor, /*allow_cast=*/true);
+                    loaded = true;
+                } else if (required) {
+                    std::cerr << "[FP8 WARN] missing Mamba weight: " << name << "\n";
+                }
             }
         };
 
@@ -728,23 +762,181 @@ void FP8WeightProvider<Block>::load_mamba_weights(const std::string& file_name) 
                                                   ("mamba_norm_w_l" + std::to_string(layer)).c_str(),
                                                   EAllocationType::ON_DEVICE, {mamba_dim});
 
-            load_tensor(prefix + ".mixer.in_proj.weight", mw.in_proj_weight, true);
+            load_tensor(prefix + ".mixer.in_proj.weight", "in_proj_weight", mw.in_proj_weight, true, layer);
             if (mw.in_proj_bias.has_value()) {
-                load_tensor(prefix + ".mixer.in_proj.bias", mw.in_proj_bias.value(), false);
+                load_tensor(prefix + ".mixer.in_proj.bias", "in_proj_bias", mw.in_proj_bias.value(), false, layer);
             }
-            load_tensor(prefix + ".mixer.out_proj.weight", mw.out_proj_weight, true);
+            load_tensor(prefix + ".mixer.out_proj.weight", "out_proj_weight", mw.out_proj_weight, true, layer);
             if (mw.out_proj_bias.has_value()) {
-                load_tensor(prefix + ".mixer.out_proj.bias", mw.out_proj_bias.value(), false);
+                load_tensor(prefix + ".mixer.out_proj.bias", "out_proj_bias", mw.out_proj_bias.value(), false, layer);
             }
-            load_tensor(prefix + ".mixer.conv1d.weight", mw.conv1d_weight, true);
+            load_tensor(prefix + ".mixer.conv1d.weight", "conv1d_weight", mw.conv1d_weight, true, layer);
             if (mw.conv1d_bias.has_value()) {
-                load_tensor(prefix + ".mixer.conv1d.bias", mw.conv1d_bias.value(), false);
+                load_tensor(prefix + ".mixer.conv1d.bias", "conv1d_bias", mw.conv1d_bias.value(), false, layer);
             }
-            load_tensor(prefix + ".mixer.A_log", mw.A_log, true);
-            load_tensor(prefix + ".mixer.D", mw.D, true);
-            load_tensor(prefix + ".mixer.dt_bias", mw.dt_bias, true);
-            load_tensor(prefix + ".mixer.norm.weight", mw.norm_weight, true);
+            load_tensor(prefix + ".mixer.A_log", "A_log", mw.A_log, true, layer);
+            load_tensor(prefix + ".mixer.D", "D", mw.D, true, layer);
+            load_tensor(prefix + ".mixer.dt_bias", "dt_bias", mw.dt_bias, true, layer);
+            load_tensor(prefix + ".mixer.norm.weight", "norm_weight", mw.norm_weight, true, layer);
         }
+    }
+}
+
+template<typename Block>
+const HfMappingSpec* FP8WeightProvider<Block>::resolve_hf_spec(const std::string& internal_name,
+                                                               int& layer_idx,
+                                                               std::string& resolved_name) const {
+    if (!mConfig.hf_mapping) {
+        return nullptr;
+    }
+    const HfMappingSpec* spec = mConfig.hf_mapping->find(internal_name, layer_idx);
+    if (!spec) {
+        return nullptr;
+    }
+    resolved_name = internal_name;
+    if (spec->kind == HfMappingSpec::Kind::TiedTo && !spec->target.empty()) {
+        int tied_layer = -1;
+        const HfMappingSpec* tied = mConfig.hf_mapping->find(spec->target, tied_layer);
+        if (tied) {
+            resolved_name = spec->target;
+            if (tied_layer >= 0) {
+                layer_idx = tied_layer;
+            }
+            return tied;
+        }
+    }
+    return spec;
+}
+
+template<typename Block>
+bool FP8WeightProvider<Block>::load_tensor_from_spec(const SafeTensorsReader& reader,
+                                                     const HfMappingSpec& spec,
+                                                     std::string_view internal_name,
+                                                     int layer_idx,
+                                                     int expert_idx,
+                                                     Tensor& target,
+                                                     cudaStream_t stream,
+                                                     std::string_view warn_tag) const {
+    auto warn_missing = [&](const std::string& name) {
+        if (!spec.optional) {
+            std::cerr << "[" << warn_tag << " WARN] weight not found: " << name << "\n";
+        }
+    };
+
+    switch (spec.kind) {
+        case HfMappingSpec::Kind::Direct: {
+            const std::string hf_name = HfMapping::format_name(
+                spec.source.empty() ? std::string(internal_name) : spec.source, layer_idx, expert_idx);
+            const SafeTensorEntry* entry = nullptr;
+            for (const auto& e : reader.entries()) {
+                if (e.name() == hf_name) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry) {
+                entry->read_tensor(target, /*allow_cast=*/true);
+                return true;
+            }
+            warn_missing(hf_name);
+            return false;
+        }
+        case HfMappingSpec::Kind::Fuse: {
+            if (spec.dim != 0 || spec.sources.empty()) {
+                return false;
+            }
+            const std::size_t elem_size = get_dtype_size(target.DType);
+            long offset = 0;
+            bool any_loaded = false;
+            for (const auto& src : spec.sources) {
+                const std::string hf_name = HfMapping::format_name(src, layer_idx, expert_idx);
+                const SafeTensorEntry* entry = nullptr;
+                for (const auto& e : reader.entries()) {
+                    if (e.name() == hf_name) {
+                        entry = &e;
+                        break;
+                    }
+                }
+                if (entry) {
+                    if (!entry->shape().empty()) {
+                        const long rows = entry->shape().at(0);
+                        Tensor slice = target;
+                        slice.Sizes[0] = rows;
+                        slice.Data = target.Data + static_cast<std::size_t>(offset) *
+                                     static_cast<std::size_t>(target.Sizes[1]) * elem_size;
+                        entry->read_tensor(slice, /*allow_cast=*/true);
+                        offset += rows;
+                        any_loaded = true;
+                    }
+                } else {
+                    warn_missing(hf_name);
+                }
+            }
+            if (any_loaded && offset != target.Sizes[0]) {
+                std::cerr << "[" << warn_tag << " WARN] fuse size mismatch for "
+                          << internal_name << " (loaded " << offset
+                          << " rows, expected " << target.Sizes[0] << ")\n";
+            }
+            return any_loaded;
+        }
+        case HfMappingSpec::Kind::Split: {
+            if (spec.dim != 0 || spec.ranges.empty()) {
+                return false;
+            }
+            const auto [start, end] = spec.ranges.front();
+            if (start < 0 || end <= start) {
+                return false;
+            }
+            const std::string hf_name = HfMapping::format_name(spec.source, layer_idx, expert_idx);
+            const SafeTensorEntry* entry = nullptr;
+            for (const auto& e : reader.entries()) {
+                if (e.name() == hf_name) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry) {
+                long stride = 1;
+                for (std::size_t i = 1; i < entry->shape().size(); ++i) {
+                    stride *= entry->shape()[i];
+                }
+                const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(start) * stride;
+                entry->read_raw(target, offset, target.nelem(), /*allow_cast=*/true);
+                return true;
+            }
+            warn_missing(hf_name);
+            return false;
+        }
+        case HfMappingSpec::Kind::Transform: {
+            if (spec.fn != "transpose" || !mAllocator) {
+                return false;
+            }
+            const std::string hf_name = HfMapping::format_name(spec.source, layer_idx, expert_idx);
+            const SafeTensorEntry* entry = nullptr;
+            for (const auto& e : reader.entries()) {
+                if (e.name() == hf_name) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry) {
+                if (entry->shape().size() != 2 || target.Rank != 2) {
+                    return false;
+                }
+                Tensor tmp = mAllocator->allocate(target.DType, ("hf_tmp_" + std::string(internal_name)).c_str(),
+                                                 EAllocationType::ON_DEVICE,
+                                                 {entry->shape().at(0), entry->shape().at(1)});
+                entry->read_tensor(tmp, /*allow_cast=*/true);
+                transpose(target, tmp, static_cast<int>(entry->shape().at(0)),
+                          static_cast<int>(entry->shape().at(1)), stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                return true;
+            }
+            warn_missing(hf_name);
+            return false;
+        }
+        default:
+            return false;
     }
 }
 

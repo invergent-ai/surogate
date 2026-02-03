@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "dsl/ir.h"
+#include "dsl/dsl_runtime_config.h"
 #include "modules/model_config.h"
 #include "modules/lora/lora_config.h"
 #include "modules/lora/lora_grads_manager.h"
@@ -24,6 +25,10 @@
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
 #include "dsl/qlora_provider.h"
+
+namespace modules {
+struct HfMapping;
+}
 
 namespace dsl {
 
@@ -143,6 +148,7 @@ public:
     modules::ModularLoRAGradsManager& lora_grads();
     modules::LoRARunState& lora_run_state();
     [[nodiscard]] const modules::ModularLoRAConfig& lora_config() const { return *mLoRAConfig; }
+    const DslGradStore& grads() const;
 
     std::vector<std::byte> rng_state() const override;
     void set_rng_state(const std::vector<std::byte>& state) override;
@@ -203,6 +209,7 @@ private:
     std::unique_ptr<DslRunState> mRunState;
     IRFile mIr;
     const Module* mModule = nullptr;
+    DslRuntimeConfig mRuntimeConfig;
     std::unique_ptr<DslParamStore> mParams;
     std::unique_ptr<DslGradStore> mGrads;
     std::unique_ptr<DslWeightManager> mWeightManager;  // Optional - for streaming/sharding
@@ -246,6 +253,7 @@ private:
 
     std::unordered_map<std::string, MappingSpec> mHfMapping;
     std::unordered_map<std::string, MappingSpec> mHfExport;
+    std::shared_ptr<modules::HfMapping> mQLoRAMapping;
 };
 
 } // namespace dsl

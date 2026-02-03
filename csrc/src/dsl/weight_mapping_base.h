@@ -4,17 +4,11 @@
 // Weight Mapping Base Infrastructure
 //
 // This file defines the base weight mapping system that maps HuggingFace tensor names
-// to internal tensor destinations with optional fusion. Model-specific mappings are
-// defined in their respective model directories (e.g., models/llama/weight_mapping.h)
-// and registered through the models registry (models/registry.h).
-//
-// The registry pattern enables:
-// 1. Easy addition of new model architectures
-// 2. Inherited weight patterns from parent models
-// 3. Custom loaders for weight fusion/transformation
+// to internal tensor destinations with optional fusion. Mappings are now
+// produced from DSL IR hf_mapping blocks rather than static model registries.
 
-#ifndef SUROGATE_SRC_MODULES_WEIGHTS_WEIGHT_MAPPING_H
-#define SUROGATE_SRC_MODULES_WEIGHTS_WEIGHT_MAPPING_H
+#ifndef SUROGATE_SRC_DSL_WEIGHT_MAPPING_BASE_H
+#define SUROGATE_SRC_DSL_WEIGHT_MAPPING_BASE_H
 
 #include <functional>
 #include <memory>
@@ -464,4 +458,4 @@ inline long mlp_intermediate(const PretrainedConfig& cfg) {
 
 } // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_WEIGHTS_WEIGHT_MAPPING_H
+#endif // SUROGATE_SRC_DSL_WEIGHT_MAPPING_BASE_H

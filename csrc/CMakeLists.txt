@@ -297,12 +297,6 @@ target_sources(surogate-common PRIVATE
 
 
     src/config/pretrained_config.cpp
-    src/models/registry.cpp
-    src/models/qwen25/qwen25.cpp
-    src/models/qwen3/qwen3.cpp
-    src/models/qwen3moe/qwen3_moe.cpp
-    src/models/llama/llama.cpp
-    src/models/nemotron_h/nemotron_h.cpp
 
     src/modules/qlora/fp8_weights.cpp
     src/modules/qlora/fp4_weights.cpp
@@ -312,7 +306,6 @@ target_sources(surogate-common PRIVATE
     src/modules/lora/lora_grads_manager.cpp
     src/modules/lora/lora_optimizer_state.cpp
     src/modules/lora/lora_utils.cpp
-    src/modules/weights/weight_mapping_override.cpp
 
     # Recipe system
     src/recipes/recipe.cpp
@@ -496,7 +489,6 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # MoE
             src/testing/moe/test-moe.cu
-            src/testing/moe/test_moe.cpp
 
             # Models
             src/testing/models/test_pretrained_config.cpp
@@ -521,10 +513,6 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/utilities/test_main.cpp
 
             # Training
-            src/testing/training/test-modular-training-loop.cpp
-            src/testing/training/test-learning.cpp
-            src/testing/training/test-checkpoint.cpp
-
             # Distributed
             src/testing/distributed/test-nccl.cpp
         )

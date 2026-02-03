@@ -315,6 +315,9 @@ class NodeTrainer:
                 )
 
         # Create model config
+        from surogate.dsl.ir_builder import build_dsl_ir_for_model
+        ir_json = build_dsl_ir_for_model(self._config.model_dir)
+        self._config.runtime_config.dsl_ir_json = ir_json
         pretrained_config = _surogate.PretrainedConfig.from_pretrained(
             self._config.model_dir, to_surogate_dtype(self._config.torch_dtype)
         )
@@ -483,7 +486,7 @@ class NodeTrainer:
         B = config.per_device_train_batch_size
         T = config.sequence_len
         local_gpus = self.local_gpus
-        use_full_step_graphs = bool(config.use_dsl_ir)
+        use_full_step_graphs = True
         if use_full_step_graphs and config.optimizer != "adamw_8bit":
             raise RuntimeError("DSL training requires optimizer 'adamw_8bit' for full-step execution.")
         if use_full_step_graphs and not config.use_cuda_graphs:

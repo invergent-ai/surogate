@@ -9,7 +9,7 @@
 #include <memory>
 
 #include "dsl/ir.h"
-#include "modules/weights/weight_mapping.h"
+#include "dsl/weight_mapping_base.h"
 
 namespace dsl {
 

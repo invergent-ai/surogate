@@ -11,6 +11,7 @@
 
 #include "fp4_block_quantized_tensor.h"
 #include "block_quantized_tensor.h"  // For QLoRAEmbeddingWeights
+#include "hf_mapping.h"
 #include "moe_weights.h"
 #include "qlora_config.h"
 #include "utilities/allocator.h"
@@ -52,6 +53,7 @@ public:
         bool tied_embeddings = true;
         int shard_idx = 0;
         int num_shards = 1;
+        const HfMapping* hf_mapping = nullptr;
 
         /// When true, store MoE expert FP4 weights in pinned CPU memory instead of GPU.
         /// Experts are streamed to GPU on-demand when selected by the router.
@@ -138,6 +140,7 @@ private:
     Config mConfig;
     TensorAllocator* mAllocator;
     const cudaDeviceProp* mDeviceProps;
+    const HfMapping* mHfMapping = nullptr;
 
     // FP4 quantized base model weights for dense models
     std::vector<FP4BlockWeights> mFP4Blocks;

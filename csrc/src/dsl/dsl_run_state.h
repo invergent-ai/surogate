@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include "dsl/dsl_runtime_config.h"
 #include "dsl/tensor_slot_registry.h"
 #include "utilities/stack.h"
 #include "modules/run_state_types.h"
@@ -31,6 +32,7 @@ public:
     static constexpr std::size_t kDefaultStackBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2GB
 
     DslRunState(const PretrainedConfig& config,
+                const DslRuntimeConfig& runtime_config,
                 const RuntimeOptions& options,
                 int B, int T,
                 const std::shared_ptr<TensorAllocator>& allocator,
@@ -161,6 +163,7 @@ private:
     void release_cuda_resources() noexcept;
 
     std::shared_ptr<TensorAllocator> mAllocator;
+    DslRuntimeConfig mRuntimeConfig;
     Tensor mStackBuffer{};
     bool mStackSimulate = false;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;

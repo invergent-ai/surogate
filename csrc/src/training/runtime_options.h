@@ -88,18 +88,9 @@ struct RuntimeOptions {
     // Eliminates precomputed freq_cis tensor, reduces memory bandwidth.
     bool UseFusedRope = false;
 
-    // DSL IR execution (placeholder backend).
+    // DSL IR execution (deprecated flag; DSL backend is always used).
     bool UseDslIr = true;
     std::string DslIrJson;
-
-    // Compiled DSL execution: eliminate operation dispatch overhead by pre-compiling
-    // operations into direct function pointer calls with pre-resolved tensors/attrs.
-    // This can improve throughput by 5-10% by eliminating:
-    // - Runtime string comparisons (op_type == "embedding")
-    // - Hash map lookups for tensor resolution (get_tensor())
-    // - Attribute parsing (find_attr(), attr_double())
-    // - Shape resolution (resolve_shape())
-    bool UseCompiledDsl = true;
 
     // Matmul backend selection
     // AUTO: Let the system auto-detect (CUTLASS for SM120+ FP8, cuBLAS otherwise)
@@ -214,7 +205,7 @@ struct RuntimeOptions {
         if (level == "false" || level == "none" || level == "0") {
             return RecomputeLevel::None;
         }
-        if (level == "true" || level == "1" || level == "standard" || level == "aggressive" || level == "2") {
+        if (level == "true" || level == "1") {
             return RecomputeLevel::Enabled;
         }
         throw std::invalid_argument("Invalid recompute level: " + level +

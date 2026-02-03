@@ -121,7 +121,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
         } else if (mModelConfig.NumExperts > 0) {
             // Fallback: use ModelConfig fields directly when moe_config is not set
-            // This can happen if the PretrainedConfig wasn't dynamically cast to Qwen3MoEConfig
+            // This can happen if MoE config wasn't provided by the DSL
             if (mQLoRAConfig.num_experts == 0) {
                 mQLoRAConfig.num_experts = mModelConfig.NumExperts;
             }
@@ -133,8 +133,9 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
         }
 
-        mQLoRAProvider = internal::create_dsl_qlora_provider(*mConfig, mModelConfig, mOptions,
-                                                             *mLoRAConfig, mQLoRAConfig, mAllocator);
+        mQLoRAProvider = internal::create_dsl_qlora_provider(mModelConfig, mOptions,
+                                                             *mLoRAConfig, mQLoRAConfig, mAllocator,
+                                                             mQLoRAMapping.get());
         cudaStream_t quant_stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&quant_stream));
         mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);

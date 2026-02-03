@@ -15,7 +15,6 @@
 
 #include "dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
-#include "models/qwen3moe/config.h"
 #include "training/runtime_options.h"
 #include "modules/fp8_run_state.h"
 #include "modules/fp8_scaling_config.h"
@@ -27,6 +26,7 @@
 namespace dsl {
 
 DslRunState::DslRunState(const PretrainedConfig& config,
+                         const DslRuntimeConfig& runtime_config,
                          const RuntimeOptions& options,
                          int B, int T,
                          const std::shared_ptr<TensorAllocator>& allocator,
@@ -36,6 +36,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          const ActivationLayoutIR* activation_layout)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
+      mRuntimeConfig(runtime_config),
       mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
       mNumLayers(config.NumLayers),
@@ -186,12 +187,13 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
     const long MUp = 2 * M;
-    const auto* moe_cfg = cfg.is_moe() ? dynamic_cast<const Qwen3MoEConfig*>(&cfg) : nullptr;
-    const long NumExperts = moe_cfg ? moe_cfg->NumExperts : 0;
-    const long TopK = (moe_cfg && moe_cfg->NumExpertsPerTok > 0) ? moe_cfg->NumExpertsPerTok : 1;
-    const long MoeM = (moe_cfg && moe_cfg->MoeIntermediateSize > 0) ? moe_cfg->MoeIntermediateSize : cfg.IntermediateSize;
+    const long NumExperts = mRuntimeConfig.num_experts;
+    const long TopK = (mRuntimeConfig.num_experts_per_tok > 0) ? mRuntimeConfig.num_experts_per_tok : 1;
+    const long MoeM = (mRuntimeConfig.moe_intermediate_size > 0)
+        ? mRuntimeConfig.moe_intermediate_size
+        : cfg.IntermediateSize;
     const long MoeMUp = 2 * MoeM;
-    const bool use_qk_norm = cfg.UseQKNorm;
+    const bool use_qk_norm = mRuntimeConfig.use_qk_norm;
 
     const auto dtype = mActivationDtype;
     const auto kind = EAllocationType::ON_DEVICE;

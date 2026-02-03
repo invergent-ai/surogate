@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bnb_block_quantized_tensor.h"
+#include "hf_mapping.h"
 #include "moe_weights.h"
 #include "qlora_config.h"
 #include "utilities/allocator.h"
@@ -50,6 +51,7 @@ public:
         bool tied_embeddings = true;   ///< Whether lm_head is tied to embeddings
         int shard_idx = 0;
         int num_shards = 1;
+        const HfMapping* hf_mapping = nullptr;
 
         /// When true, store MoE expert NF4 weights in pinned CPU memory instead of GPU.
         /// Experts are streamed to GPU on-demand when selected by the router.
@@ -155,6 +157,7 @@ private:
     Config mConfig;
     TensorAllocator* mAllocator;
     const cudaDeviceProp* mDeviceProps;
+    const HfMapping* mHfMapping = nullptr;
 
     // BnB scale configuration (derived from qlora_config)
     BnBBlockScaleConfig mScaleConfig;

@@ -35,11 +35,8 @@
 #include "modules/qlora/fp8_weight_provider.h"
 #include "modules/qlora/fp4_weight_provider.h"
 #include "modules/qlora/bnb_weight_provider.h"
-#include "modules/composite/transformer_block.h"
-#include "models/llama/transformer_block.h"
-#include "models/qwen25/transformer_block.h"
-#include "models/qwen3/transformer_block.h"
-#include "models/qwen3moe/qwen3_moe_block.h"
+#include "modules/qlora/hf_mapping.h"
+#include "modules/qlora/dsl_block_weights.h"
 #include "modules/model_config.h"
 #include "modules/optimizers/adamw_8bit.h"
 #include "modules/optimizers/normuon.h"
@@ -61,6 +58,59 @@ std::string_view trim_optional(std::string_view name) {
 bool ends_with(std::string_view value, std::string_view suffix) {
     return value.size() >= suffix.size() &&
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool graph_has_kernel(const Module& module, std::string_view kernel) {
+    if (!module.forward.has_value()) {
+        return false;
+    }
+    const auto& ops = module.forward->operations;
+    for (const auto& op : ops) {
+        if (op.kernel_type == kernel || op.name == kernel) {
+            return true;
+        }
+    }
+    return false;
+}
+
+modules::HfMappingSpec to_hf_mapping_spec(const DslModel::MappingSpec& spec) {
+    modules::HfMappingSpec out{};
+    using SrcKind = DslModel::MappingSpec::Kind;
+    using DstKind = modules::HfMappingSpec::Kind;
+    switch (spec.kind) {
+        case SrcKind::Direct:
+            out.kind = DstKind::Direct;
+            break;
+        case SrcKind::Fuse:
+            out.kind = DstKind::Fuse;
+            break;
+        case SrcKind::Split:
+            out.kind = DstKind::Split;
+            break;
+        case SrcKind::Transform:
+            out.kind = DstKind::Transform;
+            break;
+        case SrcKind::TiedTo:
+            out.kind = DstKind::TiedTo;
+            break;
+        case SrcKind::StackExperts:
+            out.kind = DstKind::StackExperts;
+            break;
+        case SrcKind::Unknown:
+        default:
+            out.kind = DstKind::Unknown;
+            break;
+    }
+    out.source = spec.source;
+    out.sources = spec.sources;
+    out.ranges = spec.ranges;
+    out.fn = spec.fn;
+    out.target = spec.target;
+    out.dim = spec.dim;
+    out.optional = spec.optional;
+    out.fuse_gate_up = spec.fuse_gate_up;
+    out.num_experts = spec.num_experts;
+    return out;
 }
 
 bool is_qlora_param_name(std::string_view name, bool train_router) {
@@ -103,6 +153,219 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
            clean == "lm_head" || clean == "lm_head_weight";
 }
 
+struct DslConfigView {
+    std::optional<long> d_model;
+    std::optional<long> d_ff;
+    std::optional<long> n_layers;
+    std::optional<long> num_query_heads;
+    std::optional<long> num_kv_heads;
+    std::optional<long> head_size;
+    std::optional<long> max_seq;
+    std::optional<long> vocab_size;
+    std::optional<double> eps;
+    std::optional<bool> use_qkv_bias;
+    std::optional<bool> use_qk_norm;
+    std::optional<long> num_experts;
+    std::optional<long> num_experts_per_tok;
+    std::optional<long> moe_intermediate_size;
+    std::optional<bool> norm_topk_prob;
+    std::optional<bool> use_shared_expert;
+    std::optional<long> shared_expert_intermediate;
+};
+
+std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (auto v = internal::as_int(*value)) {
+            return *v;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<double> get_double_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (const auto* f64 = std::get_if<double>(&value->value)) {
+            return *f64;
+        }
+        if (const auto* i64 = std::get_if<std::int64_t>(&value->value)) {
+            return static_cast<double>(*i64);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> get_bool_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (auto v = internal::as_bool(*value)) {
+            return *v;
+        }
+    }
+    return std::nullopt;
+}
+
+DslConfigView parse_dsl_config(const Module& module) {
+    DslConfigView view;
+    const auto& cfg = module.config;
+    view.d_model = get_long_attr(cfg, "d_model");
+    view.d_ff = get_long_attr(cfg, "d_ff");
+    view.n_layers = get_long_attr(cfg, "n_layers");
+    view.num_query_heads = get_long_attr(cfg, "num_query_heads");
+    view.num_kv_heads = get_long_attr(cfg, "num_kv_heads");
+    view.head_size = get_long_attr(cfg, "head_size");
+    view.max_seq = get_long_attr(cfg, "max_seq");
+    view.vocab_size = get_long_attr(cfg, "vocab_size");
+    view.eps = get_double_attr(cfg, "eps");
+    view.use_qkv_bias = get_bool_attr(cfg, "use_qkv_bias");
+    view.use_qk_norm = get_bool_attr(cfg, "use_qk_norm");
+    view.num_experts = get_long_attr(cfg, "num_experts");
+    view.num_experts_per_tok = get_long_attr(cfg, "num_experts_per_tok");
+    view.moe_intermediate_size = get_long_attr(cfg, "moe_intermediate_size");
+    view.norm_topk_prob = get_bool_attr(cfg, "norm_topk_prob");
+    view.use_shared_expert = get_bool_attr(cfg, "use_shared_expert");
+    view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate");
+    return view;
+}
+
+DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConfig& base) {
+    DslRuntimeConfig runtime;
+    const auto view = parse_dsl_config(module);
+
+    runtime.use_qk_norm = view.use_qk_norm.value_or(base.UseQKNorm);
+    // If the IR graph uses qkv_qk_norm_rope, force-enable qk-norm even when
+    // config.json does not expose a flag (e.g., Qwen3 defaults).
+    if (!runtime.use_qk_norm && graph_has_kernel(module, "qkv_qk_norm_rope")) {
+        runtime.use_qk_norm = true;
+    }
+    runtime.num_experts = static_cast<int>(view.num_experts.value_or(0));
+    runtime.num_experts_per_tok = static_cast<int>(view.num_experts_per_tok.value_or(0));
+    runtime.norm_topk_prob = view.norm_topk_prob.value_or(false);
+    runtime.use_shared_expert = view.use_shared_expert.value_or(false);
+    runtime.shared_expert_intermediate = static_cast<int>(view.shared_expert_intermediate.value_or(0));
+
+    if (view.moe_intermediate_size.has_value()) {
+        runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
+    } else if (runtime.num_experts > 0 && view.d_ff.has_value()) {
+        runtime.moe_intermediate_size = static_cast<int>(view.d_ff.value());
+    }
+
+    return runtime;
+}
+
+std::optional<PretrainedConfig::ArchitectureId> arch_from_string(std::string_view name) {
+    std::string lower = internal::to_lower(std::string(name));
+    if (lower.find("qwen3moe") != std::string::npos || lower.find("qwen3_moe") != std::string::npos) {
+        return PretrainedConfig::QWEN3_MOE;
+    }
+    if (lower.find("qwen3") != std::string::npos) {
+        return PretrainedConfig::QWEN3;
+    }
+    if (lower.find("qwen2") != std::string::npos || lower.find("qwen25") != std::string::npos ||
+        lower.find("qwen2.5") != std::string::npos) {
+        return PretrainedConfig::QWEN2;
+    }
+    if (lower.find("nemotron") != std::string::npos) {
+        return PretrainedConfig::NEMOTRON_H;
+    }
+    if (lower.find("llama") != std::string::npos) {
+        return PretrainedConfig::LLAMA;
+    }
+    return std::nullopt;
+}
+
+void apply_arch_from_hf_config(PretrainedConfig& cfg, const Module& module) {
+    if (const auto* value = internal::find_key(&module.hf_config, "architecture")) {
+        if (auto arch = internal::as_string(*value)) {
+            if (auto mapped = arch_from_string(*arch)) {
+                cfg.Architecture = *mapped;
+                return;
+            }
+        }
+    }
+    if (const auto* value = internal::find_key(&module.hf_config, "model_type")) {
+        if (auto arch = internal::as_string(*value)) {
+            if (auto mapped = arch_from_string(*arch)) {
+                cfg.Architecture = *mapped;
+            }
+        }
+    }
+}
+
+modules::ModelConfig build_model_config(const Module& module,
+                                        const PretrainedConfig& base,
+                                        const DslRuntimeConfig& runtime) {
+    const auto view = parse_dsl_config(module);
+    modules::ModelConfig cfg;
+    cfg.original_config = base.clone();
+
+    // Copy base fields
+    cfg.Architecture = base.Architecture;
+    cfg.BosTokenId = base.BosTokenId;
+    cfg.EosTokenId = base.EosTokenId;
+    cfg.PadTokenId = base.PadTokenId;
+    cfg.HiddenSize = base.HiddenSize;
+    cfg.IntermediateSize = base.IntermediateSize;
+    cfg.VocabSize = base.VocabSize;
+    cfg.NumQueryHeads = base.NumQueryHeads;
+    cfg.NumKeyValHeads = base.NumKeyValHeads;
+    cfg.NumLayers = base.NumLayers;
+    cfg.HeadDim = base.HeadDim;
+    cfg.MaxPositionEmbeddings = base.MaxPositionEmbeddings;
+    cfg.RopeTheta = base.RopeTheta;
+    cfg.Rope = base.Rope;
+    cfg.RmsNormEps = base.RmsNormEps;
+    cfg.TiedWordEmbeddings = base.TiedWordEmbeddings;
+    cfg.UseQKVBias = base.UseQKVBias;
+    cfg.UseQKNorm = base.UseQKNorm;
+    cfg.DType = base.DType;
+
+    // Override with DSL-provided values when available
+    if (view.d_model) cfg.HiddenSize = static_cast<int>(*view.d_model);
+    if (view.d_ff) cfg.IntermediateSize = static_cast<int>(*view.d_ff);
+    if (view.n_layers) cfg.NumLayers = static_cast<int>(*view.n_layers);
+    if (view.num_query_heads) cfg.NumQueryHeads = static_cast<int>(*view.num_query_heads);
+    if (view.num_kv_heads) cfg.NumKeyValHeads = static_cast<int>(*view.num_kv_heads);
+    if (view.head_size) cfg.HeadDim = static_cast<int>(*view.head_size);
+    if (view.max_seq) cfg.MaxPositionEmbeddings = static_cast<int>(*view.max_seq);
+    if (view.vocab_size) cfg.VocabSize = static_cast<int>(*view.vocab_size);
+    if (view.eps) cfg.RmsNormEps = static_cast<float>(*view.eps);
+    if (view.use_qkv_bias) cfg.UseQKVBias = *view.use_qkv_bias;
+
+    cfg.UseQKNorm = runtime.use_qk_norm;
+    cfg.use_qk_norm = runtime.use_qk_norm;
+
+    // Infer attention type from head counts
+    if (cfg.NumKeyValHeads == 1) {
+        cfg.attention_type = modules::AttentionType::MQA;
+    } else if (cfg.NumKeyValHeads < cfg.NumQueryHeads) {
+        cfg.attention_type = modules::AttentionType::GQA;
+    } else {
+        cfg.attention_type = modules::AttentionType::MHA;
+    }
+
+    // MoE configuration (DSL-driven)
+    if (runtime.num_experts > 0) {
+        cfg.architecture = modules::ArchitectureType::MoE;
+        modules::MoEConfig moe;
+        moe.num_experts = runtime.num_experts;
+        moe.top_k = runtime.num_experts_per_tok > 0 ? runtime.num_experts_per_tok : 1;
+        moe.moe_intermediate_size = runtime.moe_intermediate_size > 0
+                                        ? runtime.moe_intermediate_size
+                                        : cfg.IntermediateSize;
+        moe.norm_topk_prob = runtime.norm_topk_prob;
+        moe.use_shared_expert = runtime.use_shared_expert;
+        moe.shared_expert_size = runtime.shared_expert_intermediate;
+        cfg.moe_config = moe;
+
+        cfg.NumExperts = moe.num_experts;
+        cfg.NumExpertsPerTok = moe.top_k;
+        cfg.MoeIntermediateSize = moe.moe_intermediate_size;
+    } else {
+        cfg.architecture = modules::ArchitectureType::Dense;
+    }
+
+    return cfg;
+}
+
 template<typename Block>
 class DslQLoRAWeightProvider final : public QLoRAWeightProvider {
 public:
@@ -110,12 +373,14 @@ public:
                            const RuntimeOptions& options,
                            const modules::ModularLoRAConfig& lora_config,
                            const modules::QLoRAConfig& qlora_config,
-                           const std::shared_ptr<TensorAllocator>& allocator)
+                           const std::shared_ptr<TensorAllocator>& allocator,
+                           const modules::HfMapping* hf_mapping)
         : mConfig(cfg),
           mOptions(options),
           mLoRAConfig(lora_config),
           mQLoRAConfig(qlora_config),
-          mAllocator(allocator) {}
+          mAllocator(allocator),
+          mHfMapping(hf_mapping) {}
 
     bool handles_param(std::string_view name) const override {
         return is_qlora_param_name(name, mLoRAConfig.train_router);
@@ -435,6 +700,7 @@ private:
             cfg.model_dtype = mConfig.DType;
             cfg.use_qk_norm = mConfig.UseQKNorm;
             cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
+            cfg.hf_mapping = mHfMapping;
             cfg.shard_idx = comm.rank();
             cfg.num_shards = comm.world_size();
             cfg.enable_fp8_forward = mOptions.fp8_forward_enabled();
@@ -459,6 +725,7 @@ private:
             cfg.model_dtype = mConfig.DType;
             cfg.use_qk_norm = mConfig.UseQKNorm;
             cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
+            cfg.hf_mapping = mHfMapping;
             cfg.shard_idx = comm.rank();
             cfg.num_shards = comm.world_size();
             cfg.selective_expert_dequant = force_full_moe_dequant ? false : mOptions.SelectiveExpertDequant;
@@ -484,6 +751,7 @@ private:
             cfg.model_dtype = mConfig.DType;
             cfg.use_qk_norm = mConfig.UseQKNorm;
             cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
+            cfg.hf_mapping = mHfMapping;
             cfg.shard_idx = comm.rank();
             cfg.num_shards = comm.world_size();
             cfg.selective_expert_dequant = force_full_moe_dequant ? false : mOptions.SelectiveExpertDequant;
@@ -500,6 +768,7 @@ private:
     modules::ModularLoRAConfig mLoRAConfig;
     modules::QLoRAConfig mQLoRAConfig;
     std::shared_ptr<TensorAllocator> mAllocator;
+    const modules::HfMapping* mHfMapping = nullptr;
 
     std::unique_ptr<FP8Provider> mFP8Provider;
     std::unique_ptr<FP4Provider> mFP4Provider;
@@ -511,30 +780,19 @@ private:
 namespace internal {
 
 std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
-    const PretrainedConfig& config,
     const modules::ModelConfig& model_cfg,
     const RuntimeOptions& options,
     const modules::ModularLoRAConfig& lora_cfg,
     const modules::QLoRAConfig& qlora_cfg,
-    const std::shared_ptr<TensorAllocator>& allocator) {
-    switch (config.Architecture) {
-        case PretrainedConfig::QWEN3_MOE:
-            return std::make_unique<DslQLoRAWeightProvider<modules::Qwen3MoEBlock>>(
-                model_cfg, options, lora_cfg, qlora_cfg, allocator);
-        case PretrainedConfig::QWEN3:
-            return std::make_unique<DslQLoRAWeightProvider<modules::Qwen3TransformerBlock>>(
-                model_cfg, options, lora_cfg, qlora_cfg, allocator);
-        case PretrainedConfig::QWEN2:
-            return std::make_unique<DslQLoRAWeightProvider<modules::Qwen2TransformerBlock>>(
-                model_cfg, options, lora_cfg, qlora_cfg, allocator);
-        case PretrainedConfig::NEMOTRON_H:
-            return std::make_unique<DslQLoRAWeightProvider<modules::DenseTransformerBlock<>>>(
-                model_cfg, options, lora_cfg, qlora_cfg, allocator);
-        case PretrainedConfig::LLAMA:
-        default:
-            return std::make_unique<DslQLoRAWeightProvider<modules::LlamaTransformerBlock>>(
-                model_cfg, options, lora_cfg, qlora_cfg, allocator);
+    const std::shared_ptr<TensorAllocator>& allocator,
+    const modules::HfMapping* hf_mapping) {
+    const bool is_moe = qlora_cfg.is_moe() || model_cfg.moe_config.has_value();
+    if (is_moe) {
+        return std::make_unique<DslQLoRAWeightProvider<modules::DslMoEBlock>>(
+            model_cfg, options, lora_cfg, qlora_cfg, allocator, hf_mapping);
     }
+    return std::make_unique<DslQLoRAWeightProvider<modules::DslDenseBlock>>(
+        model_cfg, options, lora_cfg, qlora_cfg, allocator, hf_mapping);
 }
 
 }  // namespace internal
@@ -550,7 +808,6 @@ DslModel::DslModel(const PretrainedConfig& config,
     : mConfig(config.clone()),
       mAllocator(allocator ? allocator : std::make_shared<TensorAllocator>()),
       mOptions(options),
-      mModelConfig(modules::ModelConfig::from_pretrained_config(config)),
       mQLoRAConfig(qlora_config),
       mShardIdx(shard_idx),
       mNumShards(num_shards) {
@@ -564,6 +821,9 @@ DslModel::DslModel(const PretrainedConfig& config,
     }
     mModule = &pick_model_module(mIr);
     validate_ir();
+    apply_arch_from_hf_config(*mConfig, *mModule);
+    mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
+    mModelConfig = build_model_config(*mModule, *mConfig, mRuntimeConfig);
 
     if (!mModule->forward.has_value()) {
         throw std::runtime_error("DSL model: module missing forward graph");
@@ -657,6 +917,13 @@ DslModel::DslModel(const PretrainedConfig& config,
     for (const auto& kv : mModule->hf_export) {
         mHfExport.emplace(kv.first, internal::parse_mapping_spec(kv.second));
     }
+    if (!mHfMapping.empty()) {
+        mQLoRAMapping = std::make_shared<modules::HfMapping>();
+        mQLoRAMapping->mapping.reserve(mHfMapping.size());
+        for (const auto& kv : mHfMapping) {
+            mQLoRAMapping->mapping.emplace(kv.first, to_hf_mapping_spec(kv.second));
+        }
+    }
 }
 
 DslModel::~DslModel() = default;
@@ -680,6 +947,13 @@ modules::LoRARunState& DslModel::lora_run_state() {
         throw std::runtime_error("DSL model: LoRA run state not allocated");
     }
     return *mLoRARunState;
+}
+
+const DslGradStore& DslModel::grads() const {
+    if (!mGrads) {
+        throw std::runtime_error("DSL model: gradients not initialized");
+    }
+    return *mGrads;
 }
 
 std::size_t DslModel::qlora_quantized_weights_bytes() const {
