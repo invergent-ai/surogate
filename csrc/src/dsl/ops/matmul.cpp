@@ -619,13 +619,19 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     if (!used_recipe) {
         Tensor d_out_mat = d_out;
         Tensor a_mat = a;
+        auto maybe_flatten_bt = [&](Tensor& t) {
+            if (t.Rank > 2 && t.Sizes[0] == mB && t.Sizes[1] == mT) {
+                t = view_tensor(t, {mB * mT, t.Sizes[t.Rank - 1]});
+            }
+        };
+        // Ensure matmul inputs are rank-2 by flattening [B, T, K] -> [B*T, K].
+        // This handles cases where *_flat tensors were not materialized as views.
         if (disable_qkv_recipe_bwd && is_qkv_op) {
-            if (d_out_mat.Rank > 2 && d_out_mat.Sizes[0] == mB && d_out_mat.Sizes[1] == mT) {
-                d_out_mat = view_tensor(d_out_mat, {mB * mT, d_out_mat.Sizes[d_out_mat.Rank - 1]});
-            }
-            if (a_mat.Rank > 2 && a_mat.Sizes[0] == mB && a_mat.Sizes[1] == mT) {
-                a_mat = view_tensor(a_mat, {mB * mT, a_mat.Sizes[a_mat.Rank - 1]});
-            }
+            maybe_flatten_bt(d_out_mat);
+            maybe_flatten_bt(a_mat);
+        } else {
+            maybe_flatten_bt(d_out_mat);
+            maybe_flatten_bt(a_mat);
         }
 
         // Fallback: explicit matmuls for dA and dB
