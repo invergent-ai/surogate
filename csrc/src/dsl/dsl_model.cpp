@@ -409,8 +409,7 @@ private:
             mQLoRAConfig.is_moe() && mLoRAConfig.enabled() &&
             (mOptions.SelectiveExpertDequant || mOptions.OffloadExperts);
         if (force_full_moe_dequant) {
-            std::cerr << "[DSL QLoRA] MoE selective expert dequant disabled "
-                      << "(DSL path requires full expert weights for base MoE GEMM)\n";
+            std::cerr << "[DSL QLoRA] MoE selective expert dequant disabled\n";
             if (mOptions.OffloadExperts) {
                 std::cerr << "[DSL QLoRA] Offload experts enabled; full expert dequant will stream all experts.\n";
             }
