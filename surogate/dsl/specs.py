@@ -40,6 +40,20 @@ class ActivationMemoryHint(str, Enum):
     SHARED = "shared"           # Shares memory with another slot
 
 
+class SharePolicy(str, Enum):
+    """Sharing policy for activation slots across layers.
+
+    Controls whether an activation buffer can be shared across transformer layers
+    to reduce memory usage. The policy determines when sharing is safe based on
+    the recompute strategy and training mode (FFT vs LoRA).
+    """
+    PER_LAYER = "per_layer"           # Always allocate per-layer (no sharing)
+    WHEN_RECOMPUTED = "when_recomputed"  # Share when slot will be recomputed in backward
+    ALWAYS_SHARE = "always_share"     # Always share across layers (use with caution)
+    FFT_SHARE = "fft_share"           # Share only in FFT mode (not LoRA)
+    LORA_SHARE = "lora_share"         # Share only in LoRA mode (not FFT)
+
+
 @dataclass
 class ActivationSlotSpec:
     """Specification for an activation tensor slot.
@@ -97,6 +111,9 @@ class ActivationSlotSpec:
     recompute_group: str | None = None
     recompute_outputs: list[str] = field(default_factory=list)
     lora_targets: list[str] = field(default_factory=list)
+
+    # Sharing policy for cross-layer buffer sharing
+    share_policy: SharePolicy = SharePolicy.WHEN_RECOMPUTED
 
     # For gradient slots, the corresponding forward activation
     gradient_of: str | None = None

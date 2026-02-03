@@ -57,6 +57,7 @@ from .specs import (
     ActivationLayoutSpec,
     ActivationScope,
     ActivationMemoryHint,
+    SharePolicy,
 )
 
 if TYPE_CHECKING:
@@ -469,6 +470,7 @@ class Activation:
         recompute_group: str | None = None,
         recompute_outputs: list[str] | None = None,
         lora_targets: list[str] | None = None,
+        share_policy: str | SharePolicy = "when_recomputed",
         when: str | Callable[[Any], bool] | None = None,
         scope: str = "block",
         description: str | None = None,
@@ -492,6 +494,11 @@ class Activation:
         self.recompute_group = recompute_group
         self.recompute_outputs = recompute_outputs or []
         self.lora_targets = lora_targets or []
+        # Normalize share_policy to string
+        if isinstance(share_policy, SharePolicy):
+            self.share_policy = share_policy.value
+        else:
+            self.share_policy = share_policy
         self.when = when
         self.scope = scope
         self.description = description
@@ -526,6 +533,8 @@ class Activation:
             parts.append(f", recompute_outputs={self.recompute_outputs!r}")
         if self.lora_targets:
             parts.append(f", lora_targets={self.lora_targets!r}")
+        if self.share_policy != "when_recomputed":
+            parts.append(f", share_policy={self.share_policy!r}")
         if self.shares_with:
             parts.append(f", shares_with={self.shares_with!r}")
         if self.when:
@@ -545,6 +554,16 @@ class Activation:
             "global_gradient": ActivationScope.GLOBAL_GRADIENT,
         }
         scope_enum = scope_map.get(self.scope, ActivationScope.BLOCK)
+
+        # Map share_policy string to enum
+        share_policy_map = {
+            "per_layer": SharePolicy.PER_LAYER,
+            "when_recomputed": SharePolicy.WHEN_RECOMPUTED,
+            "always_share": SharePolicy.ALWAYS_SHARE,
+            "fft_share": SharePolicy.FFT_SHARE,
+            "lora_share": SharePolicy.LORA_SHARE,
+        }
+        share_policy_enum = share_policy_map.get(self.share_policy, SharePolicy.WHEN_RECOMPUTED)
 
         # Determine memory hint
         if self.shares_with:
@@ -584,6 +603,7 @@ class Activation:
             recompute_group=self.recompute_group,
             recompute_outputs=list(self.recompute_outputs),
             lora_targets=list(self.lora_targets),
+            share_policy=share_policy_enum,
             condition=condition,
             condition_expr=condition_expr,
             description=self.description,

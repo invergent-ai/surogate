@@ -184,19 +184,12 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
     const int hidden_size = static_cast<int>(d_input.Sizes[1]);
     const int total_tokens = num_tokens * top_k;
     if (d_permuted.DType == ETensorDType::BF16) {
-        auto shape_vec = [](const Tensor& t) {
-            return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
-        };
-        Tensor d_perm_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_permuted), "moe_perm_d_f32");
-        Tensor d_in_f32 = mRunState.Stack.allocate(ETensorDType::FP32, shape_vec(d_input), "moe_perm_out_f32");
-        convert_dtype(d_perm_f32.get<float>(), d_permuted.get<nv_bfloat16>(), d_permuted.nelem(), mRunState.MainStream);
-        fill_zero(d_in_f32, mRunState.MainStream);
-        moe_permute_backward(d_in_f32.get<float>(),
-                             d_perm_f32.get<float>(),
+        fill_zero(d_input, mRunState.MainStream);
+        moe_permute_backward(d_input.get<nv_bfloat16>(),
+                             d_permuted.get<nv_bfloat16>(),
                              gather_indices->get<int>(),
                              total_tokens, num_tokens, hidden_size, top_k,
                              mRunState.MainStream);
-        convert_dtype(d_input.get<nv_bfloat16>(), d_in_f32.get<float>(), d_input.nelem(), mRunState.MainStream);
     } else {
         fill_zero(d_input, mRunState.MainStream);
         moe_permute_backward(d_input.get<float>(),

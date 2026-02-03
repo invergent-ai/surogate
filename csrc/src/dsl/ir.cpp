@@ -210,6 +210,15 @@ ActivationMemoryHint parse_memory_hint(const std::string& hint_str) {
     return ActivationMemoryHint::Persistent;  // Default
 }
 
+SharePolicy parse_share_policy(const std::string& policy_str) {
+    if (policy_str == "per_layer") return SharePolicy::PerLayer;
+    if (policy_str == "when_recomputed") return SharePolicy::WhenRecomputed;
+    if (policy_str == "always_share") return SharePolicy::AlwaysShare;
+    if (policy_str == "fft_share") return SharePolicy::FFTShare;
+    if (policy_str == "lora_share") return SharePolicy::LoRAShare;
+    return SharePolicy::WhenRecomputed;  // Default
+}
+
 ActivationSlotIR parse_activation_slot(const nlohmann::json& slot_json) {
     ActivationSlotIR slot;
     slot.name = slot_json.value("name", "");
@@ -255,6 +264,9 @@ ActivationSlotIR parse_activation_slot(const nlohmann::json& slot_json) {
         for (const auto& target : slot_json["lora_targets"]) {
             slot.lora_targets.push_back(target.get<std::string>());
         }
+    }
+    if (slot_json.contains("share_policy") && !slot_json["share_policy"].is_null()) {
+        slot.share_policy = parse_share_policy(slot_json["share_policy"].get<std::string>());
     }
     slot.gradient_of = slot_json.value("gradient_of", "");
     slot.alias_of = slot_json.value("alias_of", "");

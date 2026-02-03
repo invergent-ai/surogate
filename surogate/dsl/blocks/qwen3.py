@@ -73,9 +73,13 @@ class Qwen3Block:
         recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
         recompute_op="rmsnorm_apply_saved",
         recompute_policy="always",  # Recompute in both FFT and LoRA modes
+        share_policy="when_recomputed",  # Share across layers when recomputed
     )
-    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
-                          description="RMSNorm reciprocal std for LN1")
+    ln1_rstd = Activation(
+        Tensor["B", "T"], dtype="fp32", save=True,
+        share_policy="per_layer",  # Always save per-layer (needed for recompute)
+        description="RMSNorm reciprocal std for LN1",
+    )
 
     # QKV projection and RoPE
     # NOTE: qkv is safe to recompute in FFT mode (cuDNN attention is deterministic in latest release).
@@ -90,6 +94,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["q", "k", "v"],
+        share_policy="when_recomputed",  # Share when recomputed in backward
     )
     # NOTE: qkv_rope is safe to recompute in FFT mode (cuDNN attention is deterministic).
     qkv_rope = Activation(
@@ -108,6 +113,7 @@ class Qwen3Block:
         recompute_op="qkv_qk_norm_rope",
         recompute_attrs={"rotary_dim": "D"},
         recompute_policy="always",
+        share_policy="when_recomputed",  # Share when recomputed in backward
         description="QKV after QK-Norm + RoPE",
     )
 
@@ -120,6 +126,7 @@ class Qwen3Block:
         recompute=True,
         recompute_group="qk_norm_rope",
         recompute_policy="always",
+        share_policy="when_recomputed",  # Share when recomputed in backward
         when="use_qk_norm",
         description="Q head RMSNorm rstd",
     )
@@ -130,6 +137,7 @@ class Qwen3Block:
         recompute=True,
         recompute_group="qk_norm_rope",
         recompute_policy="always",
+        share_policy="when_recomputed",  # Share when recomputed in backward
         when="use_qk_norm",
         description="K head RMSNorm rstd",
     )
@@ -147,6 +155,8 @@ class Qwen3Block:
         recompute_op="flash_attention",
         recompute_attrs={"attn_impl": "cudnn"},
         recompute_policy="fft_only",
+        # Share only in FFT mode - LoRA O-proj hook needs per-layer att values
+        share_policy="fft_share",
         description="Attention output (pre out-proj)",
     )
     lse = Activation(
@@ -156,6 +166,8 @@ class Qwen3Block:
         recompute=True,
         recompute_group="attn_fwd",
         recompute_policy="fft_only",
+        # Share only in FFT mode - needed per-layer for attention backward in LoRA
+        share_policy="fft_share",
         description="Log-sum-exp from flash attention",
     )
     att_out = Activation(
@@ -167,6 +179,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["o"],
+        share_policy="when_recomputed",  # Can share in both FFT and LoRA modes
         description="After output projection",
     )
 
@@ -180,6 +193,7 @@ class Qwen3Block:
         recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
         recompute_op="fused_residual_rmsnorm_apply_saved",
         recompute_policy="always",  # Recompute in both FFT and LoRA modes
+        share_policy="when_recomputed",  # Share across layers when recomputed
         description="Residual + attention",
     )
 
@@ -190,9 +204,13 @@ class Qwen3Block:
         recompute=True,
         recompute_group="ln2_fused",
         recompute_policy="always",  # Recompute in both FFT and LoRA modes
+        share_policy="when_recomputed",  # Share across layers when recomputed
     )
-    ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
-                          description="RMSNorm reciprocal std for LN2")
+    ln2_rstd = Activation(
+        Tensor["B", "T"], dtype="fp32", save=True,
+        share_policy="per_layer",  # Always save per-layer (needed for recompute)
+        description="RMSNorm reciprocal std for LN2",
+    )
 
     # MLP
     mlp_up = Activation(
@@ -204,6 +222,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["up", "gate"],
+        share_policy="when_recomputed",  # Share across layers when recomputed
     )
     swiglu = Activation(
         Tensor["B", "T", "M"],
@@ -213,6 +232,7 @@ class Qwen3Block:
         recompute_op="swiglu",
         recompute_attrs={"activation": "swiglu"},
         recompute_policy="always",
+        share_policy="when_recomputed",  # Share across layers when recomputed
         description="SwiGLU activation output",
     )
     mlp_down = Activation(
@@ -224,6 +244,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["down"],
+        share_policy="when_recomputed",  # Share across layers when recomputed
         description="MLP down projection output",
     )
 
@@ -232,6 +253,7 @@ class Qwen3Block:
         Tensor["B", "T", "C"],
         aliases=["residual_ffn"],
         # res_ffn is stored via residual manager; do not mark as recompute.
+        share_policy="per_layer",  # Managed by residual manager, not shared
         description="Residual + MLP (block output)",
     )
 

@@ -99,6 +99,7 @@ class ActivationSlotIR:
     recompute_group: Optional[str] = None
     recompute_outputs: List[str] = field(default_factory=list)
     lora_targets: List[str] = field(default_factory=list)
+    share_policy: str = "when_recomputed"  # "per_layer", "when_recomputed", "always_share", "fft_share", "lora_share"
     gradient_of: Optional[str] = None
     alias_of: Optional[str] = None
     slot_index: int = -1  # Index in the activation struct
@@ -361,6 +362,7 @@ def _compile_activation_slot(
         recompute_group=slot.recompute_group,
         recompute_outputs=list(slot.recompute_outputs),
         lora_targets=list(slot.lora_targets),
+        share_policy=slot.share_policy.value,
         gradient_of=slot.gradient_of,
         alias_of=slot.alias_of,
         slot_index=slot_index,
@@ -1236,6 +1238,8 @@ def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
         result["recompute_outputs"] = list(slot.recompute_outputs)
     if slot.lora_targets:
         result["lora_targets"] = list(slot.lora_targets)
+    if slot.share_policy and slot.share_policy != "when_recomputed":
+        result["share_policy"] = slot.share_policy
     if slot.gradient_of:
         result["gradient_of"] = slot.gradient_of
     if slot.alias_of:

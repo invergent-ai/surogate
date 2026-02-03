@@ -147,6 +147,7 @@ void TensorSlotRegistry::init_from_layout(const ActivationLayoutIR& layout) {
         entry.recompute_group = slot_ir.recompute_group;
         entry.recompute_outputs = slot_ir.recompute_outputs;
         entry.lora_targets = slot_ir.lora_targets;
+        entry.share_policy = slot_ir.share_policy;
         entry.memory_hint = slot_ir.memory_hint;
         entry.shares_with = slot_ir.shares_with;
         entry.alias_of = slot_ir.alias_of;
@@ -295,6 +296,56 @@ ActivationMemoryHint TensorSlotRegistry::get_memory_hint(const std::string& name
         return entry->memory_hint;
     }
     return ActivationMemoryHint::Persistent;  // Default
+}
+
+SharePolicy TensorSlotRegistry::get_share_policy(const std::string& name) const {
+    auto entry = lookup(name);
+    if (entry) {
+        return entry->share_policy;
+    }
+    return SharePolicy::WhenRecomputed;  // Default
+}
+
+bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const {
+    auto entry = lookup(name);
+    if (!entry) {
+        // Default: share when recompute is enabled and will_recompute says so
+        return recompute_enabled && will_recompute(name, lora_only_mode);
+    }
+
+    switch (entry->share_policy) {
+        case SharePolicy::PerLayer:
+            // Never share - always allocate per-layer
+            return false;
+
+        case SharePolicy::WhenRecomputed:
+            // Share only if recompute is enabled AND will_recompute returns true
+            // This ensures we don't share when the tensor needs to be saved per-layer
+            return recompute_enabled && will_recompute(name, lora_only_mode);
+
+        case SharePolicy::AlwaysShare:
+            // Always share regardless of mode (use with caution)
+            // The caller must ensure this is safe for their use case
+            return true;
+
+        case SharePolicy::FFTShare:
+            // Share only in FFT mode (not LoRA mode) when recompute is enabled
+            // Useful for tensors that:
+            // - Are safe to share in FFT (no backward hooks need per-layer values)
+            // - Need per-layer in LoRA (LoRA hooks need original values per-layer)
+            // Example: attention output (att, lse) - LoRA O-proj hook needs per-layer att
+            return recompute_enabled && !lora_only_mode;
+
+        case SharePolicy::LoRAShare:
+            // Share only in LoRA mode (not FFT mode) when recompute is enabled
+            // Useful for tensors that:
+            // - LoRA can recompute during backward (hooks don't need saved values)
+            // - FFT needs saved per-layer for bit-exact gradients
+            return recompute_enabled && lora_only_mode;
+    }
+
+    // Fallback (should not reach here)
+    return recompute_enabled && will_recompute(name, lora_only_mode);
 }
 
 // ============================================================================

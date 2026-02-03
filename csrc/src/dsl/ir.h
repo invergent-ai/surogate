@@ -115,6 +115,19 @@ enum class ActivationMemoryHint : std::uint8_t {
     Shared,          ///< Shares memory with another slot
 };
 
+/// @brief Sharing policy for activation slots across layers
+///
+/// Controls whether an activation buffer can be shared across transformer layers
+/// to reduce memory usage. The policy determines when sharing is safe based on
+/// the recompute strategy and training mode (FFT vs LoRA).
+enum class SharePolicy : std::uint8_t {
+    PerLayer,        ///< Always allocate per-layer (no sharing)
+    WhenRecomputed,  ///< Share when slot will be recomputed in backward (default)
+    AlwaysShare,     ///< Always share across layers (use with caution)
+    FFTShare,        ///< Share only in FFT mode (not LoRA)
+    LoRAShare,       ///< Share only in LoRA mode (not FFT)
+};
+
 /// @brief Specification for a single activation tensor slot
 struct ActivationSlotIR {
     std::string name;                          ///< Canonical slot name (e.g., "ln1", "qkv")
@@ -133,6 +146,7 @@ struct ActivationSlotIR {
     std::string recompute_group;               ///< Group ID for multi-output ops
     std::vector<std::string> recompute_outputs;///< Explicit recompute outputs
     std::vector<std::string> lora_targets;     ///< LoRA targets for matmul recompute
+    SharePolicy share_policy = SharePolicy::WhenRecomputed;  ///< Cross-layer sharing policy
     std::string gradient_of;                   ///< For gradient slots: corresponding forward activation
     std::string alias_of;                      ///< Optional alias target (reuse existing buffer)
     std::string condition;                     ///< Condition expression (e.g., "use_qk_norm")

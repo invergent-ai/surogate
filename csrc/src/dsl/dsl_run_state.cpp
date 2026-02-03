@@ -196,127 +196,48 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const auto dtype = mActivationDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Activation sharing logic - based on recompute setting
-    // When recompute is enabled, intermediates can be shared because backward
-    // will recompute them from checkpoints.
+    // =========================================================================
+    // DSL-driven activation sharing
+    // =========================================================================
+    // The sharing policy for each slot is now defined in the Python DSL
+    // (e.g., surogate/dsl/blocks/qwen3.py) via the share_policy attribute.
+    // This eliminates hardcoded rules and makes the DSL the single source of truth.
     //
-    // recompute: false - Save everything, no sharing (maximum memory)
-    // recompute: true  - Share intermediates, recompute from checkpoints
+    // The TensorSlotRegistry.should_share() method evaluates the share_policy:
+    // - PerLayer: Never share (always allocate per-layer)
+    // - WhenRecomputed: Share when recompute is enabled and will_recompute() is true
+    // - AlwaysShare: Always share across layers
+    // - FFTShare: Share only in FFT mode (not LoRA)
+    // - LoRAShare: Share only in LoRA mode (not FFT)
     //
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool lora_only = mLoraOnlyMode;
-    const bool allow_lora_recompute = recompute_enabled && lora_only;
     const bool has_layout = mSlotRegistry.has_dsl_layout();
 
-    auto lookup_slot = [&](const char* name) -> std::optional<TensorSlotRegistry::SlotEntry> {
-        if (!has_layout) {
-            return std::nullopt;
+    // Helper to determine if a slot should be shared
+    auto should_share_slot = [&](const char* name) -> bool {
+        if (has_layout) {
+            return mSlotRegistry.should_share(name, lora_only, recompute_enabled);
         }
-        return mSlotRegistry.lookup(name);
+        // Legacy fallback when no DSL layout is available
+        return recompute_enabled && mSlotRegistry.will_recompute(name, lora_only);
     };
 
-    auto will_recompute_slot = [&](const char* name) -> bool {
-        if (!recompute_enabled) {
-            return false;
-        }
-        if (!has_layout) {
-            return recompute_enabled;
-        }
-        auto entry = lookup_slot(name);
-        if (!entry) {
-            return recompute_enabled;
-        }
-        if (lora_only && !allow_lora_recompute && !entry->lora_targets.empty()) {
-            return false;
-        }
-        bool will = mSlotRegistry.will_recompute(name, lora_only);
-        if (!will && lora_only && allow_lora_recompute && entry->recompute_in_backward) {
-            if (entry->recompute_policy == "fft_only") {
-                will = true;
-            }
-        }
-        return will;
-    };
+    // Query the DSL for sharing decisions
+    const bool share_ln1 = should_share_slot("ln1");
+    const bool share_ln2 = should_share_slot("ln2");
+    const bool share_qkv = should_share_slot("qkv");
+    const bool share_att = should_share_slot("att");
+    const bool share_att_out = should_share_slot("att_out");
+    const bool share_mlp_up = should_share_slot("mlp_up");
+    const bool share_swiglu = should_share_slot("swiglu");
+    const bool share_residual_intermediates = should_share_slot("res_att");
+    const bool share_mlp_down = should_share_slot("mlp_down");
+    const bool share_qk_rstd = use_qk_norm && should_share_slot("q_rstd");
 
-    bool share_ln1 = false;
-    bool share_ln2 = false;
-    bool share_qkv = false;
-    bool share_att = false;
-    bool share_att_out = false;
-    bool share_mlp_up = false;
-    bool share_swiglu = false;
-    bool share_residual_intermediates = false;
-    bool share_mlp_down = false;
-    bool share_qk_rstd = false;
-
-    if (recompute_enabled && lora_only) {
-        // Mirror modular recompute_block behavior in LoRA-only mode.
-        const bool lora_can_share_ln = !lora_only || allow_lora_recompute;
-        const bool lora_can_share_att = !lora_only;
-        const bool lora_can_share_swiglu = !lora_only;
-
-        share_ln1 = lora_can_share_ln;
-        share_ln2 = lora_can_share_ln;
-        share_qkv = true;
-        share_att = lora_can_share_att;
-        // att_out is not needed for LoRA backward; share it across layers.
-        share_att_out = true;
-        share_mlp_up = true;
-        share_swiglu = lora_can_share_swiglu;
-        share_residual_intermediates = true;
-        share_mlp_down = share_residual_intermediates;
-        share_qk_rstd = use_qk_norm;
-    } else if (has_layout) {
-        share_ln1 = will_recompute_slot("ln1");
-        share_ln2 = will_recompute_slot("ln2");
-        share_qkv = will_recompute_slot("qkv");
-        share_att = will_recompute_slot("att");
-        // In LoRA-only mode, only share outputs if we will recompute them.
-        share_att_out = share_att || (lora_only && allow_lora_recompute);
-        share_mlp_up = will_recompute_slot("mlp_up");
-        share_swiglu = will_recompute_slot("swiglu");
-        share_residual_intermediates = will_recompute_slot("res_att");
-        // In LoRA-only mode, only share MLP down when recompute is allowed.
-        share_mlp_down = share_residual_intermediates || (lora_only && allow_lora_recompute);
-        share_qk_rstd = will_recompute_slot("q_rstd") || (lora_only && allow_lora_recompute && use_qk_norm);
-    } else {
-        // Fallback to legacy behavior when no DSL layout is available.
-        // LN outputs can be shared only when recompute is enabled AND we will actually recompute them.
-        // In LoRA mode we skip recompute for several ops, so LN outputs must be per-layer.
-        const bool lora_can_share_ln = !lora_only || allow_lora_recompute;
-        share_ln1 = recompute_enabled && lora_can_share_ln;
-        share_ln2 = recompute_enabled && lora_can_share_ln;
-
-        // QKV sharing: only in LoRA mode where attention is recomputed.
-        // In FFT mode, we skip attention recompute and need saved QKV per-layer for bit-exact gradients.
-        // If QKV is shared, all layers would use the last layer's QKV data during backward!
-        share_qkv = recompute_enabled && (allow_lora_recompute || !lora_only);
-
-        // Attention output sharing:
-        // IMPORTANT: att/att_out/lse must NEVER be shared when recompute is enabled.
-        // - FFT mode: Need original forward values for bit-exact gradients
-        // - LoRA mode: LoRA O proj backward hook needs original att values per-layer
-        //              cuDNN attention is non-deterministic, so recomputed att != forward att
-        // This matches modular model behavior (see run_state_impl.tpp:568-572).
-        share_att = recompute_enabled && !lora_only;
-        share_att_out = share_att || (lora_only && allow_lora_recompute);
-
-        // MLP intermediates sharing:
-        // - FFT mode: Need per-layer for bit-exact gradients
-        // - LoRA mode: LoRA down_proj backward hook needs original swiglu values per-layer
-        // This matches modular model behavior (lora_can_share_swiglu = !lora_only).
-        share_mlp_up = recompute_enabled && (allow_lora_recompute || !lora_only);
-        share_swiglu = recompute_enabled && (allow_lora_recompute || !lora_only);
-
-        // Residual intermediates: must be per-layer in LoRA mode because we skip recompute.
-        share_residual_intermediates = recompute_enabled && !lora_only;
-        share_mlp_down = share_residual_intermediates || (lora_only && allow_lora_recompute);
-        share_qk_rstd = use_qk_norm && (recompute_enabled || (lora_only && allow_lora_recompute));
-    }
-
-    // FFN temps: Use stack-backed temps only when we explicitly allow LoRA recompute.
+    // FFN temps: Use stack-backed temps only in LoRA mode with recompute enabled.
     // This keeps FFT behavior unchanged while enabling QLoRA memory savings.
-    const bool ffn_temps_on_stack = recompute_enabled && lora_only && allow_lora_recompute;
+    const bool ffn_temps_on_stack = recompute_enabled && lora_only;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -549,15 +470,20 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto dtype = mGradDtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Gradient sharing flags - based on recompute level
-    // IMPORTANT: In FFT mode (not lora_only), gradient buffer sharing can cause issues because
-    // the DSL backward graph structure differs from LoRA mode. The gradients may be needed
-    // at different points in the backward pass, and sharing can cause corruption.
-    // For safety, disable all gradient sharing in FFT mode.
+    // =========================================================================
+    // Gradient buffer sharing
+    // =========================================================================
+    // Unlike activations, gradient sharing is more complex due to:
+    // 1. Backward hooks in LoRA mode that rely on per-layer gradients
+    // 2. Different backward graph structures in FFT vs LoRA modes
+    // 3. Risk of gradient corruption when sharing across layers
+    //
+    // For now, we keep gradient sharing disabled (per-layer allocation).
+    // In the future, this could be made DSL-driven via Gradient share_policy,
+    // but the benefit is smaller than activation sharing (gradients are typically
+    // computed and consumed immediately, not stored across layers).
+    //
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
-    // NOTE: LoRA + recompute uses backward hooks that rely on per-layer gradients.
-    // Sharing gradient buffers across layers corrupts those hooks in the DSL path.
-    // Disable gradient sharing in LoRA mode to keep per-layer grads stable.
     const bool share_grads = false;
     const bool share_res_ffn = false;
     const bool share_mlp_down = false;
