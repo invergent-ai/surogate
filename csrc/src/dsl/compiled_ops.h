@@ -242,15 +242,6 @@ private:
     int mCurrentLayer = -1;
     bool mCapturing = false;
 
-    struct RecomputeSample {
-        int micro_step = -1;
-        bool ln1_valid = false;
-        bool ln2_valid = false;
-        std::array<float, 4> ln1{};
-        std::array<float, 4> ln2{};
-    };
-    std::vector<RecomputeSample> mRecomputeSamples;
-
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;
     std::unordered_map<std::string, Tensor> mTensorMap;

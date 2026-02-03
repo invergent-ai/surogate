@@ -12,7 +12,6 @@
 #include <memory>
 #include <vector>
 #include <functional>
-#include <string>
 
 #include "tensor.h"
 
@@ -59,8 +58,6 @@ public:
 
     void set_context(const std::string& ctx);
     const std::string& get_context() const;
-
-    void debug_log_allocation_for_ptr(const void* ptr, const char* tag) const;
 
     class AllocationMonitor {
     public:

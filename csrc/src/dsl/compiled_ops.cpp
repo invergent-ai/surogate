@@ -116,60 +116,6 @@ MoeCompactInfo build_moe_compact_info_from_host(const int* host_offsets,
 
     return info;
 }
-
-bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
-                                      std::size_t count, std::vector<float>& out) {
-    out.assign(count, 0.0f);
-    if (count == 0 || !t.Data) {
-        return false;
-    }
-    const std::size_t total = static_cast<std::size_t>(t.nelem());
-    if (elem_offset + count > total) {
-        return false;
-    }
-    const std::size_t byte_offset = elem_offset * get_dtype_size(t.DType);
-    const std::byte* base = static_cast<const std::byte*>(t.Data) + byte_offset;
-    switch (t.DType) {
-    case ETensorDType::FP32:
-        cudaMemcpy(out.data(), base, count * sizeof(float), cudaMemcpyDeviceToHost);
-        return true;
-    case ETensorDType::BF16: {
-        std::vector<nv_bfloat16> tmp(count);
-        cudaMemcpy(tmp.data(), base, count * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost);
-        for (std::size_t i = 0; i < count; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
-    }
-    case ETensorDType::FP16: {
-        std::vector<half> tmp(count);
-        cudaMemcpy(tmp.data(), base, count * sizeof(half), cudaMemcpyDeviceToHost);
-        for (std::size_t i = 0; i < count; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
-    }
-    case ETensorDType::FP8_E4M3: {
-        std::vector<__nv_fp8_e4m3> tmp(count);
-        cudaMemcpy(tmp.data(), base, count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
-        for (std::size_t i = 0; i < count; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
-    }
-    case ETensorDType::FP8_E5M2: {
-        std::vector<__nv_fp8_e5m2> tmp(count);
-        cudaMemcpy(tmp.data(), base, count * sizeof(__nv_fp8_e5m2), cudaMemcpyDeviceToHost);
-        for (std::size_t i = 0; i < count; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
-    }
-    default:
-        return false;
-    }
-}
-
 bool build_selective_info_from_offsets(const int* host_offsets,
                                        int num_experts,
                                        modules::SelectiveExpertInfo& selection) {
@@ -216,234 +162,9 @@ bool refresh_moe_experts_if_needed(int layer_idx,
     return refreshed;
 }
 
-bool copy_tensor_token_sample_as_f32(const Tensor& t, long token_idx,
-                                     std::size_t count, std::vector<float>& out) {
-    out.assign(count, 0.0f);
-    if (!t.Data || token_idx < 0 || t.Rank < 2) {
-        return false;
-    }
-    std::size_t row_width = 0;
-    if (t.Rank == 2) {
-        row_width = static_cast<std::size_t>(t.Sizes[1]);
-    } else if (t.Rank >= 3) {
-        row_width = 1;
-        for (int i = 2; i < t.Rank; ++i) {
-            row_width *= static_cast<std::size_t>(t.Sizes[i]);
-        }
-    }
-    if (row_width == 0) {
-        return false;
-    }
-    const std::size_t elem_offset = static_cast<std::size_t>(token_idx) * row_width;
-    return copy_tensor_sample_offset_as_f32(t, elem_offset, count, out);
-}
-
-std::size_t tensor_row_width(const Tensor& t);
-
-std::size_t tensor_row_width(const Tensor& t) {
-    if (t.Rank <= 1) {
-        return static_cast<std::size_t>(t.nelem());
-    }
-    std::size_t row_width = 1;
-    for (int i = 1; i < t.Rank; ++i) {
-        row_width *= static_cast<std::size_t>(t.Sizes[i]);
-    }
-    return row_width;
-}
-
-bool tensor_row_has_nan_or_inf(const Tensor& t, long token_idx, float* out_min, float* out_max) {
-    if (!t.Data) {
-        return false;
-    }
-    const std::size_t row_width = tensor_row_width(t);
-    if (row_width == 0) {
-        return false;
-    }
-    std::vector<float> vals(row_width);
-    if (!copy_tensor_token_sample_as_f32(t, token_idx, row_width, vals)) {
-        return false;
-    }
-    float min_val = std::numeric_limits<float>::infinity();
-    float max_val = -std::numeric_limits<float>::infinity();
-    bool has_nan = false;
-    for (float v : vals) {
-        if (std::isnan(v) || std::isinf(v)) {
-            has_nan = true;
-            continue;
-        }
-        min_val = std::min(min_val, v);
-        max_val = std::max(max_val, v);
-    }
-    if (out_min) {
-        *out_min = std::isfinite(min_val) ? min_val : 0.0f;
-    }
-    if (out_max) {
-        *out_max = std::isfinite(max_val) ? max_val : 0.0f;
-    }
-    return has_nan;
-}
-
-bool find_first_nan_row(const Tensor& t, long* out_row, float* out_min, float* out_max) {
-    if (t.Rank < 1) {
-        return false;
-    }
-    const long rows = static_cast<long>(t.Sizes[0]);
-    for (long r = 0; r < rows; ++r) {
-        if (tensor_row_has_nan_or_inf(t, r, out_min, out_max)) {
-            if (out_row) {
-                *out_row = r;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
 // Global state for QKV gradient tracking (shared across split op files)
 std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
 std::vector<int> g_qkv_dA_micro_by_layer;
-
-namespace {
-
-struct QkvGuardKey {
-    const void* ptr = nullptr;
-    int layer = -1;
-    int micro = -1;
-};
-
-struct QkvGuardKeyHash {
-    std::size_t operator()(const QkvGuardKey& k) const noexcept {
-        const auto h1 = std::hash<const void*>{}(k.ptr);
-        const auto h2 = std::hash<int>{}(k.layer);
-        const auto h3 = std::hash<int>{}(k.micro);
-        return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2))
-               ^ (h3 + 0x9e3779b9 + (h2 << 6) + (h2 >> 2));
-    }
-};
-
-struct QkvGuardKeyEq {
-    bool operator()(const QkvGuardKey& a, const QkvGuardKey& b) const noexcept {
-        return a.ptr == b.ptr && a.layer == b.layer && a.micro == b.micro;
-    }
-};
-
-std::unordered_map<QkvGuardKey, QkvGuardSample, QkvGuardKeyHash, QkvGuardKeyEq> g_qkv_guard_samples;
-std::unordered_map<const void*, QkvLastWriter> g_qkv_last_writer_by_ptr;
-std::unordered_map<const void*, QkvKernelWriter> g_qkv_kernel_writer_by_ptr;
-std::atomic<const void*> g_qkv_watch_ptr{nullptr};
-std::mutex g_qkv_guard_mutex;
-
-}  // namespace
-
-void record_qkv_guard_sample(const void* ptr,
-                             int layer_idx,
-                             int micro_step,
-                             std::uint16_t op_idx,
-                             const std::string& op_id,
-                             const std::array<float, 8>& vals) {
-    if (!ptr || layer_idx < 0 || micro_step < 0) {
-        return;
-    }
-    const QkvGuardKey key{ptr, layer_idx, micro_step};
-    QkvGuardSample sample;
-    sample.vals = vals;
-    sample.op_idx = op_idx;
-    sample.op_id = op_id;
-    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
-    g_qkv_guard_samples[key] = std::move(sample);
-
-    if (env_int("SUROGATE_QKV_PTR_WATCH_ANY", 0)) {
-        const void* expected = nullptr;
-        g_qkv_watch_ptr.compare_exchange_strong(expected, ptr);
-    }
-}
-
-bool fetch_qkv_guard_sample(const void* ptr,
-                            int layer_idx,
-                            int micro_step,
-                            QkvGuardSample& out) {
-    if (!ptr || layer_idx < 0 || micro_step < 0) {
-        return false;
-    }
-    const QkvGuardKey key{ptr, layer_idx, micro_step};
-    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
-    auto it = g_qkv_guard_samples.find(key);
-    if (it == g_qkv_guard_samples.end()) {
-        return false;
-    }
-    out = it->second;
-    return true;
-}
-
-void record_qkv_last_writer(const void* ptr,
-                            int layer_idx,
-                            int micro_step,
-                            std::uint16_t op_idx,
-                            const std::string& op_id,
-                            const char* op_type,
-                            const std::string& out_name) {
-    if (!ptr) {
-        return;
-    }
-    QkvLastWriter writer;
-    writer.layer = layer_idx;
-    writer.micro = micro_step;
-    writer.op_idx = op_idx;
-    writer.op_id = op_id;
-    writer.op_type = op_type ? op_type : "";
-    writer.out_name = out_name;
-    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
-    g_qkv_last_writer_by_ptr[ptr] = std::move(writer);
-}
-
-bool fetch_qkv_last_writer(const void* ptr,
-                           QkvLastWriter& out) {
-    if (!ptr) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
-    auto it = g_qkv_last_writer_by_ptr.find(ptr);
-    if (it == g_qkv_last_writer_by_ptr.end()) {
-        return false;
-    }
-    out = it->second;
-    return true;
-}
-
-void record_qkv_kernel_writer(const void* ptr,
-                              int layer_idx,
-                              int micro_step,
-                              std::uint16_t op_idx,
-                              const std::string& op_id,
-                              const char* op_type,
-                              const std::string& out_name) {
-    if (!ptr) {
-        return;
-    }
-    QkvKernelWriter writer;
-    writer.layer = layer_idx;
-    writer.micro = micro_step;
-    writer.op_idx = op_idx;
-    writer.op_id = op_id;
-    writer.op_type = op_type ? op_type : "";
-    writer.out_name = out_name;
-    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
-    g_qkv_kernel_writer_by_ptr[ptr] = std::move(writer);
-}
-
-bool fetch_qkv_kernel_writer(const void* ptr,
-                             QkvKernelWriter& out) {
-    if (!ptr) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_qkv_guard_mutex);
-    auto it = g_qkv_kernel_writer_by_ptr.find(ptr);
-    if (it == g_qkv_kernel_writer_by_ptr.end()) {
-        return false;
-    }
-    out = it->second;
-    return true;
-}
 
 float env_float(const char* name, float fallback) {
     if (!name || !*name) {
@@ -1487,45 +1208,6 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
-    const char* watch_env = std::getenv("SUROGATE_PTR_WATCH");
-    const bool auto_watch_qkv = (watch_env &&
-                                 (std::strcmp(watch_env, "auto_qkv") == 0 ||
-                                  std::strcmp(watch_env, "qkv") == 0));
-    static void* auto_watch_ptr = nullptr;
-    static bool auto_watch_set = false;
-    void* watch_ptr = nullptr;
-    if (!auto_watch_qkv && watch_env && *watch_env) {
-        char* end = nullptr;
-        const unsigned long long raw = std::strtoull(watch_env, &end, 0);
-        if (end != watch_env) {
-            watch_ptr = reinterpret_cast<void*>(raw);
-        }
-    }
-    auto watch = [&](Tensor& t) -> Tensor& {
-        if (auto_watch_qkv && !auto_watch_set && t.Data && !ref.name.empty()) {
-            if (ref.name.find(".qkv") != std::string::npos) {
-                auto_watch_ptr = t.Data;
-                auto_watch_set = true;
-                std::cerr << "[PTR_WATCH_SET] name=" << ref.name
-                          << " layer=" << ref.layer_idx
-                          << " ptr=" << t.Data
-                          << " dtype=" << static_cast<int>(t.DType)
-                          << " shape=" << tensor_shape_str(t)
-                          << std::endl;
-            }
-        }
-        void* effective_watch_ptr = auto_watch_qkv ? auto_watch_ptr : watch_ptr;
-        if (effective_watch_ptr && t.Data == effective_watch_ptr) {
-            std::cerr << "[PTR_WATCH] name=" << ref.name
-                      << " layer=" << ref.layer_idx
-                      << " ptr=" << t.Data
-                      << " dtype=" << static_cast<int>(t.DType)
-                      << " shape=" << tensor_shape_str(t)
-                      << std::endl;
-        }
-        return t;
-    };
-
     if (!ref.name.empty()) {
         if (auto base = base_param_from_grad(ref.name)) {
             bool accum = false;
@@ -1533,10 +1215,10 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                 if (grad->Data) {
                     if (!ref.shape.empty()) {
                         auto [it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*grad, ref.shape));
-                        return watch(it->second);
+                        return it->second;
                     }
                     auto [it, _] = mTensorMap.insert_or_assign(ref.name, *grad);
-                    return watch(it->second);
+                    return it->second;
                 }
             }
         }
@@ -1575,7 +1257,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                         Tensor& base = resolve_tensor(alias_ref);
                         Tensor view = ref.shape.empty() ? base : view_tensor(base, ref.shape);
                         auto [it, _] = mTensorMap.insert_or_assign(ref.name, view);
-                        return watch(it->second);
+                        return it->second;
                     } catch (const std::exception&) {
                         // Fall through to normal allocation if alias resolution fails.
                     }
@@ -1597,15 +1279,15 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
             if (!inserted) {
                 it->second = view_tensor(t, ref.shape);
             }
-            return watch(it->second);
+            return it->second;
         }
-        return watch(t);
+        return t;
     }
 
     // For mapped/temporary tensors, allocate if needed
     auto it = mTensorMap.find(ref.name);
     if (it != mTensorMap.end()) {
-        return watch(it->second);
+        return it->second;
     }
 
     Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape);
@@ -1621,7 +1303,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 
     mTemps.push_back(t);
     auto [ins_it, inserted] = mTensorMap.emplace(ref.name, t);
-    return watch(ins_it->second);
+    return ins_it->second;
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
@@ -1693,15 +1375,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         layer_temp_marks.resize(static_cast<std::size_t>(num_layers));
         layer_active.assign(static_cast<std::size_t>(num_layers), 0);
     }
-    const bool lora_b_watch = env_int("SUROGATE_LORA_B_FIRST_WRITER", 0) != 0;
-    const int lora_b_watch_layer = env_int("SUROGATE_LORA_B_FIRST_WRITER_LAYER", -1);
-    const int lora_b_watch_limit = env_int("SUROGATE_LORA_B_FIRST_WRITER_LIMIT", 1000000);
-    const bool lora_b_watch_abort = env_int("SUROGATE_LORA_B_FIRST_WRITER_ABORT", 1) != 0;
-    static std::atomic<int> lora_b_watch_count{0};
-    static std::atomic<int> lora_b_watch_tripped{0};
-    if (lora_b_watch && mLoRAWeights && mConfig.NumLayers > 0 && mLoraBSeenClean.empty()) {
-        mLoraBSeenClean.assign(static_cast<std::size_t>(mConfig.NumLayers), 0);
-    }
+
     auto prune_stack_tensors = [&]() {
         for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
             // Skip tensors that are needed for backward (in save list)
@@ -1837,198 +1511,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             oss << "CompiledExecutor forward op " << idx << " (type=" << op_type_to_string(op.type)
                 << ", id=" << op.op_id << "): " << e.what();
             throw std::runtime_error(oss.str());
-        }
-
-        if (env_int("SUROGATE_QKV_GUARD", 0)) {
-            const char* op_type_name = op_type_to_string(op.type);
-            for (const auto& out_ref : op.outputs) {
-                auto it = mTensorMap.find(out_ref.name);
-                if (it == mTensorMap.end()) {
-                    continue;
-                }
-                const Tensor& t = it->second;
-                if (!t.Data) {
-                    continue;
-                }
-                int layer_idx = op.attrs.layer_idx;
-                if (layer_idx < 0 && out_ref.layer_idx >= 0) {
-                    layer_idx = out_ref.layer_idx;
-                }
-                record_qkv_last_writer(t.Data, layer_idx, mMicroStep,
-                                       op.original_idx, op.op_id,
-                                       op_type_name, out_ref.name);
-            }
-        }
-
-        if (env_int("SUROGATE_QKV_PTR_WATCH_ANY", 0)) {
-            const void* watch_ptr = g_qkv_watch_ptr.load(std::memory_order_relaxed);
-            if (watch_ptr) {
-                const int watch_limit = env_int("SUROGATE_QKV_PTR_WATCH_ANY_LIMIT", 64);
-                static std::atomic<int> watch_count{0};
-                const char* op_type_name = op_type_to_string(op.type);
-                for (const auto& out_ref : op.outputs) {
-                    auto it = mTensorMap.find(out_ref.name);
-                    if (it == mTensorMap.end()) {
-                        continue;
-                    }
-                    const Tensor& t = it->second;
-                    if (!t.Data || t.Data != watch_ptr) {
-                        continue;
-                    }
-                    int layer_idx = op.attrs.layer_idx;
-                    if (layer_idx < 0 && out_ref.layer_idx >= 0) {
-                        layer_idx = out_ref.layer_idx;
-                    }
-                    if (watch_limit <= 0 || watch_count.fetch_add(1) < watch_limit) {
-                        std::cerr << "[QKV_PTR_WATCH_ANY] layer=" << layer_idx
-                                  << " micro=" << mMicroStep
-                                  << " op_idx=" << op.original_idx
-                                  << " op_id=" << op.op_id
-                                  << " type=" << op_type_name
-                                  << " out=" << out_ref.name
-                                  << " ptr=" << t.Data
-                                  << std::endl;
-                    }
-                }
-            }
-        }
-
-        if (env_int("SUROGATE_QKV_WRITE_WATCH", 0) && op.type != CompiledOpType::View) {
-            const int watch_layer = env_int("SUROGATE_QKV_WRITE_WATCH_LAYER", -1);
-            const int watch_limit = env_int("SUROGATE_QKV_WRITE_WATCH_LIMIT", 32);
-            static std::atomic<int> watch_count{0};
-            const char* op_type_name = op_type_to_string(op.type);
-            for (const auto& out_ref : op.outputs) {
-                auto it = mTensorMap.find(out_ref.name);
-                if (it == mTensorMap.end()) {
-                    continue;
-                }
-                const Tensor& t = it->second;
-                if (!t.Data) {
-                    continue;
-                }
-                int layer_idx = op.attrs.layer_idx;
-                if (layer_idx < 0 && out_ref.layer_idx >= 0) {
-                    layer_idx = out_ref.layer_idx;
-                }
-                if (watch_layer >= 0 && layer_idx != watch_layer) {
-                    continue;
-                }
-                QkvGuardSample guard_sample;
-                if (!fetch_qkv_guard_sample(t.Data, layer_idx, mMicroStep, guard_sample)) {
-                    continue;
-                }
-                record_qkv_kernel_writer(t.Data, layer_idx, mMicroStep,
-                                         op.original_idx, op.op_id,
-                                         op_type_name, out_ref.name);
-                if (watch_limit <= 0 || watch_count.fetch_add(1) < watch_limit) {
-                    std::cerr << "[QKV_WRITE_WATCH] layer=" << layer_idx
-                              << " micro=" << mMicroStep
-                              << " op_idx=" << op.original_idx
-                              << " op_id=" << op.op_id
-                              << " type=" << op_type_name
-                              << " out=" << out_ref.name
-                              << " ptr=" << t.Data
-                              << " guard_op_idx=" << guard_sample.op_idx
-                              << " guard_op_id=" << guard_sample.op_id
-                              << std::endl;
-                }
-            }
-        }
-
-        if (lora_b_watch && mLoRAWeights && mLoRAConfig && !mCapturing &&
-            !lora_b_watch_tripped.load(std::memory_order_relaxed)) {
-            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-            if (cudaStreamIsCapturing(mRunState.MainStream, &status) == cudaSuccess &&
-                status == cudaStreamCaptureStatusNone) {
-                if (lora_b_watch_limit <= 0 ||
-                    lora_b_watch_count.fetch_add(1) < lora_b_watch_limit) {
-                    auto resolve_layer_idx = [&](const CompiledOp& op_ref) -> int {
-                        int layer_idx = op_ref.attrs.layer_idx;
-                        if (layer_idx < 0) {
-                            for (const auto& out_ref : op_ref.outputs) {
-                                if (out_ref.layer_idx >= 0) {
-                                    layer_idx = out_ref.layer_idx;
-                                    break;
-                                }
-                            }
-                        }
-                        return layer_idx;
-                    };
-                    const int layer_idx = resolve_layer_idx(op);
-                    if (layer_idx >= 0 &&
-                        (lora_b_watch_layer < 0 || lora_b_watch_layer == layer_idx) &&
-                        layer_idx < static_cast<int>(mLoraBSeenClean.size())) {
-                        auto& block = mLoRAWeights->peek_block(layer_idx);
-                        auto sample_nan = [&](const std::optional<modules::LoRALayerWeights<Tensor>>& lw,
-                                              std::array<float, 4>& sample) -> bool {
-                            sample = {0.0f, 0.0f, 0.0f, 0.0f};
-                            if (!lw.has_value() || !lw->B.Data) {
-                                return false;
-                            }
-                            std::vector<float> vals;
-                            if (!copy_tensor_sample_offset_as_f32(lw->B, 0, 8, vals)) {
-                                return false;
-                            }
-                            bool has_nan = false;
-                            for (std::size_t i = 0; i < vals.size(); ++i) {
-                                if (std::isnan(vals[i]) || std::isinf(vals[i])) {
-                                    has_nan = true;
-                                }
-                                if (i < 4) {
-                                    sample[i] = vals[i];
-                                }
-                            }
-                            return has_nan;
-                        };
-                        std::array<float, 4> q_sample{};
-                        std::array<float, 4> k_sample{};
-                        std::array<float, 4> v_sample{};
-                        const bool q_nan = sample_nan(block.attention.q, q_sample);
-                        const bool k_nan = sample_nan(block.attention.k, k_sample);
-                        const bool v_nan = sample_nan(block.attention.v, v_sample);
-                        const bool any_nan = q_nan || k_nan || v_nan;
-                        if (!any_nan) {
-                            mLoraBSeenClean[static_cast<std::size_t>(layer_idx)] = 1;
-                        } else {
-                            const bool seen_clean = mLoraBSeenClean[static_cast<std::size_t>(layer_idx)] != 0;
-                            auto join_refs = [](const std::vector<TensorRef>& refs) {
-                                std::string out;
-                                for (std::size_t i = 0; i < refs.size(); ++i) {
-                                    out += refs[i].name;
-                                    if (i + 1 < refs.size()) {
-                                        out += ",";
-                                    }
-                                }
-                                return out;
-                            };
-                            const std::string inputs_str = join_refs(op.inputs);
-                            const std::string outputs_str = join_refs(op.outputs);
-                            std::cerr << fmt::format(
-                                "[LORA_B_FIRST_WRITER] layer={} micro={} op_idx={} op_id={} type={} seen_clean={} inputs=[{}] outputs=[{}] "
-                                "q_nan={} k_nan={} v_nan={} q={:.6g},{:.6g},{:.6g},{:.6g} k={:.6g},{:.6g},{:.6g},{:.6g} v={:.6g},{:.6g},{:.6g},{:.6g}\n",
-                                layer_idx,
-                                mMicroStep,
-                                op.original_idx,
-                                op.op_id,
-                                op_type_to_string(op.type),
-                                seen_clean ? 1 : 0,
-                                inputs_str,
-                                outputs_str,
-                                q_nan ? 1 : 0,
-                                k_nan ? 1 : 0,
-                                v_nan ? 1 : 0,
-                                q_sample[0], q_sample[1], q_sample[2], q_sample[3],
-                                k_sample[0], k_sample[1], k_sample[2], k_sample[3],
-                                v_sample[0], v_sample[1], v_sample[2], v_sample[3]);
-                            lora_b_watch_tripped.store(1, std::memory_order_relaxed);
-                            if (lora_b_watch_abort) {
-                                throw std::runtime_error("LoRA B became NaN (first-writer watchdog)");
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         // Handle layer end
@@ -2550,36 +2032,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     };
 
     const int num_layers = static_cast<int>(mConfig.NumLayers);
-    const bool assert_recompute_a = (std::getenv("SUROGATE_ASSERT_RECOMPUTE_A") != nullptr);
-    if (assert_recompute_a) {
-        if (mRecomputeSamples.size() != static_cast<std::size_t>(num_layers)) {
-            mRecomputeSamples.assign(static_cast<std::size_t>(num_layers), RecomputeSample{});
-        }
-        for (auto& sample : mRecomputeSamples) {
-            sample.micro_step = mMicroStep;
-            sample.ln1_valid = false;
-            sample.ln2_valid = false;
-        }
-    }
-    auto record_recompute_sample = [&](int layer_idx) {
-        if (!assert_recompute_a) return;
-        if (layer_idx < 0 || layer_idx >= num_layers) return;
-        auto& sample = mRecomputeSamples[static_cast<std::size_t>(layer_idx)];
-        sample.micro_step = mMicroStep;
-        sample.ln1_valid = false;
-        sample.ln2_valid = false;
-        const long sample_token = 3;
-        std::vector<float> vals;
-        auto& acts = mRunState.simplified_acts(layer_idx);
-        if (acts.ln1.Data && copy_tensor_token_sample_as_f32(acts.ln1, sample_token, 4, vals)) {
-            for (int i = 0; i < 4; ++i) sample.ln1[static_cast<std::size_t>(i)] = vals[i];
-            sample.ln1_valid = true;
-        }
-        if (acts.ln2.Data && copy_tensor_token_sample_as_f32(acts.ln2, sample_token, 4, vals)) {
-            for (int i = 0; i < 4; ++i) sample.ln2[static_cast<std::size_t>(i)] = vals[i];
-            sample.ln2_valid = true;
-        }
-    };
+
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
     std::vector<bool> layer_seen_any(num_layers, false);
     for (const auto& op : graph.ops) {
@@ -2605,7 +2058,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
                 }
                 mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
-                record_recompute_sample(layer_idx);
                 mLastRecomputeLayer = layer_idx;
             }
         }
@@ -2629,7 +2081,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
                 }
                 mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
-                record_recompute_sample(effective_layer_idx);
                 mLastRecomputeLayer = effective_layer_idx;
             }
         }

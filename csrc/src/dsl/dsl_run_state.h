@@ -86,11 +86,6 @@ public:
     /// @brief Get temporary LSE buffer for recomputation (avoids overwriting saved values)
     Tensor& recompute_lse() { return mRecomputeLSE; }
 
-    /// @brief Check QKV canary guards for shared buffer corruption.
-    bool check_qkv_canary(cudaStream_t stream, const char* tag,
-                          int layer_idx, int micro_step,
-                          const char* op_id) const;
-
     cudaStream_t side_stream() const { return mSideStream; }
     cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
     cudaEvent_t all_reduce_done_event() const { return mAllReduceDone; }
@@ -200,12 +195,6 @@ private:
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     Tensor mFP8ForwardStats{};
     Tensor mGradQuantStats{};
-
-    // QKV shared buffer canary (debug)
-    bool mQkvCanaryEnabled = false;
-    Tensor mQkvCanaryRaw{};
-    std::size_t mQkvCanaryGuardBytes = 0;
-    std::byte mQkvCanaryPattern{0xA5};
 
     // Temporary buffers for recomputation (to avoid overwriting saved activations)
     Tensor mRecomputeRstd{};  ///< Temp buffer for rstd during recomputation [B, T]

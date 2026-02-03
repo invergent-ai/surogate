@@ -6,9 +6,7 @@
 #ifndef SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H
 #define SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H
 
-#include <array>
 #include <cstddef>
-#include <cstdint>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
@@ -19,61 +17,6 @@ namespace dsl {
 // Global state for QKV gradient tracking (shared across split op files)
 extern std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
 extern std::vector<int> g_qkv_dA_micro_by_layer;
-
-struct QkvGuardSample {
-    std::array<float, 8> vals{};
-    std::uint16_t op_idx = 0;
-    std::string op_id;
-};
-
-struct QkvLastWriter {
-    int layer = -1;
-    int micro = -1;
-    std::uint16_t op_idx = 0;
-    std::string op_id;
-    std::string op_type;
-    std::string out_name;
-};
-
-struct QkvKernelWriter {
-    int layer = -1;
-    int micro = -1;
-    std::uint16_t op_idx = 0;
-    std::string op_id;
-    std::string op_type;
-    std::string out_name;
-};
-
-void record_qkv_guard_sample(const void* ptr,
-                             int layer_idx,
-                             int micro_step,
-                             std::uint16_t op_idx,
-                             const std::string& op_id,
-                             const std::array<float, 8>& vals);
-bool fetch_qkv_guard_sample(const void* ptr,
-                            int layer_idx,
-                            int micro_step,
-                            QkvGuardSample& out);
-
-void record_qkv_last_writer(const void* ptr,
-                            int layer_idx,
-                            int micro_step,
-                            std::uint16_t op_idx,
-                            const std::string& op_id,
-                            const char* op_type,
-                            const std::string& out_name);
-bool fetch_qkv_last_writer(const void* ptr,
-                           QkvLastWriter& out);
-
-void record_qkv_kernel_writer(const void* ptr,
-                              int layer_idx,
-                              int micro_step,
-                              std::uint16_t op_idx,
-                              const std::string& op_id,
-                              const char* op_type,
-                              const std::string& out_name);
-bool fetch_qkv_kernel_writer(const void* ptr,
-                             QkvKernelWriter& out);
 
 // MoE compact weight information
 struct MoeCompactInfo {
@@ -98,30 +41,15 @@ MoeCompactInfo build_moe_compact_info_from_host(const int* host_offsets,
                                                 int layer_idx,
                                                 const char* tag);
 
-void log_moe_gate_up_weight_sample(const char* tag,
-                                   int layer_idx,
-                                   int micro_step,
-                                   DslParamStore& weights,
-                                   const modules::ModelConfig& cfg);
-
 int env_int(const char* name, int fallback);
 float env_float(const char* name, float fallback);
 
-bool copy_tensor_token_sample_as_f32(const Tensor& t, long token_idx,
-                                     std::size_t count, std::vector<float>& out);
-bool copy_tensor_sample_offset_as_f32(const Tensor& t, std::size_t elem_offset,
-                                      std::size_t count, std::vector<float>& out);
-
-bool tensor_row_has_nan_or_inf(const Tensor& t, long token_idx, float* out_min, float* out_max);
-bool find_first_nan_row(const Tensor& t, long* out_row, float* out_min, float* out_max);
 
 bool refresh_moe_experts_if_needed(int layer_idx,
                                    const int* host_offsets,
                                    int num_experts,
                                    DslParamStore& weights,
                                    cudaStream_t stream);
-
-std::size_t tensor_row_width(const Tensor& t);
 
 }  // namespace dsl
 

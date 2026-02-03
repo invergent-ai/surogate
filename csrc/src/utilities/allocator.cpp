@@ -454,55 +454,6 @@ const std::string& TensorAllocator::get_context() const {
     return m_Stats->Context;
 }
 
-void TensorAllocator::debug_log_allocation_for_ptr(const void* ptr, const char* tag) const {
-    const char* tag_str = tag ? tag : "<none>";
-    if (!ptr) {
-        std::cerr << fmt::format("[ALLOC_PTR] tag={} ptr=<null>\n", tag_str);
-        return;
-    }
-    const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
-    const sAllocationData* match = nullptr;
-    std::uintptr_t match_base = 0;
-    std::size_t matches = 0;
-    for (const auto& alloc : m_Pointers) {
-        const auto base = reinterpret_cast<std::uintptr_t>(alloc.Pointer);
-        const auto size = static_cast<std::uintptr_t>(alloc.Size);
-        if (addr >= base && addr < base + size) {
-            if (!match) {
-                match = &alloc;
-                match_base = base;
-            }
-            ++matches;
-        }
-    }
-    if (!match) {
-        std::cerr << fmt::format("[ALLOC_PTR] tag={} ptr={} owner=<none>\n", tag_str, ptr);
-        return;
-    }
-    const char* kind_str = "unknown";
-    switch (match->Kind) {
-        case EAllocationType::ON_DEVICE: kind_str = "device"; break;
-        case EAllocationType::MANAGED: kind_str = "managed"; break;
-        case EAllocationType::PINNED: kind_str = "pinned"; break;
-        case EAllocationType::WRITE_CMB: kind_str = "write-combined"; break;
-        case EAllocationType::ON_HOST: kind_str = "host"; break;
-    }
-    const auto offset = static_cast<std::size_t>(addr - match_base);
-    const bool is_base = addr == match_base;
-    std::cerr << fmt::format(
-        "[ALLOC_PTR] tag={} ptr={} owner={} ctx={} kind={} base={} size={} offset={} is_base={} matches={}\n",
-        tag_str,
-        ptr,
-        match->Name.empty() ? "<unnamed>" : match->Name,
-        match->Context.empty() ? "<none>" : match->Context,
-        kind_str,
-        static_cast<const void*>(match->Pointer),
-        match->Size,
-        offset,
-        is_base ? 1 : 0,
-        matches);
-}
-
 /**
  * @brief RAII helper that sets an allocator context for the lifetime of the monitor.
  *

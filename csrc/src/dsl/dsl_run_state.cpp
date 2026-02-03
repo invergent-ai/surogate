@@ -255,30 +255,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     if (share_ln1) shared_ln1 = mAllocator->allocate(dtype, "ln1_shared", kind, {B, T, C});
     if (share_ln2) shared_ln2 = mAllocator->allocate(dtype, "ln2_shared", kind, {B, T, C});
     if (share_qkv) {
-        const char* canary_env = std::getenv("SUROGATE_QKV_CANARY");
-        const bool use_canary = canary_env && *canary_env && std::atoi(canary_env) != 0;
-        if (use_canary) {
-            const char* guard_env = std::getenv("SUROGATE_QKV_CANARY_BYTES");
-            std::size_t guard_bytes = guard_env && *guard_env ? std::strtoull(guard_env, nullptr, 10) : 4096ULL;
-            const std::size_t qkv_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T)
-                                          * static_cast<std::size_t>(QKV) * static_cast<std::size_t>(get_dtype_size(dtype));
-            if (guard_bytes == 0) {
-                guard_bytes = 4096ULL;
-            }
-            const std::size_t total_bytes = qkv_bytes + 2 * guard_bytes;
-            Tensor raw = mAllocator->allocate(ETensorDType::BYTE, "qkv_shared_canary", kind,
-                                              {static_cast<long>(total_bytes)});
-            mQkvCanaryEnabled = true;
-            mQkvCanaryRaw = raw;
-            mQkvCanaryGuardBytes = guard_bytes;
-            shared_qkv = Tensor::from_pointer(raw.Data + guard_bytes, raw.Device, dtype,
-                                              std::vector<long>{B, T, QKV});
-            CUDA_CHECK(cudaMemsetAsync(raw.Data, static_cast<int>(mQkvCanaryPattern), guard_bytes, MainStream));
-            CUDA_CHECK(cudaMemsetAsync(raw.Data + guard_bytes + qkv_bytes,
-                                       static_cast<int>(mQkvCanaryPattern), guard_bytes, MainStream));
-        } else {
-            shared_qkv = mAllocator->allocate(dtype, "qkv_shared", kind, {B, T, QKV});
-        }
+        shared_qkv = mAllocator->allocate(dtype, "qkv_shared", kind, {B, T, QKV});
     }
     if (share_qk_rstd && use_qk_norm) {
         shared_q_rstd = mAllocator->allocate(ETensorDType::FP32, "q_rstd_shared", kind, {B, T, Hq});
@@ -300,68 +277,6 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     }
     if (share_mlp_down) {
         shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
-    }
-
-    auto overlap_check_enabled = []() {
-        static int enabled = []() {
-            const char* value = std::getenv("SUROGATE_SHARED_OVERLAP_CHECK");
-            if (!value || !*value) {
-                return 0;
-            }
-            return std::atoi(value) != 0 ? 1 : 0;
-        }();
-        return enabled != 0;
-    };
-
-    if (overlap_check_enabled()) {
-        struct Range {
-            std::string name;
-            const std::byte* ptr = nullptr;
-            std::size_t bytes = 0;
-        };
-        std::vector<Range> ranges;
-        ranges.reserve(16);
-        auto add_range = [&](const char* name, const Tensor& t) {
-            if (!t.Data) {
-                return;
-            }
-            const std::size_t bytes = t.bytes();
-            if (bytes == 0) {
-                return;
-            }
-            ranges.push_back({name, static_cast<const std::byte*>(t.Data), bytes});
-        };
-        add_range("ln1_shared", shared_ln1);
-        add_range("ln2_shared", shared_ln2);
-        add_range("qkv_shared", shared_qkv);
-        add_range("q_rstd_shared", shared_q_rstd);
-        add_range("k_rstd_shared", shared_k_rstd);
-        add_range("lse_shared", shared_lse);
-        add_range("att_shared", shared_att);
-        add_range("att_out_shared", shared_att_out);
-        add_range("mlp_up_shared", shared_mlp_up);
-        add_range("swiglu_shared", shared_swiglu);
-        add_range("residual_att_shared", shared_residual_att);
-        add_range("mlp_down_shared", shared_mlp_down);
-
-        for (std::size_t i = 0; i < ranges.size(); ++i) {
-            const auto& a = ranges[i];
-            const auto* a_end = a.ptr + a.bytes;
-            for (std::size_t j = i + 1; j < ranges.size(); ++j) {
-                const auto& b = ranges[j];
-                const auto* b_end = b.ptr + b.bytes;
-                const bool overlap = (a.ptr < b_end) && (a_end > b.ptr);
-                if (overlap) {
-                    std::cerr << "[SHARED_OVERLAP] "
-                              << a.name << " ptr=" << static_cast<const void*>(a.ptr)
-                              << " bytes=" << a.bytes
-                              << " overlaps "
-                              << b.name << " ptr=" << static_cast<const void*>(b.ptr)
-                              << " bytes=" << b.bytes
-                              << std::endl;
-                }
-            }
-        }
     }
 
     mSimplifiedActivations.resize(cfg.NumLayers);
@@ -550,54 +465,6 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     // Preserve the original buffer pointers so we can restore them if the
     // compiled executor temporarily aliases gradients to stack-backed temps.
     mSimplifiedGradientsBase = mSimplifiedGradients;
-}
-
-bool DslRunState::check_qkv_canary(cudaStream_t stream,
-                                   const char* tag,
-                                   int layer_idx,
-                                   int micro_step,
-                                   const char* op_id) const {
-    if (!mQkvCanaryEnabled || !mQkvCanaryRaw.Data || mQkvCanaryGuardBytes == 0) {
-        return true;
-    }
-    const std::size_t guard_bytes = mQkvCanaryGuardBytes;
-    const std::size_t total_bytes = mQkvCanaryRaw.bytes();
-    if (total_bytes < guard_bytes * 2) {
-        return true;
-    }
-    const std::size_t qkv_bytes = total_bytes - guard_bytes * 2;
-    const std::size_t check_bytes = guard_bytes;
-    std::vector<std::byte> front(check_bytes);
-    std::vector<std::byte> back(check_bytes);
-    CUDA_CHECK(cudaMemcpyAsync(front.data(), mQkvCanaryRaw.Data,
-                               check_bytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(back.data(), mQkvCanaryRaw.Data + guard_bytes + qkv_bytes,
-                               check_bytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    auto check_region = [&](const std::vector<std::byte>& buf, const char* region) {
-        for (std::size_t i = 0; i < buf.size(); ++i) {
-            if (buf[i] != mQkvCanaryPattern) {
-                std::cerr << "[QKV_CANARY_HIT] tag=" << (tag ? tag : "<none>")
-                          << " layer=" << layer_idx
-                          << " micro=" << micro_step
-                          << " op_id=" << (op_id ? op_id : "<none>")
-                          << " region=" << region
-                          << " idx=" << i
-                          << " value=" << static_cast<int>(buf[i])
-                          << " expected=" << static_cast<int>(mQkvCanaryPattern)
-                          << " guard_bytes=" << guard_bytes
-                          << std::endl;
-                return false;
-            }
-        }
-        return true;
-    };
-
-    bool ok = true;
-    ok &= check_region(front, "front");
-    ok &= check_region(back, "back");
-    return ok;
 }
 
 void DslRunState::reset_simplified_gradients() {

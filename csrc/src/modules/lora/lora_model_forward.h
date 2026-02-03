@@ -59,138 +59,10 @@ inline int lora_fwd_nan_trace_samples() {
     return samples;
 }
 
-inline bool lora_fwd_nan_trace_should_log(int layer_idx) {
-    if (!lora_fwd_nan_trace_enabled()) return false;
-    const int target = lora_fwd_nan_trace_layer();
-    if (target >= 0 && target != layer_idx) return false;
-    static std::atomic<int> counter{0};
-    const int limit = lora_fwd_nan_trace_limit();
-    if (limit <= 0) return false;
-    const int idx = counter.fetch_add(1);
-    return idx < limit;
-}
-
-inline bool lora_fwd_nan_trace_can_copy(cudaStream_t stream) {
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
-        return false;
-    }
-    return status == cudaStreamCaptureStatusNone;
-}
-
 inline float lora_to_float(float v) { return v; }
 inline float lora_to_float(nv_bfloat16 v) { return __bfloat162float(v); }
 inline float lora_to_float(half v) { return __half2float(v); }
 
-template <typename T>
-inline void lora_trace_row(const char* tag,
-                           int layer_idx,
-                           const Tensor& t,
-                           long row_idx,
-                           long col_offset,
-                           int samples,
-                           cudaStream_t stream) {
-    if (!t.Data || samples <= 0) return;
-    if (!lora_fwd_nan_trace_can_copy(stream)) return;
-
-    const long stride = t.Sizes[t.Rank - 1];
-    const long rows = [&]() {
-        long r = 1;
-        for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-        return r;
-    }();
-    if (row_idx < 0 || row_idx >= rows) return;
-    if (col_offset < 0 || col_offset >= stride) return;
-    const int count = std::min<long>(samples, stride - col_offset);
-    const long elem_offset = row_idx * stride + col_offset;
-
-    std::vector<T> host(count);
-    const std::size_t bytes = (std::size_t)count * sizeof(T);
-    CUDA_CHECK(cudaMemcpyAsync(host.data(),
-                               t.Data + elem_offset * sizeof(T),
-                               bytes,
-                               cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    int nan_count = 0;
-    int inf_count = 0;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    if (!host.empty()) {
-        float v0 = lora_to_float(host[0]);
-        min_val = v0;
-        max_val = v0;
-        for (int i = 0; i < count; ++i) {
-            float v = lora_to_float(host[i]);
-            if (std::isnan(v)) nan_count++;
-            if (std::isinf(v)) inf_count++;
-            if (v < min_val) min_val = v;
-            if (v > max_val) max_val = v;
-        }
-    }
-
-    fprintf(stderr,
-            "[LORA_FWD_NAN] layer=%d tag=%s dtype=%s row=%ld offset=%ld samples=%d nan=%d inf=%d min=%g max=%g vals=%g,%g,%g,%g\n",
-            layer_idx,
-            tag,
-            dtype_to_str(t.DType),
-            row_idx,
-            col_offset,
-            count,
-            nan_count,
-            inf_count,
-            min_val,
-            max_val,
-            count > 0 ? lora_to_float(host[0]) : 0.0f,
-            count > 1 ? lora_to_float(host[1]) : 0.0f,
-            count > 2 ? lora_to_float(host[2]) : 0.0f,
-            count > 3 ? lora_to_float(host[3]) : 0.0f);
-}
-
-inline void lora_trace_tensor(const char* tag,
-                              int layer_idx,
-                              const Tensor& t,
-                              long col_offset,
-                              int samples,
-                              cudaStream_t stream) {
-    if (t.DType == ETensorDType::BF16) {
-        lora_trace_row<nv_bfloat16>(tag, layer_idx, t, 0, col_offset, samples, stream);
-        const long rows = [&]() {
-            long r = 1;
-            for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-            return r;
-        }();
-        if (rows > 1) {
-            lora_trace_row<nv_bfloat16>(tag, layer_idx, t, rows / 2, col_offset, samples, stream);
-        }
-        return;
-    }
-    if (t.DType == ETensorDType::FP16) {
-        lora_trace_row<half>(tag, layer_idx, t, 0, col_offset, samples, stream);
-        const long rows = [&]() {
-            long r = 1;
-            for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-            return r;
-        }();
-        if (rows > 1) {
-            lora_trace_row<half>(tag, layer_idx, t, rows / 2, col_offset, samples, stream);
-        }
-        return;
-    }
-    if (t.DType == ETensorDType::FP32) {
-        lora_trace_row<float>(tag, layer_idx, t, 0, col_offset, samples, stream);
-        const long rows = [&]() {
-            long r = 1;
-            for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-            return r;
-        }();
-        if (rows > 1) {
-            lora_trace_row<float>(tag, layer_idx, t, rows / 2, col_offset, samples, stream);
-        }
-        return;
-    }
-}
 } // namespace detail
 
 template<typename Block>
@@ -364,63 +236,25 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
             case ForwardHookPoint::AfterQKVProjection: {
                 // Projection types: 0=Q, 1=K, 2=V, 3=O, 4=Up, 5=Gate, 6=Down, 7=Router
                 if (lora_block.attention.q.has_value()) {
-                    const bool trace = detail::lora_fwd_nan_trace_should_log(layer_idx);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_PRE_Q", layer_idx, acts.qkv, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_IN_Q", layer_idx, acts.ln1, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_A_Q", layer_idx, lora_block.attention.q->A, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_B_Q", layer_idx, lora_block.attention.q->B, 0, samples, stream);
-                    }
                     detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(0), is_training,
                                                     B * T, C, Hq * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_POST_Q", layer_idx, acts.qkv, 0, samples, stream);
-                    }
                 }
                 if (lora_block.attention.k.has_value()) {
-                    const bool trace = detail::lora_fwd_nan_trace_should_log(layer_idx);
-                    const long k_offset = (long)Hq * Hs;
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_PRE_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_IN_K", layer_idx, acts.ln1, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_A_K", layer_idx, lora_block.attention.k->A, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_B_K", layer_idx, lora_block.attention.k->B, 0, samples, stream);
-                    }
                     detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(1), is_training,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_POST_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                    }
                 }
                 if (lora_block.attention.v.has_value()) {
-                    const bool trace = detail::lora_fwd_nan_trace_should_log(layer_idx);
-                    const long v_offset = (long)(Hq + Hkv) * Hs;
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_PRE_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_IN_V", layer_idx, acts.ln1, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_A_V", layer_idx, lora_block.attention.v->A, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_B_V", layer_idx, lora_block.attention.v->B, 0, samples, stream);
-                    }
                     detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(2), is_training,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_POST_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                    }
                 }
             } break;
             case ForwardHookPoint::AfterAttnOutProjection: {
@@ -592,63 +426,25 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
             case ForwardHookPoint::AfterQKVProjection: {
                 // Validation: no dropout (is_training=false)
                 if (lora_block.attention.q.has_value()) {
-                    const bool trace = detail::lora_fwd_nan_trace_should_log(layer_idx);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_PRE_Q", layer_idx, acts.qkv, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_IN_Q", layer_idx, acts.ln1, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_A_Q", layer_idx, lora_block.attention.q->A, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_B_Q", layer_idx, lora_block.attention.q->B, 0, samples, stream);
-                    }
                     detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, Hq * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_POST_Q", layer_idx, acts.qkv, 0, samples, stream);
-                    }
                 }
                 if (lora_block.attention.k.has_value()) {
-                    const bool trace = detail::lora_fwd_nan_trace_should_log(layer_idx);
-                    const long k_offset = (long)Hq * Hs;
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_PRE_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_IN_K", layer_idx, acts.ln1, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_A_K", layer_idx, lora_block.attention.k->A, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_B_K", layer_idx, lora_block.attention.k->B, 0, samples, stream);
-                    }
                     detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_POST_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                    }
                 }
                 if (lora_block.attention.v.has_value()) {
-                    const bool trace = detail::lora_fwd_nan_trace_should_log(layer_idx);
-                    const long v_offset = (long)(Hq + Hkv) * Hs;
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_PRE_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_IN_V", layer_idx, acts.ln1, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_A_V", layer_idx, lora_block.attention.v->A, 0, samples, stream);
-                        detail::lora_trace_tensor("LORA_QKV_B_V", layer_idx, lora_block.attention.v->B, 0, samples, stream);
-                    }
                     detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = detail::lora_fwd_nan_trace_samples();
-                        detail::lora_trace_tensor("LORA_QKV_POST_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                    }
                 }
             } break;
             case ForwardHookPoint::AfterAttnOutProjection: {

@@ -6,19 +6,16 @@
 #include "dsl/dsl_model.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
-#include <fmt/format.h>
 
 #include "dsl/dsl_model_internal.h"
 #include "dsl/dsl_runtime.h"
 #include "dsl/dsl_weight_manager.h"
 #include "dsl/graph_executor.h"
-#include "dsl/compiled_ops_helpers.h"
 #include "modules/lora/lora_model_utils.h"
 #include "utilities/utils.h"
 #include "utilities/safetensors.h"
@@ -26,63 +23,6 @@
 #include <cuda_bf16.h>
 
 namespace dsl {
-
-namespace {
-inline bool lora_init_nan_trace_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_INIT_NAN_TRACE");
-        enabled = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return enabled == 1;
-}
-
-inline int lora_init_nan_trace_layer() {
-    static int layer = -2;
-    if (layer == -2) {
-        const char* env = std::getenv("SUROGATE_LORA_INIT_NAN_TRACE_LAYER");
-        layer = env ? std::atoi(env) : -1;
-    }
-    return layer;
-}
-
-inline int lora_init_nan_trace_limit() {
-    static int limit = -1;
-    if (limit < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_INIT_NAN_TRACE_LIMIT");
-        limit = env ? std::atoi(env) : 32;
-    }
-    return limit;
-}
-
-inline bool lora_init_nan_trace_should_log(int layer_idx) {
-    if (!lora_init_nan_trace_enabled()) return false;
-    const int target = lora_init_nan_trace_layer();
-    if (target >= 0 && target != layer_idx) return false;
-    static std::atomic<int> counter{0};
-    const int limit = lora_init_nan_trace_limit();
-    if (limit <= 0) return false;
-    const int idx = counter.fetch_add(1);
-    return idx < limit;
-}
-
-inline void log_lora_nan(const Tensor& t, int layer_idx, const char* tag) {
-    if (!t.Data) return;
-    long row = -1;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    if (!find_first_nan_row(t, &row, &min_val, &max_val)) {
-        return;
-    }
-    std::cerr << fmt::format("[LORA_INIT_NAN] layer={} tag={} row={} min={} max={} dtype={}\n",
-                             layer_idx,
-                             tag ? tag : "<unnamed>",
-                             row,
-                             min_val,
-                             max_val,
-                             static_cast<int>(t.DType));
-}
-}  // namespace
 
 std::vector<std::byte> DslModel::rng_state() const {
     if (mExecutor) {
@@ -145,24 +85,6 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
 
     if (lora_enabled()) {
         mLoRAWeights->random_init(42, comm);
-        if (lora_init_nan_trace_enabled()) {
-            for (int l = 0; l < mModelConfig.NumLayers; ++l) {
-                if (!lora_init_nan_trace_should_log(l)) continue;
-                auto& block = mLoRAWeights->get_master_block(l, cudaStreamDefault);
-                if (block.attention.q.has_value()) {
-                    log_lora_nan(block.attention.q->A, l, "q_proj.A");
-                    log_lora_nan(block.attention.q->B, l, "q_proj.B");
-                }
-                if (block.attention.k.has_value()) {
-                    log_lora_nan(block.attention.k->A, l, "k_proj.A");
-                    log_lora_nan(block.attention.k->B, l, "k_proj.B");
-                }
-                if (block.attention.v.has_value()) {
-                    log_lora_nan(block.attention.v->A, l, "v_proj.A");
-                    log_lora_nan(block.attention.v->B, l, "v_proj.B");
-                }
-            }
-        }
     }
 
     comm.barrier();
@@ -560,24 +482,6 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
 
     if (lora_enabled()) {
         mLoRAWeights->random_init(42, comm);
-        if (lora_init_nan_trace_enabled()) {
-            for (int l = 0; l < mModelConfig.NumLayers; ++l) {
-                if (!lora_init_nan_trace_should_log(l)) continue;
-                auto& block = mLoRAWeights->get_master_block(l, cudaStreamDefault);
-                if (block.attention.q.has_value()) {
-                    log_lora_nan(block.attention.q->A, l, "q_proj.A");
-                    log_lora_nan(block.attention.q->B, l, "q_proj.B");
-                }
-                if (block.attention.k.has_value()) {
-                    log_lora_nan(block.attention.k->A, l, "k_proj.A");
-                    log_lora_nan(block.attention.k->B, l, "k_proj.B");
-                }
-                if (block.attention.v.has_value()) {
-                    log_lora_nan(block.attention.v->A, l, "v_proj.A");
-                    log_lora_nan(block.attention.v->B, l, "v_proj.B");
-                }
-            }
-        }
     }
 
     comm.barrier();

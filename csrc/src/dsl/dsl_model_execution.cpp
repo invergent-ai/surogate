@@ -9,20 +9,10 @@
 #include "dsl/graph_executor.h"
 #include "dsl/graph_executor_helpers.h"
 
-namespace dsl {
-class DslParamStore;
-}  // namespace dsl
-#include "dsl/compiled_ops_helpers.h"
-
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
-#include <sstream>
 #include <stdexcept>
 #include <iostream>
-
-#include <fmt/format.h>
-#include <cuda_runtime_api.h>
 
 #include "kernels/kernels.h"
 #include "modules/forward_hooks.h"
@@ -30,230 +20,8 @@ class DslParamStore;
 #include "modules/fp8_scaling_state.h"
 #include "modules/lora/lora_utils.h"
 #include "modules/lora/lora_model_utils.h"
-#include "modules/lora/lora_weights_manager.h"
 #include "modules/optimizers/adamw_8bit.h"
 #include "utilities/comm.h"
-#include "utilities/dtype.h"
-#include "utilities/utils.h"
-
-namespace {
-inline bool lora_fwd_nan_trace_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_FWD_NAN_TRACE");
-        enabled = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return enabled == 1;
-}
-
-inline bool lora_qkv_guard_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_QKV_GUARD");
-        enabled = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return enabled == 1;
-}
-
-inline int lora_qkv_guard_layer() {
-    static int layer = -2;
-    if (layer == -2) {
-        const char* env = std::getenv("SUROGATE_LORA_QKV_GUARD_LAYER");
-        layer = env ? std::atoi(env) : -1;
-    }
-    return layer;
-}
-
-inline int lora_qkv_guard_limit() {
-    static int limit = -1;
-    if (limit < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_QKV_GUARD_LIMIT");
-        limit = env ? std::atoi(env) : 8;
-    }
-    return limit;
-}
-
-inline bool lora_qkv_guard_should_log(int layer_idx) {
-    if (!lora_qkv_guard_enabled()) return false;
-    const int target = lora_qkv_guard_layer();
-    if (target >= 0 && target != layer_idx) return false;
-    static std::atomic<int> counter{0};
-    const int limit = lora_qkv_guard_limit();
-    if (limit <= 0) return false;
-    const int idx = counter.fetch_add(1);
-    return idx < limit;
-}
-
-inline bool lora_b_guard_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_B_GUARD");
-        enabled = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return enabled == 1;
-}
-
-inline int lora_fwd_nan_trace_layer() {
-    static int layer = -2;
-    if (layer == -2) {
-        const char* env = std::getenv("SUROGATE_LORA_FWD_TRACE_LAYER");
-        layer = env ? std::atoi(env) : -1;
-    }
-    return layer;
-}
-
-inline int lora_fwd_nan_trace_limit() {
-    static int limit = -1;
-    if (limit < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_FWD_TRACE_LIMIT");
-        limit = env ? std::atoi(env) : 8;
-    }
-    return limit;
-}
-
-inline int lora_fwd_nan_trace_samples() {
-    static int samples = -1;
-    if (samples < 0) {
-        const char* env = std::getenv("SUROGATE_LORA_FWD_TRACE_SAMPLES");
-        samples = env ? std::atoi(env) : 8;
-        if (samples < 1) samples = 1;
-    }
-    return samples;
-}
-
-inline bool lora_fwd_nan_trace_should_log(int layer_idx) {
-    if (!lora_fwd_nan_trace_enabled()) return false;
-    const int target = lora_fwd_nan_trace_layer();
-    if (target >= 0 && target != layer_idx) return false;
-    static std::atomic<int> counter{0};
-    const int limit = lora_fwd_nan_trace_limit();
-    if (limit <= 0) return false;
-    const int idx = counter.fetch_add(1);
-    return idx < limit;
-}
-
-inline bool lora_fwd_nan_trace_can_copy(cudaStream_t stream) {
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
-        return false;
-    }
-    return status == cudaStreamCaptureStatusNone;
-}
-
-inline float lora_to_float(float v) { return v; }
-inline float lora_to_float(nv_bfloat16 v) { return __bfloat162float(v); }
-inline float lora_to_float(half v) { return __half2float(v); }
-
-template <typename T>
-inline void lora_trace_row(const char* tag,
-                           int layer_idx,
-                           const Tensor& t,
-                           long row_idx,
-                           long col_offset,
-                           int samples,
-                           cudaStream_t stream) {
-    if (!t.Data || samples <= 0) return;
-    if (!lora_fwd_nan_trace_can_copy(stream)) return;
-
-    const long stride = t.Sizes[t.Rank - 1];
-    const long rows = [&]() {
-        long r = 1;
-        for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-        return r;
-    }();
-    if (row_idx < 0 || row_idx >= rows) return;
-    if (col_offset < 0 || col_offset >= stride) return;
-    const int count = std::min<long>(samples, stride - col_offset);
-    const long elem_offset = row_idx * stride + col_offset;
-
-    std::vector<T> host(count);
-    const std::size_t bytes = (std::size_t)count * sizeof(T);
-    CUDA_CHECK(cudaMemcpyAsync(host.data(),
-                               t.Data + elem_offset * sizeof(T),
-                               bytes,
-                               cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    int nan_count = 0;
-    int inf_count = 0;
-    float min_val = 0.0f;
-    float max_val = 0.0f;
-    if (!host.empty()) {
-        float v0 = lora_to_float(host[0]);
-        min_val = v0;
-        max_val = v0;
-        for (int i = 0; i < count; ++i) {
-            float v = lora_to_float(host[i]);
-            if (std::isnan(v)) nan_count++;
-            if (std::isinf(v)) inf_count++;
-            if (v < min_val) min_val = v;
-            if (v > max_val) max_val = v;
-        }
-    }
-
-    fprintf(stderr,
-            "[LORA_FWD_NAN] layer=%d tag=%s dtype=%s row=%ld offset=%ld samples=%d nan=%d inf=%d min=%g max=%g vals=%g,%g,%g,%g\n",
-            layer_idx,
-            tag,
-            dtype_to_str(t.DType),
-            row_idx,
-            col_offset,
-            count,
-            nan_count,
-            inf_count,
-            min_val,
-            max_val,
-            count > 0 ? lora_to_float(host[0]) : 0.0f,
-            count > 1 ? lora_to_float(host[1]) : 0.0f,
-            count > 2 ? lora_to_float(host[2]) : 0.0f,
-            count > 3 ? lora_to_float(host[3]) : 0.0f);
-}
-
-inline void lora_trace_tensor(const char* tag,
-                              int layer_idx,
-                              const Tensor& t,
-                              long col_offset,
-                              int samples,
-                              cudaStream_t stream) {
-    if (t.DType == ETensorDType::BF16) {
-        lora_trace_row<nv_bfloat16>(tag, layer_idx, t, 0, col_offset, samples, stream);
-        const long rows = [&]() {
-            long r = 1;
-            for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-            return r;
-        }();
-        if (rows > 1) {
-            lora_trace_row<nv_bfloat16>(tag, layer_idx, t, rows / 2, col_offset, samples, stream);
-        }
-        return;
-    }
-    if (t.DType == ETensorDType::FP16) {
-        lora_trace_row<half>(tag, layer_idx, t, 0, col_offset, samples, stream);
-        const long rows = [&]() {
-            long r = 1;
-            for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-            return r;
-        }();
-        if (rows > 1) {
-            lora_trace_row<half>(tag, layer_idx, t, rows / 2, col_offset, samples, stream);
-        }
-        return;
-    }
-    if (t.DType == ETensorDType::FP32) {
-        lora_trace_row<float>(tag, layer_idx, t, 0, col_offset, samples, stream);
-        const long rows = [&]() {
-            long r = 1;
-            for (int i = 0; i < t.Rank - 1; ++i) r *= t.Sizes[i];
-            return r;
-        }();
-        if (rows > 1) {
-            lora_trace_row<float>(tag, layer_idx, t, rows / 2, col_offset, samples, stream);
-        }
-        return;
-    }
-}
-}  // namespace
 
 namespace dsl {
 
@@ -306,208 +74,27 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
 
         switch (point) {
             case modules::ForwardHookPoint::AfterQKVProjection: {
-                const bool qkv_guard = lora_qkv_guard_should_log(layer_idx) &&
-                                       lora_fwd_nan_trace_can_copy(stream);
-                const bool b_guard = lora_b_guard_enabled() && lora_fwd_nan_trace_can_copy(stream);
-                auto guard_check = [&](const char* proj,
-                                       long offset,
-                                       const modules::LoRALayerWeights<Tensor>& lora_w,
-                                       bool pre_nan,
-                                       long pre_row,
-                                       float pre_min,
-                                       float pre_max) {
-                    if (!qkv_guard) return;
-                    long post_row = -1;
-                    float post_min = 0.0f;
-                    float post_max = 0.0f;
-                    const bool post_nan = find_first_nan_row(acts.qkv, &post_row, &post_min, &post_max);
-                    if (!post_nan || pre_nan) return;
-                    long ln1_row = -1;
-                    float ln1_min = 0.0f;
-                    float ln1_max = 0.0f;
-                    long a_row = -1;
-                    float a_min = 0.0f;
-                    float a_max = 0.0f;
-                    long b_row = -1;
-                    float b_min = 0.0f;
-                    float b_max = 0.0f;
-                    const bool ln1_nan = find_first_nan_row(acts.ln1, &ln1_row, &ln1_min, &ln1_max);
-                    const bool a_nan = find_first_nan_row(lora_w.A, &a_row, &a_min, &a_max);
-                    const bool b_nan = find_first_nan_row(lora_w.B, &b_row, &b_min, &b_max);
-                    std::cerr << fmt::format(
-                        "[LORA_QKV_GUARD] layer={} micro={} proj={} offset={} qkv_ptr={} pre_row={} pre_min={} pre_max={} "
-                        "post_row={} post_min={} post_max={} ln1_nan={} A_nan={} B_nan={} ln1_ptr={} A_ptr={} B_ptr={}\n",
-                        layer_idx,
-                        micro_step,
-                        proj ? proj : "?",
-                        offset,
-                        static_cast<const void*>(acts.qkv.Data),
-                        pre_row,
-                        pre_min,
-                        pre_max,
-                        post_row,
-                        post_min,
-                        post_max,
-                        ln1_nan ? 1 : 0,
-                        a_nan ? 1 : 0,
-                        b_nan ? 1 : 0,
-                        static_cast<const void*>(acts.ln1.Data),
-                        static_cast<const void*>(lora_w.A.Data),
-                        static_cast<const void*>(lora_w.B.Data));
-                };
-                auto b_guard_check = [&](const char* proj, const modules::LoRALayerWeights<Tensor>& lora_w, const char* stage) {
-                    if (!b_guard || !lora_w.B.Data) return;
-                    modules::LoRABGuardSample cached;
-                    if (!modules::fetch_lora_b_guard_sample(lora_w.B.Data, layer_idx, cached)) {
-                        return;
-                    }
-                    std::vector<float> cur_vals;
-                    if (!copy_tensor_sample_offset_as_f32(lora_w.B, 0, 8, cur_vals)) {
-                        return;
-                    }
-                    float max_diff = 0.0f;
-                    bool cur_nan = false;
-                    for (std::size_t i = 0; i < cached.vals.size(); ++i) {
-                        const float cur = i < cur_vals.size() ? cur_vals[i] : 0.0f;
-                        if (std::isnan(cur) || std::isinf(cur)) {
-                            cur_nan = true;
-                        }
-                        max_diff = std::max(max_diff, std::abs(cur - cached.vals[i]));
-                    }
-                    if (max_diff > 0.0f || cur_nan) {
-                        std::cerr << fmt::format(
-                            "[LORA_B_GUARD] layer={} micro={} proj={} stage={} ptr={} cached_tag={} max_diff={} cur_nan={} "
-                            "cached={:.6g},{:.6g},{:.6g},{:.6g} cur={:.6g},{:.6g},{:.6g},{:.6g}\n",
-                            layer_idx,
-                            micro_step,
-                            proj ? proj : "?",
-                            stage ? stage : "?",
-                            static_cast<const void*>(lora_w.B.Data),
-                            cached.tag.empty() ? "<none>" : cached.tag,
-                            max_diff,
-                            cur_nan ? 1 : 0,
-                            cached.vals[0], cached.vals[1], cached.vals[2], cached.vals[3],
-                            cur_vals.size() > 0 ? cur_vals[0] : 0.0f,
-                            cur_vals.size() > 1 ? cur_vals[1] : 0.0f,
-                            cur_vals.size() > 2 ? cur_vals[2] : 0.0f,
-                            cur_vals.size() > 3 ? cur_vals[3] : 0.0f);
-                        const auto b_base = reinterpret_cast<std::uintptr_t>(lora_w.B.Data);
-                        const auto b_end = b_base + static_cast<std::uintptr_t>(lora_w.B.bytes());
-                        const auto qkv_base = reinterpret_cast<std::uintptr_t>(acts.qkv.Data);
-                        const auto qkv_end = qkv_base + static_cast<std::uintptr_t>(acts.qkv.bytes());
-                        const bool overlap = (b_base < qkv_end) && (qkv_base < b_end);
-                        std::size_t gap = 0;
-                        if (!overlap) {
-                            gap = b_base < qkv_base
-                                  ? static_cast<std::size_t>(qkv_base - b_end)
-                                  : static_cast<std::size_t>(b_base - qkv_end);
-                        }
-                        std::cerr << fmt::format(
-                            "[LORA_B_GUARD_RANGE] layer={} micro={} proj={} stage={} b_base={} b_bytes={} "
-                            "qkv_base={} qkv_bytes={} overlap={} gap={}\n",
-                            layer_idx,
-                            micro_step,
-                            proj ? proj : "?",
-                            stage ? stage : "?",
-                            static_cast<const void*>(lora_w.B.Data),
-                            lora_w.B.bytes(),
-                            static_cast<const void*>(acts.qkv.Data),
-                            acts.qkv.bytes(),
-                            overlap ? 1 : 0,
-                            gap);
-                        if (mAllocator) {
-                            mAllocator->debug_log_allocation_for_ptr(lora_w.B.Data, "lora_b_guard");
-                            mAllocator->debug_log_allocation_for_ptr(acts.qkv.Data, "lora_b_guard_qkv");
-                        }
-                    }
-                };
-
                 // Projection types: 0=Q, 1=K, 2=V, 3=O, 4=Up, 5=Gate, 6=Down
                 if (lora_block.attention.q.has_value()) {
-                    const bool trace = lora_fwd_nan_trace_should_log(layer_idx);
-                    long pre_row = -1;
-                    float pre_min = 0.0f;
-                    float pre_max = 0.0f;
-                    const bool pre_nan = qkv_guard
-                                         ? find_first_nan_row(acts.qkv, &pre_row, &pre_min, &pre_max)
-                                         : false;
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_PRE_Q", layer_idx, acts.qkv, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_IN_Q", layer_idx, acts.ln1, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_A_Q", layer_idx, lora_block.attention.q->A, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_B_Q", layer_idx, lora_block.attention.q->B, 0, samples, stream);
-                    }
-                    b_guard_check("Q", lora_block.attention.q.value(), "pre");
                     modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(0), is_training,
                                                     B * T, C, Hq * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    guard_check("Q", 0, lora_block.attention.q.value(), pre_nan, pre_row, pre_min, pre_max);
-                    b_guard_check("Q", lora_block.attention.q.value(), "post");
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_POST_Q", layer_idx, acts.qkv, 0, samples, stream);
-                    }
                 }
-                if (lora_block.attention.k.has_value()) {
-                    const bool trace = lora_fwd_nan_trace_should_log(layer_idx);
-                    const long k_offset = (long)Hq * Hs;
-                    long pre_row = -1;
-                    float pre_min = 0.0f;
-                    float pre_max = 0.0f;
-                    const bool pre_nan = qkv_guard
-                                         ? find_first_nan_row(acts.qkv, &pre_row, &pre_min, &pre_max)
-                                         : false;
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_PRE_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                        lora_trace_tensor("LORA_QKV_IN_K", layer_idx, acts.ln1, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_A_K", layer_idx, lora_block.attention.k->A, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_B_K", layer_idx, lora_block.attention.k->B, 0, samples, stream);
-                    }
-                    b_guard_check("K", lora_block.attention.k.value(), "pre");
+                if (lora_block.attention.k.has_value()) {                   
                     modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(1), is_training,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    guard_check("K", k_offset, lora_block.attention.k.value(), pre_nan, pre_row, pre_min, pre_max);
-                    b_guard_check("K", lora_block.attention.k.value(), "post");
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_POST_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                    }
                 }
                 if (lora_block.attention.v.has_value()) {
-                    const bool trace = lora_fwd_nan_trace_should_log(layer_idx);
-                    const long v_offset = (long)(Hq + Hkv) * Hs;
-                    long pre_row = -1;
-                    float pre_min = 0.0f;
-                    float pre_max = 0.0f;
-                    const bool pre_nan = qkv_guard
-                                         ? find_first_nan_row(acts.qkv, &pre_row, &pre_min, &pre_max)
-                                         : false;
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_PRE_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                        lora_trace_tensor("LORA_QKV_IN_V", layer_idx, acts.ln1, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_A_V", layer_idx, lora_block.attention.v->A, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_B_V", layer_idx, lora_block.attention.v->B, 0, samples, stream);
-                    }
-                    b_guard_check("V", lora_block.attention.v.value(), "pre");
                     modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(2), is_training,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    guard_check("V", v_offset, lora_block.attention.v.value(), pre_nan, pre_row, pre_min, pre_max);
-                    b_guard_check("V", lora_block.attention.v.value(), "post");
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_POST_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                    }
                 }
             } break;
             case modules::ForwardHookPoint::AfterAttnOutProjection: {
@@ -584,63 +171,25 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
             case modules::ForwardHookPoint::AfterQKVProjection: {
                 // Validation: no dropout (is_training=false)
                 if (lora_block.attention.q.has_value()) {
-                    const bool trace = lora_fwd_nan_trace_should_log(layer_idx);
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_PRE_Q", layer_idx, acts.qkv, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_IN_Q", layer_idx, acts.ln1, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_A_Q", layer_idx, lora_block.attention.q->A, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_B_Q", layer_idx, lora_block.attention.q->B, 0, samples, stream);
-                    }
                     modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, Hq * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_POST_Q", layer_idx, acts.qkv, 0, samples, stream);
-                    }
                 }
                 if (lora_block.attention.k.has_value()) {
-                    const bool trace = lora_fwd_nan_trace_should_log(layer_idx);
-                    const long k_offset = (long)Hq * Hs;
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_PRE_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                        lora_trace_tensor("LORA_QKV_IN_K", layer_idx, acts.ln1, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_A_K", layer_idx, lora_block.attention.k->A, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_B_K", layer_idx, lora_block.attention.k->B, 0, samples, stream);
-                    }
                     modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_POST_K", layer_idx, acts.qkv, k_offset, samples, stream);
-                    }
                 }
                 if (lora_block.attention.v.has_value()) {
-                    const bool trace = lora_fwd_nan_trace_should_log(layer_idx);
-                    const long v_offset = (long)(Hq + Hkv) * Hs;
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_PRE_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                        lora_trace_tensor("LORA_QKV_IN_V", layer_idx, acts.ln1, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_A_V", layer_idx, lora_block.attention.v->A, 0, samples, stream);
-                        lora_trace_tensor("LORA_QKV_B_V", layer_idx, lora_block.attention.v->B, 0, samples, stream);
-                    }
                     modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    if (trace) {
-                        const int samples = lora_fwd_nan_trace_samples();
-                        lora_trace_tensor("LORA_QKV_POST_V", layer_idx, acts.qkv, v_offset, samples, stream);
-                    }
                 }
             } break;
             case modules::ForwardHookPoint::AfterAttnOutProjection: {
@@ -717,79 +266,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
         const float dropout = mLoRAConfig->dropout;
         const bool is_training = mLoRARunState->is_training;
         const int micro_step = mLoRARunState->micro_step;
-        const int qlora_trace = env_int("SUROGATE_QLORA_TRACE", 0);
-        const int qlora_trace_layer = env_int("SUROGATE_QLORA_TRACE_LAYER", -1);
-        const int qlora_trace_micro = env_int("SUROGATE_QLORA_TRACE_MICRO", -1);
-        const int qlora_trace_limit = env_int("SUROGATE_QLORA_TRACE_LIMIT", 8);
-        static std::atomic<int> qlora_trace_count{0};
-
-        auto tensor_shape = [](const Tensor& t) {
-            std::ostringstream oss;
-            oss << "[";
-            for (int i = 0; i < t.Rank; ++i) {
-                if (i) oss << ",";
-                oss << t.Sizes[i];
-            }
-            oss << "]";
-            return oss.str();
-        };
-
-        auto log_tensor_sample = [&](const Tensor& t, const char* tag) {
-            if (!tag) tag = "<unnamed>";
-            if (!t.Data) {
-                std::cerr << fmt::format("[QLORA_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr=<null>\n",
-                                         layer_idx, micro_step, tag, static_cast<int>(t.DType), tensor_shape(t));
-                return;
-            }
-            std::vector<float> sample;
-            sample.reserve(8);
-            if (!copy_tensor_sample_offset_as_f32(t, 0, 8, sample) || sample.empty()) {
-                std::cerr << fmt::format("[QLORA_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr={} sample=<unavailable>\n",
-                                         layer_idx, micro_step, tag, static_cast<int>(t.DType), tensor_shape(t), (const void*)t.Data);
-                return;
-            }
-            float min_v = sample[0];
-            float max_v = sample[0];
-            float mean_v = 0.0f;
-            for (float v : sample) {
-                min_v = std::min(min_v, v);
-                max_v = std::max(max_v, v);
-                mean_v += v;
-            }
-            mean_v /= static_cast<float>(sample.size());
-            std::ostringstream vals;
-            vals << sample[0];
-            for (std::size_t i = 1; i < sample.size(); ++i) {
-                vals << "," << sample[i];
-            }
-            std::cerr << fmt::format("[QLORA_TRACE] layer={} micro={} tag={} dtype={} shape={} ptr={} min={:.6g} max={:.6g} mean={:.6g} vals={}\n",
-                                     layer_idx, micro_step, tag, static_cast<int>(t.DType), tensor_shape(t),
-                                     (const void*)t.Data, min_v, max_v, mean_v, vals.str());
-        };
-
-        auto should_trace = [&](modules::BackwardHookPoint hook_point) {
-            if (!qlora_enabled() || !qlora_trace) {
-                return false;
-            }
-            if (internal::stream_is_capturing(stream)) {
-                return false;
-            }
-            if (qlora_trace_layer >= 0 && qlora_trace_layer != layer_idx) {
-                return false;
-            }
-            if (qlora_trace_micro >= 0 && qlora_trace_micro != micro_step) {
-                return false;
-            }
-            if (qlora_trace_limit > 0) {
-                const int idx = qlora_trace_count.fetch_add(1);
-                if (idx >= qlora_trace_limit) {
-                    return false;
-                }
-            }
-            std::cerr << fmt::format("[QLORA_TRACE_BEGIN] layer={} micro={} hook={}\n",
-                                     layer_idx, micro_step, static_cast<int>(hook_point));
-            return true;
-        };
 
         // Helper to compute unique dropout seed per layer and projection type
         auto get_dropout_seed = [&](int proj_type) -> unsigned int {
@@ -812,7 +288,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
-                const bool trace = should_trace(point);
 
                 // Projection type 6 = Down
                 const unsigned int dropout_seed = get_dropout_seed(6);
@@ -828,14 +303,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     mLoRARunState->intermediate, mLoRARunState->slice,
                     B * T, D, C, rank, lora_accum,
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-
-                if (trace) {
-                    log_tensor_sample(da.d_swiglu, "d_swiglu");
-                    log_tensor_sample(da.d_res_ffn, "d_res_ffn");
-                    log_tensor_sample(a.swiglu, "swiglu");
-                    log_tensor_sample(lora_block.mlp.down->A, "lora_down.A");
-                    log_tensor_sample(lora_block.mlp.down->B, "lora_down.B");
-                }
             } break;
             case modules::BackwardHookPoint::AfterMLPUpBackward: {
                 bool lora_accum = false;
@@ -844,7 +311,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
-                const bool trace = should_trace(point);
 
                 // Get ln2 input: either from stored activation or recompute from residual stream
                 // LN2 input is residual_att = res_ffn[L-1] + att_out[L]
@@ -875,20 +341,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     }
                 } else {
                     ln2_input = a.ln2;
-                }
-                if (mOptions.recompute_enabled() && !internal::stream_is_capturing(stream)) {
-                    long nan_row = -1;
-                    float nan_min = 0.0f;
-                    float nan_max = 0.0f;
-                    if (find_first_nan_row(ln2_input, &nan_row, &nan_min, &nan_max)) {
-                        std::cerr << fmt::format(
-                            "[LORA_RECOMP_NAN] layer={} micro={} tag=ln2_input row={} min={} max={} using_saved={}\n",
-                            layer_idx, micro_step, nan_row, nan_min, nan_max,
-                            a.ln2.Data ? 1 : 0);
-                        if (a.ln2.Data) {
-                            ln2_input = a.ln2;
-                        }
-                    }
                 }
 
                 // Prepare gradient tensors (use empty tensor if projection not enabled)
@@ -929,21 +381,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     rs.CublasLtHandle,
                     rs.CuBlasWorkspace,
                     stream);
-
-                if (trace) {
-                    log_tensor_sample(da.d_ln2, "d_ln2");
-                    log_tensor_sample(da.d_mlp_up, "d_mlp_up");
-                    log_tensor_sample(ln2_input, "ln2_input");
-                    log_tensor_sample(a.ln2, "ln2_saved");
-                    if (lora_block.mlp.up.has_value()) {
-                        log_tensor_sample(lora_block.mlp.up->A, "lora_up.A");
-                        log_tensor_sample(lora_block.mlp.up->B, "lora_up.B");
-                    }
-                    if (lora_block.mlp.gate.has_value()) {
-                        log_tensor_sample(lora_block.mlp.gate->A, "lora_gate.A");
-                        log_tensor_sample(lora_block.mlp.gate->B, "lora_gate.B");
-                    }
-                }
             } break;
             case modules::BackwardHookPoint::AfterAttnOutBackward: {
                 if (!lora_block.attention.o.has_value()) break;
@@ -955,7 +392,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
-                const bool trace = should_trace(point);
 
                 // Projection type 3 = O
                 const unsigned int dropout_seed = get_dropout_seed(3);
@@ -971,14 +407,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     mLoRARunState->intermediate, mLoRARunState->slice,
                     B * T, Hq * Hs, C, rank, lora_accum,
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-
-                if (trace) {
-                    log_tensor_sample(da.d_att, "d_att");
-                    log_tensor_sample(da.d_res_att, "d_res_att");
-                    log_tensor_sample(a.att, "att");
-                    log_tensor_sample(lora_block.attention.o->A, "lora_o.A");
-                    log_tensor_sample(lora_block.attention.o->B, "lora_o.B");
-                }
             } break;
             case modules::BackwardHookPoint::AfterQKVBackward: {
                 bool lora_accum = false;
@@ -987,7 +415,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
-                const bool trace = should_trace(point);
 
                 // Get ln1 input: either from stored activation or recompute from residual
                 // LN1 input is res_ffn[L-1] (output of previous layer) for layer L > 0
@@ -1014,20 +441,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 } else {
                     ln1_input = a.ln1;
                 }
-                if (mOptions.recompute_enabled() && !internal::stream_is_capturing(stream)) {
-                    long nan_row = -1;
-                    float nan_min = 0.0f;
-                    float nan_max = 0.0f;
-                    if (find_first_nan_row(ln1_input, &nan_row, &nan_min, &nan_max)) {
-                        std::cerr << fmt::format(
-                            "[LORA_RECOMP_NAN] layer={} micro={} tag=ln1_input row={} min={} max={} using_saved={}\n",
-                            layer_idx, micro_step, nan_row, nan_min, nan_max,
-                            a.ln1.Data ? 1 : 0);
-                        if (a.ln1.Data) {
-                            ln1_input = a.ln1;
-                        }
-                    }
-                }
 
                 // Prepare gradient tensors (use empty tensor if projection not enabled)
                 Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
@@ -1050,47 +463,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 }
 
                 if (!dA_q.Data && !dA_k.Data && !dA_v.Data) break;
-
-                const int trace_qkv = env_int("SUROGATE_LORA_QKV_TRACE", 0);
-                const int trace_layer = env_int("SUROGATE_LORA_QKV_TRACE_LAYER", -1);
-                const int nan_abort = env_int("SUROGATE_LORA_NAN_ABORT", 0);
-                if (trace_qkv && !internal::stream_is_capturing(stream) &&
-                    (trace_layer < 0 || trace_layer == layer_idx)) {
-                    auto log_nan = [&](const Tensor& t, const char* tag) {
-                        if (!t.Data) return;
-                        long row = -1;
-                        float min_val = 0.0f;
-                        float max_val = 0.0f;
-                        if (!find_first_nan_row(t, &row, &min_val, &max_val)) {
-                            return;
-                        }
-                        std::cerr << fmt::format("[LORA_QKV_NAN] layer={} tag={} row={} min={} max={} dtype={}\n",
-                                                 layer_idx,
-                                                 tag ? tag : "<unnamed>",
-                                                 row,
-                                                 min_val,
-                                                 max_val,
-                                                 static_cast<int>(t.DType));
-                        if (nan_abort) {
-                            throw std::runtime_error("LoRA QKV inputs contain NaN/Inf");
-                        }
-                    };
-                    log_nan(da.d_qkv, "d_qkv");
-                    log_nan(da.d_ln1, "d_ln1");
-                    log_nan(ln1_input, "ln1_input");
-                    if (lora_q.has_value()) {
-                        log_nan(lora_q.A, "lora_q.A");
-                        log_nan(lora_q.B, "lora_q.B");
-                    }
-                    if (lora_k.has_value()) {
-                        log_nan(lora_k.A, "lora_k.A");
-                        log_nan(lora_k.B, "lora_k.B");
-                    }
-                    if (lora_v.has_value()) {
-                        log_nan(lora_v.A, "lora_v.A");
-                        log_nan(lora_v.B, "lora_v.B");
-                    }
-                }
 
                 // Projection types: 0=Q, 1=K, 2=V
                 modules::detail::backward_lora_qkv_fused(
@@ -1117,25 +489,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     stream);
 
                 mLoRAGrads->notify_block(layer_idx, stream, comm);
-
-                if (trace) {
-                    log_tensor_sample(da.d_ln1, "d_ln1");
-                    log_tensor_sample(da.d_qkv, "d_qkv");
-                    log_tensor_sample(ln1_input, "ln1_input");
-                    log_tensor_sample(a.ln1, "ln1_saved");
-                    if (lora_block.attention.q.has_value()) {
-                        log_tensor_sample(lora_block.attention.q->A, "lora_q.A");
-                        log_tensor_sample(lora_block.attention.q->B, "lora_q.B");
-                    }
-                    if (lora_block.attention.k.has_value()) {
-                        log_tensor_sample(lora_block.attention.k->A, "lora_k.A");
-                        log_tensor_sample(lora_block.attention.k->B, "lora_k.B");
-                    }
-                    if (lora_block.attention.v.has_value()) {
-                        log_tensor_sample(lora_block.attention.v->A, "lora_v.A");
-                        log_tensor_sample(lora_block.attention.v->B, "lora_v.B");
-                    }
-                }
             } break;
             default:
                 break;

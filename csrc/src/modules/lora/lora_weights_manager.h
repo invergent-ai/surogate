@@ -5,7 +5,6 @@
 #ifndef SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
 #define SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
 
-#include <array>
 #include <string>
 #include <vector>
 #include <functional>
@@ -19,19 +18,6 @@ class TensorAllocator;
 class NCCLCommunicator;
 
 namespace modules {
-
-struct LoRABGuardSample {
-    std::array<float, 8> vals{};
-    std::string tag;
-};
-
-void record_lora_b_guard_sample(const void* ptr,
-                                int layer_idx,
-                                const char* tag,
-                                const std::array<float, 8>& vals);
-bool fetch_lora_b_guard_sample(const void* ptr,
-                               int layer_idx,
-                               LoRABGuardSample& out);
 
 /**
  * @brief Modular LoRA weights manager
@@ -91,7 +77,6 @@ public:
      * @brief Get block weights for forward/backward pass
      */
     LoRABlockWeights<Tensor>& get_block(int layer_idx, cudaStream_t stream);
-    LoRABlockWeights<Tensor>& peek_block(int layer_idx);
 
     /**
      * @brief Get master block weights for optimizer
