@@ -71,7 +71,7 @@ __device__ __forceinline__ float rcp_approx_ftz(float a) {
  * @param array Input array of 8 float values to quantize.
  * @return uint32_t with 8 packed FP4 E2M1 values.
  */
-__device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
+[[maybe_unused]] __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
     uint32_t val;
     asm volatile(
         "{\n"
@@ -235,6 +235,42 @@ __device__ __forceinline__ size_t nvfp4_cutlass_scale_offset(
     size_t intra_offset = row_in_32 * 16 + row_blk32 * 4 + col_in_atom;
 
     return atom_offset + intra_offset;
+}
+
+// ============================================================================
+// Scale Layout Reorder Kernels (Linear <-> CUTLASS)
+// ============================================================================
+
+__global__ void nvfp4_scales_linear_to_cutlass_kernel(
+    uint8_t* __restrict__ out_cutlass,
+    const uint8_t* __restrict__ in_linear,
+    int rows,
+    int num_scale_cols)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * num_scale_cols;
+    if (idx >= total) return;
+
+    const int row = idx / num_scale_cols;
+    const int scale_col = idx - row * num_scale_cols;
+    const size_t off = nvfp4_cutlass_scale_offset(row, scale_col, num_scale_cols);
+    out_cutlass[off] = in_linear[idx];
+}
+
+__global__ void nvfp4_scales_cutlass_to_linear_kernel(
+    uint8_t* __restrict__ out_linear,
+    const uint8_t* __restrict__ in_cutlass,
+    int rows,
+    int num_scale_cols)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * num_scale_cols;
+    if (idx >= total) return;
+
+    const int row = idx / num_scale_cols;
+    const int scale_col = idx - row * num_scale_cols;
+    const size_t off = nvfp4_cutlass_scale_offset(row, scale_col, num_scale_cols);
+    out_linear[idx] = in_cutlass[off];
 }
 
 /**
@@ -880,6 +916,42 @@ size_t compute_nvfp4_cutlass_scale_size(int rows, int cols) {
     int aligned_rows = div_ceil(rows, kNVFP4TileDim) * kNVFP4TileDim;
     int aligned_cols = div_ceil(num_scale_cols, 4) * 4;
     return static_cast<size_t>(aligned_rows) * aligned_cols;
+}
+
+void nvfp4_scales_linear_to_cutlass(
+    uint8_t* out_cutlass,
+    const uint8_t* in_linear,
+    int rows,
+    int cols,
+    cudaStream_t stream)
+{
+    const int num_scale_cols = div_ceil(cols, kNVFP4BlockSize);
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(num_scale_cols);
+    if (total == 0) return;
+
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    nvfp4_scales_linear_to_cutlass_kernel<<<blocks, kThreads, 0, stream>>>(
+        out_cutlass, in_linear, rows, num_scale_cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void nvfp4_scales_cutlass_to_linear(
+    uint8_t* out_linear,
+    const uint8_t* in_cutlass,
+    int rows,
+    int cols,
+    cudaStream_t stream)
+{
+    const int num_scale_cols = div_ceil(cols, kNVFP4BlockSize);
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(num_scale_cols);
+    if (total == 0) return;
+
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    nvfp4_scales_cutlass_to_linear_kernel<<<blocks, kThreads, 0, stream>>>(
+        out_linear, in_cutlass, rows, num_scale_cols);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 /**

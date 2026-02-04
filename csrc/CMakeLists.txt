@@ -60,6 +60,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(USE_CUFILE "Enable cuFile support for optimized file I/O" ON)
 option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
+option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 FetchContent_Declare(
         json
@@ -70,7 +71,7 @@ FetchContent_Declare(
 FetchContent_Declare(
         cudnn-fe
         GIT_REPOSITORY https://github.com/NVIDIA/cudnn-frontend.git
-        GIT_TAG v1.17.0
+        GIT_TAG v1.18.0
         EXCLUDE_FROM_ALL
 )
 
@@ -84,7 +85,7 @@ FetchContent_Declare(
         nanobind
         QUIET
         GIT_REPOSITORY https://github.com/wjakob/nanobind.git
-        GIT_TAG v2.9.2
+        GIT_TAG v2.11.0
 )
 
 # we could use fmt only if std::format is not available, but (e.g., g++-12), but
@@ -127,7 +128,7 @@ set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "N
 FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v4.3.4
+        GIT_TAG v4.3.5
         EXCLUDE_FROM_ALL
 )
 
@@ -238,33 +239,87 @@ target_sources(surogate-common PRIVATE
     src/utilities/system_info.cpp
     src/utilities/crash_handler.cpp
 
-    src/training/dataloader.cpp
-    src/training/logging.cpp
-    src/training/checkpoint.cpp
-    src/training/model.cpp
+    src/runtime/training/dataloader.cpp
+    src/runtime/training/logging.cpp
+    src/runtime/training/checkpoint.cpp
+    src/runtime/training/model.cpp
+
+    src/runtime/dsl/ir.cpp
+    src/runtime/dsl/dsl_model.cpp
+    src/runtime/dsl/dsl_model_execution.cpp
+    src/runtime/dsl/dsl_model_helpers.cpp
+    src/runtime/dsl/dsl_model_lora.cpp
+    src/runtime/dsl/dsl_model_optimizer.cpp
+    src/runtime/dsl/dsl_model_weights.cpp
+    src/runtime/dsl/dsl_param_store.cpp
+    src/runtime/dsl/dsl_grad_store.cpp
+    src/runtime/dsl/dsl_run_state.cpp
+    src/runtime/dsl/dsl_weight_manager.cpp
+    src/runtime/dsl/graph_executor.cpp
+    src/runtime/dsl/graph_executor_utils.cpp
+    src/runtime/dsl/graph_executor_tensors.cpp
+    src/runtime/dsl/graph_executor_weight_cache.cpp
+    src/runtime/dsl/graph_executor_backward.cpp
+    src/runtime/dsl/graph_executor_helpers.cpp
+    src/runtime/dsl/recompute_plan.cpp
+    src/runtime/dsl/compiled_ops.cpp
+    src/runtime/dsl/graph_compiler.cpp
+    src/runtime/dsl/weight_mapping.cpp
+    src/runtime/dsl/autodiff.cpp
+    src/runtime/dsl/autodiff_rules.cpp
+    src/runtime/dsl/op_shape_signatures.cpp
+    src/runtime/dsl/tensor_slot_registry.cpp
+
+    src/runtime/ops/embedding.cpp
+    src/runtime/ops/zeros.cpp
+    src/runtime/ops/fused_residual_rmsnorm.cpp
+    src/runtime/ops/view.cpp
+    src/runtime/ops/add.cpp
+    src/runtime/ops/bias_add.cpp
+    src/runtime/ops/matmul.cpp
+    src/runtime/ops/swiglu.cpp
+    src/runtime/ops/matmul_swiglu.cpp
+    src/runtime/ops/qkv_qk_norm_rope.cpp
+    src/runtime/ops/rope.cpp
+    src/runtime/ops/flash_attention.cpp
+    src/runtime/ops/cross_entropy_loss.cpp
+    src/runtime/ops/fused_lm_head_loss.cpp
+    src/runtime/ops/silu.cpp
+    src/runtime/ops/mul.cpp
+    src/runtime/ops/moe_softmax.cpp
+    src/runtime/ops/moe_sigmoid.cpp
+    src/runtime/ops/moe_topk.cpp
+    src/runtime/ops/moe_permute.cpp
+    src/runtime/ops/moe_grouped_gemm_gate_up.cpp
+    src/runtime/ops/moe_grouped_gemm_down.cpp
+    src/runtime/ops/moe_unpermute.cpp
+
+
 
     src/config/pretrained_config.cpp
-    src/models/registry.cpp
-    src/models/qwen25/qwen25.cpp
-    src/models/qwen3/qwen3.cpp
-    src/models/qwen3moe/qwen3_moe.cpp
-    src/models/llama/llama.cpp
-    src/models/nemotron_h/nemotron_h.cpp
 
-    src/modules/qlora/fp8_weights.cpp
-    src/modules/qlora/fp4_weights.cpp
-    src/modules/qlora/bnb_weights.cpp
+    src/runtime/qlora/fp8_weights.cpp
+    src/runtime/qlora/fp4_weights.cpp
+    src/runtime/qlora/bnb_weights.cpp
 
-    src/modules/lora/lora_weights_manager.cpp
-    src/modules/lora/lora_grads_manager.cpp
-    src/modules/lora/lora_optimizer_state.cpp
-    src/modules/lora/lora_utils.cpp
+    src/runtime/lora/lora_weights_manager.cpp
+    src/runtime/lora/lora_grads_manager.cpp
+    src/runtime/lora/lora_optimizer_state.cpp
+    src/runtime/lora/lora_utils.cpp
 
     # Recipe system
     src/recipes/recipe.cpp
     src/recipes/recipe_factory.cpp
     src/recipes/fp8_hybrid/fp8_hybrid_recipe.cpp
     src/recipes/nvfp4/nvfp4_recipe.cpp
+
+    # NVFP4-Quartet recipe (Quartet-II EDEN quantization)
+    src/recipes/nvfp4_quartet/nvfp4_quartet_recipe.cpp
+    src/recipes/nvfp4_quartet/kernels/hadamard_init.cu
+    src/recipes/nvfp4_quartet/kernels/group_transform_128.cu
+    src/recipes/nvfp4_quartet/kernels/group_transform_eden.cu
+    src/recipes/nvfp4_quartet/kernels/eden_fp4.cu
+    src/recipes/nvfp4_quartet/kernels/dequant_transform_quant.cu
 
     # Shared kernels (used by all recipes)
     src/kernels/kernels.cpp
@@ -283,9 +338,9 @@ target_sources(surogate-common PRIVATE
     src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu
-    src/modules/optimizers/adamw_8bit.cu
-    src/modules/optimizers/polar_express.cu
-    src/modules/optimizers/normuon.cu
+    src/runtime/optimizers/adamw_8bit.cu
+    src/runtime/optimizers/polar_express.cu
+    src/runtime/optimizers/normuon.cu
     src/kernels/attention.cu
     src/kernels/fused_classifier.cu
     src/kernels/transpose.cu
@@ -329,7 +384,7 @@ target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
 target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
-target_include_directories(surogate-common PUBLIC src src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
+target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
 
 # backward-cpp for stack traces
 if(BACKWARD_HAS_DW)
@@ -342,6 +397,12 @@ if(BACKWARD_LIBS)
 endif()
 # -rdynamic exports symbols to the dynamic symbol table, enabling backtrace_symbols to resolve names
 target_link_options(surogate-common PUBLIC "-rdynamic")
+
+set(SUROGATE_NVCC_THREADS $ENV{NVCC_THREADS})
+if(NOT SUROGATE_NVCC_THREADS)
+    set(SUROGATE_NVCC_THREADS 8)
+endif()
+
 # Always include debug info for stack traces (even in Release builds)
 # -g adds debug symbols, -lineinfo adds CUDA line info for GPU crashes
 # -fno-omit-frame-pointer preserves frame pointers for stack unwinding
@@ -352,7 +413,17 @@ target_compile_options(surogate-common PUBLIC
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     $<$<COMPILE_LANGUAGE:CUDA>:-g>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-omit-frame-pointer>
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>)
+
+# AddressSanitizer and UndefinedBehaviorSanitizer (C++ host code only, not CUDA)
+if(ENABLE_SANITIZERS)
+    message(STATUS "Sanitizers enabled (ASan + UBSan) for C++ files only")
+    target_compile_options(surogate-common PUBLIC
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=undefined>)
+    target_link_options(surogate-common PUBLIC -fsanitize=address -fsanitize=undefined)
+endif()
 
 if (NOT SKBUILD)
     install(TARGETS surogate-common
@@ -365,7 +436,7 @@ endif ()
 if (PYTHON_BINDING)
     find_package(Python COMPONENTS Interpreter Development.Module OPTIONAL_COMPONENTS Development.SABIModule)
     FetchContent_MakeAvailable(nanobind)
-    nanobind_add_module(_surogate STABLE_ABI src/binding/binding.cpp src/binding/py_train.cpp)
+    nanobind_add_module(_surogate STABLE_ABI NOSTRIP src/binding/binding.cpp src/binding/py_train.cpp)
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
 
     # pick up cuda libraries from within the current python env, if available
@@ -426,13 +497,15 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # MoE
             src/testing/moe/test-moe.cu
-            src/testing/moe/test_moe.cpp
 
             # Models
             src/testing/models/test_pretrained_config.cpp
 
             # Utilities
             src/testing/utilities/test-sol.cpp
+            src/testing/utilities/test_dsl_ir.cpp
+            src/testing/utilities/test_dsl_goldens.cpp
+            src/testing/utilities/test_dsl_module_goldens.cpp
         )
         target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
         target_compile_options(unit-tests PRIVATE
@@ -448,10 +521,6 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/utilities/test_main.cpp
 
             # Training
-            src/testing/training/test-modular-training-loop.cpp
-            src/testing/training/test-learning.cpp
-            src/testing/training/test-checkpoint.cpp
-
             # Distributed
             src/testing/distributed/test-nccl.cpp
         )

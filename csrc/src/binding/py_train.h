@@ -11,12 +11,13 @@
 #include <utility>
 #include <thread>
 #include <functional>
+#include <cuda_runtime.h>
 
 #include "config/pretrained_config.h"
-#include "training/runtime_options.h"
+#include "runtime/training/runtime_options.h"
 #include "config/lora_adapter_config.h"
-#include "modules/qlora/qlora_config.h"
-#include "modules/optimizers/optimizer_config.h"
+#include "runtime/qlora/qlora_config.h"
+#include "runtime/optimizers/optimizer_config.h"
 
 class DataLoader;
 class IModel;
@@ -68,9 +69,12 @@ public:
     void init_weights();
     void load_checkpoint(std::string directory, int step);
     void save_checkpoint(std::string directory, int step);
-    void step(const std::int32_t* inputs, const std::int32_t* targets);
-    float validate(const std::int32_t* inputs, const std::int32_t* targets);
+    void step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
+    float validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
     std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
+    std::pair<float, float> train_step_graphed(const std::int32_t* inputs, const std::int32_t* targets,
+                                               const std::int32_t* position_ids,
+                                               const optimizers::OptimizerConfig& config, int step);
     void stop();
 
     std::vector<GPUUtilInfo> get_gpu_info();
@@ -83,6 +87,7 @@ public:
     int local_world_size() const { return static_cast<int>(mContexts.size()); }
     int batch_size() const { return B; }
     int seq_length() const { return T; }
+    int grad_accumulation() const { return mGradAccumulation; }
     const PretrainedConfig& config() const { return *mConfig; }
     const RuntimeOptions& options() const { return mOptions; }
     bool is_qlora() const { return mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized(); }
@@ -105,10 +110,23 @@ private:
     int mGradAccumulation = 1;
 
     std::unique_ptr<CommunicatorThreadsPack> mThreads;
+    struct sFullStepGraphState {
+        cudaGraphExec_t graph_exec = nullptr;
+        bool captured = false;
+        int captured_B = 0;
+        int captured_T = 0;
+        int captured_grad_accum = 0;
+        Tensor opt_params;
+        Tensor opt_step;
+        std::vector<Tensor> inputs;
+        std::vector<Tensor> targets;
+        std::vector<Tensor> position_ids;
+    };
     struct sThreadContext {
         NCCLCommunicator* Communicator;
         std::unique_ptr<IModel> Model;
         std::unique_ptr<IGPUUtilTracker> GPUUtil;
+        std::unique_ptr<sFullStepGraphState> FullStepGraph;
         std::function<void(sThreadContext& ctx)> Work;
     };
     std::vector<sThreadContext> mContexts;

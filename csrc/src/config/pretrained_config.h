@@ -3,16 +3,14 @@
 //
 // PretrainedConfig - Base configuration class for pretrained models.
 //
-// Model-specific configs are defined in their respective model directories:
-//   models/llama/config.h     - LlamaConfig
-//   models/qwen25/config.h    - Qwen2Config
-//   models/qwen3/config.h     - Qwen3Config
-//   models/qwen3moe/config.h  - Qwen3MoEConfig
+// Model-specific configs have been removed; the DSL IR + config.json drive
+// all model configuration via this base struct.
 
 #ifndef SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H
 #define SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H
 
 #include <memory>
+#include <string>
 #include <string_view>
 
 #include "config/rope_config.h"
@@ -21,14 +19,8 @@
 /**
  * @brief Base configuration class for pretrained decoder-only transformer models.
  *
- * This is the base class in a Transformers-like inheritance hierarchy:
- *   PretrainedConfig
- *   └── LlamaConfig
- *       └── Qwen2Config (adds sliding_window)
- *           └── Qwen3Config (adds qk_norm, head_dim)
- *               └── Qwen3MoEConfig (adds MoE-specific fields)
- *
- * Derived classes inherit all base fields and can add model-specific fields.
+ * This is the base class for all model configs. Model-specific subclasses have
+ * been removed; DSL IR supplies any architecture-specific overrides.
  */
 struct PretrainedConfig {
     enum ArchitectureId {
@@ -41,6 +33,9 @@ struct PretrainedConfig {
 
     // Architecture identifier
     ArchitectureId Architecture = LLAMA;
+    // Optional raw architecture/model_type strings from config.json
+    std::string ArchitectureName;
+    std::string ModelTypeName;
 
     // Token IDs
     int BosTokenId = 1;

@@ -40,6 +40,16 @@ void rmsnorm_forward(Tensor& out, Tensor& rms, const Tensor& inp, const Tensor& 
     }
 }
 
+void rmsnorm_apply_saved(Tensor& out, const Tensor& inp, const Tensor& weight, const Tensor& rstd, int B, int T, int C, cudaStream_t stream) {
+    if(out.DType == ETensorDType::BF16) {
+        rmsnorm_apply_saved(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), B, T, C, stream);
+    } else if (out.DType == ETensorDType::FP32) {
+        rmsnorm_apply_saved(out.get<float>(), inp.get<float>(), weight.get<float>(), rstd.get<float>(), B, T, C, stream);
+    } else {
+        throw std::logic_error("rmsnorm_apply_saved: unsupported dtype");
+    }
+}
+
 /**
  * @brief Computes the backward pass for Root Mean Square Normalization (RMSNorm).
  *
@@ -122,6 +132,21 @@ void fused_residual_rmsnorm_forward(Tensor& residual, Tensor& normed, Tensor& rr
             inp1.get<float>(), inp2.get<float>(), weight.get<float>(), abs_max_ptr, epsilon, N, C, stream);
     } else {
         throw std::logic_error("fused_residual_rmsnorm_forward: unsupported dtype");
+    }
+}
+
+void fused_residual_rmsnorm_apply_saved(Tensor& residual, Tensor& normed,
+                                        const Tensor& inp1, const Tensor& inp2,
+                                        const Tensor& weight, const Tensor& rstd,
+                                        int N, int C, cudaStream_t stream) {
+    if(residual.DType == ETensorDType::BF16) {
+        fused_residual_rmsnorm_apply_saved(residual.get<nv_bfloat16>(), normed.get<nv_bfloat16>(),
+            inp1.get<nv_bfloat16>(), inp2.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), N, C, stream);
+    } else if (residual.DType == ETensorDType::FP32) {
+        fused_residual_rmsnorm_apply_saved(residual.get<float>(), normed.get<float>(),
+            inp1.get<float>(), inp2.get<float>(), weight.get<float>(), rstd.get<float>(), N, C, stream);
+    } else {
+        throw std::logic_error("fused_residual_rmsnorm_apply_saved: unsupported dtype");
     }
 }
 
@@ -486,6 +511,90 @@ void fused_classifier(Tensor& logits, Tensor& losses,
         fused_classifier(logits.get<nv_bfloat16>(), losses.get<float>(), dloss, targets.get<int>(), count_ptr, correct_ptr, BT, V, P, write_dlogits, stream);
     } else {
         throw std::runtime_error("fused_classifier: unsupported dtype");
+    }
+}
+
+void fused_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                 const Tensor& targets, Tensor* valid_token_count,
+                                 Tensor* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream) {
+    float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
+    int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
+    if (logits.DType == ETensorDType::FP32) {
+        fused_cross_entropy_forward(logits.get<float>(), losses.get<float>(), lse_ptr,
+                                    targets.get<int>(), count_ptr, correct_ptr,
+                                    BT, V, P, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        fused_cross_entropy_forward(logits.get<nv_bfloat16>(), losses.get<float>(), lse_ptr,
+                                    targets.get<int>(), count_ptr, correct_ptr,
+                                    BT, V, P, stream);
+    } else {
+        throw std::runtime_error("fused_cross_entropy_forward: unsupported dtype");
+    }
+}
+
+void fused_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                  const Tensor& dloss, const Tensor& targets,
+                                  int BT, int V, int P, cudaStream_t stream) {
+    const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    const float* dloss_ptr = dloss.get<float>();
+    if (dlogits.DType == ETensorDType::FP32) {
+        fused_cross_entropy_backward(dlogits.get<float>(), logits.get<float>(), lse_ptr,
+                                     dloss_ptr, targets.get<int>(),
+                                     BT, V, P, stream);
+    } else if (dlogits.DType == ETensorDType::BF16) {
+        fused_cross_entropy_backward(dlogits.get<nv_bfloat16>(), logits.get<nv_bfloat16>(), lse_ptr,
+                                     dloss_ptr, targets.get<int>(),
+                                     BT, V, P, stream);
+    } else {
+        throw std::runtime_error("fused_cross_entropy_backward: unsupported dtype");
+    }
+}
+
+void chunked_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                   Tensor& chunk_logsumexp, const Tensor& targets,
+                                   Tensor* valid_token_count, Tensor* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+    float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    if (!lse_ptr) {
+        throw std::runtime_error("chunked_cross_entropy_forward: logsumexp buffer is required");
+    }
+    int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
+    int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
+    if (logits.DType == ETensorDType::FP32) {
+        chunked_cross_entropy_forward(logits.get<float>(), losses.get<float>(), lse_ptr,
+                                      chunk_logsumexp.get<float>(), targets.get<int>(),
+                                      count_ptr, correct_ptr,
+                                      BT, V, P, n_chunks, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        chunked_cross_entropy_forward(logits.get<nv_bfloat16>(), losses.get<float>(), lse_ptr,
+                                      chunk_logsumexp.get<float>(), targets.get<int>(),
+                                      count_ptr, correct_ptr,
+                                      BT, V, P, n_chunks, stream);
+    } else {
+        throw std::runtime_error("chunked_cross_entropy_forward: unsupported dtype");
+    }
+}
+
+void chunked_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                    const Tensor& dloss, const Tensor& targets,
+                                    int BT, int V, int P, cudaStream_t stream) {
+    const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
+    if (!lse_ptr) {
+        throw std::runtime_error("chunked_cross_entropy_backward: logsumexp buffer is required");
+    }
+    const float* dloss_ptr = dloss.get<float>();
+    if (dlogits.DType == ETensorDType::FP32) {
+        chunked_cross_entropy_backward(dlogits.get<float>(), logits.get<float>(), lse_ptr,
+                                       dloss_ptr, targets.get<int>(),
+                                       BT, V, P, stream);
+    } else if (dlogits.DType == ETensorDType::BF16) {
+        chunked_cross_entropy_backward(dlogits.get<nv_bfloat16>(), logits.get<nv_bfloat16>(), lse_ptr,
+                                       dloss_ptr, targets.get<int>(),
+                                       BT, V, P, stream);
+    } else {
+        throw std::runtime_error("chunked_cross_entropy_backward: unsupported dtype");
     }
 }
 
@@ -964,6 +1073,52 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
         fprintf(stderr, "[DEBUG] matmul error: c.DType=%d a.DType=%d b.DType=%d\n",
                 (int)c.DType, (int)a.DType, (int)b.DType);
         throw std::logic_error("matmul_forward: invalid DType combination");
+    }
+}
+
+/**
+ * @brief Performs Tensor-based matrix multiplication with explicit alpha/beta: C = alpha * (A @ B) + beta * C
+ *
+ * This overload allows fusing scaling into the matmul epilogue for better performance.
+ * Useful for LoRA backward pass where scaling factors need to be applied.
+ *
+ * @param c [in,out] Output tensor C.
+ * @param a [in] Input tensor A.
+ * @param b [in] Input tensor B.
+ * @param bias [in] Optional bias tensor.
+ * @param scale_a [in] Scaling factor for A (FP8 only).
+ * @param scale_b [in] Scaling factor for B (FP8 only).
+ * @param handle [in] cuBLASLt handle.
+ * @param workspace [in] Workspace tensor.
+ * @param M [in] Number of rows in C.
+ * @param N [in] Number of columns in C.
+ * @param K [in] Inner dimension.
+ * @param mode [in] Transpose mode.
+ * @param alpha [in] Output scaling factor.
+ * @param beta [in] Accumulation factor.
+ * @param stream [in] CUDA stream.
+ */
+void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
+            const float* scale_a, const float* scale_b,
+            cublasLtHandle_t handle, Tensor& workspace,
+            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream) {
+    std::byte* ws = workspace.get<std::byte>();
+    std::size_t ws_size = workspace.bytes();
+
+    // Currently only BF16 is supported with explicit alpha/beta
+    // (this is the primary use case for LoRA backward)
+    if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
+        nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
+        matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, alpha, beta, stream);
+    } else {
+        // For other dtypes, fall back to the accumulate-based API
+        // Note: this loses the ability to use non-1.0 alpha values
+        bool accumulate = (beta != 0.0f);
+        matmul(c, a, b, bias, scale_a, scale_b, handle, workspace, M, N, K, mode, accumulate, stream);
+        // If alpha != 1.0, we'd need a separate scale kernel, but this shouldn't happen in practice
+        if (alpha != 1.0f && alpha != 0.0f) {
+            fprintf(stderr, "[WARNING] matmul with alpha!=1.0 not supported for dtype %d, scaling skipped\n", (int)c.DType);
+        }
     }
 }
 

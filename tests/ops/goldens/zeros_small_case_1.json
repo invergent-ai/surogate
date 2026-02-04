@@ -1,0 +1,26 @@
+{
+  "attrs": {},
+  "case": "small_case_1",
+  "inputs": {},
+  "meta": {
+    "note": "Zeros op has no inputs; output is all zeros."
+  },
+  "op": "zeros",
+  "outputs": {
+    "out": {
+      "data": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dtype": "fp64",
+      "shape": [
+        2,
+        3
+      ]
+    }
+  }
+}

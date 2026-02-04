@@ -1,3 +1,4 @@
+import os
 import shutil
 import sys
 import time
@@ -14,7 +15,6 @@ from surogate.train.training_plot import generate_training_plot
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.system_info import get_system_info, print_system_diagnostics
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
@@ -30,6 +30,10 @@ class SurogateTrainerWrapper():
         self.config = config
 
         model_weights_path = get_model_weights_path(config.model_dir)
+
+        from surogate.dsl.ir_builder import build_dsl_ir_for_model
+        ir_json = build_dsl_ir_for_model(config.model_dir)
+        config.runtime_config.dsl_ir_json = ir_json
         
         # Setup data loaders
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
@@ -251,14 +255,22 @@ class SurogateTrainerWrapper():
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
 
     def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
-        # Allocate token buffers
-        in_tokens = np.empty((self.config.gpus * self.config.per_device_train_batch_size, self.config.sequence_len),
-                             dtype=np.int32)
-        out_tokens = np.empty((self.config.gpus * self.config.per_device_train_batch_size, self.config.sequence_len),
-                              dtype=np.int32)
+        use_full_step_graphs = True
+        if use_full_step_graphs and self.config.optimizer not in ("adamw_8bit", "normuon"):
+            raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
+        if use_full_step_graphs and not self.config.use_cuda_graphs:
+            logger.info("CUDA graphs disabled; DSL full-step execution will use eager fallback.")
 
-        # Preload first batch
-        self.train_loader.load_batch(in_tokens, out_tokens)
+        # Allocate token buffers
+        micro_steps = self.config.gradient_accumulation_steps if use_full_step_graphs else 1
+        total_rows = self.config.gpus * self.config.per_device_train_batch_size * micro_steps
+        in_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
+        out_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
+        pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
+
+        # Preload first batch (eager path only)
+        if not use_full_step_graphs:
+            self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
@@ -266,19 +278,30 @@ class SurogateTrainerWrapper():
             # Check if we need to advance epoch
             if not self.train_loader.has_next(self.config.gradient_accumulation_steps):
                 self.train_loader.advance_epoch()
-                self.train_loader.load_batch(in_tokens, out_tokens)
+                if not use_full_step_graphs:
+                    self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic evaluation (before training step)
             if self.eval_loader and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
                 # Limit periodic eval to 100 batches for speed; full eval runs at end of training
-                val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, max_steps=100)
+                if use_full_step_graphs:
+                    chunk = self.config.gpus * self.config.per_device_train_batch_size
+                    val_loss, elapsed_ms, batches_processed = self.run_evaluation(
+                        in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], max_steps=100
+                    )
+                else:
+                    val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, pos_ids, max_steps=100)
                 epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
                 # Calculate actual tokens processed based on batches run
                 # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
                 eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
                 # Reload training batch after evaluation (eval leaves its last batch in the buffers)
-                self.train_loader.load_batch(in_tokens, out_tokens)
+                if use_full_step_graphs:
+                    chunk = self.config.gpus * self.config.per_device_train_batch_size
+                    self.train_loader.load_batch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk])
+                else:
+                    self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic checkpointing (before training step)
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
@@ -308,10 +331,19 @@ class SurogateTrainerWrapper():
             # Training step
             step_start = time.time()
 
-            for micro_step in range(self.config.gradient_accumulation_steps):
-                self.trainer.step(in_tokens, out_tokens)
-                if self.train_loader.has_next():
-                    self.train_loader.load_batch(in_tokens, out_tokens)
+            if use_full_step_graphs:
+                chunk = self.config.gpus * self.config.per_device_train_batch_size
+                for micro_step in range(self.config.gradient_accumulation_steps):
+                    if not self.train_loader.has_next():
+                        self.train_loader.advance_epoch()
+                    start = micro_step * chunk
+                    end = start + chunk
+                    self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+            else:
+                for micro_step in range(self.config.gradient_accumulation_steps):
+                    self.trainer.step(in_tokens, out_tokens, pos_ids)
+                    if self.train_loader.has_next():
+                        self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Log GPU utilization
             if self.config.log_gpu_util > 0 and step % self.config.log_gpu_util == 0:
@@ -336,7 +368,14 @@ class SurogateTrainerWrapper():
                 normuon_lr=lr,  # Use same LR for NorMuon
                 normuon_cautious_wd=self.config.normuon_cautious_wd
             )
-            result = self.trainer.update_with_config(opt_config, step + 1)
+            if use_full_step_graphs:
+                result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+                # Optional LoRA grad debug runs after graph replay (post-update).
+                self._maybe_log_lora_grad_stats(step)
+            else:
+                # Optional LoRA gradient debug (before optimizer update)
+                self._maybe_log_lora_grad_stats(step)
+                result = self.trainer.update_with_config(opt_config, step + 1)
 
             step_time = time.time() - step_start
             elapsed_ms = int(step_time * 1000)
@@ -360,12 +399,70 @@ class SurogateTrainerWrapper():
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
-    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
+    def _maybe_log_lora_grad_stats(self, step: int) -> None:
+        if not self.config.lora:
+            return
+        if os.environ.get("SUROGATE_DEBUG_LORA_GRADS", "0") not in {"1", "true", "True", "yes", "YES"}:
+            return
+        try:
+            every = int(os.environ.get("SUROGATE_DEBUG_LORA_GRADS_EVERY", "1"))
+        except ValueError:
+            every = 1
+        if every <= 0 or step % every != 0:
+            return
+
+        try:
+            import torch
+        except Exception as exc:  # pragma: no cover - debug-only
+            logger.warning(f"LoRA grad debug requested but torch unavailable: {exc}")
+            return
+
+        try:
+            grads = self.trainer.get_lora_gradients(0)
+        except Exception as exc:
+            logger.warning(f"Failed to fetch LoRA gradients for debug: {exc}")
+            return
+
+        total_sq = None
+        max_abs = None
+        any_nan = False
+        tensor_count = 0
+
+        for _, arr in grads.items():
+            try:
+                t = torch.utils.dlpack.from_dlpack(arr)
+            except Exception:
+                # Fallback: try as_tensor (may copy to CPU)
+                t = torch.as_tensor(arr)
+            if t.numel() == 0:
+                continue
+            tensor_count += 1
+            t_f = t.float()
+            if torch.isnan(t_f).any().item():
+                any_nan = True
+            sq = (t_f * t_f).sum()
+            total_sq = sq if total_sq is None else total_sq + sq
+            t_max = t_f.abs().max()
+            max_abs = t_max if max_abs is None else torch.maximum(max_abs, t_max)
+
+        if total_sq is None:
+            logger.info("LoRA grad debug: no gradients found")
+            return
+
+        total_norm = total_sq.sqrt().item()
+        max_abs_val = max_abs.item() if max_abs is not None else float("nan")
+        logger.info(
+            "LoRA grad debug: step=%d tensors=%d norm=%.6g max_abs=%.6g nan=%s",
+            step, tensor_count, total_norm, max_abs_val, any_nan
+        )
+
+    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
         """
         Run evaluation on test set.
         Args:
             in_tokens (np.ndarray): Input token buffer.
             out_tokens (np.ndarray): Output token buffer.
+            pos_ids (np.ndarray): Position id buffer.
             max_steps (int): Maximum number of eval batches to process. Pass -1 to process all available batches.
         Returns:
             Tuple of (mean_loss, elapsed_ms, batches_processed)
@@ -381,8 +478,8 @@ class SurogateTrainerWrapper():
         # Use has_next() to check data availability (matches C++ implementation)
         # max_steps < 0 means process all available batches
         while self.eval_loader.has_next() and (max_steps < 0 or batches < max_steps):
-            self.eval_loader.load_batch(in_tokens, out_tokens)
-            loss = self.trainer.validate(in_tokens, out_tokens)
+            self.eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
+            loss = self.trainer.validate(in_tokens, out_tokens, pos_ids)
             total_loss += loss
             batches += 1
 

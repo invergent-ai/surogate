@@ -20,8 +20,8 @@
 #include <cuda_runtime.h>
 
 #include "kernels/kernel_utils.cuh"
-#include "modules/fp8_scaling_config.h"
-#include "modules/fp8_scaling_state.h"
+#include "runtime/core/fp8_scaling_config.h"
+#include "runtime/core/fp8_scaling_state.h"
 
 namespace {
 
@@ -74,36 +74,35 @@ __global__ void delayed_scaling_update_kernel(
     float* hist = amax_history + qid;
     const int stride = num_quantizers;
 
-    // Get the most recent amax from history slot [0] (from previous iteration)
-    // This is the "delayed" part - we use previous iteration's amax to compute scale
-    const float last_amax = hist[0];
+    // Get the newly recorded amax from this iteration's forward pass
+    const float new_amax = recorded_amaxes[qid];
 
     // Compute max across history while rolling (TransformerEngine approach)
     __shared__ float shared_max[BLOCK_SIZE];
     float thread_max = 0.0f;
 
-    // Roll history forward: hist[i] = hist[i+1], then zero out hist[0]
+    // Roll history forward: hist[i] = hist[i+1], and insert new_amax at slot [0]
     // Process forward in chunks to avoid overwriting values we still need
     for (int off = 0; off < history_len; off += blockDim.x) {
         const int i = off + tid;
         float val = 0.0f;
         if (i < history_len) {
-            // Read value: shift from next slot, or use last_amax for the end
-            val = (i < history_len - 1) ? hist[(i + 1) * stride] : last_amax;
+            // Read value: shift from next slot, or use new_amax for the last slot
+            val = (i < history_len - 1) ? hist[(i + 1) * stride] : new_amax;
             thread_max = fmaxf(thread_max, val);
         }
         __syncthreads();  // Ensure reads complete before writes
 
         if (i < history_len) {
-            // Write rolled value, but zero out slot [0] for next iteration
-            hist[i * stride] = (i > 0) ? val : 0.0f;
+            // Write rolled value: slot[0] gets new_amax, others shift down
+            hist[i * stride] = (i == 0) ? new_amax : val;
         }
     }
 
     // Compute effective amax based on algorithm
     float effective_amax;
     if (amax_compute_algo == 1) {  // MOST_RECENT
-        effective_amax = last_amax;
+        effective_amax = new_amax;
     } else {  // MAX (default)
         // Reduce thread_max across block
         shared_max[tid] = thread_max;

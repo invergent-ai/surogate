@@ -17,6 +17,10 @@ configure:
 # Build all targets
 build: configure
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS)
+	cp -f $(BUILD_DIR)/_surogate*.so surogate/
+	cp -f $(BUILD_DIR)/_surogate*.so .venv/lib/python3.12/site-packages/surogate/
+	cp -f $(BUILD_DIR)/libsurogate-common.so surogate/
+	cp -f $(BUILD_DIR)/libsurogate-common.so .venv/lib/python3.12/site-packages/surogate/
 
 # Build Python wheel
 wheel:

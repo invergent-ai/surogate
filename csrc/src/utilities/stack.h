@@ -25,6 +25,8 @@ public:
     std::size_t bytes_used() const;
     std::size_t max_utilization() const;
     int device_id() const;
+    bool owns(const std::byte* ptr) const;
+    bool is_live(const std::byte* ptr) const;
 
     // Checkpoint/restore for CUDA graph compatibility.
     // Save the current stack position and restore it later to ensure
@@ -61,5 +63,6 @@ private:
     std::size_t mMaxUtilization = 0;
     std::vector<sAllocRecord> mHighMark;
 };
+
 
 #endif //SUROGATE_SRC_UTILITIES_STACK_H

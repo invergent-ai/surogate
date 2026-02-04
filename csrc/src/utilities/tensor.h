@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "dtype.h"
@@ -73,7 +74,8 @@ struct Tensor {
     template<class TargetType>
     [[nodiscard]] constexpr const TargetType* get() const {
         if(dtype_from_type<TargetType> != DType) {
-            throw std::logic_error("DType mismatch");
+            throw std::logic_error(std::string("DType mismatch: expected ") +
+                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType));
         }
 
         return reinterpret_cast<const TargetType*>(Data);
@@ -82,7 +84,8 @@ struct Tensor {
     template<typename TargetType>
     [[nodiscard]] constexpr TargetType* get() {
         if(dtype_from_type<TargetType> != DType) {
-            throw std::logic_error("DType mismatch");
+            throw std::logic_error(std::string("DType mismatch: expected ") +
+                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType));
         }
 
         return reinterpret_cast<TargetType*>(Data);

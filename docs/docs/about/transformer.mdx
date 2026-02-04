@@ -530,11 +530,11 @@ Example for a 4B parameter model with batch size 2, sequence length 2048:
 
 ### LoRA-Specific Recomputation
 
-When using LoRA with `recompute_lora: true`, an additional optimization is available. Instead of storing LN1/LN2 activations for all layers, they are recomputed on-demand from the residual stream during the LoRA backward pass:
+With LoRA, `recompute_block: true` also recomputes LN1/LN2 on-demand from the residual stream during the LoRA backward pass, instead of storing per-layer LN activations:
 
 ```
-# Without recompute_lora: store ln1 for all 36 layers (~360 MB)
-# With recompute_lora: recompute ln1 from residual when needed
+# Without recompute_block: store ln1 for all 36 layers (~360 MB)
+# With recompute_block: recompute ln1 from residual when needed
 
 ln1 = rmsnorm(residual, weight)  # Recomputed during backward
 d_lora = backward_lora(ln1, d_output)

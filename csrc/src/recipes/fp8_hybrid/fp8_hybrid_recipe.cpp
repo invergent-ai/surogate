@@ -7,10 +7,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include "modules/fp8_scaling_config.h"  // QuantizerIndex
-#include "modules/fp8_scaling_state.h"   // FP8ScalingState (must be before training/model.h)
+#include "runtime/core/fp8_scaling_config.h"  // QuantizerIndex
+#include "runtime/core/fp8_scaling_state.h"   // FP8ScalingState (must be before runtime/training/model.h)
 #include "kernels/kernels.h"
-#include "training/model.h"
+#include "runtime/training/model.h"
 
 namespace recipes {
 
@@ -228,11 +228,28 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     Tensor weight_stats{};
     bool weight_is_temp = false;
 
+    // Optional: use cached FP8 weights to avoid per-op quantize+transpose.
+    // - If cached weight is (K, N), we treat it as W^T and skip transpose.
+    // - If cached weight is (N, K), we treat it as W and still transpose each call.
+    const Tensor* cached_fp8 = (ctx.cached_weight && ctx.cached_weight->Data) ? ctx.cached_weight : nullptr;
+    const bool cached_is_fp8 = (cached_fp8 && cached_fp8->DType == ETensorDType::FP8_E4M3);
+    const bool cached_is_transposed = (cached_is_fp8 &&
+                                       cached_fp8->Rank == 2 &&
+                                       cached_fp8->Sizes[0] == K &&
+                                       cached_fp8->Sizes[1] == N);
+
     if (ctx.weight->DType == ETensorDType::FP8_E4M3) {
         // Weight already FP8 (e.g., QLoRA FP8 base)
         weight_e4m3 = *ctx.weight;
         if (!weight_e4m3.scale()) {
             throw std::runtime_error("FP8HybridRecipe::backward_matmul: FP8 weight missing scale Stats");
+        }
+    } else if (cached_is_fp8 && cached_fp8->Rank == 2 &&
+               cached_fp8->Sizes[0] == N && cached_fp8->Sizes[1] == K) {
+        // Use cached FP8 weight (non-transposed) and still transpose per call.
+        weight_e4m3 = *cached_fp8;
+        if (!weight_e4m3.scale()) {
+            throw std::runtime_error("FP8HybridRecipe::backward_matmul: cached FP8 weight missing scale Stats");
         }
     } else {
         // Quantize BF16/FP32 weight to E4M3 on-the-fly
@@ -247,22 +264,32 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Step 3: Compute dinp = W^T @ dout
-    // Need to transpose weight: (N, K) -> (K, N)
-    auto weight_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, N});
-    Tensor weight_tp_stats = rs.temp_alloc(ETensorDType::FP32, {2});
-    weight_tp.Stats = weight_tp_stats.get<float>();
+    if (cached_is_transposed) {
+        // Use cached W^T in FP8 directly.
+        if (!cached_fp8->scale()) {
+            throw std::runtime_error("FP8HybridRecipe::backward_matmul: cached FP8 W^T missing scale Stats");
+        }
+        matmul(*ctx.dinp, *cached_fp8, dout_e5m2, std::nullopt, cached_fp8->scale(), dout_e5m2.scale(),
+               rs.CublasLtHandle, rs.CuBlasWorkspace,
+               K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+    } else {
+        // Need to transpose weight: (N, K) -> (K, N)
+        auto weight_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, N});
+        Tensor weight_tp_stats = rs.temp_alloc(ETensorDType::FP32, {2});
+        weight_tp.Stats = weight_tp_stats.get<float>();
 
-    transpose(weight_tp, weight_e4m3, N, K, ctx.stream);
-    // Copy scale (transpose doesn't change it)
-    cudaMemcpyAsync(weight_tp.scale(), weight_e4m3.scale(), sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream);
+        transpose(weight_tp, weight_e4m3, N, K, ctx.stream);
+        // Copy scale (transpose doesn't change it)
+        cudaMemcpyAsync(weight_tp.scale(), weight_e4m3.scale(), sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream);
 
-    // dinp = W^T @ dout: (K, N) × (N, M)^T = (K, M)^T -> (M, K)
-    matmul(*ctx.dinp, weight_tp, dout_e5m2, std::nullopt, weight_tp.scale(), dout_e5m2.scale(),
-           rs.CublasLtHandle, rs.CuBlasWorkspace,
-           K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        // dinp = W^T @ dout: (K, N) × (N, M)^T = (K, M)^T -> (M, K)
+        matmul(*ctx.dinp, weight_tp, dout_e5m2, std::nullopt, weight_tp.scale(), dout_e5m2.scale(),
+               rs.CublasLtHandle, rs.CuBlasWorkspace,
+               K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
 
-    rs.temp_free(weight_tp_stats);
-    rs.temp_free(weight_tp);
+        rs.temp_free(weight_tp_stats);
+        rs.temp_free(weight_tp);
+    }
     if (weight_is_temp) {
         rs.temp_free(weight_stats);
         rs.temp_free(weight_e4m3);

@@ -47,6 +47,13 @@ void rmsnorm_forward(float* out, float* rms, const float* inp, const float* weig
 void rmsnorm_forward(nv_bfloat16* out, float* rms, const nv_bfloat16* inp, const nv_bfloat16* weight, float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 void rmsnorm_forward(Tensor& out, Tensor& rms, const Tensor& inp, const Tensor& weight, float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 
+/// @brief Apply RMSNorm using a pre-computed rstd value (for deterministic recomputation)
+/// This avoids recomputing rstd which can differ due to floating-point non-associativity.
+/// out[i] = inp[i] * rstd[batch_idx] * weight[i % C]
+void rmsnorm_apply_saved(float* out, const float* inp, const float* weight, const float* rstd, int B, int T, int C, cudaStream_t stream);
+void rmsnorm_apply_saved(nv_bfloat16* out, const nv_bfloat16* inp, const nv_bfloat16* weight, const float* rstd, int B, int T, int C, cudaStream_t stream);
+void rmsnorm_apply_saved(Tensor& out, const Tensor& inp, const Tensor& weight, const Tensor& rstd, int B, int T, int C, cudaStream_t stream);
+
 void rmsnorm_forward_quant(__nv_fp8_e4m3* out, float* scale_ptr, float* rms, const nv_bfloat16* inp, const nv_bfloat16* weight, const float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 void rmsnorm_forward_quant(Tensor& out, float* scale_ptr, Tensor& rms, const Tensor& inp, const Tensor& weight, const float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream);
 
@@ -64,6 +71,13 @@ void fused_residual_rmsnorm_forward(nv_bfloat16* residual, nv_bfloat16* normed, 
                                     float epsilon, int N, int C, cudaStream_t stream);
 void fused_residual_rmsnorm_forward(Tensor& residual, Tensor& normed, Tensor& rrms, const Tensor& inp1, const Tensor& inp2, const Tensor& weight, float* abs_max_ptr,
                                     float epsilon, int N, int C, cudaStream_t stream);
+
+/// @brief Fused residual add + RMSNorm apply using pre-computed rstd (for deterministic recomputation)
+/// residual = inp1 + inp2
+/// normed = residual * rstd * weight
+void fused_residual_rmsnorm_apply_saved(float* residual, float* normed, const float* inp1, const float* inp2, const float* weight, const float* rstd, int N, int C, cudaStream_t stream);
+void fused_residual_rmsnorm_apply_saved(nv_bfloat16* residual, nv_bfloat16* normed, const nv_bfloat16* inp1, const nv_bfloat16* inp2, const nv_bfloat16* weight, const float* rstd, int N, int C, cudaStream_t stream);
+void fused_residual_rmsnorm_apply_saved(Tensor& residual, Tensor& normed, const Tensor& inp1, const Tensor& inp2, const Tensor& weight, const Tensor& rstd, int N, int C, cudaStream_t stream);
 
 // Head-wise RMSNorm over packed QKV buffers (used for Qwen3-style Q/K norm).
 // Operates in-place on @p qkv, normalizing vectors of length @p head_size for each (token, head)
@@ -95,13 +109,17 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv, const Tensor& qkv_rope, co
                                        const Tensor& freqs_cis, const int* position_ids,
                                        int B, int T, int qkv_channels,
                                        int num_heads, int head_size, int channel_offset,
-                                       cudaStream_t stream);
+                                       cudaStream_t stream, float* abs_max_ptr = nullptr);
 
 void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qkv, const Tensor& qkv_rope, const Tensor& weight,
                                             const Tensor& freqs_cis, const int* position_ids,
                                             int B, int T, int qkv_channels,
                                             int num_heads, int head_size, int channel_offset,
                                             bool accumulate, cudaStream_t stream);
+
+void qkv_abs_max_slice(const Tensor& qkv, int B, int T, int qkv_channels,
+                       int channel_offset, int channel_count,
+                       float* abs_max_ptr, cudaStream_t stream);
 
 void matmul(float* c, const float* a, const float* b, const float* bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
@@ -143,9 +161,21 @@ void matmul(nv_bfloat16* c, const __nv_fp8_e4m3* a, const __nv_fp8_e5m2* b, cons
             cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
 
+// Matmul with explicit alpha/beta: C = alpha * (A @ B) + beta * C
+// Raw pointer overloads with alpha/beta for fused scaling
+void matmul(nv_bfloat16* c, const nv_bfloat16* a, const nv_bfloat16* b, const nv_bfloat16* bias, const float* scale_a, const float* scale_b,
+            cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream);
+
 void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias, const float* scale_a, const float* scale_b,
             cublasLtHandle_t handle, Tensor& workspace,
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream);
+
+// Matmul with explicit alpha/beta: C = alpha * (A @ B) + beta * C
+// This allows fusing scaling into the matmul epilogue for better performance.
+void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias, const float* scale_a, const float* scale_b,
+            cublasLtHandle_t handle, Tensor& workspace,
+            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream);
 
 // Initialize fallback cuBLAS handle used when cuBLASLt matmul fails.
 // Call once during startup (before CUDA graph capture) to avoid cublasCreate in capture.
@@ -299,6 +329,43 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Nq, HS)
                              Tensor& workspace, cudnnHandle_t handle,
                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
+// Custom (non-cuDNN) attention forward using the in-tree kernel (supports FP32/BF16).
+void attention_forward_custom(Tensor& out,  // output: (B, T, Nq, HS)
+                              Tensor& stats, // output for backward pass: (B, Hq, T)
+                              const Tensor& inp,  // input: (B, T, Hq + 2Hkv, HS) QKV
+                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+// Custom (non-cuDNN) attention backward using the in-tree kernel (supports FP32/BF16).
+void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
+                               const Tensor& out, const Tensor& dout, const Tensor& qkv,
+                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+
+struct AttnBwdDebugConfig {
+    int enabled = 0;
+    int layer = -1;
+    int micro = -1;
+    int target_b = 0;
+    int target_h = 0;
+    int target_t = 0;
+    int target_l = 0;
+};
+
+struct AttnFwdDebugConfig {
+    int enabled = 0;
+    int layer = -1;
+    int target_b = 0;
+    int target_h = 0;
+    int target_t = 0;
+    int target_l = 0;
+};
+
+void attention_backward_debug(const Tensor& out, const Tensor& dout, const Tensor& qkv,
+                              const Tensor& stats, int B, int T, int Hq, int Hkv, int HS,
+                              const AttnBwdDebugConfig& cfg, cudaStream_t stream);
+
+void attention_forward_debug(const Tensor& qkv, const Tensor& stats,
+                             int B, int T, int Hq, int Hkv, int HS,
+                             const AttnFwdDebugConfig& cfg, cudaStream_t stream);
+
 std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle);
 void attention_backward_cudnn(nv_bfloat16* dqkv, const float* stats,
                               const nv_bfloat16* out, const nv_bfloat16* dout, const nv_bfloat16* qkv,
@@ -331,6 +398,52 @@ void fused_classifier(Tensor& logits, Tensor& losses,
                       Tensor* correct_count,
                       int BT, int V, int P, bool write_dlogits, cudaStream_t stream);
 
+constexpr int CROSS_ENTROPY_MAX_FUSED_SIZE = 65536;
+constexpr int CROSS_ENTROPY_BACKWARD_CHUNK_SIZE = 4096;
+
+void fused_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
+                                 const int* targets, int* valid_token_count,
+                                 int* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
+                                 const int* targets, int* valid_token_count,
+                                 int* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
+                                  const float* dloss, const int* targets,
+                                  int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
+                                  const float* dloss, const int* targets,
+                                  int BT, int V, int P, cudaStream_t stream);
+void chunked_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
+                                   float* chunk_logsumexp, const int* targets,
+                                   int* valid_token_count, int* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream);
+void chunked_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
+                                   float* chunk_logsumexp, const int* targets,
+                                   int* valid_token_count, int* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream);
+void chunked_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
+                                    const float* dloss, const int* targets,
+                                    int BT, int V, int P, cudaStream_t stream);
+void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
+                                    const float* dloss, const int* targets,
+                                    int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                 const Tensor& targets, Tensor* valid_token_count,
+                                 Tensor* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream);
+void fused_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                  const Tensor& dloss, const Tensor& targets,
+                                  int BT, int V, int P, cudaStream_t stream);
+void chunked_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
+                                   Tensor& chunk_logsumexp, const Tensor& targets,
+                                   Tensor* valid_token_count, Tensor* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream);
+void chunked_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
+                                    const Tensor& dloss, const Tensor& targets,
+                                    int BT, int V, int P, cudaStream_t stream);
+
 int get_max_num_block_sums(const cudaDeviceProp& dp);
 void global_norm_squared(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
 void global_norm_squared(float* out, const nv_bfloat16* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
@@ -342,7 +455,7 @@ void global_norm_squared(Tensor& out, const Tensor& values, size_t count, const 
 //
 // Writes:
 // - out[1] := total multiplier to apply to gradients (may be > 1 when many tokens are masked)
-// - out_cpu := scaled gradient norm (norm * token_scale), for logging
+// - out_cpu := raw gradient norm (before token scaling), for logging
 void global_norm_sqrt(float* out, float* out_cpu, float grad_clip,
                       const int* valid_token_count, float total_tokens,
                       const cudaDeviceProp& dp, cudaStream_t stream);
@@ -351,9 +464,9 @@ void deterministic_sum(float* out, const float* values, std::size_t count, cudaS
 void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count, cudaStream_t stream);
 
 
-// 8-bit AdamW optimizer - functions moved to modules/optimizers/adamw_8bit.h
+// 8-bit AdamW optimizer - functions moved to runtime/adamw_8bit.h
 // Bring them into global namespace for backward compatibility
-#include "modules/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/adamw_8bit.h"
 
 using optimizers::adamw_update_8bit;
 using optimizers::adamw_update_8bit_multi_tensor;
@@ -424,6 +537,10 @@ void fill_normal(Tensor& dest, std::size_t count, float mean, float std, unsigne
 void fill_constant(float* dst, float value, std::size_t count, cudaStream_t stream);
 void fill_constant(nv_bfloat16* dst, nv_bfloat16 value, std::size_t count, cudaStream_t stream);
 void fill_constant(Tensor& dest, float value, std::size_t count, cudaStream_t stream);
+
+// Efficiently zero multiple non-contiguous device buffers in a single kernel launch.
+// `ptrs[i]` is a device pointer (encoded as uint64_t) and `sizes[i]` is the size in bytes.
+void zero_device_segments(const std::uint64_t* ptrs, const std::uint64_t* sizes, int n, cudaStream_t stream);
 
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size);
@@ -599,6 +716,24 @@ void compute_fp4_alpha(float* alpha_out, const float* global_amax_a, const float
 /// @param stream CUDA stream
 void compute_fp4_alpha_4o6(float* alpha_out, const float* global_amax_a, const float* global_amax_b,
                            cudaStream_t stream);
+
+/// @brief Compute FP4 tensor scale from a global amax.
+///
+/// Computes tensor_scale = global_amax / (fp4_max * fp8_max).
+/// This matches Quartet-II's convention where `tensor_scale` is a scalar applied
+/// during dequantization: value ≈ fp4 * fp8_scale * tensor_scale.
+///
+/// Note: Standard NVFP4 uses fp4_max=6 and fp8_max=448, so tensor_scale = amax / 2688.
+/// EDEN / 4o6 typically uses fp8_max≈256, so tensor_scale ≈ amax / 1536.
+void compute_fp4_tensor_scale(float* tensor_scale_out, const float* global_amax,
+                              float fp4_max, float fp8_max, cudaStream_t stream);
+
+/// @brief Compute FP4 alpha from tensor scales.
+///
+/// Computes alpha = tensor_scale_a * tensor_scale_b for use with matmul_cutlass_fp4_alpha().
+/// This is equivalent to compute_fp4_alpha() when tensor_scale = amax / (fp4_max * fp8_max).
+void compute_fp4_alpha_from_tensor_scale(float* alpha_out, const float* tensor_scale_a,
+                                         const float* tensor_scale_b, cudaStream_t stream);
 
 /// @brief Fused FP4 alpha scaling + FP32→BF16 conversion.
 ///
@@ -805,6 +940,23 @@ void fp4_matmul(Tensor& d, const Tensor& a, const Tensor& b,
 /// @param cols Number of columns in the data matrix.
 /// @return Number of UE4M3 scale elements needed.
 size_t compute_nvfp4_cutlass_scale_size(int rows, int cols);
+
+/// @brief Reorder NVFP4 scales from linear row-major layout to CUTLASS layout.
+///
+/// Linear layout is a plain row-major matrix of shape (rows, ceil(cols/16)),
+/// where each scale corresponds to a 16-element block.
+///
+/// CUTLASS layout matches Sm1xxBlkScaledConfig expectations used by
+/// matmul_cutlass_fp4*() kernels.
+void nvfp4_scales_linear_to_cutlass(uint8_t* out_cutlass, const uint8_t* in_linear,
+                                    int rows, int cols, cudaStream_t stream);
+
+/// @brief Reorder NVFP4 scales from CUTLASS layout to linear row-major layout.
+///
+/// This is the inverse of nvfp4_scales_linear_to_cutlass() for the (rows, cols)
+/// problem shape.
+void nvfp4_scales_cutlass_to_linear(uint8_t* out_linear, const uint8_t* in_cutlass,
+                                    int rows, int cols, cudaStream_t stream);
 
 /// @brief NVFP4 activation quantization with CUTLASS-compatible scale layout.
 /// @param[out] out_fp4 Output packed FP4 data (M, K/2 bytes).

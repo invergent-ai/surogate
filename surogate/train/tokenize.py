@@ -599,7 +599,7 @@ class TokenizeDatasets(SurogateCommand):
 
         # Write BIN.TOK files
         logger.info("Writing tokenized train files...")
-        self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=True)
+        self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=self.config.sample_packing)
         if val_dataset is not None:
             logger.info("Writing tokenized validation files...")
             self._write_bin_tok(val_dataset, os.path.join(self.config.output_dir, 'eval.bin'), packing=False)
@@ -656,7 +656,7 @@ class TokenizeDatasets(SurogateCommand):
         pad_token_id = self.config.tokenizer.pad_token_id if self.config.tokenizer.pad_token_id is not None else 0
 
         # Set defaults for multi-file processing
-        if max_tokens_per_file is None and packing:
+        if max_tokens_per_file is None:
             max_tokens_per_file = DEFAULT_MAX_TOKENS_PER_FILE
 
         if num_workers is None:
@@ -684,7 +684,7 @@ class TokenizeDatasets(SurogateCommand):
         # non_overlapping=True for validation (padded, non-packed) so dataloader uses correct chunk count
         non_overlapping = not packing
 
-        if packing and max_tokens_per_file:
+        if max_tokens_per_file:
             self._write_multi_file(
                 iter_docs(),
                 out_dir=out_dir,
@@ -693,7 +693,8 @@ class TokenizeDatasets(SurogateCommand):
                 seq_len=seq_len,
                 pad_token_id=pad_token_id,
                 max_tokens_per_file=max_tokens_per_file,
-                non_overlapping=non_overlapping
+                non_overlapping=non_overlapping,
+                packing=packing
             )
         else:
             # Single file output for validation or small datasets
@@ -712,7 +713,8 @@ class TokenizeDatasets(SurogateCommand):
         seq_len: int,
         pad_token_id: int,
         max_tokens_per_file: int,
-        non_overlapping: bool = False
+        non_overlapping: bool = False,
+        packing: bool = True
     ) -> int:
         """Write tokenized documents to multiple files, splitting when token limit is reached.
 
@@ -721,10 +723,11 @@ class TokenizeDatasets(SurogateCommand):
             out_dir: Output directory.
             name_prefix: Prefix for output files (e.g., 'train' -> 'train-000.bin').
             vocab_size: Vocabulary size for header.
-            seq_len: Sequence length for packing.
+            seq_len: Sequence length for packing/padding.
             pad_token_id: Padding token ID.
             max_tokens_per_file: Maximum tokens per file before creating a new shard.
             non_overlapping: Whether chunks should be non-overlapping.
+            packing: If True, pack multiple docs into sequences. If False, pad each doc individually.
 
         Returns:
             Total number of tokens written across all files.
@@ -754,10 +757,32 @@ class TokenizeDatasets(SurogateCommand):
             current_masks = []
             current_len = 0
 
+        def write_padded_doc(tokens: np.ndarray, mask: np.ndarray):
+            """Write a single document with padding (no packing)."""
+            # Truncate if too long
+            if tokens.size > seq_len:
+                tokens = tokens[:seq_len]
+                mask = mask[:seq_len]
+
+            actual_len = tokens.size
+
+            # Pad if too short
+            if tokens.size < seq_len:
+                pad_len = seq_len - tokens.size
+                tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
+                mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
+
+            # Position IDs: 0..actual_len-1, then 0 for padding
+            pos_ids = np.zeros(seq_len, dtype=np.int32)
+            pos_ids[:actual_len] = np.arange(actual_len, dtype=np.int32)
+
+            current_writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
+
         def start_new_file():
             nonlocal current_writer, file_index
             if current_writer is not None:
-                flush_to_writer()
+                if packing:
+                    flush_to_writer()
                 current_writer.__exit__(None, None, None)
                 logger.info(f"Completed file {get_output_path(file_index - 1)} with {current_writer.n_tokens:,} tokens")
 
@@ -778,32 +803,43 @@ class TokenizeDatasets(SurogateCommand):
             if tokens.size == 0:
                 continue
 
-            # Check if we need to start a new file
-            if current_writer.n_tokens + current_len >= max_tokens_per_file:
-                flush_to_writer()
-                total_tokens += current_writer.n_tokens
-                start_new_file()
+            if packing:
+                # Packing mode: combine multiple docs into sequences
+                # Check if we need to start a new file
+                if current_writer.n_tokens + current_len >= max_tokens_per_file:
+                    flush_to_writer()
+                    total_tokens += current_writer.n_tokens
+                    start_new_file()
 
-            # Handle documents longer than seq_len
-            if tokens.size > seq_len:
-                flush_to_writer()
-                current_writer.add_document(
-                    tokens=tokens[:seq_len],
-                    position_ids=np.arange(seq_len, dtype=np.int32),
-                    mask=mask[:seq_len]
-                )
-                continue
+                # Handle documents longer than seq_len
+                if tokens.size > seq_len:
+                    flush_to_writer()
+                    current_writer.add_document(
+                        tokens=tokens[:seq_len],
+                        position_ids=np.arange(seq_len, dtype=np.int32),
+                        mask=mask[:seq_len]
+                    )
+                    continue
 
-            # Check if adding this doc would exceed seq_len
-            if current_len + tokens.size > seq_len:
-                flush_to_writer()
+                # Check if adding this doc would exceed seq_len
+                if current_len + tokens.size > seq_len:
+                    flush_to_writer()
 
-            current_tokens.append(tokens)
-            current_masks.append(mask)
-            current_len += tokens.size
+                current_tokens.append(tokens)
+                current_masks.append(mask)
+                current_len += tokens.size
+            else:
+                # Non-packing mode: each doc is padded individually
+                # Check if we need to start a new file (each padded doc is seq_len tokens)
+                if current_writer.n_tokens + seq_len > max_tokens_per_file:
+                    total_tokens += current_writer.n_tokens
+                    start_new_file()
+
+                write_padded_doc(tokens, mask)
 
         # Flush remaining data
-        flush_to_writer()
+        if packing:
+            flush_to_writer()
         if current_writer is not None:
             total_tokens += current_writer.n_tokens
             current_writer.__exit__(None, None, None)

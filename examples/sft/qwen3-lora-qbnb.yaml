@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-4B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -9,14 +9,15 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-num_epochs: 2
+max_steps: 5
 eval_steps: 25
 save_steps: 0
 
 learning_rate: 2e-4
 
 recipe: bf16
-recompute_lora: true
+debug_memory_breakdown: true
+use_dsl_ir: true
 
 lora: true
 lora_rank: 16

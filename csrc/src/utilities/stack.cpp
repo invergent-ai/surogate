@@ -174,6 +174,25 @@ int DeviceMemoryStack::device_id() const {
     return mDeviceID;
 }
 
+bool DeviceMemoryStack::owns(const std::byte* ptr) const {
+    if (!mBackingMemory || !ptr) {
+        return false;
+    }
+    return ptr >= mBackingMemory && ptr < (mBackingMemory + mCapacity);
+}
+
+bool DeviceMemoryStack::is_live(const std::byte* ptr) const {
+    if (!ptr) {
+        return false;
+    }
+    for (const auto& rec : mAlloc) {
+        if (rec.Pointer == ptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * @brief Save the current stack position for later restoration.
  *

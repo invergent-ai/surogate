@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-4B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -17,7 +17,7 @@ learning_rate: 2e-4
 
 recipe: fp8-hybrid
 qlora_fp8: true
-recompute_lora: true
+recompute: aggressive
 
 lora: true
 lora_rank: 16

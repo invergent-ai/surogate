@@ -3,7 +3,7 @@
 
 #include <catch2/catch_all.hpp>
 
-#include "training/logging.h"
+#include "runtime/training/logging.h"
 #include "utilities/dtype.h"
 
 TEST_CASE("TrainingRunLogger::log_sol_estimate does not throw on unsupported dtypes") {

@@ -1,0 +1,69 @@
+{
+  "attrs": {
+    "compute_accuracy": false
+  },
+  "case": "small_case_1",
+  "inputs": {
+    "logits": {
+      "data": [
+        1.0,
+        -0.5,
+        0.25,
+        2.0,
+        -1.0,
+        0.5,
+        -0.75,
+        1.25,
+        0.5,
+        1.5,
+        -0.25,
+        -1.0,
+        0.75,
+        -0.5,
+        1.0,
+        -1.25,
+        -0.5,
+        0.25,
+        1.0,
+        -0.75,
+        1.5,
+        -1.0,
+        0.5,
+        0.25
+      ],
+      "dtype": "fp64",
+      "shape": [
+        3,
+        8
+      ]
+    },
+    "targets": {
+      "data": [
+        3,
+        1,
+        6
+      ],
+      "dtype": "int32",
+      "shape": [
+        3
+      ]
+    }
+  },
+  "meta": {
+    "note": "Loss per token: logsumexp(logits) - logits[target]."
+  },
+  "op": "cross_entropy_loss",
+  "outputs": {
+    "loss": {
+      "data": [
+        0.8891045233971746,
+        1.0653652607252893,
+        2.054395371604019
+      ],
+      "dtype": "fp64",
+      "shape": [
+        3
+      ]
+    }
+  }
+}

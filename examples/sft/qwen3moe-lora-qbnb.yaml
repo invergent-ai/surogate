@@ -4,22 +4,25 @@ output_dir: ./output_moe_2
 merge_adapter: false
 apply_recommended_values: false
 
-per_device_train_batch_size: 2
+per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
 sample_packing: true
-sequence_len: 2048
+sequence_len: 512
+gpus: 1
 
-num_epochs: 2
+max_steps: 5
 eval_steps: 25
 save_steps: 0
 
 learning_rate: 2e-4
 
 recipe: bf16
-recompute_lora: true
 lmhead_chunks: 8
 warmup_steps: 20
+use_cuda_graphs: false
+use_dsl_ir: true
+recompute: false
 
 lora: true
 lora_rank: 16
@@ -35,14 +38,7 @@ lora_target_modules:
   - up_proj
   - down_proj
 
-# qlora_bnb: true
-# qlora_bnb_block_size: 64
-# qlora_bnb_double_quant: true
-# qlora_offload_experts: true
-# debug_memory_breakdown: true
-# offload_residual: true
-# offload_optimizer: true
-# use_cuda_graphs: false
+qlora_bnb: true
 
 dataloader_num_workers: 4
 datasets:

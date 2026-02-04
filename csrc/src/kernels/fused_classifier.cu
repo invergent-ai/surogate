@@ -20,6 +20,7 @@
 #include <cassert>
 
 #include "kernel_utils.cuh"
+#include "kernels.h"
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
 
@@ -413,4 +414,437 @@ void fused_classifier(nv_bfloat16* logits, float* losses,
                       int* correct_count,
                       int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
     fused_classifier_imp(logits, losses, dloss, targets, valid_token_count, correct_count, BT, V, P, write_dlogits, stream);
+}
+
+// ----------------------------------------------------------------------------
+// Cross-entropy forward/backward (non-fused with matmul) helpers
+
+template <class floatX>
+__global__ void cross_entropy_forward_kernel(const floatX* logits, float* losses, float* logsumexp,
+                                             const int* targets, int* valid_token_count,
+                                             int* correct_count, int BT, int V, int P) {
+    int idx = static_cast<int>(blockIdx.x);
+    if (idx >= BT) {
+        return;
+    }
+    int ix = targets[idx];
+    if (ix == -100) {
+        // For padding tokens, don't touch the loss buffer to preserve accumulated values
+        // from previous micro-steps. Only zero logsumexp for backward correctness.
+        if (threadIdx.x == 0 && logsumexp) {
+            logsumexp[idx] = 0.0f;
+        }
+        return;
+    }
+
+    if (threadIdx.x == 0 && valid_token_count) {
+        atomicAdd(valid_token_count, 1);
+    }
+
+    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
+    float lse = sp.Offset + logf(1.0f / sp.Scale);
+
+    // Optional accuracy computation (argmax)
+    if (correct_count) {
+        __shared__ int shared_max_idx[32];
+        __shared__ float shared_max_val[32];
+
+        const floatX* logits_vec = logits + static_cast<int64_t>(idx) * P;
+        float thread_max_val = -INFINITY;
+        int thread_max_idx = 0;
+
+        for (int i = threadIdx.x; i < V; i += blockDim.x) {
+            float val = (float)logits_vec[i];
+            if (val > thread_max_val) {
+                thread_max_val = val;
+                thread_max_idx = i;
+            }
+        }
+
+        const int lane_id = threadIdx.x % 32;
+        const int warp_id = threadIdx.x / 32;
+        const int num_warps = blockDim.x / 32;
+
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, thread_max_val, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, thread_max_idx, offset);
+            if (other_val > thread_max_val) {
+                thread_max_val = other_val;
+                thread_max_idx = other_idx;
+            }
+        }
+
+        if (lane_id == 0) {
+            shared_max_val[warp_id] = thread_max_val;
+            shared_max_idx[warp_id] = thread_max_idx;
+        }
+        __syncthreads();
+
+        if (warp_id == 0) {
+            thread_max_val = (lane_id < num_warps) ? shared_max_val[lane_id] : -INFINITY;
+            thread_max_idx = (lane_id < num_warps) ? shared_max_idx[lane_id] : 0;
+
+            for (int offset = 16; offset > 0; offset /= 2) {
+                float other_val = __shfl_down_sync(0xffffffff, thread_max_val, offset);
+                int other_idx = __shfl_down_sync(0xffffffff, thread_max_idx, offset);
+                if (other_val > thread_max_val) {
+                    thread_max_val = other_val;
+                    thread_max_idx = other_idx;
+                }
+            }
+
+            if (threadIdx.x == 0) {
+                if (thread_max_idx == ix) {
+                    atomicAdd(correct_count, 1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float logit_val = (float)logits[idx * P + ix];
+        // Accumulate loss (not overwrite) to support gradient accumulation
+        losses[idx] += lse - logit_val;
+        if (logsumexp) {
+            logsumexp[idx] = lse;
+        }
+    }
+}
+
+template <class floatX>
+__global__ void cross_entropy_backward_kernel(floatX* dlogits, const floatX* logits, const float* logsumexp,
+                                              const float* dloss, const int* targets,
+                                              int BT, int V, int P) {
+    // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
+    // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
+    int idx = static_cast<int>(blockIdx.x);
+    if (idx >= BT) {
+        return;
+    }
+    int ix = targets[idx];
+    if (ix == -100) {
+        for (int i = threadIdx.x; i < V; i += blockDim.x) {
+            dlogits[idx * P + i] = (floatX)0.0f;
+        }
+        return;
+    }
+
+    float lse = 0.0f;
+    if (logsumexp) {
+        lse = logsumexp[idx];
+    } else {
+        SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
+        lse = sp.Offset + logf(1.0f / sp.Scale);
+    }
+
+    float dloss_val = dloss ? dloss[idx] : 1.0f;
+    const floatX* logits_vec = logits + static_cast<int64_t>(idx) * P;
+
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float prob = expf((float)logits_vec[i] - lse);
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (prob - indicator) * dloss_val;
+        dlogits[idx * P + i] = (floatX)dlogit;
+    }
+}
+
+template <class floatX>
+__global__ void chunked_cross_entropy_forward_kernel(const floatX* logits, float* losses, float* chunk_logsumexp,
+                                                     const int* targets, int* valid_token_count,
+                                                     int BT, int V, int P, int n_chunks, int chunk_size) {
+    int row_idx = static_cast<int>(blockIdx.x);
+    int chunk_idx = static_cast<int>(blockIdx.y);
+    int start = chunk_idx * chunk_size;
+    if (row_idx >= BT || start >= V) {
+        return;
+    }
+    int end = (start + chunk_size < V) ? (start + chunk_size) : V;
+
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+        float v = (float)logits[row_idx * P + i];
+        float old_max = thread_maxval;
+        thread_maxval = fmaxf(thread_maxval, v);
+        thread_sumval *= expf(old_max - thread_maxval);
+        thread_sumval += expf(v - thread_maxval);
+    }
+
+    float block_maxval = blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
+
+    if (threadIdx.x == 0) {
+        chunk_logsumexp[row_idx * n_chunks + chunk_idx] = block_maxval + logf(block_sumval);
+        if (chunk_idx == 0) {
+            int ix = targets[row_idx];
+            if (ix != -100) {
+                if (valid_token_count) {
+                    atomicAdd(valid_token_count, 1);
+                }
+                float logit_val = (float)logits[row_idx * P + ix];
+                // Accumulate loss (not overwrite) to support gradient accumulation
+                losses[row_idx] -= logit_val;
+            }
+            // For padding tokens (ix == -100), don't touch the loss buffer
+            // to preserve accumulated values from previous micro-steps
+        }
+    }
+}
+
+__global__ void logsumexp_reduce_kernel(float* logsumexp_out,
+                                        const float* chunk_logsumexp,
+                                        int BT, int n_chunks) {
+    int row_idx = static_cast<int>(blockIdx.x);
+    if (row_idx >= BT) {
+        return;
+    }
+
+    float thread_maxval = -INFINITY;
+    for (int i = threadIdx.x; i < n_chunks; i += blockDim.x) {
+        float v = chunk_logsumexp[row_idx * n_chunks + i];
+        thread_maxval = fmaxf(thread_maxval, v);
+    }
+    float block_maxval = blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
+
+    float thread_sumval = 0.0f;
+    for (int i = threadIdx.x; i < n_chunks; i += blockDim.x) {
+        float v = chunk_logsumexp[row_idx * n_chunks + i];
+        thread_sumval += expf(v - block_maxval);
+    }
+    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
+
+    if (threadIdx.x == 0) {
+        logsumexp_out[row_idx] = block_maxval + logf(block_sumval);
+    }
+}
+
+__global__ void finalize_loss_kernel(float* losses, const float* logsumexp,
+                                     const int* targets, int BT) {
+    int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= BT) {
+        return;
+    }
+    if (targets[idx] != -100) {
+        losses[idx] += logsumexp[idx];
+    }
+}
+
+template <class floatX>
+__global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits, const floatX* logits, const float* logsumexp,
+                                                      const float* dloss, const int* targets,
+                                                      int BT, int V, int P, int chunk_size) {
+    // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
+    // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
+    int row_idx = static_cast<int>(blockIdx.x);
+    int block_idx = static_cast<int>(blockIdx.y);
+    int start = block_idx * chunk_size;
+    if (row_idx >= BT || start >= V) {
+        return;
+    }
+    int end = (start + chunk_size < V) ? (start + chunk_size) : V;
+
+    int ix = targets[row_idx];
+    if (ix == -100) {
+        for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+            dlogits[row_idx * P + i] = (floatX)0.0f;
+        }
+        return;
+    }
+
+    float lse = logsumexp ? logsumexp[row_idx] : 0.0f;
+    float dloss_val = dloss ? dloss[row_idx] : 1.0f;
+    const floatX* logits_vec = logits + static_cast<int64_t>(row_idx) * P;
+
+    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+        float prob = expf((float)logits_vec[i] - lse);
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (prob - indicator) * dloss_val;
+        dlogits[row_idx * P + i] = (floatX)dlogit;
+    }
+}
+
+template <class floatX>
+__global__ void argmax_correct_kernel(const floatX* logits, const int* targets,
+                                      int* correct_count, int BT, int V, int P) {
+    int idx = static_cast<int>(blockIdx.x);
+    if (idx >= BT) {
+        return;
+    }
+    int ix = targets[idx];
+    if (ix == -100 || correct_count == nullptr) {
+        return;
+    }
+
+    __shared__ int shared_max_idx[32];
+    __shared__ float shared_max_val[32];
+
+    const floatX* logits_vec = logits + static_cast<int64_t>(idx) * P;
+    float thread_max_val = -INFINITY;
+    int thread_max_idx = 0;
+
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float val = (float)logits_vec[i];
+        if (val > thread_max_val) {
+            thread_max_val = val;
+            thread_max_idx = i;
+        }
+    }
+
+    const int lane_id = threadIdx.x % 32;
+    const int warp_id = threadIdx.x / 32;
+    const int num_warps = blockDim.x / 32;
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, thread_max_val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, thread_max_idx, offset);
+        if (other_val > thread_max_val) {
+            thread_max_val = other_val;
+            thread_max_idx = other_idx;
+        }
+    }
+
+    if (lane_id == 0) {
+        shared_max_val[warp_id] = thread_max_val;
+        shared_max_idx[warp_id] = thread_max_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        thread_max_val = (lane_id < num_warps) ? shared_max_val[lane_id] : -INFINITY;
+        thread_max_idx = (lane_id < num_warps) ? shared_max_idx[lane_id] : 0;
+
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, thread_max_val, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, thread_max_idx, offset);
+            if (other_val > thread_max_val) {
+                thread_max_val = other_val;
+                thread_max_idx = other_idx;
+            }
+        }
+
+        if (threadIdx.x == 0 && thread_max_idx == ix) {
+            atomicAdd(correct_count, 1);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Kernel launchers
+
+void fused_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
+                                 const int* targets, int* valid_token_count,
+                                 int* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = BT;
+    cross_entropy_forward_kernel<<<grid_size, block_size, 0, stream>>>(
+        logits, losses, logsumexp, targets, valid_token_count, correct_count, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
+                                 const int* targets, int* valid_token_count,
+                                 int* correct_count,
+                                 int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = BT;
+    cross_entropy_forward_kernel<<<grid_size, block_size, 0, stream>>>(
+        logits, losses, logsumexp, targets, valid_token_count, correct_count, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
+                                  const float* dloss, const int* targets,
+                                  int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = BT;
+    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        dlogits, logits, logsumexp, dloss, targets, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
+                                  const float* dloss, const int* targets,
+                                  int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = BT;
+    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        dlogits, logits, logsumexp, dloss, targets, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void chunked_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
+                                   float* chunk_logsumexp, const int* targets,
+                                   int* valid_token_count, int* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+    const int block_size = 256;
+    dim3 grid(BT, n_chunks);
+    chunked_cross_entropy_forward_kernel<<<grid, block_size, 0, stream>>>(
+        logits, losses, chunk_logsumexp, targets, valid_token_count, BT, V, P, n_chunks, CROSS_ENTROPY_MAX_FUSED_SIZE);
+    CUDA_CHECK(cudaGetLastError());
+
+    logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(logsumexp, chunk_logsumexp, BT, n_chunks);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int threads = 256;
+    const int blocks = (BT + threads - 1) / threads;
+    finalize_loss_kernel<<<blocks, threads, 0, stream>>>(losses, logsumexp, targets, BT);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (correct_count) {
+        argmax_correct_kernel<<<BT, block_size, 0, stream>>>(
+            logits, targets, correct_count, BT, V, P);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void chunked_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
+                                   float* chunk_logsumexp, const int* targets,
+                                   int* valid_token_count, int* correct_count,
+                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+    const int block_size = 256;
+    dim3 grid(BT, n_chunks);
+    chunked_cross_entropy_forward_kernel<<<grid, block_size, 0, stream>>>(
+        logits, losses, chunk_logsumexp, targets, valid_token_count, BT, V, P, n_chunks, CROSS_ENTROPY_MAX_FUSED_SIZE);
+    CUDA_CHECK(cudaGetLastError());
+
+    logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(logsumexp, chunk_logsumexp, BT, n_chunks);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int threads = 256;
+    const int blocks = (BT + threads - 1) / threads;
+    finalize_loss_kernel<<<blocks, threads, 0, stream>>>(losses, logsumexp, targets, BT);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (correct_count) {
+        argmax_correct_kernel<<<BT, block_size, 0, stream>>>(
+            logits, targets, correct_count, BT, V, P);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void chunked_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
+                                    const float* dloss, const int* targets,
+                                    int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
+    dim3 grid(BT, n_blocks);
+    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(
+        dlogits, logits, logsumexp, dloss, targets,
+        BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
+                                    const float* dloss, const int* targets,
+                                    int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
+    dim3 grid(BT, n_blocks);
+    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(
+        dlogits, logits, logsumexp, dloss, targets,
+        BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+    CUDA_CHECK(cudaGetLastError());
 }

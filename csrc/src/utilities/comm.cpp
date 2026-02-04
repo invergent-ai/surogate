@@ -65,7 +65,13 @@ struct NCCLCommunicator::CommandBuffer
         int Source;
     };
 
-    std::vector<std::variant<Gather, ScatterReduce, Send, Recv>> Commands;
+    struct AllReduce {
+        ETensorDType DType;
+        std::byte* Tensor;
+        std::size_t Elements;
+    };
+
+    std::vector<std::variant<Gather, ScatterReduce, Send, Recv, AllReduce>> Commands;
     cudaEvent_t Ready = nullptr;
 };
 
@@ -239,6 +245,16 @@ struct NCCLCommunicator::CommandVisitor {
         Comm->recv(cmd.Tensor, cmd.Source, cmd.Bytes);
     }
 
+    /**
+     * @brief Execute an AllReduce command via NCCL all-reduce with average.
+     * @param cmd AllReduce command containing dtype, tensor pointer, and element count.
+     *
+     * @throws std::runtime_error If @p cmd.DType is not supported.
+     */
+    void operator()(CommandBuffer::AllReduce& cmd) const {
+        Comm->all_reduce_avg_impl(cmd.Tensor, cmd.Elements, cmd.DType);
+    }
+
 };
 
 /**
@@ -273,7 +289,8 @@ void NCCLCommunicator::execute_transaction(cudaEvent_t signal) {
     bool has_collectives = std::any_of(mCmdBuf->Commands.begin(), mCmdBuf->Commands.end(),
         [](const auto& cmd) {
             return std::holds_alternative<CommandBuffer::ScatterReduce>(cmd) ||
-                   std::holds_alternative<CommandBuffer::Gather>(cmd);
+                   std::holds_alternative<CommandBuffer::Gather>(cmd) ||
+                   std::holds_alternative<CommandBuffer::AllReduce>(cmd);
         });
 
     // Synchronize CPU threads before enqueuing collective operations
@@ -339,12 +356,28 @@ void NCCLCommunicator::schedule_all_gather(const TensorShard& src, Tensor& tgt) 
 }
 
 /**
+ * @brief Schedule an in-place all-reduce with average for a tensor (for batching in transactions).
+ *
+ * @param tensor Tensor whose device buffer is all-reduced in-place.
+ *
+ * @throws std::runtime_error If @p tensor.Data is null.
+ */
+void NCCLCommunicator::schedule_all_reduce_avg(Tensor& tensor) {
+    if (tensor.Data == nullptr) {
+        throw std::runtime_error("schedule_all_reduce_avg: Tensor is null");
+    }
+
+    mCmdBuf->Commands.emplace_back(CommandBuffer::AllReduce{.DType = tensor.DType, .Tensor = tensor.Data, .Elements = tensor.nelem()});
+}
+
+/**
  * @brief All-reduce a single scalar loss value across ranks using average.
  *
  * @param loss Device pointer to a single float (input/output in-place).
  * @param stream CUDA stream to enqueue the NCCL all-reduce on.
  */
 void NCCLCommunicator::reduce_loss(float* loss, cudaStream_t stream) {
+    if (mWorld == 1) return;
     ncclCheck(ncclAllReduce(loss, loss, 1, ncclFloat, ncclAvg, mNcclComm, stream));
 }
 
@@ -417,7 +450,39 @@ void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
 
     ncclCheck(ncclAllReduce(tensor.Data, tensor.Data, tensor.nelem(), nccl_dtype, ncclAvg, mNcclComm, stream));
 }
- 
+
+/**
+ * @brief Internal implementation for all-reduce with average (used by transaction visitor).
+ *
+ * Executes on the internal comms stream within an NCCL group.
+ *
+ * @param data Device pointer to tensor data (input/output in-place).
+ * @param elements Number of elements in the tensor.
+ * @param dtype Data type of the tensor.
+ *
+ * @throws std::runtime_error if dtype is not supported.
+ */
+void NCCLCommunicator::all_reduce_avg_impl(std::byte* data, std::size_t elements, ETensorDType dtype) {
+    ncclDataType_t nccl_dtype;
+    switch (dtype) {
+        case ETensorDType::FP32:
+            nccl_dtype = ncclFloat;
+            break;
+        case ETensorDType::BF16:
+            nccl_dtype = ncclBfloat16;
+            break;
+        case ETensorDType::FP16:
+            nccl_dtype = ncclFloat16;
+            break;
+        default:
+            throw std::runtime_error(fmt::format(
+                "NCCLCommunicator::all_reduce_avg_impl: unsupported dtype {}",
+                static_cast<int>(dtype)));
+    }
+
+    ncclCheck(ncclAllReduce(data, data, elements, nccl_dtype, ncclAvg, mNcclComm, mCommsStream));
+}
+
 /**
  * @brief Reduce-scatter FP32 gradients across ranks using average.
  *
@@ -872,6 +937,9 @@ void NCCLCommunicatorImpl::on_execute_transaction(const NCCLCommunicator::Comman
     mUseNCCL = false;
     for (auto& c : cmd.Commands) {
         if (std::holds_alternative<CommandBuffer::ScatterReduce>(c)) {
+            mUseNCCL = true;
+        }
+        if (std::holds_alternative<CommandBuffer::AllReduce>(c)) {
             mUseNCCL = true;
         }
         if (std::holds_alternative<CommandBuffer::Gather>(c)) {

@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "training/matmul_backend.h"  // For EMatmulBackend
+#include "runtime/training/matmul_backend.h"  // For EMatmulBackend
 #include "recipes/recipe.h"
 
 namespace recipes {

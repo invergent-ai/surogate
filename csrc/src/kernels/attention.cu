@@ -14,6 +14,7 @@
  */
 
 #include <cmath>
+#include <cstdio>
 
 #include <cooperative_groups.h>
 #include "kernels/kernels.h"
@@ -352,7 +353,10 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
     dim3 grid_dim{(unsigned)Hq, (unsigned)B, (unsigned)T};
     dim3 block_dim{512, 1, 1};
     size_t smem = Hs * sizeof(float) * block_dim.x / 16;
-    cudaMemsetAsync(dqkv, 0, sizeof(float)*B*T*(Hq + 2*Hkv) * Hs, stream);
+    const size_t dqkv_bytes =
+        static_cast<size_t>(B) * static_cast<size_t>(T) *
+        static_cast<size_t>(Hq + 2 * Hkv) * static_cast<size_t>(Hs) * sizeof(floatX);
+    cudaMemsetAsync(dqkv, 0, dqkv_bytes, stream);
     if (Hs == 128) {
         attention_backward_gpu_kernel<128><<<grid_dim, block_dim, smem, stream>>>(
             dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv);
@@ -425,6 +429,33 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Hq, HS)
     }
 }
 
+void attention_forward_custom(Tensor& out,  // output: (B, T, Hq, HS)
+                              Tensor& stats, // output for backward pass: (B, Hq, T)
+                              const Tensor& inp,  // input: (B, T, Hq + Hk + Hv, HS) QKV
+                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        attention_gpu_forward(out.get<float>(), stats.get<float>(), 1.f / sqrtf(HS),
+                              inp.get<float>(), B, T, Hq, Hkv, HS, stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        attention_gpu_forward(out.get<nv_bfloat16>(), stats.get<float>(), 1.f / sqrtf(HS),
+                              inp.get<nv_bfloat16>(), B, T, Hq, Hkv, HS, stream);
+    } else {
+        throw std::logic_error("attention_forward_custom: unsupported dtype");
+    }
+}
+
+void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
+                               const Tensor& out, const Tensor& dout, const Tensor& qkv,
+                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        attention_gpu_backward(dqkv.get<float>(), stats.get<float>(), 1.f / sqrtf(HS),
+                               out.get<float>(), dout.get<float>(), qkv.get<float>(),
+                               B, T, Hq, Hkv, HS, stream);
+    } else {
+        throw std::logic_error("attention_backward_custom: unsupported dtype");
+    }
+}
+
 /**
  * @brief Backward attention with Tensor wrapper (dtype dispatch).
  *
@@ -454,8 +485,8 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
     if(out.DType == ETensorDType::FP32) {
         attention_backward_cudnn(dqkv.get<float>(), stats.get<float>(), out.get<float>(), dout.get<float>(), qkv.get<float>(), ws, B, T, Hq, Hkv, HS, stream);
     } else if(out.DType == ETensorDType::BF16) {
-        // TODO make argument order consistent
-        attention_backward_cudnn(dqkv.get<nv_bfloat16>(), stats.get<float>(), dout.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(), out.get<nv_bfloat16>(), ws, handle, B, T, Hq, Hkv, HS, stream);
+        // Argument order is now consistent: out, dout, qkv (matching header declaration)
+        attention_backward_cudnn(dqkv.get<nv_bfloat16>(), stats.get<float>(), out.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(), ws, handle, B, T, Hq, Hkv, HS, stream);
     } else {
         throw std::logic_error("attention_backward: unsupported dtype");
     }

@@ -277,6 +277,8 @@ TEST_CASE("AdamW 8-bit FP32 correctness", "[optimizers][adamw8bit]") {
             thrust::raw_pointer_cast(d_quantiles2.data()),
             thrust::raw_pointer_cast(d_absmax1.data()),
             thrust::raw_pointer_cast(d_absmax2.data()),
+            nullptr,
+            nullptr,
             0
         );
 
@@ -349,6 +351,8 @@ TEST_CASE("AdamW 8-bit BF16 correctness", "[optimizers][adamw8bit]") {
             thrust::raw_pointer_cast(d_quantiles2.data()),
             thrust::raw_pointer_cast(d_absmax1.data()),
             thrust::raw_pointer_cast(d_absmax2.data()),
+            nullptr,
+            nullptr,
             0
         );
 
@@ -426,6 +430,8 @@ TEST_CASE("AdamW 8-bit benchmark - FP32 params", "[optimizers][adamw8bit][benchm
             thrust::raw_pointer_cast(d_quantiles2.data()),
             thrust::raw_pointer_cast(d_absmax1.data()),
             thrust::raw_pointer_cast(d_absmax2.data()),
+            nullptr,
+            nullptr,
             stream
         );
     }
@@ -443,6 +449,8 @@ TEST_CASE("AdamW 8-bit benchmark - FP32 params", "[optimizers][adamw8bit][benchm
             thrust::raw_pointer_cast(d_quantiles2.data()),
             thrust::raw_pointer_cast(d_absmax1.data()),
             thrust::raw_pointer_cast(d_absmax2.data()),
+            nullptr,
+            nullptr,
             stream
         );
     }
@@ -526,6 +534,8 @@ TEST_CASE("AdamW 8-bit benchmark - BF16 params", "[optimizers][adamw8bit][benchm
             thrust::raw_pointer_cast(d_quantiles2.data()),
             thrust::raw_pointer_cast(d_absmax1.data()),
             thrust::raw_pointer_cast(d_absmax2.data()),
+            nullptr,
+            nullptr,
             stream
         );
     }
@@ -543,6 +553,8 @@ TEST_CASE("AdamW 8-bit benchmark - BF16 params", "[optimizers][adamw8bit][benchm
             thrust::raw_pointer_cast(d_quantiles2.data()),
             thrust::raw_pointer_cast(d_absmax1.data()),
             thrust::raw_pointer_cast(d_absmax2.data()),
+            nullptr,
+            nullptr,
             stream
         );
     }

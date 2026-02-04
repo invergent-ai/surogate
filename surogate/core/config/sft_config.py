@@ -63,35 +63,15 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             If a value is passed, will limit the total amount of checkpoints. Deletes the older checkpoints in
             `output_dir`.
 
-        recompute_swiglu (Optional[bool], defaults to True):
-            Recompute SwiGLU activation during backward pass to save activation memory.
-            As SwiGLU is at the widest part of the model, this will result in substantial memory savings at only moderate compute increases (especially for large models).
-            This reduces GPU memory usage but slows down training.
-        recompute_rmsnorm (Optional[bool], defaults to True):
-            Whether to enable recompute for RMSNorm activations during the backward pass to save memory during training.
-            This reduces GPU memory usage but slows down training.
-        recompute_ffn (Optional[bool], defaults to True):
-            Whether to enable recompute for Feed-Forward Network (FFN) activations during the backward pass to save memory during training.
-            Implies --recompute-swiglu.
-            This reduces GPU memory usage but slows down training.
-        recompute_qkv (Optional[bool], defaults to True):
-            Whether to enable recompute for QKV projections during the backward pass to save memory during training.
-            This reduces GPU memory usage but slows down training.
-        recompute_att (Optional[bool], defaults to True):
-            Whether to enable recompute for the attention block to save memory during training.
-            Implies --recompute-qkv.
-            This reduces GPU memory usage but slows down training.
-        recompute_block (Optional[bool], defaults to True):
-            Whether to enable recompute for entire Transformer block to save memory during training.
-            This reduces GPU memory usage but slows down training.
-        recompute_lora (Optional[bool], defaults to False):
-            Recompute ln1/ln2 activations during LoRA backward pass instead of storing per-layer.
-            Only effective when LoRA is enabled. It requires and sets recompute_block to True.
-            When used together with offload_residual, it disables CUDA graphs.
-
+        recompute (bool, defaults to True):
+            Enable activation recomputation to trade compute for memory:
+            - False: Save all activations. Maximum memory, fastest training.
+                     Guarantees bit-exact gradients.
+            - True: Recompute intermediates from checkpoints. Saves ~17% VRAM.
+                    Recommended for most training scenarios.
         offload_residual (Optional[bool], defaults to False):
             Offload the residuals (of the ffn block; the only remaining part of the block that is not recomputed) to pinned host memory.
-            Combined with --recompute-block, the total activation memory consumption becomes independent of the network depth.
+            Combined with recompute, the total activation memory consumption becomes independent of the network depth.
             This saves GPU memory at the cost of increased data transfer overhead.
         offload_master (Optional[bool], defaults to False):
             Store master weights in pinned host memory.
@@ -138,8 +118,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Which dtype to use for (activation) gradients / backward matmul policy. Defaults to matmul-dtype. Note: recipes may override backward dtype.
         master_dtype (Optional[str], defaults to None):
             Master weight dtype used for optimizer updates (e.g. FP32 for more stable full fine-tuning). Defaults to model-dtype.
-        recipe (Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4']], defaults to 'bf16'):
-            Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4
+        recipe (Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4', 'nvfp4_quartet']], defaults to 'bf16'):
+            Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4, nvfp4-quartet
         use_fused_rope (Optional[bool], defaults to False):
             Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth)
         fp8_amax_history (Optional[int], defaults to 16):
@@ -155,7 +135,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Number of GPUs to use for training. Default is the first available GPU. Use 0 for all available GPUs.
         use_cuda_graphs (Optional[bool], defaults to True):
             Enable or disable CUDA graphs for performance.
-
         optimizer (Optional[Literal['adamw_8bit', 'normuon']], defaults to 'adamw_8bit'):
             Optimizer type to use for training. Supports:
             - 'adamw_8bit': 8-bit blockwise quantized AdamW (default)
@@ -216,7 +195,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Dropout rate for LoRA adapters.
         lora_dype(Optional[Literal['bf16','fp32']], defaults to 'fp32):
             Dropout rate for LoRA adapters.
-        lora_target_modules (Optional[str], default to 'all-linear'):
+        lora_target_modules (Optional[str], default to 'all'):
             List of comma-separated module names to apply LoRA adapters to.
         train_router (Optional[bool], defaults to False):
             Train the MoE router gate weights during LoRA fine-tuning.
@@ -278,13 +257,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     save_steps: Optional[int] = 50
     save_total_limit: Optional[int] = 5
 
-    recompute_swiglu: Optional[bool] = True
-    recompute_rmsnorm: Optional[bool] = True
-    recompute_ffn: Optional[bool] = True
-    recompute_qkv: Optional[bool] = True
-    recompute_att: Optional[bool] = True
-    recompute_block: Optional[bool] = True
-    recompute_lora: Optional[bool] = False
+    recompute: Optional[bool] = True
 
     offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
@@ -306,7 +279,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     attn_bwd_chunks: Optional[int] = 1
     gradient_dtype: Optional[str] = None
     master_dtype: Optional[str] = None
-    recipe: Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4']] = 'bf16'
+    recipe: Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4', 'nvfp4_quartet']] = 'bf16'
     use_fused_rope: Optional[bool] = False
     fp8_amax_history: Optional[int] = 16
     fp4_backend: Optional[Literal['cutlass', 'cudnn']] = 'cutlass'
@@ -315,7 +288,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
-
     optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
     lr_scheduler_type: Optional[Literal['linear', 'cosine', 'wsd']] = 'linear'
@@ -385,13 +357,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.save_steps = cfg.get('save_steps', self.save_steps)
         self.save_total_limit = cfg.get('save_total_limit', self.save_total_limit)
 
-        self.recompute_swiglu = cfg.get('recompute_swiglu', self.recompute_swiglu)
-        self.recompute_rmsnorm = cfg.get('recompute_rmsnorm', self.recompute_rmsnorm)
-        self.recompute_ffn = cfg.get('recompute_ffn', self.recompute_ffn)
-        self.recompute_qkv = cfg.get('recompute_qkv', self.recompute_qkv)
-        self.recompute_att = cfg.get('recompute_att', self.recompute_att)
-        self.recompute_block = cfg.get('recompute_block', self.recompute_block)
-        self.recompute_lora = cfg.get('recompute_lora', self.recompute_lora)
+        # Parse recompute setting (accepts bool or legacy string values)
+        recompute_raw = cfg.get('recompute', self.recompute)
+        if isinstance(recompute_raw, bool):
+            self.recompute = recompute_raw
+        elif isinstance(recompute_raw, str):
+            if recompute_raw.lower() in ('false', 'none', '0'):
+                self.recompute = False
+            else:
+                raise ValueError(f"recompute must be true or false, got '{recompute_raw}'")
+        else:
+            self.recompute = bool(recompute_raw)
 
         self.offload_residual = cfg.get('offload_residual', self.offload_residual)
         self.offload_master = cfg.get('offload_master', self.offload_master)
@@ -422,7 +398,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         self.gpus = cfg.get('gpus', self.gpus)
         self.use_cuda_graphs = cfg.get('use_cuda_graphs', self.use_cuda_graphs)
-
         self.optimizer = cfg.get('optimizer', self.optimizer)
         self.learning_rate = float(cfg.get('learning_rate', self.learning_rate))
         self.lr_scheduler_type = cfg.get('lr_scheduler_type', self.lr_scheduler_type)
@@ -450,7 +425,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.lora_alpha = cfg.get('lora_alpha', self.lora_alpha)
         self.lora_dropout = cfg['lora_dropout'] if 'lora_dropout' in cfg else self.lora_dropout
         self.lora_dtype = cfg.get('lora_dtype', self.lora_dtype)
-        self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
+        self.lora_target_modules = cfg.get('lora_target_modules', ['all'])
         self.train_router = cfg.get('train_router', self.train_router)
         self.router_aux_loss_coef = cfg.get('router_aux_loss_coef', self.router_aux_loss_coef)
         self.router_z_loss_coef = cfg.get('router_z_loss_coef', self.router_z_loss_coef)
@@ -474,6 +449,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.aim_experiment = cfg.get('aim_experiment', self.aim_experiment)
         self.aim_repo = cfg.get('aim_repo', self.aim_repo)
         self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
+        
+        # Validate recompute is boolean
+        if not isinstance(self.recompute, bool):
+            raise ValueError(f"recompute must be true or false, got '{self.recompute}'")
 
         # Parse distributed config
         distributed_cfg = cfg.get('distributed', None)
@@ -524,6 +503,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!")
 
         self._validate_chunking_config()
+        if self.offload_optimizer and not self.use_zero_copy:
+            logger.warning(
+                "offload_optimizer is enabled but use_zero_copy is false; "
+                "optimizer state will remain on device. Set use_zero_copy=true to offload.")
+        # Validate offload_grads requires gradient sharding (ZeRO-2 or higher)
+        if self.offload_grads:
+            shard_gradients = self.shard_gradients or self.zero_level >= 2
+            if not shard_gradients:
+                raise ValueError(
+                    "offload_grads requires shard_gradients=true or zero_level >= 2. "
+                    "Gradient offloading is only supported with ZeRO-2 (gradient sharding) enabled."
+                )
 
         self.create_runtime_config()
         self.create_lora_config()
@@ -598,31 +589,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         if self.zero_level >= 3:
             shard_weights = True
 
-        # Handle recomputation hierarchy (block -> att/ffn -> individual components)
-        recompute_block = self.recompute_block
-        recompute_att = self.recompute_att or recompute_block
-        recompute_ffn = self.recompute_ffn or recompute_block
-        recompute_qkv = self.recompute_qkv or recompute_att
-        recompute_swiglu = self.recompute_swiglu or recompute_ffn
-        recompute_rmsnorm = self.recompute_rmsnorm or recompute_block
-        
         if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
-            self.recompute_lora = True
+            # QLoRA requires recompute enabled
+            if not self.recompute:
+                self.recompute = True
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
-            
-        if self.recompute_lora:
-            self.recompute_block = True  # Enforce block recompute if LoRA recompute is enabled            
-            if self.offload_residual:
-                self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with LoRA recompute
-            
+
+
+        if self.lora and self.recompute and self.offload_residual:
+            self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
+
         self.runtime_config = _surogate.RuntimeOptions(
-            recompute_swiglu=recompute_swiglu,
-            recompute_rmsnorm=recompute_rmsnorm,
-            recompute_ffn=recompute_ffn,
-            recompute_qkv=recompute_qkv,
-            recompute_att=recompute_att,
-            recompute_block=recompute_block,
-            recompute_lora=self.recompute_lora,
+            recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,

@@ -3,6 +3,7 @@
 //
 
 #include "utils.h"
+#include "crash_handler.h"
 
 #include <algorithm>
 #include <iostream>
@@ -31,11 +32,37 @@ void cuda_throw_on_error(cudaError_t status, const char* statement, const char* 
     if (status != cudaSuccess) {
         std::string msg = std::string("Cuda Error in ") + file + ":" + std::to_string(line) + " (" + std::string(statement) + "): " + cudaGetErrorName(status) + ": ";
         msg += cudaGetErrorString(status);
+        msg += "\n\nStack trace:\n" + surogate::capture_stacktrace(2);
         // make sure we have a clean cuda error state before launching the exception
         // otherwise, if there are calls to the CUDA API in the exception handler,
         // they will return the old error.
         [[maybe_unused]] cudaError_t clear_error = cudaGetLastError();
         throw cuda_error(status, msg);
+    }
+}
+
+static const char* cublas_get_error_name(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS:          return "CUBLAS_STATUS_SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED:  return "CUBLAS_STATUS_NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED:     return "CUBLAS_STATUS_ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE:    return "CUBLAS_STATUS_INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH:    return "CUBLAS_STATUS_ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR:    return "CUBLAS_STATUS_MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR:   return "CUBLAS_STATUS_INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED:    return "CUBLAS_STATUS_NOT_SUPPORTED";
+        case CUBLAS_STATUS_LICENSE_ERROR:    return "CUBLAS_STATUS_LICENSE_ERROR";
+        default:                             return "CUBLAS_STATUS_UNKNOWN";
+    }
+}
+
+void cublas_throw_on_error(cublasStatus_t status, const char* statement, const char* file, int line) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        std::string msg = std::string("cuBLAS Error in ") + file + ":" + std::to_string(line) +
+                          " (" + std::string(statement) + "): " + cublas_get_error_name(status);
+        msg += "\n\nStack trace:\n" + surogate::capture_stacktrace(2);
+        throw std::runtime_error(msg);
     }
 }
 

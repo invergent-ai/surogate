@@ -14,10 +14,10 @@
 #include <fmt/format.h>
 
 #include "py_train.h"
-#include "training/dataloader.h"
-#include "training/checkpoint.h"
-#include "training/logging.h"
-#include "training/matmul_backend.h"
+#include "runtime/training/dataloader.h"
+#include "runtime/training/checkpoint.h"
+#include "runtime/training/logging.h"
+#include "runtime/training/matmul_backend.h"
 #include "utilities/gpu_info.h"
 #include "utilities/safetensors.h"
 #include "utilities/sol.h"
@@ -25,7 +25,7 @@
 #include "utilities/crash_handler.h"
 #include "config/lora_adapter_config.h"
 #include "recipes/recipe_factory.h"
-#include "modules/qlora/qlora_config.h"
+#include "runtime/qlora/qlora_config.h"
 
 namespace nb = nanobind;
 
@@ -285,19 +285,18 @@ NB_MODULE(_surogate, m) {
             }
             return cfg.release();  // Transfer ownership of polymorphic object
         }, nb::arg("name"), nb::arg("dtype"),
-           "Create a configuration from a known model name.\n\n"
+           "Load a configuration from a config.json path or directory.\n\n"
            "Parameters:\n"
-           "- name: Model name.\n"
+           "- name: Path to config.json or a directory containing it.\n"
            "- dtype: Desired dtype.\n\n"
            "Returns: PretrainedConfig")
         ;
 
     nb::class_<RuntimeOptions>(m, "RuntimeOptions",
         "Execution/training options controlling recomputation, offloading, sharding, and dtypes.\n\n"
-        "Many flags trade compute for memory (recompute) or host/device transfers (offload).\n\n"
+        "Recomputation trades compute for memory. Offloading trades host/device transfers for VRAM.\n\n"
         "Backwards-compatibility: `LLamaOptions` is an alias of this class.")
-        .def("__init__", [](RuntimeOptions *t, bool recompute_swiglu, bool recompute_rmsnorm,
-            bool recompute_ffn, bool recompute_qkv, bool recompute_att, bool recompute_block, bool recompute_lora, bool offload_residual,
+        .def("__init__", [](RuntimeOptions *t, const std::string& recompute, bool offload_residual,
             bool use_cuda_graphs, bool trigger_timing_events,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
@@ -305,7 +304,8 @@ NB_MODULE(_surogate, m) {
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope,
             int fp8_amax_history, const std::string& fp4_backend,
-            int skip_quant_first_layers, int skip_quant_last_layers) {
+            int skip_quant_first_layers, int skip_quant_last_layers,
+            bool use_dsl_ir) {
 
             // Build recipe options
             recipes::RecipeConfig recipe_options;
@@ -321,14 +321,11 @@ NB_MODULE(_surogate, m) {
                 backend = matmul_backend_from_str(matmul_backend);
             }
 
+            // Parse recompute level
+            RecomputeLevel recompute_level = RuntimeOptions::parse_recompute_level(recompute);
+
             new (t) RuntimeOptions{
-                .RecomputeSwiGLu = recompute_swiglu,
-                .RecomputeRMSNorm = recompute_rmsnorm,
-                .RecomputeFFN = recompute_ffn,
-                .RecomputeQKV = recompute_qkv,
-                .RecomputeAtt = recompute_att,
-                .RecomputeBlock = recompute_block,
-                .RecomputeLoRA = recompute_lora,
+                .Recompute = recompute_level,
                 .OffloadResidual = offload_residual,
                 .LMHeadChunks = lmhead_chunks,
                 .AttBwdChunks = attn_bwd_chunks,
@@ -349,19 +346,14 @@ NB_MODULE(_surogate, m) {
                 .TrainingRecipe = std::move(training_recipe),
                 .RecipeOptions = recipe_options,
                 .UseFusedRope = use_fused_rope,
+                .UseDslIr = use_dsl_ir,
                 .MatmulBackend = backend,
                 .MatmulType = opt_dtype_from_str(matmul_type),
                 .GradientType = opt_dtype_from_str(gradient_type),
                 .MasterDType = opt_dtype_from_str(master_dtype)
             };
         }, nb::kw_only(),
-             nb::arg("recompute_swiglu") = false,
-             nb::arg("recompute_rmsnorm") = false,
-             nb::arg("recompute_ffn") = false,
-             nb::arg("recompute_qkv") = false,
-             nb::arg("recompute_att") = false,
-             nb::arg("recompute_block") = false,
-             nb::arg("recompute_lora") = false,
+             nb::arg("recompute") = "true",
              nb::arg("offload_residual") = false,
              nb::arg("use_cuda_graphs") = true,
              nb::arg("trigger_timing_events") = false,
@@ -389,29 +381,30 @@ NB_MODULE(_surogate, m) {
              nb::arg("fp4_backend") = "cutlass",
              nb::arg("skip_quant_first_layers") = 0,
              nb::arg("skip_quant_last_layers") = 0,
+             nb::arg("use_dsl_ir") = true,
              "Create runtime/training options.\n\n"
              "Parameters:\n"
-             "- recompute_*: Enable recomputation for submodules to reduce activation memory.\n"
+             "- recompute: Enable activation recomputation ('true' or 'false').\n"
+             "  - 'false': Save all activations. Maximum memory, fastest training.\n"
+             "  - 'true': Recompute intermediates from checkpoints. Saves ~17% VRAM.\n"
              "- offload_*: Offload specific buffers/states; may reduce VRAM at performance cost.\n"
              "- use_cuda_graphs: Enable CUDA graphs where supported.\n"
              "- trigger_timing_events: Log additional timing information.\n"
              "- shard_*: Enable sharding of weights/gradients across GPUs.\n"
              "- use_all_to_all_reduce: Use all-to-all based reduction (if supported by backend).\n"
              "- *_type/master_dtype: Dtype strings (empty means default/auto for optional fields).\n"
-             "- recipe: Training recipe (bf16, fp8-hybrid, nvfp4).\n"
+             "- recipe: Training recipe (bf16, fp8-hybrid, nvfp4, nvfp4-quartet).\n"
              "- matmul_backend: Matmul backend (auto, cublaslt, cutlass).\n"
              "- use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.\n"
              "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
-             "- skip_quant_last_layers: Skip quantization for last N layers.")
-        .def_rw("recompute_swiglu", &RuntimeOptions::RecomputeSwiGLu, "Recompute SwiGLU activations in backward.")
-        .def_rw("recompute_rms_norm", &RuntimeOptions::RecomputeRMSNorm, "Recompute RMSNorm in backward.")
-        .def_rw("recompute_ffn", &RuntimeOptions::RecomputeFFN, "Recompute FFN in backward.")
-        .def_rw("recompute_qkv", &RuntimeOptions::RecomputeQKV, "Recompute QKV projections in backward.")
-        .def_rw("recompute_att", &RuntimeOptions::RecomputeAtt, "Recompute attention in backward.")
-        .def_rw("recompute_block", &RuntimeOptions::RecomputeBlock, "Recompute the whole block (coarse-grained).")
-        .def_rw("recompute_lora", &RuntimeOptions::RecomputeLoRA, "Recompute ln1/ln2 during LoRA backward (saves ~350MB for 4B models).")
+             "- skip_quant_last_layers: Skip quantization for last N layers.\n"
+             "- use_dsl_ir: Deprecated (DSL backend is always enabled).")
+        .def_prop_rw("recompute",
+            [](const RuntimeOptions& self) { return std::string(self.recompute_level_name()); },
+            [](RuntimeOptions& self, const std::string& level) { self.Recompute = RuntimeOptions::parse_recompute_level(level); },
+            "Enable activation recomputation: 'true' or 'false'.")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")
@@ -432,6 +425,8 @@ NB_MODULE(_surogate, m) {
         .def_rw("init_projections_to_zero", &RuntimeOptions::InitProjectionsToZero, "Initialize certain projections to zero (for experiments).")
         .def_rw("debug_memory_breakdown", &RuntimeOptions::DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation.")
         .def_rw("use_fused_rope", &RuntimeOptions::UseFusedRope, "Use fused RoPE kernel with on-the-fly cos/sin computation.")
+        .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Deprecated (DSL backend is always enabled).")
+        .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
         .def_rw("router_z_loss_coef", &RuntimeOptions::RouterZLossCoef, "MoE z-loss coefficient (-1 = use model config).")
         .def_prop_rw("matmul_type", [](const RuntimeOptions* opt){ return opt->matmul_dtype(); },
@@ -834,6 +829,19 @@ NB_MODULE(_surogate, m) {
              "Parameters:\n"
              "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].")
+        .def("step", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
+            // Use local_world_size (GPUs on this node) not global world_size
+            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+
+            trainer->step(inputs.data(), targets.data(), position_ids.data());
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Perform one training step (forward + backward) with explicit position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].")
         .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
             // Use local_world_size (GPUs on this node) not global world_size
             CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
@@ -846,6 +854,20 @@ NB_MODULE(_surogate, m) {
              "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n\n"
              "Returns: loss (float).")
+        .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
+            // Use local_world_size (GPUs on this node) not global world_size
+            CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+            CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+
+            return trainer->validate(inputs.data(), targets.data(), position_ids.data());
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Compute validation loss for one batch (forward only) with explicit position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].\n\n"
+             "Returns: loss (float).")
         .def("update_with_config", [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& config, int step){
             auto [loss, norm] = trainer->update_with_config(config, step);
             nb::dict ret;
@@ -856,6 +878,46 @@ NB_MODULE(_surogate, m) {
              "Run the optimizer step with full configuration.\n\n"
              "Supports AdamW 8-bit and NorMuon optimizers based on config.type.\n\n"
              "Parameters:\n"
+             "- config: OptimizerConfig with all hyperparameters.\n"
+             "- step: Global step index.\n\n"
+             "Returns: dict with keys {loss: float, norm: float}.")
+        .def("train_step_graphed", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
+                                      const optimizers::OptimizerConfig& config, int step){
+            const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
+            CHECK_SHAPE(inputs, rows, trainer->seq_length());
+            CHECK_SHAPE(targets, rows, trainer->seq_length());
+
+            auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), nullptr, config, step);
+            nb::dict ret;
+            ret["loss"] = loss;
+            ret["norm"] = norm;
+            return ret;
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("config"), nb::arg("step"),
+             "Run a full training step with CUDA graph capture (forward+backward+optimizer).\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- config: OptimizerConfig with all hyperparameters.\n"
+             "- step: Global step index.\n\n"
+             "Returns: dict with keys {loss: float, norm: float}.")
+        .def("train_step_graphed", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
+                                      TokenArray position_ids, const optimizers::OptimizerConfig& config, int step){
+            const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
+            CHECK_SHAPE(inputs, rows, trainer->seq_length());
+            CHECK_SHAPE(targets, rows, trainer->seq_length());
+            CHECK_SHAPE(position_ids, rows, trainer->seq_length());
+
+            auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), position_ids.data(), config, step);
+            nb::dict ret;
+            ret["loss"] = loss;
+            ret["norm"] = norm;
+            return ret;
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"), nb::arg("config"), nb::arg("step"),
+             "Run a full training step with CUDA graph capture and explicit position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
+             "- position_ids: int32 position ids shaped [grad_accum * local_gpus * batch_size, seq_length].\n"
              "- config: OptimizerConfig with all hyperparameters.\n"
              "- step: Global step index.\n\n"
              "Returns: dict with keys {loss: float, norm: float}.")
@@ -1005,6 +1067,21 @@ NB_MODULE(_surogate, m) {
              "Parameters:\n"
              "- inputs: Preallocated int32 array [batch, seq_len].\n"
              "- targets: Preallocated int32 array [batch, seq_len].")
+        .def("load_batch", [](DataLoader* d, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
+            CHECK_SHAPE(position_ids, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)));
+            Tensor inp_t{ETensorDType::INT32, {static_cast<long>(inputs.shape(0)), static_cast<long>(inputs.shape(1))},
+                        reinterpret_cast<std::byte*>(inputs.data()), nullptr, 2, inputs.device_id()};
+            Tensor tgt_t{ETensorDType::INT32, {static_cast<long>(targets.shape(0)), static_cast<long>(targets.shape(1))},
+                        reinterpret_cast<std::byte*>(targets.data()), nullptr, 2, inputs.device_id()};
+            Tensor pos_t{ETensorDType::INT32, {static_cast<long>(position_ids.shape(0)), static_cast<long>(position_ids.shape(1))},
+                        reinterpret_cast<std::byte*>(position_ids.data()), nullptr, 2, position_ids.device_id()};
+            d->load_batch(inp_t, tgt_t, &pos_t);
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Fill `inputs`, `targets`, and `position_ids` with the next batch.\n\n"
+             "Parameters:\n"
+             "- inputs: Preallocated int32 array [batch, seq_len].\n"
+             "- targets: Preallocated int32 array [batch, seq_len].\n"
+             "- position_ids: Preallocated int32 array [batch, seq_len].")
         .def("epoch", &DataLoader::epoch, "Return the current epoch number (0-based).")
         .def("progress", &DataLoader::progress, "Return progress within the current epoch (percent).")
         .def("advance_epoch", &DataLoader::advance_epoch, "Advance to the next epoch and reshuffle chunk order.")
@@ -1163,6 +1240,10 @@ NB_MODULE(_surogate, m) {
              nb::arg("step"), nb::arg("gpu_id"), nb::arg("gpu_util"),
              "Log GPU utilization state.\n\n"
              "Parameters:\n- step: Global step.\n- gpu_id: GPU index.\n- gpu_util: GPUUtilInfo snapshot.")
+        .def("log_message", &TrainingRunLogger::log_message,
+             nb::arg("step"), nb::arg("msg"),
+             "Log a free-form message.\n\n"
+             "Parameters:\n- step: Global step.\n- msg: Message string.")
         .def("log_allocator", [](TrainingRunLogger* logger, const nb::dict& stats) {
             std::vector<std::pair<std::string, sSegmentMemory>> cpp_stats;
             std::vector<std::pair<std::string, long>> cpp_stack;

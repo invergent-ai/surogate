@@ -6,21 +6,52 @@
 #include "py_train.h"
 
 #include <filesystem>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <iostream>
 
 #include <fmt/format.h>
 
 #include "utilities/gpu_info.h"
-#include "training/checkpoint.h"
-#include "training/dataloader.h"
-#include "training/logging.h"
+#include "runtime/training/checkpoint.h"
+#include "runtime/training/dataloader.h"
+#include "runtime/training/logging.h"
 #include "utilities/comm.h"
 #include "kernels/kernels.h"
-#include "training/model.h"
-#include "modules/model_config.h"
-#include "modules/model_factory.h"
-#include "modules/composite/transformer_block.h"
-#include "modules/moe/moe_block.h"
-#include "modules/lora/lora_model.h"
+#include "runtime/training/model.h"
+#include "runtime/core/model_factory.h"
+#include "runtime/lora/lora_config.h"
+#include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dsl_grad_store.h"
+#include "runtime/dsl/dsl_runtime.h"
+#include "runtime/optimizers/normuon.h"
+
+namespace {
+bool env_enabled(const char* name) {
+    if (!name || !*name) {
+        return false;
+    }
+    const char* value = std::getenv(name);
+    if (!value) {
+        return false;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0) {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+static void fill_sequential_position_ids(std::int32_t* dst, int B, int T) {
+    for (int b = 0; b < B; ++b) {
+        std::int32_t* row = dst + b * T;
+        for (int t = 0; t < T; ++t) {
+            row[t] = t;
+        }
+    }
+}
 
 /**
  * @brief Construct a multi-GPU trainer and launch one worker thread per GPU.
@@ -135,10 +166,14 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
     mIsRunning = false;
 
     // make sure all work has finished
+    // Use local_rank() for cudaSetDevice, and don't throw from destructor
     for(auto& ctx : mContexts) {
         if(ctx.Communicator) {
-            CUDA_CHECK(cudaSetDevice(ctx.Communicator->rank()));
-            CUDA_CHECK(cudaDeviceSynchronize());
+            cudaError_t err = cudaSetDevice(ctx.Communicator->local_rank());
+            if (err == cudaSuccess) {
+                cudaDeviceSynchronize();
+            }
+            // Ignore errors - we're in destructor, possibly after a crash
         }
     }
 
@@ -175,12 +210,14 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
                 breakdown_ctx.seq_length = T;
 
                 // Get QLoRA stats if applicable
-                modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
-                    if (lora_model->qlora_enabled()) {
-                        breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
-                        breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
-                    }
-                });
+                auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!dsl_model) {
+                    throw std::runtime_error("memory breakdown requires DSL model");
+                }
+                if (dsl_model->qlora_enabled()) {
+                    breakdown_ctx.qlora_quantized_bytes = dsl_model->qlora_quantized_weights_bytes();
+                    breakdown_ctx.qlora_savings_ratio = dsl_model->qlora_memory_savings_ratio();
+                }
 
                 // Use a temporary logger to print the breakdown
                 TrainingRunLogger logger("", 0, TrainingRunLogger::VERBOSE);
@@ -225,13 +262,14 @@ void MultiGPUPyTrainer::export_model(std::string path) {
  */
 void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_path) {
     run_work([path, base_model_path](sThreadContext& ctx) {
-        bool found = modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
-            lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
-        });
-
-        if (!found) {
-            throw std::runtime_error("export_adapter: Model is not a modular LoRA model");
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("export_adapter: DSL model required");
         }
+        if (!dsl_model->lora_enabled()) {
+            throw std::runtime_error("export_adapter: DSL model is not configured for LoRA");
+        }
+        dsl_model->export_adapter(path, *ctx.Communicator, base_model_path);
     });
 }
 
@@ -292,14 +330,23 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
  *
  * @throws std::runtime_error If called more than `grad_accum` times without an update().
  */
-void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets) {
+void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("step: ctx[{}].Model is null", i));
+        }
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            std::memcpy(pb, position_ids + i * B * T, B * T * sizeof(std::int32_t));
+        } else {
+            fill_sequential_position_ids(pb, B, T);
+        }
     }
 
     if(mTrainMicroStep >= mGradAccumulation) {
@@ -314,7 +361,7 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         try {
             ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
         } catch (const std::exception& e) {
-            fprintf(stderr, "[DEBUG] Exception in backward: %s\n", e.what());
+            std::cerr << "backward threw: " << e.what() << std::endl;
             throw;
         }
     });
@@ -331,14 +378,20 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
  * @param targets Pointer to host int32 target token IDs for all ranks.
  * @return Loss value computed on rank 0 for this validation micro-step.
  */
-float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t* targets) {
+float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            std::memcpy(pb, position_ids + i * B * T, B * T * sizeof(std::int32_t));
+        } else {
+            fill_sequential_position_ids(pb, B, T);
+        }
     }
 
     float loss;
@@ -381,6 +434,210 @@ std::pair<float, float> MultiGPUPyTrainer::update_with_config(const optimizers::
     step_norm = ctx.Model->get_norm();
 
     // ensure we're re-gathering on next forward for eval and train
+    mTrainMicroStep = 0;
+    mEvalStep = 0;
+
+    return {step_loss, step_norm};
+}
+
+std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t* inputs,
+                                                              const std::int32_t* targets,
+                                                              const std::int32_t* position_ids,
+                                                              const optimizers::OptimizerConfig& config,
+                                                              int step) {
+    const int local_gpus = static_cast<int>(mContexts.size());
+    const int micro_steps = mGradAccumulation;
+    const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+
+    run_work([&](sThreadContext& ctx) {
+        auto& rs = ctx.Model->get_run_state();
+        if (!rs.Allocator) {
+            throw std::runtime_error("train_step_graphed: missing allocator");
+        }
+
+        if (!ctx.FullStepGraph) {
+            ctx.FullStepGraph = std::make_unique<sFullStepGraphState>();
+        }
+        auto& gs = *ctx.FullStepGraph;
+
+        // Reset graph if shape or accumulation changed.
+        if (gs.captured && (gs.captured_B != B || gs.captured_T != T || gs.captured_grad_accum != micro_steps)) {
+            if (gs.graph_exec) {
+                CUDA_CHECK(cudaGraphExecDestroy(gs.graph_exec));
+                gs.graph_exec = nullptr;
+            }
+            gs.captured = false;
+        }
+
+        // Allocate per-micro-step pinned buffers if needed.
+        if (gs.inputs.size() != static_cast<size_t>(micro_steps) ||
+            gs.targets.size() != static_cast<size_t>(micro_steps) ||
+            gs.position_ids.size() != static_cast<size_t>(micro_steps) ||
+            gs.captured_B != B || gs.captured_T != T) {
+            gs.inputs.clear();
+            gs.targets.clear();
+            gs.position_ids.clear();
+            gs.inputs.reserve(micro_steps);
+            gs.targets.reserve(micro_steps);
+            gs.position_ids.reserve(micro_steps);
+
+            const int rank = ctx.Communicator->local_rank();
+            for (int j = 0; j < micro_steps; ++j) {
+                auto in_name = fmt::format("graph_inputs_cpu_ms{}_rank{}", j, rank);
+                auto tgt_name = fmt::format("graph_targets_cpu_ms{}_rank{}", j, rank);
+                auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
+                gs.inputs.push_back(rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.targets.push_back(rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+            }
+
+            gs.captured_B = B;
+            gs.captured_T = T;
+            gs.captured_grad_accum = micro_steps;
+        }
+
+        // Allocate device-side optimizer parameter buffers if needed.
+        // Use the maximum size to support both AdamW and NorMuon
+        constexpr int max_opt_params = std::max(optimizers::ADAMW_GRAPH_PARAM_COUNT,
+                                                 optimizers::NORMUON_GRAPH_PARAM_COUNT);
+        if (!gs.opt_params.Data) {
+            auto name = fmt::format("graph_opt_params_rank{}", ctx.Communicator->local_rank());
+            gs.opt_params = rs.Allocator->allocate(ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE,
+                                                  {max_opt_params});
+        }
+        if (!gs.opt_step.Data) {
+            auto name = fmt::format("graph_opt_step_rank{}", ctx.Communicator->local_rank());
+            gs.opt_step = rs.Allocator->allocate(ETensorDType::INT32, name.c_str(), EAllocationType::ON_DEVICE, {1});
+        }
+
+        // Stage inputs/targets/position_ids for all micro-steps.
+        const int rank = ctx.Communicator->local_rank();
+        for (int j = 0; j < micro_steps; ++j) {
+            const std::size_t offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) + static_cast<std::size_t>(rank)) * stride;
+            std::memcpy(gs.inputs[j].Data, inputs + offset, stride * sizeof(std::int32_t));
+            std::memcpy(gs.targets[j].Data, targets + offset, stride * sizeof(std::int32_t));
+            if (position_ids) {
+                std::memcpy(gs.position_ids[j].Data, position_ids + offset, stride * sizeof(std::int32_t));
+            } else {
+                fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data), B, T);
+            }
+        }
+
+        // Update optimizer parameters on device (dynamic LR/step support).
+        const int opt_step_host = step + 1;
+        if (config.type == optimizers::OptimizerType::NORMUON) {
+            // NorMuon graph params layout:
+            // [0] = normuon_lr, [1] = normuon_momentum, [2] = normuon_beta2, [3] = weight_decay
+            // [4] = adamw_lr, [5] = adamw_beta1, [6] = adamw_beta2, [7] = adamw_eps
+            float opt_params_host[optimizers::NORMUON_GRAPH_PARAM_COUNT] = {
+                config.normuon_lr > 0 ? config.normuon_lr : config.learning_rate,
+                config.normuon_momentum,
+                config.normuon_beta2,
+                config.weight_decay,
+                config.learning_rate,
+                config.adamw_beta1,
+                config.adamw_beta2,
+                config.adamw_epsilon
+            };
+            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
+                                       sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+        } else {
+            float opt_params_host[optimizers::ADAMW_GRAPH_PARAM_COUNT] = {
+                config.learning_rate, config.adamw_beta1, config.adamw_beta2, config.adamw_epsilon, config.weight_decay
+            };
+            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
+                                       sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data, &opt_step_host,
+                                   sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
+
+        // If graphs are disabled or unsupported, fall back to eager execution.
+        if (!mOptions.UseCudaGraphs) {
+            for (int j = 0; j < micro_steps; ++j) {
+                rs.Targets_CPU = gs.targets[j];
+                ctx.Model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                ctx.Model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+            }
+            ctx.Model->update_with_config(*ctx.Communicator, config, opt_step_host);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            return;
+        }
+
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("train_step_graphed: only supported for DSL models");
+        }
+        if (config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+            config.type != optimizers::OptimizerType::NORMUON) {
+            throw std::runtime_error("train_step_graphed: only supports AdamW 8-bit or NorMuon optimizer");
+        }
+
+        // CUDA graph capture path (both AdamW and NorMuon support graph capture)
+        const bool warmup_full_graph = !gs.captured && !dsl_model->lora_enabled()
+                                       && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
+        const bool warmup_skip_bwd = env_enabled("SUROGATE_DSL_GRAPH_WARMUP_SKIP_BWD");
+        const bool prev_internal_graphs = dsl_model->internal_graphs_enabled();
+        if (prev_internal_graphs) {
+            dsl_model->set_internal_graphs_enabled(false);
+        }
+        if (warmup_full_graph) {
+            auto rng_state = dsl_model->rng_state();
+            for (int j = 0; j < micro_steps; ++j) {
+                rs.Targets_CPU = gs.targets[j];
+                dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                if (!warmup_skip_bwd) {
+                    dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+                }
+            }
+            dsl_model->zero_grads(rs.MainStream);
+            dsl_model->set_rng_state(rng_state);
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        }
+
+        if (!gs.captured) {
+            dsl_model->prepare_optimizer_state_for_graph(*ctx.Communicator, config);
+            // Ensure the main stream is idle before beginning capture (no external dependencies).
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+            cudaGraph_t graph = nullptr;
+            CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
+            for (int j = 0; j < micro_steps; ++j) {
+                rs.Targets_CPU = gs.targets[j];
+                dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+            }
+            dsl_model->update_with_graph_params(*ctx.Communicator, config,
+                                               gs.opt_params.template get<float>(),
+                                               gs.opt_step.template get<int>());
+            CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            gs.captured = true;
+        }
+
+        if (prev_internal_graphs) {
+            dsl_model->set_internal_graphs_enabled(true);
+        }
+
+        CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Refresh loss/norm on host after full-step graph launch.
+        CUDA_CHECK(cudaMemcpy(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost));
+        auto& dsl_rs = dynamic_cast<dsl::DslRunState&>(dsl_model->get_run_state());
+        if (dsl_model->lora_enabled()) {
+            auto& lora_rs = dsl_model->lora_run_state();
+            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost, lora_rs.norm_buffer.template get<float>(),
+                                  sizeof(float), cudaMemcpyDeviceToHost));
+        } else {
+            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost, dsl_rs.scratch().norm_buffer.template get<float>(),
+                                  sizeof(float), cudaMemcpyDeviceToHost));
+        }
+    });
+
+    auto& ctx = mContexts.at(0);
+    float step_loss = ctx.Model->get_loss();
+    float step_norm = ctx.Model->get_norm();
+
     mTrainMicroStep = 0;
     mEvalStep = 0;
 
@@ -440,7 +697,6 @@ void MultiGPUPyTrainer::stop() {
 auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sThreadContext & ctx)> {
     std::lock_guard<std::mutex> lock(mGlobalMutex);
     if (!ctx.Work) {
-        std::this_thread::yield();
         return {};
     } else {
         auto work = std::move(ctx.Work);
@@ -463,6 +719,8 @@ auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sT
  * @throws Rethrows any exception encountered in worker threads.
  */
 void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext & ctx)> work, int idx) {
+    static int work_id = 0;
+    int current_work_id = work_id++;
     {
         std::lock_guard<std::mutex> lock(mGlobalMutex);
 
@@ -572,18 +830,32 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         if(mHasCrashed.load()) throw std::runtime_error("Another worker has crashed, exiting.");
     }
 
+    int loop_iteration = 0;
     while (mIsRunning.load()) {
         if (auto work = fetch_work(ctx); work) {
-            work(ctx);
+            try {
+                work(ctx);
+            } catch (const std::exception& e) {
+                std::cerr << "work threw exception: " << e.what() << std::endl;
+                throw;
+            }
             mWorkDone.fetch_add(1);
         } else {
             std::this_thread::yield();
         }
+        loop_iteration++;
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     comm.barrier();
 
     // free resources
+    if (ctx.FullStepGraph) {
+        if (ctx.FullStepGraph->graph_exec) {
+            CUDA_CHECK(cudaGraphExecDestroy(ctx.FullStepGraph->graph_exec));
+            ctx.FullStepGraph->graph_exec = nullptr;
+        }
+        ctx.FullStepGraph.reset();
+    }
     ctx.Model.reset();
     ctx.GPUUtil.reset();
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -646,45 +918,20 @@ std::vector<std::pair<std::string, long>> MultiGPUPyTrainer::get_stack_info(int 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_gradients(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;
     run_work([&result](sThreadContext& ctx) {
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
-        DenseModel* base_model = nullptr;
-        if (auto* m = dynamic_cast<DenseModel*>(ctx.Model.get())) {
-            base_model = m;
-        } else if (auto* lora = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get())) {
-            base_model = &lora->base_model();
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("get_gradients: DSL model required");
         }
-        if (!base_model) {
-            throw std::runtime_error("get_gradients: unsupported model type for gradient inspection");
-        }
-
-        const auto& config = base_model->config();
-        auto& rs = base_model->get_run_state();
-        cudaStream_t stream = rs.MainStream;
-        auto& grads = base_model->grads();
-
         CUDA_CHECK(cudaDeviceSynchronize());
-        result.emplace_back("model.embed_tokens.weight", static_cast<Tensor>(grads.get_embeddings_shard(stream)));
-        if (!config.TiedWordEmbeddings) {
-            result.emplace_back("lm_head.weight", static_cast<Tensor>(grads.get_lm_head_shard(stream)));
-        }
-        result.emplace_back("model.norm.weight", static_cast<Tensor>(grads.get_final_norm_shard(stream)));
-
-        for (int l = 0; l < config.NumLayers; l++) {
-            std::string prefix = "model.layers." + std::to_string(l);
-            auto& block = grads.get_block_shard(l, stream);
-
-            result.emplace_back(prefix + ".input_layernorm.weight", block.ln1_grads.d_weight);
-            result.emplace_back(prefix + ".post_attention_layernorm.weight", block.ln2_grads.d_weight);
-
-            result.emplace_back(prefix + ".self_attn.qkv.weight", block.attention_grads.d_qkv_weight);
-            if (block.attention_grads.d_qkv_bias.has_value()) {
-                result.emplace_back(prefix + ".self_attn.qkv.bias", block.attention_grads.d_qkv_bias.value());
+        const auto& grads = dsl_model->grads();
+        const auto& grad_map = grads.grads();
+        result.reserve(grads.param_names().size());
+        for (const auto& name : grads.param_names()) {
+            auto it = grad_map.find(name);
+            if (it == grad_map.end()) {
+                continue;
             }
-            result.emplace_back(prefix + ".self_attn.o_proj.weight", block.attention_grads.d_out_weight);
-
-            result.emplace_back(prefix + ".mlp.up.weight", block.d_mlp_up_weight);
-            result.emplace_back(prefix + ".mlp.down_proj.weight", block.d_mlp_down_weight);
+            result.emplace_back(name, it->second);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
     }, gpu_id);
@@ -701,45 +948,43 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
             if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
         };
-
-        bool found = modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
-            const auto& config = lora_model->base_model().config();
-            const bool is_moe = lora_model->is_moe_model();
-            CUDA_CHECK(cudaDeviceSynchronize());
-
-            for (int l = 0; l < config.NumLayers; ++l) {
-                bool unused_accumulate = false;
-                auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-                std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
-
-                // Attention LoRA (same for dense and MoE)
-                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
-
-                if (is_moe) {
-                    // MoE models use per-expert LoRA
-                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
-                        auto& expert = block.moe.experts[e];
-                        std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
-                        add_layer(expert_prefix + ".gate_proj", expert.gate);
-                        add_layer(expert_prefix + ".up_proj", expert.up);
-                        add_layer(expert_prefix + ".down_proj", expert.down);
-                    }
-                } else {
-                    // Dense models use single MLP LoRA
-                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
-                }
-            }
-            CUDA_CHECK(cudaDeviceSynchronize());
-        });
-
-        if (!found) {
-            throw std::runtime_error("get_lora_gradients: model is not a modular LoRA model");
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("get_lora_gradients: DSL model required");
         }
+        if (!dsl_model->lora_enabled()) {
+            throw std::runtime_error("get_lora_gradients: DSL model is not configured for LoRA");
+        }
+        const auto& config = *ctx.Model->get_run_state().Config;
+        const bool is_moe = dsl_model->is_moe_model();
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        for (int l = 0; l < config.NumLayers; ++l) {
+            bool unused_accumulate = false;
+            auto& block = dsl_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
+            std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
+
+            // Attention LoRA (same for dense and MoE)
+            add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+            add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+            add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+            add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+
+            if (is_moe) {
+                for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                    auto& expert = block.moe.experts[e];
+                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                    add_layer(expert_prefix + ".gate_proj", expert.gate);
+                    add_layer(expert_prefix + ".up_proj", expert.up);
+                    add_layer(expert_prefix + ".down_proj", expert.down);
+                }
+            } else {
+                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+            }
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
     }, gpu_id);
     return result;
 }

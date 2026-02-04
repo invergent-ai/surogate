@@ -94,6 +94,8 @@ private:
         EAllocationType Kind;
         std::byte* Pointer;
         long Size;
+        std::string Name;
+        std::string Context;
     };
 
     std::vector<sAllocationData> m_Pointers;

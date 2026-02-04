@@ -10,6 +10,9 @@
 
 namespace fe = cudnn_frontend;
 
+// Forward declaration for workspace size helper (defined later in file)
+std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle);
+
 /**
  * @brief Checks a cuDNN status code and exits on error.
  * @param error The cuDNN status code to check.
@@ -339,7 +342,7 @@ void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Hq, HS)
  */
 void attention_backward_cudnn(nv_bfloat16* dqkvr,                                       // output
                               const float* stats,
-                              const nv_bfloat16* dout, const nv_bfloat16* qkvr, const nv_bfloat16* o, // inputs
+                              const nv_bfloat16* o, const nv_bfloat16* dout, const nv_bfloat16* qkvr, // inputs: out, dout, qkv (matches header)
                               std::byte* workspace, cudnnHandle_t handle,
                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
     // Get graph and tensors from cache (or generate it on first use)

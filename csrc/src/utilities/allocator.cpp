@@ -6,6 +6,7 @@
 #include "allocator.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <unordered_map>
 
@@ -200,7 +201,8 @@ template<typename Container>
 Tensor TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAllocationType kind, const Container& shape) {
     try {
         Tensor allocated = allocate_tensor(dtype, kind, shape);
-        m_Pointers.emplace_back(kind, allocated.Data, allocated.bytes());
+        const char* safe_name = name ? name : "<unnamed>";
+        m_Pointers.emplace_back(sAllocationData{kind, allocated.Data, narrow<long>(allocated.bytes()), safe_name, m_Stats->Context});
         record_stats(m_Stats->TensorStats, name, kind, allocated.bytes());
         if (!m_Stats->Context.empty()){
             record_stats(m_Stats->ContextStats, m_Stats->Context, kind, allocated.bytes());
@@ -328,16 +330,16 @@ struct MemoryCategory {
 static MemoryCategory categorize_tensor(const std::string& name) {
     // Optimizer state (momentum/variance)
     if (name.find("opt_m_") == 0 || name.find("opt_v_") == 0) {
-        return {"optimizer", "--offload-optimizer"};
+        return {"optimizer", "enable 'offload-optimizer'"};
     }
     // Gradients (d_ prefix)
     if (name.find("d_") == 0) {
-        return {"gradients", "--shard-gradients, --offload-gradients"};
+        return {"gradients", "enable 'shard-gradients' and 'offload-gradients'"};
     }
     // FP8/quantization buffers
     if (name.find("fp8_") == 0 || name.find("fp4_") == 0 || name.find("quant") != std::string::npos ||
         name.find("_q") == name.size() - 2 || name.find("_scales") != std::string::npos) {
-        return {"quants", "--offload-quants, --persistent-quants"};
+        return {"quants", "enable 'offload-quants' and 'persistent-quants'"};
     }
     // Workspace buffers
     if (name.find("_ws") != std::string::npos || name.find("workspace") != std::string::npos) {
@@ -346,10 +348,10 @@ static MemoryCategory categorize_tensor(const std::string& name) {
     // Activations
     if (name.find("act_") == 0 || name.find("cache") != std::string::npos ||
         name.find("residual") != std::string::npos || name.find("logits") != std::string::npos) {
-        return {"activations", "--recompute-swiglu, --recompute-ffn, --recompute-block"};
+        return {"activations", "enable 'recompute'"};
     }
     // Model weights
-    return {"weights", "--offload-master"};
+    return {"weights", "enable 'offload-master'"};
 }
 
 /**
