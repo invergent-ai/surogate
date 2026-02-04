@@ -1,33 +1,31 @@
-model: ./output_moe
+model: Qwen/Qwen3-30B-A3B
 model_type: qwen3_moe
-output_dir: ./output_moe_2
-merge_adapter: false
-apply_recommended_values: false
+output_dir: ./output_moe
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
 sample_packing: true
-sequence_len: 512
-gpus: 1
+sequence_len: 1024
+gpus: 4
 
-max_steps: 5
+num_epochs: 1
 eval_steps: 25
-save_steps: 0
+save_steps: 2
 
 learning_rate: 2e-4
 
 recipe: bf16
 lmhead_chunks: 8
-warmup_steps: 20
-use_cuda_graphs: false
-use_dsl_ir: true
-recompute: false
+warmup_ratio: 0.1
 
 lora: true
 lora_rank: 16
 lora_alpha: 32
 lora_dtype: bf16
+
+qlora_bnb: true
+qlora_offload_experts: true
 
 lora_target_modules:
   - q_proj
@@ -37,8 +35,6 @@ lora_target_modules:
   - gate_proj
   - up_proj
   - down_proj
-
-qlora_bnb: true
 
 dataloader_num_workers: 4
 datasets:
