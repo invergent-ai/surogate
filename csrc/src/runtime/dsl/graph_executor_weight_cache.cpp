@@ -168,6 +168,115 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
 }
 
 // ============================================================================
+// FP8 Transposed Weight Caching (for FP8 hybrid backward dinp path)
+// ============================================================================
+
+void GraphExecutor::prime_fp8_weight_cache_transposed(const std::vector<char>& required) {
+    if (!mOptions.TrainingRecipe || !mRunState.has_fp8_hybrid_backward()) {
+        return;
+    }
+    if (!mBackward) {
+        return;
+    }
+
+    const auto& config = mConfig;
+    for (std::size_t idx = 0; idx < mBackward->operations.size(); ++idx) {
+        if (!required.empty() && !required[idx]) {
+            continue;
+        }
+        const auto& op = mBackward->operations[idx];
+        const std::string& op_type =
+            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        if (op_type != "matmul_backward" && op_type != "matmul_swiglu_backward") {
+            continue;
+        }
+        if (op.inputs.size() < 3) {
+            continue;
+        }
+        const std::string& weight_name = op.inputs.at(2);
+
+        int layer_idx = -1;
+        auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
+        if (!op_kind.has_value()) {
+            continue;
+        }
+        if (!allow_quant_layer(mOptions, config, layer_idx)) {
+            continue;
+        }
+
+        if (!mWeights.has(weight_name)) {
+            continue;
+        }
+        Tensor& weight = mWeights.get(weight_name);
+        (void)get_fp8_cached_weight_transposed(weight_name, weight, mRunState.MainStream);
+    }
+}
+
+const Tensor* GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name,
+                                                              Tensor& weight,
+                                                              cudaStream_t stream) {
+    if (!mRunState.has_fp8_hybrid_backward()) {
+        return nullptr;
+    }
+    if (!mWeights.has(name) || mWeights.is_trainable(name)) {
+        return nullptr;
+    }
+
+    // Only cache rank-2 weights.
+    if (weight.Rank != 2) {
+        return nullptr;
+    }
+
+    const int N = static_cast<int>(weight.Sizes[0]);
+    const int K = static_cast<int>(weight.Sizes[1]);
+    if (N <= 0 || K <= 0) {
+        return nullptr;
+    }
+
+    // Cached tensor is the transposed view: (K, N).
+    auto it = mFP8WeightCacheT.find(name);
+    if (it == mFP8WeightCacheT.end()) {
+        FP8WeightCacheEntry entry{};
+        entry.weight = mRunState.Allocator->allocate(ETensorDType::FP8_E4M3,
+                                                     ("fp8_cacheT_" + name).c_str(),
+                                                     EAllocationType::ON_DEVICE,
+                                                     {static_cast<long>(K), static_cast<long>(N)});
+        entry.stats = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                    ("fp8_cacheT_" + name + "_stats").c_str(),
+                                                    EAllocationType::ON_DEVICE,
+                                                    {2L});
+        entry.weight.Stats = entry.stats.get<float>();
+        auto [insert_it, _] = mFP8WeightCacheT.emplace(name, std::move(entry));
+        it = insert_it;
+    }
+
+    if (!it->second.initialized) {
+        if (weight.DType == ETensorDType::BF16 || weight.DType == ETensorDType::FP32) {
+            const long numel = static_cast<long>(N) * K;
+            abs_max(it->second.weight.abs_max(), weight, numel, mRunState.DeviceProp, stream);
+            // Quantize+transpose into the cached tensor (K, N).
+            quantize_and_transpose_with_abs_max(it->second.weight, it->second.weight.scale(),
+                                                weight, it->second.weight.abs_max(),
+                                                /*rows=*/N, /*cols=*/K,
+                                                mRunState.DeviceProp, stream);
+        } else if (weight.DType == ETensorDType::FP8_E4M3) {
+            // Weight already FP8: just transpose and keep the same scale.
+            transpose(it->second.weight, weight, N, K, stream);
+            if (!weight.scale()) {
+                throw std::runtime_error("DSL FP8 cacheT: FP8 weight missing scale Stats");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(it->second.weight.scale(), weight.scale(), sizeof(float),
+                                       cudaMemcpyDeviceToDevice, stream));
+        } else {
+            return nullptr;
+        }
+        it->second.initialized = true;
+    }
+
+    return &it->second.weight;
+}
+
+// ============================================================================
 // FP4 Weight Caching (for NVFP4 recipe on Blackwell+)
 // ============================================================================
 

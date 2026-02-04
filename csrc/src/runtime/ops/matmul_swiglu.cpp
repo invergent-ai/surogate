@@ -20,24 +20,97 @@
 
 namespace dsl {
 
-void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op) {
+void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook) {
     Tensor& a = resolve_tensor(op.inputs[0]);
     Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     Tensor& up_out = ensure_output_tensor(op.outputs[1]);
+    const std::string& weight_name = op.inputs[1].name;
 
     int M = 0, N = 0, K = 0;
     matmul_dims(a, b, op.attrs.transpose, M, N, K);
     const long D = N / 2;
 
-    matmul(up_out, b, a, std::nullopt, nullptr, nullptr,
-           mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-           N, M, K, swap_transpose(op.attrs.transpose), false, mRunState.MainStream);
+    bool used_recipe = false;
+    modules::MatmulContext ctx{};
+    modules::MatmulContext* ctx_ptr = nullptr;
+    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT &&
+        op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
+        ctx.out = &up_out;
+        ctx.inp = &a;
+        ctx.weight = &b;
+        ctx.bias = nullptr;
+        ctx.B = static_cast<int>(mB);
+        ctx.T = static_cast<int>(mT);
+        ctx.C_in = K;
+        ctx.C_out = N;
+        ctx.run_state = &mRunState;
+        ctx.stream = mRunState.MainStream;
+        ctx.layer_idx = op.attrs.layer_idx;
+        ctx.op = *op.attrs.matmul_op;
+        ctx.allow_fp8 = mRecipe->uses_fp8_forward();
+        ctx.allow_fp4 = mRecipe->uses_fp4_forward();
+
+        if (ctx.allow_fp8) {
+            ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
+            ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+            if (b.DType == ETensorDType::FP8_E4M3) {
+                ctx.cached_weight = &b;
+            } else if (mFP8Cache) {
+                auto it = mFP8Cache->find(weight_name);
+                if (it != mFP8Cache->end() && it->second.initialized && it->second.weight.Data) {
+                    ctx.cached_weight = &it->second.weight;
+                }
+            }
+        }
+        if (ctx.allow_fp4 && mFP4Cache) {
+            auto it = mFP4Cache->find(weight_name);
+            if (it != mFP4Cache->end() && it->second.initialized &&
+                it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                ctx.cached_fp4_data = &it->second.data;
+                ctx.cached_fp4_scales = &it->second.scales;
+                ctx.cached_fp4_amax = it->second.amax.get<float>();
+            }
+        }
+
+        mRecipe->forward_matmul(ctx);
+        used_recipe = true;
+        ctx_ptr = &ctx;
+    }
+
+    if (!used_recipe) {
+        matmul(up_out, b, a, std::nullopt, nullptr, nullptr,
+               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               N, M, K, swap_transpose(op.attrs.transpose), false, mRunState.MainStream);
+    }
+
+    // Hook invocation (AfterMLPUpProjection should observe the projection output before activation).
+    if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
+        (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
+    }
 
     Tensor up_3d = view_tensor(up_out, {mB, mT, static_cast<long>(N)});
     Tensor out_3d = view_tensor(out, {mB, mT, D});
     swiglu_forward(out_3d, up_3d, nullptr, static_cast<int>(mB),
                    static_cast<int>(mT), static_cast<int>(D), mRunState.MainStream);
+
+    // Record forward plan for recompute (treat matmul_swiglu as the MLPUp projection).
+    if (mForwardPlan && op.attrs.matmul_op.has_value() && op.attrs.layer_idx >= 0 &&
+        static_cast<std::size_t>(op.attrs.layer_idx) < mForwardPlan->size() &&
+        *op.attrs.matmul_op == modules::MatmulOp::MLPUp) {
+        MatmulForwardPlan plan{};
+        plan.valid = true;
+        plan.use_recipe = used_recipe;
+        plan.has_bias = false;
+        if (used_recipe && ctx_ptr) {
+            plan.allow_fp8 = ctx_ptr->allow_fp8;
+            plan.allow_fp4 = ctx_ptr->allow_fp4;
+            plan.delayed_quantizer_idx = ctx_ptr->delayed_quantizer_idx;
+            plan.use_fp8_cache = (ctx_ptr->cached_weight && ctx_ptr->cached_weight->Data);
+            plan.use_fp4_cache = (ctx_ptr->cached_fp4_data && ctx_ptr->cached_fp4_scales);
+        }
+        (*mForwardPlan)[static_cast<std::size_t>(op.attrs.layer_idx)].mlp_up = plan;
+    }
 }
 
 void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
@@ -49,6 +122,8 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     Tensor mlp_up = resolve_tensor(op.inputs[3]);
 
     const int layer_idx = op.attrs.layer_idx;
+    const bool allow_quant = op.attrs.allow_quant;
+    const std::string& weight_name = op.inputs.size() > 2 ? op.inputs[2].name : "";
     
     // Recompute mlp_up if the saved tensor was stack-allocated and freed
     bool recomputed_mlp_up = false;
@@ -109,7 +184,23 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         d_inp_ptr = &ensure_output_tensor(op.outputs[0]);
     }
+    // Skip weight gradient if frozen (LoRA-only mode).
+    bool skip_weight_grad = true;
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        std::string base_name;
+        if (auto base = base_param_from_grad(op.outputs[1].name)) {
+            base_name = *base;
+        } else {
+            base_name = op.outputs[1].name;
+            if (base_name.rfind("d_", 0) == 0) {
+                base_name = base_name.substr(2);
+            }
+        }
+        bool accum = false;
+        Tensor* grad = mGrads.get_param_grad(base_name, accum);
+        skip_weight_grad = (grad == nullptr || !grad->Data);
+    }
+    if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
     }
 
@@ -123,65 +214,133 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         }
     }
 
-    if (d_inp_ptr) {
-        EMMTranspose mode_dA = EMMTranspose::NN;
-        switch (op.attrs.transpose) {
-            case EMMTranspose::NN:
-                mode_dA = EMMTranspose::NT;
-                break;
-            case EMMTranspose::NT:
-                mode_dA = EMMTranspose::NN;
-                break;
-            case EMMTranspose::TN:
-                mode_dA = EMMTranspose::NT;
-                break;
-            case EMMTranspose::TT:
-                mode_dA = EMMTranspose::TT;
-                break;
-        }
-
-        int M = 0, N = 0, K = 0;
-        matmul_dims(d_mlp_up_flat, weight, mode_dA, M, N, K);
-        EMMTranspose mode_col = swap_transpose(mode_dA);
-        matmul(*d_inp_ptr, weight, d_mlp_up_flat, std::nullopt, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, mode_col, false, mRunState.MainStream);
-    }
-    if (d_weight_ptr) {
+    bool used_recipe = false;
+    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && d_mlp_up_flat.Sizes[0] == mB * mT &&
+        allow_quant && op.attrs.matmul_op.has_value()) {
         Tensor inp_flat = (inp.Rank == 2) ? inp : view_tensor(inp, {mB * mT, inp.Sizes[inp.Rank - 1]});
 
-        const Tensor* lhs = nullptr;
-        const Tensor* rhs = nullptr;
-        EMMTranspose mode_rm = EMMTranspose::NN;
-        switch (op.attrs.transpose) {
-            case EMMTranspose::NN:
-                lhs = &inp_flat;
-                rhs = &d_mlp_up_flat;
-                mode_rm = EMMTranspose::TN;
-                break;
-            case EMMTranspose::NT:
-                lhs = &d_mlp_up_flat;
-                rhs = &inp_flat;
-                mode_rm = EMMTranspose::TN;
-                break;
-            case EMMTranspose::TN:
-                lhs = &inp_flat;
-                rhs = &d_mlp_up_flat;
-                mode_rm = EMMTranspose::NN;
-                break;
-            case EMMTranspose::TT:
-                lhs = &d_mlp_up_flat;
-                rhs = &inp_flat;
-                mode_rm = EMMTranspose::TT;
-                break;
+        Tensor dA_tmp{};
+        Tensor dB_tmp{};
+        Tensor* dA_use = d_inp_ptr;
+        Tensor* dB_use = d_weight_ptr;
+
+        if (!dA_use) {
+            dA_tmp = mRunState.temp_alloc(inp.DType, {inp_flat.Sizes[0], inp_flat.Sizes[1]});
+            mTemps.push_back(dA_tmp);
+            dA_use = &dA_tmp;
+        }
+        if (!dB_use && !skip_weight_grad) {
+            dB_tmp = mRunState.temp_alloc(weight.DType, {weight.Sizes[0], weight.Sizes[1]});
+            mTemps.push_back(dB_tmp);
+            dB_use = &dB_tmp;
         }
 
-        int M = 0, N = 0, K = 0;
-        matmul_dims(*lhs, *rhs, mode_rm, M, N, K);
-        EMMTranspose mode_col = swap_transpose(mode_rm);
-        matmul(*d_weight_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, mode_col, do_accumulate, mRunState.MainStream);
+        modules::MatmulContext ctx{};
+        ctx.dinp = dA_use;
+        ctx.dweight = dB_use;
+        ctx.dout = &d_mlp_up_flat;
+        ctx.inp = &inp_flat;
+        ctx.weight = &weight;
+        ctx.B = static_cast<int>(mB);
+        ctx.T = static_cast<int>(mT);
+        ctx.C_in = static_cast<int>(inp_flat.Sizes[1]);
+        ctx.C_out = static_cast<int>(weight.Sizes[0]);
+        ctx.run_state = &mRunState;
+        ctx.stream = mRunState.MainStream;
+        ctx.layer_idx = layer_idx;
+        ctx.op = *op.attrs.matmul_op;
+        ctx.accumulate = do_accumulate;
+        ctx.skip_weight_grad = skip_weight_grad || !d_weight_ptr;
+        ctx.allow_fp8 = allow_quant && mRecipe->uses_fp8_hybrid_backward();
+        ctx.allow_fp4 = allow_quant && mRecipe->uses_fp4_forward();
+
+        if (ctx.allow_fp8) {
+            ctx.dout_quant = fp8_grad_buffer(mRunState, *op.attrs.matmul_op);
+            if (!ctx.dout_quant || !ctx.dout_quant->Data) {
+                ctx.allow_fp8 = false;
+            }
+        }
+        if (ctx.allow_fp8 && mFP8CacheT) {
+            auto it = mFP8CacheT->find(weight_name);
+            if (it != mFP8CacheT->end() && it->second.initialized && it->second.weight.Data) {
+                ctx.cached_weight = &it->second.weight;
+            }
+        }
+        if (ctx.allow_fp4 && mFP4CacheT) {
+            auto it = mFP4CacheT->find(weight_name);
+            if (it != mFP4CacheT->end() && it->second.initialized &&
+                it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                ctx.cached_fp4_data = &it->second.data;
+                ctx.cached_fp4_scales = &it->second.scales;
+                ctx.cached_fp4_amax = it->second.amax.get<float>();
+            }
+        }
+
+        mRecipe->backward_matmul(ctx);
+        used_recipe = true;
+    }
+
+    if (!used_recipe) {
+        if (d_inp_ptr) {
+            EMMTranspose mode_dA = EMMTranspose::NN;
+            switch (op.attrs.transpose) {
+                case EMMTranspose::NN:
+                    mode_dA = EMMTranspose::NT;
+                    break;
+                case EMMTranspose::NT:
+                    mode_dA = EMMTranspose::NN;
+                    break;
+                case EMMTranspose::TN:
+                    mode_dA = EMMTranspose::NT;
+                    break;
+                case EMMTranspose::TT:
+                    mode_dA = EMMTranspose::TT;
+                    break;
+            }
+
+            int M = 0, N = 0, K = 0;
+            matmul_dims(d_mlp_up_flat, weight, mode_dA, M, N, K);
+            EMMTranspose mode_col = swap_transpose(mode_dA);
+            matmul(*d_inp_ptr, weight, d_mlp_up_flat, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   N, M, K, mode_col, false, mRunState.MainStream);
+        }
+        if (d_weight_ptr && !skip_weight_grad) {
+            Tensor inp_flat = (inp.Rank == 2) ? inp : view_tensor(inp, {mB * mT, inp.Sizes[inp.Rank - 1]});
+
+            const Tensor* lhs = nullptr;
+            const Tensor* rhs = nullptr;
+            EMMTranspose mode_rm = EMMTranspose::NN;
+            switch (op.attrs.transpose) {
+                case EMMTranspose::NN:
+                    lhs = &inp_flat;
+                    rhs = &d_mlp_up_flat;
+                    mode_rm = EMMTranspose::TN;
+                    break;
+                case EMMTranspose::NT:
+                    lhs = &d_mlp_up_flat;
+                    rhs = &inp_flat;
+                    mode_rm = EMMTranspose::TN;
+                    break;
+                case EMMTranspose::TN:
+                    lhs = &inp_flat;
+                    rhs = &d_mlp_up_flat;
+                    mode_rm = EMMTranspose::NN;
+                    break;
+                case EMMTranspose::TT:
+                    lhs = &d_mlp_up_flat;
+                    rhs = &inp_flat;
+                    mode_rm = EMMTranspose::TT;
+                    break;
+            }
+
+            int M = 0, N = 0, K = 0;
+            matmul_dims(*lhs, *rhs, mode_rm, M, N, K);
+            EMMTranspose mode_col = swap_transpose(mode_rm);
+            matmul(*d_weight_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   N, M, K, mode_col, do_accumulate, mRunState.MainStream);
+        }
     }
 
     if (layer_idx >= 0 && d_inp_ptr) {

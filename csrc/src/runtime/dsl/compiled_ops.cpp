@@ -333,6 +333,10 @@ void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCa
     mFP8Cache = cache;
 }
 
+void CompiledExecutor::set_fp8_cache_transposed(std::unordered_map<std::string, FP8WeightCacheEntry>* cache_t) {
+    mFP8CacheT = cache_t;
+}
+
 void CompiledExecutor::set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
                                      std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t) {
     mFP4Cache = cache;
@@ -1464,7 +1468,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     dispatch_mul(op);
                     break;
                 case CompiledOpType::MatmulSwiGLU:
-                    dispatch_matmul_swiglu(op);
+                    dispatch_matmul_swiglu(op, hook);
                     break;
                 case CompiledOpType::QKVQKNormRoPE:
                     dispatch_qkv_qk_norm_rope(op);

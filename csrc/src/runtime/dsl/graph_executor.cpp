@@ -500,6 +500,7 @@ void GraphExecutor::init_compiled_execution() {
             recompute_block(layer_idx, B, T);
         });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
+    mCompiledExecutor->set_fp8_cache_transposed(&mFP8WeightCacheT);
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
     mCompiledExecutor->set_saved_tensors(&mSaved);
     mCompiledExecutor->set_save_list(&mSaveList);
@@ -571,6 +572,11 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // inside save_tensors (which is not allowed during capture).
         mCompiledExecutor->set_dimensions(B, T);
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList);
+
+        // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
+        // without allocating during cudaStreamBeginCapture.
+        prime_fp8_weight_cache({});
+        prime_fp4_weight_cache({});
     }
 
     auto run_ops = [&]() {
@@ -611,6 +617,12 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
     }
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
+    if (capturing) {
+        // Same reason as forward: avoid allocating inside capture when a recipe wants cached weights.
+        prime_fp8_weight_cache({});
+        prime_fp8_weight_cache_transposed({});
+        prime_fp4_weight_cache({});
+    }
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);

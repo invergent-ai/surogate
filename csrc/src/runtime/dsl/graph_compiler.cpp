@@ -510,6 +510,21 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // MatmulSwiGLU: fused MLP up+gate matmul (forward) still needs layer/op attrs for recipes.
+    if (type == CompiledOpType::MatmulSwiGLU) {
+        if (op.inputs.size() > 1) {
+            int layer_idx = -1;
+            auto matmul_op = matmul_op_from_weight(op.inputs[1], layer_idx);
+            attrs.matmul_op = matmul_op;
+            attrs.layer_idx = layer_idx;
+            attrs.allow_quant = matmul_op.has_value() &&
+                                allow_quant_layer(mOptions, mConfig, layer_idx);
+            if (matmul_op.has_value() && *matmul_op == modules::MatmulOp::MLPUp) {
+                attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+            }
+        }
+    }
+
     // MatmulBackward: weight is at inputs[2], not inputs[1]
     // Also set backward_hook_point for LoRA hook invocation
     if (type == CompiledOpType::MatmulBackward) {
@@ -550,6 +565,8 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
                 }
                 attrs.layer_idx = layer_idx;
+                attrs.allow_quant = attrs.matmul_op.has_value() &&
+                                    allow_quant_layer(mOptions, mConfig, layer_idx);
             }
         }
     }

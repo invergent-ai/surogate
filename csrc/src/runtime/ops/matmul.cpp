@@ -18,6 +18,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     Tensor& a = resolve_tensor(op.inputs[0]);
     Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
+    const std::string& weight_name = op.inputs[1].name;
 
     std::optional<Tensor> bias;
     if (op.type == CompiledOpType::MatmulBias && op.inputs.size() > 2) {
@@ -47,10 +48,27 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
             ctx.allow_fp8 = mRecipe->uses_fp8_forward();
             ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
-            // FP8/FP4 buffers would be set here via pre-resolved cache
+            // Wire FP8/FP4 buffers + static weight caches (GraphExecutor primes caches before CUDA graph capture).
             if (ctx.allow_fp8) {
                 ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
                 ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+                if (b.DType == ETensorDType::FP8_E4M3) {
+                    ctx.cached_weight = &b;
+                } else if (mFP8Cache) {
+                    auto it = mFP8Cache->find(weight_name);
+                    if (it != mFP8Cache->end() && it->second.initialized && it->second.weight.Data) {
+                        ctx.cached_weight = &it->second.weight;
+                    }
+                }
+            }
+            if (ctx.allow_fp4 && mFP4Cache) {
+                auto it = mFP4Cache->find(weight_name);
+                if (it != mFP4Cache->end() && it->second.initialized &&
+                    it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                    ctx.cached_fp4_data = &it->second.data;
+                    ctx.cached_fp4_scales = &it->second.scales;
+                    ctx.cached_fp4_amax = it->second.amax.get<float>();
+                }
             }
 
             mRecipe->forward_matmul(ctx);
@@ -220,6 +238,22 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             ctx.dout_quant = fp8_grad_buffer(mRunState, *op.attrs.matmul_op);
             if (!ctx.dout_quant || !ctx.dout_quant->Data) {
                 ctx.allow_fp8 = false;
+            }
+        }
+        if (ctx.allow_fp8 && mFP8CacheT) {
+            auto it = mFP8CacheT->find(weight_name);
+            if (it != mFP8CacheT->end() && it->second.initialized && it->second.weight.Data) {
+                // For FP8 backward, cache stores W^T in FP8 (K, N) to skip per-op quantize+transpose.
+                ctx.cached_weight = &it->second.weight;
+            }
+        }
+        if (ctx.allow_fp4 && mFP4CacheT) {
+            auto it = mFP4CacheT->find(weight_name);
+            if (it != mFP4CacheT->end() && it->second.initialized &&
+                it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                ctx.cached_fp4_data = &it->second.data;
+                ctx.cached_fp4_scales = &it->second.scales;
+                ctx.cached_fp4_amax = it->second.amax.get<float>();
             }
         }
         used_fp8 = ctx.allow_fp8;

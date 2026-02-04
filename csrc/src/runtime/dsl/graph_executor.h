@@ -219,6 +219,7 @@ private:
 
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
+    std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCacheT;  ///< Backward dinp (transposed layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
 
@@ -226,6 +227,8 @@ private:
 
     void prime_fp8_weight_cache(const std::vector<char>& required);
     const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
+    void prime_fp8_weight_cache_transposed(const std::vector<char>& required);
+    const Tensor* get_fp8_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
 
     // FP4 weight cache helpers (for NVFP4 recipe on Blackwell+)
     void prime_fp4_weight_cache(const std::vector<char>& required);

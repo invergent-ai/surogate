@@ -103,6 +103,7 @@ public:
 
     // Cache management
     void set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache);
+    void set_fp8_cache_transposed(std::unordered_map<std::string, FP8WeightCacheEntry>* cache_t);
     void set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
@@ -148,7 +149,7 @@ private:
     void dispatch_swiglu(const CompiledOp& op);
     void dispatch_silu(const CompiledOp& op);
     void dispatch_mul(const CompiledOp& op);
-    void dispatch_matmul_swiglu(const CompiledOp& op);
+    void dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook);
     void dispatch_qkv_qk_norm_rope(const CompiledOp& op);
     void dispatch_rope(const CompiledOp& op);
     void dispatch_flash_attention(const CompiledOp& op);
@@ -222,6 +223,7 @@ private:
 
     // Caches
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8Cache = nullptr;
+    std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8CacheT = nullptr;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4Cache = nullptr;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
