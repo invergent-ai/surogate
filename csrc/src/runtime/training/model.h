@@ -128,6 +128,9 @@ public:
         // Default no-op for models that allocate run state in constructor
     }
 
+    //! Check if LoRA training is enabled (default: false)
+    [[nodiscard]] virtual bool lora_enabled() const { return false; }
+
     //! Save LoRA adapter to a checkpoint directory (no-op for non-LoRA models)
     virtual void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {}
 

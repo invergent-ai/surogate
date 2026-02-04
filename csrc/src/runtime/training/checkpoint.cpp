@@ -56,45 +56,49 @@ std::string save_checkpoint(std::string target, int step, IModel& model, const D
     comm.barrier();
 
     nlohmann::json meta_data;
+    const bool is_lora = model.lora_enabled();
 
     target = get_checkpoint_path(std::move(target), step);
     std::filesystem::create_directories(target);
 
-    // weights
-    // TODO don't duplicate weights if they are unsharded
-    write_safetensors(target + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.weights());
+    // For LoRA training, only save the adapter - base model weights are frozen
+    if (!is_lora) {
+        // weights
+        // TODO don't duplicate weights if they are unsharded
+        write_safetensors(target + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.weights());
 
-    // sharded optimizer state
-    write_safetensors(target + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum());
-    write_safetensors(target + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance());
+        // sharded optimizer state
+        write_safetensors(target + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum());
+        write_safetensors(target + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance());
 
-    bool has_scales = false;
-    model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
-        if(tensor.Data != nullptr) {
-            has_scales = true;
+        bool has_scales = false;
+        model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
+            if(tensor.Data != nullptr) {
+                has_scales = true;
+            }
+        });
+        if(has_scales) {
+            write_safetensors(target + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum_scales());
         }
-    });
-    if(has_scales) {
-        write_safetensors(target + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum_scales());
+
+        bool has_v_scales = false;
+        model.opt_variance_scales().iterate_tensors([&has_v_scales](const std::string&, const TensorShard& tensor) {
+            if (tensor.Data != nullptr) {
+                has_v_scales = true;
+            }
+        });
+        if (has_v_scales) {
+            write_safetensors(target + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance_scales());
+        }
+
+        // Export full model weights in HuggingFace-compatible format (config.json + model.safetensors)
+        // This allows loading the checkpoint directly with HuggingFace transformers
+        save_pretrained_config(*model.get_run_state().Config, (target + "/config.json").c_str());
+        model.export_weights(target + "/model.safetensors", comm);
     }
 
-    bool has_v_scales = false;
-    model.opt_variance_scales().iterate_tensors([&has_v_scales](const std::string&, const TensorShard& tensor) {
-        if (tensor.Data != nullptr) {
-            has_v_scales = true;
-        }
-    });
-    if (has_v_scales) {
-        write_safetensors(target + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance_scales());
-    }
-
-    // Save LoRA adapter if this is a LoRA model
+    // Save LoRA adapter if this is a LoRA model (includes adapter weights and optimizer state)
     model.save_lora_checkpoint(target, comm);
-
-    // Export full model weights in HuggingFace-compatible format (config.json + model.safetensors)
-    // This allows loading the checkpoint directly with HuggingFace transformers
-    save_pretrained_config(*model.get_run_state().Config, (target + "/config.json").c_str());
-    model.export_weights(target + "/model.safetensors", comm);
 
     comm.barrier();  // only write checkpoint.json once we know all the shard files are saved
 
@@ -179,35 +183,41 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
         loader->set_state(dl["seed"].get<std::uint64_t>(), dl["epoch"].get<int>(), dl["file_index"].get<int>(), dl["chunk_index"].get<int>());
     }
 
-    // weights
-    load_safetensors(source + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.weights(), false);
+    // Check if this is a LoRA-only checkpoint (no base model weights saved)
+    const std::string weights_file = source + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size());
+    const bool has_base_weights = std::filesystem::exists(weights_file);
 
-    // Pre-allocate optimizer state buffers before loading.
-    // This ensures the 8-bit AdamW state tensors are allocated so load_safetensors can fill them.
-    model.prepare_optimizer_for_checkpoint_load();
+    if (has_base_weights) {
+        // Load base model weights
+        load_safetensors(weights_file, model.weights(), false);
 
-    // load optimizer shards
-    load_safetensors(source + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum(), false);
-    load_safetensors(source + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance(), false);
+        // Pre-allocate optimizer state buffers before loading.
+        // This ensures the 8-bit AdamW state tensors are allocated so load_safetensors can fill them.
+        model.prepare_optimizer_for_checkpoint_load();
 
-    bool has_scales = false;
-    model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
-        if(tensor.Data != nullptr) {
-            has_scales = true;
+        // load optimizer shards
+        load_safetensors(source + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum(), false);
+        load_safetensors(source + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance(), false);
+
+        bool has_scales = false;
+        model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
+            if(tensor.Data != nullptr) {
+                has_scales = true;
+            }
+        });
+        if(has_scales) {
+            load_safetensors(source + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum_scales(), false);
         }
-    });
-    if(has_scales) {
-        load_safetensors(source + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum_scales(), false);
-    }
 
-    bool has_v_scales = false;
-    model.opt_variance_scales().iterate_tensors([&has_v_scales](const std::string&, const TensorShard& tensor) {
-        if (tensor.Data != nullptr) {
-            has_v_scales = true;
+        bool has_v_scales = false;
+        model.opt_variance_scales().iterate_tensors([&has_v_scales](const std::string&, const TensorShard& tensor) {
+            if (tensor.Data != nullptr) {
+                has_v_scales = true;
+            }
+        });
+        if (has_v_scales) {
+            load_safetensors(source + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance_scales(), false);
         }
-    });
-    if (has_v_scales) {
-        load_safetensors(source + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance_scales(), false);
     }
 
     // Load LoRA adapter if this is a LoRA model and adapter exists

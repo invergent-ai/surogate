@@ -131,7 +131,7 @@ public:
     void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
     void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
 
-    [[nodiscard]] bool lora_enabled() const { return mLoRAConfig.has_value() && mLoRAConfig->enabled(); }
+    [[nodiscard]] bool lora_enabled() const override { return mLoRAConfig.has_value() && mLoRAConfig->enabled(); }
     [[nodiscard]] bool qlora_enabled() const { return lora_enabled() && mQLoRAConfig.is_quantized(); }
     [[nodiscard]] bool is_moe_model() const { return mIsMoEModel; }
     [[nodiscard]] std::size_t lora_num_parameters() const {

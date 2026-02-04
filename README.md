@@ -38,7 +38,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - [**🖥️...🖥️ Native multi-GPU**](https://docs.surogate.ai/guides/multi-gpu) training with multi-threaded backend
 - [**🖥️...🖥️ Native multi-Node**](https://docs.surogate.ai/guides/multi-node) DDP training with Ray
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
-- [**🗲 CUDA Kernel Fusions**](https://docs.surogate.ai/about/transformer#kernel-fusions) for maximum throughput  
+- [**🔥 Python DSL**](https://docs.surogate.ai/about/dsl) with AOT auto-differentiation for adding new model architectures
 - [**⚖️ Smart CPU Offloading**](https://docs.surogate.ai/guides/offloading) for weights, gradients, activations, quants
 - **📜 Pre-built training recipes**: 
   - [**💎 BF16**](https://docs.surogate.ai/guides/precision-and-recipes#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.

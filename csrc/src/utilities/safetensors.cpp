@@ -164,10 +164,26 @@ void SafeTensorEntry::read_tensor(Tensor& target, bool allow_cast) const {
  * @throws std::runtime_error / nlohmann::json exceptions on I/O or parse failures.
  */
 SafeTensorsReader::SafeTensorsReader(const std::string& file_name) {
-    if (file_name.ends_with(".index.json"))
+    namespace fs = std::filesystem;
+
+    if (file_name.ends_with(".index.json")) {
         parse_index_file(file_name);
-    else
+    } else if (fs::is_directory(file_name)) {
+        // Handle directory paths by looking for index or single safetensors file
+        fs::path dir(file_name);
+        fs::path index_file = dir / "model.safetensors.index.json";
+        fs::path single_file = dir / "model.safetensors";
+
+        if (fs::exists(index_file)) {
+            parse_index_file(index_file.string());
+        } else if (fs::exists(single_file)) {
+            parse_single_file(single_file.string());
+        } else {
+            throw std::runtime_error("No safetensors files found in directory '" + file_name + "'");
+        }
+    } else {
         parse_single_file(file_name);
+    }
 }
 
 /**
