@@ -448,7 +448,7 @@ MoE models have more parameters than dense models but similar active compute:
 Tips for reducing memory:
 - Use QLoRA (`qlora_bnb: true`) for large models
 - Reduce `per_device_train_batch_size` and increase `gradient_accumulation_steps`
-- Enable `recompute_block: true` (default)
+- Enable `recompute` (default)
 
 ## Limitations
 

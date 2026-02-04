@@ -10,10 +10,11 @@ This section provides a comprehensive reference for all configuration options av
 | `apply_recommended_values` | bool   | `false`        | Whether to apply recommended configuration values.                                   |
 | `num_epochs`               | int    | `3`            | Total number of training epochs to perform.                                          |
 | `output_dir`               | string | `"output"`     | The output directory where the model predictions and checkpoints will be written.    |
-| `checkpoint_dir`           | string | `"output"`     | Directory to save checkpoints during training. If None, defaults to `output_dir`.    |
-| `resume_from_checkpoint`   | bool   | `false`        | Continue from checkpoint. If enabled, uses the latest checkpoint.                    |
+| `checkpoint_dir`           | string | `null`         | Directory to save checkpoints during training. If None, defaults to `output_dir`.    |
+| `resume_from_checkpoint`   | bool   | `true`         | Continue from checkpoint. If enabled, uses the latest checkpoint.                    |
 | `save_steps`               | int    | `50`           | Number of steps between saving checkpoints.                                          |
 | `save_total_limit`         | int    | `5`            | Limit the total amount of checkpoints. Deletes older checkpoints in `output_dir`.    |
+| `from_scratch`             | bool   | `false`        | Train from scratch (random initialization) instead of fine-tuning a pre-trained model. |
 
 ## Model Settings
 
@@ -21,31 +22,18 @@ This section provides a comprehensive reference for all configuration options av
 | --------------- | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`         | string | required    | Path or HuggingFace model identifier (e.g., `"Qwen/Qwen3-0.6B"`).                                                                                                                                                                                                                         |
 | `model_type`    | string | auto-detect | Type of the model group. Automatically detected from model config if not specified.                                                                                                                                                                                                       |
-| `sequence_len`  | int    | model's max | Maximum sequence length for training. Defaults to model's `max_model_len`.                                                                                                                                                                                                                |
-| `max_model_len` | int    | auto-detect | Maximum model length for rope scaling. Automatically detected from model config if not specified.                                                                                                                                                                                         |
+| `sequence_len`  | int    | `1024`      | Maximum sequence length for training. Samples exceeding this length are truncated.                                                                                                                                                                                                        |
+| `max_model_len` | int    | `null`      | Maximum model length for rope scaling. Automatically detected from model config if not specified.                                                                                                                                                                                         |
 | `rope_scaling`  | string | `null`      | Type of RoPE scaling. Pass a string like `"linear"`, `"dynamic"`, or `"yarn"` along with `max_model_len` to automatically configure rope_scaling. Alternatively, pass a JSON string like `'{"factor": 2.0, "type": "yarn"}'` to directly override the rope_scaling in the model's config. |
 | `torch_dtype`   | string | auto-detect | PyTorch data type for model weights. Options: `"bfloat16"`, `"float16"`, `"float32"`. Automatically detected from model config if not specified.                                                                                                                                          |
 
-## Recomputation Options
+## Recomputation
 
-Recomputation options trade compute for memory by recomputing activations during the backward pass instead of storing them.
+Recomputation trades compute for memory by recomputing activations during the backward pass instead of storing them.
 
-| Option              | Type | Default | Description                                                                                                                                                                                                                            |
-| ------------------- | ---- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `recompute_swiglu`  | bool | `true`  | Recompute SwiGLU activation during backward pass. As SwiGLU is at the widest part of the model, this results in substantial memory savings at moderate compute cost.                                                                   |
-| `recompute_rmsnorm` | bool | `true`  | Recompute RMSNorm activations during backward pass to save memory.                                                                                                                                                                     |
-| `recompute_ffn`     | bool | `true`  | Recompute Feed-Forward Network (FFN) activations during backward pass. Implies `recompute_swiglu`.                                                                                                                                     |
-| `recompute_qkv`     | bool | `true`  | Recompute QKV projections during backward pass to save memory.                                                                                                                                                                         |
-| `recompute_att`     | bool | `true`  | Recompute attention block during backward pass. Implies `recompute_qkv`.                                                                                                                                                               |
-| `recompute_block`   | bool | `true`  | Recompute entire Transformer block during backward pass to save memory. For LoRA, this also recomputes ln1/ln2 during LoRA backward instead of storing per-layer.                                                                       |
-
-### Recomputation Hierarchy
-
-The recomputation options form a hierarchy:
-
-- `recompute_block` → implies `recompute_att`, `recompute_ffn`, `recompute_rmsnorm`
-- `recompute_att` → implies `recompute_qkv`
-- `recompute_ffn` → implies `recompute_swiglu`
+| Option      | Type | Default | Description                                                                                                                                                                                     |
+| ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead).                   |
 
 ## Offloading Options
 
@@ -53,11 +41,11 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 | Option               | Type | Default | Description                                                                                                                                                                                                                   |
 | -------------------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `offload_residual`   | bool | `false` | Offload residuals (of the FFN block) to pinned host memory. Combined with `recompute_block`, total activation memory becomes independent of network depth.                                                                    |
+| `offload_residual`   | bool | `false` | Offload residuals (of the FFN block) to pinned host memory. Combined with `recompute`, total activation memory becomes independent of network depth.                                                                          |
 | `offload_master`     | bool | `false` | Store master weights in pinned host memory.                                                                                                                                                                                   |
 | `offload_quants`     | bool | `false` | Store quantized weights in pinned host memory. Requires `persistent_quants`.                                                                                                                                                  |
 | `offload_optimizer`  | bool | `false` | Store optimizer state in pinned host memory. Slows down optimizer step drastically, but with enough gradient accumulation steps, the overall contribution becomes negligible.                                                 |
-| `offload_grads`      | bool | `false` | Offload gradients to pinned host memory.                                                                                                                                                                                      |
+| `offload_grads`      | bool | `false` | Offload gradients to pinned host memory. Requires `shard_gradients=true` or `zero_level >= 2`.                                                                                                                               |
 | `persistent_quants`  | bool | `false` | Avoid re-quantization of weights. Increases memory, but when combined with `offload_quants`, the additional memory is placed on the host. In PCIe settings, this can lead to significant speed-ups. Requires `shard_weights`. |
 | `use_zero_copy`      | bool | `false` | Use ZeroCopy memory access instead of double-buffered cudaMemcpy for offloaded optimizer states. DMA is slower on consumer cards but faster on professional cards.                                                            |
 | `use_write_combined` | bool | `false` | Use write-combined memory for offloaded tensors. May improve PCIe throughput in some situations.                                                                                                                              |
@@ -100,13 +88,13 @@ distributed:
 | Option            | Type | Default | Description                                                                                                                       |
 | ----------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `gpus`            | int  | `1`     | Number of GPUs to use for training. Use `0` for all available GPUs.                                                               |
-| `use_cuda_graphs` | bool | `true`  | Enable CUDA graphs for performance. Automatically disabled for QLoRA and when `offload_residual` is used with `recompute_block` in LoRA mode. |
+| `use_cuda_graphs` | bool | `true`  | Enable CUDA graphs for performance.                                                                                                |
 
 ## Mixed Precision & Recipe Options
 
 | Option           | Type   | Default  | Description                                                                                                                   |
 | ---------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `recipe`         | string | `"bf16"` | Mixed precision training recipe. Options: `"bf16"` (default), `"fp8_hybrid"`, `"nvfp4"`.                                      |
+| `recipe`         | string | `"bf16"` | Mixed precision training recipe. Options: `"bf16"` (default), `"fp8_hybrid"`, `"nvfp4"`, `"nvfp4_quartet"`.                   |
 | `gradient_dtype` | string | `null`   | Dtype for activation gradients / backward matmul policy. Defaults to matmul-dtype. Note: recipes may override backward dtype. |
 | `master_dtype`   | string | `null`   | Master weight dtype for optimizer updates (e.g., FP32 for stable full fine-tuning). Defaults to model-dtype.                  |
 | `use_fused_rope` | bool   | `false`  | Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth).                                  |
@@ -115,7 +103,7 @@ distributed:
 
 | Option             | Type | Default | Description                                                        |
 | ------------------ | ---- | ------- | ------------------------------------------------------------------ |
-| `fp8_amax_history` | int  | `1024`  | FP8 delayed scaling amax history length (for `fp8_hybrid` recipe). |
+| `fp8_amax_history` | int  | `16`    | FP8 delayed scaling amax history length (for `fp8_hybrid` recipe). |
 
 ### FP4/NVFP4 Recipe Options
 
@@ -142,7 +130,7 @@ distributed:
 | `cooldown_steps`    | int    | `0`            | Number of steps for linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`. |
 | `final_lr_fraction` | float  | `0.0`          | Final learning rate as a fraction of the initial learning rate.                                  |
 | `weight_decay`      | float  | `0.1`          | Weight decay applied to all layers except bias and LayerNorm weights.                            |
-| `max_grad_norm`     | float  | `1.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                            |
+| `max_grad_norm`     | float  | `0.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                            |
 
 ### AdamW 8-bit Optimizer Parameters
 
@@ -281,7 +269,7 @@ datasets:
 | `lora_alpha`          | int    | `32`             | Alpha value for LoRA adapters.                                     |
 | `lora_dropout`        | float  | `0.05`           | Dropout rate for LoRA adapters.                                    |
 | `lora_dtype`          | string | `"fp32"`         | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                 |
-| `lora_target_modules` | list   | `["all-linear"]` | List of module names to apply LoRA adapters to.                    |
+| `lora_target_modules` | list   | `["all"]`        | List of module names to apply LoRA adapters to.                    |
 | `train_router`        | bool   | `false`          | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
 | `merge_adapter`       | bool   | `false`          | Whether to merge LoRA adapters into the base model after training. |
 
@@ -291,8 +279,8 @@ MoE (Mixture-of-Experts) settings control router loss coefficients for load bala
 
 | Option                | Type  | Default         | Description                                                                                       |
 | --------------------- | ----- | --------------- | ------------------------------------------------------------------------------------------------- |
-| `router_aux_loss_coef`| float | model config    | MoE auxiliary (load balancing) loss coefficient. None uses model config default (typically 0.001). |
-| `router_z_loss_coef`  | float | model config    | MoE z-loss (router logit regularization) coefficient. None uses model config default (typically 0.001). |
+| `router_aux_loss_coef`| float | `null`          | MoE auxiliary (load balancing) loss coefficient. `null` uses model config default. |
+| `router_z_loss_coef`  | float | `null`          | MoE z-loss (router logit regularization) coefficient. `null` uses model config default. |
 
 **Understanding MoE Losses:**
 
@@ -310,6 +298,8 @@ MoE (Mixture-of-Experts) settings control router loss coefficients for load bala
 | `qlora_bnb_block_size`   | int  | `64`    | Block size for BnB NF4 QLoRA quantization. Valid values: `64`, `128`, `256`, `512`.                                                                              |
 | `qlora_bnb_double_quant` | bool | `true`  | Enable double quantization for BnB (quantize absmax values to INT8 for extra memory savings).                                                                    |
 | `qlora_four_over_six`    | bool | `true`  | Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization. Evaluates both max=4 and max=6 scaling per block and selects lower error option. |
+| `qlora_selective_expert_dequant` | bool | `false` | Enable selective expert dequantization for MoE models to reduce dequant buffer memory.                                                                  |
+| `qlora_offload_experts`  | bool | `false` | Offload expert weights in QLoRA MoE models to host memory.                                                                                                     |
 
 ## Chat Template Settings
 
@@ -333,24 +323,24 @@ Chat template settings control how conversations are formatted for training and 
 
 ## Logging & Reporting
 
-| Option         | Type   | Default        | Description                                                                                 |
-| -------------- | ------ |f -------------- | ------------------------------------------------------------------------------------------- |
-| `report_to`    | list   | `null`         | Report results and logs to specified platforms. Options: `"wandb"`, `"aim"`.                |
-| `log_file`     | string | auto-generated | Where to save the training log. Defaults to `{output_dir}/log-{run_name}-{timestamp}.json`. |
-| `log_gpu_util` | int    | `100`          | Interval for logging GPU utilization.                                                       |
+| Option         | Type   | Default | Description                                                  |
+| -------------- | ------ | ------- | ------------------------------------------------------------ |
+| `report_to`    | list   | `null`  | Report results and logs to specified platforms. Options: `"wandb"`, `"aim"`. |
+| `log_file`     | string | `null`  | Where to save the training log. If `null`, no log file is written. |
+| `log_gpu_util` | int    | `100`   | Interval for logging GPU utilization.                         |
 
 ### WandB (Weights & Biases) Settings
 
 | Option          | Type   | Default      | Description                                                      |
 | --------------- | ------ | ------------ | ---------------------------------------------------------------- |
-| `wandb_project` | string | `"Surogate"` | WandB project name for logging.                                  |
-| `wandb_name`    | string | `run_name`   | WandB run name for logging. Defaults to the value of `run_name`. |
+| `wandb_project` | string | `null`     | WandB project name for logging.                                  |
+| `wandb_name`    | string | `run_name` | WandB run name for logging. Defaults to the value of `run_name`. |
 
 ### Aim Settings
 
 | Option           | Type   | Default      | Description                                                     |
 | ---------------- | ------ | ------------ | --------------------------------------------------------------- |
-| `aim_experiment` | string | `"Surogate"` | Aim experiment name for logging.                                |
+| `aim_experiment` | string | `null`     | Aim experiment name for logging.                                |
 | `aim_repo`       | string | `null`       | Aim repository path for logging. Uses default if not specified. |
 | `aim_name`       | string | `run_name`   | Aim run name for logging. Defaults to the value of `run_name`.  |
 
@@ -368,6 +358,7 @@ Chat template settings control how conversations are formatted for training and 
 | `bf16`       | BF16 forward/backward       | Any CUDA GPU                   | Baseline, maximum compatibility      |
 | `fp8_hybrid` | FP8 E4M3 fwd / E5M2 bwd     | SM89+ (Ada, Hopper, Blackwell) | 2x throughput, minimal accuracy loss |
 | `nvfp4`      | FP4 E2M1 with block scaling | SM100+ (Blackwell only)        | Maximum memory efficiency            |
+| `nvfp4_quartet` | FP4 E2M1 quartet scaling | SM100+ (Blackwell only)        | Higher accuracy FP4 training         |
 
 ## Example Configuration
 
@@ -425,7 +416,7 @@ lora_dropout: 0.05
 lora_dtype: fp32
 
 # Memory optimization
-recompute_block: true
+recompute: true
 recipe: bf16
 
 # Hardware

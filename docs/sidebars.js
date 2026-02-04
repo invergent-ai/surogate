@@ -11,7 +11,8 @@ module.exports = {
       collapsed: false,
       items: [
         'about/how-it-works',
-        'about/transformer',
+        'about/dsl',
+        'about/automatic-differentiation'
       ],
     },
     {

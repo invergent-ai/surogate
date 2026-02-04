@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from .decorators import _model_registry, _block_registry, _module_registry
+from .decorators import _model_registry, _block_registry, _module_registry, _primitive_registry
 from .specs import (
     ModelSpec,
     BlockSpec,
@@ -27,8 +27,18 @@ from .specs import (
     ActivationMemoryHint,
 )
 from .graph_builder import GraphBuilder, GraphNode, GraphRef
-from .hf import FuseMapping, SplitMapping, TransformMapping, StackExpertsMapping
+from .hf import FuseMapping, SplitMapping, TransformMapping, StackExpertsMapping, TiedToMapping
 from .dim import Dim, DimExpr, ConcreteDimValue, dim_to_ir
+from .errors import (
+    DSLError,
+    DSLSyntaxError,
+    DSLTypeError,
+    DSLShapeError,
+    DSLUndefinedError,
+    ErrorCode,
+    WarningCode,
+    WarningCollector,
+)
 
 if TYPE_CHECKING:
     from .tensor_type import TensorAnnotation
@@ -148,6 +158,39 @@ class ModuleIR:
 # =============================================================================
 # Compiler Implementation
 # =============================================================================
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _dsl_error_to_dict(err: DSLError) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"code": err.code.value, "message": err.message}
+    if err.location is not None:
+        payload["location"] = str(err.location)
+    if err.hint:
+        payload["hint"] = err.hint
+    return payload
+
+
+def _dsl_warning_to_dict(w) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"code": w.code.value, "message": w.message}
+    if w.location is not None:
+        payload["location"] = str(w.location)
+    return payload
+
+
+def _warn(warnings: WarningCollector | None, code: WarningCode, message: str) -> None:
+    if warnings is None:
+        return
+    warnings.warn(code, message)
 
 
 def _parse_shape_dim(dim: Any) -> Any:
@@ -272,6 +315,11 @@ def _serialize_hf_spec(spec: Any) -> Any:
     if isinstance(spec, str):
         return spec
     if isinstance(spec, FuseMapping):
+        if len(spec.sources) < 2:
+            raise DSLError(
+                ErrorCode.E013,
+                f"fuse() requires at least 2 sources, got {len(spec.sources)}",
+            )
         payload = {
             "type": "fuse",
             "sources": list(spec.sources),
@@ -280,6 +328,16 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["dim"] = spec.dim
         return payload
     if isinstance(spec, SplitMapping):
+        if not spec.ranges:
+            raise DSLError(ErrorCode.E013, "split() requires ranges or parts")
+        # Validate explicit ranges (ignore the parts sentinel (-1, parts))
+        if spec.ranges and not (len(spec.ranges) == 1 and spec.ranges[0][0] == -1):
+            for start, end in spec.ranges:
+                if start < 0 or end <= start:
+                    raise DSLError(
+                        ErrorCode.E013,
+                        f"invalid split() range [{start}, {end}] (expected 0 <= start < end)",
+                    )
         payload = {
             "type": "split",
             "source": spec.source,
@@ -290,6 +348,8 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["dim"] = spec.dim
         return payload
     if isinstance(spec, TransformMapping):
+        if not spec.fn:
+            raise DSLError(ErrorCode.E010, "transform() requires a non-empty fn")
         payload = {
             "type": "transform",
             "source": spec.source,
@@ -297,6 +357,10 @@ def _serialize_hf_spec(spec: Any) -> Any:
         if spec.fn:
             payload["fn"] = spec.fn
         return payload
+    if isinstance(spec, TiedToMapping):
+        if not spec.target:
+            raise DSLError(ErrorCode.E010, "tied_to() requires a non-empty target")
+        return {"type": "tied_to", "target": spec.target}
     if isinstance(spec, HFTransformSpec):
         payload = {"type": spec.kind}
         if spec.sources:
@@ -307,6 +371,11 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["fn"] = spec.fn
         return payload
     if isinstance(spec, StackExpertsMapping):
+        if "{expert}" not in spec.pattern:
+            raise DSLError(
+                ErrorCode.E010,
+                "stack_experts() pattern must include '{expert}' placeholder",
+            )
         payload = {
             "type": "stack_experts",
             "pattern": spec.pattern,
@@ -316,7 +385,11 @@ def _serialize_hf_spec(spec: Any) -> Any:
         if spec.fuse_gate_up:
             payload["fuse_gate_up"] = spec.fuse_gate_up
         return payload
-    return str(spec)
+    raise DSLError(
+        ErrorCode.E010,
+        f"invalid weight mapping spec type: {type(spec).__name__}",
+        hint="Expected a string HF path or an hf mapping helper like fuse()/split()/transform()/tied_to()/stack_experts().",
+    )
 
 
 def _compile_activation_slot(
@@ -483,6 +556,8 @@ def _compile_graph_builder(
     spec: ForwardSpec,
     config: Dict[str, Any],
     params: Dict[str, ParamSpec],
+    *,
+    warnings: WarningCollector | None = None,
 ) -> GraphIR:
     """Compile a GraphBuilder to GraphIR."""
     graph = GraphIR()
@@ -552,8 +627,16 @@ def _compile_graph_builder(
                     )
 
     # Save/recompute lists
-    graph.save_list = builder._save_list
-    graph.recompute_list = builder._recompute_list
+    graph.save_list = _dedupe_preserve_order(list(spec.save) + list(builder._save_list))
+    graph.recompute_list = _dedupe_preserve_order(list(spec.recompute) + list(builder._recompute_list))
+
+    # Warn on save entries that don't correspond to any tensor in the graph.
+    available = set(graph.inputs) | set(graph.params) | set(graph.intermediates) | set(graph.outputs)
+    for name in graph.save_list:
+        if name.startswith("@param:") or name.startswith("saved."):
+            continue
+        if name not in available:
+            _warn(warnings, WarningCode.W004, f"unused saved tensor '{name}' (not present in graph)")
 
     return graph
 
@@ -585,6 +668,8 @@ def _inline_stacked_blocks(
     graph: GraphIR,
     model_spec: ModelSpec,
     config: Dict[str, Any],
+    *,
+    warnings: WarningCollector | None = None,
 ) -> GraphIR:
     """Inline StackedBlocks calls into per-layer block graphs."""
     # Quick check: if no StackedBlocks present, return as-is
@@ -595,10 +680,13 @@ def _inline_stacked_blocks(
     def _resolve_block_spec(blocks_param: str) -> BlockSpec:
         param_spec = model_spec.params.get(blocks_param)
         if not param_spec or param_spec.kind != ParamKind.ARRAY or not param_spec.element_type:
-            raise ValueError(f"StackedBlocks expects array param '{blocks_param}' with element_type")
+            raise DSLTypeError(
+                f"StackedBlocks expects array param '{blocks_param}' with element_type",
+                hint="Declare blocks as Param(Array[\"n_layers\", \"YourBlock\"]) and pass blocks=\"blocks\" in g.call().",
+            )
         block_spec = get_block_spec(param_spec.element_type)
         if block_spec is None:
-            raise ValueError(f"Block not found: {param_spec.element_type}")
+            raise DSLUndefinedError(param_spec.element_type)
         return block_spec
 
     # Cache compiled block graphs by block name
@@ -632,12 +720,20 @@ def _inline_stacked_blocks(
         blocks_param = node.attrs.get("blocks", "blocks")
         n_layers = node.attrs.get("n_layers") or config.get("n_layers")
         if n_layers is None:
-            raise ValueError("StackedBlocks missing n_layers")
+            raise DSLError(
+                ErrorCode.E012,
+                "StackedBlocks missing n_layers",
+                hint="Pass n_layers=... in g.call(...), or provide n_layers in the model config.",
+            )
 
         block_spec = _resolve_block_spec(blocks_param)
         block_ir = _get_block_ir(block_spec)
         if not block_ir.forward_graph or not block_ir.forward_graph.nodes:
-            raise ValueError(f"Block graph missing for {block_spec.name}")
+            raise DSLError(
+                ErrorCode.E012,
+                f"Block graph missing for {block_spec.name}",
+                hint="Ensure the block defines an @forward method using 'with graph() as g:' and returns GraphRef(s).",
+            )
 
         block_graph = block_ir.forward_graph
         block_inputs = list(block_graph.inputs.keys())
@@ -647,8 +743,9 @@ def _inline_stacked_blocks(
         # StackedBlocks inputs are (x, residual, position_ids)
         cur_inputs = list(node.inputs)
         if len(cur_inputs) != len(block_inputs):
-            raise ValueError(
-                f"StackedBlocks input mismatch: expected {len(block_inputs)}, got {len(cur_inputs)}"
+            raise DSLTypeError(
+                f"StackedBlocks input mismatch: expected {len(block_inputs)}, got {len(cur_inputs)}",
+                hint="Make sure g.call('StackedBlocks', ...) inputs match the block forward signature.",
             )
 
         for layer_idx in range(int(n_layers)):
@@ -939,8 +1036,20 @@ def _capture_forward_graph(
 def compile_model_spec(
     spec: ModelSpec,
     config: Dict[str, Any],
+    *,
+    warnings: WarningCollector | None = None,
 ) -> ModuleIR:
     """Compile a ModelSpec to ModuleIR."""
+    if spec.name in _primitive_registry:
+        _warn(warnings, WarningCode.W001, f"model '{spec.name}' shadows a registered primitive of the same name")
+
+    if spec.forward is None or spec.forward.graph_fn is None:
+        raise DSLError(
+            ErrorCode.E012,
+            f"model '{spec.name}' is missing an @forward method",
+            hint="Define a forward(self, ...) method decorated with @forward that builds the graph using 'with graph() as g:'.",
+        )
+
     ir = ModuleIR(
         name=spec.name,
         kind="model",
@@ -1011,26 +1120,23 @@ def compile_model_spec(
     if spec.forward:
         forward_fn = spec.forward.graph_fn
         if forward_fn and instance:
-            try:
-                # Capture the graph by patching graph()
-                builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
+            # Capture the graph by patching graph()
+            builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
+            if builder is None:
+                raise DSLSyntaxError(
+                    f"could not capture forward graph for model '{spec.name}'",
+                    hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
+                )
 
-                if builder:
-                    graph = _compile_graph_builder(builder, spec.forward, config, spec.params)
-                    # Expand StackedBlocks into per-layer block graphs
-                    graph = _inline_stacked_blocks(graph, spec, config)
-                    ir.forward_graph = graph
-                else:
-                    ir.forward_graph = GraphIR()
-
-            except Exception as e:
-                # If graph construction fails, create empty graph
-                ir.forward_graph = GraphIR()
+            graph = _compile_graph_builder(builder, spec.forward, config, spec.params, warnings=warnings)
+            # Expand StackedBlocks into per-layer block graphs
+            graph = _inline_stacked_blocks(graph, spec, config, warnings=warnings)
+            ir.forward_graph = graph
 
     # Save/recompute
     if spec.forward:
-        ir.save_tensors = spec.forward.save
-        ir.recompute_tensors = spec.forward.recompute
+        ir.save_tensors = _dedupe_preserve_order(list(spec.forward.save))
+        ir.recompute_tensors = _dedupe_preserve_order(list(spec.forward.recompute))
 
     # Compile activation layout - merge model's global activations with block activations
     ir.activation_layout = _compile_merged_activation_layout(spec, config, dim_map)
@@ -1041,8 +1147,21 @@ def compile_model_spec(
 def compile_block_spec(
     spec: BlockSpec,
     config: Dict[str, Any],
+    *,
+    warnings: WarningCollector | None = None,
 ) -> ModuleIR:
     """Compile a BlockSpec to ModuleIR."""
+    if spec.name in _primitive_registry:
+        _warn(warnings, WarningCode.W001, f"block '{spec.name}' shadows a registered primitive of the same name")
+
+    if spec.extends:
+        base = get_block_spec(spec.extends)
+        if base is None:
+            raise DSLUndefinedError(
+                spec.extends,
+                hint=f"block '{spec.name}' extends '{spec.extends}', but '{spec.extends}' is not registered",
+            )
+
     ir = ModuleIR(
         name=spec.name,
         kind="block",
@@ -1084,17 +1203,13 @@ def compile_block_spec(
     if spec.forward:
         forward_fn = spec.forward.graph_fn
         if forward_fn and instance:
-            try:
-                # Capture the graph by patching graph()
-                builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
-
-                if builder:
-                    ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params)
-                else:
-                    ir.forward_graph = GraphIR()
-
-            except Exception:
-                ir.forward_graph = GraphIR()
+            builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
+            if builder is None:
+                raise DSLSyntaxError(
+                    f"could not capture forward graph for block '{spec.name}'",
+                    hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
+                )
+            ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, warnings=warnings)
 
     # Compile activation layout if present
     if spec.activations:
@@ -1106,8 +1221,21 @@ def compile_block_spec(
 def compile_module_spec(
     spec: ModuleSpec,
     config: Dict[str, Any],
+    *,
+    warnings: WarningCollector | None = None,
 ) -> ModuleIR:
     """Compile a ModuleSpec to ModuleIR."""
+    if spec.name in _primitive_registry:
+        _warn(warnings, WarningCode.W001, f"module '{spec.name}' shadows a registered primitive of the same name")
+
+    if spec.extends:
+        base = get_module_spec(spec.extends)
+        if base is None:
+            raise DSLUndefinedError(
+                spec.extends,
+                hint=f"module '{spec.name}' extends '{spec.extends}', but '{spec.extends}' is not registered",
+            )
+
     ir = ModuleIR(
         name=spec.name,
         kind="module",
@@ -1147,17 +1275,18 @@ def compile_module_spec(
     if spec.forward:
         forward_fn = spec.forward.graph_fn
         if forward_fn and instance:
-            try:
-                # Capture the graph by patching graph()
-                builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
-
-                if builder:
-                    ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params)
-                else:
+            builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
+            if builder is None:
+                # Abstract modules may intentionally omit a forward graph.
+                if getattr(spec, "is_abstract", False):
                     ir.forward_graph = GraphIR()
-
-            except Exception:
-                ir.forward_graph = GraphIR()
+                else:
+                    raise DSLSyntaxError(
+                        f"could not capture forward graph for module '{spec.name}'",
+                        hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
+                    )
+            else:
+                ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, warnings=warnings)
 
     return ir
 
@@ -1322,6 +1451,9 @@ def get_module_spec(name: str) -> Optional[ModuleSpec]:
 def compile_model(
     model_class_or_name: type | str,
     config: Dict[str, Any],
+    *,
+    raise_on_error: bool = False,
+    warnings: WarningCollector | None = None,
 ) -> str:
     """
     Compile a Python DSL model to JSON IR.
@@ -1333,34 +1465,77 @@ def compile_model(
     Returns:
         JSON string in the format expected by the C++ runtime
     """
-    # Get the spec
-    if isinstance(model_class_or_name, str):
-        spec = get_model_spec(model_class_or_name)
-        if spec is None:
-            raise ValueError(f"Model not found: {model_class_or_name}")
-    else:
-        if not hasattr(model_class_or_name, "_dsl_spec"):
-            raise ValueError(f"Class {model_class_or_name.__name__} is not a DSL model")
-        spec = model_class_or_name._dsl_spec
-        if not isinstance(spec, ModelSpec):
-            raise ValueError(f"Class {model_class_or_name.__name__} is not a model")
+    diag = warnings or WarningCollector()
+    source_file = "python:<unknown>"
 
-    # Compile
-    ir = compile_model_spec(spec, config)
+    try:
+        # Get the spec
+        if isinstance(model_class_or_name, str):
+            spec = get_model_spec(model_class_or_name)
+            if spec is None:
+                raise DSLUndefinedError(model_class_or_name)
+        else:
+            if not hasattr(model_class_or_name, "_dsl_spec"):
+                raise DSLError(
+                    ErrorCode.E008,
+                    f"class '{model_class_or_name.__name__}' is not a DSL model",
+                    hint="Decorate the class with @model (and ensure it is imported so it registers).",
+                )
+            spec = model_class_or_name._dsl_spec
+            if not isinstance(spec, ModelSpec):
+                raise DSLError(
+                    ErrorCode.E008,
+                    f"class '{model_class_or_name.__name__}' is not a DSL model",
+                    hint="Decorate the class with @model.",
+                )
+        source_file = f"python:{spec.name}"
 
-    # Serialize
-    result = {
-        "source_file": f"python:{spec.name}",
-        "success": True,
-        "modules": [_module_ir_to_dict(ir)],
-    }
+        # Compile
+        ir = compile_model_spec(spec, config, warnings=diag)
 
-    return json.dumps(result)
+        # Serialize
+        result: Dict[str, Any] = {
+            "source_file": source_file,
+            "success": True,
+            "modules": [_module_ir_to_dict(ir)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
+
+    except DSLError as e:
+        if raise_on_error:
+            raise
+        result = {
+            "source_file": source_file,
+            "success": False,
+            "modules": [],
+            "errors": [_dsl_error_to_dict(e)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
+    except Exception as e:
+        wrapped = DSLSyntaxError(f"unhandled compiler error: {e}")
+        if raise_on_error:
+            raise wrapped from e
+        result = {
+            "source_file": source_file,
+            "success": False,
+            "modules": [],
+            "errors": [_dsl_error_to_dict(wrapped)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
 
 
 def compile_model_for_hf(
     architecture: str,
     hf_config: Dict[str, Any],
+    *,
+    raise_on_error: bool = False,
+    warnings: WarningCollector | None = None,
 ) -> str:
     """
     Compile a model matching the HuggingFace architecture.
@@ -1372,6 +1547,8 @@ def compile_model_for_hf(
     Returns:
         JSON string in the format expected by the C++ runtime
     """
+    diag = warnings or WarningCollector()
+
     # Find model spec by architecture
     spec = None
     model_name = None
@@ -1388,7 +1565,21 @@ def compile_model_for_hf(
                 break
 
     if spec is None:
-        raise ValueError(f"No Python DSL model found for architecture: {architecture}")
+        err = DSLUndefinedError(
+            architecture,
+            hint="Ensure the model is registered and has @hf_config(architecture=...).",
+        )
+        if raise_on_error:
+            raise err
+        result = {
+            "source_file": f"python:<hf:{architecture}>",
+            "success": False,
+            "modules": [],
+            "errors": [_dsl_error_to_dict(err)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
 
     # Build config from HF config using the mapping
     config = {}
@@ -1397,17 +1588,44 @@ def compile_model_for_hf(
             if hf_key in hf_config and hf_config[hf_key] is not None:
                 config[dsl_param] = hf_config[hf_key]
 
-    # Compile
-    ir = compile_model_spec(spec, config)
+    try:
+        # Compile
+        ir = compile_model_spec(spec, config, warnings=diag)
 
-    # Serialize
-    result = {
-        "source_file": f"python:{spec.name}",
-        "success": True,
-        "modules": [_module_ir_to_dict(ir)],
-    }
-
-    return json.dumps(result)
+        # Serialize
+        result: Dict[str, Any] = {
+            "source_file": f"python:{spec.name}",
+            "success": True,
+            "modules": [_module_ir_to_dict(ir)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
+    except DSLError as e:
+        if raise_on_error:
+            raise
+        result = {
+            "source_file": f"python:{spec.name}",
+            "success": False,
+            "modules": [],
+            "errors": [_dsl_error_to_dict(e)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
+    except Exception as e:
+        wrapped = DSLSyntaxError(f"unhandled compiler error: {e}")
+        if raise_on_error:
+            raise wrapped from e
+        result = {
+            "source_file": f"python:{spec.name}",
+            "success": False,
+            "modules": [],
+            "errors": [_dsl_error_to_dict(wrapped)],
+        }
+        if diag.warnings:
+            result["warnings"] = [_dsl_warning_to_dict(w) for w in diag.warnings]
+        return json.dumps(result)
 
 
 def get_hf_param_mapping(architecture: str) -> tuple[Dict[str, str], str]:
@@ -1427,7 +1645,7 @@ def get_hf_param_mapping(architecture: str) -> tuple[Dict[str, str], str]:
             if spec.hf_config.model_type == architecture:
                 return spec.hf_config.param_mapping, name
 
-    raise ValueError(f"No Python DSL model found for architecture: {architecture}")
+    raise DSLUndefinedError(architecture)
 
 
 def list_registered_models() -> List[str]:

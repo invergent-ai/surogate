@@ -10,7 +10,7 @@ This guide collects the main knobs that affect GPU memory use.
 
 ## Framework knobs
 
-- Recomputation (`recompute_*`)
+- Recomputation (`recompute`)
 - Chunking (`lmhead_chunks`, `attn_bwd_chunks`)
 - Offloading (`offload_*`)
 - Quantization / QLoRA (`qlora_*`)

@@ -911,6 +911,13 @@ def forward(fn: F) -> F:
         graph_fn=fn,
     )
 
+    # If @save / @recompute ran before @forward, they stored lists on the function.
+    # Apply them now so either decorator order works.
+    if hasattr(fn, "_save_list"):
+        spec.save = list(fn._save_list)
+    if hasattr(fn, "_recompute_list"):
+        spec.recompute = list(fn._recompute_list)
+
     fn._forward_spec = spec
     return fn
 
