@@ -35,13 +35,14 @@ DslGradStore::DslGradStore(const DslParamStore& params,
                            EAllocationType offload_alloc,
                            int num_shards,
                            bool tied_embeddings)
-    : mAllocator(allocator) {
+    : mAllocator(allocator), mOffloadGrads(offload_grads), mOffloadAlloc(offload_alloc) {
     if (!mAllocator) {
         throw std::runtime_error("DslGradStore: allocator is null");
     }
 
-    const bool allow_offload = offload_grads && num_shards == 1;
-    const EAllocationType grad_alloc = allow_offload ? offload_alloc : EAllocationType::ON_DEVICE;
+    // Full gradients are always allocated on device for NCCL compatibility.
+    // Sharded gradients (for ZeRO-2) are allocated later in configure() and can be offloaded.
+    const EAllocationType grad_alloc = EAllocationType::ON_DEVICE;
 
     // First pass: find embedding gradient name if present (for weight tying)
     std::string embedding_grad_name;
@@ -86,6 +87,17 @@ DslGradStore::DslGradStore(const DslParamStore& params,
 
 void DslGradStore::configure(const DslGradStoreConfig& config) {
     mConfig = config;
+
+    // Validate: offload_grads requires shard_gradients (ZeRO-2).
+    // Without gradient sharding, each rank needs full gradients for backward computation,
+    // so offloading provides no benefit and would break NCCL operations.
+    if (mOffloadGrads && !mConfig.shard_gradients) {
+        throw std::logic_error(
+            "offload_grads requires shard_gradients=true (ZeRO-2). "
+            "Gradient offloading is only supported with gradient sharding enabled."
+        );
+    }
+
     // Early exit if no gradients to manage (e.g., LoRA-only training)
     if (mParamOrder.empty()) {
         return;
@@ -96,6 +108,14 @@ void DslGradStore::configure(const DslGradStoreConfig& config) {
         if (mHasLayerGrads) {
             create_layer_events(mConfig.num_layers);
         }
+    }
+
+    // ZeRO-2 gradient offloading: allocate sharded gradient storage on host.
+    // This mirrors the old ModularGradientManager behavior where:
+    // - Full gradients stay on device (for backward + NCCL reduce-scatter)
+    // - Sharded gradients can be offloaded to host (for optimizer)
+    if (mOffloadGrads && mConfig.shard_gradients && mConfig.num_shards > 1) {
+        allocate_sharded_grads();
     }
 }
 
@@ -326,6 +346,82 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         }
     }
     comm.execute_transaction(ev);
+
+    // ZeRO-2 with offloading: accumulate reduced shards into host storage
+    if (mConfig.shard_gradients && !mShardedGrads.empty()) {
+        accumulate_to_sharded(layer_idx, stream);
+    }
+}
+
+void DslGradStore::allocate_sharded_grads() {
+    // Allocate sharded gradient storage for ZeRO-2 offloading.
+    // Each rank stores only its local shard (1/num_shards of full gradient).
+    // Storage can be on host (pinned/write-combined) for memory savings.
+    for (const auto& kv : mGrads) {
+        const std::string& name = kv.first;
+        const Tensor& full = kv.second;
+
+        // Compute shard size (first dimension is sharded)
+        std::vector<long> shard_shape(full.Sizes.begin(), full.Sizes.begin() + full.Rank);
+        long full_size = shard_shape[0];
+        long shard_size = (full_size + mConfig.num_shards - 1) / mConfig.num_shards;
+        shard_shape[0] = shard_size;
+
+        Tensor shard = mAllocator->allocate(full.DType, ("ds_" + name).c_str(),
+                                             mOffloadAlloc, shard_shape);
+        mShardedGrads.emplace(name, shard);
+    }
+}
+
+void DslGradStore::accumulate_to_sharded(int layer_idx, cudaStream_t stream) {
+    // After reduce-scatter, copy the local shard from full gradient buffer to sharded storage.
+    // This is the ZeRO-2 accumulation step from the old ModularGradientManager.
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(mLayerGradNames.size())) return;
+
+    const auto& grad_names = mLayerGradNames[layer_idx];
+    for (const auto& name : grad_names) {
+        auto full_it = mGrads.find(name);
+        auto shard_it = mShardedGrads.find(name);
+        if (full_it == mGrads.end() || shard_it == mShardedGrads.end()) continue;
+
+        const Tensor& full = full_it->second;
+        Tensor& shard = shard_it->second;
+
+        // After reduce-scatter, the local shard is in [0:shard_size] of the full buffer.
+        // We need to copy/accumulate it to the sharded storage.
+        size_t shard_bytes = shard.bytes();
+
+        if (mMicroStep == 0) {
+            // First micro-step: copy (overwrite)
+            CUDA_CHECK(cudaMemcpyAsync(shard.Data, full.Data, shard_bytes,
+                                        cudaMemcpyDeviceToHost, stream));
+        } else {
+            // Subsequent micro-steps: accumulate
+            // For host-resident shards, we use a simple kernel that writes to pinned memory.
+            // Pinned memory is accessible from GPU via zero-copy.
+            // Use layer_idx + micro_step as seed for stochastic rounding.
+            unsigned seed = static_cast<unsigned>(layer_idx * 1000 + mMicroStep);
+            vector_add_sr(shard, shard, full, 1.0f, static_cast<long>(shard.nelem()), seed, stream);
+        }
+    }
+}
+
+std::vector<Tensor*> DslGradStore::get_layer_sharded_grads(int layer_idx) {
+    std::vector<Tensor*> result;
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(mLayerGradNames.size())) {
+        return result;
+    }
+
+    // Return sharded grads if offloading is active, otherwise return full grads
+    auto& grad_map = mShardedGrads.empty() ? mGrads : mShardedGrads;
+
+    for (const auto& name : mLayerGradNames[layer_idx]) {
+        auto it = grad_map.find(name);
+        if (it != grad_map.end()) {
+            result.push_back(&it->second);
+        }
+    }
+    return result;
 }
 
 } // namespace dsl

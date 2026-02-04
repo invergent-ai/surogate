@@ -83,22 +83,40 @@ public:
     const std::vector<std::string>& param_names() const { return mParamOrder; }
     const std::unordered_map<std::string, Tensor>& grads() const { return mGrads; }
 
+    /// Get sharded gradients for optimizer (returns mShardedGrads if ZeRO-2 offload, else mGrads)
+    const std::unordered_map<std::string, Tensor>& sharded_grads() const {
+        return mShardedGrads.empty() ? mGrads : mShardedGrads;
+    }
+
+    /// Check if gradient offloading is active (ZeRO-2 with offload_grads=true)
+    [[nodiscard]] bool is_offloading() const { return !mShardedGrads.empty(); }
+
     /// Get gradients for a specific layer (for per-layer operations)
     std::vector<Tensor*> get_layer_grads(int layer_idx);
+
+    /// Get sharded gradients for a specific layer (for optimizer with offloading)
+    std::vector<Tensor*> get_layer_sharded_grads(int layer_idx);
 
 private:
     void build_layer_grad_map();
     void scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
     void create_layer_events(int num_layers);
     void destroy_layer_events() noexcept;
+    void allocate_sharded_grads();
+    void accumulate_to_sharded(int layer_idx, cudaStream_t stream);
 
     std::shared_ptr<TensorAllocator> mAllocator;
-    std::unordered_map<std::string, Tensor> mGrads;
+    std::unordered_map<std::string, Tensor> mGrads;          ///< Full gradients (always on device for NCCL)
+    std::unordered_map<std::string, Tensor> mShardedGrads;   ///< ZeRO-2: sharded gradient storage (may be on host)
     std::vector<std::string> mParamOrder;
     bool mAccumulate = false;
     bool mReducePending = false;  ///< True if async reduce has been started
     int mMicroStep = 0;
     bool mIsLastMicroStep = false;
+
+    // Offload configuration (stored for deferred sharded allocation in configure())
+    bool mOffloadGrads = false;
+    EAllocationType mOffloadAlloc = EAllocationType::PINNED;
 
     // Per-layer gradient organization (for overlapped reduction)
     DslGradStoreConfig mConfig;
@@ -113,7 +131,6 @@ private:
         cudaEvent_t Event = nullptr;
     };
     std::array<BlockState, 2> mBlockStates;  ///< Double-buffer for overlapped layers
-    std::vector<Tensor> mShardedGrads;       ///< ZeRO-2: per-layer sharded gradient storage
 };
 
 } // namespace dsl
