@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cublas_v2.h>
+
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_runtime_config.h"
 #include "runtime/core/model_config.h"
@@ -188,6 +190,8 @@ private:
     void validate_config_mapping(const Module& module) const;
     void validate_param_shapes(const Module& module) const;
     void init_optimizer_state(cudaStream_t stream);
+    void init_normuon_state(cudaStream_t stream);
+    void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
     void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T);
@@ -195,6 +199,8 @@ private:
                                int t, float epsilon, float weight_decay, float grad_clip);
     void update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
                                  const float* opt_params, const int* opt_step);
+    void update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
+                              const float* opt_params, const int* opt_step);
     void update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
                                       const float* opt_params, const int* opt_step);
     void update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
@@ -250,6 +256,48 @@ private:
         Tensor absmax2;
     };
     std::unique_ptr<AdamW8BitState> mAdamW8BitState;
+
+    // NorMuon optimizer state for full fine-tuning (hybrid: AdamW for 1D, NorMuon for 2D)
+    struct FFTNorMuonState {
+        bool initialized = false;
+
+        // AdamW state for 1D params (embeddings, norms, lm_head, etc.)
+        size_t adamw_total_params = 0;
+        size_t adamw_state_elems = 0;
+        size_t adamw_num_blocks = 0;
+        Tensor adamw_quantiles1;
+        Tensor adamw_quantiles2;
+        Tensor adamw_state1;
+        Tensor adamw_state2;
+        Tensor adamw_absmax1;
+        Tensor adamw_absmax2;
+
+        // NorMuon state for 2D params (attention, MLP weights)
+        size_t normuon_total_params = 0;
+        size_t normuon_state_elems = 0;
+        size_t normuon_num_blocks = 0;
+        Tensor momentum_quantiles;
+        Tensor momentum_state;
+        Tensor momentum_absmax;
+
+        // Variance buffers - one per 2D weight
+        std::vector<Tensor> variance_buffers;
+        std::vector<std::pair<int, int>> variance_shapes;  // (M, N) per buffer
+
+        // Polar Express workspace
+        Tensor polar_workspace;
+        size_t max_weight_M = 0;
+        size_t max_weight_N = 0;
+
+        // cuBLAS handle for Polar Express
+        cublasHandle_t cublas_handle = nullptr;
+
+        // Param classification: true = 2D (NorMuon), false = 1D (AdamW)
+        std::vector<std::pair<std::string, bool>> param_classification;
+
+        ~FFTNorMuonState();
+    };
+    std::unique_ptr<FFTNorMuonState> mFFTNorMuonState;
 
     std::unordered_map<std::string, MappingSpec> mHfMapping;
     std::unordered_map<std::string, MappingSpec> mHfExport;

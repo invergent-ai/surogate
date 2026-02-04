@@ -118,8 +118,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Which dtype to use for (activation) gradients / backward matmul policy. Defaults to matmul-dtype. Note: recipes may override backward dtype.
         master_dtype (Optional[str], defaults to None):
             Master weight dtype used for optimizer updates (e.g. FP32 for more stable full fine-tuning). Defaults to model-dtype.
-        recipe (Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4']], defaults to 'bf16'):
-            Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4
+        recipe (Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4', 'nvfp4_quartet']], defaults to 'bf16'):
+            Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4, nvfp4-quartet
         use_fused_rope (Optional[bool], defaults to False):
             Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth)
         fp8_amax_history (Optional[int], defaults to 16):
@@ -279,7 +279,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     attn_bwd_chunks: Optional[int] = 1
     gradient_dtype: Optional[str] = None
     master_dtype: Optional[str] = None
-    recipe: Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4']] = 'bf16'
+    recipe: Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4', 'nvfp4_quartet']] = 'bf16'
     use_fused_rope: Optional[bool] = False
     fp8_amax_history: Optional[int] = 16
     fp4_backend: Optional[Literal['cutlass', 'cudnn']] = 'cutlass'
@@ -507,19 +507,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             logger.warning(
                 "offload_optimizer is enabled but use_zero_copy is false; "
                 "optimizer state will remain on device. Set use_zero_copy=true to offload.")
+        # Validate offload_grads requires gradient sharding (ZeRO-2 or higher)
         if self.offload_grads:
-            num_shards = None
-            if self.distributed:
-                gpus_per_node = self.distributed.gpus_per_node or self.gpus
-                if gpus_per_node and gpus_per_node > 0:
-                    num_shards = self.distributed.num_nodes * gpus_per_node
-            elif self.gpus and self.gpus > 0:
-                num_shards = self.gpus
-            if num_shards and num_shards > 1:
-                logger.warning(
-                    "offload_grads is enabled with num_shards=%d; "
-                    "true ZeRO-2 sharded/offloaded grads for DSL is not implemented yet.",
-                    num_shards,
+            shard_gradients = self.shard_gradients or self.zero_level >= 2
+            if not shard_gradients:
+                raise ValueError(
+                    "offload_grads requires shard_gradients=true or zero_level >= 2. "
+                    "Gradient offloading is only supported with ZeRO-2 (gradient sharding) enabled."
                 )
 
         self.create_runtime_config()

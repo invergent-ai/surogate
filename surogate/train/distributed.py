@@ -487,8 +487,8 @@ class NodeTrainer:
         T = config.sequence_len
         local_gpus = self.local_gpus
         use_full_step_graphs = True
-        if use_full_step_graphs and config.optimizer != "adamw_8bit":
-            raise RuntimeError("DSL training requires optimizer 'adamw_8bit' for full-step execution.")
+        if use_full_step_graphs and config.optimizer not in ("adamw_8bit", "normuon"):
+            raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
         if use_full_step_graphs and not config.use_cuda_graphs:
             logger.info("CUDA graphs disabled; DSL full-step execution will use eager fallback.")
 

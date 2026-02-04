@@ -908,7 +908,7 @@ class RuntimeOptions:
         - shard_*: Enable sharding of weights/gradients across GPUs.
         - use_all_to_all_reduce: Use all-to-all based reduction (if supported by backend).
         - *_type/master_dtype: Dtype strings (empty means default/auto for optional fields).
-        - recipe: Training recipe (bf16, fp8-hybrid, nvfp4).
+        - recipe: Training recipe (bf16, fp8-hybrid, nvfp4, nvfp4-quartet).
         - matmul_backend: Matmul backend (auto, cublaslt, cutlass).
         - use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.
         - fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).
@@ -919,7 +919,7 @@ class RuntimeOptions:
         """
     def set_recipe(self, recipe_name: str) -> None:
         """
-        Set training recipe by name (bf16, fp8-hybrid, nvfp4).
+        Set training recipe by name (bf16, fp8-hybrid, nvfp4, nvfp4-quartet).
         """
     @property
     def attn_bwd_chunks(self) -> int:

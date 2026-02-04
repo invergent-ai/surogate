@@ -2062,3 +2062,49 @@ void compute_fp4_alpha_4o6(
         alpha_out, global_amax_a, global_amax_b);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// Quartet-II style tensor-scale helpers
+// ============================================================================
+
+__global__ void compute_fp4_tensor_scale_kernel(
+    float* __restrict__ tensor_scale_out,
+    const float* __restrict__ global_amax,
+    float fp4_max,
+    float fp8_max)
+{
+    const float denom = fp4_max * fp8_max;
+    const float amax = *global_amax;
+    *tensor_scale_out = (denom != 0.0f) ? (amax / denom) : 0.0f;
+}
+
+void compute_fp4_tensor_scale(
+    float* tensor_scale_out,
+    const float* global_amax,
+    float fp4_max,
+    float fp8_max,
+    cudaStream_t stream)
+{
+    compute_fp4_tensor_scale_kernel<<<1, 1, 0, stream>>>(
+        tensor_scale_out, global_amax, fp4_max, fp8_max);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void compute_fp4_alpha_from_tensor_scale_kernel(
+    float* __restrict__ alpha_out,
+    const float* __restrict__ tensor_scale_a,
+    const float* __restrict__ tensor_scale_b)
+{
+    *alpha_out = (*tensor_scale_a) * (*tensor_scale_b);
+}
+
+void compute_fp4_alpha_from_tensor_scale(
+    float* alpha_out,
+    const float* tensor_scale_a,
+    const float* tensor_scale_b,
+    cudaStream_t stream)
+{
+    compute_fp4_alpha_from_tensor_scale_kernel<<<1, 1, 0, stream>>>(
+        alpha_out, tensor_scale_a, tensor_scale_b);
+    CUDA_CHECK(cudaGetLastError());
+}

@@ -393,7 +393,7 @@ NB_MODULE(_surogate, m) {
              "- shard_*: Enable sharding of weights/gradients across GPUs.\n"
              "- use_all_to_all_reduce: Use all-to-all based reduction (if supported by backend).\n"
              "- *_type/master_dtype: Dtype strings (empty means default/auto for optional fields).\n"
-             "- recipe: Training recipe (bf16, fp8-hybrid, nvfp4).\n"
+             "- recipe: Training recipe (bf16, fp8-hybrid, nvfp4, nvfp4-quartet).\n"
              "- matmul_backend: Matmul backend (auto, cublaslt, cutlass).\n"
              "- use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.\n"
              "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"

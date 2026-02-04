@@ -25,6 +25,7 @@
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/optimizers/normuon.h"
 
 namespace {
 bool env_enabled(const char* name) {
@@ -496,10 +497,13 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         // Allocate device-side optimizer parameter buffers if needed.
+        // Use the maximum size to support both AdamW and NorMuon
+        constexpr int max_opt_params = std::max(optimizers::ADAMW_GRAPH_PARAM_COUNT,
+                                                 optimizers::NORMUON_GRAPH_PARAM_COUNT);
         if (!gs.opt_params.Data) {
             auto name = fmt::format("graph_opt_params_rank{}", ctx.Communicator->local_rank());
             gs.opt_params = rs.Allocator->allocate(ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE,
-                                                  {optimizers::ADAMW_GRAPH_PARAM_COUNT});
+                                                  {max_opt_params});
         }
         if (!gs.opt_step.Data) {
             auto name = fmt::format("graph_opt_step_rank{}", ctx.Communicator->local_rank());
@@ -520,12 +524,30 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         // Update optimizer parameters on device (dynamic LR/step support).
-        float opt_params_host[optimizers::ADAMW_GRAPH_PARAM_COUNT] = {
-            config.learning_rate, config.adamw_beta1, config.adamw_beta2, config.adamw_epsilon, config.weight_decay
-        };
         const int opt_step_host = step + 1;
-        CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
-                                   sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+        if (config.type == optimizers::OptimizerType::NORMUON) {
+            // NorMuon graph params layout:
+            // [0] = normuon_lr, [1] = normuon_momentum, [2] = normuon_beta2, [3] = weight_decay
+            // [4] = adamw_lr, [5] = adamw_beta1, [6] = adamw_beta2, [7] = adamw_eps
+            float opt_params_host[optimizers::NORMUON_GRAPH_PARAM_COUNT] = {
+                config.normuon_lr > 0 ? config.normuon_lr : config.learning_rate,
+                config.normuon_momentum,
+                config.normuon_beta2,
+                config.weight_decay,
+                config.learning_rate,
+                config.adamw_beta1,
+                config.adamw_beta2,
+                config.adamw_epsilon
+            };
+            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
+                                       sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+        } else {
+            float opt_params_host[optimizers::ADAMW_GRAPH_PARAM_COUNT] = {
+                config.learning_rate, config.adamw_beta1, config.adamw_beta2, config.adamw_epsilon, config.weight_decay
+            };
+            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
+                                       sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data, &opt_step_host,
                                    sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
 
@@ -545,10 +567,12 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         if (!dsl_model) {
             throw std::runtime_error("train_step_graphed: only supported for DSL models");
         }
-        if (config.type != optimizers::OptimizerType::ADAMW_8BIT) {
-            throw std::runtime_error("train_step_graphed: only supports AdamW 8-bit optimizer");
+        if (config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+            config.type != optimizers::OptimizerType::NORMUON) {
+            throw std::runtime_error("train_step_graphed: only supports AdamW 8-bit or NorMuon optimizer");
         }
 
+        // CUDA graph capture path (both AdamW and NorMuon support graph capture)
         const bool warmup_full_graph = !gs.captured && !dsl_model->lora_enabled()
                                        && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
         const bool warmup_skip_bwd = env_enabled("SUROGATE_DSL_GRAPH_WARMUP_SKIP_BWD");

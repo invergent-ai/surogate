@@ -717,6 +717,24 @@ void compute_fp4_alpha(float* alpha_out, const float* global_amax_a, const float
 void compute_fp4_alpha_4o6(float* alpha_out, const float* global_amax_a, const float* global_amax_b,
                            cudaStream_t stream);
 
+/// @brief Compute FP4 tensor scale from a global amax.
+///
+/// Computes tensor_scale = global_amax / (fp4_max * fp8_max).
+/// This matches Quartet-II's convention where `tensor_scale` is a scalar applied
+/// during dequantization: value ≈ fp4 * fp8_scale * tensor_scale.
+///
+/// Note: Standard NVFP4 uses fp4_max=6 and fp8_max=448, so tensor_scale = amax / 2688.
+/// EDEN / 4o6 typically uses fp8_max≈256, so tensor_scale ≈ amax / 1536.
+void compute_fp4_tensor_scale(float* tensor_scale_out, const float* global_amax,
+                              float fp4_max, float fp8_max, cudaStream_t stream);
+
+/// @brief Compute FP4 alpha from tensor scales.
+///
+/// Computes alpha = tensor_scale_a * tensor_scale_b for use with matmul_cutlass_fp4_alpha().
+/// This is equivalent to compute_fp4_alpha() when tensor_scale = amax / (fp4_max * fp8_max).
+void compute_fp4_alpha_from_tensor_scale(float* alpha_out, const float* tensor_scale_a,
+                                         const float* tensor_scale_b, cudaStream_t stream);
+
 /// @brief Fused FP4 alpha scaling + FP32→BF16 conversion.
 ///
 /// Combines alpha scaling and type conversion into a single kernel, eliminating
@@ -922,6 +940,23 @@ void fp4_matmul(Tensor& d, const Tensor& a, const Tensor& b,
 /// @param cols Number of columns in the data matrix.
 /// @return Number of UE4M3 scale elements needed.
 size_t compute_nvfp4_cutlass_scale_size(int rows, int cols);
+
+/// @brief Reorder NVFP4 scales from linear row-major layout to CUTLASS layout.
+///
+/// Linear layout is a plain row-major matrix of shape (rows, ceil(cols/16)),
+/// where each scale corresponds to a 16-element block.
+///
+/// CUTLASS layout matches Sm1xxBlkScaledConfig expectations used by
+/// matmul_cutlass_fp4*() kernels.
+void nvfp4_scales_linear_to_cutlass(uint8_t* out_cutlass, const uint8_t* in_linear,
+                                    int rows, int cols, cudaStream_t stream);
+
+/// @brief Reorder NVFP4 scales from CUTLASS layout to linear row-major layout.
+///
+/// This is the inverse of nvfp4_scales_linear_to_cutlass() for the (rows, cols)
+/// problem shape.
+void nvfp4_scales_cutlass_to_linear(uint8_t* out_linear, const uint8_t* in_cutlass,
+                                    int rows, int cols, cudaStream_t stream);
 
 /// @brief NVFP4 activation quantization with CUTLASS-compatible scale layout.
 /// @param[out] out_fp4 Output packed FP4 data (M, K/2 bytes).

@@ -21,6 +21,17 @@ namespace optimizers {
 // Block size for NorMuon 8-bit optimizer (matches AdamW)
 constexpr int NORMUON_BLOCK_SIZE = 2048;
 
+// Graph parameter layout for NorMuon optimizer:
+// opt_params[0] = normuon_lr
+// opt_params[1] = normuon_momentum (beta1)
+// opt_params[2] = normuon_beta2
+// opt_params[3] = weight_decay
+// opt_params[4] = adamw_lr (for 1D params)
+// opt_params[5] = adamw_beta1
+// opt_params[6] = adamw_beta2
+// opt_params[7] = adamw_eps
+constexpr int NORMUON_GRAPH_PARAM_COUNT = 8;
+
 // ----------------------------------------------------------------------------
 // Variance Reduction
 // ----------------------------------------------------------------------------
@@ -226,6 +237,33 @@ void normuon_update_2d(
     float weight_decay,
     const float* quantiles,
     float* absmax,
+    cudaStream_t stream
+);
+
+/**
+ * @brief Graph-capturable NorMuon update for 2D weight tensor
+ *
+ * Same as normuon_update_2d but reads hyperparameters from device memory
+ * for CUDA graph compatibility.
+ *
+ * @param opt_params Device pointer to hyperparameters (see NORMUON_GRAPH_PARAM_COUNT layout)
+ * @param lr_multiplier Per-weight LR multiplier (based on M/N ratio), applied on device
+ * @param wd_scale Weight decay scale (0 or 1), applied on device
+ */
+void normuon_update_2d_graph(
+    cublasHandle_t handle,
+    nv_bfloat16* param,
+    const nv_bfloat16* gradient,
+    unsigned char* momentum_state,
+    float* variance_buffer,
+    nv_bfloat16* polar_workspace,
+    int M,
+    int N,
+    float lr_multiplier,
+    float wd_scale,
+    const float* quantiles,
+    float* absmax,
+    const float* opt_params,
     cudaStream_t stream
 );
 

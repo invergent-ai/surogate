@@ -593,4 +593,249 @@ void normuon_update_2d(
     );
 }
 
+// ----------------------------------------------------------------------------
+// Graph-compatible kernels (read hyperparameters from device memory)
+
+template <typename T, int BLOCK_SIZE, int N_PER_TH>
+__launch_bounds__(256, 3)
+__global__ void kNormuonMomentum8bitGraph(
+    const T* __restrict__ gradient,
+    unsigned char* __restrict__ momentum_state,
+    T* __restrict__ momentum_out,
+    const float* __restrict__ opt_params,  // [0] = unused, [1] = beta1
+    const float* __restrict__ quantiles,
+    float* __restrict__ absmax,
+    const size_t n
+) {
+    const float beta1 = opt_params[1];  // normuon_momentum
+    const int block_idx = blockIdx.x;
+    const int base = block_idx * BLOCK_SIZE;
+    const int thread_offset = threadIdx.x * N_PER_TH;
+
+    __shared__ float smem_quantiles[256];
+    __shared__ float smem_quadrants[3];
+    __shared__ float smem_absmax_new;
+
+    if (threadIdx.x < 256) {
+        smem_quantiles[threadIdx.x] = quantiles[threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        smem_quadrants[0] = quantiles[64];
+        smem_quadrants[1] = quantiles[128];
+        smem_quadrants[2] = quantiles[192];
+        smem_absmax_new = 0.0f;
+    }
+    __syncthreads();
+
+    float local_absmax = 0.0f;
+    float current_absmax = absmax[block_idx];
+
+    float m_vals[N_PER_TH];
+    float g_vals[N_PER_TH];
+
+    #pragma unroll
+    for (int j = 0; j < N_PER_TH; ++j) {
+        size_t idx = base + thread_offset + j;
+        if (idx < n) {
+            unsigned char code = momentum_state[idx];
+            m_vals[j] = smem_quantiles[code] * current_absmax;
+            g_vals[j] = static_cast<float>(gradient[idx]);
+        } else {
+            m_vals[j] = 0.0f;
+            g_vals[j] = 0.0f;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < N_PER_TH; ++j) {
+        m_vals[j] = beta1 * m_vals[j] + (1.0f - beta1) * g_vals[j];
+        local_absmax = fmaxf(local_absmax, fabsf(m_vals[j]));
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xFFFFFFFF, local_absmax, offset));
+    }
+
+    if (threadIdx.x % 32 == 0) {
+        atomicMax(reinterpret_cast<int*>(&smem_absmax_new), __float_as_int(local_absmax));
+    }
+    __syncthreads();
+
+    float new_absmax = fmaxf(smem_absmax_new, 1e-7f);
+
+    #pragma unroll
+    for (int j = 0; j < N_PER_TH; ++j) {
+        size_t idx = base + thread_offset + j;
+        if (idx < n) {
+            float normalized = m_vals[j] / new_absmax;
+            unsigned char code = quantize_signed(smem_quadrants, smem_quantiles, normalized);
+            momentum_state[idx] = code;
+            momentum_out[idx] = static_cast<T>(m_vals[j]);
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        absmax[block_idx] = new_absmax;
+    }
+}
+
+__global__ void kApplyVarianceReductionRowsGraph(
+    nv_bfloat16* __restrict__ v,
+    float* __restrict__ variance_buffer,
+    const float* __restrict__ v_mean,
+    int M,
+    int N,
+    const float* __restrict__ opt_params  // [2] = beta2
+) {
+    const float beta2 = opt_params[2];
+    const int batch_idx = blockIdx.z;
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float* buf = variance_buffer + batch_idx * M;
+    const float* mean = v_mean + batch_idx * M;
+    nv_bfloat16* v_batch = v + batch_idx * M * N;
+
+    __shared__ float row_scale;
+    if (threadIdx.x == 0) {
+        float old_buf = buf[row];
+        float new_mean = mean[row];
+        float new_buf = beta2 * old_buf + (1.0f - beta2) * new_mean;
+        buf[row] = new_buf;
+        row_scale = rsqrtf(fmaxf(new_buf, 1e-10f));
+    }
+    __syncthreads();
+
+    float val = __bfloat162float(v_batch[row * N + col]);
+    v_batch[row * N + col] = __float2bfloat16(val * row_scale);
+}
+
+__global__ void kApplyVarianceReductionColsGraph(
+    nv_bfloat16* __restrict__ v,
+    float* __restrict__ variance_buffer,
+    const float* __restrict__ v_mean,
+    int M,
+    int N,
+    const float* __restrict__ opt_params
+) {
+    const float beta2 = opt_params[2];
+    const int batch_idx = blockIdx.z;
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float* buf = variance_buffer + batch_idx * N;
+    const float* mean = v_mean + batch_idx * N;
+    nv_bfloat16* v_batch = v + batch_idx * M * N;
+
+    float col_scale;
+    if (row == 0) {
+        float old_buf = buf[col];
+        float new_mean = mean[col];
+        float new_buf = beta2 * old_buf + (1.0f - beta2) * new_mean;
+        buf[col] = new_buf;
+        col_scale = rsqrtf(fmaxf(new_buf, 1e-10f));
+    }
+    col_scale = rsqrtf(fmaxf(buf[col], 1e-10f));
+
+    float val = __bfloat162float(v_batch[row * N + col]);
+    v_batch[row * N + col] = __float2bfloat16(val * col_scale);
+}
+
+template <typename TParam, typename TUpdate>
+__global__ void kCautiousWeightDecayUpdateGraph(
+    TParam* __restrict__ p,
+    const TUpdate* __restrict__ v,
+    size_t n,
+    float lr_multiplier,
+    float wd_scale,
+    const float* __restrict__ opt_params  // [0] = lr, [3] = weight_decay
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float lr = opt_params[0] * lr_multiplier;
+    float weight_decay = opt_params[3] * wd_scale;
+
+    float p_val = static_cast<float>(p[idx]);
+    float v_val = static_cast<float>(v[idx]);
+
+    float mask = (v_val * p_val >= 0.0f) ? 1.0f : 0.0f;
+    float new_p = p_val - (p_val * mask * weight_decay * lr) - (v_val * lr);
+
+    p[idx] = static_cast<TParam>(new_p);
+}
+
+void normuon_update_2d_graph(
+    cublasHandle_t handle,
+    nv_bfloat16* param,
+    const nv_bfloat16* gradient,
+    unsigned char* momentum_state,
+    float* variance_buffer,
+    nv_bfloat16* polar_workspace,
+    int M,
+    int N,
+    float lr_multiplier,
+    float wd_scale,
+    const float* quantiles,
+    float* absmax,
+    const float* opt_params,
+    cudaStream_t stream
+) {
+    size_t n = static_cast<size_t>(M) * N;
+    nv_bfloat16* momentum_out = polar_workspace;
+
+    // Step 1: Momentum update (graph-compatible)
+    constexpr int BLOCK_SIZE = NORMUON_BLOCK_SIZE;
+    constexpr int N_PER_TH = NORMUON_NUM_PER_THREAD;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    kNormuonMomentum8bitGraph<nv_bfloat16, BLOCK_SIZE, N_PER_TH>
+        <<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(
+            gradient, momentum_state, momentum_out, opt_params, quantiles, absmax, n
+        );
+
+    // Step 2: Polar Express orthogonalization (cuBLAS is graph-capturable)
+    size_t ws_size = polar_express_workspace_size(1, M, N);
+    nv_bfloat16* pe_workspace = momentum_out + n;
+
+    polar_express(
+        handle,
+        momentum_out,
+        pe_workspace,
+        1,
+        M,
+        N,
+        stream
+    );
+
+    // Step 3: Variance reduction (graph-compatible)
+    bool reduce_over_cols = (M >= N);
+    compute_variance_mean(momentum_out, variance_buffer, 1, M, N, reduce_over_cols, stream);
+
+    if (reduce_over_cols) {
+        int blocks_x = (N + NORMUON_THREADS - 1) / NORMUON_THREADS;
+        dim3 grid(blocks_x, M, 1);
+        kApplyVarianceReductionRowsGraph<<<grid, NORMUON_THREADS, 0, stream>>>(
+            momentum_out, variance_buffer, variance_buffer, M, N, opt_params
+        );
+    } else {
+        int blocks_x = (N + NORMUON_THREADS - 1) / NORMUON_THREADS;
+        dim3 grid(blocks_x, M, 1);
+        kApplyVarianceReductionColsGraph<<<grid, NORMUON_THREADS, 0, stream>>>(
+            momentum_out, variance_buffer, variance_buffer, M, N, opt_params
+        );
+    }
+
+    // Step 4: Cautious weight decay + parameter update (graph-compatible)
+    int blocks = (n + NORMUON_THREADS - 1) / NORMUON_THREADS;
+    kCautiousWeightDecayUpdateGraph<nv_bfloat16, nv_bfloat16>
+        <<<blocks, NORMUON_THREADS, 0, stream>>>(
+            param, momentum_out, n, lr_multiplier, wd_scale, opt_params
+        );
+}
+
 } // namespace optimizers

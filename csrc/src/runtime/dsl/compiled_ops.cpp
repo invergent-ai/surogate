@@ -873,13 +873,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             } else if (field == "res_att" || field == "residual_att") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).residual_att, prefer_live, false);
             } else if (field == "res_ffn" || field == "residual_ffn") {
-                // res_ffn is computed dynamically (residual_att + mlp_down), check mTensorMap
-                auto it = mTensorMap.find(name);
-                if (it != mTensorMap.end()) {
-                    save_tensor_with_policy(name, it->second, prefer_live, false);
-                } else {
-                    throw std::runtime_error("CompiledExecutor: res_ffn tensor not found in map: " + name);
-                }
+                // res_ffn is the residual stream after FFN block (residual_att + mlp_down)
+                Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
+                save_tensor_with_policy(name, res, prefer_live, false);
             } else if (mWeights.has(name)) {
                 (*mSaved)[name] = mWeights.get(name);
             } else {

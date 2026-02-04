@@ -253,6 +253,7 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         ctx.skip_weight_grad = skip_weight_grad || !d_weight_ptr;
         ctx.allow_fp8 = allow_quant && mRecipe->uses_fp8_hybrid_backward();
         ctx.allow_fp4 = allow_quant && mRecipe->uses_fp4_forward();
+        ctx.seed = mRngSeedFn ? mRngSeedFn() : 0u;
 
         if (ctx.allow_fp8) {
             ctx.dout_quant = fp8_grad_buffer(mRunState, *op.attrs.matmul_op);
@@ -266,13 +267,20 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
                 ctx.cached_weight = &it->second.weight;
             }
         }
-        if (ctx.allow_fp4 && mFP4CacheT) {
-            auto it = mFP4CacheT->find(weight_name);
-            if (it != mFP4CacheT->end() && it->second.initialized &&
-                it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
-                ctx.cached_fp4_data = &it->second.data;
-                ctx.cached_fp4_scales = &it->second.scales;
-                ctx.cached_fp4_amax = it->second.amax.get<float>();
+        if (ctx.allow_fp4 && mRecipe) {
+            // NVFP4QuartetRecipe uses the forward-layout FP4 cache and performs an explicit
+            // dequant->transpose->Hadamard->requant pipeline for per-step re-randomization.
+            // Standard NVFP4 uses the transposed cache (W^T) directly for dgrad.
+            const bool is_quartet = (mRecipe->name() == std::string_view{"nvfp4-quartet"});
+            auto* cache = is_quartet ? mFP4Cache : mFP4CacheT;
+            if (cache) {
+                auto it = cache->find(weight_name);
+                if (it != cache->end() && it->second.initialized &&
+                    it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                    ctx.cached_fp4_data = &it->second.data;
+                    ctx.cached_fp4_scales = &it->second.scales;
+                    ctx.cached_fp4_amax = it->second.amax.get<float>();
+                }
             }
         }
 
