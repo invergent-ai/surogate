@@ -424,13 +424,19 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t
 std::pair<float, float> MultiGPUPyTrainer::update_with_config(const optimizers::OptimizerConfig& config, int step) {
     run_work([&](sThreadContext& ctx) {
         ctx.Model->update_with_config(*ctx.Communicator, config, step + 1);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(ctx.Model->get_run_state().MainStream));
     });
 
-    float step_loss, step_norm;
-    auto& ctx = mContexts.at(0);
-    step_loss = ctx.Model->get_loss();
-    step_norm = ctx.Model->get_norm();
+    // Avoid the extra cudaEventSynchronize in get_loss()/get_norm().
+    // update_with_config() already synchronizes the stream on each rank.
+    float step_loss = 0.0f;
+    float step_norm = 0.0f;
+    {
+        auto& ctx = mContexts.at(0);
+        auto& rs = ctx.Model->get_run_state();
+        step_loss = rs.LossHost ? rs.LossHost[0] : 0.0f;
+        step_norm = rs.NormHost ? rs.NormHost[0] : 0.0f;
+    }
 
     // ensure we're re-gathering on next forward for eval and train
     mTrainMicroStep = 0;
@@ -537,7 +543,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 ctx.Model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
             }
             ctx.Model->update_with_config(*ctx.Communicator, config, opt_step_host);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
             return;
         }
 
@@ -595,7 +601,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
 
         // Refresh loss/norm on host after full-step graph launch.
         CUDA_CHECK(cudaMemcpy(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost));
@@ -611,8 +617,11 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
     });
 
     auto& ctx = mContexts.at(0);
-    float step_loss = ctx.Model->get_loss();
-    float step_norm = ctx.Model->get_norm();
+    // Avoid the extra cudaEventSynchronize in get_loss()/get_norm(). We synchronize
+    // the main stream during graph replay, then explicitly refresh LossHost/NormHost.
+    auto& rs = ctx.Model->get_run_state();
+    float step_loss = rs.LossHost ? rs.LossHost[0] : 0.0f;
+    float step_norm = rs.NormHost ? rs.NormHost[0] : 0.0f;
 
     mTrainMicroStep = 0;
     mEvalStep = 0;

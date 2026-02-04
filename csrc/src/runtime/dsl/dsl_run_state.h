@@ -156,6 +156,7 @@ private:
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_activations(const PretrainedConfig& cfg);
     void allocate_simplified_gradients(const PretrainedConfig& cfg);
+    void build_activation_grad_zero_segments();
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
     void allocate_scratch_buffers(const PretrainedConfig& cfg);
     void allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals);
@@ -186,6 +187,12 @@ private:
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradientsBase;
+
+    // Precomputed list of activation-gradient buffers to zero at the start of backward.
+    // Stored as device arrays of (ptr, bytes) to zero in a single kernel launch.
+    Tensor mActGradZeroPtrs{};
+    Tensor mActGradZeroSizes{};
+    int mActGradZeroCount = 0;
 
     // Shared gradient buffers (when recompute_block=true)
     std::array<Tensor, 2> mSharedDResFFN{};  ///< Alternating buffers for d_res_ffn

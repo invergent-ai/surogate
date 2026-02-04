@@ -23,6 +23,7 @@ namespace std
 
 struct Tensor;
 struct TensorShard;
+enum class ETensorDType : int;
 
 typedef struct ncclComm* ncclComm_t;
 typedef struct CUevent_st* cudaEvent_t;
@@ -52,6 +53,7 @@ public:
     void begin_transaction(cudaStream_t wait_for_stream);
     void schedule_reduce_scatter(Tensor& tensor);
     void schedule_all_gather(const TensorShard& src, Tensor& tgt);
+    void schedule_all_reduce_avg(Tensor& tensor);
     // like all-to-all, except the local shard will *not* be preserved, and results will be shifted cyclically
     void schedule_destructive_all_to_all(const Tensor& tensor);
     void execute_transaction(cudaEvent_t signal);
@@ -163,6 +165,7 @@ protected:
 
     void scatter_grad(float* value, std::size_t size);
     void scatter_grad(nv_bfloat16* value, std::size_t size);
+    void all_reduce_avg_impl(std::byte* data, std::size_t elements, ETensorDType dtype);
 
     virtual void gather_weight(const std::byte* src, std::byte* tgt, std::size_t size);
     virtual void send(const std::byte* src, int peer, std::size_t size);

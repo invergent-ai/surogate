@@ -802,15 +802,23 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
 
     const bool in_capture = stream_is_capturing(rs.MainStream);
     const cudaStream_t target_stream = in_capture ? rs.MainStream : rs.side_stream();
+    // In the DSL training loop, forward() copies targets from rs.Targets_CPU when the forward
+    // graph includes a loss op. In graphed full-step execution this would otherwise duplicate
+    // a large H2D memcpy node for every micro-step.
+    const bool skip_target_copy =
+        mHasLossOp && targets.Device == -1 && rs.Targets_CPU.Data != nullptr && rs.Targets_CPU.Data == targets.Data;
     // Copy targets to device (side stream in eager, main stream during capture).
     {
         if (!in_capture) {
             CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
         }
-        const std::size_t target_bytes =
-            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, target_stream));
-        record_event_if_not_capturing(rs.TransferDone, target_stream);
+        if (!skip_target_copy) {
+            const std::size_t target_bytes =
+                static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
+            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes,
+                                       cudaMemcpyHostToDevice, target_stream));
+            record_event_if_not_capturing(rs.TransferDone, target_stream);
+        }
     }
 
     if (micro_step == 0) {
@@ -848,7 +856,9 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     }
 
     if (!in_capture) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        if (!skip_target_copy) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        }
         if (micro_step == 0) {
             CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
         }
@@ -864,11 +874,20 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     // Start async all-reduce on last micro-step (overlaps with CPU work and optimizer prep)
     // Note: LoRA gradients are already reduced in end_micro_step() above
     if (last_step && comm.world_size() > 1) {
+        // Ensure all per-layer gradient reductions on side_stream complete before
+        // recording all_reduce_done_event. Layer reductions were started during backward
+        // on side_stream to overlap with compute on MainStream.
+        if (grads.is_overlapped_enabled()) {
+            CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
+        }
         grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
     }
 
     record_event_if_not_capturing(rs.BackwardDone, rs.MainStream);
-    sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
+    if (!skip_target_copy) {
+        sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
+    }
 }
 
 void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
@@ -1040,15 +1059,20 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
 
     const bool in_capture = stream_is_capturing(rs.MainStream);
     const cudaStream_t target_stream = in_capture ? rs.MainStream : rs.side_stream();
+    const bool skip_target_copy =
+        mHasLossOp && targets.Device == -1 && rs.Targets_CPU.Data != nullptr && rs.Targets_CPU.Data == targets.Data;
     // Copy targets to device (side stream in eager, main stream during capture).
     {
         if (!in_capture) {
             CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.BackwardDone, 0));
         }
-        const std::size_t target_bytes =
-            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, target_stream));
-        record_event_if_not_capturing(rs.TransferDone, target_stream);
+        if (!skip_target_copy) {
+            const std::size_t target_bytes =
+                static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
+            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes,
+                                       cudaMemcpyHostToDevice, target_stream));
+            record_event_if_not_capturing(rs.TransferDone, target_stream);
+        }
     }
 
     if (micro_step == 0) {
@@ -1086,7 +1110,9 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
     }
 
     if (!in_capture) {
-        CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        if (!skip_target_copy) {
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.TransferDone, 0));
+        }
         if (micro_step == 0) {
             CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
         }
@@ -1107,6 +1133,13 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
     // Start async all-reduce on last micro-step (overlaps with CPU work and optimizer prep)
     // Note: LoRA gradients are already reduced in end_micro_step() above
     if (last_step && comm.world_size() > 1) {
+        // Ensure all per-layer gradient reductions on side_stream complete before
+        // recording all_reduce_done_event. Layer reductions were started during backward
+        // on side_stream to overlap with compute on MainStream.
+        if (grads.is_overlapped_enabled()) {
+            CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
+        }
         grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
     }
 

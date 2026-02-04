@@ -163,13 +163,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         dB_ptr = &ensure_output_tensor(op.outputs[1]);
     }
 
-    // Zero dA buffer before matmul to ensure consistent results regardless of initial values
-    // This is needed because the buffer may contain stale gradients in no-recompute mode.
-    // Even though matmul uses accumulate=false (beta=0), we explicitly zero to ensure determinism.
-    if (dA_ptr && dA_ptr->Data) {
-        fill_zero(*dA_ptr, mRunState.MainStream);
-    }
-
     if (!dA_ptr && !dB_ptr) {
         return;
     }

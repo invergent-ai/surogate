@@ -2212,6 +2212,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (op.layer_end >= 0 &&
                 op.layer_end != last_layer_restored &&
                 can_restore_stack(idx)) {
+                // Trigger async gradient reduction for this layer on side_stream.
+                // This overlaps communication with the next layer's backward compute on MainStream.
+                if (mComm && mComm->world_size() > 1) {
+                    // Record event on MainStream to ensure layer gradients are ready
+                    CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                    // Wait for gradients on side_stream before starting reduction
+                    CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                    // Start async reduction on side_stream (overlaps with next layer backward on MainStream)
+                    mGrads.notify_block(op.layer_end, mRunState.side_stream(), *mComm);
+                }
                 // Restore stack and clear temps
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();

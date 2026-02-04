@@ -538,6 +538,10 @@ void fill_constant(float* dst, float value, std::size_t count, cudaStream_t stre
 void fill_constant(nv_bfloat16* dst, nv_bfloat16 value, std::size_t count, cudaStream_t stream);
 void fill_constant(Tensor& dest, float value, std::size_t count, cudaStream_t stream);
 
+// Efficiently zero multiple non-contiguous device buffers in a single kernel launch.
+// `ptrs[i]` is a device pointer (encoded as uint64_t) and `sizes[i]` is the size in bytes.
+void zero_device_segments(const std::uint64_t* ptrs, const std::uint64_t* sizes, int n, cudaStream_t stream);
+
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size);

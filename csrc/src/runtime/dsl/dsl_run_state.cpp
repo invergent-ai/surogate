@@ -6,11 +6,13 @@
 #include "runtime/dsl/dsl_run_state.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "runtime/dsl/graph_executor_utils.h"
@@ -86,6 +88,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     allocate_non_block_state(config);
     allocate_simplified_activations(config);
     allocate_simplified_gradients(config);
+    build_activation_grad_zero_segments();
     allocate_simplified_quant_buffers(config, options);
     allocate_residual_buffers(config, options.OffloadResidual);
     allocate_scratch_buffers(config);
@@ -499,26 +502,82 @@ void DslRunState::reset_simplified_gradients() {
 }
 
 void DslRunState::zero_activation_gradients(cudaStream_t stream) {
-    // Zero ALL activation gradient buffers to prevent stale gradients from accumulating.
-    // Many backward kernels accumulate (+=) to their output buffers. If any buffer contains
-    // stale values from a previous micro-batch, gradients will explode.
-    // Zeroing ensures a clean slate for each backward pass.
+    // Zero activation gradient buffers to prevent stale gradients from accumulating.
+    // Use a single kernel launch over a precomputed (ptr, bytes) list to reduce graph-node
+    // overhead vs many separate cudaMemsetAsync calls.
+    if (mActGradZeroCount > 0 && mActGradZeroPtrs.Data && mActGradZeroSizes.Data) {
+        zero_device_segments(reinterpret_cast<const std::uint64_t*>(mActGradZeroPtrs.Data),
+                             reinterpret_cast<const std::uint64_t*>(mActGradZeroSizes.Data),
+                             mActGradZeroCount,
+                             stream);
+        return;
+    }
+
+    // Fallback: should not normally happen.
     for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
         auto& g = mSimplifiedGradients[i];
-        // d_res_ffn: The last layer's is zeroed separately (receives gradient from loss).
-        if (i < mSimplifiedGradients.size() - 1 && g.d_res_ffn.Data) {
-            fill_zero(g.d_res_ffn, stream);
-        }
-        // Zero all other activation gradient buffers
+        if (i < mSimplifiedGradients.size() - 1 && g.d_res_ffn.Data) fill_zero(g.d_res_ffn, stream);
         if (g.d_res_att.Data) fill_zero(g.d_res_att, stream);
-        if (g.d_ln2.Data) fill_zero(g.d_ln2, stream);
-        if (g.d_mlp_up.Data) fill_zero(g.d_mlp_up, stream);
-        if (g.d_swiglu.Data) fill_zero(g.d_swiglu, stream);
-        if (g.d_mlp_down.Data) fill_zero(g.d_mlp_down, stream);
-        if (g.d_att.Data) fill_zero(g.d_att, stream);
-        if (g.d_qkv.Data) fill_zero(g.d_qkv, stream);
-        if (g.d_ln1.Data) fill_zero(g.d_ln1, stream);
     }
+}
+
+void DslRunState::build_activation_grad_zero_segments() {
+    mActGradZeroPtrs = {};
+    mActGradZeroSizes = {};
+    mActGradZeroCount = 0;
+
+    if (!mAllocator) {
+        return;
+    }
+    if (mSimplifiedGradientsBase.empty()) {
+        return;
+    }
+
+    std::vector<std::uint64_t> ptrs;
+    std::vector<std::uint64_t> sizes;
+    ptrs.reserve(mSimplifiedGradientsBase.size() * 8);
+    sizes.reserve(mSimplifiedGradientsBase.size() * 8);
+
+    std::unordered_set<std::byte*> seen;
+    seen.reserve(mSimplifiedGradientsBase.size() * 8);
+
+    auto add = [&](const Tensor& t) {
+        if (!t.Data) return;
+        const std::size_t bytes = static_cast<std::size_t>(t.bytes());
+        if (bytes == 0) return;
+        if (!seen.insert(t.Data).second) return;
+        ptrs.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.Data)));
+        sizes.push_back(static_cast<std::uint64_t>(bytes));
+    };
+
+    const std::size_t n_layers = mSimplifiedGradientsBase.size();
+    for (std::size_t i = 0; i < n_layers; ++i) {
+        const auto& g = mSimplifiedGradientsBase[i];
+        // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
+        if (i + 1 < n_layers) {
+            add(g.d_res_ffn);
+        }
+        // Residual gradients can be used as accumulation targets (multiple branches).
+        // Other activation gradients are expected to be overwritten (beta=0 / memcpy) within
+        // the backward graph and don't need blanket zeroing.
+        add(g.d_res_att);
+    }
+
+    mActGradZeroCount = static_cast<int>(ptrs.size());
+    if (mActGradZeroCount <= 0) {
+        return;
+    }
+
+    const long bytes = static_cast<long>(static_cast<std::size_t>(mActGradZeroCount) * sizeof(std::uint64_t));
+    mActGradZeroPtrs = mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs",
+                                            EAllocationType::ON_DEVICE, {bytes});
+    mActGradZeroSizes = mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes",
+                                             EAllocationType::ON_DEVICE, {bytes});
+
+    CUDA_CHECK(cudaMemcpy(mActGradZeroPtrs.Data, ptrs.data(),
+                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mActGradZeroSizes.Data, sizes.data(),
+                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
 }
 
 void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {

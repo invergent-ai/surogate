@@ -71,9 +71,6 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         mTemps.push_back(mRunState.scratch().cudnn_workspace);
     }
 
-    // Zero-initialize d_qkv to avoid stale values.
-    fill_zero(d_qkv, mRunState.MainStream);
-
     const int attn_chunks = mOptions.AttBwdChunks;
     if (attn_chunks < 1) {
         throw std::runtime_error("attn_bwd_chunks must be >= 1");

@@ -311,29 +311,21 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
                          ? mLayerReduceEvents[layer_idx]
                          : nullptr;
 
-    if (mConfig.shard_gradients) {
-        // ZeRO-2: Use reduce-scatter (batched transaction)
-        comm.begin_transaction(stream);
-        for (const auto& name : grad_names) {
-            auto it = mGrads.find(name);
-            if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
+    // Both ZeRO-2 and ZeRO-1/DDP use batched transactions for NCCL efficiency
+    comm.begin_transaction(stream);
+    for (const auto& name : grad_names) {
+        auto it = mGrads.find(name);
+        if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
+            if (mConfig.shard_gradients) {
+                // ZeRO-2: Use reduce-scatter
                 comm.schedule_reduce_scatter(it->second);
+            } else {
+                // DDP/ZeRO-1: Use all-reduce with batching
+                comm.schedule_all_reduce_avg(it->second);
             }
-        }
-        comm.execute_transaction(ev);
-    } else {
-        // DDP/ZeRO-1: Use all-reduce (one per tensor, as the API requires)
-        for (const auto& name : grad_names) {
-            auto it = mGrads.find(name);
-            if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
-                comm.all_reduce_avg(it->second, stream);
-            }
-        }
-        // Record event after all reductions
-        if (ev) {
-            CUDA_CHECK(cudaEventRecord(ev, stream));
         }
     }
+    comm.execute_transaction(ev);
 }
 
 } // namespace dsl
