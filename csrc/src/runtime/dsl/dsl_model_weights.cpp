@@ -597,6 +597,83 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
             continue;
         }
 
+        if (spec->kind == MappingSpec::Kind::StackExperts) {
+            // Export batched expert tensor [num_experts, ...] as individual HF expert tensors
+            if (spec->source.empty()) {
+                throw std::runtime_error("DSL model: stack_experts export missing pattern for " + name);
+            }
+
+            int num_experts = spec->num_experts;
+            if (num_experts <= 0 && mModelConfig.moe_config.has_value()) {
+                num_experts = mModelConfig.moe_config->num_experts;
+            }
+            if (num_experts <= 0) {
+                num_experts = mModelConfig.NumExperts;
+            }
+            if (num_experts <= 0) {
+                throw std::runtime_error("DSL model: stack_experts export cannot determine num_experts for " + name);
+            }
+
+            if (param.Rank < 1 || param.Sizes[0] != num_experts) {
+                throw std::runtime_error("DSL model: stack_experts export param size mismatch for " + name);
+            }
+
+            const long expert_size = param.nelem() / param.Sizes[0];
+            const std::size_t elem_size = get_dtype_size(param.DType);
+
+            if (spec->fuse_gate_up) {
+                // Export fused gate_up tensor as separate gate_proj and up_proj per expert
+                // Layout: [E, 2*D, C] where first D rows are up, next D rows are gate
+                std::string gate_pattern = spec->source;
+                std::string up_pattern = spec->source;
+                std::size_t pos = up_pattern.find("gate_proj");
+                if (pos != std::string::npos) {
+                    up_pattern.replace(pos, 9, "up_proj");
+                }
+
+                const long fused_rows = param.Rank >= 2 ? param.Sizes[1] : 1;
+                const long D = fused_rows / 2;
+                const long C = param.Rank >= 3 ? param.Sizes[2] : 1;
+                const long sub_expert_elems = D * C;
+
+                for (int e = 0; e < num_experts; ++e) {
+                    const std::size_t base_offset = static_cast<std::size_t>(e) * fused_rows * C * elem_size;
+
+                    // Export up_proj from first D rows
+                    std::string up_hf = internal::format_hf_name(up_pattern, layer_idx, e);
+                    Tensor up_slice = param;
+                    up_slice.Rank = 2;
+                    up_slice.Sizes[0] = D;
+                    up_slice.Sizes[1] = C;
+                    up_slice.Data = param.Data + base_offset;
+                    exports.push_back({up_hf, up_slice, false, {}});
+
+                    // Export gate_proj from second D rows
+                    std::string gate_hf = internal::format_hf_name(gate_pattern, layer_idx, e);
+                    Tensor gate_slice = param;
+                    gate_slice.Rank = 2;
+                    gate_slice.Sizes[0] = D;
+                    gate_slice.Sizes[1] = C;
+                    gate_slice.Data = param.Data + base_offset + sub_expert_elems * elem_size;
+                    exports.push_back({gate_hf, gate_slice, false, {}});
+                }
+            } else {
+                // Export single tensor (e.g., down_proj) for each expert
+                for (int e = 0; e < num_experts; ++e) {
+                    std::string hf_name = internal::format_hf_name(spec->source, layer_idx, e);
+
+                    Tensor slice = param;
+                    slice.Rank = param.Rank - 1;
+                    for (int d = 0; d < slice.Rank; ++d) {
+                        slice.Sizes[d] = param.Sizes[d + 1];
+                    }
+                    slice.Data = param.Data + static_cast<std::size_t>(e) * expert_size * elem_size;
+                    exports.push_back({hf_name, slice, false, {}});
+                }
+            }
+            continue;
+        }
+
         throw std::runtime_error("DSL model: unsupported HF export mapping for " + name);
     }
 

@@ -129,6 +129,7 @@ private:
 
 void load_safetensors(const std::string& file_name, ITensorContainer& tensors, bool allow_cast);
 void write_safetensors(const std::string& file_name, ITensorContainer& tensors);
+void write_safetensors(const std::string& file_name, ITensorContainer& tensors, NCCLCommunicator& comm);
 
 //! Gets the path to the HF cache
 std::string get_hf_hub();

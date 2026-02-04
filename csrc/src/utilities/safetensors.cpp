@@ -551,6 +551,28 @@ void write_safetensors(const std::string& file_name, ITensorContainer& tensors) 
 }
 
 /**
+ * @brief Convenience function to write all tensors from a container into a SafeTensors file (multi-GPU).
+ *
+ * Registers all tensors, writes metadata, writes each tensor in full, then finalizes.
+ * Uses the provided communicator for synchronization - only rank 0 performs the actual write.
+ *
+ * @param file_name Output `.safetensors` path.
+ * @param tensors Tensor container providing named tensors to serialize.
+ * @param comm NCCL communicator for multi-GPU synchronization.
+ */
+void write_safetensors(const std::string& file_name, ITensorContainer& tensors, NCCLCommunicator& comm) {
+    SafeTensorWriter writer(file_name);
+    tensors.iterate_tensors([&writer](std::string name, const Tensor& tensor) {
+        writer.register_tensor(name, tensor);
+    });
+    writer.prepare_metadata(&comm);
+    tensors.iterate_tensors([&writer, &comm](std::string name, const Tensor& tensor) {
+        writer.write_tensor(name, tensor, &comm);
+    });
+    writer.finalize(&comm);
+}
+
+/**
  * @brief Determine the HuggingFace hub cache directory.
  *
  * Resolution order:

@@ -74,7 +74,7 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
     if (mLoRAAdamW8BitState && mLoRAAdamW8BitState->initialized) {
         internal::LoRAAdamW8BitStateContainer container(mLoRAAdamW8BitState.get());
         fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
-        write_safetensors(opt_file.string(), container);
+        write_safetensors(opt_file.string(), container, comm);
 
         if (comm.rank() == 0) {
             nlohmann::json opt_meta;
@@ -88,7 +88,7 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
     } else if (mLoRANorMuonState && mLoRANorMuonState->initialized) {
         internal::LoRANorMuonStateContainer container(mLoRANorMuonState.get());
         fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
-        write_safetensors(opt_file.string(), container);
+        write_safetensors(opt_file.string(), container, comm);
 
         if (comm.rank() == 0) {
             nlohmann::json opt_meta;

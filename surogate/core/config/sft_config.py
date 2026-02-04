@@ -294,7 +294,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     cooldown_steps: Optional[int] = 0
     final_lr_fraction: Optional[float] = 0.0
     gradient_accumulation_steps: Optional[int] = 4
-    max_grad_norm: Optional[float] = 0.0
+    max_grad_norm: Optional[float] = 1.0
     weight_decay: Optional[float] = 0.1
     max_steps: Optional[int] = -1
     adamw_beta1: Optional[float] = 0.9
