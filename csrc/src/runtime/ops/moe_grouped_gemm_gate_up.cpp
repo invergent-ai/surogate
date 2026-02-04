@@ -78,11 +78,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             cudaGetLastError();
             throw std::runtime_error("moe_grouped_gemm_gate_up: pointer attributes unavailable");
         }
-#if CUDART_VERSION >= 10000
         const int mem_type = static_cast<int>(attr.type);
-#else
-        const int mem_type = static_cast<int>(attr.memoryType);
-#endif
         if (mem_type == cudaMemoryTypeHost) {
             throw std::runtime_error("moe_grouped_gemm_gate_up: pointer on host memory");
         }

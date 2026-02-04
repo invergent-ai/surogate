@@ -262,6 +262,32 @@ std::optional<double> meta_double(const json& meta, const char* key) {
     return std::nullopt;
 }
 
+dsl::DslRuntimeConfig runtime_config_from_meta(const json& meta) {
+    dsl::DslRuntimeConfig runtime;
+    if (meta.contains("use_qk_norm")) {
+        runtime.use_qk_norm = meta.at("use_qk_norm").get<bool>();
+    }
+    if (meta.contains("norm_topk_prob")) {
+        runtime.norm_topk_prob = meta.at("norm_topk_prob").get<bool>();
+    }
+    if (meta.contains("use_shared_expert")) {
+        runtime.use_shared_expert = meta.at("use_shared_expert").get<bool>();
+    }
+    if (auto v = meta_long(meta, "num_experts")) {
+        runtime.num_experts = static_cast<int>(*v);
+    }
+    if (auto v = meta_long(meta, "num_experts_per_tok")) {
+        runtime.num_experts_per_tok = static_cast<int>(*v);
+    }
+    if (auto v = meta_long(meta, "moe_intermediate_size")) {
+        runtime.moe_intermediate_size = static_cast<int>(*v);
+    }
+    if (auto v = meta_long(meta, "shared_expert_intermediate")) {
+        runtime.shared_expert_intermediate = static_cast<int>(*v);
+    }
+    return runtime;
+}
+
 dsl::AttrValue parse_attr_value(const json& j) {
     if (j.is_boolean()) {
         return dsl::AttrValue(j.get<bool>());
@@ -559,7 +585,8 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy golden inputs to device
@@ -867,7 +894,8 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy golden inputs to device
@@ -1127,7 +1155,8 @@ TEST_CASE("dsl module goldens: embedding_module", "[dsl][modules][goldens]") {
 
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy inputs
@@ -1262,7 +1291,8 @@ TEST_CASE("dsl module goldens: rmsnorm_module", "[dsl][modules][goldens]") {
 
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy inputs
@@ -1852,7 +1882,8 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy golden inputs to device
@@ -2421,7 +2452,8 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy golden inputs to device
@@ -3067,7 +3099,8 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                     false, kStackBytes, true);
 
         // Copy golden inputs to device
@@ -3420,7 +3453,9 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
         constexpr std::size_t kStackBytes = 256 * 1024 * 1024;
-        dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator, false, kStackBytes, true);
+        const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
+        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+                                   false, kStackBytes, true);
 
         // Reset loss/accuracy buffers since cross-entropy forward accumulates into them.
         fill_zero(run_state.Losses, run_state.MainStream);

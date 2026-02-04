@@ -326,6 +326,35 @@ std::optional<long> meta_long(const json& meta, const char* key) {
     return std::nullopt;
 }
 
+dsl::DslRuntimeConfig runtime_config_from_meta(const json& meta, const std::string& op_name) {
+    dsl::DslRuntimeConfig runtime;
+    if (meta.contains("use_qk_norm")) {
+        runtime.use_qk_norm = meta.at("use_qk_norm").get<bool>();
+    }
+    if (!runtime.use_qk_norm && op_name.find("qk_norm") != std::string::npos) {
+        runtime.use_qk_norm = true;
+    }
+    if (meta.contains("norm_topk_prob")) {
+        runtime.norm_topk_prob = meta.at("norm_topk_prob").get<bool>();
+    }
+    if (meta.contains("use_shared_expert")) {
+        runtime.use_shared_expert = meta.at("use_shared_expert").get<bool>();
+    }
+    if (auto v = meta_long(meta, "num_experts")) {
+        runtime.num_experts = static_cast<int>(*v);
+    }
+    if (auto v = meta_long(meta, "num_experts_per_tok")) {
+        runtime.num_experts_per_tok = static_cast<int>(*v);
+    }
+    if (auto v = meta_long(meta, "moe_intermediate_size")) {
+        runtime.moe_intermediate_size = static_cast<int>(*v);
+    }
+    if (auto v = meta_long(meta, "shared_expert_intermediate")) {
+        runtime.shared_expert_intermediate = static_cast<int>(*v);
+    }
+    return runtime;
+}
+
 dsl::AttrValue parse_attr_value(const json& j) {
     if (j.is_boolean()) {
         return dsl::AttrValue(j.get<bool>());
@@ -812,7 +841,8 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
             dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
             dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
-            dsl::DslRunState run_state(cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
+            const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta, gc.op);
+            dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
                                        false, kStackBytes, true);
 
             // Copy parameter inputs
