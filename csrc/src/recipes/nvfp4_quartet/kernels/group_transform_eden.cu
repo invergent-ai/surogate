@@ -238,7 +238,9 @@ __global__ void eden_convert_scales_kernel(
     if (i >= groups) return;
 
     uint4 rng = philox<10>(seed, threadIdx.x, blockIdx.x);
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
+    #endif
 
     float max_scale = __uint_as_float(*max_scale_ptr);
     float global_scale = max_scale * inv_fp8_max;
@@ -275,17 +277,28 @@ void launch_eden_convert_scales_kernel(
     const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr,
     long seed, int groups, float inv_fp8_max, cudaStream_t stream)
 {
-    cudaLaunchAttribute attribute[1];
-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = 1;
-
     cudaLaunchConfig_t config;
-    config.attrs = attribute;
-    config.numAttrs = 1;
     config.blockDim = dim3(128);
     config.gridDim = dim3((groups + 127)/128);
     config.dynamicSmemBytes = 0;
     config.stream = stream;
+    config.attrs = nullptr;
+    config.numAttrs = 0;
+
+    cudaLaunchAttribute attribute[1];
+    int device = 0;
+    int cc_major = 0;
+    int cc_minor = 0;
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess) {
+        if (cc_major > 9 || (cc_major == 9 && cc_minor >= 0)) {
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            config.attrs = attribute;
+            config.numAttrs = 1;
+        }
+    }
     QUARTET_CUDA_CHECK(cudaLaunchKernelEx(&config, eden_convert_scales_kernel, scales_fp8, global_scale_ptr, scales_bf16, max_scale_ptr, seed, groups, inv_fp8_max));
 }
 
