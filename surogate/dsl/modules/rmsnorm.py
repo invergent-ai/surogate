@@ -12,6 +12,13 @@ from ..dim import Dim, B, T
 class RMSNorm:
     """Root Mean Square Layer Normalization."""
 
+    # Default HF weight path template.
+    # Use {prefix} for the norm submodule path
+    # (e.g., "model.layers.{layer}.input_layernorm").
+    _hf_mapping_defaults_ = {
+        "weight": "{prefix}.weight",
+    }
+
     def __init__(self, d_model: int, eps: float = 1e-6):
         self.d_model = d_model
         self.eps = eps
@@ -32,6 +39,11 @@ class RMSNorm:
 @module
 class FusedResidualRMSNorm:
     """Fused residual addition + RMS normalization."""
+
+    # Same weight as RMSNorm.
+    _hf_mapping_defaults_ = {
+        "weight": "{prefix}.weight",
+    }
 
     def __init__(self, d_model: int, eps: float = 1e-6):
         self.d_model = d_model

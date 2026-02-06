@@ -90,14 +90,20 @@ bool is_norm_param_name(const std::string& name);
 bool is_bias_param_name(const std::string& name);
 std::vector<long> infer_fuse_slices(const std::string& name, const PretrainedConfig& cfg, int num_sources);
 
-// QLoRA provider factory (DSL)
+// QLoRA provider factory (DSL) - creates GenericQLoRAProvider backed by
+// GenericWeightManager. Builds pipeline config from the IR module's forward
+// graph params (shapes, quantizable flags, offload groups) and the HF mapping.
 std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
+    const Module& module,
     const modules::ModelConfig& model_cfg,
+    const PretrainedConfig& pt_config,
     const RuntimeOptions& options,
     const modules::ModularLoRAConfig& lora_cfg,
     const modules::QLoRAConfig& qlora_cfg,
     const std::shared_ptr<TensorAllocator>& allocator,
-    const modules::HfMapping* hf_mapping);
+    const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
+    int shard_idx,
+    int num_shards);
 
 }  // namespace internal
 }  // namespace dsl

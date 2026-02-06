@@ -57,6 +57,8 @@ class TensorRef:
     is_param: bool = False
     is_input: bool = False
     is_output: bool = False
+    quantizable: bool = True
+    offload_group: int | str = -1
 
 
 @dataclass
@@ -319,6 +321,8 @@ def _param_spec_to_ref(
         shape=shape,
         dtype=spec.dtype,
         is_param=True,
+        quantizable=spec.quantizable,
+        offload_group=spec.offload_group,
     )
 
 
@@ -1477,15 +1481,51 @@ def compile_module_spec(
 # =============================================================================
 
 
+class _OffloadGroupResolver:
+    """Resolves string offload_group names to stable integer IDs.
+
+    String group names (e.g., ``"moe_experts"``) from ``Param(offload_group=...)``
+    are mapped to monotonically increasing integer IDs starting from 0.
+    Integer group IDs are passed through unchanged. The resolver is reset
+    per compilation unit.
+    """
+
+    def __init__(self) -> None:
+        self._name_to_id: Dict[str, int] = {}
+        self._next_id: int = 0
+
+    def resolve(self, group: int | str) -> int:
+        if isinstance(group, int):
+            return group
+        if group not in self._name_to_id:
+            self._name_to_id[group] = self._next_id
+            self._next_id += 1
+        return self._name_to_id[group]
+
+    def reset(self) -> None:
+        self._name_to_id.clear()
+        self._next_id = 0
+
+
+# Shared resolver instance (reset before each compilation)
+_offload_resolver = _OffloadGroupResolver()
+
+
 def _tensor_ref_to_dict(ref: TensorRef) -> Dict[str, Any]:
     """Convert TensorRef to JSON-serializable dict."""
-    return {
+    result = {
         "shape": ref.shape,
         "dtype": ref.dtype,
         "is_param": ref.is_param,
         "is_input": ref.is_input,
         "is_output": ref.is_output,
     }
+    if ref.is_param:
+        if not ref.quantizable:
+            result["quantizable"] = False
+        if ref.offload_group != -1:
+            result["offload_group"] = _offload_resolver.resolve(ref.offload_group)
+    return result
 
 
 def _graph_ir_to_dict(graph: GraphIR) -> Dict[str, Any]:
@@ -1670,6 +1710,9 @@ def compile_model(
                     hint="Decorate the class with @model.",
                 )
         source_file = f"python:{spec.name}"
+
+        # Reset offload group resolver for fresh compilation
+        _offload_resolver.reset()
 
         # Compile
         ir = compile_model_spec(spec, config, warnings=diag)

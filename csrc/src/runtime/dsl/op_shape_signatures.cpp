@@ -92,6 +92,11 @@ std::optional<ShapeValidationError> check_same_numel(
     const std::string& name1,
     const std::string& name2,
     const std::string& op_name) {
+    // Empty shape = unknown/not inferred — skip validation
+    if (shape1.empty() || shape2.empty()) {
+        return std::optional<ShapeValidationError>();
+    }
+
     auto numel = [](const std::vector<long>& s) {
         return std::accumulate(s.begin(), s.end(), 1L, std::multiplies<long>());
     };

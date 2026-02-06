@@ -573,10 +573,14 @@ void GraphExecutor::build_layer_weight_map() {
     // - FP8 forward (need async quantization)
     // - FP4 forward (need async quantization)
     // - Weight streaming/sharding enabled (need async gather)
+    // - QLoRA offloading enabled (need async CPU→GPU transfer)
     // - Multi-layer model (enables overlap of weight access with compute)
     const bool has_weight_streaming = mWeightManager && mWeightManager->is_streaming_enabled();
     const bool has_quantized_forward = mRunState.has_fp8_forward() || mRunState.has_fp4_forward();
-    mPrefetchEnabled = num_layers > 1 && (has_quantized_forward || has_weight_streaming);
+    const bool has_qlora_offloading = mWeights.qlora_provider() &&
+                                      mWeights.qlora_provider()->has_offloading();
+    mPrefetchEnabled = num_layers > 1 &&
+                       (has_quantized_forward || has_weight_streaming || has_qlora_offloading);
     if (mPrefetchEnabled && !mPrefetchEvent) {
         CUDA_CHECK(cudaEventCreate(&mPrefetchEvent));
     }
@@ -713,6 +717,11 @@ void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
             // Also prefetch transposed FP4 cache for backward dgrad
             (void)get_fp4_cached_weight_transposed(name, weight, stream);
         }
+    }
+
+    // QLoRA offload prefetching (async CPU→GPU transfer of quantized weights)
+    if (auto* provider = mWeights.qlora_provider()) {
+        provider->prefetch_for_layer(layer_idx, stream);
     }
 
     mPrefetchedLayer = layer_idx;

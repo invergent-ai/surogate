@@ -6,11 +6,25 @@ from ..tensor_type import Tensor
 from ..decorators import module, forward, save, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
+from ..hf import fuse
 
 
 @module
 class SwiGLUMLP:
     """SwiGLU MLP: down(swiglu(up(x)))."""
+
+    # Default HF weight path templates.
+    # Use {prefix} for the MLP submodule path
+    # (e.g., "model.layers.{layer}.mlp").
+    # SwiGLU fuses up_proj and gate_proj into a single up_weight.
+    _hf_mapping_defaults_ = {
+        "up_weight": fuse(
+            "{prefix}.up_proj.weight",
+            "{prefix}.gate_proj.weight",
+            dim=0,
+        ),
+        "down_weight": "{prefix}.down_proj.weight",
+    }
 
     def __init__(self, d_model: int, d_ff: int):
         self.d_model = d_model
@@ -52,6 +66,14 @@ class SwiGLUMLP:
 @module
 class GatedMLP:
     """Gated MLP with configurable activation."""
+
+    # Default HF weight path templates.
+    # GatedMLP uses separate gate and up projections (not fused).
+    _hf_mapping_defaults_ = {
+        "gate_weight": "{prefix}.gate_proj.weight",
+        "up_weight": "{prefix}.up_proj.weight",
+        "down_weight": "{prefix}.down_proj.weight",
+    }
 
     def __init__(
         self,

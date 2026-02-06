@@ -12,6 +12,12 @@ from ..dim import Dim, B, T
 class Linear:
     """Linear projection: y = x @ W^T (+ bias)."""
 
+    # Default HF weight path template.
+    _hf_mapping_defaults_ = {
+        "weight": "{prefix}.weight",
+        "bias": "{prefix}.bias",
+    }
+
     def __init__(self, in_dim: int, out_dim: int, use_bias: bool = False):
         self.in_dim = in_dim
         self.out_dim = out_dim

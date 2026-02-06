@@ -5,7 +5,8 @@ from __future__ import annotations
 from ..tensor_type import Tensor, Array
 from ..decorators import model, forward, hf_config, Param, Activation, Gradient
 from ..graph_builder import graph
-from ..hf import fuse, stack_experts
+from ..hf import build_norm_mappings, build_attn_mappings, build_moe_mappings
+from ..modules.attention import Qwen3Attention
 
 
 @model
@@ -139,47 +140,14 @@ class Qwen3MoEModel:
     d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
     d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
 
-    # HF mappings for block parameters
+    # HF mappings: composed from module-level defaults.
     _hf_block_mappings_ = {
-        # Layer norms
-        "ln1_weight": "model.layers.{layer}.input_layernorm.weight",
-        "ln2_weight": "model.layers.{layer}.post_attention_layernorm.weight",
-
-        # Attention (same as Qwen3)
-        "qkv_weight": fuse(
-            "model.layers.{layer}.self_attn.q_proj.weight",
-            "model.layers.{layer}.self_attn.k_proj.weight",
-            "model.layers.{layer}.self_attn.v_proj.weight",
-            dim=0,
-        ),
-        "qkv_bias": fuse(
-            "model.layers.{layer}.self_attn.q_proj.bias",
-            "model.layers.{layer}.self_attn.k_proj.bias",
-            "model.layers.{layer}.self_attn.v_proj.bias",
-            dim=0,
-        ),
-        "out_weight": "model.layers.{layer}.self_attn.o_proj.weight",
-        "q_norm_weight": "model.layers.{layer}.self_attn.q_norm.weight",
-        "k_norm_weight": "model.layers.{layer}.self_attn.k_norm.weight",
-
-        # Router
-        "router_weight": "model.layers.{layer}.mlp.gate.weight",
-
-        # Experts (batched format) - stack individual expert weights from HF format
-        # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
-        "experts_gate_up": stack_experts(
-            "model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
-            fuse_gate_up=True,  # Also load up_proj and fuse into gate_up
-        ),
-        "experts_down": stack_experts(
-            "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
-        ),
-
-        # Shared expert (optional)
-        # NOTE: Param names must match C++ TensorTarget expectations in weight_mapping.cpp
-        "shared_expert_gate": "model.layers.{layer}.mlp.shared_expert.gate_proj.weight",
-        "shared_expert_up": "model.layers.{layer}.mlp.shared_expert.up_proj.weight",
-        "shared_expert_down": "model.layers.{layer}.mlp.shared_expert.down_proj.weight",
+        # Norms (from RMSNorm._hf_mapping_defaults_)
+        **build_norm_mappings(),
+        # Attention (from Qwen3Attention._hf_mapping_defaults_)
+        **build_attn_mappings(attn_module=Qwen3Attention),
+        # MoE router + experts + shared expert (from MoEExpertsGated + MoESharedExpert)
+        **build_moe_mappings(include_shared=True),
     }
 
     @forward

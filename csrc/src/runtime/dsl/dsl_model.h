@@ -301,7 +301,6 @@ private:
 
     std::unordered_map<std::string, MappingSpec> mHfMapping;
     std::unordered_map<std::string, MappingSpec> mHfExport;
-    std::shared_ptr<modules::HfMapping> mQLoRAMapping;
 };
 
 } // namespace dsl

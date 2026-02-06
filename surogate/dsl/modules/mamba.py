@@ -22,6 +22,22 @@ class Mamba2Mixer:
     This is based on the Mamba2 paper and Nemotron-H implementation.
     """
 
+    # Default HF weight path templates.
+    # Use {prefix} for the Mamba mixer submodule path
+    # (e.g., "backbone.layers.{layer}.mixer" for Nemotron-H).
+    _hf_mapping_defaults_ = {
+        "in_proj_weight": "{prefix}.in_proj.weight",
+        "in_proj_bias": "{prefix}.in_proj.bias",
+        "conv_weight": "{prefix}.conv1d.weight",
+        "conv_bias": "{prefix}.conv1d.bias",
+        "A_log": "{prefix}.A_log",
+        "D_param": "{prefix}.D",
+        "dt_bias": "{prefix}.dt_bias",
+        "gated_norm_weight": "{prefix}.norm.weight",
+        "out_proj_weight": "{prefix}.out_proj.weight",
+        "out_proj_bias": "{prefix}.out_proj.bias",
+    }
+
     def __init__(
         self,
         d_model: int,
@@ -168,6 +184,16 @@ class SimpleMLP:
 
     Architecture: up -> relu2 -> down
     """
+
+    # Default HF weight path templates.
+    # Use {prefix} for the MLP submodule path
+    # (e.g., "backbone.layers.{layer}.mixer" for Nemotron-H).
+    _hf_mapping_defaults_ = {
+        "up_weight": "{prefix}.up_proj.weight",
+        "up_bias": "{prefix}.up_proj.bias",
+        "down_weight": "{prefix}.down_proj.weight",
+        "down_bias": "{prefix}.down_proj.bias",
+    }
 
     def __init__(
         self,

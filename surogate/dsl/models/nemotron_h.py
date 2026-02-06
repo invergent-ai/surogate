@@ -19,7 +19,11 @@ from __future__ import annotations
 from ..tensor_type import Tensor, Array
 from ..decorators import model, forward, hf_config, Param, Activation, Gradient
 from ..graph_builder import graph
-from ..hf import fuse, stack_experts
+from ..hf import (
+    build_mamba_mappings, build_simple_mlp_mappings, build_attn_mappings,
+    build_moe_mappings,
+)
+from ..modules.moe import MoEExpertsSimple
 
 
 def parse_hybrid_pattern(pattern: str) -> list[str]:
@@ -253,57 +257,40 @@ class NemotronHModel:
     d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
     d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
 
-    # HuggingFace weight mappings for each block type
-    # These use layer-specific patterns for the hybrid architecture
-    # Note: Nemotron uses 'backbone.layers' prefix (not 'model.layers')
+    # HuggingFace weight mappings for each block type.
+    # Composed from module-level _hf_mapping_defaults_ where possible.
+    # Note: Nemotron uses 'backbone.layers' prefix and 'mixer' submodule
+    # (not 'model.layers' / 'self_attn' / 'mlp').
     _hf_block_mappings_ = {
         # Common to all blocks - Nemotron uses 'norm.weight' directly
         "norm_weight": "backbone.layers.{layer}.norm.weight",
 
-        # Mamba2 block weights
-        "in_proj_weight": "backbone.layers.{layer}.mixer.in_proj.weight",
-        "in_proj_bias": "backbone.layers.{layer}.mixer.in_proj.bias",
-        "conv_weight": "backbone.layers.{layer}.mixer.conv1d.weight",
-        "conv_bias": "backbone.layers.{layer}.mixer.conv1d.bias",
-        "A_log": "backbone.layers.{layer}.mixer.A_log",
-        "D_param": "backbone.layers.{layer}.mixer.D",
-        "dt_bias": "backbone.layers.{layer}.mixer.dt_bias",
-        "gated_norm_weight": "backbone.layers.{layer}.mixer.norm.weight",
-        "out_proj_weight": "backbone.layers.{layer}.mixer.out_proj.weight",
-        "out_proj_bias": "backbone.layers.{layer}.mixer.out_proj.bias",
+        # Mamba2 block weights (from Mamba2Mixer._hf_mapping_defaults_)
+        **build_mamba_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            mamba_suffix="mixer",
+        ),
 
-        # Attention block weights
-        "qkv_weight": fuse(
-            "backbone.layers.{layer}.mixer.q_proj.weight",
-            "backbone.layers.{layer}.mixer.k_proj.weight",
-            "backbone.layers.{layer}.mixer.v_proj.weight",
-            dim=0,
+        # Attention block weights (from GQAAttention._hf_mapping_defaults_)
+        **build_attn_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            attn_suffix="mixer",
         ),
-        "qkv_bias": fuse(
-            "backbone.layers.{layer}.mixer.q_proj.bias",
-            "backbone.layers.{layer}.mixer.k_proj.bias",
-            "backbone.layers.{layer}.mixer.v_proj.bias",
-            dim=0,
-        ),
-        "out_weight": "backbone.layers.{layer}.mixer.o_proj.weight",
+        # Nemotron attention also has output bias (beyond GQAAttention defaults)
         "out_bias": "backbone.layers.{layer}.mixer.o_proj.bias",
 
-        # MLP block weights (for dense MLP blocks)
-        "up_weight": "backbone.layers.{layer}.mixer.up_proj.weight",
-        "up_bias": "backbone.layers.{layer}.mixer.up_proj.bias",
-        "down_weight": "backbone.layers.{layer}.mixer.down_proj.weight",
-        "down_bias": "backbone.layers.{layer}.mixer.down_proj.bias",
-
-        # MoE block weights
-        # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj per expert
-        # Use standard names (experts_gate_up, experts_down) for BnB loader compatibility
-        "router_weight": "backbone.layers.{layer}.mixer.gate.weight",
-        "experts_gate_up": stack_experts(
-            "backbone.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
-            fuse_gate_up=False,  # No gate_proj in Nemotron MoE, just up_proj
+        # MLP block weights (from SimpleMLP._hf_mapping_defaults_)
+        **build_simple_mlp_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            mlp_suffix="mixer",
         ),
-        "experts_down": stack_experts(
-            "backbone.layers.{layer}.mixer.experts.{expert}.down_proj.weight",
+
+        # MoE block weights (from MoEExpertsSimple._hf_mapping_defaults_)
+        # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj
+        **build_moe_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            moe_module=MoEExpertsSimple,
+            moe_suffix="mixer",
         ),
     }
 

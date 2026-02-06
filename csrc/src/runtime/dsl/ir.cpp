@@ -113,6 +113,8 @@ TensorInfo parse_tensor_info(const nlohmann::json& obj) {
     info.is_param = obj.value("is_param", false);
     info.is_input = obj.value("is_input", false);
     info.is_output = obj.value("is_output", false);
+    info.quantizable = obj.value("quantizable", true);
+    info.offload_group = obj.value("offload_group", -1);
     return info;
 }
 

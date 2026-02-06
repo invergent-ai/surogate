@@ -265,6 +265,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/compiled_ops.cpp
     src/runtime/dsl/graph_compiler.cpp
     src/runtime/dsl/weight_mapping.cpp
+    src/runtime/dsl/dsl_weight_loader.cpp
     src/runtime/dsl/autodiff.cpp
     src/runtime/dsl/autodiff_rules.cpp
     src/runtime/dsl/op_shape_signatures.cpp
@@ -305,9 +306,14 @@ target_sources(surogate-common PRIVATE
 
     src/config/pretrained_config.cpp
 
-    src/runtime/qlora/fp8_weights.cpp
-    src/runtime/qlora/fp4_weights.cpp
-    src/runtime/qlora/bnb_weights.cpp
+    src/runtime/qlora/generic_quantizer.cpp
+    src/runtime/qlora/bnb_quantizer.cpp
+    src/runtime/qlora/fp8_quantizer.cpp
+    src/runtime/qlora/fp4_quantizer.cpp
+    src/runtime/qlora/offload_manager.cpp
+    src/runtime/qlora/generic_weight_manager.cpp
+    src/runtime/qlora/dsl_qlora_pipeline.cpp
+    src/runtime/qlora/generic_qlora_provider.cpp
 
     src/runtime/lora/lora_weights_manager.cpp
     src/runtime/lora/lora_grads_manager.cpp

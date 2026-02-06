@@ -53,6 +53,24 @@ public:
         return false;
     }
 
+    /// Prefetch offloaded weights for a given layer to GPU.
+    ///
+    /// Called by the graph executor ahead of layer computation to overlap
+    /// weight transfers with compute on the current layer. Implementations
+    /// that use group-based offloading should map the layer index to offload
+    /// group IDs and initiate async prefetching.
+    ///
+    /// @param layer_idx  Layer index to prefetch weights for
+    /// @param stream     CUDA stream for async prefetch transfers
+    virtual void prefetch_for_layer(int layer_idx, cudaStream_t stream) {
+        (void)layer_idx;
+        (void)stream;
+    }
+
+    /// Returns true if this provider uses weight offloading (CPU↔GPU).
+    /// Used by the graph executor to enable prefetch scheduling.
+    [[nodiscard]] virtual bool has_offloading() const { return false; }
+
     /// Total bytes used by quantized weights (for memory stats).
     virtual std::size_t quantized_weights_bytes() const = 0;
 

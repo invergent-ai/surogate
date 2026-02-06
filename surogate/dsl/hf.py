@@ -258,6 +258,290 @@ def is_hf_mapping_spec(value: Any) -> bool:
     return isinstance(value, (str, FuseMapping, SplitMapping, TransformMapping, TiedToMapping, StackExpertsMapping))
 
 
+# =============================================================================
+# Module mapping composition utilities
+# =============================================================================
+
+
+def _expand_hf_prefix(mapping: Any, hf_prefix: str) -> Any:
+    """Replace {prefix} placeholder in an HF mapping with the actual prefix."""
+    if isinstance(mapping, str):
+        return mapping.replace("{prefix}", hf_prefix)
+    elif isinstance(mapping, FuseMapping):
+        return FuseMapping(
+            sources=tuple(s.replace("{prefix}", hf_prefix) for s in mapping.sources),
+            dim=mapping.dim,
+        )
+    elif isinstance(mapping, SplitMapping):
+        return SplitMapping(
+            source=mapping.source.replace("{prefix}", hf_prefix),
+            ranges=mapping.ranges,
+            dim=mapping.dim,
+        )
+    elif isinstance(mapping, TransformMapping):
+        return TransformMapping(
+            source=mapping.source.replace("{prefix}", hf_prefix),
+            fn=mapping.fn,
+        )
+    elif isinstance(mapping, StackExpertsMapping):
+        return StackExpertsMapping(
+            pattern=mapping.pattern.replace("{prefix}", hf_prefix),
+            num_experts=mapping.num_experts,
+            fuse_gate_up=mapping.fuse_gate_up,
+        )
+    else:
+        return mapping
+
+
+def expand_module_mapping(
+    defaults: dict[str, Any],
+    *,
+    hf_prefix: str,
+    param_prefix: str = "",
+) -> dict[str, Any]:
+    """Expand module-level HF mapping defaults with concrete prefixes.
+
+    Takes a module's ``_hf_mapping_defaults_`` dict (which uses ``{prefix}``
+    placeholders) and returns a new dict with ``{prefix}`` replaced by
+    *hf_prefix*, and param names optionally prefixed with *param_prefix*.
+
+    Args:
+        defaults: Module's ``_hf_mapping_defaults_`` dict.
+        hf_prefix: HF path prefix to replace ``{prefix}`` with.
+        param_prefix: Optional prefix for param names (e.g., ``"mlp_"``).
+
+    Returns:
+        Dict suitable for inclusion in ``_hf_block_mappings_``.
+
+    Example::
+
+        >>> expand_module_mapping(
+        ...     SwiGLUMLP._hf_mapping_defaults_,
+        ...     hf_prefix="model.layers.{layer}.mlp",
+        ...     param_prefix="mlp_",
+        ... )
+        {
+            "mlp_up_weight": fuse("model.layers.{layer}.mlp.up_proj.weight", ...),
+            "mlp_down_weight": "model.layers.{layer}.mlp.down_proj.weight",
+        }
+    """
+    result: dict[str, Any] = {}
+    for param_name, mapping in defaults.items():
+        full_param_name = param_prefix + param_name
+        result[full_param_name] = _expand_hf_prefix(mapping, hf_prefix)
+    return result
+
+
+def build_norm_mappings(
+    layer_prefix: str = "model.layers.{layer}",
+    *,
+    ln1_suffix: str = "input_layernorm",
+    ln2_suffix: str = "post_attention_layernorm",
+) -> dict[str, Any]:
+    """Build HF mappings for pre-attention and pre-MLP layer norms.
+
+    Args:
+        layer_prefix: HF prefix for the layer (e.g., ``"model.layers.{layer}"``).
+        ln1_suffix: Suffix for the pre-attention norm.
+        ln2_suffix: Suffix for the pre-MLP norm.
+    """
+    from .modules.rmsnorm import RMSNorm
+
+    mappings: dict[str, Any] = {}
+    mappings.update(expand_module_mapping(
+        RMSNorm._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{ln1_suffix}",
+        param_prefix="ln1_",
+    ))
+    mappings.update(expand_module_mapping(
+        RMSNorm._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{ln2_suffix}",
+        param_prefix="ln2_",
+    ))
+    return mappings
+
+
+def build_attn_mappings(
+    layer_prefix: str = "model.layers.{layer}",
+    *,
+    attn_module: type | None = None,
+    attn_suffix: str = "self_attn",
+) -> dict[str, Any]:
+    """Build HF mappings for attention params from module defaults.
+
+    Args:
+        layer_prefix: HF prefix for the layer.
+        attn_module: Attention module class (default: ``GQAAttention``).
+                     Must have ``_hf_mapping_defaults_``.
+        attn_suffix: Suffix for the attention submodule.
+    """
+    if attn_module is None:
+        from .modules.attention import GQAAttention
+        attn_module = GQAAttention
+
+    return expand_module_mapping(
+        attn_module._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{attn_suffix}",
+    )
+
+
+def build_mlp_mappings(
+    layer_prefix: str = "model.layers.{layer}",
+    *,
+    mlp_module: type | None = None,
+    mlp_suffix: str = "mlp",
+    param_prefix: str = "mlp_",
+) -> dict[str, Any]:
+    """Build HF mappings for MLP params from module defaults.
+
+    Args:
+        layer_prefix: HF prefix for the layer.
+        mlp_module: MLP module class (default: ``SwiGLUMLP``).
+                    Must have ``_hf_mapping_defaults_``.
+        mlp_suffix: Suffix for the MLP submodule.
+        param_prefix: Prefix for param names (default: ``"mlp_"``).
+    """
+    if mlp_module is None:
+        from .modules.mlp import SwiGLUMLP
+        mlp_module = SwiGLUMLP
+
+    return expand_module_mapping(
+        mlp_module._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{mlp_suffix}",
+        param_prefix=param_prefix,
+    )
+
+
+def build_mamba_mappings(
+    layer_prefix: str = "backbone.layers.{layer}",
+    *,
+    mamba_module: type | None = None,
+    mamba_suffix: str = "mixer",
+) -> dict[str, Any]:
+    """Build HF mappings for Mamba2 params from module defaults.
+
+    Args:
+        layer_prefix: HF prefix for the layer.
+        mamba_module: Mamba module class (default: ``Mamba2Mixer``).
+                      Must have ``_hf_mapping_defaults_``.
+        mamba_suffix: Suffix for the Mamba submodule.
+    """
+    if mamba_module is None:
+        from .modules.mamba import Mamba2Mixer
+        mamba_module = Mamba2Mixer
+
+    return expand_module_mapping(
+        mamba_module._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{mamba_suffix}",
+    )
+
+
+def build_simple_mlp_mappings(
+    layer_prefix: str = "backbone.layers.{layer}",
+    *,
+    mlp_module: type | None = None,
+    mlp_suffix: str = "mixer",
+    param_prefix: str = "",
+) -> dict[str, Any]:
+    """Build HF mappings for SimpleMLP params from module defaults.
+
+    Args:
+        layer_prefix: HF prefix for the layer.
+        mlp_module: MLP module class (default: ``SimpleMLP``).
+                    Must have ``_hf_mapping_defaults_``.
+        mlp_suffix: Suffix for the MLP submodule.
+        param_prefix: Prefix for param names.
+    """
+    if mlp_module is None:
+        from .modules.mamba import SimpleMLP
+        mlp_module = SimpleMLP
+
+    return expand_module_mapping(
+        mlp_module._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{mlp_suffix}",
+        param_prefix=param_prefix,
+    )
+
+
+def build_moe_mappings(
+    layer_prefix: str = "model.layers.{layer}",
+    *,
+    moe_module: type | None = None,
+    moe_suffix: str = "mlp",
+    include_shared: bool = False,
+    shared_module: type | None = None,
+) -> dict[str, Any]:
+    """Build HF mappings for MoE params from module defaults.
+
+    Composes router + expert mappings from ``MoEExpertsGated`` (default)
+    or another MoE module. Optionally includes shared expert mappings.
+
+    Args:
+        layer_prefix: HF prefix for the layer.
+        moe_module: MoE module class (default: ``MoEExpertsGated``).
+                    Must have ``_hf_mapping_defaults_``.
+        moe_suffix: Suffix for the MoE submodule.
+        include_shared: If True, also include shared expert mappings.
+        shared_module: Shared expert module class (default: ``MoESharedExpert``).
+    """
+    if moe_module is None:
+        from .modules.moe import MoEExpertsGated
+        moe_module = MoEExpertsGated
+
+    mappings = expand_module_mapping(
+        moe_module._hf_mapping_defaults_,
+        hf_prefix=f"{layer_prefix}.{moe_suffix}",
+    )
+
+    if include_shared:
+        if shared_module is None:
+            from .modules.moe import MoESharedExpert
+            shared_module = MoESharedExpert
+        mappings.update(expand_module_mapping(
+            shared_module._hf_mapping_defaults_,
+            hf_prefix=f"{layer_prefix}.{moe_suffix}",
+        ))
+
+    return mappings
+
+
+def build_dense_block_mappings(
+    layer_prefix: str = "model.layers.{layer}",
+    *,
+    attn_module: type | None = None,
+    mlp_module: type | None = None,
+) -> dict[str, Any]:
+    """Build complete ``_hf_block_mappings_`` for a dense transformer block.
+
+    Composes norm, attention, and MLP mappings from module-level defaults.
+
+    Args:
+        layer_prefix: HF prefix for the layer (e.g., ``"model.layers.{layer}"``).
+        attn_module: Attention module class (default: ``GQAAttention``).
+        mlp_module: MLP module class (default: ``SwiGLUMLP``).
+
+    Returns:
+        Complete ``_hf_block_mappings_`` dict ready for use in a model class.
+
+    Example::
+
+        @model
+        class LlamaModel:
+            _hf_block_mappings_ = build_dense_block_mappings()
+
+        @model
+        class Qwen3Model:
+            _hf_block_mappings_ = build_dense_block_mappings(
+                attn_module=Qwen3Attention,
+            )
+    """
+    return {
+        **build_norm_mappings(layer_prefix),
+        **build_attn_mappings(layer_prefix, attn_module=attn_module),
+        **build_mlp_mappings(layer_prefix, mlp_module=mlp_module),
+    }
+
+
 def mapping_to_dict(mapping: HFMappingValue) -> dict[str, Any]:
     """Convert an HF mapping spec to a dictionary representation."""
     if isinstance(mapping, str):

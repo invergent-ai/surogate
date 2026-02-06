@@ -224,6 +224,10 @@ class ParamSpec:
     optional: bool = False
     frozen: bool = False  # @frozen - precomputed, not trained
 
+    # Quantization metadata
+    quantizable: bool = True  # Whether this parameter can be quantized (QLoRA)
+    offload_group: int | str = -1  # Offload group ID (-1 = no offloading, "{expert}" for dynamic)
+
     # HuggingFace mapping
     hf_path: str | None = None
     hf_transform: HFTransformSpec | None = None
@@ -352,6 +356,9 @@ class ModuleSpec(BaseModuleSpec):
     extends: str | None = None
     is_abstract: bool = False
 
+    # HuggingFace weight mapping defaults (from @hf_mapping or _hf_mapping_defaults_)
+    hf_mapping: HFMappingSpec | None = None
+
 
 @dataclass
 class BlockSpec(BaseModuleSpec):
@@ -365,6 +372,9 @@ class BlockSpec(BaseModuleSpec):
 
     # Activation layout for this block (per-layer activations and gradients)
     activations: ActivationLayoutSpec | None = None
+
+    # HuggingFace weight mapping (from @hf_mapping or _hf_block_mappings_)
+    hf_mapping: HFMappingSpec | None = None
 
 
 @dataclass

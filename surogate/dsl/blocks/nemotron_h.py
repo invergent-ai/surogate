@@ -714,8 +714,10 @@ class NemotronHMoEBlock:
     router_weight = Param(Tensor["E", "C"])
 
     # Experts (batched format)
-    experts_up = Param(Tensor["E", "M", "C"])
-    experts_down = Param(Tensor["E", "C", "M"])
+    # offload_group="moe_experts" signals the runtime to store these on CPU
+    # and stream to GPU on demand when expert offloading is enabled.
+    experts_up = Param(Tensor["E", "M", "C"], offload_group="moe_experts")
+    experts_down = Param(Tensor["E", "C", "M"], offload_group="moe_experts")
 
     # Shared expert (optional)
     shared_expert_up = Param(Tensor["SharedM", "C"], when="use_shared_expert")

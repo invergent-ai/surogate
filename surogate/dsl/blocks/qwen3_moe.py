@@ -91,8 +91,10 @@ class Qwen3MoEBlock:
     router_weight = Param(Tensor["E", "C"])
 
     # Expert weights (batched format: [num_experts, ...])
-    experts_gate_up = Param(Tensor["E", "MUp", "C"])
-    experts_down = Param(Tensor["E", "C", "M"])
+    # offload_group="moe_experts" signals the runtime to store these on CPU
+    # and stream to GPU on demand when expert offloading is enabled.
+    experts_gate_up = Param(Tensor["E", "MUp", "C"], offload_group="moe_experts")
+    experts_down = Param(Tensor["E", "C", "M"], offload_group="moe_experts")
 
     # Shared expert weights (optional - present when shared_expert_intermediate > 0)
     shared_expert_gate = Param(Tensor["SharedM", "C"], when=lambda self: getattr(self, 'use_shared_expert', False) or getattr(self, 'shared_expert_intermediate', 0) > 0)

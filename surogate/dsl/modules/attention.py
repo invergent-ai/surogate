@@ -6,11 +6,31 @@ from ..tensor_type import Tensor
 from ..decorators import module, forward, save, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
+from ..hf import fuse
 
 
 @module
 class GQAAttention:
     """Grouped-Query Attention with RoPE and FlashAttention."""
+
+    # Default HF weight path templates.
+    # Use {prefix} for the attention submodule path
+    # (e.g., "model.layers.{layer}.self_attn").
+    _hf_mapping_defaults_ = {
+        "qkv_weight": fuse(
+            "{prefix}.q_proj.weight",
+            "{prefix}.k_proj.weight",
+            "{prefix}.v_proj.weight",
+            dim=0,
+        ),
+        "qkv_bias": fuse(
+            "{prefix}.q_proj.bias",
+            "{prefix}.k_proj.bias",
+            "{prefix}.v_proj.bias",
+            dim=0,
+        ),
+        "out_weight": "{prefix}.o_proj.weight",
+    }
 
     def __init__(
         self,
@@ -78,6 +98,13 @@ class GQAAttention:
 @module
 class Qwen3Attention:
     """Qwen3-style attention with QK-Norm."""
+
+    # Extends GQAAttention defaults with QK-norm weight paths.
+    _hf_mapping_defaults_ = {
+        **GQAAttention._hf_mapping_defaults_,
+        "q_norm_weight": "{prefix}.q_norm.weight",
+        "k_norm_weight": "{prefix}.k_norm.weight",
+    }
 
     def __init__(
         self,

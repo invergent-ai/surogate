@@ -133,9 +133,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
         }
 
-        mQLoRAProvider = internal::create_dsl_qlora_provider(mModelConfig, mOptions,
-                                                             *mLoRAConfig, mQLoRAConfig, mAllocator,
-                                                             mQLoRAMapping.get());
+        mQLoRAProvider = internal::create_dsl_qlora_provider(
+            *mModule, mModelConfig, *mConfig, mOptions,
+            *mLoRAConfig, mQLoRAConfig, mAllocator,
+            mHfMapping, mShardIdx, mNumShards);
         cudaStream_t quant_stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&quant_stream));
         mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);

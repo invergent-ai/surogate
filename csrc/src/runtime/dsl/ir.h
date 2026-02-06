@@ -92,6 +92,8 @@ struct TensorInfo {
     bool is_param = false;
     bool is_input = false;
     bool is_output = false;
+    bool quantizable = true;     ///< Whether this param can be quantized (QLoRA)
+    int offload_group = -1;      ///< Offload group ID (-1 = no offloading)
 };
 
 // ============================================================================

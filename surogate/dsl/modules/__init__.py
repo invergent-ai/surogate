@@ -5,6 +5,7 @@ from .rmsnorm import RMSNorm, FusedResidualRMSNorm
 from .mlp import SwiGLUMLP, GatedMLP
 from .attention import GQAAttention, Qwen3Attention
 from .mamba import Mamba2Mixer, SimpleMLP
+from .moe import MoEExpertsGated, MoEExpertsSimple, MoESharedExpert
 
 __all__ = [
     "Linear",
@@ -17,4 +18,8 @@ __all__ = [
     # Mamba2 / SSM
     "Mamba2Mixer",
     "SimpleMLP",
+    # MoE
+    "MoEExpertsGated",
+    "MoEExpertsSimple",
+    "MoESharedExpert",
 ]

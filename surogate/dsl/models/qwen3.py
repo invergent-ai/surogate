@@ -5,7 +5,8 @@ from __future__ import annotations
 from ..tensor_type import Tensor, Array
 from ..decorators import model, forward, hf_config, Param, Activation, Gradient
 from ..graph_builder import graph
-from ..hf import fuse
+from ..hf import build_dense_block_mappings
+from ..modules.attention import Qwen3Attention
 
 
 @model
@@ -117,33 +118,8 @@ class Qwen3Model:
     d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
     d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
 
-    # Define HF mappings for block parameters
-    _hf_block_mappings_ = {
-        "ln1_weight": "model.layers.{layer}.input_layernorm.weight",
-        "ln2_weight": "model.layers.{layer}.post_attention_layernorm.weight",
-        "qkv_weight": fuse(
-            "model.layers.{layer}.self_attn.q_proj.weight",
-            "model.layers.{layer}.self_attn.k_proj.weight",
-            "model.layers.{layer}.self_attn.v_proj.weight",
-            dim=0,
-        ),
-        "qkv_bias": fuse(
-            "model.layers.{layer}.self_attn.q_proj.bias",
-            "model.layers.{layer}.self_attn.k_proj.bias",
-            "model.layers.{layer}.self_attn.v_proj.bias",
-            dim=0,
-        ),
-        "out_weight": "model.layers.{layer}.self_attn.o_proj.weight",
-        "q_norm_weight": "model.layers.{layer}.self_attn.q_norm.weight",
-        "k_norm_weight": "model.layers.{layer}.self_attn.k_norm.weight",
-        # swiglu expects [up, gate] concatenation
-        "mlp_up_weight": fuse(
-            "model.layers.{layer}.mlp.up_proj.weight",
-            "model.layers.{layer}.mlp.gate_proj.weight",
-            dim=0,
-        ),
-        "mlp_down_weight": "model.layers.{layer}.mlp.down_proj.weight",
-    }
+    # Block mappings composed from module-level defaults (Qwen3Attention + QK-norm, SwiGLUMLP, RMSNorm).
+    _hf_block_mappings_ = build_dense_block_mappings(attn_module=Qwen3Attention)
 
     @forward
     def forward(

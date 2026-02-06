@@ -32,11 +32,9 @@
 #include "runtime/core/backward_hooks.h"
 #include "runtime/lora/lora_utils.h"
 #include "runtime/lora/lora_model_utils.h"
-#include "runtime/qlora/fp8_weight_provider.h"
-#include "runtime/qlora/fp4_weight_provider.h"
-#include "runtime/qlora/bnb_weight_provider.h"
-#include "runtime/qlora/hf_mapping.h"
-#include "runtime/qlora/dsl_block_weights.h"
+#include "runtime/qlora/generic_qlora_provider.h"
+#include "runtime/qlora/dsl_qlora_pipeline.h"
+#include "runtime/dsl/graph_executor_utils.h"
 #include "runtime/core/model_config.h"
 #include "runtime/optimizers/adamw_8bit.h"
 #include "runtime/optimizers/normuon.h"
@@ -71,46 +69,6 @@ bool graph_has_kernel(const Module& module, std::string_view kernel) {
         }
     }
     return false;
-}
-
-modules::HfMappingSpec to_hf_mapping_spec(const DslModel::MappingSpec& spec) {
-    modules::HfMappingSpec out{};
-    using SrcKind = DslModel::MappingSpec::Kind;
-    using DstKind = modules::HfMappingSpec::Kind;
-    switch (spec.kind) {
-        case SrcKind::Direct:
-            out.kind = DstKind::Direct;
-            break;
-        case SrcKind::Fuse:
-            out.kind = DstKind::Fuse;
-            break;
-        case SrcKind::Split:
-            out.kind = DstKind::Split;
-            break;
-        case SrcKind::Transform:
-            out.kind = DstKind::Transform;
-            break;
-        case SrcKind::TiedTo:
-            out.kind = DstKind::TiedTo;
-            break;
-        case SrcKind::StackExperts:
-            out.kind = DstKind::StackExperts;
-            break;
-        case SrcKind::Unknown:
-        default:
-            out.kind = DstKind::Unknown;
-            break;
-    }
-    out.source = spec.source;
-    out.sources = spec.sources;
-    out.ranges = spec.ranges;
-    out.fn = spec.fn;
-    out.target = spec.target;
-    out.dim = spec.dim;
-    out.optional = spec.optional;
-    out.fuse_gate_up = spec.fuse_gate_up;
-    out.num_experts = spec.num_experts;
-    return out;
 }
 
 bool is_qlora_param_name(std::string_view name, bool train_router) {
@@ -489,531 +447,178 @@ modules::ModelConfig build_model_config(const Module& module,
     return cfg;
 }
 
-template<typename Block>
-class DslQLoRAWeightProvider final : public QLoRAWeightProvider {
-public:
-    DslQLoRAWeightProvider(const modules::ModelConfig& cfg,
-                           const RuntimeOptions& options,
-                           const modules::ModularLoRAConfig& lora_config,
-                           const modules::QLoRAConfig& qlora_config,
-                           const std::shared_ptr<TensorAllocator>& allocator,
-                           const modules::HfMapping* hf_mapping)
-        : mConfig(cfg),
-          mOptions(options),
-          mLoRAConfig(lora_config),
-          mQLoRAConfig(qlora_config),
-          mAllocator(allocator),
-          mHfMapping(hf_mapping) {}
+/// Convert DslModel::MappingSpec to dsl::MappingSpec for the generic pipeline.
+MappingSpec to_pipeline_mapping(const DslModel::MappingSpec& src) {
+    MappingSpec dst;
+    using SK = DslModel::MappingSpec::Kind;
+    using DK = MappingSpec::Kind;
+    switch (src.kind) {
+        case SK::Direct:       dst.kind = DK::Direct; break;
+        case SK::Fuse:         dst.kind = DK::Fuse; break;
+        case SK::Split:        dst.kind = DK::Split; break;
+        case SK::Transform:    dst.kind = DK::Transform; break;
+        case SK::TiedTo:       dst.kind = DK::TiedTo; break;
+        case SK::StackExperts: dst.kind = DK::StackExperts; break;
+        default:               dst.kind = DK::Unknown; break;
+    }
+    dst.source = src.source;
+    dst.sources = src.sources;
+    dst.ranges = src.ranges;
+    dst.fn = src.fn;
+    dst.target = src.target;
+    dst.dim = src.dim;
+    dst.optional = src.optional;
+    dst.fuse_gate_up = src.fuse_gate_up;
+    dst.num_experts = src.num_experts;
+    return dst;
+}
 
-    bool handles_param(std::string_view name) const override {
-        return is_qlora_param_name(name, mLoRAConfig.train_router);
+/// Build a MappingTable from DslModel's parsed HF mapping.
+MappingTable build_mapping_table(
+    const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping) {
+    MappingTable table;
+    table.reserve(hf_mapping.size());
+    for (const auto& kv : hf_mapping) {
+        table.emplace(kv.first, to_pipeline_mapping(kv.second));
+    }
+    return table;
+}
+
+/// Build QuantizerConfig from QLoRAConfig and runtime options.
+qlora::QuantizerConfig build_quantizer_config(
+    const modules::QLoRAConfig& qlora_cfg,
+    const RuntimeOptions& options) {
+    qlora::QuantizerConfig qcfg;
+
+    if (qlora_cfg.is_bnb()) {
+        qcfg.format = qlora::QuantFormat::BNB_NF4;
+        qcfg.block_size = qlora_cfg.block_size() > 0 ? qlora_cfg.block_size() : 64;
+        qcfg.double_quant = qlora_cfg.bnb_double_quant;
+        qcfg.double_quant_group_size = qlora_cfg.bnb_double_quant_group_size;
+    } else if (qlora_cfg.is_fp8()) {
+        qcfg.format = qlora::QuantFormat::FP8_PER_BLOCK;
+        qcfg.block_size = qlora_cfg.block_size() > 0 ? qlora_cfg.block_size() : 128;
+        qcfg.enable_fp8_forward = options.fp8_forward_enabled();
+        qcfg.enable_fp8_hybrid = options.fp8_hybrid_enabled();
+    } else if (qlora_cfg.is_fp4()) {
+        qcfg.format = qlora::QuantFormat::FP4_BLOCK_2D;
+        qcfg.block_size = qlora_cfg.block_size() > 0 ? qlora_cfg.block_size() : 16;
+    } else {
+        qcfg.format = qlora::QuantFormat::NONE;
     }
 
-    Tensor& resolve_param(std::string_view name, cudaStream_t stream) override {
-        if (!mFP8Provider && !mFP4Provider && !mBnBProvider) {
-            throw std::runtime_error("DSL QLoRA provider: weights not initialized (import_weights_qlora not called)");
-        }
+    int device_id = 0;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device_id));
+    qcfg.device_id = device_id;
+    qcfg.sm_version = props.major * 10 + props.minor;
 
-        const std::string_view clean = trim_optional(name);
-        
-        if (clean == "embedding" || clean == "embeddings" || clean == "embed_tokens") {
-            return with_provider([&](auto& provider) -> Tensor& { return provider.get_embeddings(stream); });
-        }
-        if (clean == "final_norm" || clean == "final_norm_weight" || clean == "norm") {
-             return with_provider([&](auto& provider) -> Tensor& { return provider.get_final_norm(stream); });
-        }
-        if (clean == "lm_head" || clean == "lm_head_weight") {
-            return with_provider([&](auto& provider) -> Tensor& { return provider.get_lm_head(stream); });
-        }
+    return qcfg;
+}
 
-        int layer_idx = -1;
-        std::string field;
-        std::string block_type;
-        if (!internal::parse_block_param_with_type(clean, layer_idx, field, block_type)) {
-            throw std::runtime_error("DSL QLoRA provider: unknown param " + std::string(name));
-        }
-        if (!field.empty() && field.back() == '?') {
-            field.pop_back();
-        }
-
-        // Map block-type-specific index to physical layer index for hybrid architectures
-        // e.g., mamba_blocks[0] needs to map to the physical layer index of the first Mamba layer
-        int physical_layer_idx = map_to_physical_layer(block_type, layer_idx);
-
-        auto& block = with_provider([&](auto& provider) -> typename std::remove_reference_t<decltype(provider)>::BlockWeights& {
-            return provider.get_block(physical_layer_idx, stream);
-        });
-
-        if (field == "ln1_weight" || field == "norm_weight") {
-            // norm_weight is used by hybrid blocks (Mamba, Attention, MLP, MoE) for pre-block norm
-            return block.ln1.weight;
-        }
-        if (field == "ln2_weight") {
-            return block.ln2.weight;
-        }
-        if (field == "qkv_weight") {
-            return block.attention.qkv_weight;
-        }
-        if (field == "out_weight" || field == "o_proj_weight") {
-            return block.attention.out_weight;
-        }
-        if (field == "mlp_up_weight" || field == "up_weight") {
-            if constexpr (requires { block.mlp_up_weight; }) {
-                return block.mlp_up_weight;
-            }
-            throw std::runtime_error("DSL QLoRA provider: mlp_up_weight not available for " + std::string(name));
-        }
-        if (field == "mlp_down_weight" || field == "down_weight") {
-            if constexpr (requires { block.mlp_down_weight; }) {
-                return block.mlp_down_weight;
-            }
-            throw std::runtime_error("DSL QLoRA provider: mlp_down_weight not available for " + std::string(name));
-        }
-        if (field == "q_norm_weight") {
-            if constexpr (requires { block.attention.q_norm_weight; }) {
-                if (block.attention.q_norm_weight.has_value()) {
-                    return block.attention.q_norm_weight.value();
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: q_norm_weight not available for " + std::string(name));
-        }
-        if (field == "k_norm_weight") {
-            if constexpr (requires { block.attention.k_norm_weight; }) {
-                if (block.attention.k_norm_weight.has_value()) {
-                    return block.attention.k_norm_weight.value();
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: k_norm_weight not available for " + std::string(name));
-        }
-
-        if (field == "router_weight") {
-            if constexpr (requires { block.router.gate; }) {
-                return block.router.gate;
-            }
-            throw std::runtime_error("DSL QLoRA provider: router_weight not available for " + std::string(name));
-        }
-        if (field == "experts_gate_up" || field == "experts_up") {
-            if constexpr (requires { block.experts.gate_up_proj; }) {
-                return block.experts.gate_up_proj;
-            }
-            throw std::runtime_error("DSL QLoRA provider: experts_gate_up not available for " + std::string(name));
-        }
-        if (field == "experts_down") {
-            if constexpr (requires { block.experts.down_proj; }) {
-                return block.experts.down_proj;
-            }
-            throw std::runtime_error("DSL QLoRA provider: experts_down not available for " + std::string(name));
-        }
-        if (field == "shared_expert_gate") {
-            if constexpr (requires { block.shared_expert; }) {
-                if (block.shared_expert.has_value()) {
-                    return block.shared_expert->gate_proj;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: shared_expert_gate not available for " + std::string(name));
-        }
-        if (field == "shared_expert_up") {
-            if constexpr (requires { block.shared_expert; }) {
-                if (block.shared_expert.has_value()) {
-                    return block.shared_expert->up_proj;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: shared_expert_up not available for " + std::string(name));
-        }
-        if (field == "shared_expert_down") {
-            if constexpr (requires { block.shared_expert; }) {
-                if (block.shared_expert.has_value()) {
-                    return block.shared_expert->down_proj;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: shared_expert_down not available for " + std::string(name));
-        }
-
-        if (ends_with(field, "in_proj_weight")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->in_proj_weight;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: in_proj_weight not available for " + std::string(name));
-        }
-        if (ends_with(field, "in_proj_bias")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value() && block.mamba->in_proj_bias.has_value()) {
-                    return block.mamba->in_proj_bias.value();
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: in_proj_bias not available for " + std::string(name));
-        }
-        if (ends_with(field, "out_proj_weight")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->out_proj_weight;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: out_proj_weight not available for " + std::string(name));
-        }
-        if (ends_with(field, "out_proj_bias")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value() && block.mamba->out_proj_bias.has_value()) {
-                    return block.mamba->out_proj_bias.value();
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: out_proj_bias not available for " + std::string(name));
-        }
-        if (ends_with(field, "conv1d_weight") || ends_with(field, "conv_weight")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->conv1d_weight;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: conv_weight not available for " + std::string(name));
-        }
-        if (ends_with(field, "conv1d_bias") || ends_with(field, "conv_bias")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value() && block.mamba->conv1d_bias.has_value()) {
-                    return block.mamba->conv1d_bias.value();
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: conv_bias not available for " + std::string(name));
-        }
-        if (ends_with(field, "A_log")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->A_log;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: A_log not available for " + std::string(name));
-        }
-        if (field == "D" || field == "D_param") {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->D;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: D_param not available for " + std::string(name));
-        }
-        if (ends_with(field, "dt_bias")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->dt_bias;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: dt_bias not available for " + std::string(name));
-        }
-        if (ends_with(field, "norm_weight")) {
-            if constexpr (requires { block.mamba; }) {
-                if (block.mamba.has_value()) {
-                    return block.mamba->norm_weight;
-                }
-            }
-            throw std::runtime_error("DSL QLoRA provider: norm_weight not available for " + std::string(name));
-        }
-
-        throw std::runtime_error("DSL QLoRA provider: unsupported param " + std::string(name));
+/// Build WeightLoadSpec list from the forward graph parameters.
+///
+/// Iterates the IR's forward graph params, resolves shapes using the module's
+/// config, and creates a WeightLoadSpec for each QLoRA-managed parameter.
+std::vector<qlora::WeightLoadSpec> build_weight_specs(
+    const Module& module,
+    const modules::ModularLoRAConfig& lora_cfg) {
+    if (!module.forward.has_value()) {
+        return {};
     }
 
-    void import_and_quantize(const std::string& file_name, NCCLCommunicator& comm,
-                             cudaStream_t stream) override {
-        ensure_provider(comm);
-        with_provider([&](auto& provider) { provider.import_and_quantize(file_name, comm, stream); });
+    const auto& graph = module.forward.value();
+    ShapeEnv env = make_shape_env(module, /*B=*/1, /*T=*/1);
+    augment_shape_env(env, module.config);
+
+    const bool train_router = lora_cfg.enabled() && lora_cfg.train_router;
+
+    std::vector<qlora::WeightLoadSpec> specs;
+    specs.reserve(graph.params.size());
+
+    for (const auto& kv : graph.params) {
+        const std::string& name = kv.first;
+        const TensorInfo& info = kv.second;
+
+        // Only include QLoRA-managed parameters
+        if (!is_qlora_param_name(name, train_router)) {
+            continue;
+        }
+
+        // Resolve shape from IR dimensions
+        auto resolved = resolve_shape(info.shape, env);
+        if (resolved.empty()) {
+            continue;
+        }
+
+        qlora::WeightLoadSpec spec;
+        spec.name = name;
+        spec.M = static_cast<int>(resolved[0]);
+        spec.K = resolved.size() >= 2 ? static_cast<int>(resolved[1]) : 0;
+        spec.quantize = info.quantizable;
+        spec.offload_group = info.offload_group;
+        spec.sharded = false;  // QLoRA base weights are replicated (not sharded)
+
+        specs.push_back(std::move(spec));
     }
 
-    void invalidate_cache() override {
-        with_provider([&](auto& provider) { provider.invalidate_cache(); });
-    }
-
-    bool refresh_moe_experts(int layer_idx,
-                             const modules::SelectiveExpertInfo& selection,
-                             cudaStream_t stream) override {
-        if (!selection.enabled || selection.num_active == 0) {
-            return false;
-        }
-        if (mBnBProvider) {
-            if (!mBnBProvider->use_selective_dequant()) {
-                return false;
-            }
-            mBnBProvider->dequantize_selected_experts(layer_idx, selection, stream, true);
-            return true;
-        }
-        if (mFP4Provider) {
-            if (!mFP4Provider->use_selective_dequant()) {
-                return false;
-            }
-            mFP4Provider->dequantize_selected_experts(layer_idx, selection, stream, true);
-            return true;
-        }
-        // FP8 provider not yet wired for selective MoE refresh in DSL path.
-        return false;
-    }
-
-    std::size_t quantized_weights_bytes() const override {
-        return with_provider([&](const auto& provider) { return provider.quantized_weights_bytes(); });
-    }
-
-    float memory_savings_ratio() const override {
-        return with_provider([&](const auto& provider) { return provider.memory_savings_ratio(); });
-    }
-
-private:
-    using FP8Provider = modules::FP8WeightProvider<Block>;
-    using FP4Provider = modules::FP4WeightProvider<Block>;
-    using BnBProvider = modules::BnBWeightProvider<Block>;
-
-    template<typename Fn>
-    decltype(auto) with_provider(Fn&& fn) {
-        if (mFP8Provider) return fn(*mFP8Provider);
-        if (mFP4Provider) return fn(*mFP4Provider);
-        if (mBnBProvider) return fn(*mBnBProvider);
-        throw std::runtime_error("DSL QLoRA provider: no provider initialized");
-    }
-
-    template<typename Fn>
-    decltype(auto) with_provider(Fn&& fn) const {
-        if (mFP8Provider) return fn(*mFP8Provider);
-        if (mFP4Provider) return fn(*mFP4Provider);
-        if (mBnBProvider) return fn(*mBnBProvider);
-        throw std::runtime_error("DSL QLoRA provider: no provider initialized");
-    }
-
-    /**
-     * @brief Map block-type-specific index to physical layer index
-     *
-     * For hybrid architectures, DSL models use separate arrays for each block type:
-     * - mamba_blocks[0], mamba_blocks[1], ... for Mamba layers
-     * - attn_blocks[0], attn_blocks[1], ... for Attention layers
-     * - mlp_blocks[0], mlp_blocks[1], ... for MLP layers
-     * - moe_blocks[0], moe_blocks[1], ... for MoE layers
-     *
-     * This function maps (block_type, block_type_index) to the physical layer index
-     * that the BnB weight provider uses.
-     *
-     * @param block_type Block type string (e.g., "mamba", "attn", "mlp", "moe", or empty)
-     * @param block_type_idx Index within the block type array
-     * @return Physical layer index
-     */
-    int map_to_physical_layer(const std::string& block_type, int block_type_idx) const {
-        // If no block type specified (plain "blocks[N]"), return the index as-is
-        if (block_type.empty()) {
-            return block_type_idx;
-        }
-
-        // Map block type string to BlockType enum
-        modules::BlockType target_type = modules::BlockType::Dense;
-        if (block_type == "mamba") {
-            target_type = modules::BlockType::Mamba;
-        } else if (block_type == "attn" || block_type == "attention") {
-            target_type = modules::BlockType::Attention;
-        } else if (block_type == "mlp") {
-            target_type = modules::BlockType::MLP;
-        } else if (block_type == "moe") {
-            target_type = modules::BlockType::MoE;
-        } else {
-            // Unknown block type, return index as-is
-            return block_type_idx;
-        }
-
-        // Count layers of the target type until we reach block_type_idx
-        int count = 0;
-        for (int i = 0; i < mConfig.NumLayers; ++i) {
-            const auto layer_type = mConfig.get_block_type(i);
-            if (layer_type == target_type) {
-                if (count == block_type_idx) {
-                    return i;  // Found the N-th layer of this type
-                }
-                ++count;
-            }
-        }
-
-        // Block type index out of range, return the index as-is (will likely cause an error later)
-        return block_type_idx;
-    }
-
-    void fill_mamba_config(auto& cfg) {
-        cfg.layer_is_mamba.resize(mConfig.NumLayers);
-        cfg.has_mamba = false;
-
-        // Build hybrid_pattern string from per-layer block types
-        // Pattern chars: M = Mamba, E = MoE, * = Attention, - = MLP
-        std::string pattern;
-        pattern.reserve(mConfig.NumLayers);
-        bool is_hybrid = false;
-
-        for (int i = 0; i < mConfig.NumLayers; ++i) {
-            const auto block_type = mConfig.get_block_type(i);
-            const bool is_mamba = (block_type == modules::BlockType::Mamba);
-            cfg.layer_is_mamba[i] = static_cast<std::uint8_t>(is_mamba ? 1 : 0);
-            cfg.has_mamba = cfg.has_mamba || is_mamba;
-
-            // Build pattern character
-            char c = '-';  // Default: MLP
-            switch (block_type) {
-                case modules::BlockType::Mamba:
-                    c = 'M';
-                    is_hybrid = true;
-                    break;
-                case modules::BlockType::MoE:
-                case modules::BlockType::SwitchMoE:
-                    c = 'E';
-                    is_hybrid = true;
-                    break;
-                case modules::BlockType::Attention:
-                    c = '*';
-                    is_hybrid = true;
-                    break;
-                case modules::BlockType::MLP:
-                    c = '-';
-                    break;
-                default:
-                    c = '-';  // Dense blocks default to MLP behavior
-                    break;
-            }
-            pattern.push_back(c);
-        }
-
-        // Only set hybrid_pattern if we have a true hybrid architecture
-        if (is_hybrid) {
-            cfg.hybrid_pattern = std::move(pattern);
-        }
-
-        cfg.mamba_num_heads = mConfig.MambaNumHeads;
-        cfg.mamba_head_dim = mConfig.MambaHeadDim;
-        cfg.mamba_ssm_state_size = mConfig.MambaSsmStateSize;
-        cfg.mamba_conv_kernel = mConfig.MambaConvKernel;
-        cfg.mamba_n_groups = mConfig.MambaNGroups;
-        cfg.mamba_intermediate_size = mConfig.MambaIntermediateSize;
-        cfg.mamba_use_bias = mConfig.MambaUseBias;
-        cfg.mamba_use_conv_bias = mConfig.MambaUseConvBias;
-    }
-
-    void ensure_provider(NCCLCommunicator& comm) {
-        if (mFP8Provider || mFP4Provider || mBnBProvider) {
-            return;
-        }
-
-        const bool force_full_moe_dequant =
-            mQLoRAConfig.is_moe() && mLoRAConfig.enabled() &&
-            (mOptions.SelectiveExpertDequant || mOptions.OffloadExperts);
-        if (force_full_moe_dequant) {
-            std::cerr << "[QLoRA] MoE selective expert dequant disabled\n";
-            if (mOptions.OffloadExperts) {
-                std::cerr << "[QLoRA] Offload experts enabled; full expert dequant will stream all experts.\n";
-            }
-        }
-
-        int device_id = 0;
-        CUDA_CHECK(cudaGetDevice(&device_id));
-        cudaDeviceProp device_props{};
-        CUDA_CHECK(cudaGetDeviceProperties(&device_props, device_id));
-
-        if (mQLoRAConfig.is_fp8()) {
-            typename FP8Provider::Config cfg{};
-            cfg.num_layers = mConfig.NumLayers;
-            cfg.hidden_size = mConfig.HiddenSize;
-            cfg.intermediate_size = mConfig.IntermediateSize;
-            cfg.num_query_heads = mConfig.NumQueryHeads;
-            cfg.num_kv_heads = mConfig.NumKeyValHeads;
-            cfg.head_size = mConfig.head_size();
-            cfg.vocab_size = mConfig.VocabSize;
-            cfg.mlp_up_factor = mConfig.mlp_up_factor();
-            cfg.qlora_config = mQLoRAConfig;
-            cfg.lora_config = mLoRAConfig;
-            cfg.model_dtype = mConfig.DType;
-            cfg.use_qk_norm = mConfig.UseQKNorm;
-            cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
-            cfg.hf_mapping = mHfMapping;
-            cfg.shard_idx = comm.rank();
-            cfg.num_shards = comm.world_size();
-            cfg.enable_fp8_forward = mOptions.fp8_forward_enabled();
-            cfg.enable_fp8_hybrid = mOptions.fp8_hybrid_enabled();
-            fill_mamba_config(cfg);
-            mFP8Provider = std::make_unique<FP8Provider>(cfg, *mAllocator, device_props);
-            return;
-        }
-
-        if (mQLoRAConfig.is_fp4()) {
-            typename FP4Provider::Config cfg{};
-            cfg.num_layers = mConfig.NumLayers;
-            cfg.hidden_size = mConfig.HiddenSize;
-            cfg.intermediate_size = mConfig.IntermediateSize;
-            cfg.num_query_heads = mConfig.NumQueryHeads;
-            cfg.num_kv_heads = mConfig.NumKeyValHeads;
-            cfg.head_size = mConfig.head_size();
-            cfg.vocab_size = mConfig.VocabSize;
-            cfg.mlp_up_factor = mConfig.mlp_up_factor();
-            cfg.qlora_config = mQLoRAConfig;
-            cfg.lora_config = mLoRAConfig;
-            cfg.model_dtype = mConfig.DType;
-            cfg.use_qk_norm = mConfig.UseQKNorm;
-            cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
-            cfg.hf_mapping = mHfMapping;
-            cfg.shard_idx = comm.rank();
-            cfg.num_shards = comm.world_size();
-            cfg.selective_expert_dequant = force_full_moe_dequant ? false : mOptions.SelectiveExpertDequant;
-            cfg.force_full_expert_dequant = force_full_moe_dequant;
-            cfg.offload_experts = mOptions.OffloadExperts;
-            fill_mamba_config(cfg);
-            mFP4Provider = std::make_unique<FP4Provider>(cfg, *mAllocator, device_props);
-            return;
-        }
-
-        if (mQLoRAConfig.is_bnb()) {
-            typename BnBProvider::Config cfg{};
-            cfg.num_layers = mConfig.NumLayers;
-            cfg.hidden_size = mConfig.HiddenSize;
-            cfg.intermediate_size = mConfig.IntermediateSize;
-            cfg.num_query_heads = mConfig.NumQueryHeads;
-            cfg.num_kv_heads = mConfig.NumKeyValHeads;
-            cfg.head_size = mConfig.head_size();
-            cfg.vocab_size = mConfig.VocabSize;
-            cfg.mlp_up_factor = mConfig.mlp_up_factor();
-            cfg.qlora_config = mQLoRAConfig;
-            cfg.lora_config = mLoRAConfig;
-            cfg.model_dtype = mConfig.DType;
-            cfg.use_qk_norm = mConfig.UseQKNorm;
-            cfg.tied_embeddings = mConfig.TiedWordEmbeddings;
-            cfg.hf_mapping = mHfMapping;
-            cfg.shard_idx = comm.rank();
-            cfg.num_shards = comm.world_size();
-            cfg.selective_expert_dequant = force_full_moe_dequant ? false : mOptions.SelectiveExpertDequant;
-            cfg.force_full_expert_dequant = force_full_moe_dequant;
-            cfg.offload_experts = mOptions.OffloadExperts;
-            fill_mamba_config(cfg);
-            mBnBProvider = std::make_unique<BnBProvider>(cfg, *mAllocator, device_props);
-            return;
-        }
-    }
-
-    modules::ModelConfig mConfig;
-    RuntimeOptions mOptions;
-    modules::ModularLoRAConfig mLoRAConfig;
-    modules::QLoRAConfig mQLoRAConfig;
-    std::shared_ptr<TensorAllocator> mAllocator;
-    const modules::HfMapping* mHfMapping = nullptr;
-
-    std::unique_ptr<FP8Provider> mFP8Provider;
-    std::unique_ptr<FP4Provider> mFP4Provider;
-    std::unique_ptr<BnBProvider> mBnBProvider;
-};
+    return specs;
+}
 
 }  // namespace
 
 namespace internal {
 
 std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
+    const Module& module,
     const modules::ModelConfig& model_cfg,
+    const PretrainedConfig& pt_config,
     const RuntimeOptions& options,
     const modules::ModularLoRAConfig& lora_cfg,
     const modules::QLoRAConfig& qlora_cfg,
     const std::shared_ptr<TensorAllocator>& allocator,
-    const modules::HfMapping* hf_mapping) {
-    const bool is_moe = qlora_cfg.is_moe() || model_cfg.moe_config.has_value();
-    if (is_moe) {
-        return std::make_unique<DslQLoRAWeightProvider<modules::DslMoEBlock>>(
-            model_cfg, options, lora_cfg, qlora_cfg, allocator, hf_mapping);
+    const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
+    int shard_idx,
+    int num_shards) {
+
+    // Build the pipeline configuration
+    qlora::DslQLoRAPipelineConfig config;
+    config.mapping = build_mapping_table(hf_mapping);
+    config.weight_specs = build_weight_specs(module, lora_cfg);
+    config.quantizer_config = build_quantizer_config(qlora_cfg, options);
+    config.shard_idx = shard_idx;
+    config.num_shards = num_shards;
+    config.num_experts = qlora_cfg.num_experts;
+    config.moe_intermediate_size = qlora_cfg.moe_intermediate_size;
+
+    // Configure weight manager
+    config.weight_manager_config.device_id = config.quantizer_config.device_id;
+    if (options.OffloadExperts && qlora_cfg.is_moe()) {
+        config.weight_manager_config.enable_offloading = true;
     }
-    return std::make_unique<DslQLoRAWeightProvider<modules::DslDenseBlock>>(
-        model_cfg, options, lora_cfg, qlora_cfg, allocator, hf_mapping);
+
+    // Use pooled dequant buffers for large models to reduce peak memory
+    const int num_quantizable = static_cast<int>(std::count_if(
+        config.weight_specs.begin(), config.weight_specs.end(),
+        [](const qlora::WeightLoadSpec& s) { return s.quantize; }));
+    if (num_quantizable > 64) {
+        // For models with many quantizable weights, use a pool to limit
+        // concurrent dequant buffers and reduce peak GPU memory
+        config.weight_manager_config.max_dequant_cache_size = 32;
+    }
+
+    fprintf(stderr, "[QLoRA] Generic provider: %d weight specs (%d quantizable), "
+                    "format=%s, shard=%d/%d\n",
+            static_cast<int>(config.weight_specs.size()),
+            num_quantizable,
+            qlora_cfg.is_bnb() ? "BnB-NF4" :
+            qlora_cfg.is_fp8() ? "FP8" :
+            qlora_cfg.is_fp4() ? "FP4" : "none",
+            shard_idx, num_shards);
+
+    return std::make_unique<qlora::GenericQLoRAProvider>(
+        std::move(config), pt_config, allocator);
 }
 
 }  // namespace internal
@@ -1144,13 +749,6 @@ DslModel::DslModel(const PretrainedConfig& config,
     }
     for (const auto& kv : mModule->hf_export) {
         mHfExport.emplace(kv.first, internal::parse_mapping_spec(kv.second));
-    }
-    if (!mHfMapping.empty()) {
-        mQLoRAMapping = std::make_shared<modules::HfMapping>();
-        mQLoRAMapping->mapping.reserve(mHfMapping.size());
-        for (const auto& kv : mHfMapping) {
-            mQLoRAMapping->mapping.emplace(kv.first, to_hf_mapping_spec(kv.second));
-        }
     }
 }
 

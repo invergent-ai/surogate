@@ -244,6 +244,11 @@ def _process_module_class(cls: type, spec_class: type) -> Any:
         if hasattr(cls, "_hf_export_"):
             spec.hf_export = cls._hf_export_
 
+    # Handle HF mapping for modules and blocks (from @hf_mapping decorator)
+    if spec_class in (ModuleSpec, BlockSpec):
+        if hasattr(cls, "_hf_mapping_"):
+            spec.hf_mapping = cls._hf_mapping_
+
     # Handle pattern for blocks
     if spec_class == BlockSpec:
         if hasattr(cls, "_pattern_"):
@@ -353,6 +358,12 @@ class Param:
             - str: attribute name to check (e.g., "use_bias")
             - callable: lambda self: self.use_bias
         frozen: If True, this parameter is precomputed and not trained
+        quantizable: If True (default), this parameter can be quantized by QLoRA.
+            Set to False for parameters that should always remain in full precision
+            (e.g., layer norms, biases).
+        offload_group: Offload group ID for CPU offloading. -1 means no offloading.
+            Can be an integer for static groups, or a string like "{expert}" for
+            dynamic per-expert groups in MoE models.
         hf_mapping: HuggingFace weight path for import
     """
 
@@ -362,6 +373,8 @@ class Param:
         *,
         when: str | Callable[[Any], bool] | None = None,
         frozen: bool = False,
+        quantizable: bool = True,
+        offload_group: int | str = -1,
         hf_mapping: str | None = None,
     ):
         if not isinstance(param_type, (TensorAnnotation, ArrayAnnotation)):
@@ -373,6 +386,8 @@ class Param:
         self.param_type = param_type
         self.when = when
         self.frozen = frozen
+        self.quantizable = quantizable
+        self.offload_group = offload_group
         self.hf_mapping = hf_mapping
         # Name will be set by __set_name__
         self._name: str | None = None
@@ -387,6 +402,10 @@ class Param:
             parts.append(f", when={self.when!r}")
         if self.frozen:
             parts.append(", frozen=True")
+        if not self.quantizable:
+            parts.append(", quantizable=False")
+        if self.offload_group != -1:
+            parts.append(f", offload_group={self.offload_group!r}")
         if self.hf_mapping:
             parts.append(f", hf_mapping={self.hf_mapping!r}")
         parts.append(")")
@@ -407,6 +426,8 @@ class Param:
             spec.element_type = self.param_type.element_type
 
         spec.frozen = self.frozen
+        spec.quantizable = self.quantizable
+        spec.offload_group = self.offload_group
         spec.hf_path = self.hf_mapping
 
         # Handle condition
