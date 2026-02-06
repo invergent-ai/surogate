@@ -82,7 +82,6 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
         if (train_router && field.find("router") != std::string::npos) {
             return false;
         }
-        // Standard block weights (Qwen3, LLaMA, etc.)
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" ||
             field == "mlp_up_weight" || field == "mlp_down_weight" ||
             field == "ln1_weight" || field == "ln2_weight" ||
@@ -90,25 +89,17 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
             field == "router_weight" ||
             field == "experts_gate_up" || field == "experts_down" ||
             field == "shared_expert_gate" || field == "shared_expert_up" ||
-            field == "shared_expert_down" ||
-            // Nemotron-H MoE: separate up/down without gate fusion
-            field == "experts_up") {
+            field == "shared_expert_down") {
             return true;
         }
-        // Mamba/SSM weights (pattern suffixes)
         if (ends_with(field, "in_proj_weight") ||
             ends_with(field, "in_proj_bias") ||
             ends_with(field, "out_proj_weight") ||
             ends_with(field, "out_proj_bias") ||
             ends_with(field, "conv1d_weight") ||
             ends_with(field, "conv1d_bias") ||
-            // Nemotron-H Mamba: uses conv_weight/bias instead of conv1d_weight/bias
-            ends_with(field, "conv_weight") ||
-            ends_with(field, "conv_bias") ||
             ends_with(field, "A_log") ||
             ends_with(field, "D") ||
-            // Nemotron-H Mamba: D_param naming variant
-            field == "D_param" ||
             ends_with(field, "dt_bias") ||
             ends_with(field, "norm_weight")) {
             return true;
@@ -138,18 +129,6 @@ struct DslConfigView {
     std::optional<bool> norm_topk_prob;
     std::optional<bool> use_shared_expert;
     std::optional<long> shared_expert_intermediate;
-    std::optional<std::string> mlp_activation;
-    std::optional<std::string> hybrid_pattern;  ///< Hybrid arch pattern (e.g., "MEMEM*EMEMEM*...")
-
-    // Mamba / SSM configuration (for hybrid architectures like Nemotron-H)
-    std::optional<long> mamba_num_heads;
-    std::optional<long> mamba_head_dim;
-    std::optional<long> ssm_state_size;
-    std::optional<long> n_groups;
-    std::optional<long> conv_kernel;
-    std::optional<long> chunk_size;
-    std::optional<bool> use_conv_bias;
-    std::optional<bool> use_mamba_bias;
 };
 
 std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
@@ -182,15 +161,6 @@ std::optional<bool> get_bool_attr(const AttrMap& map, const char* key) {
     return std::nullopt;
 }
 
-std::optional<std::string> get_string_attr(const AttrMap& map, const char* key) {
-    if (const auto* value = internal::find_key(&map, key)) {
-        if (auto v = internal::as_string(*value)) {
-            return std::string(*v);
-        }
-    }
-    return std::nullopt;
-}
-
 DslConfigView parse_dsl_config(const Module& module) {
     DslConfigView view;
     const auto& cfg = module.config;
@@ -211,18 +181,6 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.norm_topk_prob = get_bool_attr(cfg, "norm_topk_prob");
     view.use_shared_expert = get_bool_attr(cfg, "use_shared_expert");
     view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate");
-    view.mlp_activation = get_string_attr(cfg, "mlp_activation");
-    view.hybrid_pattern = get_string_attr(cfg, "hybrid_pattern");
-
-    // Mamba / SSM configuration
-    view.mamba_num_heads = get_long_attr(cfg, "mamba_num_heads");
-    view.mamba_head_dim = get_long_attr(cfg, "mamba_head_dim");
-    view.ssm_state_size = get_long_attr(cfg, "ssm_state_size");
-    view.n_groups = get_long_attr(cfg, "n_groups");
-    view.conv_kernel = get_long_attr(cfg, "conv_kernel");
-    view.chunk_size = get_long_attr(cfg, "chunk_size");
-    view.use_conv_bias = get_bool_attr(cfg, "use_conv_bias");
-    view.use_mamba_bias = get_bool_attr(cfg, "use_mamba_bias");
     return view;
 }
 
@@ -246,24 +204,6 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
     } else if (runtime.num_experts > 0 && view.d_ff.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.d_ff.value());
-    }
-
-    // Determine mlp_up_factor based on activation type
-    // Gated activations (SwiGLU, GeGLU) use factor 2, non-gated (ReLU, ReLU2, SiLU) use factor 1
-    if (view.mlp_activation.has_value()) {
-        const std::string& act = *view.mlp_activation;
-        if (act == "relu2" || act == "ReLU2" || act == "relu" || act == "ReLU" ||
-            act == "silu" || act == "SiLU" || act == "gelu" || act == "GeLU") {
-            runtime.mlp_up_factor = 1;
-        } else {
-            // Default to gated (SwiGLU, GeGLU)
-            runtime.mlp_up_factor = 2;
-        }
-    }
-
-    // Hybrid architecture pattern for Nemotron-H style models
-    if (view.hybrid_pattern.has_value()) {
-        runtime.hybrid_pattern = *view.hybrid_pattern;
     }
 
     return runtime;
@@ -379,69 +319,6 @@ modules::ModelConfig build_model_config(const Module& module,
         cfg.MoeIntermediateSize = moe.moe_intermediate_size;
     } else {
         cfg.architecture = modules::ArchitectureType::Dense;
-    }
-
-    // Set activation type based on mlp_up_factor
-    // factor 1 = non-gated (ReLU2), factor 2 = gated (SwiGLU)
-    if (runtime.mlp_up_factor == 1) {
-        cfg.activation_type = modules::ActivationType::ReLU2;
-    } else {
-        cfg.activation_type = modules::ActivationType::SwiGLU;
-    }
-
-    // Mamba / SSM configuration (for hybrid architectures like Nemotron-H)
-    if (view.mamba_num_heads) cfg.MambaNumHeads = static_cast<int>(*view.mamba_num_heads);
-    if (view.mamba_head_dim) cfg.MambaHeadDim = static_cast<int>(*view.mamba_head_dim);
-    if (view.ssm_state_size) cfg.MambaSsmStateSize = static_cast<int>(*view.ssm_state_size);
-    if (view.n_groups) cfg.MambaNGroups = static_cast<int>(*view.n_groups);
-    if (view.conv_kernel) cfg.MambaConvKernel = static_cast<int>(*view.conv_kernel);
-    if (view.chunk_size) cfg.MambaChunkSize = static_cast<int>(*view.chunk_size);
-    if (view.use_conv_bias) cfg.MambaUseConvBias = *view.use_conv_bias;
-    if (view.use_mamba_bias) cfg.MambaUseBias = *view.use_mamba_bias;
-    // Mamba intermediate = num_heads * head_dim (distinct from MLP intermediate)
-    if (view.mamba_num_heads && view.mamba_head_dim) {
-        cfg.MambaIntermediateSize = static_cast<int>(*view.mamba_num_heads * *view.mamba_head_dim);
-    }
-
-    // Populate layer_overrides from hybrid_pattern for hybrid architectures
-    // Pattern chars: M = Mamba, E = MoE, * = Attention, - = MLP
-    if (!runtime.hybrid_pattern.empty()) {
-        cfg.layer_overrides.clear();
-        cfg.layer_overrides.reserve(cfg.NumLayers);
-
-        for (int i = 0; i < cfg.NumLayers && i < static_cast<int>(runtime.hybrid_pattern.size()); ++i) {
-            const char c = runtime.hybrid_pattern[i];
-            modules::LayerOverride override;
-            override.layer_idx = i;
-
-            switch (c) {
-                case 'M':
-                    override.block_type = modules::BlockType::Mamba;
-                    override.is_moe = false;
-                    break;
-                case 'E':
-                    override.block_type = modules::BlockType::MoE;
-                    override.is_moe = true;
-                    break;
-                case '*':
-                    override.block_type = modules::BlockType::Attention;
-                    override.is_moe = false;
-                    break;
-                case '-':
-                    override.block_type = modules::BlockType::MLP;
-                    override.is_moe = false;
-                    break;
-                default:
-                    override.block_type = modules::BlockType::Dense;
-                    override.is_moe = false;
-                    break;
-            }
-
-            cfg.layer_overrides.push_back(override);
-        }
-
-        // Update architecture type if we have a hybrid pattern
-        cfg.architecture = modules::ArchitectureType::Hybrid;
     }
 
     return cfg;

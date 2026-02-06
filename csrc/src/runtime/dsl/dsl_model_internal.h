@@ -70,8 +70,6 @@ const AttrValue* find_key(const AttrMap* map, const std::string& key);
 
 // String utilities
 bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name);
-bool parse_block_param_with_type(std::string_view name, int& layer_idx, std::string& param_name,
-                                  std::string& block_type);
 std::string to_lower(std::string s);
 bool contains_ci(const std::string& haystack, const std::string& needle);
 void replace_all(std::string& str, std::string_view from, std::string_view to);

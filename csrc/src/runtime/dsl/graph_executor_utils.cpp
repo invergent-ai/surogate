@@ -71,26 +71,18 @@ std::optional<std::string> base_param_from_grad(std::string_view name) {
     return base;
 }
 
-// Block parameter parsing
-// Supports standard and hybrid block arrays:
-//   "blocks[0].qkv_weight" -> layer_idx=0, param_name="qkv_weight"
-//   "mamba_blocks[0].in_proj_weight" -> layer_idx=0, param_name="in_proj_weight"
-//   "moe_blocks[3].shared_expert_up" -> layer_idx=3, param_name="shared_expert_up"
+// Block parameter parsing (e.g., "blocks[0].qkv_weight" -> layer_idx=0, param_name="qkv_weight")
 bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name) {
     auto dot = name.find('.');
     if (dot == std::string_view::npos) return false;
     auto prefix = name.substr(0, dot);
     auto rest = name.substr(dot + 1);
 
-    // Match patterns: blocks[N], mamba_blocks[N], attn_blocks[N], mlp_blocks[N], moe_blocks[N]
-    // Look for any XXX_blocks[ or just blocks[ pattern
-    auto bracket = prefix.find("blocks[");
-    if (bracket != std::string_view::npos) {
-        auto close = prefix.find(']', bracket);
+    // blocks[<idx>]
+    if (starts_with(prefix, "blocks[")) {
+        auto close = prefix.find(']');
         if (close == std::string_view::npos) return false;
-        // Extract index from between [ and ]
-        auto idx_start = bracket + 7;  // length of "blocks["
-        auto idx_str = prefix.substr(idx_start, close - idx_start);
+        auto idx_str = prefix.substr(7, close - 7);
         try {
             layer_idx = std::stoi(std::string(idx_str));
         } catch (...) {
@@ -100,7 +92,7 @@ bool parse_block_param(std::string_view name, int& layer_idx, std::string& param
         return true;
     }
 
-    // blocks.<idx> (legacy format)
+    // blocks.<idx>
     if (starts_with(prefix, "blocks")) {
         auto idx_str = name.substr(dot + 1);
         auto dot2 = idx_str.find('.');

@@ -274,31 +274,12 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     Tensor& buf = mLoRARunState->norm_buffer;
     fill_zero(buf, stream);
 
-    static bool debug_printed = false;
     int grad_count = 0;
-    int null_count = 0;
-    const bool is_capturing = internal::stream_is_capturing(stream);
 
-    auto norm_squared = [&](const Tensor& grad, const char* name) {
+    auto norm_squared = [&](const Tensor& grad) {
         if (grad.Data) {
-            if (!debug_printed && !is_capturing) {
-                // Check first few values of this gradient
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                float first_val = 0.f;
-                if (grad.DType == ETensorDType::FP32) {
-                    CUDA_CHECK(cudaMemcpy(&first_val, grad.Data, sizeof(float), cudaMemcpyDeviceToHost));
-                } else if (grad.DType == ETensorDType::BF16) {
-                    nv_bfloat16 bf_val;
-                    CUDA_CHECK(cudaMemcpy(&bf_val, grad.Data, sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-                    first_val = __bfloat162float(bf_val);
-                }
-                fprintf(stderr, "[DEBUG norm] grad '%s': nelem=%ld dtype=%d first_val=%g\n",
-                        name, grad.nelem(), (int)grad.DType, first_val);
-            }
             grad_count++;
             global_norm_squared(buf, grad, grad.nelem(), rs.DeviceProp, stream);
-        } else {
-            null_count++;
         }
     };
 
@@ -306,38 +287,26 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
         bool unused_acc = false;
         auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
 
-        if (g.attention.q.has_value()) { norm_squared(g.attention.q->A, "attn.q.A"); norm_squared(g.attention.q->B, "attn.q.B"); }
-        if (g.attention.k.has_value()) { norm_squared(g.attention.k->A, "attn.k.A"); norm_squared(g.attention.k->B, "attn.k.B"); }
-        if (g.attention.v.has_value()) { norm_squared(g.attention.v->A, "attn.v.A"); norm_squared(g.attention.v->B, "attn.v.B"); }
-        if (g.attention.o.has_value()) { norm_squared(g.attention.o->A, "attn.o.A"); norm_squared(g.attention.o->B, "attn.o.B"); }
-        if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A, "mlp.gate.A"); norm_squared(g.mlp.gate->B, "mlp.gate.B"); }
-        if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A, "mlp.up.A"); norm_squared(g.mlp.up->B, "mlp.up.B"); }
-        if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A, "mlp.down.A"); norm_squared(g.mlp.down->B, "mlp.down.B"); }
+        if (g.attention.q.has_value()) { norm_squared(g.attention.q->A); norm_squared(g.attention.q->B); }
+        if (g.attention.k.has_value()) { norm_squared(g.attention.k->A); norm_squared(g.attention.k->B); }
+        if (g.attention.v.has_value()) { norm_squared(g.attention.v->A); norm_squared(g.attention.v->B); }
+        if (g.attention.o.has_value()) { norm_squared(g.attention.o->A); norm_squared(g.attention.o->B); }
+        if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A); norm_squared(g.mlp.gate->B); }
+        if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A); norm_squared(g.mlp.up->B); }
+        if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A); norm_squared(g.mlp.down->B); }
         if (g.moe.use_grouped) {
-            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A, "moe.gate.A"); norm_squared(g.moe.grouped.gate->B, "moe.gate.B"); }
-            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A, "moe.up.A"); norm_squared(g.moe.grouped.up->B, "moe.up.B"); }
-            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A, "moe.down.A"); norm_squared(g.moe.grouped.down->B, "moe.down.B"); }
+            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A); norm_squared(g.moe.grouped.gate->B); }
+            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A); norm_squared(g.moe.grouped.up->B); }
+            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A); norm_squared(g.moe.grouped.down->B); }
         } else {
             for (const auto& expert : g.moe.experts) {
-                if (expert.gate.has_value()) { norm_squared(expert.gate->A, "exp.gate.A"); norm_squared(expert.gate->B, "exp.gate.B"); }
-                if (expert.up.has_value()) { norm_squared(expert.up->A, "exp.up.A"); norm_squared(expert.up->B, "exp.up.B"); }
-                if (expert.down.has_value()) { norm_squared(expert.down->A, "exp.down.A"); norm_squared(expert.down->B, "exp.down.B"); }
-                if (expert.down.has_value()) { norm_squared(expert.down->A, "exp.down.A"); norm_squared(expert.down->B, "exp.down.B"); }
+                if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
+                if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
+                if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
             }
         }
 
-        if (g.router.has_value()) { norm_squared(g.router->A, "router.A"); norm_squared(g.router->B, "router.B"); }
-    }
-
-    if (!debug_printed && !is_capturing) {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::vector<float> h_buf(buf.nelem());
-        CUDA_CHECK(cudaMemcpy(h_buf.data(), buf.Data, buf.nelem() * sizeof(float), cudaMemcpyDeviceToHost));
-        double total = 0;
-        for (int i = 0; i < (int)h_buf.size() - 2; ++i) total += h_buf[i];
-        fprintf(stderr, "[DEBUG norm] grad_count=%d null_count=%d sum_of_partials=%g buf_nelem=%ld\n",
-                grad_count, null_count, total, buf.nelem());
-        debug_printed = true;
+        if (g.router.has_value()) { norm_squared(g.router->A); norm_squared(g.router->B); }
     }
 
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);

@@ -172,49 +172,24 @@ const AttrValue* find_key(const AttrMap* map, const std::string& key) {
 }
 
 bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name) {
-    std::string block_type;
-    return parse_block_param_with_type(name, layer_idx, param_name, block_type);
-}
-
-bool parse_block_param_with_type(std::string_view name, int& layer_idx, std::string& param_name,
-                                  std::string& block_type) {
     auto dot = name.find('.');
     if (dot == std::string_view::npos) return false;
     auto prefix = name.substr(0, dot);
     auto rest = name.substr(dot + 1);
 
-    // Match patterns: blocks[N], mamba_blocks[N], attn_blocks[N], mlp_blocks[N], moe_blocks[N]
-    // Look for any XXX_blocks[ or just blocks[ pattern
-    auto bracket = prefix.find("blocks[");
-    if (bracket != std::string_view::npos) {
-        auto close = prefix.find(']', bracket);
+    if (prefix.find("blocks[") == 0) {
+        auto close = prefix.find(']');
         if (close == std::string_view::npos) return false;
-        // Extract index from between [ and ]
-        auto idx_start = bracket + 7;  // length of "blocks["
-        auto idx_str = prefix.substr(idx_start, close - idx_start);
+        auto idx_str = prefix.substr(7, close - 7);
         try {
             layer_idx = std::stoi(std::string(idx_str));
         } catch (...) {
             return false;
         }
         param_name = std::string(rest);
-
-        // Extract block type from prefix (e.g., "mamba_blocks" -> "mamba")
-        if (bracket > 0) {
-            // Extract everything before "blocks[" but remove trailing underscore
-            auto type_part = prefix.substr(0, bracket);
-            if (!type_part.empty() && type_part.back() == '_') {
-                type_part = type_part.substr(0, type_part.size() - 1);
-            }
-            block_type = std::string(type_part);
-        } else {
-            // Just "blocks[N]" - no specific type
-            block_type.clear();
-        }
         return true;
     }
 
-    // Match pattern: blocks.<idx>.field (legacy format)
     if (prefix == "blocks") {
         auto idx_str = name.substr(dot + 1);
         auto dot2 = idx_str.find('.');
@@ -225,7 +200,6 @@ bool parse_block_param_with_type(std::string_view name, int& layer_idx, std::str
             return false;
         }
         param_name = std::string(idx_str.substr(dot2 + 1));
-        block_type.clear();
         return true;
     }
 
