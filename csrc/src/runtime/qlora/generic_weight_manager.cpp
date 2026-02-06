@@ -239,8 +239,18 @@ void GenericWeightManager::quantize_expert_slice(
     const int num_experts = full.M / per_expert_M;
     const long per_expert_elems = static_cast<long>(per_expert_M) * K;
 
-    // Verify expert boundaries align with block boundaries
-    if (per_expert_elems % full.block_size != 0) {
+    // Verify expert boundaries align with block boundaries.
+    // For 1D block formats (BnB NF4): total elements per expert must be block-aligned.
+    // For 2D block formats (FP8): expert rows must align with block rows, since scales
+    // are stored as a 2D grid (ceil(M/bs) x ceil(K/bs)).
+    if (full.format == QuantFormat::FP8_PER_BLOCK) {
+        if (per_expert_M % full.block_size != 0) {
+            throw std::runtime_error(
+                fmt::format("GenericWeightManager: per_expert_M ({}) not divisible by "
+                           "block_size ({}) for FP8 2D-block weight '{}'",
+                           per_expert_M, full.block_size, name));
+        }
+    } else if (per_expert_elems % full.block_size != 0) {
         throw std::runtime_error(
             fmt::format("GenericWeightManager: expert elements ({}) not divisible by "
                        "block_size ({}) for '{}'", per_expert_elems, full.block_size, name));

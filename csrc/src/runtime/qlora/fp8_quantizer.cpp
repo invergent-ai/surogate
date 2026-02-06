@@ -54,8 +54,11 @@ void FP8Quantizer::allocate_storage(
     TensorAllocator& allocator,
     EAllocationType alloc_type,
     const std::string& name) {
-    const long num_elements = static_cast<long>(M) * K;
-    const long num_blocks = (num_elements + mBlockSize - 1) / mBlockSize;
+    // The per-block kernel uses 2D tiles of (block_size x block_size).
+    // Scale count = ceil(M/block_size) * ceil(K/block_size), NOT ceil(M*K/block_size).
+    const long scale_rows = (static_cast<long>(M) + mBlockSize - 1) / mBlockSize;
+    const long scale_cols = (static_cast<long>(K) + mBlockSize - 1) / mBlockSize;
+    const long num_scales = scale_rows * scale_cols;
 
     output.M = M;
     output.K = K;
@@ -70,20 +73,22 @@ void FP8Quantizer::allocate_storage(
         alloc_type,
         {static_cast<long>(M), static_cast<long>(K)});
 
-    // Per-block FP32 scales
+    // Per-block FP32 scales (2D tile layout, flattened)
     output.scales = allocator.allocate(
         ETensorDType::FP32,
         fmt::format("{}.block_scales", name).c_str(),
         alloc_type,
-        {num_blocks});
+        {num_scales});
 }
 
 size_t FP8Quantizer::estimate_storage_bytes(int M, int K) const {
     const long num_elements = static_cast<long>(M) * K;
-    const long num_blocks = (num_elements + mBlockSize - 1) / mBlockSize;
+    const long scale_rows = (static_cast<long>(M) + mBlockSize - 1) / mBlockSize;
+    const long scale_cols = (static_cast<long>(K) + mBlockSize - 1) / mBlockSize;
+    const long num_scales = scale_rows * scale_cols;
 
     size_t total = static_cast<size_t>(num_elements);          // FP8 data (1 byte each)
-    total += static_cast<size_t>(num_blocks) * sizeof(float);  // FP32 block scales
+    total += static_cast<size_t>(num_scales) * sizeof(float);  // FP32 block scales (2D tiles)
 
     return total;
 }
