@@ -51,6 +51,7 @@ enum class CompiledOpType : std::uint8_t {
     BiasAdd,
     SwiGLU,
     Silu,
+    Relu2,
     Mul,
     MatmulSwiGLU,
     QKVQKNormRoPE,
@@ -63,6 +64,7 @@ enum class CompiledOpType : std::uint8_t {
     MoESigmoid,
     MoETopK,
     MoEPermute,
+    MoEGroupedGemm,
     MoEGroupedGemmGateUp,
     MoEGroupedGemmDown,
     MoEUnpermute,
@@ -73,6 +75,7 @@ enum class CompiledOpType : std::uint8_t {
     BiasAddBackward,
     SwiGLUBackward,
     SiluBackward,
+    Relu2Backward,
     MulBackward,
     MatmulSwiGLUBackward,
     RoPEBackward,
@@ -88,9 +91,24 @@ enum class CompiledOpType : std::uint8_t {
     MoESigmoidBackward,
     MoETopKBackward,
     MoEPermuteBackward,
+    MoEGroupedGemmBackward,
     MoEGroupedGemmGateUpBackward,
     MoEGroupedGemmDownBackward,
     MoEUnpermuteBackward,
+    // Mamba/SSM forward operations
+    MambaSplitProj,
+    MambaConv1d,
+    MambaSplitConvOut,
+    MambaSsmScan,
+    MambaGatedRMSNorm,
+    MambaOutProj,
+    // Mamba/SSM backward operations
+    MambaSplitProjBackward,
+    MambaConv1dBackward,
+    MambaSplitConvOutBackward,
+    MambaSsmScanBackward,
+    MambaGatedRMSNormBackward,
+    MambaOutProjBackward,
     // Sentinel
     Unknown
 };
@@ -137,6 +155,21 @@ struct CompiledAttrs {
     // MoE-specific
     int top_k = 0;
     bool normalize_weights = true;
+
+    // Mamba/SSM-specific
+    int mamba_num_heads = 0;
+    int mamba_head_dim = 0;
+    int ssm_state_size = 0;
+    int n_groups = 0;
+    int conv_kernel = 4;
+    int chunk_size = 256;
+    int intermediate_size = 0;
+    int conv_dim = 0;
+    float dt_min = 0.001f;
+    float dt_max = 0.1f;
+    bool dt_softplus = true;
+    bool use_conv_bias = true;
+    std::string activation;  // for mamba_conv1d (e.g., "silu")
 };
 
 // ============================================================================

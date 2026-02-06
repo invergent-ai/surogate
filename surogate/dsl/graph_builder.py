@@ -915,6 +915,276 @@ class GraphBuilder:
         return self._make_output(out)
 
     # =========================================================================
+    # Mamba2 / SSM Operations
+    # =========================================================================
+
+    def mamba_conv1d(
+        self,
+        x: str | GraphRef,
+        weight: str | GraphRef,
+        bias: str | GraphRef | None = None,
+        *,
+        activation: str = "silu",
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Causal 1D convolution for Mamba.
+
+        Args:
+            x: Input tensor [B, T, D_conv]
+            weight: Conv weight [D_conv, kernel_size]
+            bias: Optional conv bias [D_conv]
+            activation: Activation function ("silu" or "swish")
+
+        Returns:
+            Convolved output [B, T, D_conv]
+        """
+        out = out_name or self._fresh_name("mamba_conv")
+        inputs = [self._resolve_input(x), self._resolve_input(weight)]
+        if bias is not None:
+            inputs.append(self._resolve_input(bias))
+        self._add_node(GraphNode(
+            op="mamba_conv1d",
+            inputs=inputs,
+            outputs=[out],
+            attrs={"activation": activation},
+        ))
+        return self._make_output(out)
+
+    def mamba_ssm_scan(
+        self,
+        hidden_states: str | GraphRef,
+        dt: str | GraphRef,
+        A_log: str | GraphRef,
+        B: str | GraphRef,
+        C: str | GraphRef,
+        D: str | GraphRef,
+        *,
+        dt_bias: str | GraphRef | None = None,
+        dt_softplus: bool = True,
+        dt_min: float = 0.0,
+        dt_max: float = float("inf"),
+        chunk_size: int = 256,
+        out_name: str | None = None,
+        state_name: str | None = None,
+    ) -> tuple[GraphRef, GraphRef]:
+        """Mamba2 State Space Model scan.
+
+        Args:
+            hidden_states: Input [B, T, H, D]
+            dt: Time step [B, T, H]
+            A_log: Log of state decay [H]
+            B: Input-to-state [B, T, G, N]
+            C: State-to-output [B, T, G, N]
+            D: Skip connection [H]
+            dt_bias: Time step bias [H]
+            dt_softplus: Apply softplus to dt
+            dt_min, dt_max: Time step clipping
+            chunk_size: Chunk size for scan
+
+        Returns:
+            (output, final_state): SSM output and final state
+        """
+        out = out_name or self._fresh_name("ssm_out")
+        state = state_name or self._fresh_name("ssm_state")
+        inputs = [
+            self._resolve_input(hidden_states),
+            self._resolve_input(dt),
+            self._resolve_input(A_log),
+            self._resolve_input(B),
+            self._resolve_input(C),
+            self._resolve_input(D),
+        ]
+        if dt_bias is not None:
+            inputs.append(self._resolve_input(dt_bias))
+        self._add_node(GraphNode(
+            op="mamba_ssm_scan",
+            inputs=inputs,
+            outputs=[out, state],
+            attrs={
+                "dt_softplus": dt_softplus,
+                "dt_min": dt_min,
+                "dt_max": dt_max,
+                "chunk_size": chunk_size,
+            },
+        ))
+        return self._make_outputs([out, state])
+
+    def mamba_gated_rmsnorm(
+        self,
+        x: str | GraphRef,
+        gate: str | GraphRef,
+        weight: str | GraphRef,
+        *,
+        eps: float = 1e-5,
+        group_size: int = 0,
+        norm_before_gate: bool = False,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Gated RMSNorm for Mamba2.
+
+        Args:
+            x: Input tensor
+            gate: Gate tensor
+            weight: RMSNorm weight
+            eps: Epsilon for numerical stability
+            group_size: Group size for normalization (0 = full dim)
+            norm_before_gate: If True, normalize before gating
+
+        Returns:
+            Gated normalized output
+        """
+        out = out_name or self._fresh_name("gated_norm")
+        self._add_node(GraphNode(
+            op="mamba_gated_rmsnorm",
+            inputs=[
+                self._resolve_input(x),
+                self._resolve_input(gate),
+                self._resolve_input(weight),
+            ],
+            outputs=[out],
+            attrs={
+                "eps": eps,
+                "group_size": group_size,
+                "norm_before_gate": norm_before_gate,
+            },
+        ))
+        return self._make_output(out)
+
+    def mamba_split_proj(
+        self,
+        projected: str | GraphRef,
+        *,
+        intermediate_size: int,
+        conv_dim: int,
+        num_heads: int,
+        gate_name: str | None = None,
+        conv_input_name: str | None = None,
+        dt_name: str | None = None,
+    ) -> tuple[GraphRef, GraphRef, GraphRef]:
+        """Split Mamba2 input projection into gate, conv_input, dt.
+
+        Args:
+            projected: Input projection output [B, T, P]
+            intermediate_size: Gate size
+            conv_dim: Conv input size
+            num_heads: Number of heads (dt size)
+
+        Returns:
+            (gate, conv_input, dt)
+        """
+        gate = gate_name or self._fresh_name("gate")
+        conv_input = conv_input_name or self._fresh_name("conv_input")
+        dt = dt_name or self._fresh_name("dt")
+        self._add_node(GraphNode(
+            op="mamba_split_proj",
+            inputs=[self._resolve_input(projected)],
+            outputs=[gate, conv_input, dt],
+            attrs={
+                "intermediate_size": intermediate_size,
+                "conv_dim": conv_dim,
+                "num_heads": num_heads,
+            },
+        ))
+        return self._make_outputs([gate, conv_input, dt])
+
+    def mamba_split_conv_out(
+        self,
+        conv_out: str | GraphRef,
+        *,
+        intermediate_size: int,
+        groups_state_size: int,
+        hidden_name: str | None = None,
+        B_name: str | None = None,
+        C_name: str | None = None,
+    ) -> tuple[GraphRef, GraphRef, GraphRef]:
+        """Split conv output into hidden_states, B, C.
+
+        Args:
+            conv_out: Conv output [B, T, conv_dim]
+            intermediate_size: Hidden states size
+            groups_state_size: n_groups * ssm_state_size
+
+        Returns:
+            (hidden_states, B, C)
+        """
+        hidden = hidden_name or self._fresh_name("hidden")
+        B_out = B_name or self._fresh_name("ssm_B")
+        C_out = C_name or self._fresh_name("ssm_C")
+        self._add_node(GraphNode(
+            op="mamba_split_conv_out",
+            inputs=[self._resolve_input(conv_out)],
+            outputs=[hidden, B_out, C_out],
+            attrs={
+                "intermediate_size": intermediate_size,
+                "groups_state_size": groups_state_size,
+            },
+        ))
+        return self._make_outputs([hidden, B_out, C_out])
+
+    def mamba_combine_scan(
+        self,
+        projected_states: str | GraphRef,
+        conv_weight: str | GraphRef,
+        conv_bias: str | GraphRef | None,
+        dt_bias: str | GraphRef,
+        A_log: str | GraphRef,
+        D: str | GraphRef,
+        norm_weight: str | GraphRef,
+        out_proj_weight: str | GraphRef,
+        out_proj_bias: str | GraphRef | None,
+        *,
+        chunk_size: int = 256,
+        num_heads: int,
+        head_dim: int,
+        n_groups: int,
+        intermediate_size: int,
+        ssm_state_size: int,
+        eps: float = 1e-5,
+        activation: str = "silu",
+        dt_min: float = 0.0,
+        dt_max: float = float("inf"),
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Fused Mamba2 forward: conv + SSM scan + gated norm + out proj."""
+        out = out_name or self._fresh_name("mamba_out")
+        inputs = [
+            self._resolve_input(projected_states),
+            self._resolve_input(conv_weight),
+        ]
+        if conv_bias is not None:
+            inputs.append(self._resolve_input(conv_bias))
+        else:
+            inputs.append("")  # Placeholder for optional bias
+        inputs.extend([
+            self._resolve_input(dt_bias),
+            self._resolve_input(A_log),
+            self._resolve_input(D),
+            self._resolve_input(norm_weight),
+            self._resolve_input(out_proj_weight),
+        ])
+        if out_proj_bias is not None:
+            inputs.append(self._resolve_input(out_proj_bias))
+
+        self._add_node(GraphNode(
+            op="mamba_combine_scan",
+            inputs=inputs,
+            outputs=[out],
+            attrs={
+                "chunk_size": chunk_size,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+                "n_groups": n_groups,
+                "intermediate_size": intermediate_size,
+                "ssm_state_size": ssm_state_size,
+                "eps": eps,
+                "activation": activation,
+                "dt_min": dt_min,
+                "dt_max": dt_max,
+            },
+        ))
+        return self._make_output(out)
+
+    # =========================================================================
     # Custom Operations
     # =========================================================================
 

@@ -1788,6 +1788,11 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
                                    int Bsz, int T, int Ddim, int dstate,
                                    int groups, int n_chunks, cudaStream_t stream);
 
+// Simple element-wise multiply for gated operations (e.g., gated RMSNorm)
+void elementwise_mul(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long total, cudaStream_t stream);
+void elementwise_mul(half* out, const half* a, const half* b, long total, cudaStream_t stream);
+void elementwise_mul(float* out, const float* a, const float* b, long total, cudaStream_t stream);
+
 // ----------------------------------------------------------------------------
 // LoRA Dropout
 // ----------------------------------------------------------------------------

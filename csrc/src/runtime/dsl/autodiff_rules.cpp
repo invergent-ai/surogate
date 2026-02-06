@@ -362,6 +362,31 @@ std::vector<Operation> gelu_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// ReLU² backward rule
+// Forward: y = relu2(x) = x * relu(x) = x * max(0, x)
+// For x <= 0: y = 0
+// For x > 0:  y = x²
+// Backward: dx = dy * 2 * relu(x)
+// -----------------------------------------------------------------------------
+std::vector<Operation> relu2_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string x = fwd.inputs[0];
+
+        ops.push_back(make_operation(
+            "relu2_backward_" + std::to_string(ctx.op_counter++),
+            "relu2_backward",
+            "relu2_backward",
+            {ctx.d_output, saved_ref(x)},
+            {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // SwiGLU backward rule
 // Forward: out = swiglu(gate, up) = silu(gate) * up
 // Backward: d_gate, d_up = swiglu_backward(d_out, gate, up)
@@ -919,6 +944,36 @@ std::vector<Operation> moe_grouped_gemm_down_backward(const BackwardRuleContext&
 }
 
 // -----------------------------------------------------------------------------
+// MoE Grouped GEMM backward rule (generic version without fused activation)
+// Forward: out = moe_grouped_gemm(inp, weights, scatter_indices)
+// Backward: d_inp = moe_grouped_gemm_backward(d_out, inp, weights, scatter_indices)
+// Used for Nemotron-H MoE blocks that use relu2 activation instead of swiglu
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_grouped_gemm_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string inp = fwd.inputs[0];
+        std::string weights = fwd.inputs[1];
+        std::string scatter_indices = fwd.inputs[2];
+
+        std::string inp_ref = ctx.is_param(inp) ? inp : saved_ref(inp);
+        std::string weights_ref = ctx.is_param(weights) ? weights : saved_ref(weights);
+        std::string scatter_ref = saved_ref(scatter_indices);
+
+        ops.push_back(make_operation(
+            "moe_grouped_gemm_backward_" + std::to_string(ctx.op_counter++),
+            "moe_grouped_gemm_backward",
+            "moe_grouped_gemm_backward",
+            {ctx.d_output, inp_ref, weights_ref, scatter_ref},
+            {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // MoE Unpermute backward rule
 // Forward: out = moe_unpermute(expert_out, routing_weights, scatter_indices, top_k)
 // Backward: d_expert_out, d_routing_weights = moe_unpermute_backward(...)
@@ -948,6 +1003,204 @@ std::vector<Operation> moe_unpermute_backward(const BackwardRuleContext& ctx) {
     return ops;
 }
 
+// -----------------------------------------------------------------------------
+// Mamba split_proj backward rule
+// Forward: gate, conv_in, delta = mamba_split_proj(projected)
+// Backward: d_projected = mamba_split_proj_backward(d_gate, d_conv_in, d_delta)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_split_proj_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+
+        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "conv_dim", "mamba_num_heads", "mamba_head_dim"});
+
+        // d_outputs[0..2] are the gradients of the 3 forward outputs: gate, conv_in, delta
+        // d_inputs[0] is where to write the gradient of the forward input: projected
+        ops.push_back(make_operation(
+            "mamba_split_proj_backward_" + std::to_string(ctx.op_counter++),
+            "mamba_split_proj_backward",
+            "mamba_split_proj_backward",
+            {ctx.d_outputs[0], ctx.d_outputs[1], ctx.d_outputs[2]},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Mamba conv1d backward rule
+// Forward: out = mamba_conv1d(x, weight, bias)
+// Backward: dx, dweight, dbias = mamba_conv1d_backward(d_out, x, weight)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_conv1d_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string x = fwd.inputs[0];
+    std::string weight = fwd.inputs[1];
+    std::string bias = (fwd.inputs.size() > 2) ? fwd.inputs[2] : "";
+
+    std::string x_ref = ctx.is_param(x) ? x : saved_ref(x);
+    std::string weight_ref = ctx.is_param(weight) ? weight : saved_ref(weight);
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    if (fwd.inputs.size() > 2 && ctx.needs_grad(2)) {
+        outputs.push_back(ctx.d_inputs[2]);
+    }
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"activation"});
+
+    ops.push_back(make_operation(
+        "mamba_conv1d_backward_" + std::to_string(ctx.op_counter++),
+        "mamba_conv1d_backward",
+        "mamba_conv1d_backward",
+        {ctx.d_output, x_ref, weight_ref},
+        outputs,
+        attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Mamba split_conv_out backward rule
+// Forward: u, B, C = mamba_split_conv_out(conv_out)
+// Backward: d_conv_out = mamba_split_conv_out_backward(d_u, d_B, d_C)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_split_conv_out_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+
+        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "n_groups", "ssm_state_size"});
+
+        // d_outputs[0..2] are the gradients of the 3 forward outputs: u, B, C
+        // d_inputs[0] is where to write the gradient of the forward input: conv_out
+        ops.push_back(make_operation(
+            "mamba_split_conv_out_backward_" + std::to_string(ctx.op_counter++),
+            "mamba_split_conv_out_backward",
+            "mamba_split_conv_out_backward",
+            {ctx.d_outputs[0], ctx.d_outputs[1], ctx.d_outputs[2]},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Mamba SSM scan backward rule
+// Forward: out, ssm_state = mamba_ssm_scan(u, delta, A_log, B, C, D_param, dt_bias)
+// Backward: du, ddelta, dA_log, dB, dC, dD, ddelta_bias = mamba_ssm_scan_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_ssm_scan_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string u = fwd.inputs[0];
+    std::string delta = fwd.inputs[1];
+    std::string A_log = fwd.inputs[2];
+    std::string B_ssm = fwd.inputs[3];
+    std::string C_ssm = fwd.inputs[4];
+    std::string D_param = fwd.inputs[5];
+    std::string dt_bias = (fwd.inputs.size() > 6) ? fwd.inputs[6] : "";
+
+    std::string u_ref = ctx.is_param(u) ? u : saved_ref(u);
+    std::string delta_ref = ctx.is_param(delta) ? delta : saved_ref(delta);
+    std::string A_log_ref = ctx.is_param(A_log) ? A_log : saved_ref(A_log);
+    std::string B_ssm_ref = ctx.is_param(B_ssm) ? B_ssm : saved_ref(B_ssm);
+    std::string C_ssm_ref = ctx.is_param(C_ssm) ? C_ssm : saved_ref(C_ssm);
+    std::string D_param_ref = ctx.is_param(D_param) ? D_param : saved_ref(D_param);
+    std::string dt_bias_ref = dt_bias.empty() ? "" : (ctx.is_param(dt_bias) ? dt_bias : saved_ref(dt_bias));
+
+    // ssm_state is the second output from forward, referenced via saved
+    std::string ssm_state_ref = saved_ref(fwd.outputs[1]);
+
+    std::vector<std::string> inputs = {
+        ctx.d_output,  // d_out
+        u_ref, delta_ref, A_log_ref, B_ssm_ref, C_ssm_ref, D_param_ref,
+        dt_bias_ref, ssm_state_ref
+    };
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // du
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // ddelta
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // dA_log
+    outputs.push_back(ctx.needs_grad(3) ? ctx.d_inputs[3] : "");  // dB
+    outputs.push_back(ctx.needs_grad(4) ? ctx.d_inputs[4] : "");  // dC
+    outputs.push_back(ctx.needs_grad(5) ? ctx.d_inputs[5] : "");  // dD
+    if (fwd.inputs.size() > 6 && ctx.needs_grad(6)) {
+        outputs.push_back(ctx.d_inputs[6]);  // ddelta_bias
+    }
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"mamba_num_heads", "mamba_head_dim", "chunk_size"});
+
+    ops.push_back(make_operation(
+        "mamba_ssm_scan_backward_" + std::to_string(ctx.op_counter++),
+        "mamba_ssm_scan_backward",
+        "mamba_ssm_scan_backward",
+        inputs,
+        outputs,
+        attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Mamba gated RMSNorm backward rule
+// Forward: out = mamba_gated_rmsnorm(x, gate, weight)
+// Backward: dx, dgate, dweight = mamba_gated_rmsnorm_backward(d_out, x, gate, weight, rstd, normed)
+// Note: rstd and normed are saved internally by the forward op with op.op_id suffix
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string x = fwd.inputs[0];
+    std::string gate = fwd.inputs[1];
+    std::string weight = fwd.inputs[2];
+
+    std::string x_ref = ctx.is_param(x) ? x : saved_ref(x);
+    std::string gate_ref = ctx.is_param(gate) ? gate : saved_ref(gate);
+    std::string weight_ref = ctx.is_param(weight) ? weight : saved_ref(weight);
+
+    // rstd and normed are saved with op_id prefix
+    std::string rstd_ref = "saved." + fwd.id + ".rstd";
+    std::string normed_ref = "saved." + fwd.id + ".normed";
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // dx
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // dgate
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // dweight
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups"});
+
+    ops.push_back(make_operation(
+        "mamba_gated_rmsnorm_backward_" + std::to_string(ctx.op_counter++),
+        "mamba_gated_rmsnorm_backward",
+        "mamba_gated_rmsnorm_backward",
+        {ctx.d_output, x_ref, gate_ref, weight_ref, rstd_ref, normed_ref},
+        outputs,
+        attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Mamba out_proj backward rule
+// Forward: out = mamba_out_proj(inp, weight)
+// This is just a matmul, so we delegate to matmul backward
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_out_proj_backward(const BackwardRuleContext& ctx) {
+    // Delegate to matmul backward since mamba_out_proj is just a matmul
+    return matmul_backward(ctx);
+}
+
 } // anonymous namespace
 
 // -----------------------------------------------------------------------------
@@ -974,6 +1227,7 @@ void register_builtin_backward_rules() {
     // Activations
     reg.register_rule("silu", silu_backward);
     reg.register_rule("gelu", gelu_backward);
+    reg.register_rule("relu2", relu2_backward);
     reg.register_rule("swiglu", swiglu_backward);
     reg.register_rule("bias_add", bias_add_backward);
 
@@ -1006,10 +1260,19 @@ void register_builtin_backward_rules() {
     reg.register_rule("moe_permute", moe_permute_backward);
     reg.register_rule("moe_grouped_gemm_gate_up", moe_grouped_gemm_gate_up_backward);
     reg.register_rule("moe_grouped_gemm_down", moe_grouped_gemm_down_backward);
+    reg.register_rule("moe_grouped_gemm", moe_grouped_gemm_backward);
     reg.register_rule("moe_unpermute", moe_unpermute_backward);
 
     // Compound ops (handled as units)
     reg.register_rule("StackedBlocks", stacked_blocks_backward);
+
+    // Mamba/SSM ops
+    reg.register_rule("mamba_split_proj", mamba_split_proj_backward);
+    reg.register_rule("mamba_conv1d", mamba_conv1d_backward);
+    reg.register_rule("mamba_split_conv_out", mamba_split_conv_out_backward);
+    reg.register_rule("mamba_ssm_scan", mamba_ssm_scan_backward);
+    reg.register_rule("mamba_gated_rmsnorm", mamba_gated_rmsnorm_backward);
+    reg.register_rule("mamba_out_proj", mamba_out_proj_backward);
 }
 
 } // namespace dsl

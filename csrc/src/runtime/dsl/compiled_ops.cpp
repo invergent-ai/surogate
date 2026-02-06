@@ -218,6 +218,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::BiasAdd: return "bias_add";
         case CompiledOpType::SwiGLU: return "swiglu";
         case CompiledOpType::Silu: return "silu";
+        case CompiledOpType::Relu2: return "relu2";
         case CompiledOpType::Mul: return "mul";
         case CompiledOpType::MatmulSwiGLU: return "matmul_swiglu";
         case CompiledOpType::QKVQKNormRoPE: return "qkv_qk_norm_rope";
@@ -230,6 +231,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MoESigmoid: return "moe_sigmoid";
         case CompiledOpType::MoETopK: return "moe_topk";
         case CompiledOpType::MoEPermute: return "moe_permute";
+        case CompiledOpType::MoEGroupedGemm: return "moe_grouped_gemm";
         case CompiledOpType::MoEGroupedGemmGateUp: return "moe_grouped_gemm_gate_up";
         case CompiledOpType::MoEGroupedGemmDown: return "moe_grouped_gemm_down";
         case CompiledOpType::MoEUnpermute: return "moe_unpermute";
@@ -240,6 +242,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::BiasAddBackward: return "bias_add_backward";
         case CompiledOpType::SwiGLUBackward: return "swiglu_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
+        case CompiledOpType::Relu2Backward: return "relu2_backward";
         case CompiledOpType::MulBackward: return "mul_backward";
         case CompiledOpType::MatmulSwiGLUBackward: return "matmul_swiglu_backward";
         case CompiledOpType::RoPEBackward: return "rope_backward";
@@ -255,9 +258,24 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MoESigmoidBackward: return "moe_sigmoid_backward";
         case CompiledOpType::MoETopKBackward: return "moe_topk_backward";
         case CompiledOpType::MoEPermuteBackward: return "moe_permute_backward";
+        case CompiledOpType::MoEGroupedGemmBackward: return "moe_grouped_gemm_backward";
         case CompiledOpType::MoEGroupedGemmGateUpBackward: return "moe_grouped_gemm_gate_up_backward";
         case CompiledOpType::MoEGroupedGemmDownBackward: return "moe_grouped_gemm_down_backward";
         case CompiledOpType::MoEUnpermuteBackward: return "moe_unpermute_backward";
+        // Mamba/SSM forward
+        case CompiledOpType::MambaSplitProj: return "mamba_split_proj";
+        case CompiledOpType::MambaConv1d: return "mamba_conv1d";
+        case CompiledOpType::MambaSplitConvOut: return "mamba_split_conv_out";
+        case CompiledOpType::MambaSsmScan: return "mamba_ssm_scan";
+        case CompiledOpType::MambaGatedRMSNorm: return "mamba_gated_rmsnorm";
+        case CompiledOpType::MambaOutProj: return "mamba_out_proj";
+        // Mamba/SSM backward
+        case CompiledOpType::MambaSplitProjBackward: return "mamba_split_proj_backward";
+        case CompiledOpType::MambaConv1dBackward: return "mamba_conv1d_backward";
+        case CompiledOpType::MambaSplitConvOutBackward: return "mamba_split_conv_out_backward";
+        case CompiledOpType::MambaSsmScanBackward: return "mamba_ssm_scan_backward";
+        case CompiledOpType::MambaGatedRMSNormBackward: return "mamba_gated_rmsnorm_backward";
+        case CompiledOpType::MambaOutProjBackward: return "mamba_out_proj_backward";
         case CompiledOpType::Unknown: return "unknown";
     }
     return "unknown";
@@ -1460,6 +1478,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::Silu:
                     dispatch_silu(op);
                     break;
+                case CompiledOpType::Relu2:
+                    dispatch_relu2(op);
+                    break;
                 case CompiledOpType::Mul:
                     dispatch_mul(op);
                     break;
@@ -1494,6 +1515,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::MoEPermute:
                     dispatch_moe_permute(op);
                     break;
+                case CompiledOpType::MoEGroupedGemm:
+                    dispatch_moe_grouped_gemm(op);
+                    break;
                 case CompiledOpType::MoEGroupedGemmGateUp:
                     dispatch_moe_grouped_gemm_gate_up(op);
                     break;
@@ -1502,6 +1526,25 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::MoEUnpermute:
                     dispatch_moe_unpermute(op);
+                    break;
+                // Mamba/SSM forward operations
+                case CompiledOpType::MambaSplitProj:
+                    dispatch_mamba_split_proj(op);
+                    break;
+                case CompiledOpType::MambaConv1d:
+                    dispatch_mamba_conv1d(op);
+                    break;
+                case CompiledOpType::MambaSplitConvOut:
+                    dispatch_mamba_split_conv_out(op);
+                    break;
+                case CompiledOpType::MambaSsmScan:
+                    dispatch_mamba_ssm_scan(op);
+                    break;
+                case CompiledOpType::MambaGatedRMSNorm:
+                    dispatch_mamba_gated_rmsnorm(op);
+                    break;
+                case CompiledOpType::MambaOutProj:
+                    dispatch_mamba_out_proj(op, hook);
                     break;
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
@@ -2121,6 +2164,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::SiluBackward:
                     dispatch_silu_backward(op);
                     break;
+                case CompiledOpType::Relu2Backward:
+                    dispatch_relu2_backward(op);
+                    break;
                 case CompiledOpType::MulBackward:
                     dispatch_mul_backward(op);
                     break;
@@ -2174,6 +2220,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MoEPermuteBackward:
                     dispatch_moe_permute_backward(op);
                     break;
+                case CompiledOpType::MoEGroupedGemmBackward:
+                    dispatch_moe_grouped_gemm_backward(op);
+                    break;
                 case CompiledOpType::MoEGroupedGemmGateUpBackward:
                     dispatch_moe_grouped_gemm_gate_up_backward(op);
                     break;
@@ -2189,13 +2238,45 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MoESigmoid:
                 case CompiledOpType::MoETopK:
                 case CompiledOpType::MoEPermute:
+                case CompiledOpType::MoEGroupedGemm:
                 case CompiledOpType::MoEGroupedGemmGateUp:
                 case CompiledOpType::MoEGroupedGemmDown:
                 case CompiledOpType::MoEUnpermute:
                 case CompiledOpType::Silu:
+                case CompiledOpType::Relu2:
                 case CompiledOpType::Mul:
                     // These forward MoE ops may appear in backward graph due to autodiff
                     throw std::runtime_error("CompiledExecutor: MoE forward op in backward graph not yet supported");
+
+                // Mamba/SSM backward operations
+                case CompiledOpType::MambaSplitProjBackward:
+                    dispatch_mamba_split_proj_backward(op);
+                    break;
+                case CompiledOpType::MambaConv1dBackward:
+                    dispatch_mamba_conv1d_backward(op);
+                    break;
+                case CompiledOpType::MambaSplitConvOutBackward:
+                    dispatch_mamba_split_conv_out_backward(op);
+                    break;
+                case CompiledOpType::MambaSsmScanBackward:
+                    dispatch_mamba_ssm_scan_backward(op);
+                    break;
+                case CompiledOpType::MambaGatedRMSNormBackward:
+                    dispatch_mamba_gated_rmsnorm_backward(op);
+                    break;
+                case CompiledOpType::MambaOutProjBackward:
+                    dispatch_mamba_out_proj_backward(op, hook);
+                    break;
+
+                // Mamba forward ops that may appear in backward graph
+                case CompiledOpType::MambaSplitProj:
+                case CompiledOpType::MambaConv1d:
+                case CompiledOpType::MambaSplitConvOut:
+                case CompiledOpType::MambaSsmScan:
+                case CompiledOpType::MambaGatedRMSNorm:
+                case CompiledOpType::MambaOutProj:
+                    // These forward Mamba ops may appear in backward graph due to autodiff
+                    throw std::runtime_error("CompiledExecutor: Mamba forward op in backward graph not yet supported");
 
                 default: {
                     std::ostringstream oss;

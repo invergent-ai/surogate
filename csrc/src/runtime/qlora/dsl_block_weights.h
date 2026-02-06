@@ -97,6 +97,11 @@ struct DslMoEBlock {
         DslRouterWeights router;
         DslExpertGroupWeights experts;
         std::optional<DslExpertWeights> shared_expert;
+
+        // Mamba / SSM weights (for hybrid architectures like Nemotron-H
+        // that interleave MoE and Mamba layers)
+        using MambaWeights = DslDenseBlock::Weights::MambaWeights;
+        std::optional<MambaWeights> mamba;
     };
 };
 

@@ -19,6 +19,14 @@ from .moe import (
     moe_grouped_gemm_gate_up,
     moe_grouped_gemm_down,
 )
+from .mamba import (
+    mamba_conv1d,
+    mamba_ssm_scan,
+    mamba_gated_rmsnorm,
+    mamba_split_proj,
+    mamba_split_conv_out,
+    mamba_combine_scan,
+)
 
 __all__ = [
     # Common
@@ -64,4 +72,11 @@ __all__ = [
     "moe_unpermute",
     "moe_grouped_gemm_gate_up",
     "moe_grouped_gemm_down",
+    # Mamba2 / SSM
+    "mamba_conv1d",
+    "mamba_ssm_scan",
+    "mamba_gated_rmsnorm",
+    "mamba_split_proj",
+    "mamba_split_conv_out",
+    "mamba_combine_scan",
 ]

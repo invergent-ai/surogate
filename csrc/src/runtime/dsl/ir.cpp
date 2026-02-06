@@ -446,6 +446,19 @@ IRFile load_ir_from_json(const nlohmann::json& root) {
             ir.warnings.push_back(warning.get<std::string>());
         }
     }
+    if (root.contains("errors") && root["errors"].is_array()) {
+        for (const auto& err : root["errors"]) {
+            if (err.is_string()) {
+                ir.errors.push_back(err.get<std::string>());
+            } else if (err.is_object()) {
+                std::string msg = err.value("message", "unknown error");
+                if (err.contains("hint") && !err["hint"].is_null()) {
+                    msg += " (Hint: " + err["hint"].get<std::string>() + ")";
+                }
+                ir.errors.push_back(msg);
+            }
+        }
+    }
     if (root.contains("modules")) {
         for (const auto& mod_json : root["modules"]) {
             Module mod;

@@ -34,6 +34,25 @@ const SafeTensorEntry* find_entry_opt(const SafeTensorsReader& reader, std::stri
     return nullptr;
 }
 
+// Hybrid layer type classification
+enum class HybridLayerType { Mamba, MoE, Attention, MLP, Unknown };
+
+// Get the layer type from the hybrid pattern
+// Pattern chars: M = Mamba, E = MoE, * = Attention, - = MLP
+HybridLayerType get_hybrid_layer_type(const std::string& pattern, int layer_idx) {
+    if (pattern.empty() || layer_idx < 0 || static_cast<size_t>(layer_idx) >= pattern.size()) {
+        return HybridLayerType::Unknown;
+    }
+    const char c = pattern[layer_idx];
+    switch (c) {
+        case 'M': return HybridLayerType::Mamba;
+        case 'E': return HybridLayerType::MoE;
+        case '*': return HybridLayerType::Attention;
+        case '-': return HybridLayerType::MLP;
+        default: return HybridLayerType::Unknown;
+    }
+}
+
 template<typename T>
 bool copy_tensor_range_host(const Tensor& t, long offset, long count, std::vector<T>& out) {
     if (!t.Data || offset < 0 || count <= 0) {
@@ -272,7 +291,15 @@ BnBWeightsManager::BnBWeightsManager(const Config& config, TensorAllocator& allo
     // Pre-size the vector but don't allocate GPU memory yet.
     // Each layer's storage will be allocated lazily in load_and_quantize_block()
     // to reduce peak memory during initialization.
-    if (config.qlora_config.is_moe()) {
+    //
+    // For hybrid architectures, we need both vectors since different layers
+    // use different block types (MoE vs Dense/Mamba/Attention).
+    const bool is_hybrid = !config.hybrid_pattern.empty();
+    if (is_hybrid) {
+        // Hybrid: allocate both vectors, layers will use appropriate one
+        mQuantizedBlocks.resize(mConfig.num_layers);
+        mMoEBlocks.resize(mConfig.num_layers);
+    } else if (config.qlora_config.is_moe()) {
         mMoEBlocks.resize(mConfig.num_layers);
     } else {
         mQuantizedBlocks.resize(mConfig.num_layers);
@@ -346,27 +373,42 @@ void BnBWeightsManager::allocate_single_block(int layer_idx) {
 
     auto& block = mQuantizedBlocks[layer_idx];
 
-    // QKV projection: (hidden, (num_q + 2*num_kv) * head_size)
-    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-    allocate_bnb_weight(block.qkv_proj, qkv_out, hidden, "qkv");
+    // Determine layer type for hybrid architectures
+    // Mamba layers don't need attention or MLP weights (they have SSM weights)
+    // MLP layers don't need attention weights
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+    const bool needs_attention = (layer_type != HybridLayerType::Mamba &&
+                                   layer_type != HybridLayerType::MLP &&
+                                   layer_type != HybridLayerType::MoE);
+    const bool needs_mlp = (layer_type != HybridLayerType::Mamba &&
+                            layer_type != HybridLayerType::MoE);
 
-    // Output projection: (hidden, num_q * head_size)
-    allocate_bnb_weight(block.out_proj, hidden, num_q_heads * head_size, "out");
+    // For Mamba layers, we only need layer norms (Mamba-specific weights handled elsewhere)
+    if (needs_attention) {
+        // QKV projection: (hidden, (num_q + 2*num_kv) * head_size)
+        const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+        allocate_bnb_weight(block.qkv_proj, qkv_out, hidden, "qkv");
 
-    // Gate+Up projection: (mlp_up_factor * intermediate, hidden)
-    allocate_bnb_weight(block.gate_up_proj, mlp_M, hidden, "gate_up");
+        // Output projection: (hidden, num_q * head_size)
+        allocate_bnb_weight(block.out_proj, hidden, num_q_heads * head_size, "out");
+    }
 
-    // Down projection: (hidden, intermediate)
-    allocate_bnb_weight(block.down_proj, hidden, intermediate, "down");
+    if (needs_mlp) {
+        // Gate+Up projection: (mlp_up_factor * intermediate, hidden)
+        allocate_bnb_weight(block.gate_up_proj, mlp_M, hidden, "gate_up");
 
-    // Layer norm weights (BF16, not quantized)
+        // Down projection: (hidden, intermediate)
+        allocate_bnb_weight(block.down_proj, hidden, intermediate, "down");
+    }
+
+    // Layer norm weights (BF16, not quantized) - all layer types need these
     block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
                                             EAllocationType::ON_DEVICE, {(long)hidden});
     block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
                                             EAllocationType::ON_DEVICE, {(long)hidden});
 
-    // QK-norm weights (BF16, not quantized) - only for models like Qwen3
-    if (mConfig.use_qk_norm) {
+    // QK-norm weights (BF16, not quantized) - only for models like Qwen3, and only for attention layers
+    if (mConfig.use_qk_norm && needs_attention) {
         block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
                                                    EAllocationType::ON_DEVICE, {(long)head_size});
         block.k_norm_weight = mAllocator->allocate(ETensorDType::BF16, "k_norm",
@@ -485,54 +527,45 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_0, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_1, cudaStreamNonBlocking));
 
-    if (is_moe()) {
-        // MoE path: load experts + router with double-buffering
-        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-            const bool use_buffer_0 = (layer % 2 == 0);
-            cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
+    // Hybrid architecture support: Use pattern to determine loader per layer
+    // Pattern chars: M = Mamba, E = MoE, * = Attention, - = MLP
+    const bool has_hybrid_pattern = !mConfig.hybrid_pattern.empty();
 
-            // Swap buffers
-            Tensor saved_load = mLoadBuffer;
-            Tensor saved_absmax = mAbsmaxBuffer;
+    for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+        const bool use_buffer_0 = (layer % 2 == 0);
+        cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
 
-            if (!use_buffer_0) {
-                mLoadBuffer = load_buffer_2;
-                if (mScaleConfig.double_quant) {
-                    mAbsmaxBuffer = absmax_buffer_2;
-                }
+        // Swap buffers
+        Tensor saved_load = mLoadBuffer;
+        Tensor saved_absmax = mAbsmaxBuffer;
+
+        if (!use_buffer_0) {
+            mLoadBuffer = load_buffer_2;
+            if (mScaleConfig.double_quant) {
+                mAbsmaxBuffer = absmax_buffer_2;
             }
+        }
 
-            // Load and quantize on current stream (GPU work is async)
+        // Determine loader based on layer type (hybrid) or global config
+        HybridLayerType layer_type = HybridLayerType::Unknown;
+        if (has_hybrid_pattern) {
+            layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer);
+        }
+
+        if (layer_type == HybridLayerType::MoE || (!has_hybrid_pattern && is_moe())) {
+            // MoE layer: load router + experts + attention
             load_and_quantize_moe_block(layer, reader, curr_stream);
-
-            // Restore buffers
-            mLoadBuffer = saved_load;
-            mAbsmaxBuffer = saved_absmax;
-        }
-    } else {
-        // Dense path with double-buffering
-        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-            const bool use_buffer_0 = (layer % 2 == 0);
-            cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
-
-            // Swap buffers
-            Tensor saved_load = mLoadBuffer;
-            Tensor saved_absmax = mAbsmaxBuffer;
-
-            if (!use_buffer_0) {
-                mLoadBuffer = load_buffer_2;
-                if (mScaleConfig.double_quant) {
-                    mAbsmaxBuffer = absmax_buffer_2;
-                }
-            }
-
-            // Load and quantize on current stream (GPU work is async)
+        } else if (layer_type == HybridLayerType::Mamba) {
+            // Mamba layer: skip attention, load Mamba-specific weights (handled as dense with skip)
             load_and_quantize_block(layer, reader, curr_stream);
-
-            // Restore buffers
-            mLoadBuffer = saved_load;
-            mAbsmaxBuffer = saved_absmax;
+        } else {
+            // Dense layer (Attention or MLP): load attention + MLP
+            load_and_quantize_block(layer, reader, curr_stream);
         }
+
+        // Restore buffers
+        mLoadBuffer = saved_load;
+        mAbsmaxBuffer = saved_absmax;
     }
 
     // Sync both streams
@@ -712,6 +745,15 @@ void BnBWeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
     const int num_kv_heads = mConfig.num_kv_heads;
     const int head_size = mConfig.head_size;
 
+    // Determine layer type for hybrid architectures
+    // Mamba layers don't have attention weights, MLP layers don't have attention either
+    // In Nemotron-H, Attention layers don't have MLP weights (pure attention blocks)
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+    const bool skip_attention = (layer_type == HybridLayerType::Mamba ||
+                                  layer_type == HybridLayerType::MLP);
+    const bool skip_mlp = (layer_type == HybridLayerType::Mamba ||
+                           layer_type == HybridLayerType::Attention);  // Mamba/Attention have no MLP
+
     auto load_quantized_from_mapping = [&](const std::string& internal_name,
                                            BnBBlockQuantizedWeight& dest,
                                            int M, int K) -> bool {
@@ -786,134 +828,140 @@ void BnBWeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
     };
 
     // Load Q, K, V projections (need to handle both fused and separate)
-    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-    const std::string qkv_internal = fmt::format("blocks[{}].qkv_weight", layer_idx);
-    bool qkv_loaded = load_quantized_from_mapping(qkv_internal, block.qkv_proj, qkv_out, hidden);
-    if (!qkv_loaded) {
-        const std::string qkv_name = pick_attn_name(prefix + ".self_attn.qkv_proj.weight",
-                                                    prefix + ".mixer.qkv_proj.weight");
-        if (find_entry_opt(reader, qkv_name)) {
-            // Fused QKV
-            load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
-        } else {
-            // Separate Q, K, V - load into parts of mLoadBuffer and then quantize
-            const int q_out = num_q_heads * head_size;
-            const int kv_out = num_kv_heads * head_size;
-
-            // Set up load buffer for fused QKV
-            mLoadBuffer.Sizes[0] = qkv_out;
-            mLoadBuffer.Sizes[1] = hidden;
-            mLoadBuffer.Rank = 2;
-
-            // Load Q into the first part
-            Tensor q_view = mLoadBuffer;
-            q_view.Sizes[0] = q_out;
-            const std::string q_name = pick_attn_name(prefix + ".self_attn.q_proj.weight",
-                                                      prefix + ".mixer.q_proj.weight");
-            if (const auto* entry = find_entry_opt(reader, q_name)) {
-                entry->read_tensor(q_view, true);
-            }
-
-            // Load K into the middle part
-            Tensor k_view = mLoadBuffer;
-            k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
-            k_view.Sizes[0] = kv_out;
-            const std::string k_name = pick_attn_name(prefix + ".self_attn.k_proj.weight",
-                                                      prefix + ".mixer.k_proj.weight");
-            if (const auto* entry = find_entry_opt(reader, k_name)) {
-                entry->read_tensor(k_view, true);
-            }
-
-            // Load V into the last part
-            Tensor v_view = mLoadBuffer;
-            v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
-            v_view.Sizes[0] = kv_out;
-            const std::string v_name = pick_attn_name(prefix + ".self_attn.v_proj.weight",
-                                                      prefix + ".mixer.v_proj.weight");
-            if (const auto* entry = find_entry_opt(reader, v_name)) {
-                entry->read_tensor(v_view, true);
-            }
-
-            // Restore full shape and quantize
-            mLoadBuffer.Sizes[0] = qkv_out;
-            quantize_and_store(block.qkv_proj, mLoadBuffer, qkv_out, hidden, stream);
-        }
-    }
-
-    // Output projection
-    const std::string out_internal = fmt::format("blocks[{}].out_weight", layer_idx);
-    if (!load_quantized_from_mapping(out_internal, block.out_proj, hidden, num_q_heads * head_size)) {
-        const std::string out_name = pick_attn_name(prefix + ".self_attn.o_proj.weight",
-                                                    prefix + ".mixer.o_proj.weight");
-        load_and_quantize(out_name, block.out_proj, hidden, num_q_heads * head_size);
-    }
-
-    const int mlp_M = mConfig.mlp_up_factor * intermediate;
-
-    // MLP projections (handle both fused and separate gate/up)
-    auto pick_mlp_name = [&](const std::string& mlp_name, const std::string& mixer_name) -> std::string {
-        if (find_entry_opt(reader, mlp_name)) return mlp_name;
-        if (find_entry_opt(reader, mixer_name)) return mixer_name;
-        return mlp_name;
-    };
-
-    const std::string gate_up_internal = fmt::format("blocks[{}].mlp_up_weight", layer_idx);
-    if (!load_quantized_from_mapping(gate_up_internal, block.gate_up_proj, mlp_M, hidden)) {
-        const std::string gate_up_name = pick_mlp_name(prefix + ".mlp.gate_up_proj.weight",
-                                                       prefix + ".mixer.gate_up_proj.weight");
-        if (find_entry_opt(reader, gate_up_name)) {
-            load_and_quantize(gate_up_name, block.gate_up_proj, mlp_M, hidden);
-        } else {
-            if (mConfig.mlp_up_factor == 1) {
-                // Non-gated MLP: only up projection
-                mLoadBuffer.Sizes[0] = intermediate;
-                mLoadBuffer.Sizes[1] = hidden;
-                mLoadBuffer.Rank = 2;
-                const std::string up_name = pick_mlp_name(prefix + ".mlp.up_proj.weight",
-                                                          prefix + ".mixer.up_proj.weight");
-                if (const auto* entry = find_entry_opt(reader, up_name)) {
-                    entry->read_tensor(mLoadBuffer, true);
-                }
-                quantize_and_store(block.gate_up_proj, mLoadBuffer, mlp_M, hidden, stream);
+    // Skip for Mamba layers (they use SSM, not attention)
+    if (!skip_attention) {
+        const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+        const std::string qkv_internal = fmt::format("blocks[{}].qkv_weight", layer_idx);
+        bool qkv_loaded = load_quantized_from_mapping(qkv_internal, block.qkv_proj, qkv_out, hidden);
+        if (!qkv_loaded) {
+            const std::string qkv_name = pick_attn_name(prefix + ".self_attn.qkv_proj.weight",
+                                                        prefix + ".mixer.qkv_proj.weight");
+            if (find_entry_opt(reader, qkv_name)) {
+                // Fused QKV
+                load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
             } else {
-                // Separate gate and up - load into parts of mLoadBuffer
-                // Layout: [up; gate] - up in first half, gate in second half
-                mLoadBuffer.Sizes[0] = 2 * intermediate;
+                // Separate Q, K, V - load into parts of mLoadBuffer and then quantize
+                const int q_out = num_q_heads * head_size;
+                const int kv_out = num_kv_heads * head_size;
+
+                // Set up load buffer for fused QKV
+                mLoadBuffer.Sizes[0] = qkv_out;
                 mLoadBuffer.Sizes[1] = hidden;
                 mLoadBuffer.Rank = 2;
 
-                // Load up into the first part
-                Tensor up_view = mLoadBuffer;
-                up_view.Sizes[0] = intermediate;
-                const std::string up_name = pick_mlp_name(prefix + ".mlp.up_proj.weight",
-                                                          prefix + ".mixer.up_proj.weight");
-                if (const auto* entry = find_entry_opt(reader, up_name)) {
-                    entry->read_tensor(up_view, true);
+                // Load Q into the first part
+                Tensor q_view = mLoadBuffer;
+                q_view.Sizes[0] = q_out;
+                const std::string q_name = pick_attn_name(prefix + ".self_attn.q_proj.weight",
+                                                          prefix + ".mixer.q_proj.weight");
+                if (const auto* entry = find_entry_opt(reader, q_name)) {
+                    entry->read_tensor(q_view, true);
                 }
 
-                // Load gate into the second part
-                Tensor gate_view = mLoadBuffer;
-                gate_view.Data = mLoadBuffer.Data + intermediate * hidden * sizeof(nv_bfloat16);
-                gate_view.Sizes[0] = intermediate;
-                const std::string gate_name = pick_mlp_name(prefix + ".mlp.gate_proj.weight",
-                                                            prefix + ".mixer.gate_proj.weight");
-                if (const auto* entry = find_entry_opt(reader, gate_name)) {
-                    entry->read_tensor(gate_view, true);
+                // Load K into the middle part
+                Tensor k_view = mLoadBuffer;
+                k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
+                k_view.Sizes[0] = kv_out;
+                const std::string k_name = pick_attn_name(prefix + ".self_attn.k_proj.weight",
+                                                          prefix + ".mixer.k_proj.weight");
+                if (const auto* entry = find_entry_opt(reader, k_name)) {
+                    entry->read_tensor(k_view, true);
+                }
+
+                // Load V into the last part
+                Tensor v_view = mLoadBuffer;
+                v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
+                v_view.Sizes[0] = kv_out;
+                const std::string v_name = pick_attn_name(prefix + ".self_attn.v_proj.weight",
+                                                          prefix + ".mixer.v_proj.weight");
+                if (const auto* entry = find_entry_opt(reader, v_name)) {
+                    entry->read_tensor(v_view, true);
                 }
 
                 // Restore full shape and quantize
-                mLoadBuffer.Sizes[0] = 2 * intermediate;
-                quantize_and_store(block.gate_up_proj, mLoadBuffer, mlp_M, hidden, stream);
+                mLoadBuffer.Sizes[0] = qkv_out;
+                quantize_and_store(block.qkv_proj, mLoadBuffer, qkv_out, hidden, stream);
             }
+        }
+
+        // Output projection
+        const std::string out_internal = fmt::format("blocks[{}].out_weight", layer_idx);
+        if (!load_quantized_from_mapping(out_internal, block.out_proj, hidden, num_q_heads * head_size)) {
+            const std::string out_name = pick_attn_name(prefix + ".self_attn.o_proj.weight",
+                                                        prefix + ".mixer.o_proj.weight");
+            load_and_quantize(out_name, block.out_proj, hidden, num_q_heads * head_size);
         }
     }
 
-    // Down projection
-    const std::string down_internal = fmt::format("blocks[{}].mlp_down_weight", layer_idx);
-    if (!load_quantized_from_mapping(down_internal, block.down_proj, hidden, intermediate)) {
-        const std::string down_name = pick_mlp_name(prefix + ".mlp.down_proj.weight",
-                                                    prefix + ".mixer.down_proj.weight");
-        load_and_quantize(down_name, block.down_proj, hidden, intermediate);
+    // MLP projections (handle both fused and separate gate/up)
+    // Skip for Mamba layers (they use SSM, not MLP)
+    if (!skip_mlp) {
+        const int mlp_M = mConfig.mlp_up_factor * intermediate;
+
+        auto pick_mlp_name = [&](const std::string& mlp_name, const std::string& mixer_name) -> std::string {
+            if (find_entry_opt(reader, mlp_name)) return mlp_name;
+            if (find_entry_opt(reader, mixer_name)) return mixer_name;
+            return mlp_name;
+        };
+
+        const std::string gate_up_internal = fmt::format("blocks[{}].mlp_up_weight", layer_idx);
+        if (!load_quantized_from_mapping(gate_up_internal, block.gate_up_proj, mlp_M, hidden)) {
+            const std::string gate_up_name = pick_mlp_name(prefix + ".mlp.gate_up_proj.weight",
+                                                           prefix + ".mixer.gate_up_proj.weight");
+            if (find_entry_opt(reader, gate_up_name)) {
+                load_and_quantize(gate_up_name, block.gate_up_proj, mlp_M, hidden);
+            } else {
+                if (mConfig.mlp_up_factor == 1) {
+                    // Non-gated MLP: only up projection
+                    mLoadBuffer.Sizes[0] = intermediate;
+                    mLoadBuffer.Sizes[1] = hidden;
+                    mLoadBuffer.Rank = 2;
+                    const std::string up_name = pick_mlp_name(prefix + ".mlp.up_proj.weight",
+                                                              prefix + ".mixer.up_proj.weight");
+                    if (const auto* entry = find_entry_opt(reader, up_name)) {
+                        entry->read_tensor(mLoadBuffer, true);
+                    }
+                    quantize_and_store(block.gate_up_proj, mLoadBuffer, mlp_M, hidden, stream);
+                } else {
+                    // Separate gate and up - load into parts of mLoadBuffer
+                    // Layout: [up; gate] - up in first half, gate in second half
+                    mLoadBuffer.Sizes[0] = 2 * intermediate;
+                    mLoadBuffer.Sizes[1] = hidden;
+                    mLoadBuffer.Rank = 2;
+
+                    // Load up into the first part
+                    Tensor up_view = mLoadBuffer;
+                    up_view.Sizes[0] = intermediate;
+                    const std::string up_name = pick_mlp_name(prefix + ".mlp.up_proj.weight",
+                                                              prefix + ".mixer.up_proj.weight");
+                    if (const auto* entry = find_entry_opt(reader, up_name)) {
+                        entry->read_tensor(up_view, true);
+                    }
+
+                    // Load gate into the second part
+                    Tensor gate_view = mLoadBuffer;
+                    gate_view.Data = mLoadBuffer.Data + intermediate * hidden * sizeof(nv_bfloat16);
+                    gate_view.Sizes[0] = intermediate;
+                    const std::string gate_name = pick_mlp_name(prefix + ".mlp.gate_proj.weight",
+                                                                prefix + ".mixer.gate_proj.weight");
+                    if (const auto* entry = find_entry_opt(reader, gate_name)) {
+                        entry->read_tensor(gate_view, true);
+                    }
+
+                    // Restore full shape and quantize
+                    mLoadBuffer.Sizes[0] = 2 * intermediate;
+                    quantize_and_store(block.gate_up_proj, mLoadBuffer, mlp_M, hidden, stream);
+                }
+            }
+        }
+
+        // Down projection
+        const std::string down_internal = fmt::format("blocks[{}].mlp_down_weight", layer_idx);
+        if (!load_quantized_from_mapping(down_internal, block.down_proj, hidden, intermediate)) {
+            const std::string down_name = pick_mlp_name(prefix + ".mlp.down_proj.weight",
+                                                        prefix + ".mixer.down_proj.weight");
+            load_and_quantize(down_name, block.down_proj, hidden, intermediate);
+        }
     }
 
     // Layer norms (not quantized, just copy)
@@ -940,8 +988,8 @@ void BnBWeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
         }
     }
 
-    // QK-norm weights (for models like Qwen3)
-    if (mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
+    // QK-norm weights (for models like Qwen3) - only for layers with attention
+    if (!skip_attention && mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
         const std::string qn_internal = fmt::format("blocks[{}].q_norm_weight", layer_idx);
         const std::string kn_internal = fmt::format("blocks[{}].k_norm_weight", layer_idx);
         bool qn_loaded = load_tensor_from_mapping(qn_internal, block.q_norm_weight.value());
@@ -1220,12 +1268,19 @@ void BnBWeightsManager::allocate_moe_block(int layer_idx) {
 
     auto& block = mMoEBlocks[layer_idx];
 
-    // QKV projection (same as dense) - always on GPU
-    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-    allocate_bnb_weight(block.qkv_proj, qkv_out, hidden, "qkv");
+    // Determine if this MoE layer has attention (for hybrid architectures)
+    // In Nemotron-H, 'E' (MoE) layers are MoE-only without attention
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+    const bool needs_attention = (layer_type != HybridLayerType::MoE);  // MoE-only layers have no attention
 
-    // Output projection (same as dense) - always on GPU
-    allocate_bnb_weight(block.out_proj, hidden, num_q_heads * head_size, "out");
+    if (needs_attention) {
+        // QKV projection (same as dense) - always on GPU
+        const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+        allocate_bnb_weight(block.qkv_proj, qkv_out, hidden, "qkv");
+
+        // Output projection (same as dense) - always on GPU
+        allocate_bnb_weight(block.out_proj, hidden, num_q_heads * head_size, "out");
+    }
 
     // Layer norm weights (BF16, not quantized) - always on GPU
     block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
@@ -1233,8 +1288,8 @@ void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
                                             EAllocationType::ON_DEVICE, {(long)hidden});
 
-    // QK-norm weights (for Qwen3) - always on GPU
-    if (mConfig.use_qk_norm) {
+    // QK-norm weights (for Qwen3) - only for layers with attention
+    if (mConfig.use_qk_norm && needs_attention) {
         block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
                                                    EAllocationType::ON_DEVICE, {(long)head_size});
         block.k_norm_weight = mAllocator->allocate(ETensorDType::BF16, "k_norm",
@@ -1283,7 +1338,12 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
         ? mConfig.qlora_config.moe_shared_expert_intermediate_size
         : moe_inter;
     const int shared_M = mConfig.mlp_up_factor * shared_inter;
-  
+
+    // Determine layer type for hybrid architectures
+    // In Nemotron-H, MoE layers ('E') don't have attention - they're MoE-only layers
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+    const bool skip_attention = (layer_type == HybridLayerType::MoE);  // MoE-only layers have no attention
+
     auto pick_layer_prefix = [&]() {
         const std::string model_prefix = fmt::format("model.layers.{}", layer_idx);
         const std::string backbone_prefix = fmt::format("backbone.layers.{}", layer_idx);
@@ -1358,63 +1418,66 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     };
 
     // Load Q, K, V projections (handle both fused and separate)
-    const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
-    const std::string qkv_internal = fmt::format("blocks[{}].qkv_weight", layer_idx);
-    bool qkv_loaded = load_quantized_from_mapping(qkv_internal, block.qkv_proj, qkv_out, hidden);
-    if (!qkv_loaded) {
-        const std::string qkv_name = pick_attn_name(prefix + ".self_attn.qkv_proj.weight",
-                                                    prefix + ".mixer.qkv_proj.weight");
-        if (find_entry_opt(reader, qkv_name)) {
-            load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
-        } else {
-            // Separate Q, K, V - load into parts of mLoadBuffer and then quantize
-            const int q_out = num_q_heads * head_size;
-            const int kv_out = num_kv_heads * head_size;
+    // Skip for MoE-only layers in hybrid architectures (they don't have attention)
+    if (!skip_attention) {
+        const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
+        const std::string qkv_internal = fmt::format("blocks[{}].qkv_weight", layer_idx);
+        bool qkv_loaded = load_quantized_from_mapping(qkv_internal, block.qkv_proj, qkv_out, hidden);
+        if (!qkv_loaded) {
+            const std::string qkv_name = pick_attn_name(prefix + ".self_attn.qkv_proj.weight",
+                                                        prefix + ".mixer.qkv_proj.weight");
+            if (find_entry_opt(reader, qkv_name)) {
+                load_and_quantize(qkv_name, block.qkv_proj, qkv_out, hidden);
+            } else {
+                // Separate Q, K, V - load into parts of mLoadBuffer and then quantize
+                const int q_out = num_q_heads * head_size;
+                const int kv_out = num_kv_heads * head_size;
 
-            mLoadBuffer.Sizes[0] = qkv_out;
-            mLoadBuffer.Sizes[1] = hidden;
-            mLoadBuffer.Rank = 2;
+                mLoadBuffer.Sizes[0] = qkv_out;
+                mLoadBuffer.Sizes[1] = hidden;
+                mLoadBuffer.Rank = 2;
 
-            // Load Q into the first part
-            Tensor q_view = mLoadBuffer;
-            q_view.Sizes[0] = q_out;
-            const std::string q_name = pick_attn_name(prefix + ".self_attn.q_proj.weight",
-                                                      prefix + ".mixer.q_proj.weight");
-            if (const auto* entry = find_entry_opt(reader, q_name)) {
-                entry->read_tensor(q_view, true);
+                // Load Q into the first part
+                Tensor q_view = mLoadBuffer;
+                q_view.Sizes[0] = q_out;
+                const std::string q_name = pick_attn_name(prefix + ".self_attn.q_proj.weight",
+                                                          prefix + ".mixer.q_proj.weight");
+                if (const auto* entry = find_entry_opt(reader, q_name)) {
+                    entry->read_tensor(q_view, true);
+                }
+
+                // Load K into the middle part
+                Tensor k_view = mLoadBuffer;
+                k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
+                k_view.Sizes[0] = kv_out;
+                const std::string k_name = pick_attn_name(prefix + ".self_attn.k_proj.weight",
+                                                          prefix + ".mixer.k_proj.weight");
+                if (const auto* entry = find_entry_opt(reader, k_name)) {
+                    entry->read_tensor(k_view, true);
+                }
+
+                // Load V into the last part
+                Tensor v_view = mLoadBuffer;
+                v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
+                v_view.Sizes[0] = kv_out;
+                const std::string v_name = pick_attn_name(prefix + ".self_attn.v_proj.weight",
+                                                          prefix + ".mixer.v_proj.weight");
+                if (const auto* entry = find_entry_opt(reader, v_name)) {
+                    entry->read_tensor(v_view, true);
+                }
+
+                mLoadBuffer.Sizes[0] = qkv_out;
+                quantize_and_store(block.qkv_proj, mLoadBuffer, qkv_out, hidden, stream);
             }
-
-            // Load K into the middle part
-            Tensor k_view = mLoadBuffer;
-            k_view.Data = mLoadBuffer.Data + q_out * hidden * sizeof(nv_bfloat16);
-            k_view.Sizes[0] = kv_out;
-            const std::string k_name = pick_attn_name(prefix + ".self_attn.k_proj.weight",
-                                                      prefix + ".mixer.k_proj.weight");
-            if (const auto* entry = find_entry_opt(reader, k_name)) {
-                entry->read_tensor(k_view, true);
-            }
-
-            // Load V into the last part
-            Tensor v_view = mLoadBuffer;
-            v_view.Data = mLoadBuffer.Data + (q_out + kv_out) * hidden * sizeof(nv_bfloat16);
-            v_view.Sizes[0] = kv_out;
-            const std::string v_name = pick_attn_name(prefix + ".self_attn.v_proj.weight",
-                                                      prefix + ".mixer.v_proj.weight");
-            if (const auto* entry = find_entry_opt(reader, v_name)) {
-                entry->read_tensor(v_view, true);
-            }
-
-            mLoadBuffer.Sizes[0] = qkv_out;
-            quantize_and_store(block.qkv_proj, mLoadBuffer, qkv_out, hidden, stream);
         }
-    }
 
-    // Output projection
-    const std::string out_internal = fmt::format("blocks[{}].out_weight", layer_idx);
-    if (!load_quantized_from_mapping(out_internal, block.out_proj, hidden, num_q_heads * head_size)) {
-        const std::string out_name = pick_attn_name(prefix + ".self_attn.o_proj.weight",
-                                                    prefix + ".mixer.o_proj.weight");
-        load_and_quantize(out_name, block.out_proj, hidden, num_q_heads * head_size);
+        // Output projection
+        const std::string out_internal = fmt::format("blocks[{}].out_weight", layer_idx);
+        if (!load_quantized_from_mapping(out_internal, block.out_proj, hidden, num_q_heads * head_size)) {
+            const std::string out_name = pick_attn_name(prefix + ".self_attn.o_proj.weight",
+                                                        prefix + ".mixer.o_proj.weight");
+            load_and_quantize(out_name, block.out_proj, hidden, num_q_heads * head_size);
+        }
     }
 
     // Layer norms
@@ -1441,8 +1504,8 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
         }
     }
 
-    // QK-norm weights (for Qwen3)
-    if (mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
+    // QK-norm weights (for Qwen3) - only for layers with attention
+    if (!skip_attention && mConfig.use_qk_norm && block.q_norm_weight.has_value() && block.k_norm_weight.has_value()) {
         const std::string qn_internal = fmt::format("blocks[{}].q_norm_weight", layer_idx);
         const std::string kn_internal = fmt::format("blocks[{}].k_norm_weight", layer_idx);
         bool qn_loaded = load_tensor_from_mapping(qn_internal, block.q_norm_weight.value());

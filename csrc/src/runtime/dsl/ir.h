@@ -211,6 +211,7 @@ struct IRFile {
     std::string source_file;
     bool success = false;
     std::vector<std::string> warnings;
+    std::vector<std::string> errors;
     std::vector<Module> modules;
 };
 

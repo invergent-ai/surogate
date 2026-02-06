@@ -167,6 +167,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"bias_add", CompiledOpType::BiasAdd},
         {"swiglu", CompiledOpType::SwiGLU},
         {"silu", CompiledOpType::Silu},
+        {"relu2", CompiledOpType::Relu2},
         {"mul", CompiledOpType::Mul},
         {"matmul_swiglu", CompiledOpType::MatmulSwiGLU},
         {"qkv_qk_norm_rope", CompiledOpType::QKVQKNormRoPE},
@@ -182,6 +183,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"moe_sigmoid", CompiledOpType::MoESigmoid},
         {"moe_topk", CompiledOpType::MoETopK},
         {"moe_permute", CompiledOpType::MoEPermute},
+        {"moe_grouped_gemm", CompiledOpType::MoEGroupedGemm},
         {"moe_grouped_gemm_gate_up", CompiledOpType::MoEGroupedGemmGateUp},
         {"moe_grouped_gemm_down", CompiledOpType::MoEGroupedGemmDown},
         {"moe_unpermute", CompiledOpType::MoEUnpermute},
@@ -192,6 +194,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"bias_add_backward", CompiledOpType::BiasAddBackward},
         {"swiglu_backward", CompiledOpType::SwiGLUBackward},
         {"silu_backward", CompiledOpType::SiluBackward},
+        {"relu2_backward", CompiledOpType::Relu2Backward},
         {"mul_backward", CompiledOpType::MulBackward},
         {"matmul_swiglu_backward", CompiledOpType::MatmulSwiGLUBackward},
         {"rope_backward", CompiledOpType::RoPEBackward},
@@ -207,9 +210,24 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"moe_sigmoid_backward", CompiledOpType::MoESigmoidBackward},
         {"moe_topk_backward", CompiledOpType::MoETopKBackward},
         {"moe_permute_backward", CompiledOpType::MoEPermuteBackward},
+        {"moe_grouped_gemm_backward", CompiledOpType::MoEGroupedGemmBackward},
         {"moe_grouped_gemm_gate_up_backward", CompiledOpType::MoEGroupedGemmGateUpBackward},
         {"moe_grouped_gemm_down_backward", CompiledOpType::MoEGroupedGemmDownBackward},
         {"moe_unpermute_backward", CompiledOpType::MoEUnpermuteBackward},
+        // Mamba/SSM forward operations
+        {"mamba_split_proj", CompiledOpType::MambaSplitProj},
+        {"mamba_conv1d", CompiledOpType::MambaConv1d},
+        {"mamba_split_conv_out", CompiledOpType::MambaSplitConvOut},
+        {"mamba_ssm_scan", CompiledOpType::MambaSsmScan},
+        {"mamba_gated_rmsnorm", CompiledOpType::MambaGatedRMSNorm},
+        {"mamba_out_proj", CompiledOpType::MambaOutProj},
+        // Mamba/SSM backward operations
+        {"mamba_split_proj_backward", CompiledOpType::MambaSplitProjBackward},
+        {"mamba_conv1d_backward", CompiledOpType::MambaConv1dBackward},
+        {"mamba_split_conv_out_backward", CompiledOpType::MambaSplitConvOutBackward},
+        {"mamba_ssm_scan_backward", CompiledOpType::MambaSsmScanBackward},
+        {"mamba_gated_rmsnorm_backward", CompiledOpType::MambaGatedRMSNormBackward},
+        {"mamba_out_proj_backward", CompiledOpType::MambaOutProjBackward},
     };
 
     auto it = type_map.find(op_type);
@@ -593,6 +611,91 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // Mamba/SSM-specific attributes
+    if (type == CompiledOpType::MambaSplitProj || type == CompiledOpType::MambaConv1d ||
+        type == CompiledOpType::MambaSplitConvOut || type == CompiledOpType::MambaSsmScan ||
+        type == CompiledOpType::MambaGatedRMSNorm || type == CompiledOpType::MambaOutProj ||
+        type == CompiledOpType::MambaSplitProjBackward || type == CompiledOpType::MambaConv1dBackward ||
+        type == CompiledOpType::MambaSplitConvOutBackward || type == CompiledOpType::MambaSsmScanBackward ||
+        type == CompiledOpType::MambaGatedRMSNormBackward || type == CompiledOpType::MambaOutProjBackward) {
+        // Mamba dimensions from attributes
+        if (auto* attr = find_attr(op.attrs, "num_heads")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.mamba_num_heads = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "head_dim")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.mamba_head_dim = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "ssm_state_size")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.ssm_state_size = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "n_groups")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.n_groups = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "conv_kernel")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.conv_kernel = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "chunk_size")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.chunk_size = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "intermediate_size")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.intermediate_size = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "conv_dim")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.conv_dim = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "dt_min")) {
+            if (auto v = attr_double(*attr)) {
+                attrs.dt_min = static_cast<float>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "dt_max")) {
+            if (auto v = attr_double(*attr)) {
+                attrs.dt_max = static_cast<float>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "dt_softplus")) {
+            if (auto v = attr_bool(*attr)) {
+                attrs.dt_softplus = *v;
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "use_conv_bias")) {
+            if (auto v = attr_bool(*attr)) {
+                attrs.use_conv_bias = *v;
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "activation")) {
+            if (auto v = attr_string(*attr)) {
+                attrs.activation = *v;
+            }
+        }
+        // group_size for gated rmsnorm (reuse top_k field or add dedicated)
+        if (auto* attr = find_attr(op.attrs, "group_size")) {
+            if (auto v = attr_int(*attr)) {
+                // Store in a suitable field - we can compute groups from intermediate_size / group_size
+                // For now, store as n_groups = intermediate_size / group_size if intermediate_size is set
+                if (attrs.intermediate_size > 0 && *v > 0) {
+                    attrs.n_groups = attrs.intermediate_size / static_cast<int>(*v);
+                }
+            }
+        }
+    }
+
     return attrs;
 }
 
@@ -947,6 +1050,7 @@ void GraphCompiler::infer_output_shapes(
         }
 
         case CompiledOpType::Silu:
+        case CompiledOpType::Relu2:
         case CompiledOpType::Mul: {
             // Element-wise ops preserve shape
             if (!input_shapes.empty() && !input_shapes[0].empty()) {
@@ -1008,6 +1112,64 @@ void GraphCompiler::infer_output_shapes(
 
         case CompiledOpType::MoEUnpermute: {
             // Output shape [B*T, C] - based on routing structure
+            break;
+        }
+
+        // Mamba/SSM operations
+        case CompiledOpType::MambaSplitProj: {
+            // Outputs: gate [B, T, intermediate_size], conv_in [B, conv_dim, T], dt [B, T, num_heads]
+            // Cannot fully infer without attributes, leave empty for runtime
+            break;
+        }
+
+        case CompiledOpType::MambaConv1d: {
+            // Output shape same as input (causal conv1d)
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::MambaSplitConvOut: {
+            // Outputs: u [B, D, T], B [B, G, N, T], C [B, G, N, T]
+            // Cannot fully infer without attributes, leave empty for runtime
+            break;
+        }
+
+        case CompiledOpType::MambaSsmScan: {
+            // Outputs: out [B, T, H, D], ssm_state [B, H, D, N]
+            // Cannot fully infer without attributes, leave empty for runtime
+            break;
+        }
+
+        case CompiledOpType::MambaGatedRMSNorm: {
+            // Output same shape as input x (gated output)
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::MambaOutProj: {
+            // Standard matmul output shape
+            if (input_shapes.size() >= 2 && !input_shapes[0].empty() && !input_shapes[1].empty()) {
+                // Same as Matmul
+                const auto& a_shape = input_shapes[0];
+                const auto& b_shape = input_shapes[1];
+                EMMTranspose mode = parse_transpose(op.attrs);
+                std::vector<long> out_shape;
+                if (mode == EMMTranspose::NT || mode == EMMTranspose::NN) {
+                    out_shape.push_back(a_shape[a_shape.size() - 2]);
+                } else {
+                    out_shape.push_back(a_shape[a_shape.size() - 1]);
+                }
+                if (mode == EMMTranspose::NT || mode == EMMTranspose::TT) {
+                    out_shape.push_back(b_shape[b_shape.size() - 2]);
+                } else {
+                    out_shape.push_back(b_shape[b_shape.size() - 1]);
+                }
+                output_shapes.push_back(out_shape);
+            }
             break;
         }
 

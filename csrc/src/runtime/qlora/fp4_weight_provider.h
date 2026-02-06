@@ -104,6 +104,11 @@ public:
         bool mamba_use_bias = false;
         bool mamba_use_conv_bias = false;
         const HfMapping* hf_mapping = nullptr;
+
+        /// Hybrid architecture pattern (e.g., "MEMEM*EMEMEM*...") where:
+        /// M = Mamba, E = MoE, * = Attention, - = MLP
+        /// If empty, assumes uniform architecture (all layers same type).
+        std::string hybrid_pattern;
     };
 
     FP4WeightProvider(const Config& config, TensorAllocator& allocator,

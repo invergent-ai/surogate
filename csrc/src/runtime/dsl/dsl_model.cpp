@@ -124,6 +124,7 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
         if (train_router && field.find("router") != std::string::npos) {
             return false;
         }
+        // Standard block weights (Qwen3, LLaMA, etc.)
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" ||
             field == "mlp_up_weight" || field == "mlp_down_weight" ||
             field == "ln1_weight" || field == "ln2_weight" ||
@@ -131,17 +132,25 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
             field == "router_weight" ||
             field == "experts_gate_up" || field == "experts_down" ||
             field == "shared_expert_gate" || field == "shared_expert_up" ||
-            field == "shared_expert_down") {
+            field == "shared_expert_down" ||
+            // Nemotron-H MoE: separate up/down without gate fusion
+            field == "experts_up") {
             return true;
         }
+        // Mamba/SSM weights (pattern suffixes)
         if (ends_with(field, "in_proj_weight") ||
             ends_with(field, "in_proj_bias") ||
             ends_with(field, "out_proj_weight") ||
             ends_with(field, "out_proj_bias") ||
             ends_with(field, "conv1d_weight") ||
             ends_with(field, "conv1d_bias") ||
+            // Nemotron-H Mamba: uses conv_weight/bias instead of conv1d_weight/bias
+            ends_with(field, "conv_weight") ||
+            ends_with(field, "conv_bias") ||
             ends_with(field, "A_log") ||
             ends_with(field, "D") ||
+            // Nemotron-H Mamba: D_param naming variant
+            field == "D_param" ||
             ends_with(field, "dt_bias") ||
             ends_with(field, "norm_weight")) {
             return true;
@@ -171,6 +180,18 @@ struct DslConfigView {
     std::optional<bool> norm_topk_prob;
     std::optional<bool> use_shared_expert;
     std::optional<long> shared_expert_intermediate;
+    std::optional<std::string> mlp_activation;
+    std::optional<std::string> hybrid_pattern;  ///< Hybrid arch pattern (e.g., "MEMEM*EMEMEM*...")
+
+    // Mamba / SSM configuration (for hybrid architectures like Nemotron-H)
+    std::optional<long> mamba_num_heads;
+    std::optional<long> mamba_head_dim;
+    std::optional<long> ssm_state_size;
+    std::optional<long> n_groups;
+    std::optional<long> conv_kernel;
+    std::optional<long> chunk_size;
+    std::optional<bool> use_conv_bias;
+    std::optional<bool> use_mamba_bias;
 };
 
 std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
@@ -203,6 +224,15 @@ std::optional<bool> get_bool_attr(const AttrMap& map, const char* key) {
     return std::nullopt;
 }
 
+std::optional<std::string> get_string_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (auto v = internal::as_string(*value)) {
+            return std::string(*v);
+        }
+    }
+    return std::nullopt;
+}
+
 DslConfigView parse_dsl_config(const Module& module) {
     DslConfigView view;
     const auto& cfg = module.config;
@@ -223,6 +253,18 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.norm_topk_prob = get_bool_attr(cfg, "norm_topk_prob");
     view.use_shared_expert = get_bool_attr(cfg, "use_shared_expert");
     view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate");
+    view.mlp_activation = get_string_attr(cfg, "mlp_activation");
+    view.hybrid_pattern = get_string_attr(cfg, "hybrid_pattern");
+
+    // Mamba / SSM configuration
+    view.mamba_num_heads = get_long_attr(cfg, "mamba_num_heads");
+    view.mamba_head_dim = get_long_attr(cfg, "mamba_head_dim");
+    view.ssm_state_size = get_long_attr(cfg, "ssm_state_size");
+    view.n_groups = get_long_attr(cfg, "n_groups");
+    view.conv_kernel = get_long_attr(cfg, "conv_kernel");
+    view.chunk_size = get_long_attr(cfg, "chunk_size");
+    view.use_conv_bias = get_bool_attr(cfg, "use_conv_bias");
+    view.use_mamba_bias = get_bool_attr(cfg, "use_mamba_bias");
     return view;
 }
 
@@ -246,6 +288,24 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
     } else if (runtime.num_experts > 0 && view.d_ff.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.d_ff.value());
+    }
+
+    // Determine mlp_up_factor based on activation type
+    // Gated activations (SwiGLU, GeGLU) use factor 2, non-gated (ReLU, ReLU2, SiLU) use factor 1
+    if (view.mlp_activation.has_value()) {
+        const std::string& act = *view.mlp_activation;
+        if (act == "relu2" || act == "ReLU2" || act == "relu" || act == "ReLU" ||
+            act == "silu" || act == "SiLU" || act == "gelu" || act == "GeLU") {
+            runtime.mlp_up_factor = 1;
+        } else {
+            // Default to gated (SwiGLU, GeGLU)
+            runtime.mlp_up_factor = 2;
+        }
+    }
+
+    // Hybrid architecture pattern for Nemotron-H style models
+    if (view.hybrid_pattern.has_value()) {
+        runtime.hybrid_pattern = *view.hybrid_pattern;
     }
 
     return runtime;
@@ -363,6 +423,69 @@ modules::ModelConfig build_model_config(const Module& module,
         cfg.architecture = modules::ArchitectureType::Dense;
     }
 
+    // Set activation type based on mlp_up_factor
+    // factor 1 = non-gated (ReLU2), factor 2 = gated (SwiGLU)
+    if (runtime.mlp_up_factor == 1) {
+        cfg.activation_type = modules::ActivationType::ReLU2;
+    } else {
+        cfg.activation_type = modules::ActivationType::SwiGLU;
+    }
+
+    // Mamba / SSM configuration (for hybrid architectures like Nemotron-H)
+    if (view.mamba_num_heads) cfg.MambaNumHeads = static_cast<int>(*view.mamba_num_heads);
+    if (view.mamba_head_dim) cfg.MambaHeadDim = static_cast<int>(*view.mamba_head_dim);
+    if (view.ssm_state_size) cfg.MambaSsmStateSize = static_cast<int>(*view.ssm_state_size);
+    if (view.n_groups) cfg.MambaNGroups = static_cast<int>(*view.n_groups);
+    if (view.conv_kernel) cfg.MambaConvKernel = static_cast<int>(*view.conv_kernel);
+    if (view.chunk_size) cfg.MambaChunkSize = static_cast<int>(*view.chunk_size);
+    if (view.use_conv_bias) cfg.MambaUseConvBias = *view.use_conv_bias;
+    if (view.use_mamba_bias) cfg.MambaUseBias = *view.use_mamba_bias;
+    // Mamba intermediate = num_heads * head_dim (distinct from MLP intermediate)
+    if (view.mamba_num_heads && view.mamba_head_dim) {
+        cfg.MambaIntermediateSize = static_cast<int>(*view.mamba_num_heads * *view.mamba_head_dim);
+    }
+
+    // Populate layer_overrides from hybrid_pattern for hybrid architectures
+    // Pattern chars: M = Mamba, E = MoE, * = Attention, - = MLP
+    if (!runtime.hybrid_pattern.empty()) {
+        cfg.layer_overrides.clear();
+        cfg.layer_overrides.reserve(cfg.NumLayers);
+
+        for (int i = 0; i < cfg.NumLayers && i < static_cast<int>(runtime.hybrid_pattern.size()); ++i) {
+            const char c = runtime.hybrid_pattern[i];
+            modules::LayerOverride override;
+            override.layer_idx = i;
+
+            switch (c) {
+                case 'M':
+                    override.block_type = modules::BlockType::Mamba;
+                    override.is_moe = false;
+                    break;
+                case 'E':
+                    override.block_type = modules::BlockType::MoE;
+                    override.is_moe = true;
+                    break;
+                case '*':
+                    override.block_type = modules::BlockType::Attention;
+                    override.is_moe = false;
+                    break;
+                case '-':
+                    override.block_type = modules::BlockType::MLP;
+                    override.is_moe = false;
+                    break;
+                default:
+                    override.block_type = modules::BlockType::Dense;
+                    override.is_moe = false;
+                    break;
+            }
+
+            cfg.layer_overrides.push_back(override);
+        }
+
+        // Update architecture type if we have a hybrid pattern
+        cfg.architecture = modules::ArchitectureType::Hybrid;
+    }
+
     return cfg;
 }
 
@@ -405,18 +528,24 @@ public:
 
         int layer_idx = -1;
         std::string field;
-        if (!internal::parse_block_param(clean, layer_idx, field)) {
+        std::string block_type;
+        if (!internal::parse_block_param_with_type(clean, layer_idx, field, block_type)) {
             throw std::runtime_error("DSL QLoRA provider: unknown param " + std::string(name));
         }
         if (!field.empty() && field.back() == '?') {
             field.pop_back();
         }
 
+        // Map block-type-specific index to physical layer index for hybrid architectures
+        // e.g., mamba_blocks[0] needs to map to the physical layer index of the first Mamba layer
+        int physical_layer_idx = map_to_physical_layer(block_type, layer_idx);
+
         auto& block = with_provider([&](auto& provider) -> typename std::remove_reference_t<decltype(provider)>::BlockWeights& {
-            return provider.get_block(layer_idx, stream);
+            return provider.get_block(physical_layer_idx, stream);
         });
 
-        if (field == "ln1_weight") {
+        if (field == "ln1_weight" || field == "norm_weight") {
+            // norm_weight is used by hybrid blocks (Mamba, Attention, MLP, MoE) for pre-block norm
             return block.ln1.weight;
         }
         if (field == "ln2_weight") {
@@ -428,13 +557,13 @@ public:
         if (field == "out_weight" || field == "o_proj_weight") {
             return block.attention.out_weight;
         }
-        if (field == "mlp_up_weight") {
+        if (field == "mlp_up_weight" || field == "up_weight") {
             if constexpr (requires { block.mlp_up_weight; }) {
                 return block.mlp_up_weight;
             }
             throw std::runtime_error("DSL QLoRA provider: mlp_up_weight not available for " + std::string(name));
         }
-        if (field == "mlp_down_weight") {
+        if (field == "mlp_down_weight" || field == "down_weight") {
             if constexpr (requires { block.mlp_down_weight; }) {
                 return block.mlp_down_weight;
             }
@@ -463,7 +592,7 @@ public:
             }
             throw std::runtime_error("DSL QLoRA provider: router_weight not available for " + std::string(name));
         }
-        if (field == "experts_gate_up") {
+        if (field == "experts_gate_up" || field == "experts_up") {
             if constexpr (requires { block.experts.gate_up_proj; }) {
                 return block.experts.gate_up_proj;
             }
@@ -532,21 +661,21 @@ public:
             }
             throw std::runtime_error("DSL QLoRA provider: out_proj_bias not available for " + std::string(name));
         }
-        if (ends_with(field, "conv1d_weight")) {
+        if (ends_with(field, "conv1d_weight") || ends_with(field, "conv_weight")) {
             if constexpr (requires { block.mamba; }) {
                 if (block.mamba.has_value()) {
                     return block.mamba->conv1d_weight;
                 }
             }
-            throw std::runtime_error("DSL QLoRA provider: conv1d_weight not available for " + std::string(name));
+            throw std::runtime_error("DSL QLoRA provider: conv_weight not available for " + std::string(name));
         }
-        if (ends_with(field, "conv1d_bias")) {
+        if (ends_with(field, "conv1d_bias") || ends_with(field, "conv_bias")) {
             if constexpr (requires { block.mamba; }) {
                 if (block.mamba.has_value() && block.mamba->conv1d_bias.has_value()) {
                     return block.mamba->conv1d_bias.value();
                 }
             }
-            throw std::runtime_error("DSL QLoRA provider: conv1d_bias not available for " + std::string(name));
+            throw std::runtime_error("DSL QLoRA provider: conv_bias not available for " + std::string(name));
         }
         if (ends_with(field, "A_log")) {
             if constexpr (requires { block.mamba; }) {
@@ -556,13 +685,13 @@ public:
             }
             throw std::runtime_error("DSL QLoRA provider: A_log not available for " + std::string(name));
         }
-        if (ends_with(field, "D")) {
+        if (field == "D" || field == "D_param") {
             if constexpr (requires { block.mamba; }) {
                 if (block.mamba.has_value()) {
                     return block.mamba->D;
                 }
             }
-            throw std::runtime_error("DSL QLoRA provider: D not available for " + std::string(name));
+            throw std::runtime_error("DSL QLoRA provider: D_param not available for " + std::string(name));
         }
         if (ends_with(field, "dt_bias")) {
             if constexpr (requires { block.mamba; }) {
@@ -647,14 +776,106 @@ private:
         throw std::runtime_error("DSL QLoRA provider: no provider initialized");
     }
 
+    /**
+     * @brief Map block-type-specific index to physical layer index
+     *
+     * For hybrid architectures, DSL models use separate arrays for each block type:
+     * - mamba_blocks[0], mamba_blocks[1], ... for Mamba layers
+     * - attn_blocks[0], attn_blocks[1], ... for Attention layers
+     * - mlp_blocks[0], mlp_blocks[1], ... for MLP layers
+     * - moe_blocks[0], moe_blocks[1], ... for MoE layers
+     *
+     * This function maps (block_type, block_type_index) to the physical layer index
+     * that the BnB weight provider uses.
+     *
+     * @param block_type Block type string (e.g., "mamba", "attn", "mlp", "moe", or empty)
+     * @param block_type_idx Index within the block type array
+     * @return Physical layer index
+     */
+    int map_to_physical_layer(const std::string& block_type, int block_type_idx) const {
+        // If no block type specified (plain "blocks[N]"), return the index as-is
+        if (block_type.empty()) {
+            return block_type_idx;
+        }
+
+        // Map block type string to BlockType enum
+        modules::BlockType target_type = modules::BlockType::Dense;
+        if (block_type == "mamba") {
+            target_type = modules::BlockType::Mamba;
+        } else if (block_type == "attn" || block_type == "attention") {
+            target_type = modules::BlockType::Attention;
+        } else if (block_type == "mlp") {
+            target_type = modules::BlockType::MLP;
+        } else if (block_type == "moe") {
+            target_type = modules::BlockType::MoE;
+        } else {
+            // Unknown block type, return index as-is
+            return block_type_idx;
+        }
+
+        // Count layers of the target type until we reach block_type_idx
+        int count = 0;
+        for (int i = 0; i < mConfig.NumLayers; ++i) {
+            const auto layer_type = mConfig.get_block_type(i);
+            if (layer_type == target_type) {
+                if (count == block_type_idx) {
+                    return i;  // Found the N-th layer of this type
+                }
+                ++count;
+            }
+        }
+
+        // Block type index out of range, return the index as-is (will likely cause an error later)
+        return block_type_idx;
+    }
+
     void fill_mamba_config(auto& cfg) {
         cfg.layer_is_mamba.resize(mConfig.NumLayers);
         cfg.has_mamba = false;
+
+        // Build hybrid_pattern string from per-layer block types
+        // Pattern chars: M = Mamba, E = MoE, * = Attention, - = MLP
+        std::string pattern;
+        pattern.reserve(mConfig.NumLayers);
+        bool is_hybrid = false;
+
         for (int i = 0; i < mConfig.NumLayers; ++i) {
-            const bool is_mamba = (mConfig.get_block_type(i) == modules::BlockType::Mamba);
+            const auto block_type = mConfig.get_block_type(i);
+            const bool is_mamba = (block_type == modules::BlockType::Mamba);
             cfg.layer_is_mamba[i] = static_cast<std::uint8_t>(is_mamba ? 1 : 0);
             cfg.has_mamba = cfg.has_mamba || is_mamba;
+
+            // Build pattern character
+            char c = '-';  // Default: MLP
+            switch (block_type) {
+                case modules::BlockType::Mamba:
+                    c = 'M';
+                    is_hybrid = true;
+                    break;
+                case modules::BlockType::MoE:
+                case modules::BlockType::SwitchMoE:
+                    c = 'E';
+                    is_hybrid = true;
+                    break;
+                case modules::BlockType::Attention:
+                    c = '*';
+                    is_hybrid = true;
+                    break;
+                case modules::BlockType::MLP:
+                    c = '-';
+                    break;
+                default:
+                    c = '-';  // Dense blocks default to MLP behavior
+                    break;
+            }
+            pattern.push_back(c);
         }
+
+        // Only set hybrid_pattern if we have a true hybrid architecture
+        if (is_hybrid) {
+            cfg.hybrid_pattern = std::move(pattern);
+        }
+
         cfg.mamba_num_heads = mConfig.MambaNumHeads;
         cfg.mamba_head_dim = mConfig.MambaHeadDim;
         cfg.mamba_ssm_state_size = mConfig.MambaSsmStateSize;
@@ -817,7 +1038,14 @@ DslModel::DslModel(const PretrainedConfig& config,
     nlohmann::json root = nlohmann::json::parse(ir_json);
     mIr = load_ir_from_json(root);
     if (!mIr.success) {
-        throw std::runtime_error("DSL model: IR JSON indicates compilation failure");
+        std::string error_msg = "DSL model: IR compilation failed";
+        if (!mIr.errors.empty()) {
+            error_msg += ":\n";
+            for (const auto& err : mIr.errors) {
+                error_msg += "  - " + err + "\n";
+            }
+        }
+        throw std::runtime_error(error_msg);
     }
     mModule = &pick_model_module(mIr);
     validate_ir();

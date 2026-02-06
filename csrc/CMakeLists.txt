@@ -285,16 +285,23 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/cross_entropy_loss.cpp
     src/runtime/ops/fused_lm_head_loss.cpp
     src/runtime/ops/silu.cpp
+    src/runtime/ops/relu2.cpp
     src/runtime/ops/mul.cpp
     src/runtime/ops/moe_softmax.cpp
     src/runtime/ops/moe_sigmoid.cpp
     src/runtime/ops/moe_topk.cpp
     src/runtime/ops/moe_permute.cpp
+    src/runtime/ops/moe_grouped_gemm.cpp
     src/runtime/ops/moe_grouped_gemm_gate_up.cpp
     src/runtime/ops/moe_grouped_gemm_down.cpp
     src/runtime/ops/moe_unpermute.cpp
 
-
+    src/runtime/ops/mamba_split_proj.cpp
+    src/runtime/ops/mamba_conv1d.cpp
+    src/runtime/ops/mamba_split_conv_out.cpp
+    src/runtime/ops/mamba_ssm_scan.cpp
+    src/runtime/ops/mamba_gated_rmsnorm.cpp
+    src/runtime/ops/mamba_out_proj.cpp
 
     src/config/pretrained_config.cpp
 

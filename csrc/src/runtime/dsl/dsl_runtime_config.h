@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 #define SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 
+#include <string>
+
 namespace dsl {
 
 struct DslRuntimeConfig {
@@ -16,6 +18,12 @@ struct DslRuntimeConfig {
     bool norm_topk_prob = false;
     bool use_shared_expert = false;
     int shared_expert_intermediate = 0;
+    int mlp_up_factor = 2;  ///< 2 for gated (SwiGLU/GeGLU), 1 for non-gated (ReLU2)
+
+    /// Hybrid architecture pattern (e.g., "MEMEM*EMEMEM*...") where:
+    /// M = Mamba, E = MoE, * = Attention, - = MLP
+    /// If empty, assumes uniform architecture (all layers same type).
+    std::string hybrid_pattern;
 
     [[nodiscard]] bool is_moe() const { return num_experts > 0; }
 };

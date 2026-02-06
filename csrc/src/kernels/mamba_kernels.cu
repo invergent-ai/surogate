@@ -809,3 +809,43 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
         throw std::logic_error("mamba_selective_scan_backward: unsupported dtype");
     }
 }
+
+// -----------------------------------------------------------------------------
+// Simple element-wise multiply kernel for gated operations
+// -----------------------------------------------------------------------------
+
+namespace {
+
+template<typename T>
+__global__ void elementwise_mul_kernel(T* out, const T* a, const T* b, long total) {
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float va = to_float(a[idx]);
+    float vb = to_float(b[idx]);
+    out[idx] = from_float<T>(va * vb);
+}
+
+// FP32 specialization
+template<>
+__global__ void elementwise_mul_kernel<float>(float* out, const float* a, const float* b, long total) {
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = a[idx] * b[idx];
+}
+
+}  // namespace
+
+void elementwise_mul(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long total, cudaStream_t stream) {
+    const int threads = 256;
+    elementwise_mul_kernel<<<div_up(total, threads), threads, 0, stream>>>(out, a, b, total);
+}
+
+void elementwise_mul(half* out, const half* a, const half* b, long total, cudaStream_t stream) {
+    const int threads = 256;
+    elementwise_mul_kernel<<<div_up(total, threads), threads, 0, stream>>>(out, a, b, total);
+}
+
+void elementwise_mul(float* out, const float* a, const float* b, long total, cudaStream_t stream) {
+    const int threads = 256;
+    elementwise_mul_kernel<<<div_up(total, threads), threads, 0, stream>>>(out, a, b, total);
+}

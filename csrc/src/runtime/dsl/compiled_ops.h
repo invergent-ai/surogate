@@ -148,6 +148,7 @@ private:
     void dispatch_bias_add(const CompiledOp& op);
     void dispatch_swiglu(const CompiledOp& op);
     void dispatch_silu(const CompiledOp& op);
+    void dispatch_relu2(const CompiledOp& op);
     void dispatch_mul(const CompiledOp& op);
     void dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook);
     void dispatch_qkv_qk_norm_rope(const CompiledOp& op);
@@ -160,6 +161,7 @@ private:
     void dispatch_moe_sigmoid(const CompiledOp& op);
     void dispatch_moe_topk(const CompiledOp& op);
     void dispatch_moe_permute(const CompiledOp& op);
+    void dispatch_moe_grouped_gemm(const CompiledOp& op);
     void dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op);
     void dispatch_moe_grouped_gemm_down(const CompiledOp& op);
     void dispatch_moe_unpermute(const CompiledOp& op);
@@ -171,6 +173,7 @@ private:
     void dispatch_bias_add_backward(const CompiledOp& op);
     void dispatch_swiglu_backward(const CompiledOp& op);
     void dispatch_silu_backward(const CompiledOp& op);
+    void dispatch_relu2_backward(const CompiledOp& op);
     void dispatch_mul_backward(const CompiledOp& op);
     void dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_rope_backward(const CompiledOp& op);
@@ -186,9 +189,26 @@ private:
     void dispatch_moe_sigmoid_backward(const CompiledOp& op);
     void dispatch_moe_topk_backward(const CompiledOp& op);
     void dispatch_moe_permute_backward(const CompiledOp& op);
+    void dispatch_moe_grouped_gemm_backward(const CompiledOp& op);
     void dispatch_moe_grouped_gemm_gate_up_backward(const CompiledOp& op);
     void dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op);
     void dispatch_moe_unpermute_backward(const CompiledOp& op);
+
+    // Mamba/SSM forward dispatch
+    void dispatch_mamba_split_proj(const CompiledOp& op);
+    void dispatch_mamba_conv1d(const CompiledOp& op);
+    void dispatch_mamba_split_conv_out(const CompiledOp& op);
+    void dispatch_mamba_ssm_scan(const CompiledOp& op);
+    void dispatch_mamba_gated_rmsnorm(const CompiledOp& op);
+    void dispatch_mamba_out_proj(const CompiledOp& op, const modules::ForwardHook* hook);
+
+    // Mamba/SSM backward dispatch
+    void dispatch_mamba_split_proj_backward(const CompiledOp& op);
+    void dispatch_mamba_conv1d_backward(const CompiledOp& op);
+    void dispatch_mamba_split_conv_out_backward(const CompiledOp& op);
+    void dispatch_mamba_ssm_scan_backward(const CompiledOp& op);
+    void dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& op);
+    void dispatch_mamba_out_proj_backward(const CompiledOp& op, const modules::BackwardHook* hook);
 
     // Tensor resolution (pre-resolved, O(1) lookup)
     Tensor& resolve_tensor(const TensorRef& ref);

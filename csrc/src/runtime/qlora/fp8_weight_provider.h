@@ -91,6 +91,11 @@ public:
         int mamba_intermediate_size = 0;
         bool mamba_use_bias = false;
         bool mamba_use_conv_bias = false;
+
+        /// Hybrid architecture pattern (e.g., "MEMEM*EMEMEM*...") where:
+        /// M = Mamba, E = MoE, * = Attention, - = MLP
+        /// If empty, assumes uniform architecture (all layers same type).
+        std::string hybrid_pattern;
     };
 
     FP8WeightProvider(const Config& config, TensorAllocator& allocator,

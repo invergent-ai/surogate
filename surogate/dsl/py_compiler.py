@@ -210,6 +210,9 @@ def _build_dim_map(instance: Any) -> Dict[str, str]:
     This maps annotation strings like "C", "D", "QKV" to config parameter expressions
     like "d_model", "head_size", "(num_query_heads + 2 * num_kv_heads) * head_size".
 
+    Also handles integer attributes used as dimension values in block definitions
+    (e.g., self.P = 1552 for projection_size).
+
     Args:
         instance: An instance of a block/module class with Dim attributes.
 
@@ -224,6 +227,11 @@ def _build_dim_map(instance: Any) -> Dict[str, str]:
             attr = getattr(instance, attr_name)
             if isinstance(attr, (Dim, DimExpr, ConcreteDimValue)):
                 dim_map[attr_name] = _parse_shape_dim(attr)
+            elif isinstance(attr, int) and attr >= 0:
+                # Also capture integer dimension values (e.g., self.P = projection_size)
+                # Use short uppercase names as heuristic for dimension aliases
+                if len(attr_name) <= 10 and attr_name[0].isupper():
+                    dim_map[attr_name] = str(attr)
         except Exception:
             pass
     return dim_map
@@ -293,6 +301,10 @@ def _param_spec_to_ref(
             # Then check if it's directly in config
             if parsed in config:
                 return config[parsed]
+            # If resolved to a numeric string (e.g., "1552" from dim_map integer),
+            # convert to integer
+            if isinstance(parsed, str) and parsed.isdigit():
+                return int(parsed)
         return parsed
 
     # Handle ARRAY params (e.g., blocks: Array["n_layers", "BlockType"])
@@ -416,6 +428,9 @@ def _compile_activation_slot(
                 parsed = dim_map[parsed]
             elif dim_map:
                 parsed = _substitute_dim_names(parsed, dim_map)
+            # Convert numeric strings to integers
+            if isinstance(parsed, str) and parsed.isdigit():
+                parsed = int(parsed)
         shape.append(parsed)
 
     return ActivationSlotIR(
@@ -557,6 +572,7 @@ def _compile_graph_builder(
     config: Dict[str, Any],
     params: Dict[str, ParamSpec],
     *,
+    dim_map: Optional[Dict[str, str]] = None,
     warnings: WarningCollector | None = None,
 ) -> GraphIR:
     """Compile a GraphBuilder to GraphIR."""
@@ -599,7 +615,7 @@ def _compile_graph_builder(
                     continue
             except Exception:
                 pass
-        graph.params[name] = _param_spec_to_ref(param_spec, config)
+        graph.params[name] = _param_spec_to_ref(param_spec, config, dim_map)
 
     # Convert nodes
     for i, node in enumerate(builder.nodes):
@@ -642,7 +658,11 @@ def _compile_graph_builder(
 
 
 def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any]) -> None:
-    """Initialize instance with config keys accepted by __init__."""
+    """Initialize instance with config keys accepted by __init__.
+
+    Raises ValueError if the __init__ fails with a ValueError (config validation error).
+    Other exceptions are silently ignored for backward compatibility.
+    """
     import inspect
 
     if not hasattr(cls, "__init__"):
@@ -660,6 +680,10 @@ def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any])
             kwargs[name] = config[name]
     try:
         cls.__init__(instance, **kwargs)
+    except ValueError:
+        # Re-raise ValueError as these typically indicate config validation errors
+        # (e.g., hybrid_override_pattern length doesn't match n_layers)
+        raise
     except Exception:
         pass
 
@@ -671,9 +695,9 @@ def _inline_stacked_blocks(
     *,
     warnings: WarningCollector | None = None,
 ) -> GraphIR:
-    """Inline StackedBlocks calls into per-layer block graphs."""
-    # Quick check: if no StackedBlocks present, return as-is
-    if not any(node.name == "StackedBlocks" for node in graph.nodes):
+    """Inline StackedBlocks and HybridStackedBlocks calls into per-layer block graphs."""
+    # Quick check: if no StackedBlocks or HybridStackedBlocks present, return as-is
+    if not any(node.name in ("StackedBlocks", "HybridStackedBlocks") for node in graph.nodes):
         return graph
 
     # Resolve block param spec from model
@@ -705,7 +729,7 @@ def _inline_stacked_blocks(
     op_id = 0
 
     for node in graph.nodes:
-        if node.name != "StackedBlocks":
+        if node.name not in ("StackedBlocks", "HybridStackedBlocks"):
             op_id += 1
             new_nodes.append(OpIR(
                 id=op_id,
@@ -717,73 +741,196 @@ def _inline_stacked_blocks(
             ))
             continue
 
-        blocks_param = node.attrs.get("blocks", "blocks")
         n_layers = node.attrs.get("n_layers") or config.get("n_layers")
         if n_layers is None:
             raise DSLError(
                 ErrorCode.E012,
-                "StackedBlocks missing n_layers",
+                f"{node.name} missing n_layers",
                 hint="Pass n_layers=... in g.call(...), or provide n_layers in the model config.",
             )
 
-        block_spec = _resolve_block_spec(blocks_param)
-        block_ir = _get_block_ir(block_spec)
-        if not block_ir.forward_graph or not block_ir.forward_graph.nodes:
-            raise DSLError(
-                ErrorCode.E012,
-                f"Block graph missing for {block_spec.name}",
-                hint="Ensure the block defines an @forward method using 'with graph() as g:' and returns GraphRef(s).",
-            )
+        if node.name == "HybridStackedBlocks":
+            # HybridStackedBlocks: different block types per layer
+            block_types = node.attrs.get("block_types")
+            if not block_types:
+                raise DSLError(
+                    ErrorCode.E012,
+                    "HybridStackedBlocks missing block_types",
+                    hint="Pass block_types=[...] in g.call('HybridStackedBlocks', ...).",
+                )
+            if len(block_types) != int(n_layers):
+                raise DSLError(
+                    ErrorCode.E012,
+                    f"HybridStackedBlocks block_types length ({len(block_types)}) != n_layers ({n_layers})",
+                )
 
-        block_graph = block_ir.forward_graph
-        block_inputs = list(block_graph.inputs.keys())
-        block_outputs = list(block_graph.outputs.keys())
-        block_params = list(block_graph.params.keys())
+            # Map block type names to their param arrays
+            block_type_to_param = {
+                "mamba": node.attrs.get("mamba_blocks", "mamba_blocks"),
+                "attention": node.attrs.get("attn_blocks", "attn_blocks"),
+                "mlp": node.attrs.get("mlp_blocks", "mlp_blocks"),
+                "moe": node.attrs.get("moe_blocks", "moe_blocks"),
+            }
 
-        # StackedBlocks inputs are (x, residual, position_ids)
-        cur_inputs = list(node.inputs)
-        if len(cur_inputs) != len(block_inputs):
-            raise DSLTypeError(
-                f"StackedBlocks input mismatch: expected {len(block_inputs)}, got {len(cur_inputs)}",
-                hint="Make sure g.call('StackedBlocks', ...) inputs match the block forward signature.",
-            )
+            # Track indices per block type
+            block_type_indices: Dict[str, int] = {
+                "mamba": 0,
+                "attention": 0,
+                "mlp": 0,
+                "moe": 0,
+            }
 
-        for layer_idx in range(int(n_layers)):
-            # Outputs for this layer
-            if layer_idx == int(n_layers) - 1:
-                layer_outputs = list(node.outputs)
-            else:
-                layer_outputs = [f"{blocks_param}[{layer_idx}].{name}" for name in block_outputs]
+            # Resolve all block specs upfront
+            block_specs: Dict[str, BlockSpec] = {}
+            block_irs: Dict[str, ModuleIR] = {}
+            for block_type, param_name in block_type_to_param.items():
+                # Only resolve if this block type is actually used
+                if block_type in block_types:
+                    param_spec = model_spec.params.get(param_name)
+                    if param_spec and param_spec.kind == ParamKind.ARRAY and param_spec.element_type:
+                        spec = get_block_spec(param_spec.element_type)
+                        if spec:
+                            block_specs[block_type] = spec
+                            block_irs[block_type] = _get_block_ir(spec)
 
-            # Build name mapping
-            prefix = f"{blocks_param}[{layer_idx}]."
-            mapping: Dict[str, str] = {}
-            for b_in, c_in in zip(block_inputs, cur_inputs):
-                mapping[b_in] = c_in
-            for b_out, c_out in zip(block_outputs, layer_outputs):
-                mapping[b_out] = c_out
-            for p in block_params:
-                mapping[p] = f"{prefix}{p}"
-                if mapping[p] not in new_params:
-                    new_params[mapping[p]] = block_graph.params[p]
+            cur_inputs = list(node.inputs)
 
-            # Inline block nodes
-            for bnode in block_graph.nodes:
-                op_id += 1
-                mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
-                mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]
-                new_nodes.append(OpIR(
-                    id=op_id,
-                    name=bnode.name,
-                    kernel_type=bnode.kernel_type,
-                    inputs=mapped_inputs,
-                    outputs=mapped_outputs,
-                    attrs=dict(bnode.attrs),
-                ))
+            for layer_idx in range(int(n_layers)):
+                block_type = block_types[layer_idx]
+                if block_type not in block_specs:
+                    raise DSLError(
+                        ErrorCode.E012,
+                        f"No block spec found for block type '{block_type}' at layer {layer_idx}",
+                        hint=f"Make sure {block_type_to_param.get(block_type, block_type + '_blocks')} param is defined.",
+                    )
 
-            # Next layer inputs
-            cur_inputs = list(layer_outputs[:len(block_inputs) - 1])
-            cur_inputs.append(node.inputs[-1])  # position_ids stays constant
+                block_spec = block_specs[block_type]
+                block_ir = block_irs[block_type]
+                block_graph = block_ir.forward_graph
+                if not block_graph or not block_graph.nodes:
+                    raise DSLError(
+                        ErrorCode.E012,
+                        f"Block graph missing for {block_spec.name}",
+                        hint="Ensure the block defines an @forward method.",
+                    )
+
+                block_inputs = list(block_graph.inputs.keys())
+                block_outputs = list(block_graph.outputs.keys())
+                block_params = list(block_graph.params.keys())
+
+                # Get the index within this block type's array
+                block_idx = block_type_indices[block_type]
+                block_type_indices[block_type] += 1
+
+                blocks_param = block_type_to_param[block_type]
+
+                # Outputs for this layer
+                if layer_idx == int(n_layers) - 1:
+                    layer_outputs = list(node.outputs)
+                else:
+                    layer_outputs = [f"layer{layer_idx}.{name}" for name in block_outputs]
+
+                # Build name mapping
+                prefix = f"{blocks_param}[{block_idx}]."
+                mapping: Dict[str, str] = {}
+
+                # Map block inputs to current layer inputs (handle mismatched counts)
+                # Some blocks take 2 inputs (x, residual), some take 3 (x, residual, position_ids)
+                for i, b_in in enumerate(block_inputs):
+                    if i < len(cur_inputs):
+                        mapping[b_in] = cur_inputs[i]
+                    else:
+                        # For position_ids or other inputs not in cur_inputs, use original
+                        if i < len(node.inputs):
+                            mapping[b_in] = node.inputs[i]
+
+                for b_out, c_out in zip(block_outputs, layer_outputs):
+                    mapping[b_out] = c_out
+                for p in block_params:
+                    mapping[p] = f"{prefix}{p}"
+                    if mapping[p] not in new_params:
+                        new_params[mapping[p]] = block_graph.params[p]
+
+                # Inline block nodes
+                for bnode in block_graph.nodes:
+                    op_id += 1
+                    mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
+                    mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]
+                    new_nodes.append(OpIR(
+                        id=op_id,
+                        name=bnode.name,
+                        kernel_type=bnode.kernel_type,
+                        inputs=mapped_inputs,
+                        outputs=mapped_outputs,
+                        attrs=dict(bnode.attrs),
+                    ))
+
+                # Next layer inputs (x, residual from outputs; keep position_ids)
+                cur_inputs = list(layer_outputs[:2])  # First 2 outputs are typically (out, residual)
+                if len(node.inputs) > 2:
+                    cur_inputs.append(node.inputs[2])  # position_ids stays constant
+
+        else:
+            # Standard StackedBlocks: same block type for all layers
+            blocks_param = node.attrs.get("blocks", "blocks")
+            block_spec = _resolve_block_spec(blocks_param)
+            block_ir = _get_block_ir(block_spec)
+            if not block_ir.forward_graph or not block_ir.forward_graph.nodes:
+                raise DSLError(
+                    ErrorCode.E012,
+                    f"Block graph missing for {block_spec.name}",
+                    hint="Ensure the block defines an @forward method using 'with graph() as g:' and returns GraphRef(s).",
+                )
+
+            block_graph = block_ir.forward_graph
+            block_inputs = list(block_graph.inputs.keys())
+            block_outputs = list(block_graph.outputs.keys())
+            block_params = list(block_graph.params.keys())
+
+            # StackedBlocks inputs are (x, residual, position_ids)
+            cur_inputs = list(node.inputs)
+            if len(cur_inputs) != len(block_inputs):
+                raise DSLTypeError(
+                    f"StackedBlocks input mismatch: expected {len(block_inputs)}, got {len(cur_inputs)}",
+                    hint="Make sure g.call('StackedBlocks', ...) inputs match the block forward signature.",
+                )
+
+            for layer_idx in range(int(n_layers)):
+                # Outputs for this layer
+                if layer_idx == int(n_layers) - 1:
+                    layer_outputs = list(node.outputs)
+                else:
+                    layer_outputs = [f"{blocks_param}[{layer_idx}].{name}" for name in block_outputs]
+
+                # Build name mapping
+                prefix = f"{blocks_param}[{layer_idx}]."
+                mapping: Dict[str, str] = {}
+                for b_in, c_in in zip(block_inputs, cur_inputs):
+                    mapping[b_in] = c_in
+                for b_out, c_out in zip(block_outputs, layer_outputs):
+                    mapping[b_out] = c_out
+                for p in block_params:
+                    mapping[p] = f"{prefix}{p}"
+                    if mapping[p] not in new_params:
+                        new_params[mapping[p]] = block_graph.params[p]
+
+                # Inline block nodes
+                for bnode in block_graph.nodes:
+                    op_id += 1
+                    mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
+                    mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]
+                    new_nodes.append(OpIR(
+                        id=op_id,
+                        name=bnode.name,
+                        kernel_type=bnode.kernel_type,
+                        inputs=mapped_inputs,
+                        outputs=mapped_outputs,
+                        attrs=dict(bnode.attrs),
+                    ))
+
+                # Next layer inputs
+                cur_inputs = list(layer_outputs[:len(block_inputs) - 1])
+                cur_inputs.append(node.inputs[-1])  # position_ids stays constant
 
     # Rebuild intermediates
     new_intermediates: Dict[str, TensorRef] = {}
@@ -1090,6 +1237,7 @@ def compile_model_spec(
     # Create instance first so we can build dim_map for param resolution
     instance = None
     dim_map: Dict[str, str] = {}
+    init_error: Exception | None = None
     if spec.python_class:
         try:
             instance = object.__new__(spec.python_class)
@@ -1097,8 +1245,41 @@ def compile_model_spec(
                 setattr(instance, key, value)
             _init_instance_from_config(instance, spec.python_class, config)
             dim_map = _build_dim_map(instance)
+
+            # Capture any computed integer attributes from the instance that might be
+            # needed for shape resolution (e.g., n_mamba_blocks, n_attn_blocks for hybrid models)
+            # These are attributes that exist on the instance but not in config.
+            # Also capture important string attributes like hybrid_pattern for runtime config.
+            _important_string_attrs = {"hybrid_pattern", "mlp_activation", "activation"}
+            for attr_name in dir(instance):
+                if attr_name.startswith("_"):
+                    continue
+                if attr_name in config:
+                    continue
+                try:
+                    attr_val = getattr(instance, attr_name)
+                    # Capture integers that look like dimension values
+                    if isinstance(attr_val, int) and attr_val >= 0:
+                        config[attr_name] = attr_val
+                    # Also capture important string attributes for runtime config
+                    elif isinstance(attr_val, str) and attr_name in _important_string_attrs:
+                        config[attr_name] = attr_val
+                except Exception:
+                    pass
+        except ValueError as e:
+            # Critical configuration errors (e.g., hybrid_override_pattern length mismatch)
+            # should be propagated rather than silently ignored
+            init_error = e
         except Exception:
             pass
+
+    # If there was a critical init error, raise it now with context
+    if init_error is not None:
+        raise DSLError(
+            ErrorCode.E012,
+            f"Model initialization failed: {init_error}",
+            hint="Check that the model config is consistent (e.g., hybrid_override_pattern length matches num_hidden_layers).",
+        )
 
     # Params - use dim_map to resolve annotation strings to Dim expressions
     for name, param_spec in spec.params.items():
@@ -1128,7 +1309,7 @@ def compile_model_spec(
                     hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
                 )
 
-            graph = _compile_graph_builder(builder, spec.forward, config, spec.params, warnings=warnings)
+            graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
             # Expand StackedBlocks into per-layer block graphs
             graph = _inline_stacked_blocks(graph, spec, config, warnings=warnings)
             ir.forward_graph = graph
@@ -1209,7 +1390,7 @@ def compile_block_spec(
                     f"could not capture forward graph for block '{spec.name}'",
                     hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
                 )
-            ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, warnings=warnings)
+            ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
 
     # Compile activation layout if present
     if spec.activations:
@@ -1286,7 +1467,7 @@ def compile_module_spec(
                         hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
                     )
             else:
-                ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, warnings=warnings)
+                ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
 
     return ir
 

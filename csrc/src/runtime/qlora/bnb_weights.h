@@ -57,6 +57,11 @@ public:
         /// Experts are streamed to GPU on-demand when selected by the router.
         /// Saves ~12GB for 128-expert models, with ~20-40% throughput reduction.
         bool offload_experts = false;
+
+        /// Hybrid architecture pattern (e.g., "MEMEM*EMEMEM*...") where:
+        /// M = Mamba, E = MoE, * = Attention, - = MLP
+        /// If empty, assumes uniform architecture (all layers same type).
+        std::string hybrid_pattern;
     };
 
     BnBWeightsManager(const Config& config, TensorAllocator& allocator,

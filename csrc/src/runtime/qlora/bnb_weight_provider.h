@@ -40,6 +40,24 @@
 namespace modules {
 
 /**
+ * @brief Helper to determine hybrid layer type from pattern string
+ */
+enum class HybridLayerType { Mamba, MoE, Attention, MLP, Dense, Unknown };
+
+inline HybridLayerType get_hybrid_layer_type(const std::string& pattern, int layer_idx) {
+    if (pattern.empty() || layer_idx < 0 || layer_idx >= static_cast<int>(pattern.size())) {
+        return HybridLayerType::Unknown;
+    }
+    switch (pattern[static_cast<std::size_t>(layer_idx)]) {
+        case 'M': return HybridLayerType::Mamba;
+        case 'E': return HybridLayerType::MoE;
+        case '*': return HybridLayerType::Attention;
+        case '-': return HybridLayerType::MLP;
+        default: return HybridLayerType::Dense;
+    }
+}
+
+/**
  * @brief Provides dequantized weights for BitsAndBytes NF4 QLoRA training
  *
  * This class wraps BnBWeightsManager and provides on-the-fly dequantization
@@ -111,6 +129,11 @@ public:
         bool mamba_use_bias = false;
         bool mamba_use_conv_bias = false;
         const HfMapping* hf_mapping = nullptr;
+
+        /// Hybrid architecture pattern (e.g., "MEMEM*EMEMEM*...") where:
+        /// M = Mamba, E = MoE, * = Attention, - = MLP
+        /// If empty, assumes uniform architecture (all layers same type).
+        std::string hybrid_pattern;
     };
 
     BnBWeightProvider(const Config& config, TensorAllocator& allocator,
@@ -471,7 +494,8 @@ BnBWeightProvider<Block>::BnBWeightProvider(
         .shard_idx = config.shard_idx,
         .num_shards = config.num_shards,
         .hf_mapping = config.hf_mapping,
-        .offload_experts = config.offload_experts
+        .offload_experts = config.offload_experts,
+        .hybrid_pattern = config.hybrid_pattern
     };
     mBnBWeights = std::make_unique<BnBWeightsManager>(bw_config, allocator, device_props);
 
@@ -868,6 +892,18 @@ bool BnBWeightProvider<Block>::load_tensor_from_spec(const SafeTensorsReader& re
 template<typename Block>
 void BnBWeightProvider<Block>::dequantize_weight(const BnBBlockQuantizedWeight& src,
                                                   Tensor& dst, cudaStream_t stream) {
+    // Safety check: skip if source data is not allocated
+    if (src.data.Data == nullptr || src.absmax.Data == nullptr) {
+        return;
+    }
+
+    // Validate dtype: NF4 packed data should be BYTE (U8)
+    if (src.data.DType != ETensorDType::BYTE) {
+        std::cerr << "[BnB ERROR] dequantize_weight: expected BYTE dtype for NF4 data, got "
+                  << dtype_to_str(src.data.DType) << " (M=" << src.M << ", K=" << src.K << ")\n";
+        return;
+    }
+
     if (src.double_quant) {
         // Use double-dequantization kernel: INT8 absmax → FP32 → NF4 dequant
         dequantize_bnb_nf4_double(
@@ -895,9 +931,50 @@ template<typename Block>
 typename BnBWeightProvider<Block>::BlockWeights& BnBWeightProvider<Block>::get_block(
     int layer_idx, cudaStream_t stream) {
 
-    // For MoE models, use the MoE-specific path that only handles attention weights
-    // MoE models don't have dense MLP weights - they have per-expert weights instead
-    if (is_moe()) {
+    // Check for hybrid architecture - Mamba layers need special handling
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+
+    // For Mamba layers in hybrid architectures, skip attention/MoE dequantization
+    // Mamba layers only have layer norms + Mamba-specific weights (loaded separately)
+    if (layer_type == HybridLayerType::Mamba) {
+        // Mamba layers are always loaded into dense (BnB) storage, not MoE storage
+        // This is true even in hybrid models with MoE layers
+        const auto& qblock = mBnBWeights->get_bnb_block(layer_idx);
+        mDequantBlock.ln1.weight = qblock.ln1_weight;
+        mDequantBlock.ln2.weight = qblock.ln2_weight;
+
+        // Set up Mamba weights if available
+        if constexpr (has_mamba_weights<BlockWeights>::value) {
+            if (mConfig.has_mamba &&
+                layer_idx >= 0 &&
+                layer_idx < static_cast<int>(mMambaWeights.weights.size()) &&
+                mMambaWeights.weights[static_cast<std::size_t>(layer_idx)].has_value()) {
+                mDequantBlock.mamba = mMambaWeights.weights[static_cast<std::size_t>(layer_idx)];
+            } else {
+                mDequantBlock.mamba.reset();
+            }
+        }
+
+        // Clear attention/MLP weights to avoid using stale data
+        mDequantBlock.attention.qkv_weight = Tensor();
+        mDequantBlock.attention.out_weight = Tensor();
+        if constexpr (has_mlp_weights<BlockWeights>::value) {
+            mDequantBlock.mlp_up_weight = Tensor();
+            mDequantBlock.mlp_down_weight = Tensor();
+        }
+
+        return mDequantBlock;
+    }
+
+    // For hybrid architectures, check if this specific layer uses MoE or dense MLP
+    // MoE layers ('E') use mMoEBlocks storage, while Attention ('*') and MLP ('-')
+    // layers use mQuantizedBlocks storage with dense MLP weights
+    const bool is_moe_layer = (layer_type == HybridLayerType::MoE ||
+                               (mConfig.hybrid_pattern.empty() && is_moe()));
+
+    // For MoE layers, use the MoE-specific path
+    // MoE layers have per-expert weights instead of dense MLP
+    if (is_moe_layer) {
         get_moe_attention_weights(layer_idx, stream);
         if constexpr (has_mamba_weights<BlockWeights>::value) {
             if (mConfig.has_mamba &&
@@ -912,8 +989,17 @@ typename BnBWeightProvider<Block>::BlockWeights& BnBWeightProvider<Block>::get_b
         return mDequantBlock;
     }
 
-    // Dense model path
+    // For Attention ('*') layers in hybrid architectures: use dense path for attention only
+    // For MLP ('-') layers: use dense path for MLP only (attention already skipped above)
+    // This handles layers that use mQuantizedBlocks storage with dense MLP instead of MoE experts
+
+    // Dense model path (also used for Attention/MLP layers in hybrid architectures)
     const auto& qblock = mBnBWeights->get_bnb_block(layer_idx);
+
+    // Check if this layer has attention (hybrid MLP layers don't have attention)
+    // Check if this layer has MLP (hybrid Attention layers don't have MLP in Nemotron-H)
+    const bool has_attention_weights = (layer_type != HybridLayerType::MLP);
+    const bool has_mlp_weights = (layer_type != HybridLayerType::Attention);  // Attention has no MLP
 
     // Check if we already have this layer dequantized in the current step
     // This happens when backward accesses the same layer that forward just used
@@ -922,17 +1008,17 @@ typename BnBWeightProvider<Block>::BlockWeights& BnBWeightProvider<Block>::get_b
     if (!cache_hit) {
         // Cache miss: need to dequantize weights
 
-        // QKV projection
-        dequantize_weight(qblock.qkv_proj, mDequantQKV, stream);
+        // QKV and output projection (only for layers with attention)
+        if (has_attention_weights && qblock.qkv_proj.data.Data != nullptr) {
+            dequantize_weight(qblock.qkv_proj, mDequantQKV, stream);
+            dequantize_weight(qblock.out_proj, mDequantOut, stream);
+        }
 
-        // Output projection
-        dequantize_weight(qblock.out_proj, mDequantOut, stream);
-
-        // Gate+Up projection
-        dequantize_weight(qblock.gate_up_proj, mDequantGateUp, stream);
-
-        // Down projection
-        dequantize_weight(qblock.down_proj, mDequantDown, stream);
+        // Gate+Up and down projection (for layers with MLP)
+        if (has_mlp_weights && qblock.gate_up_proj.data.Data != nullptr) {
+            dequantize_weight(qblock.gate_up_proj, mDequantGateUp, stream);
+            dequantize_weight(qblock.down_proj, mDequantDown, stream);
+        }
 
         // Update cache metadata
         mCurrentLayer = layer_idx;
@@ -1088,13 +1174,28 @@ template<typename Block>
 void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStream_t stream) {
     const auto& qblock = mBnBWeights->get_moe_block(layer_idx);
 
+    // Check if this layer has attention weights (hybrid architectures may have
+    // layers without attention, e.g., Mamba layers)
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+    const bool has_attention = (layer_type != HybridLayerType::Mamba &&
+                                layer_type != HybridLayerType::MLP);
+
     // Check cache for this layer's weights
     const bool cache_hit = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
 
     if (!cache_hit) {
-        // Dequantize attention weights
-        dequantize_weight(qblock.qkv_proj, mDequantQKV, stream);
-        dequantize_weight(qblock.out_proj, mDequantOut, stream);
+        // Dequantize attention weights only if this layer has attention
+        if (has_attention && qblock.qkv_proj.data.Data != nullptr) {
+            dequantize_weight(qblock.qkv_proj, mDequantQKV, stream);
+            dequantize_weight(qblock.out_proj, mDequantOut, stream);
+        }
+
+        // Check if this layer has MoE experts (vs dense MLP)
+        // In hybrid architectures, some layers use dense MLP ('*' Attention, '-' MLP)
+        // while others use MoE experts ('E' MoE layers)
+        const bool has_moe_experts = (layer_type == HybridLayerType::MoE ||
+                                      layer_type == HybridLayerType::Unknown ||
+                                      mConfig.hybrid_pattern.empty());
 
         // When selective_expert_dequant is enabled AND LoRA is enabled, skip dequantizing
         // all experts here. The LoRA forward hook will call dequantize_selected_experts()
@@ -1105,7 +1206,7 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
         // Without this check, the base model would use uninitialized expert weight buffers.
         const bool use_selective_path = mConfig.selective_expert_dequant && mConfig.lora_config.enabled();
 
-        if (!use_selective_path) {
+        if (has_moe_experts && !use_selective_path) {
             // Dequantize ALL expert weights into batched buffers
             // Each expert's weights are dequantized into a slice of the batched tensor
             const int hidden = mConfig.hidden_size;
@@ -1147,8 +1248,8 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
         }
         // When selective mode is on, expert dequantization is deferred to dequantize_selected_experts()
 
-        // Dequantize shared expert weights (always needed when enabled)
-        if (mHasSharedExpert && qblock.shared_expert.has_value()) {
+        // Dequantize shared expert weights (only for MoE layers that have experts)
+        if (has_moe_experts && mHasSharedExpert && qblock.shared_expert.has_value()) {
             const auto& shared = qblock.shared_expert.value();
             if (mExpertsOffloaded) {
                 stream_and_dequantize_expert(shared.gate_up_proj, mSharedExpertGateUp, stream);
@@ -1192,6 +1293,14 @@ void BnBWeightProvider<Block>::dequantize_selected_experts(
     if (!selection_info.enabled || selection_info.num_active == 0) {
         return;
     }
+
+    // For hybrid architectures, only MoE layers have experts to dequantize
+    const HybridLayerType layer_type = get_hybrid_layer_type(mConfig.hybrid_pattern, layer_idx);
+    if (!mConfig.hybrid_pattern.empty() && layer_type != HybridLayerType::MoE) {
+        // This layer doesn't have MoE experts (e.g., Mamba, Attention, or MLP layer)
+        return;
+    }
+
     const auto& qblock = mBnBWeights->get_moe_block(layer_idx);
     const int hidden = mConfig.hidden_size;
     const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?

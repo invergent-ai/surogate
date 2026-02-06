@@ -189,7 +189,7 @@ def get_model_info_and_template(
     if model_type is not None:
         model_template = MODEL_MAPPING[model_type]
     else:
-        model_template = ModelTemplate(None, 'dummy', get_model_tokenizer_from_local, model_arch=None)
+        model_template = ModelTemplate(None, 'dummy', get_model_and_tokenizer_from_local, model_arch=None)
         logger.info(f'Temporarily create model_meta: {model_template}')
 
     if torch_dtype is None:

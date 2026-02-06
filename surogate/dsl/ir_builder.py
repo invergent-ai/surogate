@@ -27,12 +27,37 @@ def resolve_architecture(config_json: Dict[str, Any]) -> str:
 
 
 def build_dsl_ir_from_python(architecture: str, config_json: Dict[str, Any]) -> str:
-    """Build IR JSON using Python DSL models."""
+    """Build IR JSON using Python DSL models.
+
+    Raises:
+        RuntimeError: If DSL compilation fails, with detailed error message.
+    """
     # Import here to avoid circular imports and ensure models are registered
     from surogate.dsl import models  # noqa: F401 - registers models
     from surogate.dsl.py_compiler import compile_model_for_hf
 
-    return compile_model_for_hf(architecture, config_json)
+    ir_json = compile_model_for_hf(architecture, config_json)
+
+    # Check if compilation succeeded
+    result = json.loads(ir_json)
+    if not result.get("success", False):
+        errors = result.get("errors", [])
+        if errors:
+            # Format error messages for display
+            error_msgs = []
+            for err in errors:
+                msg = err.get("message", str(err))
+                if err.get("hint"):
+                    msg += f"\n  Hint: {err['hint']}"
+                error_msgs.append(msg)
+            raise RuntimeError(
+                f"DSL compilation failed for {architecture}:\n" +
+                "\n".join(f"  - {msg}" for msg in error_msgs)
+            )
+        else:
+            raise RuntimeError(f"DSL compilation failed for {architecture} (no error details)")
+
+    return ir_json
 
 
 def build_dsl_ir_for_model(model_dir: str) -> str:
