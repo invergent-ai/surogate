@@ -431,9 +431,24 @@ std::vector<qlora::WeightLoadSpec> build_weight_specs(
 
         qlora::WeightLoadSpec spec;
         spec.name = name;
-        spec.M = static_cast<int>(resolved[0]);
-        spec.K = resolved.size() >= 2 ? static_cast<int>(resolved[1]) : 0;
-        spec.quantize = info.quantizable;
+        // Store full shape for loading (needed for 3D expert weights).
+        spec.shape.assign(resolved.begin(), resolved.end());
+        if (resolved.size() >= 3) {
+            // 3D weights (e.g., MoE expert weights [E, M, K]):
+            // Flatten expert dim into rows for quantizer: M = E*per_M, K = per_K.
+            spec.K = static_cast<int>(resolved.back());
+            long rows = 1;
+            for (size_t d = 0; d + 1 < resolved.size(); ++d) {
+                rows *= resolved[d];
+            }
+            spec.M = static_cast<int>(rows);
+        } else {
+            spec.M = static_cast<int>(resolved[0]);
+            spec.K = resolved.size() >= 2 ? static_cast<int>(resolved[1]) : 0;
+        }
+        // 1D weights (K=0) cannot be block-quantized — keep them full precision.
+        // This covers norms (ln1_weight, ln2_weight, q_norm_weight, k_norm_weight).
+        spec.quantize = info.quantizable && spec.K > 0;
         spec.offload_group = info.offload_group;
         spec.sharded = false;  // QLoRA base weights are replicated (not sharded)
 
@@ -473,16 +488,39 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     config.weight_manager_config.device_id = config.quantizer_config.device_id;
     if (options.OffloadExperts && qlora_cfg.is_moe()) {
         config.weight_manager_config.enable_offloading = true;
+        // Keep 2 groups resident: current layer + one prefetched layer ahead.
+        config.weight_manager_config.offload_config.max_resident_groups = 2;
+        config.weight_manager_config.offload_config.device_id = config.quantizer_config.device_id;
+
+        // The Python DSL assigns a single offload_group to ALL expert weights
+        // across all layers. Remap to per-layer groups so each layer's experts
+        // can be loaded/unloaded independently (~300 MB per layer instead of
+        // the entire model's experts at once).
+        for (auto& spec : config.weight_specs) {
+            if (spec.offload_group < 0) continue;
+            // Parse block index from names like "moe_blocks[3].experts_gate_up"
+            auto bracket = spec.name.find("blocks[");
+            if (bracket == std::string::npos) continue;
+            auto close = spec.name.find(']', bracket);
+            if (close == std::string::npos) continue;
+            auto idx_start = bracket + 7;  // length of "blocks["
+            try {
+                spec.offload_group = std::stoi(spec.name.substr(idx_start, close - idx_start));
+            } catch (...) {
+                // Keep original group if parsing fails
+            }
+        }
     }
 
-    // Use pooled dequant buffers for large models to reduce peak memory
+    // Use pooled dequant buffers to limit peak GPU memory.
+    // Only one layer's weights are needed at a time (forward or backward),
+    // so cache_size=4 (one per weight type: QKV, Out, GateUp, Down) matches
+    // the old provider's shared-buffer approach.
     const int num_quantizable = static_cast<int>(std::count_if(
         config.weight_specs.begin(), config.weight_specs.end(),
         [](const qlora::WeightLoadSpec& s) { return s.quantize; }));
-    if (num_quantizable > 64) {
-        // For models with many quantizable weights, use a pool to limit
-        // concurrent dequant buffers and reduce peak GPU memory
-        config.weight_manager_config.max_dequant_cache_size = 32;
+    if (num_quantizable > 4) {
+        config.weight_manager_config.max_dequant_cache_size = 4;
     }
 
     fprintf(stderr, "[QLoRA] Generic provider: %d weight specs (%d quantizable), "

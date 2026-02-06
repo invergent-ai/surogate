@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-4B
+model: Qwen/Qwen3-14B
 output_dir: ./output
 merge_adapter: false
 apply_recommended_values: false
@@ -16,8 +16,6 @@ save_steps: 0
 learning_rate: 2e-4
 
 recipe: bf16
-debug_memory_breakdown: true
-use_dsl_ir: true
 
 lora: true
 lora_rank: 16

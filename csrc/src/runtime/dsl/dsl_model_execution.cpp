@@ -555,10 +555,13 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const bool lora_stack_tight = lora_enabled();
     const long safety_floor = lora_stack_tight ? (32L * 1024 * 1024) : (64L * 1024 * 1024);
     const long safety_bytes = std::max(safety_floor, base_size / 8);
-    const long base_multiplier = lora_stack_tight ? 1L : 2L;
+    // The sizing simulation captures ~55% of actual backward peak (flash attention
+    // backward workspace and accumulated temps are not fully modeled), so we use
+    // base_multiplier=2 for both LoRA and full fine-tune.
+    const long base_multiplier = 2L;
     long required_size = std::max(1024L * 1024,
                                   base_size * base_multiplier + moe_extra + safety_bytes + extra_tmp + attn_fallback_bytes);
-    const long slack_bytes = lora_stack_tight ? (128L * 1024 * 1024) : (512L * 1024 * 1024);
+    const long slack_bytes = lora_stack_tight ? (256L * 1024 * 1024) : (512L * 1024 * 1024);
     required_size += slack_bytes;  // extra slack for unmodeled temps
     long moe_stack_slack = 0;
     if (mModelConfig.NumExperts > 0) {

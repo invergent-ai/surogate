@@ -43,9 +43,16 @@ struct WeightLoadSpec {
     /// Internal parameter name (e.g., "blocks[0].qkv_weight", "embedding").
     std::string name;
 
-    /// Shape of the weight [M, K] (or [M] for 1D).
+    /// Flattened 2D dimensions for quantizer: M = total rows, K = columns.
+    /// For 2D weights [R, C]: M=R, K=C.
+    /// For 3D weights [E, R, C]: M=E*R, K=C (flattened for quantizer).
     int M = 0;
     int K = 0;
+
+    /// Full tensor shape for loading and dequant buffer allocation.
+    /// For 2D: {M, K}. For 3D experts: {E, per_expert_M, K}.
+    /// Empty means use {M, K} as the shape.
+    std::vector<long> shape;
 
     /// Whether this weight should be quantized (true) or kept full precision.
     /// Norms, biases, embeddings, and lm_head are typically not quantized.

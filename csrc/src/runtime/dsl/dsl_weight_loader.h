@@ -126,6 +126,21 @@ public:
                       const Tensor* global_template = nullptr,
                       cudaStream_t stream = nullptr);
 
+    /// Load a single expert from a StackExperts parameter into a 2D target buffer.
+    ///
+    /// Used for per-expert streaming during quantized import: instead of
+    /// allocating the full [E, M, K] stacked tensor, the caller loads one
+    /// expert at a time into a small [per_M, K] buffer.
+    ///
+    /// @param name        Internal parameter name (must have StackExperts mapping).
+    /// @param expert_idx  Expert index (0-based).
+    /// @param target      Pre-allocated 2D tensor [per_M, K] to fill.
+    /// @param allow_cast  Allow dtype conversion during load.
+    /// @param stream      CUDA stream for async operations.
+    /// @return true if loaded successfully.
+    bool load_expert(const std::string& name, int expert_idx,
+                     Tensor& target, bool allow_cast, cudaStream_t stream = nullptr);
+
     /// Resolve all deferred TiedTo parameters.
     ///
     /// Must be called after all other parameters have been loaded.

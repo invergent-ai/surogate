@@ -26,8 +26,8 @@ class RMSNorm:
         # Typed dimension - use short symbolic names that C++ ShapeEnv expects
         self.C = Dim("C")
 
-    # Normalization weight
-    weight = Param(Tensor["C"])
+    # Normalization weight (never quantized — always full precision)
+    weight = Param(Tensor["C"], quantizable=False)
 
     @forward
     def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
@@ -52,8 +52,8 @@ class FusedResidualRMSNorm:
         # Typed dimension - use short symbolic names that C++ ShapeEnv expects
         self.C = Dim("C")
 
-    # Normalization weight
-    weight = Param(Tensor["C"])
+    # Normalization weight (never quantized — always full precision)
+    weight = Param(Tensor["C"], quantizable=False)
 
     @forward
     def forward(

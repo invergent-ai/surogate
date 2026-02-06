@@ -141,8 +141,8 @@ class Qwen3Attention:
     qkv_weight = Param(Tensor["QKV", "C"])
     qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
     out_weight = Param(Tensor["C", "AttnDim"])
-    q_norm_weight = Param(Tensor["D"], when="use_qk_norm")
-    k_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    q_norm_weight = Param(Tensor["D"], when="use_qk_norm", quantizable=False)
+    k_norm_weight = Param(Tensor["D"], when="use_qk_norm", quantizable=False)
     rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
     @forward

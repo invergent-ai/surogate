@@ -96,7 +96,7 @@ class Mamba2Mixer:
     dt_bias = Param(Tensor["H"])          # Time step bias
 
     # Gated RMSNorm
-    gated_norm_weight = Param(Tensor["I"])
+    gated_norm_weight = Param(Tensor["I"], quantizable=False)
 
     # Output projection
     out_proj_weight = Param(Tensor["C", "I"])

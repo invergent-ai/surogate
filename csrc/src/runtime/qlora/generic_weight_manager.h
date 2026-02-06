@@ -7,9 +7,6 @@
 // dequantization on access. Works with any quantization format via IQuantizer
 // and supports group-based CPU/GPU offloading via OffloadManager.
 //
-// This replaces the architecture-specific BnBWeightManager / FP8WeightsManager /
-// FP4WeightsManager with a single generic system driven by the DSL IR.
-//
 // Usage:
 //   1. Create with config and quantizer
 //   2. register_weight() or import_and_quantize() to populate
@@ -86,8 +83,13 @@ struct ManagedWeight {
     Tensor full_precision;
 
     /// Weight dimensions (stored for pool buffer acquisition in pooled mode).
+    /// M is flattened rows (E*per_M for 3D), K is columns.
     int M = 0;
     int K = 0;
+
+    /// Full tensor shape for dequant buffer (e.g., {E, per_M, K} for experts).
+    /// Empty means use default {M, K}.
+    std::vector<long> dequant_shape;
 
     /// Whether this weight currently holds a buffer from the pool.
     bool has_pool_buffer = false;
@@ -107,10 +109,10 @@ public:
     explicit DequantBufferPool(std::shared_ptr<TensorAllocator> allocator);
 
     /// Acquire a buffer for the given shape. Reuses a pooled buffer if
-    /// available, otherwise allocates a new one.
-    Tensor acquire(int M, int K);
+    /// available (by element count), otherwise allocates a new one.
+    Tensor acquire(int M, int K, const std::vector<long>& shape = {});
 
-    /// Release a buffer back to the pool for reuse.
+    /// Release a buffer back to the pool for reuse (keyed by element count).
     void release(int M, int K, Tensor buffer);
 
     /// Get the number of buffers currently in the pool (not in use).
@@ -165,13 +167,17 @@ public:
     /// buffer is acquired lazily from the pool on first access.
     ///
     /// @param name           Unique weight name (e.g., "blocks[0].qkv_weight")
-    /// @param M              Number of rows
+    /// @param M              Number of rows (flattened: E*per_M for 3D experts)
     /// @param K              Number of columns
     /// @param offload_group  Offload group ID (-1 = no offloading)
+    /// @param shape          Full tensor shape for dequant buffer (e.g., {E, M, K}).
+    ///                       If empty, uses {M, K}. Allows 3D expert weights to
+    ///                       retain their [E, per_M, K] shape after dequantization.
     void register_weight(
         const std::string& name,
         int M, int K,
-        int offload_group = -1);
+        int offload_group = -1,
+        const std::vector<long>& shape = {});
 
     /// Register a full-precision weight (not quantized).
     ///
@@ -193,6 +199,28 @@ public:
     /// @param stream  CUDA stream for async quantization
     void quantize_and_store(
         const std::string& name,
+        const Tensor& bf16,
+        cudaStream_t stream);
+
+    /// Quantize a single expert's BF16 data into a slice of a registered weight.
+    ///
+    /// Used for per-expert streaming: instead of allocating the full [E, M, K]
+    /// temporary buffer, the caller loads and quantizes one expert at a time
+    /// into a small [per_M, K] buffer. This method creates a QuantizedTensor
+    /// sub-view pointing to the correct offset and quantizes into it.
+    ///
+    /// Requires that per_expert_M * K is divisible by the quantization block
+    /// size so that expert boundaries align with block boundaries.
+    ///
+    /// @param name           Weight name (must be a registered quantized weight).
+    /// @param expert_idx     Expert index (0-based).
+    /// @param per_expert_M   Rows per expert (one expert's M dimension).
+    /// @param bf16           Input BF16 tensor [per_expert_M, K] for this expert.
+    /// @param stream         CUDA stream for async quantization.
+    void quantize_expert_slice(
+        const std::string& name,
+        int expert_idx,
+        int per_expert_M,
         const Tensor& bf16,
         cudaStream_t stream);
 

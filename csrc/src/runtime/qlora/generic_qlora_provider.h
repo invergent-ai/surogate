@@ -2,14 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // GenericQLoRAProvider: QLoRAWeightProvider backed by GenericWeightManager.
-//
-// Bridges the existing DSL runtime (which uses QLoRAWeightProvider interface
-// for weight access) with the new generic system (GenericWeightManager +
-// IQuantizer + OffloadManager).
-//
-// This is the "Phase 4B" adapter: the DSL model runtime calls
-// QLoRAWeightProvider::resolve_param("blocks[0].qkv_weight", stream)
-// and this class delegates to GenericWeightManager::get().
 
 #ifndef SUROGATE_SRC_RUNTIME_QLORA_GENERIC_QLORA_PROVIDER_H
 #define SUROGATE_SRC_RUNTIME_QLORA_GENERIC_QLORA_PROVIDER_H

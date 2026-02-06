@@ -146,6 +146,68 @@ bool DslWeightLoader::try_multiple(const std::vector<std::pair<std::string, Mapp
     return false;
 }
 
+bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
+                                   Tensor& target, bool allow_cast, cudaStream_t stream) {
+    int layer_idx = -1;
+    const MappingSpec* spec = find_mapping_spec(name, layer_idx);
+
+    if (!spec || spec->kind != MappingSpec::Kind::StackExperts) {
+        throw std::runtime_error(
+            "DslWeightLoader: load_expert requires StackExperts mapping for '" + name + "'");
+    }
+
+    const std::size_t elem_size = get_dtype_size(target.DType);
+
+    if (spec->fuse_gate_up) {
+        // Fused gate_up: target is [2*D, C], load up_proj into first D rows, gate into next D.
+        std::string gate_pattern = spec->source;
+        std::string up_pattern = spec->source;
+        std::size_t pos = up_pattern.find("gate_proj");
+        if (pos != std::string::npos) {
+            up_pattern.replace(pos, 9, "up_proj");
+        }
+
+        const long fused_rows = target.Sizes[0];  // 2*D
+        const long D = fused_rows / 2;
+        const long C = target.Rank >= 2 ? target.Sizes[1] : 1;
+        const long sub_expert_elems = D * C;
+
+        // Load up_proj into first D rows.
+        std::string up_hf = format_hf_name(up_pattern, layer_idx, expert_idx);
+        const auto& up_entry = mReader.find_entry(up_hf);
+        if (up_entry.shape().empty()) {
+            throw std::runtime_error("DslWeightLoader: load_expert missing up_proj '" + up_hf + "'");
+        }
+        Tensor up_slice = target;
+        up_slice.Sizes[0] = D;
+        up_entry.read_tensor(up_slice, allow_cast);
+
+        // Load gate_proj into second D rows.
+        std::string gate_hf = format_hf_name(gate_pattern, layer_idx, expert_idx);
+        const auto& gate_entry = mReader.find_entry(gate_hf);
+        if (gate_entry.shape().empty()) {
+            throw std::runtime_error("DslWeightLoader: load_expert missing gate_proj '" + gate_hf + "'");
+        }
+        Tensor gate_slice = target;
+        gate_slice.Sizes[0] = D;
+        gate_slice.Data = static_cast<std::byte*>(target.Data) + sub_expert_elems * elem_size;
+        gate_entry.read_tensor(gate_slice, allow_cast);
+    } else {
+        // Load single expert tensor.
+        std::string hf_name = format_hf_name(spec->source, layer_idx, expert_idx);
+        const auto& entry = mReader.find_entry(hf_name);
+        if (entry.shape().empty()) {
+            throw std::runtime_error("DslWeightLoader: load_expert missing '" + hf_name + "'");
+        }
+        entry.read_tensor(target, allow_cast);
+    }
+
+    if (stream) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    return true;
+}
+
 void DslWeightLoader::resolve_tied_params(const std::function<Tensor&(const std::string&)>& get_tensor) {
     for (const auto& [dst_name, src_name] : mTiedParams) {
         Tensor& dst = get_tensor(dst_name);

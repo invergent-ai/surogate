@@ -23,27 +23,33 @@ DequantBufferPool::DequantBufferPool(std::shared_ptr<TensorAllocator> allocator)
 {
 }
 
-Tensor DequantBufferPool::acquire(int M, int K) {
+Tensor DequantBufferPool::acquire(int M, int K, const std::vector<long>& shape) {
     const uint64_t key = shape_key(M, K);
     auto it = mPool.find(key);
     if (it != mPool.end() && !it->second.empty()) {
         Tensor buf = std::move(it->second.back());
         it->second.pop_back();
+        // Reshape to desired shape if needed (same total elements, different layout)
+        if (!shape.empty() && buf.Rank != static_cast<int>(shape.size())) {
+            buf = Tensor::from_pointer(buf.Data, buf.Device, buf.DType, shape);
+        }
         return buf;
     }
 
     // No pooled buffer available - allocate a new one
-    std::vector<long> shape;
-    if (K > 0) {
-        shape = {static_cast<long>(M), static_cast<long>(K)};
+    std::vector<long> alloc_shape;
+    if (!shape.empty()) {
+        alloc_shape = shape;
+    } else if (K > 0) {
+        alloc_shape = {static_cast<long>(M), static_cast<long>(K)};
     } else {
-        shape = {static_cast<long>(M)};
+        alloc_shape = {static_cast<long>(M)};
     }
     return mAllocator->allocate(
         ETensorDType::BF16,
         "dequant_pool_buf",
         EAllocationType::ON_DEVICE,
-        shape);
+        alloc_shape);
 }
 
 void DequantBufferPool::release(int M, int K, Tensor buffer) {
@@ -115,7 +121,8 @@ GenericWeightManager::~GenericWeightManager() {
 void GenericWeightManager::register_weight(
     const std::string& name,
     int M, int K,
-    int offload_group) {
+    int offload_group,
+    const std::vector<long>& shape) {
     if (mWeights.count(name)) {
         throw std::runtime_error(
             fmt::format("GenericWeightManager: weight '{}' already registered", name));
@@ -126,6 +133,7 @@ void GenericWeightManager::register_weight(
     entry.offload_group = offload_group;
     entry.M = M;
     entry.K = K;
+    entry.dequant_shape = shape;
 
     // Determine allocation type based on offloading
     EAllocationType alloc_type = EAllocationType::ON_DEVICE;
@@ -137,25 +145,34 @@ void GenericWeightManager::register_weight(
             : EAllocationType::ON_HOST;
     }
 
-    // Allocate quantized storage via IQuantizer
+    // Allocate quantized storage via IQuantizer (uses flat M*K element count)
     mQuantizer->allocate_storage(M, K, entry.quantized, *mAllocator, alloc_type, name);
 
-    // Allocate dequant buffer: pre-allocate in unlimited mode, defer in pooled mode
+    // Allocate dequant buffer: pre-allocate in unlimited mode, defer in pooled mode.
+    // Use the full shape if provided (e.g., [E, M, K] for 3D expert weights).
     if (!is_pooled()) {
+        std::vector<long> dequant_shape;
+        if (!shape.empty()) {
+            dequant_shape = shape;
+        } else {
+            dequant_shape = {static_cast<long>(M), static_cast<long>(K)};
+        }
         entry.dequant_buffer = mAllocator->allocate(
             ETensorDType::BF16,
             fmt::format("{}.dequant", name).c_str(),
             EAllocationType::ON_DEVICE,
-            {static_cast<long>(M), static_cast<long>(K)});
+            dequant_shape);
     }
     // In pooled mode, dequant_buffer starts as null and is acquired on first access
 
-    // Register with offload manager if offloading is active
-    if (offload_group >= 0 && mOffloadManager) {
-        mOffloadManager->register_tensor(&entry.quantized, offload_group, name);
-    }
+    // Insert into the map FIRST, then register with the offload manager.
+    // register_tensor() stores a raw QuantizedTensor* — it must point to the
+    // map-resident copy, not the local `entry` which is destroyed after move.
+    auto [it, inserted] = mWeights.emplace(name, std::move(entry));
 
-    mWeights.emplace(name, std::move(entry));
+    if (offload_group >= 0 && mOffloadManager) {
+        mOffloadManager->register_tensor(&it->second.quantized, offload_group, name);
+    }
 }
 
 void GenericWeightManager::register_full_precision(
@@ -195,6 +212,92 @@ void GenericWeightManager::quantize_and_store(
 
     // Invalidate dequant cache for this weight
     entry.dequant_valid = false;
+}
+
+void GenericWeightManager::quantize_expert_slice(
+    const std::string& name,
+    int expert_idx,
+    int per_expert_M,
+    const Tensor& bf16,
+    cudaStream_t stream) {
+
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        throw std::runtime_error(
+            fmt::format("GenericWeightManager: weight '{}' not registered", name));
+    }
+
+    auto& entry = it->second;
+    if (!entry.is_quantized_weight) {
+        throw std::runtime_error(
+            fmt::format("GenericWeightManager: weight '{}' is full-precision, "
+                       "cannot quantize", name));
+    }
+
+    const auto& full = entry.quantized;
+    const int K = full.K;
+    const int num_experts = full.M / per_expert_M;
+    const long per_expert_elems = static_cast<long>(per_expert_M) * K;
+
+    // Verify expert boundaries align with block boundaries
+    if (per_expert_elems % full.block_size != 0) {
+        throw std::runtime_error(
+            fmt::format("GenericWeightManager: expert elements ({}) not divisible by "
+                       "block_size ({}) for '{}'", per_expert_elems, full.block_size, name));
+    }
+
+    // Build a QuantizedTensor view pointing to this expert's slice
+    QuantizedTensor view;
+    view.M = per_expert_M;
+    view.K = K;
+    view.format = full.format;
+    view.block_size = full.block_size;
+    view.double_quant = full.double_quant;
+    view.double_quant_group_size = full.double_quant_group_size;
+    view.global_scale = full.global_scale;
+
+    // Data slice (byte offset computed from total data size / num_experts)
+    const size_t data_bytes_per_expert = full.data.bytes() / num_experts;
+    const long data_elems_per_expert = full.data.nelem() / num_experts;
+    view.data = Tensor::from_pointer(
+        static_cast<std::byte*>(full.data.Data) + expert_idx * data_bytes_per_expert,
+        full.data.Device,
+        full.data.DType,
+        std::vector<long>{data_elems_per_expert});
+
+    // Scales slice
+    const long scales_per_expert = full.scales.nelem() / num_experts;
+    const size_t scales_bytes_per_expert = full.scales.bytes() / num_experts;
+    view.scales = Tensor::from_pointer(
+        static_cast<std::byte*>(full.scales.Data) + expert_idx * scales_bytes_per_expert,
+        full.scales.Device,
+        full.scales.DType,
+        std::vector<long>{scales_per_expert});
+
+    // Meta slice (if present, for double quantization)
+    if (!full.meta.is_null()) {
+        const long meta_per_expert = full.meta.nelem() / num_experts;
+        const size_t meta_bytes_per_expert = full.meta.bytes() / num_experts;
+        view.meta = Tensor::from_pointer(
+            static_cast<std::byte*>(full.meta.Data) + expert_idx * meta_bytes_per_expert,
+            full.meta.Device,
+            full.meta.DType,
+            std::vector<long>{meta_per_expert});
+    }
+
+    // Meta2 slice (if present, for double quantization)
+    if (!full.meta2.is_null()) {
+        const long meta2_per_expert = full.meta2.nelem() / num_experts;
+        const size_t meta2_bytes_per_expert = full.meta2.bytes() / num_experts;
+        view.meta2 = Tensor::from_pointer(
+            static_cast<std::byte*>(full.meta2.Data) + expert_idx * meta2_bytes_per_expert,
+            full.meta2.Device,
+            full.meta2.DType,
+            std::vector<long>{meta2_per_expert});
+    }
+
+    // Quantize the single expert into the sub-view
+    mQuantizer->quantize(bf16, view, stream);
 }
 
 // =============================================================================
@@ -391,8 +494,8 @@ void GenericWeightManager::acquire_pool_buffer(ManagedWeight& entry,
         evict_lru_buffer();
     }
 
-    // Acquire a buffer from the pool
-    entry.dequant_buffer = mBufferPool->acquire(entry.M, entry.K);
+    // Acquire a buffer from the pool (with full shape for 3D expert weights)
+    entry.dequant_buffer = mBufferPool->acquire(entry.M, entry.K, entry.dequant_shape);
     entry.has_pool_buffer = true;
     mActivePoolBuffers++;
 
