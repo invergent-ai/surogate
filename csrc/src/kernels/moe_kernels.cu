@@ -26,6 +26,7 @@
 #include "kernels/kernels.h"
 #include "kernel_utils.cuh"
 #include "utilities/utils.h"
+#include "utilities/vec.cuh"
 
 // ============================================================================
 // Softmax Kernel for MoE Routing
@@ -374,6 +375,8 @@ __global__ void moe_permute_tokens_kernel(
     int hidden_size,
     int top_k
 ) {
+    using x128 = GenericVector<T, 16/sizeof(T)>;
+
     int out_idx = blockIdx.x;
     if (out_idx >= total_tokens) return;
 
@@ -381,12 +384,17 @@ __global__ void moe_permute_tokens_kernel(
     int token_assignment_idx = gather_indices[out_idx];
     int token_idx = token_assignment_idx / top_k;  // Original token index
 
-    // Copy hidden state
+    // Copy hidden state with 128-bit vectorized loads/stores
     const T* src = inp + token_idx * hidden_size;
     T* dst = out + out_idx * hidden_size;
 
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        dst[d] = src[d];
+    int d = threadIdx.x * x128::size;
+    for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+        x128::load(src + d).store(dst + d);
+    }
+    // Scalar remainder
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+        dst[r] = src[r];
     }
 }
 
@@ -402,29 +410,51 @@ __global__ void moe_unpermute_and_combine_kernel(
     int hidden_size,
     int top_k
 ) {
+    using x128 = GenericVector<T, 16/sizeof(T)>;
+
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
 
     T* dst = out + token_idx * hidden_size;
-    const T* weights = routing_weights + token_idx * top_k;
+    const T* weights_ptr = routing_weights + token_idx * top_k;
 
-    // Zero initialize output
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        float acc = 0.0f;
+    // Pre-load routing weights and expert positions into registers
+    constexpr int MAX_K = 8;
+    float w[MAX_K];
+    int expert_pos[MAX_K];
+    for (int k = 0; k < top_k && k < MAX_K; k++) {
+        w[k] = static_cast<float>(weights_ptr[k]);
+        int assignment_idx = token_idx * top_k + k;
+        expert_pos[k] = scatter_indices[assignment_idx];
+    }
 
-        // Accumulate weighted expert outputs
-        for (int k = 0; k < top_k; k++) {
-            int assignment_idx = token_idx * top_k + k;
-            int expert_pos = scatter_indices[assignment_idx];
-            if (expert_pos < 0 || expert_pos >= total_tokens) {
-                continue;
-            }
-            float weight = static_cast<float>(weights[k]);
-            float val = static_cast<float>(expert_out[expert_pos * hidden_size + d]);
-            acc += weight * val;
+    // Vectorized accumulation with 128-bit loads/stores
+    int d = threadIdx.x * x128::size;
+    for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+        x128 acc_vec;
+        for (int i = 0; i < x128::size; i++) {
+            acc_vec[i] = static_cast<T>(0);
         }
 
-        dst[d] = static_cast<T>(acc);
+        for (int k = 0; k < top_k && k < MAX_K; k++) {
+            if (expert_pos[k] < 0 || expert_pos[k] >= total_tokens) continue;
+            x128 val = x128::load(expert_out + expert_pos[k] * hidden_size + d);
+            for (int i = 0; i < x128::size; i++) {
+                acc_vec[i] = static_cast<T>(static_cast<float>(acc_vec[i]) + w[k] * static_cast<float>(val[i]));
+            }
+        }
+
+        acc_vec.store(dst + d);
+    }
+
+    // Scalar remainder
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 0; k < top_k && k < MAX_K; k++) {
+            if (expert_pos[k] < 0 || expert_pos[k] >= total_tokens) continue;
+            acc += w[k] * static_cast<float>(expert_out[expert_pos[k] * hidden_size + r]);
+        }
+        dst[r] = static_cast<T>(acc);
     }
 }
 
@@ -2555,6 +2585,8 @@ __global__ void moe_combine_backward_kernel(
     int hidden_size,
     int top_k
 ) {
+    using x128 = GenericVector<T, 16/sizeof(T)>;
+
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
 
@@ -2570,20 +2602,53 @@ __global__ void moe_combine_backward_kernel(
         float weight = static_cast<float>(weights[k]);
 
         // d_expert_out[expert_pos] = weight * d_output[token]
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-            float grad = weight * static_cast<float>(d_out[d]);
-            d_exp_out[d] = static_cast<T>(grad);
+        // Vectorized 128-bit loads/stores
+        int d = threadIdx.x * x128::size;
+        for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+            x128 grad_in = x128::load(d_out + d);
+            x128 grad_out;
+            for (int i = 0; i < x128::size; i++) {
+                grad_out[i] = static_cast<T>(weight * static_cast<float>(grad_in[i]));
+            }
+            grad_out.store(d_exp_out + d);
+        }
+        // Scalar remainder
+        for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+            d_exp_out[r] = static_cast<T>(weight * static_cast<float>(d_out[r]));
         }
 
         // Compute gradient w.r.t. routing weights (if needed)
         // d_routing_weights[token, k] = dot(expert_out[expert_pos], d_output[token])
-        if (d_routing_weights != nullptr && threadIdx.x == 0) {
+        if (d_routing_weights != nullptr) {
             const T* exp_out = expert_out + expert_pos * hidden_size;
-            float dot = 0.0f;
-            for (int d = 0; d < hidden_size; d++) {
-                dot += static_cast<float>(exp_out[d]) * static_cast<float>(d_out[d]);
+            float thread_dot = 0.0f;
+            int dv = threadIdx.x * x128::size;
+            for (; dv + x128::size <= hidden_size; dv += blockDim.x * x128::size) {
+                x128 ev = x128::load(exp_out + dv);
+                x128 dv_out = x128::load(d_out + dv);
+                for (int i = 0; i < x128::size; i++) {
+                    thread_dot += static_cast<float>(ev[i]) * static_cast<float>(dv_out[i]);
+                }
             }
-            d_routing_weights[assignment_idx] = static_cast<T>(dot);
+            for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+                thread_dot += static_cast<float>(exp_out[r]) * static_cast<float>(d_out[r]);
+            }
+            // Warp-level reduction
+            thread_dot = warpReduceSum(thread_dot);
+            // Block-level reduction
+            __shared__ float smem_dot[32];
+            int warp_id = threadIdx.x / 32;
+            int lane_id = threadIdx.x % 32;
+            if (lane_id == 0) smem_dot[warp_id] = thread_dot;
+            __syncthreads();
+            if (warp_id == 0) {
+                float val = (lane_id < (blockDim.x / 32)) ? smem_dot[lane_id] : 0.0f;
+                val = warpReduceSum(val);
+                if (lane_id == 0) {
+                    d_routing_weights[assignment_idx] = static_cast<T>(val);
+                }
+            }
+            __syncthreads();
         }
     }
 }
@@ -2591,6 +2656,7 @@ __global__ void moe_combine_backward_kernel(
 // Backward through permute: gather gradient back to original token order
 // d_input[token] += d_permuted[permuted_idx] for each assignment
 // FP32 version - uses native atomicAdd
+// Note: atomicAdd is per-element (no vectorized atomic), but we vectorize the load
 __global__ void moe_permute_backward_kernel_fp32(
     float* __restrict__ d_input,              // (num_tokens, hidden_size)
     const float* __restrict__ d_permuted,     // (total_tokens, hidden_size)
@@ -2600,6 +2666,8 @@ __global__ void moe_permute_backward_kernel_fp32(
     int hidden_size,
     int top_k
 ) {
+    using x128 = GenericVector<float, 16/sizeof(float)>;
+
     int out_idx = blockIdx.x;
     if (out_idx >= total_tokens) return;
 
@@ -2610,14 +2678,21 @@ __global__ void moe_permute_backward_kernel_fp32(
     const float* d_perm = d_permuted + out_idx * hidden_size;
     float* d_in = d_input + token_idx * hidden_size;
 
-    // Atomically add gradient back to original token
-    // (multiple assignments may map to the same token)
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        atomicAdd(d_in + d, d_perm[d]);
+    // Vectorized load, scalar atomicAdd (no vectorized atomic exists)
+    int d = threadIdx.x * x128::size;
+    for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+        x128 val = x128::load(d_perm + d);
+        for (int i = 0; i < x128::size; i++) {
+            atomicAdd(d_in + d + i, (float)val[i]);
+        }
+    }
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+        atomicAdd(d_in + r, d_perm[r]);
     }
 }
 
 // BF16 version - uses atomicAdd for __nv_bfloat16 (requires SM80+)
+// Vectorized load, scalar atomicAdd
 __global__ void moe_permute_backward_kernel_bf16(
     nv_bfloat16* __restrict__ d_input,              // (num_tokens, hidden_size)
     const nv_bfloat16* __restrict__ d_permuted,     // (total_tokens, hidden_size)
@@ -2627,6 +2702,8 @@ __global__ void moe_permute_backward_kernel_bf16(
     int hidden_size,
     int top_k
 ) {
+    using x128 = GenericVector<nv_bfloat16, 16/sizeof(nv_bfloat16)>;
+
     int out_idx = blockIdx.x;
     if (out_idx >= total_tokens) return;
 
@@ -2637,11 +2714,16 @@ __global__ void moe_permute_backward_kernel_bf16(
     const nv_bfloat16* d_perm = d_permuted + out_idx * hidden_size;
     nv_bfloat16* d_in = d_input + token_idx * hidden_size;
 
-    // Atomically add gradient back to original token
-    // (multiple assignments may map to the same token)
-    // Use native BF16 atomicAdd (SM80+)
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        atomicAdd(d_in + d, d_perm[d]);
+    // Vectorized load, scalar atomicAdd (SM80+ for BF16 atomicAdd)
+    int d = threadIdx.x * x128::size;
+    for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+        x128 val = x128::load(d_perm + d);
+        for (int i = 0; i < x128::size; i++) {
+            atomicAdd(d_in + d + i, val[i]);
+        }
+    }
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+        atomicAdd(d_in + r, d_perm[r]);
     }
 }
 
