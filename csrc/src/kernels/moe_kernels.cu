@@ -155,14 +155,117 @@ __global__ void moe_scale_forward_kernel(
 }
 
 // ============================================================================
-// Top-K Selection Kernel
+// Top-K Selection Kernel — Warp-Level Tournament
 // ============================================================================
 // Selects top-K experts per token based on routing scores.
+// Uses warp-level parallelism: one warp (32 threads) cooperatively selects the
+// top-K experts for a single token. Each lane maintains a local top-K list from
+// its portion of experts, then warp shuffles merge all per-lane lists in
+// O(K * log(WARP_SIZE)) steps without shared memory synchronization.
+//
 // Outputs: expert indices (int32) and routing weights (float/bf16).
 
-// Simple single-threaded top-K selection kernel (best for small num_experts < 64)
-// For larger num_experts, consider using bitonic sort or radix select
-template<typename T, int MAX_K = 8>
+constexpr int MOE_TOPK_MAX_K = 8;
+constexpr int MOE_WARP_SIZE = 32;
+
+// Insert a (val, idx) pair into a descending-sorted register array of size K.
+// Replaces the last element and bubbles it up to the correct position.
+template<int K>
+__device__ __forceinline__ void topk_insert(float* vals, int* idxs, float val, int idx) {
+    vals[K - 1] = val;
+    idxs[K - 1] = idx;
+    #pragma unroll
+    for (int j = K - 2; j >= 0; j--) {
+        if (vals[j + 1] > vals[j]) {
+            float tv = vals[j]; vals[j] = vals[j + 1]; vals[j + 1] = tv;
+            int ti = idxs[j]; idxs[j] = idxs[j + 1]; idxs[j + 1] = ti;
+        }
+    }
+}
+
+// Warp-level tournament top-K selection.
+// Each lane scans its stripe of experts, maintains a local sorted top-K,
+// then 5 rounds of shuffle-based merging produce the global top-K on all lanes.
+template<int K, typename T>
+__device__ __forceinline__ void warp_topk(
+    const T* __restrict__ token_scores,
+    int num_experts,
+    float* out_vals,
+    int* out_idxs
+) {
+    const int lane = threadIdx.x & (MOE_WARP_SIZE - 1);
+
+    // Per-lane local top-K
+    float my_vals[MOE_TOPK_MAX_K];
+    int my_idxs[MOE_TOPK_MAX_K];
+
+    #pragma unroll
+    for (int i = 0; i < K; i++) {
+        my_vals[i] = -FLT_MAX;
+        my_idxs[i] = -1;
+    }
+
+    // Each lane processes experts at stride MOE_WARP_SIZE
+    for (int e = lane; e < num_experts; e += MOE_WARP_SIZE) {
+        float val = static_cast<float>(token_scores[e]);
+        if (val > my_vals[K - 1]) {
+            topk_insert<K>(my_vals, my_idxs, val, e);
+        }
+    }
+
+    // Warp-level merge: 5 rounds (log2(32)) of shuffle-based tournament.
+    // Each round, exchange top-K lists with a partner lane and merge the two
+    // sorted K-lists into a single K-list (keep top K from 2K candidates).
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        // Get partner's top-K via warp shuffle
+        float partner_vals[MOE_TOPK_MAX_K];
+        int partner_idxs[MOE_TOPK_MAX_K];
+
+        #pragma unroll
+        for (int i = 0; i < K; i++) {
+            partner_vals[i] = __shfl_xor_sync(0xFFFFFFFFu, my_vals[i], offset);
+            partner_idxs[i] = __shfl_xor_sync(0xFFFFFFFFu, my_idxs[i], offset);
+        }
+
+        // Two-pointer merge of two sorted-descending K-lists → keep top K
+        float merged_vals[MOE_TOPK_MAX_K];
+        int merged_idxs[MOE_TOPK_MAX_K];
+        int a = 0, b = 0;
+
+        #pragma unroll
+        for (int m = 0; m < K; m++) {
+            // Pick the larger head element
+            bool take_partner = (a >= K) || (b < K && partner_vals[b] > my_vals[a]);
+            if (take_partner) {
+                merged_vals[m] = partner_vals[b];
+                merged_idxs[m] = partner_idxs[b];
+                b++;
+            } else {
+                merged_vals[m] = my_vals[a];
+                merged_idxs[m] = my_idxs[a];
+                a++;
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < K; i++) {
+            my_vals[i] = merged_vals[i];
+            my_idxs[i] = merged_idxs[i];
+        }
+    }
+
+    // After merging, all lanes hold the same global top-K (from lane 0).
+    // Broadcast from lane 0 to ensure consistency.
+    #pragma unroll
+    for (int i = 0; i < K; i++) {
+        out_vals[i] = __shfl_sync(0xFFFFFFFFu, my_vals[i], 0);
+        out_idxs[i] = __shfl_sync(0xFFFFFFFFu, my_idxs[i], 0);
+    }
+}
+
+// Warp-per-token top-K kernel. Packs multiple warps per block.
+template<typename T, int K>
 __global__ void moe_topk_forward_kernel(
     int* __restrict__ expert_indices,      // (num_tokens, top_k)
     T* __restrict__ routing_weights,       // (num_tokens, top_k)
@@ -172,66 +275,37 @@ __global__ void moe_topk_forward_kernel(
     int top_k,
     bool normalize_weights
 ) {
-    // One thread per token for simplicity and correctness
-    int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int warps_per_block = blockDim.x / MOE_WARP_SIZE;
+    const int warp_id = threadIdx.x / MOE_WARP_SIZE;
+    const int lane = threadIdx.x & (MOE_WARP_SIZE - 1);
+    const int token_idx = blockIdx.x * warps_per_block + warp_id;
     if (token_idx >= num_tokens) return;
 
     const T* token_scores = scores + token_idx * num_experts;
-    int* token_indices = expert_indices + token_idx * top_k;
-    T* token_weights = routing_weights + token_idx * top_k;
 
-    // Thread-local top-K tracking using insertion sort
-    float topk_vals[MAX_K];
-    int topk_idx[MAX_K];
+    // Warp-cooperative top-K selection
+    float topk_vals[MOE_TOPK_MAX_K];
+    int topk_idxs[MOE_TOPK_MAX_K];
+    warp_topk<K>(token_scores, num_experts, topk_vals, topk_idxs);
 
-    // Initialize with -inf
-    #pragma unroll
-    for (int k = 0; k < MAX_K; k++) {
-        topk_vals[k] = -FLT_MAX;
-        topk_idx[k] = -1;
-    }
-
-    // Scan through all experts and maintain top-K
-    for (int e = 0; e < num_experts; e++) {
-        float val = static_cast<float>(token_scores[e]);
-
-        // Check if this value should be inserted into top-K
-        if (val > topk_vals[top_k - 1]) {
-            // Find insertion position (values are sorted descending)
-            int insert_pos = top_k - 1;
-            for (int k = 0; k < top_k - 1; k++) {
-                if (val > topk_vals[k]) {
-                    insert_pos = k;
-                    break;
-                }
-            }
-
-            // Shift elements down to make room
-            for (int k = top_k - 1; k > insert_pos; k--) {
-                topk_vals[k] = topk_vals[k - 1];
-                topk_idx[k] = topk_idx[k - 1];
-            }
-
-            // Insert new element
-            topk_vals[insert_pos] = val;
-            topk_idx[insert_pos] = e;
-        }
-    }
-
-    // Optionally normalize weights to sum to 1
-    float sum = 0.0f;
+    // Optionally normalize weights (sum of selected scores → 1).
+    // Must sum over top_k (runtime), not K (template), since K may be larger
+    // when top_k doesn't match a specialized template (e.g. top_k=3, K=8).
     if (normalize_weights) {
+        float sum = 0.0f;
         for (int k = 0; k < top_k; k++) {
             sum += topk_vals[k];
         }
         sum = fmaxf(sum, 1e-9f);
+        for (int k = 0; k < top_k; k++) {
+            topk_vals[k] /= sum;
+        }
     }
 
-    // Write output
-    for (int k = 0; k < top_k; k++) {
-        token_indices[k] = topk_idx[k];
-        float weight = normalize_weights ? (topk_vals[k] / sum) : topk_vals[k];
-        token_weights[k] = static_cast<T>(weight);
+    // Parallel write: lanes < top_k each write one result
+    if (lane < top_k) {
+        expert_indices[token_idx * top_k + lane] = topk_idxs[lane];
+        routing_weights[token_idx * top_k + lane] = static_cast<T>(topk_vals[lane]);
     }
 }
 
@@ -316,7 +390,11 @@ __global__ void moe_topk_backward_kernel(
 // Reorders tokens from natural order to expert-grouped order for efficient GEMM.
 // Also computes histograms of tokens per expert.
 
-// Compute histogram of tokens per expert
+// Compute histogram of tokens per expert.
+// Uses shared-memory block-local histogram to reduce global atomic contention:
+// each block accumulates into a private shared histogram, then a single pass
+// flushes the per-block counts to global memory with one atomicAdd per expert.
+// This reduces global atomics from O(num_tokens * top_k) to O(num_experts * num_blocks).
 __global__ void moe_compute_expert_counts_kernel(
     int* __restrict__ expert_counts,       // (num_experts,) output
     const int* __restrict__ expert_indices, // (num_tokens, top_k)
@@ -324,20 +402,40 @@ __global__ void moe_compute_expert_counts_kernel(
     int top_k,
     int num_experts
 ) {
-    // Use atomics for simplicity; for high perf, use CUB histogram
+    extern __shared__ int shared_hist[];
+
+    // Zero shared histogram cooperatively
+    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        shared_hist[e] = 0;
+    }
+    __syncthreads();
+
+    // Accumulate into shared histogram (contention limited to threads in this block)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_assignments = num_tokens * top_k;
+    if (idx < total_assignments) {
+        int expert_id = expert_indices[idx];
+        if (expert_id >= 0 && expert_id < num_experts) {
+            atomicAdd(&shared_hist[expert_id], 1);
+        }
+    }
+    __syncthreads();
 
-    if (idx >= total_assignments) return;
-
-    int expert_id = expert_indices[idx];
-    if (expert_id >= 0 && expert_id < num_experts) {
-        atomicAdd(&expert_counts[expert_id], 1);
+    // Flush shared histogram to global — one atomicAdd per expert per block
+    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        if (shared_hist[e] > 0) {
+            atomicAdd(&expert_counts[e], shared_hist[e]);
+        }
     }
 }
 
-// Compute gather indices that reorder tokens to expert-grouped order
-// This is the key data structure for fused permute operations
+// Compute gather indices that reorder tokens to expert-grouped order.
+// This is the key data structure for fused permute operations.
+//
+// Uses warp-level ballot aggregation to reduce atomic contention:
+// threads in the same warp targeting the same expert batch their atomicAdd
+// into a single warp-aggregated add, then each thread computes its slot
+// from the warp-local prefix count.
 __global__ void moe_compute_gather_indices_kernel(
     int* __restrict__ gather_indices,      // (total_tokens,) output: index of token in original order
     int* __restrict__ scatter_indices,     // (total_tokens,) output: inverse mapping
@@ -356,10 +454,46 @@ __global__ void moe_compute_gather_indices_kernel(
     int expert_id = expert_indices[idx];
     if (expert_id < 0 || expert_id >= num_experts) return;
 
-    // Atomically claim a slot in the expert's region
-    int slot = atomicAdd(&expert_positions[expert_id], 1);
-    int dest_idx = expert_offsets[expert_id] + slot;
+    const int lane = threadIdx.x & 31;
 
+    // Warp-aggregated atomic: find all lanes in this warp targeting the same expert
+    // and batch them into a single atomicAdd.
+    // We iterate over the set of unique expert_ids in this warp using a peer mask.
+    int remaining_mask = __ballot_sync(0xFFFFFFFFu, true); // mask of all active lanes
+    int slot = -1;
+
+    while (remaining_mask) {
+        // Pick the expert_id from the lowest active lane as the "leader" for this round
+        int leader = __ffs(remaining_mask) - 1;
+        int leader_expert = __shfl_sync(0xFFFFFFFFu, expert_id, leader);
+
+        // Find all lanes in this warp with the same expert_id
+        unsigned int peer_mask = __ballot_sync(0xFFFFFFFFu, expert_id == leader_expert);
+        int peer_count = __popc(peer_mask);
+
+        // Only process if this lane matches the current leader's expert
+        if (expert_id == leader_expert) {
+            // Warp-local prefix count: how many matching lanes come before me?
+            unsigned int lanes_before_me = peer_mask & ((1u << lane) - 1u);
+            int my_offset = __popc(lanes_before_me);
+
+            // Leader lane does one atomic for the entire group
+            int base_slot = 0;
+            if (my_offset == 0) {
+                base_slot = atomicAdd(&expert_positions[leader_expert], peer_count);
+            }
+            // Broadcast base_slot from the leader of this peer group
+            int first_peer = __ffs(peer_mask) - 1;
+            base_slot = __shfl_sync(peer_mask, base_slot, first_peer);
+
+            slot = base_slot + my_offset;
+        }
+
+        // Remove processed lanes from the remaining mask
+        remaining_mask &= ~peer_mask;
+    }
+
+    int dest_idx = expert_offsets[expert_id] + slot;
     gather_indices[dest_idx] = idx;  // Token assignment idx -> goes to position dest_idx
     scatter_indices[idx] = dest_idx; // Inverse mapping
 }
@@ -799,6 +933,46 @@ void moe_scale_forward(
     );
 }
 
+// Dispatch helper: select template K and launch warp-per-token kernel
+template<typename T>
+static void moe_topk_forward_dispatch(
+    int* expert_indices,
+    T* routing_weights,
+    const T* scores,
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    cudaStream_t stream
+) {
+    // 8 warps per block = 256 threads, each warp handles one token
+    constexpr int warps_per_block = 8;
+    constexpr int block_size = warps_per_block * MOE_WARP_SIZE;
+    int grid_size = (num_tokens + warps_per_block - 1) / warps_per_block;
+
+    // Template-specialize for common K values to enable full unrolling
+    switch (top_k) {
+    case 1:
+        moe_topk_forward_kernel<T, 1><<<grid_size, block_size, 0, stream>>>(
+            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+        break;
+    case 2:
+        moe_topk_forward_kernel<T, 2><<<grid_size, block_size, 0, stream>>>(
+            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+        break;
+    case 4:
+        moe_topk_forward_kernel<T, 4><<<grid_size, block_size, 0, stream>>>(
+            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+        break;
+    default:
+        // K=8 covers top_k 3,5,6,7,8 — the merge always produces K entries,
+        // but we only write top_k of them via the lane < top_k guard.
+        moe_topk_forward_kernel<T, 8><<<grid_size, block_size, 0, stream>>>(
+            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+        break;
+    }
+}
+
 void moe_topk_forward(
     int* expert_indices,
     nv_bfloat16* routing_weights,
@@ -809,12 +983,8 @@ void moe_topk_forward(
     bool normalize_weights,
     cudaStream_t stream
 ) {
-    int block_size = 256;
-    int grid_size = (num_tokens + block_size - 1) / block_size;
-    moe_topk_forward_kernel<nv_bfloat16, 8><<<grid_size, block_size, 0, stream>>>(
-        expert_indices, routing_weights, scores,
-        num_tokens, num_experts, top_k, normalize_weights
-    );
+    moe_topk_forward_dispatch(expert_indices, routing_weights, scores,
+                              num_tokens, num_experts, top_k, normalize_weights, stream);
 }
 
 void moe_topk_forward(
@@ -827,12 +997,8 @@ void moe_topk_forward(
     bool normalize_weights,
     cudaStream_t stream
 ) {
-    int block_size = 256;
-    int grid_size = (num_tokens + block_size - 1) / block_size;
-    moe_topk_forward_kernel<float, 8><<<grid_size, block_size, 0, stream>>>(
-        expert_indices, routing_weights, scores,
-        num_tokens, num_experts, top_k, normalize_weights
-    );
+    moe_topk_forward_dispatch(expert_indices, routing_weights, scores,
+                              num_tokens, num_experts, top_k, normalize_weights, stream);
 }
 
 void moe_topk_backward(
@@ -868,7 +1034,8 @@ void moe_compute_expert_counts(
     int block_size = 256;
     int total = num_tokens * top_k;
     int grid_size = (total + block_size - 1) / block_size;
-    moe_compute_expert_counts_kernel<<<grid_size, block_size, 0, stream>>>(
+    size_t smem = num_experts * sizeof(int);
+    moe_compute_expert_counts_kernel<<<grid_size, block_size, smem, stream>>>(
         expert_counts, expert_indices, num_tokens, top_k, num_experts
     );
 }
