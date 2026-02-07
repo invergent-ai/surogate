@@ -274,7 +274,15 @@ void SafeTensorsReader::load_tensors(ITensorContainer& container, bool allow_cas
  * Frees CUDA device memory used for temporary conversion, if allocated.
  */
 SafeTensorsReader::~SafeTensorsReader() {
-    CUDA_CHECK(cudaFree(mConversionBuffer));
+    if (mConversionBuffer) {
+        auto err = cudaFree(mConversionBuffer);
+        if (err != cudaSuccess) {
+            // Never throw from a destructor — it causes std::terminate during stack unwinding.
+            fprintf(stderr, "[SafeTensorsReader] WARNING: cudaFree(mConversionBuffer) failed: %s\n",
+                    cudaGetErrorString(err));
+            cudaGetLastError();  // Clear the error
+        }
+    }
 }
 
 /**

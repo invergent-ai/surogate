@@ -1,6 +1,8 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
@@ -59,6 +61,24 @@ void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
     const int num_tokens = static_cast<int>(routing_weights.Sizes[0]);
     const int total_tokens = num_tokens * top_k;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+
+    // Validate expert_out shape: must be [total_tokens, hidden_size].
+    // A shape mismatch (e.g., [1, hidden_size] from a stale/incorrectly saved tensor)
+    // causes the kernel to read out of bounds, producing NaN in routing weight gradients.
+    if (expert_out.nelem() != static_cast<long>(total_tokens) * hidden_size) {
+        std::ostringstream oss;
+        oss << "moe_unpermute_backward: expert_out shape mismatch. "
+            << "Expected [" << total_tokens << ", " << hidden_size << "] ("
+            << static_cast<long>(total_tokens) * hidden_size << " elems), got [";
+        for (int d = 0; d < expert_out.Rank; ++d) {
+            if (d > 0) oss << ", ";
+            oss << expert_out.Sizes[d];
+        }
+        oss << "] (" << expert_out.nelem() << " elems). "
+            << "ref_name='" << op.inputs[1].name << "' ref_slot="
+            << static_cast<int>(op.inputs[1].slot);
+        throw std::runtime_error(oss.str());
+    }
 
     if (d_output.DType == ETensorDType::BF16) {
         moe_combine_backward(d_expert_out.get<nv_bfloat16>(),

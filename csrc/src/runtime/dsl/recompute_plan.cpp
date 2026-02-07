@@ -327,8 +327,8 @@ Tensor& ensure_activation(RecomputeContext& ctx, int layer_idx, const std::strin
         return t;
     };
 
-    if (name == "ln1" || name == "ln1_flat") return ensure(acts.ln1);
-    if (name == "ln1_rstd") return ensure(acts.ln1_rstd);
+    if (name == "ln1" || name == "ln1_flat" || name == "ln" || name == "ln_flat") return ensure(acts.ln1);
+    if (name == "ln1_rstd" || name == "ln_rstd") return ensure(acts.ln1_rstd);
     if (name == "ln2" || name == "ln2_flat") return ensure(acts.ln2);
     if (name == "ln2_rstd") return ensure(acts.ln2_rstd);
     if (name == "q_rstd") return ensure(acts.q_rstd);
@@ -391,8 +391,8 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
         }
     }
 
-    if (name == "ln1" || name == "ln1_flat") return get(acts.ln1);
-    if (name == "ln1_rstd") return get(acts.ln1_rstd);
+    if (name == "ln1" || name == "ln1_flat" || name == "ln" || name == "ln_flat") return get(acts.ln1);
+    if (name == "ln1_rstd" || name == "ln_rstd") return get(acts.ln1_rstd);
     if (name == "ln2" || name == "ln2_flat") return get(acts.ln2);
     if (name == "ln2_rstd") return get(acts.ln2_rstd);
     if (name == "q_rstd") return get(acts.q_rstd);
@@ -1953,8 +1953,17 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             continue;
         }
 
-        const InputMap inputs = resolve_inputs(ctx, op, layer_idx, B, T, scratch);
-        const auto outputs = resolve_outputs(ctx, op, layer_idx, stream);
+        // In hybrid models, the recompute plan contains ops for all block types
+        // but each layer only corresponds to one type. If inputs can't be resolved
+        // (e.g., attention param on a Mamba layer), skip the op.
+        InputMap inputs;
+        std::unordered_map<std::string, Tensor*> outputs;
+        try {
+            inputs = resolve_inputs(ctx, op, layer_idx, B, T, scratch);
+            outputs = resolve_outputs(ctx, op, layer_idx, stream);
+        } catch (const std::exception&) {
+            continue;
+        }
 
         if (op.op_type == "fused_residual_rmsnorm_apply_saved") {
             execute_fused_residual(ctx, op, layer_idx, B, T, inputs, outputs);

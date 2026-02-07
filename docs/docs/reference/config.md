@@ -4,16 +4,16 @@ This section provides a comprehensive reference for all configuration options av
 
 ## General Settings
 
-| Option                     | Type   | Default        | Description                                                                          |
-| -------------------------- | ------ | -------------- | ------------------------------------------------------------------------------------ |
-| `run_name`                 | string | auto-generated | A descriptor for the run. If not provided, a unique name is generated automatically. |
-| `apply_recommended_values` | bool   | `false`        | Whether to apply recommended configuration values.                                   |
-| `num_epochs`               | int    | `3`            | Total number of training epochs to perform.                                          |
-| `output_dir`               | string | `"output"`     | The output directory where the model predictions and checkpoints will be written.    |
-| `checkpoint_dir`           | string | `null`         | Directory to save checkpoints during training. If None, defaults to `output_dir`.    |
-| `resume_from_checkpoint`   | bool   | `true`         | Continue from checkpoint. If enabled, uses the latest checkpoint.                    |
-| `save_steps`               | int    | `50`           | Number of steps between saving checkpoints.                                          |
-| `save_total_limit`         | int    | `5`            | Limit the total amount of checkpoints. Deletes older checkpoints in `output_dir`.    |
+| Option                     | Type   | Default        | Description                                                                            |
+| -------------------------- | ------ | -------------- | -------------------------------------------------------------------------------------- |
+| `run_name`                 | string | auto-generated | A descriptor for the run. If not provided, a unique name is generated automatically.   |
+| `apply_recommended_values` | bool   | `false`        | Whether to apply recommended configuration values.                                     |
+| `num_epochs`               | int    | `3`            | Total number of training epochs to perform.                                            |
+| `output_dir`               | string | `"output"`     | The output directory where the model predictions and checkpoints will be written.      |
+| `checkpoint_dir`           | string | `null`         | Directory to save checkpoints during training. If None, defaults to `output_dir`.      |
+| `resume_from_checkpoint`   | bool   | `true`         | Continue from checkpoint. If enabled, uses the latest checkpoint.                      |
+| `save_steps`               | int    | `50`           | Number of steps between saving checkpoints.                                            |
+| `save_total_limit`         | int    | `5`            | Limit the total amount of checkpoints. Deletes older checkpoints in `output_dir`.      |
 | `from_scratch`             | bool   | `false`        | Train from scratch (random initialization) instead of fine-tuning a pre-trained model. |
 
 ## Model Settings
@@ -31,9 +31,9 @@ This section provides a comprehensive reference for all configuration options av
 
 Recomputation trades compute for memory by recomputing activations during the backward pass instead of storing them.
 
-| Option      | Type | Default | Description                                                                                                                                                                                     |
-| ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead).                   |
+| Option      | Type | Default | Description                                                                                                                                                                   |
+| ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead). |
 
 ## Offloading Options
 
@@ -45,7 +45,7 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | `offload_master`     | bool | `false` | Store master weights in pinned host memory.                                                                                                                                                                                   |
 | `offload_quants`     | bool | `false` | Store quantized weights in pinned host memory. Requires `persistent_quants`.                                                                                                                                                  |
 | `offload_optimizer`  | bool | `false` | Store optimizer state in pinned host memory. Slows down optimizer step drastically, but with enough gradient accumulation steps, the overall contribution becomes negligible.                                                 |
-| `offload_grads`      | bool | `false` | Offload gradients to pinned host memory. Requires `shard_gradients=true` or `zero_level >= 2`.                                                                                                                               |
+| `offload_grads`      | bool | `false` | Offload gradients to pinned host memory. Requires `shard_gradients=true` or `zero_level >= 2`.                                                                                                                                |
 | `persistent_quants`  | bool | `false` | Avoid re-quantization of weights. Increases memory, but when combined with `offload_quants`, the additional memory is placed on the host. In PCIe settings, this can lead to significant speed-ups. Requires `shard_weights`. |
 | `use_zero_copy`      | bool | `false` | Use ZeroCopy memory access instead of double-buffered cudaMemcpy for offloaded optimizer states. DMA is slower on consumer cards but faster on professional cards.                                                            |
 | `use_write_combined` | bool | `false` | Use write-combined memory for offloaded tensors. May improve PCIe throughput in some situations.                                                                                                                              |
@@ -67,11 +67,11 @@ These options apply to single-node multi-GPU training. For multi-node distribute
 
 Configuration for training across multiple machines using Ray and NCCL. See the [Multi-Node Training Guide](guides/multi-node.md) for detailed setup instructions.
 
-| Option                        | Type   | Default  | Description                                                                                                                                                |
-| ----------------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `distributed.ray_address`     | string | `"auto"` | Ray cluster address. Options: `"auto"` (connect to existing cluster), `"local"` (start local instance), `"ray://host:port"` (connect to specific head).   |
-| `distributed.num_nodes`       | int    | `1`      | Total number of nodes to use for training. Set to `> 1` to enable multi-node training.                                                                     |
-| `distributed.gpus_per_node`   | int    | `0`      | Number of GPUs per node. If `0`, uses the value from `gpus` config parameter.                                                                              |
+| Option                          | Type   | Default  | Description                                                                                                                                                  |
+| ------------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `distributed.ray_address`       | string | `"auto"` | Ray cluster address. Options: `"auto"` (connect to existing cluster), `"local"` (start local instance), `"ray://host:port"` (connect to specific head).      |
+| `distributed.num_nodes`         | int    | `1`      | Total number of nodes to use for training. Set to `> 1` to enable multi-node training.                                                                       |
+| `distributed.gpus_per_node`     | int    | `0`      | Number of GPUs per node. If `0`, uses the value from `gpus` config parameter.                                                                                |
 | `distributed.worker_output_dir` | string | `null`   | Base directory for worker-local tokenized data. Each worker creates a `node-{rank}/` subdirectory. If `null`, uses `/tmp/surogate-{run_name}/` on each node. |
 
 **Example configuration:**
@@ -85,10 +85,10 @@ distributed:
 
 ## Hardware Settings
 
-| Option            | Type | Default | Description                                                                                                                       |
-| ----------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `gpus`            | int  | `1`     | Number of GPUs to use for training. Use `0` for all available GPUs.                                                               |
-| `use_cuda_graphs` | bool | `true`  | Enable CUDA graphs for performance.                                                                                                |
+| Option            | Type | Default | Description                                                         |
+| ----------------- | ---- | ------- | ------------------------------------------------------------------- |
+| `gpus`            | int  | `1`     | Number of GPUs to use for training. Use `0` for all available GPUs. |
+| `use_cuda_graphs` | bool | `true`  | Enable CUDA graphs for performance.                                 |
 
 ## Mixed Precision & Recipe Options
 
@@ -113,10 +113,10 @@ distributed:
 
 ### Layer Quantization Skip Options
 
-| Option                    | Type | Default | Description                                                                           |
-| ------------------------- | ---- | ------- | ------------------------------------------------------------------------------------- |
+| Option                    | Type | Default | Description                                                                                               |
+| ------------------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------- |
 | `skip_quant_first_layers` | int  | `0`     | Skip quantization for the first N transformer decoder layers. (embedding layers are always kept in BF16). |
-| `skip_quant_last_layers`  | int  | `0`     | Skip quantization for the last N transformer decoder layers (lm_head layers are always kept in BF16).    |
+| `skip_quant_last_layers`  | int  | `0`     | Skip quantization for the last N transformer decoder layers (lm_head layers are always kept in BF16).     |
 
 ## Optimizer Settings
 
@@ -262,25 +262,25 @@ datasets:
 
 ## LoRA Settings
 
-| Option                | Type   | Default          | Description                                                        |
-| --------------------- | ------ | ---------------- | ------------------------------------------------------------------ |
-| `lora`                | bool   | `true`           | Whether to use LoRA adapters for training.                         |
-| `lora_rank`           | int    | `16`             | Rank for LoRA adapters.                                            |
-| `lora_alpha`          | int    | `32`             | Alpha value for LoRA adapters.                                     |
-| `lora_dropout`        | float  | `0.05`           | Dropout rate for LoRA adapters.                                    |
-| `lora_dtype`          | string | `"fp32"`         | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                 |
-| `lora_target_modules` | list   | `["all"]`        | List of module names to apply LoRA adapters to.                    |
-| `train_router`        | bool   | `false`          | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
-| `merge_adapter`       | bool   | `false`          | Whether to merge LoRA adapters into the base model after training. |
+| Option                | Type   | Default   | Description                                                                |
+| --------------------- | ------ | --------- | -------------------------------------------------------------------------- |
+| `lora`                | bool   | `true`    | Whether to use LoRA adapters for training.                                 |
+| `lora_rank`           | int    | `16`      | Rank for LoRA adapters.                                                    |
+| `lora_alpha`          | int    | `32`      | Alpha value for LoRA adapters.                                             |
+| `lora_dropout`        | float  | `0.05`    | Dropout rate for LoRA adapters.                                            |
+| `lora_dtype`          | string | `"fp32"`  | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                         |
+| `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
+| `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
+| `merge_adapter`       | bool   | `false`   | Whether to merge LoRA adapters into the base model after training.         |
 
 ## MoE Settings
 
 MoE (Mixture-of-Experts) settings control router loss coefficients for load balancing during training.
 
-| Option                | Type  | Default         | Description                                                                                       |
-| --------------------- | ----- | --------------- | ------------------------------------------------------------------------------------------------- |
-| `router_aux_loss_coef`| float | `null`          | MoE auxiliary (load balancing) loss coefficient. `null` uses model config default. |
-| `router_z_loss_coef`  | float | `null`          | MoE z-loss (router logit regularization) coefficient. `null` uses model config default. |
+| Option                 | Type  | Default | Description                                                                             |
+| ---------------------- | ----- | ------- | --------------------------------------------------------------------------------------- |
+| `router_aux_loss_coef` | float | `null`  | MoE auxiliary (load balancing) loss coefficient. `null` uses model config default.      |
+| `router_z_loss_coef`   | float | `null`  | MoE z-loss (router logit regularization) coefficient. `null` uses model config default. |
 
 **Understanding MoE Losses:**
 
@@ -289,17 +289,17 @@ MoE (Mixture-of-Experts) settings control router loss coefficients for load bala
 
 ## QLoRA Settings
 
-| Option                   | Type | Default | Description                                                                                                                                                      |
-| ------------------------ | ---- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `qlora_fp4`              | bool | `false` | Enable NVFP4 QLoRA mode (base weights quantized to FP4 E2M1). **Requires Blackwell GPU (SM100+)**.                                                               |
-| `qlora_fp8`              | bool | `false` | Enable FP8 QLoRA mode (base weights quantized to FP8 with per-block scales).                                                                                     |
-| `qlora_bnb`              | bool | `false` | Enable BitsAndBytes NF4 QLoRA mode (base weights quantized to NF4 with per-block absmax). Works on any CUDA GPU.                                                 |
-| `qlora_block_size`       | int  | `128`   | Block size for FP8 QLoRA quantization. Valid values: `64`, `128`, `256`.                                                                                         |
-| `qlora_bnb_block_size`   | int  | `64`    | Block size for BnB NF4 QLoRA quantization. Valid values: `64`, `128`, `256`, `512`.                                                                              |
-| `qlora_bnb_double_quant` | bool | `true`  | Enable double quantization for BnB (quantize absmax values to INT8 for extra memory savings).                                                                    |
-| `qlora_four_over_six`    | bool | `true`  | Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization. Evaluates both max=4 and max=6 scaling per block and selects lower error option. |
-| `qlora_selective_expert_dequant` | bool | `false` | Enable selective expert dequantization for MoE models to reduce dequant buffer memory.                                                                  |
-| `qlora_offload_experts`  | bool | `false` | Offload expert weights in QLoRA MoE models to host memory.                                                                                                     |
+| Option                           | Type | Default | Description                                                                                                                                                                                                                                |
+| -------------------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `qlora_fp4`                      | bool | `false` | Enable NVFP4 QLoRA mode (base weights quantized to FP4 E2M1). **Requires Blackwell GPU (SM100+)**.                                                                                                                                         |
+| `qlora_fp8`                      | bool | `false` | Enable FP8 QLoRA mode (base weights quantized to FP8 with per-block scales).                                                                                                                                                               |
+| `qlora_bnb`                      | bool | `false` | Enable BitsAndBytes NF4 QLoRA mode (base weights quantized to NF4 with per-block absmax). Works on any CUDA GPU.                                                                                                                           |
+| `qlora_block_size`               | int  | `128`   | Block size for FP8 QLoRA quantization. Valid values: `64`, `128`, `256`.                                                                                                                                                                   |
+| `qlora_bnb_block_size`           | int  | `64`    | Block size for BnB NF4 QLoRA quantization. Valid values: `64`, `128`, `256`, `512`.                                                                                                                                                        |
+| `qlora_bnb_double_quant`         | bool | `true`  | Enable double quantization for BnB (quantize absmax values to INT8 for extra memory savings).                                                                                                                                              |
+| `qlora_four_over_six`            | bool | `true`  | Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization. Evaluates both max=4 and max=6 scaling per block and selects lower error option.                                                                           |
+| `qlora_selective_expert_dequant` | bool | `false` | Enable selective expert dequantization for MoE models to reduce dequant buffer memory. When enabled, it only dequantizes the experts that are actually selected by the router for each forward pass, rather than dequantizing all experts. |
+| `qlora_offload_experts`          | bool | `false` | Offload expert weights in QLoRA MoE models to host memory. Works at the layer level (loads/unloads entire layer's experts as groups).                                                                                                                                                                                |
 
 ## Chat Template Settings
 
@@ -323,26 +323,26 @@ Chat template settings control how conversations are formatted for training and 
 
 ## Logging & Reporting
 
-| Option         | Type   | Default | Description                                                  |
-| -------------- | ------ | ------- | ------------------------------------------------------------ |
+| Option         | Type   | Default | Description                                                                  |
+| -------------- | ------ | ------- | ---------------------------------------------------------------------------- |
 | `report_to`    | list   | `null`  | Report results and logs to specified platforms. Options: `"wandb"`, `"aim"`. |
-| `log_file`     | string | `null`  | Where to save the training log. If `null`, no log file is written. |
-| `log_gpu_util` | int    | `100`   | Interval for logging GPU utilization.                         |
+| `log_file`     | string | `null`  | Where to save the training log. If `null`, no log file is written.           |
+| `log_gpu_util` | int    | `100`   | Interval for logging GPU utilization.                                        |
 
 ### WandB (Weights & Biases) Settings
 
-| Option          | Type   | Default      | Description                                                      |
-| --------------- | ------ | ------------ | ---------------------------------------------------------------- |
+| Option          | Type   | Default    | Description                                                      |
+| --------------- | ------ | ---------- | ---------------------------------------------------------------- |
 | `wandb_project` | string | `null`     | WandB project name for logging.                                  |
 | `wandb_name`    | string | `run_name` | WandB run name for logging. Defaults to the value of `run_name`. |
 
 ### Aim Settings
 
-| Option           | Type   | Default      | Description                                                     |
-| ---------------- | ------ | ------------ | --------------------------------------------------------------- |
+| Option           | Type   | Default    | Description                                                     |
+| ---------------- | ------ | ---------- | --------------------------------------------------------------- |
 | `aim_experiment` | string | `null`     | Aim experiment name for logging.                                |
-| `aim_repo`       | string | `null`       | Aim repository path for logging. Uses default if not specified. |
-| `aim_name`       | string | `run_name`   | Aim run name for logging. Defaults to the value of `run_name`.  |
+| `aim_repo`       | string | `null`     | Aim repository path for logging. Uses default if not specified. |
+| `aim_name`       | string | `run_name` | Aim run name for logging. Defaults to the value of `run_name`.  |
 
 ## Debugging Options
 
@@ -353,12 +353,12 @@ Chat template settings control how conversations are formatted for training and 
 
 ## Recipe Comparison
 
-| Recipe       | Format                      | GPU Requirement                | Use Case                             |
-| ------------ | --------------------------- | ------------------------------ | ------------------------------------ |
-| `bf16`       | BF16 forward/backward       | Any CUDA GPU                   | Baseline, maximum compatibility      |
-| `fp8_hybrid` | FP8 E4M3 fwd / E5M2 bwd     | SM89+ (Ada, Hopper, Blackwell) | 2x throughput, minimal accuracy loss |
-| `nvfp4`      | FP4 E2M1 with block scaling | SM100+ (Blackwell only)        | Maximum memory efficiency            |
-| `nvfp4_quartet` | FP4 E2M1 quartet scaling | SM100+ (Blackwell only)        | Higher accuracy FP4 training         |
+| Recipe          | Format                      | GPU Requirement                | Use Case                             |
+| --------------- | --------------------------- | ------------------------------ | ------------------------------------ |
+| `bf16`          | BF16 forward/backward       | Any CUDA GPU                   | Baseline, maximum compatibility      |
+| `fp8_hybrid`    | FP8 E4M3 fwd / E5M2 bwd     | SM89+ (Ada, Hopper, Blackwell) | 2x throughput, minimal accuracy loss |
+| `nvfp4`         | FP4 E2M1 with block scaling | SM100+ (Blackwell only)        | Maximum memory efficiency            |
+| `nvfp4_quartet` | FP4 E2M1 quartet scaling    | SM100+ (Blackwell only)        | Higher accuracy FP4 training         |
 
 ## Example Configuration
 

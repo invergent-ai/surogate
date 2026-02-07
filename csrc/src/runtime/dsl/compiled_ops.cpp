@@ -541,12 +541,13 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             }
             const std::string base_field = strip_ssa_suffix(field);
             auto& acts = mRunState.simplified_acts(layer_idx);
-            if (base_field == "ln1_rstd") return acts.ln1_rstd;
+            if (base_field == "ln1_rstd" || base_field == "ln_rstd") return acts.ln1_rstd;
             if (base_field == "ln2_rstd") return acts.ln2_rstd;
             if (base_field == "q_rstd") return acts.q_rstd;
             if (base_field == "k_rstd") return acts.k_rstd;
             if (base_field == "lse") return acts.lse;
-            if (base_field == "ln1" || base_field == "ln1_flat") return acts.ln1;
+            if (base_field == "ln1" || base_field == "ln1_flat" ||
+                base_field == "ln" || base_field == "ln_flat") return acts.ln1;
             if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
             if (base_field == "qkv") return acts.qkv;
             if (base_field == "qkv_rope") {
@@ -811,6 +812,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     };
 
     for (const auto& name : save_list) {
+        // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed)
+        if (mSaved->find(name) != mSaved->end()) {
+            continue;
+        }
+
         // First check the tensor map (intermediate tensors)
         auto it = mTensorMap.find(name);
         if (it != mTensorMap.end()) {
@@ -848,7 +854,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             ref.layer_idx = layer_idx;
             // Map common saved fields
             const bool prefer_live = prefer_live_tensor(name);
-            if (field == "ln1_rstd") {
+            if (field == "ln1_rstd" || field == "ln_rstd") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1_rstd, prefer_live, false);
             } else if (field == "ln2_rstd") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2_rstd, prefer_live, false);
@@ -858,7 +864,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).k_rstd, prefer_live, false);
             } else if (field == "lse") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).lse, prefer_live, false);
-            } else if (field == "ln1" || field == "ln1_flat") {
+            } else if (field == "ln1" || field == "ln1_flat" || field == "ln" || field == "ln_flat") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1, prefer_live, false);
             } else if (field == "ln2" || field == "ln2_flat") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2, prefer_live, false);
@@ -1086,6 +1092,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             case TensorSlot::BlockDMLPDown: base = &rs.simplified_grads(ref.layer_idx).d_mlp_down; break;
             case TensorSlot::BlockDLN2: base = &rs.simplified_grads(ref.layer_idx).d_ln2; break;
             case TensorSlot::BlockDResAtt: base = &rs.simplified_grads(ref.layer_idx).d_res_att; break;
+            case TensorSlot::BlockDAttOut: base = &rs.simplified_grads(ref.layer_idx).d_att_out; break;
             case TensorSlot::BlockDResFFN: base = &rs.simplified_grads(ref.layer_idx).d_res_ffn; break;
             case TensorSlot::BlockLN1: base = &rs.simplified_acts(ref.layer_idx).ln1; break;
             case TensorSlot::BlockLN2: base = &rs.simplified_acts(ref.layer_idx).ln2; break;
@@ -1186,6 +1193,8 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             return rs.simplified_grads(ref.layer_idx).d_ln2;
         case TensorSlot::BlockDResAtt:
             return rs.simplified_grads(ref.layer_idx).d_res_att;
+        case TensorSlot::BlockDAttOut:
+            return rs.simplified_grads(ref.layer_idx).d_att_out;
         case TensorSlot::BlockDResFFN:
             return rs.simplified_grads(ref.layer_idx).d_res_ffn;
         case TensorSlot::Parameter:
@@ -1401,6 +1410,15 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 ++it;
                 continue;
             }
+            // Skip cross-layer connector tensors (layerN.out, layerN.res_in, etc.)
+            // These are produced by HybridStackedBlocks and consumed by the next layer's
+            // fused_residual_rmsnorm. They use "layerN.name" naming which doesn't match
+            // parse_block_param, so they're stored in the tensor map and would be pruned
+            // when the producing layer's stack frame is freed.
+            if (it->first.rfind("layer", 0) == 0) {
+                ++it;
+                continue;
+            }
             if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
                 !mRunState.Stack.is_live(it->second.Data)) {
                 it = mTensorMap.erase(it);
@@ -1554,6 +1572,18 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             oss << "CompiledExecutor forward op " << idx << " (type=" << op_type_to_string(op.type)
                 << ", id=" << op.op_id << "): " << e.what();
             throw std::runtime_error(oss.str());
+        }
+
+        // Debug: sync after each op to pinpoint CUDA errors
+        if (env_enabled("SUROGATE_SYNC_OPS")) {
+            auto err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[SYNC_CHECK] CUDA error after op %zu (type=%s): %s\n",
+                        idx, op_type_to_string(op.type), cudaGetErrorString(err));
+                throw std::runtime_error(
+                    fmt::format("CUDA error after op {} (type={}): {}",
+                                idx, op_type_to_string(op.type), cudaGetErrorString(err)));
+            }
         }
 
         // Handle layer end
@@ -2286,6 +2316,17 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 }
             }
 
+            // Debug: sync after each backward op to pinpoint CUDA errors
+            if (env_enabled("SUROGATE_SYNC_OPS")) {
+                auto err = cudaDeviceSynchronize();
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "[BWD_SYNC] CUDA error after BWD_OP %zu (type=%s, id=%s): %s\n",
+                            idx, op_type_to_string(op.type), op.op_id.c_str(), cudaGetErrorString(err));
+                    throw std::runtime_error(
+                        fmt::format("CUDA error after BWD_OP {} (type={}, id={}): {}",
+                                    idx, op_type_to_string(op.type), op.op_id, cudaGetErrorString(err)));
+                }
+            }
 
             // Memory management - prune tensors after last use, then restore stack at layer boundaries
             // when no live stack tensors remain. This is safe for MoE as well.

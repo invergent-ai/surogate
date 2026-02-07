@@ -64,14 +64,16 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
     Tensor dx = mRunState.temp_alloc(d_out.DType, {B, conv_dim, T});
     mTemps.push_back(dx);
 
-    // Weight gradient is accumulated in FP32
+    // Weight gradient is accumulated via atomicAdd — must zero-init (stack memory is stale)
     Tensor dweight_fp32 = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim, kernel});
     mTemps.push_back(dweight_fp32);
+    fill_zero(dweight_fp32, mRunState.MainStream);
 
     Tensor* dbias_fp32 = nullptr;
     if (op.outputs.size() > 2) {
         Tensor dbias = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim});
         mTemps.push_back(dbias);
+        fill_zero(mTemps.back(), mRunState.MainStream);
         dbias_fp32 = &mTemps.back();
     }
 

@@ -269,8 +269,11 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
                 // Ensure GPU copy is complete before quantizing
                 CUDA_CHECK(cudaStreamSynchronize(stream));
 
+                CUDA_CHECK(cudaGetLastError());
+
                 // Issue quantization on quant stream (async GPU kernel)
                 weight_mgr->quantize_and_store(spec.name, target, quant_stream);
+                CUDA_CHECK(cudaStreamSynchronize(quant_stream));
 
                 // Record event: buffer slot is free when this quant completes
                 if (use_double_buffer) {
@@ -293,12 +296,14 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             }
 
             Tensor tensor = allocator->allocate(
-                ETensorDType::BF16,
+                spec.target_dtype,
                 spec.name.c_str(),
                 EAllocationType::ON_DEVICE,
                 shape);
 
             bool success = loader.load_param(spec.name, tensor, true, spec.sharded, nullptr, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaGetLastError());
             if (success) {
                 weight_mgr->register_full_precision(spec.name, tensor);
                 loaded++;
@@ -336,7 +341,7 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
         if (!spec.quantize || !weight_mgr->quantizer()) {
             // Full-precision expert weight (unlikely but handle gracefully)
             Tensor tensor = allocator->allocate(
-                ETensorDType::BF16,
+                spec.target_dtype,
                 spec.name.c_str(),
                 EAllocationType::ON_DEVICE,
                 spec.shape);
@@ -370,7 +375,12 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
         for (int e = 0; e < E; ++e) {
             loader.load_expert(spec.name, e, expert_buf, true, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            weight_mgr->quantize_expert_slice(spec.name, e, per_M, expert_buf, stream);
+            try {
+                weight_mgr->quantize_expert_slice(spec.name, e, per_M, expert_buf, stream);
+            } catch (...) {
+                cudaFree(expert_buf_ptr);
+                throw;
+            }
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 

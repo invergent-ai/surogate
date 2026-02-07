@@ -428,7 +428,7 @@ class SurogateTrainerWrapper():
         any_nan = False
         tensor_count = 0
 
-        for _, arr in grads.items():
+        for name, arr in grads.items():
             try:
                 t = torch.utils.dlpack.from_dlpack(arr)
             except Exception:
@@ -438,8 +438,17 @@ class SurogateTrainerWrapper():
                 continue
             tensor_count += 1
             t_f = t.float()
-            if torch.isnan(t_f).any().item():
+            has_nan = torch.isnan(t_f).any().item()
+            has_inf = torch.isinf(t_f).any().item()
+            if has_nan or has_inf:
                 any_nan = True
+                nan_count = torch.isnan(t_f).sum().item()
+                inf_count = torch.isinf(t_f).sum().item()
+                logger.info(
+                    "  NaN/Inf in LoRA grad '%s' shape=%s nan=%d inf=%d abs_max=%.6g",
+                    name, list(t.shape), nan_count, inf_count,
+                    t_f[~torch.isnan(t_f)].abs().max().item() if nan_count < t_f.numel() else float('nan')
+                )
             sq = (t_f * t_f).sum()
             total_sq = sq if total_sq is None else total_sq + sq
             t_max = t_f.abs().max()

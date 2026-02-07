@@ -84,10 +84,11 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
         }
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" ||
             field == "mlp_up_weight" || field == "mlp_down_weight" ||
+            field == "up_weight" || field == "down_weight" ||
             field == "ln1_weight" || field == "ln2_weight" ||
             field == "q_norm_weight" || field == "k_norm_weight" ||
             field == "router_weight" ||
-            field == "experts_gate_up" || field == "experts_down" ||
+            field == "experts_gate_up" || field == "experts_up" || field == "experts_down" ||
             field == "shared_expert_gate" || field == "shared_expert_up" ||
             field == "shared_expert_down") {
             return true;
@@ -98,9 +99,13 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
             ends_with(field, "out_proj_bias") ||
             ends_with(field, "conv1d_weight") ||
             ends_with(field, "conv1d_bias") ||
+            ends_with(field, "conv_weight") ||
+            ends_with(field, "conv_bias") ||
             ends_with(field, "A_log") ||
             ends_with(field, "D") ||
+            ends_with(field, "D_param") ||
             ends_with(field, "dt_bias") ||
+            ends_with(field, "gated_norm_weight") ||
             ends_with(field, "norm_weight")) {
             return true;
         }
@@ -129,6 +134,8 @@ struct DslConfigView {
     std::optional<bool> norm_topk_prob;
     std::optional<bool> use_shared_expert;
     std::optional<long> shared_expert_intermediate;
+    std::optional<std::string> hybrid_pattern;
+    std::optional<double> routed_scaling_factor;
 };
 
 std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
@@ -161,6 +168,15 @@ std::optional<bool> get_bool_attr(const AttrMap& map, const char* key) {
     return std::nullopt;
 }
 
+std::optional<std::string> get_string_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (auto v = internal::as_string(*value)) {
+            return std::string(*v);
+        }
+    }
+    return std::nullopt;
+}
+
 DslConfigView parse_dsl_config(const Module& module) {
     DslConfigView view;
     const auto& cfg = module.config;
@@ -170,6 +186,7 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.num_query_heads = get_long_attr(cfg, "num_query_heads");
     view.num_kv_heads = get_long_attr(cfg, "num_kv_heads");
     view.head_size = get_long_attr(cfg, "head_size");
+    if (!view.head_size) view.head_size = get_long_attr(cfg, "head_dim");  // Nemotron-H uses head_dim
     view.max_seq = get_long_attr(cfg, "max_seq");
     view.vocab_size = get_long_attr(cfg, "vocab_size");
     view.eps = get_double_attr(cfg, "eps");
@@ -181,6 +198,10 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.norm_topk_prob = get_bool_attr(cfg, "norm_topk_prob");
     view.use_shared_expert = get_bool_attr(cfg, "use_shared_expert");
     view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate");
+    if (!view.shared_expert_intermediate)
+        view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate_size");
+    view.hybrid_pattern = get_string_attr(cfg, "hybrid_pattern");
+    view.routed_scaling_factor = get_double_attr(cfg, "routed_scaling_factor");
     return view;
 }
 
@@ -248,6 +269,26 @@ void apply_arch_from_hf_config(PretrainedConfig& cfg, const Module& module) {
     }
 }
 
+/// Parse a standardised hybrid pattern string into per-layer overrides.
+/// Standard alphabet: M=Mamba, A=Attention, P=MLP, E=MoE.
+std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std::string& pattern) {
+    std::vector<modules::LayerOverride> overrides;
+    overrides.reserve(pattern.size());
+    for (int i = 0; i < static_cast<int>(pattern.size()); ++i) {
+        switch (pattern[i]) {
+            case 'M': overrides.push_back(modules::LayerOverride::mamba(i));     break;
+            case 'A': overrides.push_back(modules::LayerOverride::attention(i)); break;
+            case 'P': overrides.push_back(modules::LayerOverride::mlp(i));       break;
+            case 'E': overrides.push_back(modules::LayerOverride::moe(i));       break;
+            default:
+                throw std::runtime_error(
+                    fmt::format("Invalid character '{}' at index {} in hybrid_pattern. "
+                                "Expected 'M', 'A', 'P', or 'E'.", pattern[i], i));
+        }
+    }
+    return overrides;
+}
+
 modules::ModelConfig build_model_config(const Module& module,
                                         const PretrainedConfig& base,
                                         const DslRuntimeConfig& runtime) {
@@ -312,6 +353,9 @@ modules::ModelConfig build_model_config(const Module& module,
         moe.norm_topk_prob = runtime.norm_topk_prob;
         moe.use_shared_expert = runtime.use_shared_expert;
         moe.shared_expert_size = runtime.shared_expert_intermediate;
+        if (view.routed_scaling_factor.has_value()) {
+            moe.routed_scaling_factor = static_cast<float>(*view.routed_scaling_factor);
+        }
         cfg.moe_config = moe;
 
         cfg.NumExperts = moe.num_experts;
@@ -319,6 +363,38 @@ modules::ModelConfig build_model_config(const Module& module,
         cfg.MoeIntermediateSize = moe.moe_intermediate_size;
     } else {
         cfg.architecture = modules::ArchitectureType::Dense;
+    }
+
+    // Hybrid pattern: build per-layer overrides and refine architecture type
+    if (view.hybrid_pattern.has_value() && !view.hybrid_pattern->empty()) {
+        auto overrides = parse_hybrid_pattern_to_overrides(*view.hybrid_pattern);
+        if (static_cast<int>(overrides.size()) != cfg.NumLayers) {
+            throw std::runtime_error(
+                fmt::format("hybrid_pattern length ({}) != NumLayers ({})",
+                            overrides.size(), cfg.NumLayers));
+        }
+        // Propagate global MoE config to MoE layer overrides
+        if (cfg.moe_config.has_value()) {
+            for (auto& ov : overrides) {
+                if (ov.block_type == modules::BlockType::MoE) {
+                    ov.is_moe = true;
+                    ov.num_experts = cfg.moe_config->num_experts;
+                    ov.top_k = cfg.moe_config->top_k;
+                }
+            }
+        }
+        cfg.layer_overrides = std::move(overrides);
+        // Determine if the pattern is truly hybrid (mixed block types)
+        bool has_multiple_types = false;
+        {
+            auto first = cfg.layer_overrides[0].block_type;
+            for (const auto& ov : cfg.layer_overrides) {
+                if (ov.block_type != first) { has_multiple_types = true; break; }
+            }
+        }
+        if (has_multiple_types) {
+            cfg.architecture = modules::ArchitectureType::Hybrid;
+        }
     }
 
     return cfg;
@@ -451,6 +527,9 @@ std::vector<qlora::WeightLoadSpec> build_weight_specs(
         spec.quantize = info.quantizable && spec.K > 0;
         spec.offload_group = info.offload_group;
         spec.sharded = false;  // QLoRA base weights are replicated (not sharded)
+        // Propagate target dtype from IR (e.g., FP32 for Mamba SSM params).
+        // Defaults to BF16 when IR doesn't specify a dtype.
+        spec.target_dtype = info.dtype.value_or(ETensorDType::BF16);
 
         specs.push_back(std::move(spec));
     }
@@ -614,7 +693,9 @@ DslModel::DslModel(const PretrainedConfig& config,
 
     if (lora_config.has_value() && lora_config->enabled()) {
         mLoRAConfig = lora_config;
-        mIsMoEModel = (mModelConfig.architecture == modules::ArchitectureType::MoE) || mModelConfig.moe_config.has_value();
+        mIsMoEModel = (mModelConfig.architecture == modules::ArchitectureType::MoE) ||
+                      (mModelConfig.architecture == modules::ArchitectureType::Hybrid) ||
+                      mModelConfig.moe_config.has_value();
 
         modules::ModularLoRAWeightsManager::Config wm{};
         wm.num_layers = mModelConfig.NumLayers;
@@ -628,6 +709,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         wm.shard_idx = mShardIdx;
         wm.num_shards = mNumShards;
         wm.is_moe = mIsMoEModel;
+        wm.model_config = &mModelConfig;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
             wm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
@@ -649,6 +731,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         gm.shard_idx = mShardIdx;
         gm.num_shards = mNumShards;
         gm.is_moe = mIsMoEModel;
+        gm.model_config = &mModelConfig;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             gm.num_experts = mModelConfig.moe_config->num_experts;
             gm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0

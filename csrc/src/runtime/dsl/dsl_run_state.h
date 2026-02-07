@@ -198,6 +198,7 @@ private:
     std::array<Tensor, 2> mSharedDResFFN{};  ///< Alternating buffers for d_res_ffn
     std::array<Tensor, 2> mSharedDMlpDown{}; ///< Alternating buffers for d_mlp_down
     Tensor mSharedDResAtt{};
+    Tensor mSharedDAttOut{};
     Tensor mSharedDLn2{};
     Tensor mSharedDAtt{};
     Tensor mSharedDLn1{};

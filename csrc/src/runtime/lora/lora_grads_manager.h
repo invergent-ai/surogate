@@ -16,6 +16,8 @@ class NCCLCommunicator;
 
 namespace modules {
 
+struct ModelConfig;  // Forward declaration for per-layer block type awareness
+
 /**
  * @brief Modular LoRA gradients manager
  *
@@ -40,6 +42,8 @@ public:
         int num_experts = 0;              ///< Number of experts per layer
         int moe_intermediate_size = 0;    ///< Per-expert intermediate size (0 = use intermediate_size)
         bool train_router = false;         ///< Train MoE router gate during LoRA fine-tuning
+
+        const ModelConfig* model_config = nullptr;  ///< Per-layer block type (hybrid models)
 
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;

@@ -140,6 +140,8 @@ class Mamba2Mixer:
                 conv_out,
                 intermediate_size=self.intermediate_size,
                 groups_state_size=self.n_groups * self.ssm_state_size,
+                n_groups=self.n_groups,
+                ssm_state_size=self.ssm_state_size,
             )
 
             # Reshape for SSM scan
@@ -155,6 +157,10 @@ class Mamba2Mixer:
                 dt_min=self.dt_min,
                 dt_max=self.dt_max,
                 chunk_size=self.chunk_size,
+                num_heads=self.mamba_num_heads,
+                head_dim=self.mamba_head_dim,
+                ssm_state_size=self.ssm_state_size,
+                n_groups=self.n_groups,
             )
 
             # Reshape SSM output

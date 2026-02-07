@@ -377,9 +377,29 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         } else if (mWeights.has(effective_name)) {
             // Block-indexed weight (e.g., blocks[0].ln1_weight)
             ref.slot = TensorSlot::Parameter;
+            const auto& tmpl = mWeights.template_tensor(effective_name);
+            if (tmpl.Rank > 0) {
+                ref.shape.assign(tmpl.Sizes.begin(), tmpl.Sizes.begin() + tmpl.Rank);
+            }
             return ref;
         } else {
             ref.slot = TensorSlot::Mapped;
+        }
+
+        // For block-indexed Mapped tensors without a slot registry shape,
+        // try inferred shapes from validate_operation_shapes and pre-computed
+        // view shapes. Without this, HybridStackedBlocks intermediate tensors
+        // (e.g., shared_up_out, shared_act) would have empty shapes.
+        if (ref.shape.empty()) {
+            std::vector<long> resolved;
+            if (resolve_tensor_shape(ref.name, resolved)) {
+                ref.shape = std::move(resolved);
+            } else {
+                auto it = mExtraShapes.find(ref.name);
+                if (it != mExtraShapes.end()) {
+                    ref.shape = it->second;
+                }
+            }
         }
 
         return ref;
@@ -433,6 +453,10 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         ref.slot = TensorSlot::FreqCis;
     } else if (mWeights.has(name)) {
         ref.slot = TensorSlot::Parameter;
+        const auto& tmpl = mWeights.template_tensor(name);
+        if (tmpl.Rank > 0) {
+            ref.shape.assign(tmpl.Sizes.begin(), tmpl.Sizes.begin() + tmpl.Rank);
+        }
     } else {
         ref.slot = TensorSlot::Mapped;
     }
@@ -609,6 +633,13 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 attrs.normalize_weights = *v;
             }
         }
+
+        // scaling_factor attribute (e.g. routed_scaling_factor for Nemotron-H)
+        if (auto* sf_attr = find_attr(op.attrs, "scaling_factor")) {
+            if (auto v = attr_double(*sf_attr)) {
+                attrs.scaling_factor = static_cast<float>(*v);
+            }
+        }
     }
 
     // Mamba/SSM-specific attributes
@@ -684,11 +715,15 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 attrs.activation = *v;
             }
         }
-        // group_size for gated rmsnorm (reuse top_k field or add dedicated)
+        // n_groups for gated rmsnorm (passed directly from graph builder)
+        if (auto* attr = find_attr(op.attrs, "n_groups")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.n_groups = static_cast<int>(*v);
+            }
+        }
+        // Legacy: group_size for gated rmsnorm (compute n_groups from intermediate_size / group_size)
         if (auto* attr = find_attr(op.attrs, "group_size")) {
             if (auto v = attr_int(*attr)) {
-                // Store in a suitable field - we can compute groups from intermediate_size / group_size
-                // For now, store as n_groups = intermediate_size / group_size if intermediate_size is set
                 if (attrs.intermediate_size > 0 && *v > 0) {
                     attrs.n_groups = attrs.intermediate_size / static_cast<int>(*v);
                 }
@@ -1051,8 +1086,11 @@ void GraphCompiler::infer_output_shapes(
 
         case CompiledOpType::Silu:
         case CompiledOpType::Relu2:
-        case CompiledOpType::Mul: {
-            // Element-wise ops preserve shape
+        case CompiledOpType::Mul:
+        case CompiledOpType::SiluBackward:
+        case CompiledOpType::Relu2Backward:
+        case CompiledOpType::MulBackward: {
+            // Element-wise ops (and their backward) preserve shape
             if (!input_shapes.empty() && !input_shapes[0].empty()) {
                 output_shapes.push_back(input_shapes[0]);
             }
@@ -1470,6 +1508,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         compiled.outputs.reserve(op.outputs.size());
         for (std::size_t i = 0; i < op.outputs.size(); ++i) {
             auto ref = resolve_tensor_ref(op.outputs[i], true, op, mShapeEnv);
+            bool shape_is_default_fallback = false;
 
             // Fix dtype and shape for outputs based on operation type
             // This is needed for Mapped tensors that don't have predefined slots
@@ -1932,10 +1971,25 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         }
                         ref.shape = {B * T * top_k, C};
                     }
+                } else if (compiled.type == CompiledOpType::Silu ||
+                           compiled.type == CompiledOpType::Relu2 ||
+                           compiled.type == CompiledOpType::Mul ||
+                           compiled.type == CompiledOpType::SiluBackward ||
+                           compiled.type == CompiledOpType::Relu2Backward ||
+                           compiled.type == CompiledOpType::MulBackward) {
+                    // Element-wise ops (and their backward) preserve input shape and dtype
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                        if (ref.shape.empty()) {
+                            ref.shape = compiled.inputs[0].shape;
+                        }
+                    }
                 } else {
-                    // Default for activation tensors
+                    // Default for activation tensors — this is a best-effort guess
+                    // that is often wrong for Mamba/custom ops; do NOT persist.
                     ref.dtype = ETensorDType::BF16;
                     ref.shape = {B, T, C};
+                    shape_is_default_fallback = true;
                 }
             }
 
@@ -1954,10 +2008,19 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 ref.shape = {Bdim, Tdim, Cdim};
             }
 
-            // Track output dtype for downstream operations to reference.
-            // This allows intermediate tensors to have their dtypes properly propagated.
+            // Track output dtype and shape for downstream operations to reference.
+            // This allows intermediate tensors to have their dtypes/shapes properly propagated.
+            // Skip shapes from the catch-all default — they are often wrong for custom ops.
             if (!op.outputs[i].empty()) {
                 mTensorDtypes[op.outputs[i]] = ref.dtype;
+                if (!shape_is_default_fallback && !ref.shape.empty() &&
+                    mTensorShapes.find(op.outputs[i]) == mTensorShapes.end()) {
+                    TensorShape ts;
+                    ts.dims = ref.shape;
+                    ts.inferred = true;
+                    ts.source_op = op.id;
+                    mTensorShapes[op.outputs[i]] = ts;
+                }
             }
 
             compiled.outputs.push_back(std::move(ref));

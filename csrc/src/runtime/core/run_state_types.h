@@ -82,7 +82,8 @@ struct SimplifiedLayerQuantActivations {
  */
 struct SimplifiedLayerGradients {
     Tensor d_res_ffn;   ///< (B, T, C) gradient w.r.t. (residual_att + mlp_down)
-    Tensor d_res_att;   ///< (B, T, C) gradient w.r.t. residual input to attention (and att_out)
+    Tensor d_res_att;   ///< (B, T, C) gradient w.r.t. residual input to attention
+    Tensor d_att_out;   ///< (B, T, C) gradient w.r.t. attention output projection (O-proj output)
     Tensor d_ln2;       ///< (B, T, C) gradient w.r.t. LN2 output
     Tensor d_mlp_up;    ///< (B, T, 2*D) gradient w.r.t. MLP up (gate+up) output
     Tensor d_swiglu;    ///< (B, T, D) gradient w.r.t. SwiGLU output

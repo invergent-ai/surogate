@@ -65,7 +65,7 @@ Tensor* resolve_block_activation_tensor(ExecState& st, const std::string& name, 
     if (field == "mlp_up" || field == "mlp_up_flat") return map_tensor(acts.mlp_up);
     if (field == "swiglu") return map_tensor(acts.swiglu);
     if (field == "mlp_down" || field == "mlp_down_flat") return map_tensor(acts.mlp_down);
-    if (field == "res_ffn") {
+    if (field == "res_ffn" || field == "res_in") {
         Tensor& res = st.rs.get_residual(layer_idx, st.rs.MainStream);
         return map_tensor(res);
     }
@@ -92,7 +92,7 @@ Tensor* block_activation_base_ptr(DslRunState& rs, int layer_idx, const std::str
     if (field == "mlp_up" || field == "mlp_up_flat") return &acts.mlp_up;
     if (field == "swiglu") return &acts.swiglu;
     if (field == "mlp_down" || field == "mlp_down_flat") return &acts.mlp_down;
-    if (field == "res_ffn") {
+    if (field == "res_ffn" || field == "res_in") {
         return &rs.get_residual(layer_idx, rs.MainStream);
     }
     return nullptr;
@@ -166,7 +166,7 @@ Tensor* resolve_block_activation_base(ExecState& st, const std::string& name) {
     if (field == "mlp_up" || field == "mlp_up_flat") return map_tensor(acts.mlp_up);
     if (field == "swiglu") return map_tensor(acts.swiglu);
     if (field == "mlp_down" || field == "mlp_down_flat") return map_tensor(acts.mlp_down);
-    if (field == "res_ffn") {
+    if (field == "res_ffn" || field == "res_in") {
         Tensor& res = st.rs.get_residual(layer_idx, st.rs.MainStream);
         return map_tensor(res);
     }
@@ -209,8 +209,11 @@ Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ET
     }
     if (field == "att" || field == "att_flat") return map_tensor(grads.d_att);
     if (field == "att_out" || field == "att_out_flat") {
-        // att_out gradient shares storage with residual-att gradient (res_att = res_ffn + att_out)
-        return map_tensor(grads.d_res_att);
+        // Separate storage: d_att_out is the gradient of the O-proj output,
+        // d_res_att is the gradient of the residual input to the block.
+        // In standard transformers (res_att = x + att_out) they're equal;
+        // in hybrid architectures (Nemotron-H) they're independent.
+        return map_tensor(grads.d_att_out);
     }
     if (field == "swiglu") {
         return map_tensor(grads.d_swiglu);
@@ -223,7 +226,7 @@ Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ET
     }
     if (field == "ln2" || field == "ln2_flat") return map_tensor(grads.d_ln2);
     if (field == "res_att") return map_tensor(grads.d_res_att);
-    if (field == "res_ffn") return map_tensor(grads.d_res_ffn);
+    if (field == "res_ffn" || field == "res_in") return map_tensor(grads.d_res_ffn);
 
     return nullptr;
 }

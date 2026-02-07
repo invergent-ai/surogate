@@ -170,15 +170,29 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     const bool is_qkv_op = op.attrs.matmul_op.has_value() &&
         (*op.attrs.matmul_op == modules::MatmulOp::QKV);
 
-    // Now allocate output tensors - skip dB if weights are frozen
+    // Now allocate output tensors - skip dB if weights are frozen.
+    // For backward ops, compiled shapes of saved-tensor-derived outputs may be empty
+    // (backward compiler can't track saved tensor shapes). Derive from runtime inputs.
+    auto ensure_backward_output = [&](const TensorRef& ref, const Tensor& shape_source) -> Tensor& {
+        if (ref.shape.empty() && shape_source.Rank > 0) {
+            std::vector<long> shape(shape_source.Sizes.begin(), shape_source.Sizes.begin() + shape_source.Rank);
+            Tensor t = mRunState.temp_alloc(shape_source.DType, shape);
+            fill_zero(t, mRunState.MainStream);
+            mTemps.push_back(t);
+            auto [it, _] = mTensorMap.insert_or_assign(ref.name, t);
+            return it->second;
+        }
+        return ensure_output_tensor(ref);
+    };
+
     Tensor* dA_ptr = nullptr;
     Tensor* dB_ptr = nullptr;
 
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
-        dA_ptr = &ensure_output_tensor(op.outputs[0]);
+        dA_ptr = &ensure_backward_output(op.outputs[0], a);
     }
     if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        dB_ptr = &ensure_output_tensor(op.outputs[1]);
+        dB_ptr = &ensure_backward_output(op.outputs[1], b);
     }
 
     if (!dA_ptr && !dB_ptr) {
@@ -389,6 +403,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             std::byte* d_res_ffn{nullptr};
             std::byte* d_mlp_up{nullptr};
             std::byte* d_res_att{nullptr};
+            std::byte* d_att_out{nullptr};
             std::byte* d_qkv{nullptr};
         } prev{};
 
@@ -401,6 +416,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             prev.d_res_ffn = reinterpret_cast<std::byte*>(grads.d_res_ffn.Data);
             prev.d_mlp_up = reinterpret_cast<std::byte*>(grads.d_mlp_up.Data);
             prev.d_res_att = reinterpret_cast<std::byte*>(grads.d_res_att.Data);
+            prev.d_att_out = reinterpret_cast<std::byte*>(grads.d_att_out.Data);
             prev.d_qkv = reinterpret_cast<std::byte*>(grads.d_qkv.Data);
 
             if (dA_ptr) {
@@ -430,7 +446,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     grads.d_mlp_up.Data = d_out.Data;
                     break;
                 case modules::MatmulOp::AttnOut:
-                    grads.d_res_att.Data = d_out.Data;
+                    grads.d_att_out.Data = d_out.Data;
                     break;
                 case modules::MatmulOp::QKV:
                     grads.d_qkv.Data = d_out.Data;
@@ -466,6 +482,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             grads.d_res_ffn.Data = prev.d_res_ffn;
             grads.d_mlp_up.Data = prev.d_mlp_up;
             grads.d_res_att.Data = prev.d_res_att;
+            grads.d_att_out.Data = prev.d_att_out;
             grads.d_qkv.Data = prev.d_qkv;
         }
     }

@@ -76,8 +76,8 @@ class NemotronHMamba2Block:
         self.P = self.projection_size
         self.D_conv = self.conv_dim
 
-    # Pre-block normalization
-    norm_weight = Param(Tensor["C"])
+    # Pre-block normalization (never quantized)
+    norm_weight = Param(Tensor["C"], quantizable=False)
 
     # Input projection
     in_proj_weight = Param(Tensor["P", "C"])
@@ -85,15 +85,16 @@ class NemotronHMamba2Block:
 
     # Convolution
     conv_weight = Param(Tensor["D_conv", "K"])
-    conv_bias = Param(Tensor["D_conv"], when="use_conv_bias")
+    conv_bias = Param(Tensor["D_conv"], when="use_conv_bias", quantizable=False)
 
-    # SSM parameters
-    A_log = Param(Tensor["H"], frozen=False)  # Log of state decay
-    D_param = Param(Tensor["H"])              # Skip connection
-    dt_bias = Param(Tensor["H"])              # Time step bias
+    # SSM parameters (must be FP32 — C++ kernels use .get<float>())
+    # Never quantized: tiny 1D tensors where quantization error is fatal
+    A_log = Param(Tensor["H", "fp32"], frozen=False, quantizable=False)
+    D_param = Param(Tensor["H", "fp32"], quantizable=False)
+    dt_bias = Param(Tensor["H", "fp32"], quantizable=False)
 
-    # Gated RMSNorm
-    gated_norm_weight = Param(Tensor["I"])
+    # Gated RMSNorm (never quantized — 1D norm weight)
+    gated_norm_weight = Param(Tensor["I"], quantizable=False)
 
     # Output projection
     out_proj_weight = Param(Tensor["C", "I"])
@@ -285,6 +286,8 @@ class NemotronHMamba2Block:
                 conv_out,
                 intermediate_size=self.intermediate_size,
                 groups_state_size=self.n_groups * self.ssm_state_size,
+                n_groups=self.n_groups,
+                ssm_state_size=self.ssm_state_size,
                 hidden_name="hidden_states",
                 B_name="ssm_B",
                 C_name="ssm_C",
@@ -303,6 +306,10 @@ class NemotronHMamba2Block:
                 dt_min=self.dt_min,
                 dt_max=self.dt_max,
                 chunk_size=self.chunk_size,
+                num_heads=self.mamba_num_heads,
+                head_dim=self.mamba_head_dim,
+                ssm_state_size=self.ssm_state_size,
+                n_groups=self.n_groups,
                 out_name="ssm_out",
                 state_name="ssm_state",
             )
@@ -314,7 +321,7 @@ class NemotronHMamba2Block:
             gated_out = g.mamba_gated_rmsnorm(
                 ssm_out_flat, gate, "gated_norm_weight",
                 eps=self.eps,
-                group_size=self.intermediate_size // self.n_groups,
+                n_groups=self.n_groups,
                 out_name="gated_out",
             )
 
@@ -370,8 +377,8 @@ class NemotronHAttentionBlock:
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_dim
         self.AttnDim = num_query_heads * head_dim
 
-    # Pre-block normalization
-    norm_weight = Param(Tensor["C"])
+    # Pre-block normalization (never quantized)
+    norm_weight = Param(Tensor["C"], quantizable=False)
 
     # Attention weights
     qkv_weight = Param(Tensor["QKV", "C"])
@@ -383,16 +390,18 @@ class NemotronHAttentionBlock:
     # =========================================================================
     # Activation slots
     # =========================================================================
+    # NOTE: Use standard names (ln1, ln1_rstd, res_att) so the LoRA backward
+    # hooks can find them via simplified_acts/simplified_grads fields.
 
-    ln = Activation(
+    ln1 = Activation(
         Tensor["B", "T", "C"],
         recompute=True,
-        recompute_from=["res_in", "ln_rstd", "@param:norm_weight"],
+        recompute_from=["res_att", "ln1_rstd", "@param:norm_weight"],
         recompute_op="rmsnorm_apply_saved",
         recompute_policy="always",
         share_policy="when_recomputed",
     )
-    ln_rstd = Activation(
+    ln1_rstd = Activation(
         Tensor["B", "T"], dtype="fp32", save=True,
         share_policy="per_layer",
     )
@@ -401,7 +410,7 @@ class NemotronHAttentionBlock:
         Tensor["B", "T", "QKV"],
         save=True,
         recompute=True,
-        recompute_from=["ln", "@param:qkv_weight", "?@param:qkv_bias"],
+        recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
         recompute_op="matmul",
         recompute_attrs={"transpose": "NT"},
         recompute_policy="fft_only",
@@ -440,6 +449,7 @@ class NemotronHAttentionBlock:
     )
     att_out = Activation(
         Tensor["B", "T", "C"],
+        aliases=["att_out_flat"],
         recompute=True,
         recompute_from=["att", "@param:out_weight"],
         recompute_op="matmul",
@@ -449,11 +459,7 @@ class NemotronHAttentionBlock:
         share_policy="fft_share",
     )
 
-    out = Activation(
-        Tensor["B", "T", "C"],
-        share_policy="per_layer",
-    )
-    res_in = Activation(
+    res_att = Activation(
         Tensor["B", "T", "C"],
         share_policy="per_layer",
     )
@@ -462,13 +468,12 @@ class NemotronHAttentionBlock:
     # Gradient slots
     # =========================================================================
 
-    d_ln = Gradient(Tensor["B", "T", "C"], gradient_of="ln")
+    d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
     d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
     d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope")
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_att_out = Gradient(Tensor["B", "T", "C"], gradient_of="att_out")
-    d_out = Gradient(Tensor["B", "T", "C"], gradient_of="out")
-    d_res_in = Gradient(Tensor["B", "T", "C"], gradient_of="res_in")
+    d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
 
     @forward
     def forward(
@@ -480,19 +485,19 @@ class NemotronHAttentionBlock:
         """Forward pass. Returns (output, residual_out)."""
         with graph() as g:
             # Fused residual + RMSNorm
-            res_in, ln, ln_rstd = g.fused_residual_rmsnorm(
+            res_att, ln1, ln1_rstd = g.fused_residual_rmsnorm(
                 residual, x, "norm_weight", eps=self.eps,
-                res_out_name="res_in",
-                y_name="ln",
-                rstd_name="ln_rstd",
+                res_out_name="res_att",
+                y_name="ln1",
+                rstd_name="ln1_rstd",
             )
 
             # QKV projection
-            ln_flat = g.view(ln, shape=[B * T, self.C])
+            ln1_flat = g.view(ln1, shape=[B * T, self.C])
             if self.attention_bias:
-                qkv_flat = g.matmul_bias(ln_flat, "qkv_weight", "qkv_bias", transpose="NT")
+                qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT")
             else:
-                qkv_flat = g.matmul(ln_flat, "qkv_weight", transpose="NT")
+                qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
             qkv = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D], out_name="qkv")
 
             # RoPE
@@ -504,12 +509,12 @@ class NemotronHAttentionBlock:
             # Output projection
             att_flat = g.view(att, shape=[B * T, self.AttnDim])
             if self.attention_bias:
-                out_flat = g.matmul_bias(att_flat, "out_weight", "out_bias", transpose="NT")
+                att_out_flat = g.matmul_bias(att_flat, "out_weight", "out_bias", transpose="NT")
             else:
-                out_flat = g.matmul(att_flat, "out_weight", transpose="NT")
-            out = g.view(out_flat, shape=[B, T, self.C], out_name="out")
+                att_out_flat = g.matmul(att_flat, "out_weight", transpose="NT")
+            att_out = g.view(att_out_flat, shape=[B, T, self.C], out_name="att_out")
 
-            return out, res_in
+            return att_out, res_att
 
 
 @block
@@ -545,8 +550,8 @@ class NemotronHMLPBlock:
         self.C = d_model
         self.M = d_ff
 
-    # Pre-block normalization
-    norm_weight = Param(Tensor["C"])
+    # Pre-block normalization (never quantized)
+    norm_weight = Param(Tensor["C"], quantizable=False)
 
     # MLP weights
     up_weight = Param(Tensor["M", "C"])
@@ -687,6 +692,7 @@ class NemotronHMoEBlock:
         mlp_bias: bool = False,
         activation: str = "relu2",
         norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
     ):
         self.d_model = d_model
         self.moe_intermediate_size = moe_intermediate_size
@@ -698,6 +704,7 @@ class NemotronHMoEBlock:
         self.mlp_bias = mlp_bias
         self.activation = activation
         self.norm_topk_prob = norm_topk_prob
+        self.routed_scaling_factor = routed_scaling_factor
 
         # Dimension aliases for Param shape annotations
         # Set to actual integer values for DSL shape resolution
@@ -707,8 +714,8 @@ class NemotronHMoEBlock:
         self.K = num_experts_per_tok
         self.SharedM = shared_expert_intermediate_size if shared_expert_intermediate_size > 0 else moe_intermediate_size
 
-    # Pre-block normalization
-    norm_weight = Param(Tensor["C"])
+    # Pre-block normalization (never quantized)
+    norm_weight = Param(Tensor["C"], quantizable=False)
 
     # Router
     router_weight = Param(Tensor["E", "C"])
@@ -788,9 +795,10 @@ class NemotronHMoEBlock:
             # Nemotron-H uses sigmoid routing
             router_probs = g.moe_sigmoid(router_logits, out_name="router_probs")
 
-            # Top-k selection
+            # Top-k selection with optional scaling factor
             routing_weights, routing_indices = g.moe_topk(
                 router_probs, top_k=self.num_experts_per_tok, normalize=self.norm_topk_prob,
+                scaling_factor=self.routed_scaling_factor,
                 weights_name="routing_weights", indices_name="routing_indices",
             )
 
@@ -829,7 +837,7 @@ class NemotronHMoEBlock:
                 else:
                     shared_act = g.silu(shared_up_out, out_name="shared_act")
                 shared_out = g.matmul(shared_act, "shared_expert_down", transpose="NT", out_name="shared_out")
-                moe_out = g.add(moe_out, shared_out, out_name="moe_out")
+                moe_out = g.add(moe_out, shared_out, out_name="moe_combined")
 
             # Reshape back
             out = g.view(moe_out, shape=[B, T, self.C], out_name="out")

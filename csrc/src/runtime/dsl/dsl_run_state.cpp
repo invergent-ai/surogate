@@ -435,6 +435,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
         }
         mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
+        mSharedDAttOut = mAllocator->allocate(dtype, "d_att_out_shared", kind, {B, T, C});
         mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
         mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
         mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
@@ -448,6 +449,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         g.d_res_ffn = share_res_ffn ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
                                     : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
         g.d_res_att = share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
+        g.d_att_out = share_grads ? mSharedDAttOut : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C});
         g.d_ln2 = share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
         if (large_bwd_temps_on_stack) {
@@ -482,6 +484,7 @@ void DslRunState::reset_simplified_gradients() {
 
         dst.d_res_ffn.Data = src.d_res_ffn.Data;
         dst.d_res_att.Data = src.d_res_att.Data;
+        dst.d_att_out.Data = src.d_att_out.Data;
         dst.d_ln2.Data = src.d_ln2.Data;
         dst.d_mlp_up.Data = src.d_mlp_up.Data;
         dst.d_swiglu.Data = src.d_swiglu.Data;
@@ -518,6 +521,7 @@ void DslRunState::zero_activation_gradients(cudaStream_t stream) {
         auto& g = mSimplifiedGradients[i];
         if (i < mSimplifiedGradients.size() - 1 && g.d_res_ffn.Data) fill_zero(g.d_res_ffn, stream);
         if (g.d_res_att.Data) fill_zero(g.d_res_att, stream);
+        if (g.d_att_out.Data) fill_zero(g.d_att_out, stream);
     }
 }
 
@@ -561,6 +565,7 @@ void DslRunState::build_activation_grad_zero_segments() {
         // Other activation gradients are expected to be overwritten (beta=0 / memcpy) within
         // the backward graph and don't need blanket zeroing.
         add(g.d_res_att);
+        add(g.d_att_out);
     }
 
     mActGradZeroCount = static_cast<int>(ptrs.size());

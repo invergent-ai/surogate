@@ -692,6 +692,58 @@ def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any])
         pass
 
 
+def _expand_hybrid_hf_mappings(ir: "ModuleIR", block_types: list, block_mappings: dict) -> None:
+    """Expand template-based HF mappings for hybrid models with physical layer indices.
+
+    In hybrid models, all blocks use ``blocks[N]`` with physical layer indices.
+    This function generates per-param HF mapping entries by looking up the block
+    type for each physical layer and applying the corresponding HF mapping template.
+    """
+
+    def _replace_layer(spec, phys: int):
+        """Replace {layer} in a serialized HF mapping spec."""
+        s = str(phys)
+        if isinstance(spec, str):
+            return spec.replace("{layer}", s)
+        if isinstance(spec, dict):
+            out = {}
+            for k, v in spec.items():
+                if isinstance(v, str):
+                    out[k] = v.replace("{layer}", s)
+                elif isinstance(v, list):
+                    out[k] = [x.replace("{layer}", s) if isinstance(x, str) else x for x in v]
+                else:
+                    out[k] = v
+            return out
+        return spec
+
+    if not ir.forward_graph:
+        return
+
+    for param_name in ir.forward_graph.params:
+        dot = param_name.find(".")
+        if dot < 0:
+            continue
+        prefix_part = param_name[:dot]
+        field = param_name[dot + 1:]
+        # Match blocks[N]
+        if not prefix_part.startswith("blocks["):
+            continue
+        close = prefix_part.find("]")
+        if close < 0:
+            continue
+        try:
+            phys_layer = int(prefix_part[7:close])
+        except ValueError:
+            continue
+        if phys_layer < 0 or phys_layer >= len(block_types):
+            continue
+        if field not in block_mappings:
+            continue
+        serialized = _serialize_hf_spec(block_mappings[field])
+        ir.hf_weight_mapping[param_name] = _replace_layer(serialized, phys_layer)
+
+
 def _inline_stacked_blocks(
     graph: GraphIR,
     model_spec: ModelSpec,
@@ -832,10 +884,19 @@ def _inline_stacked_blocks(
                 if layer_idx == int(n_layers) - 1:
                     layer_outputs = list(node.outputs)
                 else:
-                    layer_outputs = [f"layer{layer_idx}.{name}" for name in block_outputs]
+                    # Residual outputs need blocks[N].* prefix so the C++ residual
+                    # manager intercepts them.  Non-residual outputs (hidden state)
+                    # use a neutral name to avoid the block-activation resolver.
+                    layer_outputs = [
+                        f"blocks[{layer_idx}].{name}"
+                        if name in ("res_in", "res_ffn", "res_att")
+                        else f"layer{layer_idx}.{name}"
+                        for name in block_outputs
+                    ]
 
-                # Build name mapping
-                prefix = f"{blocks_param}[{block_idx}]."
+                # Build name mapping — use physical layer index with uniform "blocks[N]"
+                # prefix so the C++ parse_block_param (which expects "blocks[N]") works.
+                prefix = f"blocks[{layer_idx}]."
                 mapping: Dict[str, str] = {}
 
                 # Map block inputs to current layer inputs (handle mismatched counts)
@@ -1255,10 +1316,15 @@ def compile_model_spec(
             # These are attributes that exist on the instance but not in config.
             # Also capture important string attributes like hybrid_pattern for runtime config.
             _important_string_attrs = {"hybrid_pattern", "mlp_activation", "activation"}
+            _important_float_attrs = {"routed_scaling_factor"}
             for attr_name in dir(instance):
                 if attr_name.startswith("_"):
                     continue
-                if attr_name in config:
+                # Always re-capture important string/float attrs from the instance —
+                # __init__ may translate/transform the raw HF value (e.g.
+                # hybrid_pattern: Nemotron '*'/'-' → standard 'A'/'P').
+                _force_recapture = _important_string_attrs | _important_float_attrs
+                if attr_name in config and attr_name not in _force_recapture:
                     continue
                 try:
                     attr_val = getattr(instance, attr_name)
@@ -1267,6 +1333,9 @@ def compile_model_spec(
                         config[attr_name] = attr_val
                     # Also capture important string attributes for runtime config
                     elif isinstance(attr_val, str) and attr_name in _important_string_attrs:
+                        config[attr_name] = attr_val
+                    # Capture important float attributes for runtime config
+                    elif isinstance(attr_val, float) and attr_name in _important_float_attrs:
                         config[attr_name] = attr_val
                 except Exception:
                     pass
@@ -1317,6 +1386,13 @@ def compile_model_spec(
             # Expand StackedBlocks into per-layer block graphs
             graph = _inline_stacked_blocks(graph, spec, config, warnings=warnings)
             ir.forward_graph = graph
+
+            # For hybrid models, expand block-level HF mappings with physical layer
+            # indices so the C++ weight loader resolves typed block indices correctly.
+            if (instance and hasattr(instance, "block_types") and
+                    spec.python_class and hasattr(spec.python_class, "_hf_block_mappings_")):
+                _expand_hybrid_hf_mappings(
+                    ir, instance.block_types, spec.python_class._hf_block_mappings_)
 
     # Save/recompute
     if spec.forward:

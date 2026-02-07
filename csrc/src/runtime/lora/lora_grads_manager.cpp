@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include "kernels/kernels.h"
+#include "runtime/core/model_config.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 
@@ -67,25 +68,47 @@ void ModularLoRAGradsManager::allocate_gradients() {
         auto& full = mFullGrads.blocks[l];
         auto& shard = mShardedGrads.blocks[l];
 
-        if (mConfig.lora_config.applies_to_q()) {
-            full.attention.q = alloc_full(C, q_out, prefix + "_q");
-            shard.attention.q = alloc_shard(C, q_out, prefix + "_q_shard");
-        }
-        if (mConfig.lora_config.applies_to_k()) {
-            full.attention.k = alloc_full(C, kv_out, prefix + "_k");
-            shard.attention.k = alloc_shard(C, kv_out, prefix + "_k_shard");
-        }
-        if (mConfig.lora_config.applies_to_v()) {
-            full.attention.v = alloc_full(C, kv_out, prefix + "_v");
-            shard.attention.v = alloc_shard(C, kv_out, prefix + "_v_shard");
-        }
-        if (mConfig.lora_config.applies_to_o()) {
-            full.attention.o = alloc_full(q_out, C, prefix + "_o");
-            shard.attention.o = alloc_shard(q_out, C, prefix + "_o_shard");
+        // Determine block type for this layer (hybrid-aware)
+        BlockType bt = BlockType::Dense;
+        bool is_hybrid = false;
+        if (mConfig.model_config) {
+            bt = mConfig.model_config->get_block_type(l);
+            is_hybrid = (mConfig.model_config->architecture == ArchitectureType::Hybrid);
         }
 
-        // MLP LoRA gradients
-        if (mConfig.is_moe && E > 0) {
+        // Attention LoRA grads: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
+        // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
+        const bool has_attention = (bt == BlockType::Dense || bt == BlockType::Attention ||
+                                   ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
+        if (has_attention) {
+            if (mConfig.lora_config.applies_to_q()) {
+                full.attention.q = alloc_full(C, q_out, prefix + "_q");
+                shard.attention.q = alloc_shard(C, q_out, prefix + "_q_shard");
+            }
+            if (mConfig.lora_config.applies_to_k()) {
+                full.attention.k = alloc_full(C, kv_out, prefix + "_k");
+                shard.attention.k = alloc_shard(C, kv_out, prefix + "_k_shard");
+            }
+            if (mConfig.lora_config.applies_to_v()) {
+                full.attention.v = alloc_full(C, kv_out, prefix + "_v");
+                shard.attention.v = alloc_shard(C, kv_out, prefix + "_v_shard");
+            }
+            if (mConfig.lora_config.applies_to_o()) {
+                full.attention.o = alloc_full(q_out, C, prefix + "_o");
+                shard.attention.o = alloc_shard(q_out, C, prefix + "_o_shard");
+            }
+        }
+
+        // MoE LoRA grads: only for non-hybrid MoE block types or Dense blocks in global MoE models.
+        // Hybrid MoE blocks skip MoE LoRA — no backward hooks exist for MoE grouped GEMM
+        // in the DSL compiled executor.
+        const bool layer_is_moe = !is_hybrid &&
+                                   ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
+                                    (bt == BlockType::Dense && mConfig.is_moe));
+        const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
+                                         (bt == BlockType::Dense && !mConfig.is_moe);
+
+        if (layer_is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
                                        mConfig.lora_config.applies_to_up() ||
                                        mConfig.lora_config.applies_to_down();
@@ -108,14 +131,11 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 }
             }
 
-            // Router LoRA gradients (when train_router is enabled)
-            // Router shape: (hidden_size -> num_experts), so lora_A: (r, C), lora_B: (E, r)
             if (mConfig.train_router) {
                 full.router = alloc_full(C, E, prefix + "_router");
                 shard.router = alloc_shard(C, E, prefix + "_router_shard");
             }
-        } else {
-            // Dense MLP LoRA gradients
+        } else if (layer_is_dense_mlp) {
             if (mConfig.lora_config.applies_to_gate()) {
                 full.mlp.gate = alloc_full(C, D, prefix + "_gate");
                 shard.mlp.gate = alloc_shard(C, D, prefix + "_gate_shard");
@@ -129,6 +149,7 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 shard.mlp.down = alloc_shard(D, C, prefix + "_down_shard");
             }
         }
+        // Mamba blocks: no LoRA grads allocated
     }
 }
 

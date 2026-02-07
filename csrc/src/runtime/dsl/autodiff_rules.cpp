@@ -842,7 +842,7 @@ std::vector<Operation> moe_topk_backward(const BackwardRuleContext& ctx) {
         std::string probs = fwd.inputs[0];
         std::string indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "indices";
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor"});
 
         ops.push_back(make_operation(
             "moe_topk_backward_" + std::to_string(ctx.op_counter++),
@@ -1138,7 +1138,8 @@ std::vector<Operation> mamba_ssm_scan_backward(const BackwardRuleContext& ctx) {
         outputs.push_back(ctx.d_inputs[6]);  // ddelta_bias
     }
 
-    AttrMap attrs = copy_attrs(fwd.attrs, {"mamba_num_heads", "mamba_head_dim", "chunk_size"});
+    AttrMap attrs = copy_attrs(fwd.attrs, {"num_heads", "head_dim", "chunk_size",
+                                           "ssm_state_size", "n_groups", "intermediate_size"});
 
     ops.push_back(make_operation(
         "mamba_ssm_scan_backward_" + std::to_string(ctx.op_counter++),

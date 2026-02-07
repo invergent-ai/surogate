@@ -20,6 +20,9 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"ln1", TensorSlot::BlockLN1},
     {"ln1_flat", TensorSlot::BlockLN1},
     {"ln1_rstd", TensorSlot::BlockLN1RSTD},
+    {"ln", TensorSlot::BlockLN1},            // Alias for single-norm blocks (Mamba, MLP)
+    {"ln_flat", TensorSlot::BlockLN1},        // Alias for single-norm blocks
+    {"ln_rstd", TensorSlot::BlockLN1RSTD},   // Alias for single-norm blocks
     {"ln2", TensorSlot::BlockLN2},
     {"ln2_flat", TensorSlot::BlockLN2},
     {"ln2_rstd", TensorSlot::BlockLN2RSTD},
@@ -45,8 +48,10 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"mlp_down_flat", TensorSlot::BlockMLPDown},
     {"res_ffn", TensorSlot::BlockResidualFFN},
     {"residual_ffn", TensorSlot::BlockResidualFFN},
+    {"res_in", TensorSlot::BlockResidualFFN},
     // Block gradients
     {"d_ln1", TensorSlot::BlockDLN1},
+    {"d_ln", TensorSlot::BlockDLN1},           // Alias for single-norm blocks (Mamba, MLP)
     {"d_qkv", TensorSlot::BlockDQKV},
     {"d_qkv_rope", TensorSlot::BlockDQKV},
     {"d_qkv_rope_flat", TensorSlot::BlockDQKV},
@@ -56,7 +61,10 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"d_mlp_down", TensorSlot::BlockDMLPDown},
     {"d_ln2", TensorSlot::BlockDLN2},
     {"d_res_att", TensorSlot::BlockDResAtt},
+    {"d_att_out", TensorSlot::BlockDAttOut},
+    {"d_att_out_flat", TensorSlot::BlockDAttOut},
     {"d_res_ffn", TensorSlot::BlockDResFFN},
+    {"d_res_in", TensorSlot::BlockDResFFN},
     // Global activations
     {"encoded", TensorSlot::Encoded},
     {"x0", TensorSlot::Encoded},
@@ -103,6 +111,7 @@ const char* slot_to_name(TensorSlot slot) {
         case TensorSlot::BlockDMLPDown: return "d_mlp_down";
         case TensorSlot::BlockDLN2: return "d_ln2";
         case TensorSlot::BlockDResAtt: return "d_res_att";
+        case TensorSlot::BlockDAttOut: return "d_att_out";
         case TensorSlot::BlockDResFFN: return "d_res_ffn";
         case TensorSlot::Encoded: return "encoded";
         case TensorSlot::LNFinal: return "ln_final";

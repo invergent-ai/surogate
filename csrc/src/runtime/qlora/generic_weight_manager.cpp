@@ -148,6 +148,39 @@ void GenericWeightManager::register_weight(
     // Allocate quantized storage via IQuantizer (uses flat M*K element count)
     mQuantizer->allocate_storage(M, K, entry.quantized, *mAllocator, alloc_type, name);
 
+    // For 3D expert weights with BnB double quantization, the group-level
+    // meta/meta2 allocation may be too small. allocate_storage computes
+    // groups = ceil(total_blocks / group_size), but per-expert slicing needs
+    // E * ceil(blocks_per_expert / group_size). These differ when
+    // blocks_per_expert is not divisible by group_size.
+    if (shape.size() == 3 && entry.quantized.double_quant &&
+        !entry.quantized.meta.is_null()) {
+        const int E = static_cast<int>(shape[0]);
+        const int per_expert_M_val = static_cast<int>(shape[1]);
+        const long per_expert_elems = static_cast<long>(per_expert_M_val) * K;
+        const long blocks_per_expert = (per_expert_elems + entry.quantized.block_size - 1)
+                                     / entry.quantized.block_size;
+        const long groups_per_expert = (blocks_per_expert + entry.quantized.double_quant_group_size - 1)
+                                     / entry.quantized.double_quant_group_size;
+        const long required_groups = static_cast<long>(E) * groups_per_expert;
+
+        if (required_groups > entry.quantized.meta.nelem()) {
+            // Reallocate with expert-aligned group count. The original
+            // (slightly too small) allocation is wasted but harmless since
+            // TensorAllocator is a bump allocator with no deallocation.
+            entry.quantized.meta = mAllocator->allocate(
+                ETensorDType::FP32,
+                fmt::format("{}.absmax_scale", name).c_str(),
+                alloc_type,
+                {required_groups});
+            entry.quantized.meta2 = mAllocator->allocate(
+                ETensorDType::FP32,
+                fmt::format("{}.absmax_offset", name).c_str(),
+                alloc_type,
+                {required_groups});
+        }
+    }
+
     // Allocate dequant buffer: pre-allocate in unlimited mode, defer in pooled mode.
     // Use the full shape if provided (e.g., [E, M, K] for 3D expert weights).
     if (!is_pooled()) {
@@ -275,7 +308,10 @@ void GenericWeightManager::quantize_expert_slice(
         full.data.DType,
         std::vector<long>{data_elems_per_expert});
 
-    // Scales slice
+    // Scales slice: for BnB double-quant these are INT8 absmax (one per block),
+    // for non-double-quant these are FP32 absmax. Either way, blocks divide
+    // evenly by num_experts (verified by the alignment check above).
+    const long blocks_per_expert = (per_expert_elems + full.block_size - 1) / full.block_size;
     const long scales_per_expert = full.scales.nelem() / num_experts;
     const size_t scales_bytes_per_expert = full.scales.bytes() / num_experts;
     view.scales = Tensor::from_pointer(
@@ -284,26 +320,32 @@ void GenericWeightManager::quantize_expert_slice(
         full.scales.DType,
         std::vector<long>{scales_per_expert});
 
+    // For double-quant meta/meta2 (group-level scale/offset), compute per-expert
+    // group count from per-expert block count. We cannot simply divide the total
+    // group count by num_experts because ceil(total_blocks / group_size) may be
+    // less than num_experts * ceil(blocks_per_expert / group_size).
+    const long groups_per_expert = full.double_quant
+        ? (blocks_per_expert + full.double_quant_group_size - 1) / full.double_quant_group_size
+        : 0;
+
     // Meta slice (if present, for double quantization)
     if (!full.meta.is_null()) {
-        const long meta_per_expert = full.meta.nelem() / num_experts;
-        const size_t meta_bytes_per_expert = full.meta.bytes() / num_experts;
+        const size_t meta_elem_bytes = full.meta.bytes() / full.meta.nelem();
         view.meta = Tensor::from_pointer(
-            static_cast<std::byte*>(full.meta.Data) + expert_idx * meta_bytes_per_expert,
+            static_cast<std::byte*>(full.meta.Data) + expert_idx * groups_per_expert * meta_elem_bytes,
             full.meta.Device,
             full.meta.DType,
-            std::vector<long>{meta_per_expert});
+            std::vector<long>{groups_per_expert});
     }
 
     // Meta2 slice (if present, for double quantization)
     if (!full.meta2.is_null()) {
-        const long meta2_per_expert = full.meta2.nelem() / num_experts;
-        const size_t meta2_bytes_per_expert = full.meta2.bytes() / num_experts;
+        const size_t meta2_elem_bytes = full.meta2.bytes() / full.meta2.nelem();
         view.meta2 = Tensor::from_pointer(
-            static_cast<std::byte*>(full.meta2.Data) + expert_idx * meta2_bytes_per_expert,
+            static_cast<std::byte*>(full.meta2.Data) + expert_idx * groups_per_expert * meta2_elem_bytes,
             full.meta2.Device,
             full.meta2.DType,
-            std::vector<long>{meta2_per_expert});
+            std::vector<long>{groups_per_expert});
     }
 
     // Quantize the single expert into the sub-view

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <fmt/format.h>
 #include "kernels/kernels.h"
+#include "runtime/core/model_config.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 #include "utilities/safetensors.h"
@@ -65,29 +66,52 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
 
     const std::string prefix = fmt::format("lora_layer_{}", layer_idx);
 
-    if (mConfig.lora_config.applies_to_q()) {
-        master.attention.q.emplace();
-        work.attention.q.emplace();
-        allocate_layer_weights(*master.attention.q, *work.attention.q, /*in=*/C, /*out=*/q_out, prefix + "_q");
-    }
-    if (mConfig.lora_config.applies_to_k()) {
-        master.attention.k.emplace();
-        work.attention.k.emplace();
-        allocate_layer_weights(*master.attention.k, *work.attention.k, /*in=*/C, /*out=*/kv_out, prefix + "_k");
-    }
-    if (mConfig.lora_config.applies_to_v()) {
-        master.attention.v.emplace();
-        work.attention.v.emplace();
-        allocate_layer_weights(*master.attention.v, *work.attention.v, /*in=*/C, /*out=*/kv_out, prefix + "_v");
-    }
-    if (mConfig.lora_config.applies_to_o()) {
-        master.attention.o.emplace();
-        work.attention.o.emplace();
-        allocate_layer_weights(*master.attention.o, *work.attention.o, /*in=*/q_out, /*out=*/C, prefix + "_o");
+    // Determine block type for this layer (hybrid-aware)
+    BlockType bt = BlockType::Dense;  // default: allocate everything
+    bool is_hybrid = false;
+    if (mConfig.model_config) {
+        bt = mConfig.model_config->get_block_type(layer_idx);
+        is_hybrid = (mConfig.model_config->architecture == ArchitectureType::Hybrid);
     }
 
-    // MLP LoRA: For dense models, use standard MLP LoRA. For MoE models, use per-expert LoRA.
-    if (mConfig.is_moe && mConfig.num_experts > 0) {
+    // Attention LoRA: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
+    // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
+    const bool has_attention = (bt == BlockType::Dense || bt == BlockType::Attention ||
+                               ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
+    if (has_attention) {
+        if (mConfig.lora_config.applies_to_q()) {
+            master.attention.q.emplace();
+            work.attention.q.emplace();
+            allocate_layer_weights(*master.attention.q, *work.attention.q, /*in=*/C, /*out=*/q_out, prefix + "_q");
+        }
+        if (mConfig.lora_config.applies_to_k()) {
+            master.attention.k.emplace();
+            work.attention.k.emplace();
+            allocate_layer_weights(*master.attention.k, *work.attention.k, /*in=*/C, /*out=*/kv_out, prefix + "_k");
+        }
+        if (mConfig.lora_config.applies_to_v()) {
+            master.attention.v.emplace();
+            work.attention.v.emplace();
+            allocate_layer_weights(*master.attention.v, *work.attention.v, /*in=*/C, /*out=*/kv_out, prefix + "_v");
+        }
+        if (mConfig.lora_config.applies_to_o()) {
+            master.attention.o.emplace();
+            work.attention.o.emplace();
+            allocate_layer_weights(*master.attention.o, *work.attention.o, /*in=*/q_out, /*out=*/C, prefix + "_o");
+        }
+    }
+
+    // MoE LoRA: only for non-hybrid MoE block types or Dense blocks in global MoE models.
+    // Hybrid MoE blocks skip MoE LoRA — no backward hooks exist for MoE grouped GEMM
+    // in the DSL compiled executor.
+    const bool layer_is_moe = !is_hybrid &&
+                               ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
+                                (bt == BlockType::Dense && mConfig.is_moe));
+    // Dense MLP LoRA: only for Dense (non-MoE) or MLP block types
+    const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
+                                     (bt == BlockType::Dense && !mConfig.is_moe);
+
+    if (layer_is_moe && mConfig.num_experts > 0) {
         master.moe.use_grouped = true;
         work.moe.use_grouped = true;
         const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
@@ -97,10 +121,6 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
             allocate_grouped_moe_weights(master.moe.grouped, work.moe.grouped, layer_idx);
         }
 
-        // Allocate router gate LoRA storage when train_router is enabled
-        // Router is a linear layer: (hidden_size -> num_experts), so:
-        // - lora_A: (rank, hidden_size) - projects input to low-rank space
-        // - lora_B: (num_experts, rank) - projects from low-rank to expert logits
         if (mConfig.train_router) {
             const int E = mConfig.num_experts;
             const std::string router_prefix = fmt::format("lora_layer_{}_router", layer_idx);
@@ -108,8 +128,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
             work.router.emplace();
             allocate_layer_weights(*master.router, *work.router, /*in=*/C, /*out=*/E, router_prefix);
         }
-    } else {
-        // Dense model: standard MLP LoRA
+    } else if (layer_is_dense_mlp) {
         if (mConfig.lora_config.applies_to_gate()) {
             master.mlp.gate.emplace();
             work.mlp.gate.emplace();
@@ -126,6 +145,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
             allocate_layer_weights(*master.mlp.down, *work.mlp.down, /*in=*/D, /*out=*/C, prefix + "_down");
         }
     }
+    // Mamba blocks: no LoRA allocated (Mamba LoRA not yet supported)
 }
 
 void ModularLoRAWeightsManager::allocate_grouped_moe_weights(

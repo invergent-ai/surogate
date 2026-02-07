@@ -63,6 +63,10 @@ struct WeightLoadSpec {
 
     /// Whether this parameter is sharded across GPUs.
     bool sharded = false;
+
+    /// Target dtype for full-precision weights (e.g., FP32 for SSM params).
+    /// BF16 by default; only relevant for non-quantized weights.
+    ETensorDType target_dtype = ETensorDType::BF16;
 };
 
 /// Configuration for the weight loading + quantization pipeline.

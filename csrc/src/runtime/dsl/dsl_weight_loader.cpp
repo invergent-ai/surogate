@@ -262,7 +262,28 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec, const std::string& na
     const auto& entry = *entry_ptr;
 
     if (!param_sharded) {
-        entry.read_tensor(target, allow_cast);
+        // Handle squeezable shape mismatch (e.g. HF Conv1d weight [D,1,K] → DSL [D,K]).
+        // When the file has extra size-1 dimensions, element counts match and read_raw is safe.
+        const auto& file_shape = entry.shape();
+
+        if (static_cast<int>(file_shape.size()) != target.Rank) {
+            // Check if squeezing size-1 dims yields the target shape.
+            std::vector<long> squeezed;
+            for (long d : file_shape) {
+                if (d != 1) squeezed.push_back(d);
+            }
+            bool match = (static_cast<int>(squeezed.size()) == target.Rank);
+            for (int i = 0; match && i < target.Rank; ++i) {
+                if (squeezed[i] != target.Sizes[i]) match = false;
+            }
+            if (!match) {
+                throw std::runtime_error("DslWeightLoader: shape mismatch for '" + hf_name
+                    + "': file shape cannot be squeezed to target shape for param '" + name + "'");
+            }
+            entry.read_raw(target, 0, target.nelem(), allow_cast);
+        } else {
+            entry.read_tensor(target, allow_cast);
+        }
     } else {
         if (!global_template) {
             throw std::runtime_error("DslWeightLoader: sharded param '" + name

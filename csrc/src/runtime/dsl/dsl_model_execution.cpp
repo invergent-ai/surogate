@@ -317,14 +317,22 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 Tensor ln2_input;
                 if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
-                        const std::string ln2_name = "blocks[" + std::to_string(layer_idx) + "].ln2_weight";
+                        // Standard blocks use "ln2_weight"; some architectures may use "norm_weight"
+                        std::string ln2_name = "blocks[" + std::to_string(layer_idx) + "].ln2_weight";
+                        if (!mParams->has(ln2_name)) {
+                            ln2_name = "blocks[" + std::to_string(layer_idx) + "].norm_weight";
+                        }
                         Tensor& ln2_weight = mParams->get(ln2_name);
                         // Prefer using recomputed residual_att from simplified_acts.
-                        // Fallback uses res_ffn[L-1], but this path shouldn't be hit
-                        // when recompute is working correctly since residual_att should be populated.
+                        // Fallback: Standard blocks use res_ffn[L-1]; hybrid blocks use res_in[L].
                         Tensor ln2_residual;
                         if (a.residual_att.Data) {
                             ln2_residual = a.residual_att;
+                        } else if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
+                            if (rs.has_residual_offloading()) {
+                                rs.fetch_residual(layer_idx, rs.side_stream());
+                            }
+                            ln2_residual = rs.get_residual(layer_idx, stream);
                         } else if (layer_idx == 0) {
                             ln2_residual = rs.non_block_activations().encoded;
                         } else {
@@ -399,7 +407,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 modules::detail::backward_lora_layer(
                     lora_grads.attention.o->A, lora_grads.attention.o->B,
                     da.d_att,
-                    da.d_res_att, 0,
+                    da.d_att_out, 0,
                     a.att,
                     lora_block.attention.o->A, lora_block.attention.o->B,
                     mLoRAConfig->scaling(),
@@ -417,14 +425,25 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 auto& da = rs.simplified_grads(layer_idx);
 
                 // Get ln1 input: either from stored activation or recompute from residual
-                // LN1 input is res_ffn[L-1] (output of previous layer) for layer L > 0
+                // Standard blocks: LN1 input is res_ffn[L-1] (output of previous layer)
+                // Hybrid blocks: LN1 input is res_in[L] (stored at index L by the block itself)
                 Tensor ln1_input;
                 if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
-                        const std::string ln1_name = "blocks[" + std::to_string(layer_idx) + "].ln1_weight";
+                        // Standard blocks use "ln1_weight"; Nemotron-H blocks use "norm_weight"
+                        std::string ln1_name = "blocks[" + std::to_string(layer_idx) + "].ln1_weight";
+                        if (!mParams->has(ln1_name)) {
+                            ln1_name = "blocks[" + std::to_string(layer_idx) + "].norm_weight";
+                        }
                         Tensor& ln1_weight = mParams->get(ln1_name);
                         Tensor ln1_residual;
-                        if (layer_idx == 0) {
+                        if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
+                            // Hybrid blocks store their own LN input as res_in[L] at index L
+                            if (rs.has_residual_offloading()) {
+                                rs.fetch_residual(layer_idx, rs.side_stream());
+                            }
+                            ln1_residual = rs.get_residual(layer_idx, stream);
+                        } else if (layer_idx == 0) {
                             ln1_residual = rs.non_block_activations().encoded;
                         } else {
                             // Ensure residual is fetched when offloading is enabled

@@ -31,15 +31,20 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
         dt_bias = &resolve_tensor(op.inputs[6]);
     }
 
-    const int B = static_cast<int>(u.Sizes[0]);
-    const int D = static_cast<int>(u.Sizes[1]);  // D = num_heads * head_dim
-    const int T = static_cast<int>(u.Sizes[2]);
-    const int groups = static_cast<int>(B_ssm.Sizes[1]);
-    const int dstate = static_cast<int>(B_ssm.Sizes[2]);
+    // Use op.attrs for dimensions — tensor Sizes may be wrong after DSL view() ops
     const int num_heads = op.attrs.mamba_num_heads;
     const int head_dim = op.attrs.mamba_head_dim;
-    const int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 256;
-    const int n_chunks = (T + chunk_size - 1) / chunk_size;
+    const int D = op.attrs.intermediate_size > 0
+        ? op.attrs.intermediate_size
+        : num_heads * head_dim;
+    const int groups = op.attrs.n_groups;
+    const int dstate = op.attrs.ssm_state_size;
+    const int B = static_cast<int>(u.Sizes[0]);  // Batch is always first dim
+    const int T = static_cast<int>(u.nelem() / (static_cast<long>(B) * D));
+    // n_chunks must match the selective_scan kernel's maximum kChunkSize (128 threads * 16 items = 2048).
+    // This is NOT the model's Mamba chunk_size attribute — it's the kernel's internal processing granularity.
+    constexpr int kKernelMaxChunkSize = 2048;
+    const int n_chunks = (T + kKernelMaxChunkSize - 1) / kKernelMaxChunkSize;
 
     // Expand A_log to A [D, N]
     Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate});
@@ -76,7 +81,14 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
     mamba_selective_scan_forward(out, u, delta, A, B_ssm, C_ssm, D_expanded, dt_bias_expanded,
                                   x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = out;
+    // Transpose output from [B, D, T] to [B, T, D] for downstream ops (gated RMSNorm, out_proj)
+    // which expect standard [B, T, D] layout.  Gate from split_proj is [B, T, I] physical,
+    // so SSM output must also be [B, T, D] physical to match for element-wise operations.
+    Tensor out_btd = mRunState.temp_alloc(out.DType, {B, T, D});
+    mTemps.push_back(out_btd);
+    mamba_transpose_bdt_to_btd(out_btd, out, B, T, D, mRunState.MainStream);
+
+    mTensorMap[op.outputs[0].name] = out_btd;
 
     // Optionally save ssm_state for backward
     if (op.outputs.size() > 1) {
@@ -97,15 +109,19 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     Tensor& dt_bias = resolve_tensor(op.inputs[7]);
     Tensor& x = resolve_tensor(op.inputs[8]);
 
-    const int B = static_cast<int>(u.Sizes[0]);
-    const int D = static_cast<int>(u.Sizes[1]);
-    const int T = static_cast<int>(u.Sizes[2]);
-    const int groups = static_cast<int>(B_ssm.Sizes[1]);
-    const int dstate = static_cast<int>(B_ssm.Sizes[2]);
+    // Use op.attrs for dimensions — tensor Sizes may be wrong after DSL view() ops
     const int num_heads = op.attrs.mamba_num_heads;
     const int head_dim = op.attrs.mamba_head_dim;
-    const int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 256;
-    const int n_chunks = (T + chunk_size - 1) / chunk_size;
+    const int D = op.attrs.intermediate_size > 0
+        ? op.attrs.intermediate_size
+        : num_heads * head_dim;
+    const int groups = op.attrs.n_groups;
+    const int dstate = op.attrs.ssm_state_size;
+    const int B = static_cast<int>(u.Sizes[0]);  // Batch is always first dim
+    const int T = static_cast<int>(u.nelem() / (static_cast<long>(B) * D));
+    // n_chunks must match the selective_scan kernel's maximum kChunkSize (128 threads * 16 items = 2048).
+    constexpr int kKernelMaxChunkSize = 2048;
+    const int n_chunks = (T + kKernelMaxChunkSize - 1) / kKernelMaxChunkSize;
 
     // Expand parameters (same as forward)
     Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate});
@@ -120,7 +136,15 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     mTemps.push_back(dt_bias_expanded);
     mamba_expand_head_param(dt_bias_expanded, dt_bias, num_heads, head_dim, mRunState.MainStream);
 
-    // Allocate gradient outputs
+    // Transpose d_out from [B, T, D] to [B, D, T] to match kernel's expected layout.
+    // The forward output was transposed from [B, D, T] to [B, T, D], so the incoming
+    // gradient is in [B, T, D] layout and must be transposed back.
+    Tensor d_out_bdt = mRunState.temp_alloc(d_out.DType, {B, D, T});
+    mTemps.push_back(d_out_bdt);
+    mamba_transpose_btd_to_bdt(d_out_bdt, d_out, B, T, D, mRunState.MainStream);
+
+    // Allocate gradient outputs — du and ddelta are written directly by the kernel (store_output),
+    // while dA/dB/dC/dD/ddelta_bias use atomicAdd, so they MUST be zero-initialized.
     Tensor du = mRunState.temp_alloc(u.DType, {B, D, T});
     mTemps.push_back(du);
 
@@ -129,23 +153,28 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
 
     Tensor dA = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate});
     mTemps.push_back(dA);
+    fill_zero(dA, mRunState.MainStream);
 
     Tensor dB = mRunState.temp_alloc(ETensorDType::FP32, {B, groups, dstate, T});
     mTemps.push_back(dB);
+    fill_zero(dB, mRunState.MainStream);
 
     Tensor dC = mRunState.temp_alloc(ETensorDType::FP32, {B, groups, dstate, T});
     mTemps.push_back(dC);
+    fill_zero(dC, mRunState.MainStream);
 
     Tensor dD_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
     mTemps.push_back(dD_expanded);
+    fill_zero(dD_expanded, mRunState.MainStream);
 
     Tensor ddelta_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
     mTemps.push_back(ddelta_bias_expanded);
+    fill_zero(ddelta_bias_expanded, mRunState.MainStream);
 
-    // Call selective scan backward
+    // Call selective scan backward (using transposed d_out in [B, D, T] layout)
     mamba_selective_scan_backward(du, ddelta, dA, dB, dC, &dD_expanded, &ddelta_bias_expanded,
                                    u, delta, A, B_ssm, C_ssm, D_expanded, dt_bias_expanded,
-                                   d_out, x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
+                                   d_out_bdt, x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
 
     // Reduce expanded gradients back to per-head
     Tensor dA_log = mRunState.temp_alloc(ETensorDType::FP32, {num_heads});

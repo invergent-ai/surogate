@@ -12,13 +12,21 @@ namespace dsl {
 void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
     Tensor& routing_indices = resolve_tensor(op.inputs[1]);
-    Tensor& permuted = ensure_output_tensor(op.outputs[0]);
-    Tensor& scatter_indices = ensure_output_tensor(op.outputs[1]);
 
     const int num_tokens = static_cast<int>(inp.Sizes[0]);
     const int hidden_size = static_cast<int>(inp.Sizes[1]);
     const int top_k = op.attrs.top_k;
     const int total_tokens = num_tokens * top_k;
+
+    // MoE permute outputs have dynamic shapes depending on top_k and routing.
+    // The compiled graph may have empty shapes for these intermediates, so we
+    // allocate directly with the correct dimensions instead of using ensure_output_tensor.
+    Tensor permuted = mRunState.temp_alloc(inp.DType,
+        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)});
+    mTemps.push_back(permuted);
+    Tensor scatter_indices = mRunState.temp_alloc(ETensorDType::INT32,
+        {static_cast<long>(total_tokens)});
+    mTemps.push_back(scatter_indices);
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     int layer_idx_any = op.attrs.layer_idx;
     std::string field_any;
@@ -36,9 +44,14 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     Tensor expert_positions = mRunState.Stack.allocate(ETensorDType::INT32, {num_experts}, "moe_expert_positions");
     Tensor gather_indices = mRunState.Stack.allocate(ETensorDType::INT32, {total_tokens}, "moe_gather_indices");
 
-    // Zero-initialize expert_positions before atomicAdd in build_indices
-    // Stack memory is reused across forward passes and contains stale values
+    // Zero-initialize before atomicAdd kernels — stack memory is reused
+    // across layers and contains stale values from the previous MoE layer.
+    // gather_indices must also be zeroed: when some expert_indices are out of range
+    // (< 0 or >= num_experts), moe_build_indices skips those assignments, leaving
+    // uninitialized entries that would cause OOB reads in moe_permute_tokens.
+    fill_zero(expert_counts, mRunState.MainStream);
     fill_zero(expert_positions, mRunState.MainStream);
+    fill_zero(gather_indices, mRunState.MainStream);
 
     // Compute expert counts
     moe_compute_expert_counts(expert_counts.get<int>(),

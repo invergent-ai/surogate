@@ -774,6 +774,7 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
     params.out_d_stride = Tlen;
 
     params.dout_ptr = dout.Data;
+    params.du_ptr = du.Data;
     params.dA_ptr = dA.Data;
     params.dB_ptr = dB.Data;
     params.dC_ptr = dC.Data;

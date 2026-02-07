@@ -462,7 +462,13 @@ EMMTranspose swap_transpose(EMMTranspose mode) {
 
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K) {
     if (a.Rank != 2 || b.Rank != 2) {
-        throw std::runtime_error("DSL graph executor: matmul expects rank-2 tensors");
+        std::string msg = "DSL graph executor: matmul expects rank-2 tensors, got a.Rank=" +
+            std::to_string(a.Rank) + " a.Sizes=[";
+        for (int i = 0; i < a.Rank; i++) msg += (i ? "," : "") + std::to_string(a.Sizes[i]);
+        msg += "] b.Rank=" + std::to_string(b.Rank) + " b.Sizes=[";
+        for (int i = 0; i < b.Rank; i++) msg += (i ? "," : "") + std::to_string(b.Sizes[i]);
+        msg += "]";
+        throw std::runtime_error(msg);
     }
     const long a0 = a.Sizes[0];
     const long a1 = a.Sizes[1];
@@ -475,7 +481,13 @@ void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, in
     const long b_rows = transB ? b1 : b0;
     const long b_cols = transB ? b0 : b1;
     if (a_cols != b_rows) {
-        throw std::runtime_error("DSL graph executor: matmul dimension mismatch");
+        std::string msg = "DSL graph executor: matmul dimension mismatch: a=[";
+        for (int i = 0; i < a.Rank; i++) msg += (i ? "," : "") + std::to_string(a.Sizes[i]);
+        msg += "] b=[";
+        for (int i = 0; i < b.Rank; i++) msg += (i ? "," : "") + std::to_string(b.Sizes[i]);
+        msg += "] mode=" + std::to_string(static_cast<int>(mode));
+        msg += " a_cols=" + std::to_string(a_cols) + " b_rows=" + std::to_string(b_rows);
+        throw std::runtime_error(msg);
     }
     M = static_cast<int>(a_rows);
     N = static_cast<int>(b_cols);

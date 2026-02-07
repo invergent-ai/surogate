@@ -8,7 +8,7 @@ gradient_accumulation_steps: 1
 sample_packing: true
 sequence_len: 256
 
-num_epochs: 1
+max_steps: 2
 eval_steps: 25
 save_steps: 0
 

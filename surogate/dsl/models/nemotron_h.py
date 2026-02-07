@@ -21,9 +21,8 @@ from ..decorators import model, forward, hf_config, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..hf import (
     build_mamba_mappings, build_simple_mlp_mappings, build_attn_mappings,
-    build_moe_mappings,
+    stack_experts,
 )
-from ..modules.moe import MoEExpertsSimple
 
 
 def parse_hybrid_pattern(pattern: str) -> list[str]:
@@ -55,6 +54,21 @@ def parse_hybrid_pattern(pattern: str) -> list[str]:
     return block_types
 
 
+# Standard hybrid pattern alphabet used across the DSL/C++ boundary:
+#   M = Mamba, A = Attention, P = MLP (Plain), E = MoE
+_NEMOTRON_TO_STANDARD = str.maketrans({"*": "A", "-": "P"})
+
+
+def to_standard_hybrid_pattern(nemotron_pattern: str) -> str:
+    """Translate Nemotron's hybrid_override_pattern to the standard alphabet.
+
+    Nemotron uses ``*`` for Attention and ``-`` for MLP.  The standard
+    pattern recognised by the C++ runtime uses ``A`` and ``P`` instead.
+    ``M`` (Mamba) and ``E`` (MoE) are the same in both formats.
+    """
+    return nemotron_pattern.translate(_NEMOTRON_TO_STANDARD)
+
+
 @model
 @hf_config(
     architecture="NemotronHForCausalLM",
@@ -84,7 +98,9 @@ def parse_hybrid_pattern(pattern: str) -> list[str]:
     num_experts="n_routed_experts",
     num_experts_per_tok="num_experts_per_tok",
     moe_intermediate_size="moe_intermediate_size",
-    shared_expert_intermediate="moe_shared_expert_intermediate_size",
+    shared_expert_intermediate_size="moe_shared_expert_intermediate_size",
+    # Router scaling
+    routed_scaling_factor="routed_scaling_factor",
     # Activation (for mlp_up_factor determination)
     mlp_activation="mlp_hidden_act",
 )
@@ -136,7 +152,9 @@ class NemotronHModel:
         num_experts: int = 0,
         num_experts_per_tok: int = 2,
         moe_intermediate_size: int = 7688,
-        shared_expert_intermediate: int = 0,
+        shared_expert_intermediate_size: int = 0,
+        # Router scaling
+        routed_scaling_factor: float = 1.0,
         # Activation
         mlp_activation: str = "relu2",
     ):
@@ -155,15 +173,19 @@ class NemotronHModel:
         self.chunk_size = chunk_size
         self.max_seq = max_seq
         self.eps = eps
-        self.hybrid_pattern = hybrid_pattern
+        # Store in standard alphabet (M/A/P/E) for export to C++ runtime
+        self.hybrid_pattern = to_standard_hybrid_pattern(hybrid_pattern)
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias
         self.use_conv_bias = use_conv_bias
         self.use_mamba_bias = use_mamba_bias
+        # Alias for mamba block's when="use_bias" condition evaluation
+        self.use_bias = use_mamba_bias
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
-        self.shared_expert_intermediate = shared_expert_intermediate
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.routed_scaling_factor = routed_scaling_factor
         self.mlp_activation = mlp_activation
 
         # Parse hybrid pattern to get block types
@@ -194,7 +216,7 @@ class NemotronHModel:
 
     # Model weights
     embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="backbone.embeddings.weight")
-    final_norm = Param(Tensor["d_model"], hf_mapping="backbone.norm_f.weight")
+    final_norm = Param(Tensor["d_model"], hf_mapping="backbone.norm_f.weight", quantizable=False)
     lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
 
     # Block arrays - using specialized block types based on pattern
@@ -285,13 +307,18 @@ class NemotronHModel:
             mlp_suffix="mixer",
         ),
 
-        # MoE block weights (from MoEExpertsSimple._hf_mapping_defaults_)
+        # MoE block weights (NemotronMoEBlock uses experts_up, not experts_gate_up)
         # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj
-        **build_moe_mappings(
-            layer_prefix="backbone.layers.{layer}",
-            moe_module=MoEExpertsSimple,
-            moe_suffix="mixer",
+        "router_weight": "backbone.layers.{layer}.mixer.gate.weight",
+        "experts_up": stack_experts(
+            "backbone.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
         ),
+        "experts_down": stack_experts(
+            "backbone.layers.{layer}.mixer.experts.{expert}.down_proj.weight",
+        ),
+        # Shared expert (optional, present when use_shared_expert=True)
+        "shared_expert_up": "backbone.layers.{layer}.mixer.shared_experts.up_proj.weight",
+        "shared_expert_down": "backbone.layers.{layer}.mixer.shared_experts.down_proj.weight",
     }
 
     @forward
@@ -370,5 +397,10 @@ def from_hf_config(config: dict) -> NemotronHModel:
         mlp_bias=config.get("mlp_bias", False),
         use_conv_bias=config.get("use_conv_bias", True),
         use_mamba_bias=config.get("use_bias", False),
+        num_experts=config.get("n_routed_experts", 0),
+        num_experts_per_tok=config.get("num_experts_per_tok", 2),
+        moe_intermediate_size=config.get("moe_intermediate_size", 7688),
+        shared_expert_intermediate_size=config.get("moe_shared_expert_intermediate_size", 0),
+        routed_scaling_factor=config.get("routed_scaling_factor", 1.0),
         mlp_activation=config.get("mlp_hidden_act", "relu2"),
     )

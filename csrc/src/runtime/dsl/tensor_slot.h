@@ -40,6 +40,7 @@ enum class TensorSlot : std::uint8_t {
     BlockDMLPDown,
     BlockDLN2,
     BlockDResAtt,
+    BlockDAttOut,
     BlockDResFFN,
     // Global activations
     Encoded,

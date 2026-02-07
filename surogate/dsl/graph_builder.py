@@ -638,9 +638,9 @@ class GraphBuilder:
     # Elementwise Operations
     # =========================================================================
 
-    def add(self, a: str | GraphRef, b: str | GraphRef) -> GraphRef:
+    def add(self, a: str | GraphRef, b: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """Element-wise addition."""
-        out = self._fresh_name("add")
+        out = out_name or self._fresh_name("add")
         self._add_node(GraphNode(
             op="add",
             inputs=[self._resolve_input(a), self._resolve_input(b)],
@@ -780,17 +780,21 @@ class GraphBuilder:
         *,
         top_k: int,
         normalize: bool = True,
+        scaling_factor: float = 1.0,
         weights_name: str | None = None,
         indices_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
         """MoE top-k selection. Returns (weights, indices)."""
         weights = weights_name or self._fresh_name("moe_weights")
         indices = indices_name or self._fresh_name("moe_indices")
+        attrs: dict = {"top_k": top_k, "normalize": normalize}
+        if scaling_factor != 1.0:
+            attrs["scaling_factor"] = scaling_factor
         self._add_node(GraphNode(
             op="moe_topk",
             inputs=[self._resolve_input(probs)],
             outputs=[weights, indices],
-            attrs={"top_k": top_k, "normalize": normalize},
+            attrs=attrs,
         ))
         return self._make_outputs([weights, indices])
 
@@ -964,6 +968,10 @@ class GraphBuilder:
         dt_min: float = 0.0,
         dt_max: float = float("inf"),
         chunk_size: int = 256,
+        num_heads: int = 0,
+        head_dim: int = 0,
+        ssm_state_size: int = 0,
+        n_groups: int = 0,
         out_name: str | None = None,
         state_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
@@ -980,6 +988,10 @@ class GraphBuilder:
             dt_softplus: Apply softplus to dt
             dt_min, dt_max: Time step clipping
             chunk_size: Chunk size for scan
+            num_heads: Number of SSM heads
+            head_dim: Dimension per head
+            ssm_state_size: SSM state dimension (N/dstate)
+            n_groups: Number of groups for B/C
 
         Returns:
             (output, final_state): SSM output and final state
@@ -1005,6 +1017,11 @@ class GraphBuilder:
                 "dt_min": dt_min,
                 "dt_max": dt_max,
                 "chunk_size": chunk_size,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+                "ssm_state_size": ssm_state_size,
+                "n_groups": n_groups,
+                "intermediate_size": num_heads * head_dim,
             },
         ))
         return self._make_outputs([out, state])
@@ -1016,7 +1033,7 @@ class GraphBuilder:
         weight: str | GraphRef,
         *,
         eps: float = 1e-5,
-        group_size: int = 0,
+        n_groups: int = 1,
         norm_before_gate: bool = False,
         out_name: str | None = None,
     ) -> GraphRef:
@@ -1027,7 +1044,7 @@ class GraphBuilder:
             gate: Gate tensor
             weight: RMSNorm weight
             eps: Epsilon for numerical stability
-            group_size: Group size for normalization (0 = full dim)
+            n_groups: Number of groups for normalization (1 = full dim)
             norm_before_gate: If True, normalize before gating
 
         Returns:
@@ -1044,7 +1061,7 @@ class GraphBuilder:
             outputs=[out],
             attrs={
                 "eps": eps,
-                "group_size": group_size,
+                "n_groups": n_groups,
                 "norm_before_gate": norm_before_gate,
             },
         ))
@@ -1093,6 +1110,8 @@ class GraphBuilder:
         *,
         intermediate_size: int,
         groups_state_size: int,
+        n_groups: int = 0,
+        ssm_state_size: int = 0,
         hidden_name: str | None = None,
         B_name: str | None = None,
         C_name: str | None = None,
@@ -1103,6 +1122,8 @@ class GraphBuilder:
             conv_out: Conv output [B, T, conv_dim]
             intermediate_size: Hidden states size
             groups_state_size: n_groups * ssm_state_size
+            n_groups: Number of SSM groups
+            ssm_state_size: SSM state dimension
 
         Returns:
             (hidden_states, B, C)
@@ -1117,6 +1138,8 @@ class GraphBuilder:
             attrs={
                 "intermediate_size": intermediate_size,
                 "groups_state_size": groups_state_size,
+                "n_groups": n_groups,
+                "ssm_state_size": ssm_state_size,
             },
         ))
         return self._make_outputs([hidden, B_out, C_out])

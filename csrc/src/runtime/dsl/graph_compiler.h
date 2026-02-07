@@ -155,6 +155,7 @@ struct CompiledAttrs {
     // MoE-specific
     int top_k = 0;
     bool normalize_weights = true;
+    float scaling_factor = 1.0f;
 
     // Mamba/SSM-specific
     int mamba_num_heads = 0;
