@@ -10,6 +10,7 @@ import numpy as np
 from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.early_stopping import EarlyStopping
+from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics import MoEMetrics, StepMetrics
@@ -312,6 +313,7 @@ class SurogateTrainerWrapper():
         loss_guard = LossGuard(self.lr_schedule, logger) if self.config.auto_lr_reduction else None
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
+        gradient_tracker = GradientTracker(logger)
 
         # Early stopping
         if self.config.early_stop:
@@ -438,6 +440,7 @@ class SurogateTrainerWrapper():
                 loss_guard.step(result['loss'], result['norm'], step)
             plateau_detector.step(result['loss'], step)
             phase = phase_detector.step(result['loss'], step)
+            gradient_tracker.step(result['norm'], step)
             train_logger.set_phase(phase.value)
 
             metrics = StepMetrics(
@@ -445,6 +448,9 @@ class SurogateTrainerWrapper():
                 epoch=self.train_loader.epoch() + 0.01 * self.train_loader.progress(),
                 loss=result['loss'],
                 grad_norm=result['norm'],
+                grad_norm_mean=gradient_tracker.mean,
+                grad_norm_max=gradient_tracker.max,
+                grad_norm_trend=gradient_tracker.trend,
                 lr=lr,
                 tokens=tokens_processed,
                 elapsed_ms=int(step_time * 1000),

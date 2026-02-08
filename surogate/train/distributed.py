@@ -824,6 +824,7 @@ class RayDistributedTrainer:
     def train(self) -> None:
         """Run the distributed training loop."""
         ray = _get_ray()
+        from surogate.train.gradient_tracker import GradientTracker
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
         from surogate.train.metrics import MoEMetrics, StepMetrics
@@ -895,6 +896,7 @@ class RayDistributedTrainer:
         loss_guard = LossGuard(lr_schedule, logger) if config.auto_lr_reduction else None
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
+        gradient_tracker = GradientTracker(logger)
 
         # Early stopping
         if config.early_stop:
@@ -950,6 +952,7 @@ class RayDistributedTrainer:
                 loss_guard.step(avg_loss, avg_norm, step)
             plateau_detector.step(avg_loss, step)
             phase = phase_detector.step(avg_loss, step)
+            gradient_tracker.step(avg_norm, step)
 
             # Build structured metrics
             metrics = StepMetrics(
@@ -957,6 +960,9 @@ class RayDistributedTrainer:
                 epoch=step / steps_per_epoch if steps_per_epoch > 0 else 0.0,
                 loss=avg_loss,
                 grad_norm=avg_norm,
+                grad_norm_mean=gradient_tracker.mean,
+                grad_norm_max=gradient_tracker.max,
+                grad_norm_trend=gradient_tracker.trend,
                 lr=lr,
                 tokens=total_tokens_per_step,
                 elapsed_ms=int(step_time * 1000),

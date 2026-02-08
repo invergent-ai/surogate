@@ -44,6 +44,9 @@ class StepMetrics:
     epoch: float = 0.0
     loss: float = 0.0
     grad_norm: float = 0.0
+    grad_norm_mean: float = 0.0
+    grad_norm_max: float = 0.0
+    grad_norm_trend: float = 0.0
     lr: float = 0.0
     tokens: int = 0
     elapsed_ms: int = 0
@@ -66,6 +69,9 @@ class StepMetrics:
             "epoch": self.epoch,
             "loss": self.loss,
             "grad_norm": self.grad_norm,
+            "grad_norm_mean": self.grad_norm_mean,
+            "grad_norm_max": self.grad_norm_max,
+            "grad_norm_trend": self.grad_norm_trend,
             "lr": self.lr,
             "tokens": self.tokens,
             "elapsed_ms": self.elapsed_ms,
