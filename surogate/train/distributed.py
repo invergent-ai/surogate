@@ -880,6 +880,15 @@ class RayDistributedTrainer:
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
 
+        # Early stopping
+        if config.early_stop:
+            from surogate.train.early_stopping import EarlyStopping
+            from surogate.utils.model import estimate_model_parameters
+            num_params = estimate_model_parameters(config.model_info.config)
+            early_stopping = EarlyStopping(logger, num_params, total_tokens_per_step)
+        else:
+            early_stopping = None
+
         logger.info(f"Starting distributed training...")
         logger.info(f"  Nodes: {self.num_nodes}")
         logger.info(f"  GPUs per node: {local_gpus}")
@@ -910,6 +919,8 @@ class RayDistributedTrainer:
                 loss_guard.step(avg_loss, avg_norm, step)
             plateau_detector.step(avg_loss, step)
             phase = phase_detector.step(avg_loss, step)
+            if early_stopping is not None and early_stopping.check_step(avg_loss, phase, step):
+                break
 
             # Calculate timing and throughput
             step_end_time = time.time()
@@ -939,6 +950,8 @@ class RayDistributedTrainer:
                 eval_losses = ray.get(eval_futures)
                 avg_eval_loss = sum(eval_losses) / len(eval_losses)
                 logger.info(f"  Eval loss: {avg_eval_loss:.4f}")
+                if early_stopping is not None and early_stopping.check_eval(avg_eval_loss, step):
+                    break
 
             # Periodic checkpointing
             if config.save_steps > 0 and step % config.save_steps == 0 and step > start_step:

@@ -9,6 +9,7 @@ import numpy as np
 
 from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
+from surogate.train.early_stopping import EarlyStopping
 from surogate.train.loss_guard import LossGuard
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.phase_detector import PhaseDetector
@@ -280,6 +281,15 @@ class SurogateTrainerWrapper():
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
 
+        # Early stopping
+        if self.config.early_stop:
+            from surogate.utils.model import estimate_model_parameters
+            num_params = estimate_model_parameters(self.config.model_info.config)
+            tokens_per_step = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            early_stopping = EarlyStopping(logger, num_params, tokens_per_step)
+        else:
+            early_stopping = None
+
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
         for step in range(self.start_step, self.max_steps):
@@ -304,6 +314,8 @@ class SurogateTrainerWrapper():
                 # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
                 eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
+                if early_stopping is not None and early_stopping.check_eval(val_loss, step):
+                    break
                 # Reload training batch after evaluation (eval leaves its last batch in the buffers)
                 if use_full_step_graphs:
                     chunk = self.config.gpus * self.config.per_device_train_batch_size
@@ -391,6 +403,8 @@ class SurogateTrainerWrapper():
             plateau_detector.step(result['loss'], step)
             phase = phase_detector.step(result['loss'], step)
             train_logger.set_phase(phase.value)
+            if early_stopping is not None and early_stopping.check_step(result['loss'], phase, step):
+                break
 
             step_time = time.time() - step_start
             elapsed_ms = int(step_time * 1000)
