@@ -337,7 +337,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     debug_time_breakdown: Optional[bool] = False
     debug_memory_breakdown: Optional[bool] = False
     log_gpu_util: Optional[int] = 100
-    
+    auto_lr_reduction: Optional[bool] = False
+
     wandb_project: Optional[str] = None
     wandb_name: Optional[str] = None
     aim_experiment: Optional[str] = None
@@ -443,7 +444,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
         self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
-        
+        self.auto_lr_reduction = cfg.get('auto_lr_reduction', self.auto_lr_reduction)
+
         self.wandb_project = cfg.get('wandb_project', self.wandb_project)
         self.wandb_name = cfg.get('wandb_name', self.wandb_name or self.run_name)
         self.aim_experiment = cfg.get('aim_experiment', self.aim_experiment)

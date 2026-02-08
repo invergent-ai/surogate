@@ -824,6 +824,7 @@ class RayDistributedTrainer:
     def train(self) -> None:
         """Run the distributed training loop."""
         ray = _get_ray()
+        from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
         from surogate.utils.logger import get_logger
 
@@ -872,6 +873,9 @@ class RayDistributedTrainer:
             schedule_type=config.lr_scheduler_type
         )
 
+        # Auto LR reduction guard
+        loss_guard = LossGuard(lr_schedule, logger) if config.auto_lr_reduction else None
+
         logger.info(f"Starting distributed training...")
         logger.info(f"  Nodes: {self.num_nodes}")
         logger.info(f"  GPUs per node: {local_gpus}")
@@ -896,6 +900,10 @@ class RayDistributedTrainer:
             norms = [r[1] for r in results]
             avg_loss = sum(losses) / len(losses)
             avg_norm = sum(norms) / len(norms)
+
+            # Check for loss spikes / gradient explosions
+            if loss_guard is not None:
+                loss_guard.step(avg_loss, avg_norm, step)
 
             # Calculate timing and throughput
             step_end_time = time.time()

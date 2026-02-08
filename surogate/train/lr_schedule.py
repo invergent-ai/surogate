@@ -48,3 +48,8 @@ class LRSchedule:
             # Default to cosine
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             return self.final_lr + (self.base_lr - self.final_lr) * cosine_decay
+
+    def reduce_lr(self, factor: float) -> None:
+        """Permanently scale down base_lr and final_lr by *factor*."""
+        self.base_lr *= factor
+        self.final_lr *= factor
