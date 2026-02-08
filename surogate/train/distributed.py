@@ -826,6 +826,7 @@ class RayDistributedTrainer:
         ray = _get_ray()
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
+        from surogate.train.plateau_detector import PlateauDetector
         from surogate.utils.logger import get_logger
 
         logger = get_logger()

@@ -11,6 +11,7 @@ from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.loss_guard import LossGuard
 from surogate.train.lr_schedule import LRSchedule
+from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
 from surogate.train.training_plot import generate_training_plot
 from surogate.utils.adapter_merge import merge_adapter
@@ -275,6 +276,7 @@ class SurogateTrainerWrapper():
 
         # Auto LR reduction guard
         loss_guard = LossGuard(self.lr_schedule, logger) if self.config.auto_lr_reduction else None
+        plateau_detector = PlateauDetector(logger)
 
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
@@ -384,6 +386,7 @@ class SurogateTrainerWrapper():
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:
                 loss_guard.step(result['loss'], result['norm'], step)
+            plateau_detector.step(result['loss'], step)
 
             step_time = time.time() - step_start
             elapsed_ms = int(step_time * 1000)
