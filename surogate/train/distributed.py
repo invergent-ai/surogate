@@ -828,6 +828,7 @@ class RayDistributedTrainer:
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
         from surogate.train.metrics import MoEMetrics, StepMetrics
+        from surogate.train.moe_monitor import MoEMonitor
         from surogate.train.phase_detector import PhaseDetector
         from surogate.train.plateau_detector import PlateauDetector
         from surogate.utils.logger import get_logger
@@ -897,6 +898,7 @@ class RayDistributedTrainer:
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
+        moe_monitor = MoEMonitor(logger)
 
         # Early stopping
         if config.early_stop:
@@ -970,6 +972,7 @@ class RayDistributedTrainer:
                 lr_overridden=lr_schedule.has_override,
                 moe=MoEMetrics.from_dict(ray.get(self.node_trainers[0].get_moe_stats.remote())),
             )
+            moe_monitor.step(metrics.moe, step)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break

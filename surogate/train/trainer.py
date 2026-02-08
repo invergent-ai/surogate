@@ -12,6 +12,7 @@ from surogate.core.config.sft_config import SFTConfig
 from surogate.train.early_stopping import EarlyStopping
 from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
+from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.phase_detector import PhaseDetector
@@ -314,6 +315,7 @@ class SurogateTrainerWrapper():
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
+        moe_monitor = MoEMonitor(logger)
 
         # Early stopping
         if self.config.early_stop:
@@ -458,6 +460,7 @@ class SurogateTrainerWrapper():
                 lr_overridden=self.lr_schedule.has_override,
                 moe=MoEMetrics.from_dict(self.trainer.get_moe_stats()),
             )
+            moe_monitor.step(metrics.moe, step)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
