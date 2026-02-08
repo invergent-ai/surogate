@@ -351,6 +351,22 @@ Chat template settings control how conversations are formatted for training and 
 | `debug_time_breakdown`   | bool | `false` | Enable detailed training timing breakdown for debugging.                                |
 | `debug_memory_breakdown` | bool | `false` | Print detailed memory breakdown after model allocation (useful for QLoRA optimization). |
 
+## Training Diagnostics & Automation
+
+These options control automatic training monitoring, early stopping, and compute-optimal adjustments. All are disabled by default and safe to enable — they only add diagnostics or automation on top of the normal training loop.
+
+| Option              | Type | Default | Description                                                                                                                                                                                                                                                          |
+| ------------------- | ---- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto_lr_reduction` | bool | `false` | Detect loss spikes and gradient explosions, then permanently reduce the learning rate. Monitors a rolling window of loss/grad-norm values; when an anomaly is detected (loss > mean + 3σ, or grad_norm > 10× average), the LR schedule is scaled down by 50%. Up to 5 reductions. |
+| `early_stop`        | bool | `false` | Multi-criteria early stopping. Stops training when ANY of: (1) convergence score > 0.85 for 5 consecutive evals, (2) compute efficiency (loss reduction per FLOP) drops below 50% of peak, (3) training diverges for 200+ consecutive steps, (4) loss plateaus for 500+ consecutive steps. Uses the `6N` approximation for FLOPs/token. |
+| `epoch_adjustment`  | bool | `false` | Automatically adjust `num_epochs` to match the Chinchilla-optimal token budget (20× model parameters). If the dataset is smaller than the budget, increases epochs; if larger, decreases them. Only applies when `max_steps` is not explicitly set. |
+
+**Always-on diagnostics** (no config flag required):
+
+- **Plateau detection**: Warns when training loss stops improving over a rolling window. No automatic action taken.
+- **Phase detection**: Classifies training into WARMUP / CONVERGING / PLATEAU / UNSTABLE / DIVERGING phases. Phase transitions are logged and the current phase is shown in the step log output.
+- **Chinchilla token budget**: Printed at training start — shows the Chinchilla-optimal token count (20 × params) alongside planned tokens, so you can gauge training sufficiency at a glance.
+
 ## Recipe Comparison
 
 | Recipe          | Format                      | GPU Requirement                | Use Case                             |

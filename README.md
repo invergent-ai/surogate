@@ -49,6 +49,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - [**🧪 Mixed-precision training**](https://docs.surogate.ai/guides/precision-and-recipes#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
+- [**🧬 Smart Training**](https://docs.surogate.ai/reference/config#training-diagnostics--automation): built-in training diagnostics with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR reduction, Chinchilla token budgeting and dynamic epoch adjustment
 - **🧠 Supported models**: Text Dense & MoE
 
 ---
