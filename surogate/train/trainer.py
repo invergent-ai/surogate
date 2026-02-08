@@ -14,6 +14,7 @@ from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
 from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.lr_schedule import LRSchedule
+from surogate.train.training_advisor import TrainingAdvisor
 from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
@@ -316,6 +317,11 @@ class SurogateTrainerWrapper():
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
         moe_monitor = MoEMonitor(logger)
+        advisor = TrainingAdvisor(
+            logger, phase_detector, gradient_tracker, plateau_detector,
+            loss_guard, moe_monitor, self.lr_schedule, self.max_steps,
+            warmup_steps=self.warmup_steps,
+        )
 
         # Early stopping
         if self.config.early_stop:
@@ -461,6 +467,7 @@ class SurogateTrainerWrapper():
                 moe=MoEMetrics.from_dict(self.trainer.get_moe_stats()),
             )
             moe_monitor.step(metrics.moe, step)
+            advisor.step(metrics, step)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break

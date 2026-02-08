@@ -831,6 +831,7 @@ class RayDistributedTrainer:
         from surogate.train.moe_monitor import MoEMonitor
         from surogate.train.phase_detector import PhaseDetector
         from surogate.train.plateau_detector import PlateauDetector
+        from surogate.train.training_advisor import TrainingAdvisor
         from surogate.utils.logger import get_logger
 
         logger = get_logger()
@@ -899,6 +900,11 @@ class RayDistributedTrainer:
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
         moe_monitor = MoEMonitor(logger)
+        advisor = TrainingAdvisor(
+            logger, phase_detector, gradient_tracker, plateau_detector,
+            loss_guard, moe_monitor, lr_schedule, max_steps,
+            warmup_steps=warmup_steps,
+        )
 
         # Early stopping
         if config.early_stop:
@@ -973,6 +979,7 @@ class RayDistributedTrainer:
                 moe=MoEMetrics.from_dict(ray.get(self.node_trainers[0].get_moe_stats.remote())),
             )
             moe_monitor.step(metrics.moe, step)
+            advisor.step(metrics, step)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
