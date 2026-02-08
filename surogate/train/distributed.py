@@ -826,6 +826,7 @@ class RayDistributedTrainer:
         ray = _get_ray()
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
+        from surogate.train.metrics import MoEMetrics, StepMetrics
         from surogate.train.phase_detector import PhaseDetector
         from surogate.train.plateau_detector import PlateauDetector
         from surogate.utils.logger import get_logger
@@ -940,31 +941,43 @@ class RayDistributedTrainer:
             avg_loss = sum(losses) / len(losses)
             avg_norm = sum(norms) / len(norms)
 
+            # Calculate timing
+            step_end_time = time.time()
+            step_time = step_end_time - step_start_time
+
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:
                 loss_guard.step(avg_loss, avg_norm, step)
             plateau_detector.step(avg_loss, step)
             phase = phase_detector.step(avg_loss, step)
-            if early_stopping is not None and early_stopping.check_step(avg_loss, phase, step):
-                break
 
-            # Calculate timing and throughput
-            step_end_time = time.time()
-            step_time = step_end_time - step_start_time
-            tokens_per_sec = total_tokens_per_step / step_time if step_time > 0 else 0
+            # Build structured metrics
+            metrics = StepMetrics(
+                step=step,
+                epoch=step / steps_per_epoch if steps_per_epoch > 0 else 0.0,
+                loss=avg_loss,
+                grad_norm=avg_norm,
+                lr=lr,
+                tokens=total_tokens_per_step,
+                elapsed_ms=int(step_time * 1000),
+                phase=phase.value,
+                lr_overridden=lr_schedule.has_override,
+                moe=MoEMetrics.from_dict(ray.get(self.node_trainers[0].get_moe_stats.remote())),
+            )
+
+            if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
+                break
 
             # Log progress
             logger.info(
-                f"Step {step}/{max_steps} | Loss: {avg_loss:.4f} | Norm: {avg_norm:.4f} | "
-                f"LR: {lr:.2e} | {step_time:.2f}s | {tokens_per_sec:.0f} tok/s | {phase.value}"
+                f"Step {step}/{max_steps} | Loss: {metrics.loss:.4f} | Norm: {metrics.grad_norm:.4f} | "
+                f"LR: {metrics.lr:.2e} | {step_time:.2f}s | {metrics.tokens_per_second:.0f} tok/s | {metrics.phase}"
             )
 
-            # Log MoE stats for MoE models (get from node 0)
-            moe_stats = ray.get(self.node_trainers[0].get_moe_stats.remote())
-            if moe_stats.get('valid', False):
+            if metrics.moe is not None:
                 logger.info(
-                    f"  MoE: aux_loss={moe_stats['aux_loss']:.4f} z_loss={moe_stats['z_loss']:.4f} "
-                    f"util={moe_stats['expert_utilization']:.2%} imbalance={moe_stats['load_imbalance']:.2f}"
+                    f"  MoE: aux_loss={metrics.moe.aux_loss:.4f} z_loss={metrics.moe.z_loss:.4f} "
+                    f"util={metrics.moe.expert_utilization:.2%} imbalance={metrics.moe.load_imbalance:.2f}"
                 )
 
             # Reset timer for next step

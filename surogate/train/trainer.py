@@ -12,6 +12,7 @@ from surogate.core.config.sft_config import SFTConfig
 from surogate.train.early_stopping import EarlyStopping
 from surogate.train.loss_guard import LossGuard
 from surogate.train.lr_schedule import LRSchedule
+from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
@@ -428,34 +429,44 @@ class SurogateTrainerWrapper():
                 self._maybe_log_lora_grad_stats(step)
                 result = self.trainer.update_with_config(opt_config, step + 1)
 
+            # Build structured metrics for this step
+            step_time = time.time() - step_start
+            tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:
                 loss_guard.step(result['loss'], result['norm'], step)
             plateau_detector.step(result['loss'], step)
             phase = phase_detector.step(result['loss'], step)
             train_logger.set_phase(phase.value)
-            if early_stopping is not None and early_stopping.check_step(result['loss'], phase, step):
+
+            metrics = StepMetrics(
+                step=step,
+                epoch=self.train_loader.epoch() + 0.01 * self.train_loader.progress(),
+                loss=result['loss'],
+                grad_norm=result['norm'],
+                lr=lr,
+                tokens=tokens_processed,
+                elapsed_ms=int(step_time * 1000),
+                phase=phase.value,
+                lr_overridden=self.lr_schedule.has_override,
+                moe=MoEMetrics.from_dict(self.trainer.get_moe_stats()),
+            )
+
+            if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
 
-            step_time = time.time() - step_start
-            elapsed_ms = int(step_time * 1000)
-
             # Log training step
-            tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
-            epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
-
-            # Check for MoE stats and log with inline metrics if available
-            moe_stats = self.trainer.get_moe_stats()
-            if moe_stats.get('valid', False):
-                train_logger.log_step_moe(step, epoch, tokens_processed, elapsed_ms,
-                                          result['norm'], result['loss'], lr,
-                                          moe_stats['aux_loss'],
-                                          moe_stats['z_loss'],
-                                          moe_stats['load_imbalance'],
-                                          moe_stats['expert_utilization'])
+            if metrics.moe is not None:
+                train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                          metrics.grad_norm, metrics.loss, metrics.lr,
+                                          metrics.moe.aux_loss,
+                                          metrics.moe.z_loss,
+                                          metrics.moe.load_imbalance,
+                                          metrics.moe.expert_utilization)
             else:
-                train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
-                                      result['norm'], result['loss'], lr)
+                train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                      metrics.grad_norm, metrics.loss, metrics.lr)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
