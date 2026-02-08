@@ -876,6 +876,7 @@ class RayDistributedTrainer:
 
         # Auto LR reduction guard
         loss_guard = LossGuard(lr_schedule, logger) if config.auto_lr_reduction else None
+        plateau_detector = PlateauDetector(logger)
 
         logger.info(f"Starting distributed training...")
         logger.info(f"  Nodes: {self.num_nodes}")
@@ -905,6 +906,7 @@ class RayDistributedTrainer:
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:
                 loss_guard.step(avg_loss, avg_norm, step)
+            plateau_detector.step(avg_loss, step)
 
             # Calculate timing and throughput
             step_end_time = time.time()
