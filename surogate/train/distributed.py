@@ -847,15 +847,30 @@ class RayDistributedTrainer:
         )
         total_tokens_per_step = tokens_per_step_per_node * self.num_nodes
 
+        # Chinchilla token budget (optimal tokens ≈ 20 × params)
+        from surogate.utils.model import estimate_model_parameters
+        num_params = estimate_model_parameters(config.model_info.config)
+        chinchilla_tokens = 20 * num_params
+
         # Determine max steps
         # Note: In distributed mode, each node sees 1/num_nodes of the data (sharded via strided access)
+        num_tokens = ray.get(self.node_trainers[0].get_num_tokens.remote())
+        steps_per_epoch = num_tokens // total_tokens_per_step
         if config.max_steps > 0:
             max_steps = config.max_steps
+        elif config.epoch_adjustment:
+            import math as _math
+            chinchilla_epochs = max(1, _math.ceil(chinchilla_tokens / max(num_tokens, 1)))
+            if chinchilla_epochs != config.num_epochs:
+                logger.info(
+                    f"Epoch adjustment: {config.num_epochs} -> {chinchilla_epochs} epochs "
+                    f"(Chinchilla budget {chinchilla_tokens / 1e9:.1f}B tokens, "
+                    f"dataset {num_tokens / 1e9:.1f}B tokens)"
+                )
+                config.num_epochs = chinchilla_epochs
+            max_steps = steps_per_epoch * config.num_epochs
+            logger.info(f"Derived {max_steps} steps from {config.num_epochs} epoch(s) (epoch_adjustment)")
         else:
-            # Calculate steps per epoch from the data loader
-            # Get the first node's loader info to determine total dataset size
-            num_tokens = ray.get(self.node_trainers[0].get_num_tokens.remote())
-            steps_per_epoch = num_tokens // total_tokens_per_step
             max_steps = steps_per_epoch * config.num_epochs
             logger.info(f"Calculated {steps_per_epoch} steps per epoch from {num_tokens} tokens")
 
@@ -883,8 +898,6 @@ class RayDistributedTrainer:
         # Early stopping
         if config.early_stop:
             from surogate.train.early_stopping import EarlyStopping
-            from surogate.utils.model import estimate_model_parameters
-            num_params = estimate_model_parameters(config.model_info.config)
             early_stopping = EarlyStopping(logger, num_params, total_tokens_per_step)
         else:
             early_stopping = None
@@ -896,6 +909,19 @@ class RayDistributedTrainer:
         logger.info(f"  Tokens per step: {total_tokens_per_step}")
         logger.info(f"  Starting from step: {start_step}")
         logger.info(f"  Max steps: {max_steps}")
+
+        # Chinchilla token budget
+        planned_tokens = max_steps * total_tokens_per_step
+        ratio = planned_tokens / max(chinchilla_tokens, 1)
+        def _fmt(n):
+            if n >= 1e12: return f"{n/1e12:.1f}T"
+            if n >= 1e9: return f"{n/1e9:.1f}B"
+            if n >= 1e6: return f"{n/1e6:.1f}M"
+            return f"{n/1e3:.1f}K"
+        logger.info(
+            f"  Chinchilla budget: {_fmt(chinchilla_tokens)} tokens (20 × {_fmt(num_params)} params) | "
+            f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
+        )
 
         # Training loop
         import time

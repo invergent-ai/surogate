@@ -137,9 +137,27 @@ class SurogateTrainerWrapper():
                     memcpy_send_recv=config.memcpy_send_recv
                 )
 
+        # Chinchilla token budget (optimal tokens ≈ 20 × params)
+        from surogate.utils.model import estimate_model_parameters
+        self.num_params = estimate_model_parameters(config.model_info.config)
+        self.chinchilla_tokens = 20 * self.num_params
+        self.tokens_per_step = self.total_batch_size
+
         # Determine max_steps
         if config.max_steps > 0:
             self.max_steps = config.max_steps
+        elif config.epoch_adjustment:
+            # Adjust epochs to reach Chinchilla-optimal token budget
+            chinchilla_epochs = max(1, int(np.ceil(self.chinchilla_tokens / max(self.train_loader.num_tokens, 1))))
+            if chinchilla_epochs != self.config.num_epochs:
+                logger.info(
+                    f"Epoch adjustment: {self.config.num_epochs} -> {chinchilla_epochs} epochs "
+                    f"(Chinchilla budget {self.chinchilla_tokens / 1e9:.1f}B tokens, "
+                    f"dataset {self.train_loader.num_tokens / 1e9:.1f}B tokens)"
+                )
+                self.config.num_epochs = chinchilla_epochs
+            self.max_steps = self.steps_per_epoch * self.config.num_epochs
+            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s) (epoch_adjustment)")
         else:
             self.max_steps = self.steps_per_epoch * self.config.num_epochs
             logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
@@ -197,6 +215,19 @@ class SurogateTrainerWrapper():
             logger.info(f"Max steps: {self.max_steps}")
             logger.info(
                 f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.warmup_steps}, cooldown={self.config.cooldown_steps})")
+
+            # Chinchilla token budget
+            planned_tokens = self.max_steps * self.tokens_per_step
+            ratio = planned_tokens / max(self.chinchilla_tokens, 1)
+            def _fmt(n):
+                if n >= 1e12: return f"{n/1e12:.1f}T"
+                if n >= 1e9: return f"{n/1e9:.1f}B"
+                if n >= 1e6: return f"{n/1e6:.1f}M"
+                return f"{n/1e3:.1f}K"
+            logger.info(
+                f"Chinchilla budget: {_fmt(self.chinchilla_tokens)} tokens (20 × {_fmt(self.num_params)} params) | "
+                f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
+            )
 
             # Print LoRA info if enabled
             if self.config.lora and self.config.lora_config:

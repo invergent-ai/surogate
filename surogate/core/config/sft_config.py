@@ -339,6 +339,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     log_gpu_util: Optional[int] = 100
     auto_lr_reduction: Optional[bool] = False
     early_stop: Optional[bool] = False
+    epoch_adjustment: Optional[bool] = False
 
     wandb_project: Optional[str] = None
     wandb_name: Optional[str] = None
@@ -447,6 +448,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
         self.auto_lr_reduction = cfg.get('auto_lr_reduction', self.auto_lr_reduction)
         self.early_stop = cfg.get('early_stop', self.early_stop)
+        self.epoch_adjustment = cfg.get('epoch_adjustment', self.epoch_adjustment)
 
         self.wandb_project = cfg.get('wandb_project', self.wandb_project)
         self.wandb_name = cfg.get('wandb_name', self.wandb_name or self.run_name)
