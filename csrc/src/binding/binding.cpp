@@ -1217,6 +1217,9 @@ NB_MODULE(_surogate, m) {
              "- moe_z_loss: MoE router z-loss.\n"
              "- moe_load_imbalance: MoE load imbalance ratio.\n"
              "- moe_expert_utilization: Fraction of experts receiving tokens.")
+        .def("set_phase", &TrainingRunLogger::set_phase, nb::arg("phase"),
+             "Set the current training phase label shown in step logs.\n\n"
+             "Parameters:\n- phase: Phase name (e.g. 'warmup', 'converging', 'plateau').")
         .def("log_eval", &TrainingRunLogger::log_eval,
              nb::arg("step"), nb::arg("epoch"), nb::arg("eval_tokens"), nb::arg("duration_ms"), nb::arg("loss"),
              "Log an evaluation step.\n\n"

@@ -826,6 +826,7 @@ class RayDistributedTrainer:
         ray = _get_ray()
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
+        from surogate.train.phase_detector import PhaseDetector
         from surogate.train.plateau_detector import PlateauDetector
         from surogate.utils.logger import get_logger
 
@@ -877,6 +878,7 @@ class RayDistributedTrainer:
         # Auto LR reduction guard
         loss_guard = LossGuard(lr_schedule, logger) if config.auto_lr_reduction else None
         plateau_detector = PlateauDetector(logger)
+        phase_detector = PhaseDetector(logger)
 
         logger.info(f"Starting distributed training...")
         logger.info(f"  Nodes: {self.num_nodes}")
@@ -907,6 +909,7 @@ class RayDistributedTrainer:
             if loss_guard is not None:
                 loss_guard.step(avg_loss, avg_norm, step)
             plateau_detector.step(avg_loss, step)
+            phase = phase_detector.step(avg_loss, step)
 
             # Calculate timing and throughput
             step_end_time = time.time()
@@ -916,7 +919,7 @@ class RayDistributedTrainer:
             # Log progress
             logger.info(
                 f"Step {step}/{max_steps} | Loss: {avg_loss:.4f} | Norm: {avg_norm:.4f} | "
-                f"LR: {lr:.2e} | {step_time:.2f}s | {tokens_per_sec:.0f} tok/s"
+                f"LR: {lr:.2e} | {step_time:.2f}s | {tokens_per_sec:.0f} tok/s | {phase.value}"
             )
 
             # Log MoE stats for MoE models (get from node 0)

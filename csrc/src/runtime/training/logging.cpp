@@ -300,13 +300,17 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
             }
         }
 
-        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s\n",
-               step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, sol_str.c_str(), eta_str.c_str());
+        std::string phase_str = mPhase.empty() ? "" : fmt::format(" | {}", mPhase);
+
+        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s%s\n",
+               step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, sol_str.c_str(), eta_str.c_str(), phase_str.c_str());
         fflush(stdout);
     }
-    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}}})",
+
+    std::string phase_json = mPhase.empty() ? "" : fmt::format(R"(, "phase": "{}")", mPhase);
+    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}{}}})",
         std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms,
-        sanitize_float_for_json(norm), sanitize_float_for_json(loss), sanitize_float_for_json(lr) ));
+        sanitize_float_for_json(norm), sanitize_float_for_json(loss), sanitize_float_for_json(lr), phase_json ));
 }
 
 /**
@@ -396,15 +400,19 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
         // MoE metrics string
         std::string moe_str = fmt::format(" | aux {:.4f} | imbal {:.2f}", moe_aux_loss, moe_load_imbalance);
 
-        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s%s\n",
-               step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, moe_str.c_str(), sol_str.c_str(), eta_str.c_str());
+        std::string phase_str = mPhase.empty() ? "" : fmt::format(" | {}", mPhase);
+
+        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s%s%s\n",
+               step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, moe_str.c_str(), sol_str.c_str(), eta_str.c_str(), phase_str.c_str());
         fflush(stdout);
     }
-    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {}, "moe_z_loss": {}, "moe_load_imbalance": {}, "moe_expert_utilization": {}}})",
+
+    std::string phase_json = mPhase.empty() ? "" : fmt::format(R"(, "phase": "{}")", mPhase);
+    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {}, "moe_z_loss": {}, "moe_load_imbalance": {}, "moe_expert_utilization": {}{}}})",
         std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms,
         sanitize_float_for_json(norm), sanitize_float_for_json(loss), sanitize_float_for_json(lr),
         sanitize_float_for_json(moe_aux_loss), sanitize_float_for_json(moe_z_loss),
-        sanitize_float_for_json(moe_load_imbalance), sanitize_float_for_json(moe_expert_utilization)));
+        sanitize_float_for_json(moe_load_imbalance), sanitize_float_for_json(moe_expert_utilization), phase_json));
 }
 
 /**
@@ -1051,6 +1059,10 @@ void TrainingRunLogger::set_training_tokens(long total_tokens) {
  * @param step Step associated with this message.
  * @param msg Message text.
  */
+void TrainingRunLogger::set_phase(const std::string& phase) {
+    mPhase = phase;
+}
+
 void TrainingRunLogger::log_message(int step, const std::string& msg) {
     if(mRank != 0) return;
     if(mVerbosity >= 0) {

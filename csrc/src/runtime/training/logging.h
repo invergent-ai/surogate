@@ -90,6 +90,7 @@ public:
         friend class TrainingRunLogger;
     };
 
+    void set_phase(const std::string& phase);
     void log_message(int step, const std::string& msg);
     RAII_Section log_section_start(int step, const std::string& info);
     void log_section_end();
@@ -118,6 +119,9 @@ private:
     float mPreviousLoss = -1.0f;
     float mNormMovingAverage = 0.0f;
     int mNormSampleCount = 0;
+
+    // training phase label (set from Python, included in step log)
+    std::string mPhase;
 
     // arbitrary callback for log lines
     std::function<void(std::string_view)> mCallback;
