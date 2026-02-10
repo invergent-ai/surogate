@@ -21,3 +21,5 @@ unit-test-sol.json
 uv.lock
 .aim/
 .cache/**
+tmp/**
+*.log

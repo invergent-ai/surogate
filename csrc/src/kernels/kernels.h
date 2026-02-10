@@ -376,10 +376,6 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
                               Tensor& workspace, cudnnHandle_t handle,
                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
-// Debug utilities for GQA: repeat/sum K/V heads to emulate explicit repeat_kv.
-void repeat_kv_qkv(Tensor& out, const Tensor& in, int B, int T, int Hq, int Hkv, int Hs, cudaStream_t stream);
-void reduce_kv_qkv(Tensor& out, const Tensor& in, int B, int T, int Hq, int Hkv, int Hs, cudaStream_t stream);
-
 void fused_classifier(float* logits, float* losses,
                       float dloss, const int* targets, int* valid_token_count,
                       int BT, int V, int P, bool write_dlogits, cudaStream_t stream);
