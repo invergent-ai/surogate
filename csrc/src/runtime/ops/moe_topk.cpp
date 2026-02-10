@@ -12,6 +12,13 @@ namespace dsl {
 void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     Tensor& probs = resolve_tensor(op.inputs[0]);
 
+    // Optional correction bias (e.g., e_score_correction_bias from DeepSeek V3 / Nemotron-H routing)
+    const float* correction_bias = nullptr;
+    if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
+        Tensor& bias = resolve_tensor(op.inputs[1]);
+        correction_bias = bias.get<float>();
+    }
+
     const int num_tokens = static_cast<int>(probs.Sizes[0]);
     const int num_experts = static_cast<int>(probs.Sizes[1]);
     const int top_k = op.attrs.top_k;
@@ -32,11 +39,13 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
         moe_topk_forward(indices.get<int>(),
                          weights.get<nv_bfloat16>(),
                          probs.get<nv_bfloat16>(),
+                         correction_bias,
                          num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
     } else {
         moe_topk_forward(indices.get<int>(),
                          weights.get<float>(),
                          probs.get<float>(),
+                         correction_bias,
                          num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
     }
 
@@ -105,6 +114,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
             {static_cast<long>(num_tokens), static_cast<long>(num_experts)}, "probs_f32");
         Tensor d_probs_f32 = mRunState.Stack.allocate(ETensorDType::FP32,
             {static_cast<long>(num_tokens), static_cast<long>(num_experts)}, "d_probs_f32");
+        fill_zero(d_probs_f32, mRunState.MainStream);
 
         // Cast inputs to FP32
         convert_dtype(d_weights_f32.get<float>(), d_weights_ptr->get<nv_bfloat16>(),
@@ -124,6 +134,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                       d_probs.nelem(), mRunState.MainStream);
     } else {
         // FP32 path
+        fill_zero(d_probs, mRunState.MainStream);
         moe_topk_backward(d_probs.get<float>(),
                           d_weights_ptr->get<float>(),
                           probs.get<float>(),

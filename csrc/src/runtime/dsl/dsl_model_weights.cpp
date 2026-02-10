@@ -207,7 +207,27 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             const auto& entry = *entry_ptr;
             const std::string entry_name = entry.name();
             if (!param_sharded) {
-                entry.read_tensor(param, allow_cast);
+                const auto& file_shape = entry.shape();
+                if (static_cast<int>(file_shape.size()) != param.Rank) {
+                    // Allow squeezing size-1 dims (e.g., conv1d weight [D,1,K] -> [D,K]).
+                    std::vector<long> squeezed;
+                    squeezed.reserve(file_shape.size());
+                    for (long d : file_shape) {
+                        if (d != 1) squeezed.push_back(d);
+                    }
+                    bool match = (static_cast<int>(squeezed.size()) == param.Rank);
+                    for (int i = 0; match && i < param.Rank; ++i) {
+                        if (squeezed[i] != param.Sizes[i]) match = false;
+                    }
+                    if (!match) {
+                        throw std::runtime_error("DSL model: shape mismatch for '" + hf_name
+                                                 + "': file shape cannot be squeezed to target shape for param '"
+                                                 + name + "'");
+                    }
+                    entry.read_raw(param, 0, param.nelem(), allow_cast);
+                } else {
+                    entry.read_tensor(param, allow_cast);
+                }
             } else {
                 const Tensor& global = mParams->template_tensor(name);
                 const long global_rows = global.Sizes[0];

@@ -36,6 +36,14 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
         }
         return std::nullopt;
     };
+    auto get_string = [&](std::string_view key) -> std::optional<std::string> {
+        auto it = config.find(std::string(key));
+        if (it == config.end()) return std::nullopt;
+        if (auto v = std::get_if<std::string>(&it->second.value)) {
+            return *v;
+        }
+        return std::nullopt;
+    };
 
     auto d_model = get_long("d_model");
     if (!d_model) {
@@ -56,6 +64,21 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     auto d_ff = get_long("d_ff");
     if (!d_ff) {
         d_ff = get_long("intermediate_size");
+    }
+    auto mlp_activation = get_string("mlp_activation");
+    if (!mlp_activation) mlp_activation = get_string("mlp_hidden_act");
+    if (!mlp_activation) mlp_activation = get_string("activation");
+    int up_factor = 2;
+    if (mlp_activation) {
+        std::string act = *mlp_activation;
+        std::transform(act.begin(), act.end(), act.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (act == "swiglu" || act == "geglu") {
+            up_factor = 2;
+        } else if (act == "relu" || act == "relu2" || act == "gelu" || act == "gelu_new" ||
+                   act == "gelu_fast" || act == "silu" || act == "swish") {
+            up_factor = 1;
+        }
     }
     auto vocab = get_long("vocab_size");
     if (!vocab) {
@@ -91,7 +114,7 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     }
     if (d_ff) {
         env.values.emplace("M", *d_ff);
-        env.values.emplace("MUp", 2 * (*d_ff));
+        env.values.emplace("MUp", up_factor * (*d_ff));
     }
     if (vocab) {
         env.values.emplace("V", *vocab);
@@ -118,11 +141,11 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     }
     if (shared_expert_intermediate && *shared_expert_intermediate > 0) {
         env.values.emplace("SharedM", *shared_expert_intermediate);
-        env.values.emplace("SharedMUp", 2 * (*shared_expert_intermediate));
+        env.values.emplace("SharedMUp", up_factor * (*shared_expert_intermediate));
     } else if (d_ff) {
         // Default shared expert size to regular intermediate size if not specified
         env.values.emplace("SharedM", *d_ff);
-        env.values.emplace("SharedMUp", 2 * (*d_ff));
+        env.values.emplace("SharedMUp", up_factor * (*d_ff));
     }
 }
 

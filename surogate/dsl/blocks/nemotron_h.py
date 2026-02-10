@@ -13,6 +13,8 @@ Each block has the structure:
 
 from __future__ import annotations
 
+import math
+
 from ..tensor_type import Tensor
 from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
@@ -43,6 +45,7 @@ class NemotronHMamba2Block:
         eps: float = 1e-5,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
+        time_step_limit: tuple[float, float] | None = None,
         use_conv_bias: bool = True,
         use_bias: bool = False,
     ):
@@ -56,6 +59,18 @@ class NemotronHMamba2Block:
         self.eps = eps
         self.dt_min = dt_min
         self.dt_max = dt_max
+        dt_max_default = 1e9
+        if time_step_limit is None:
+            time_step_limit = (0.0, dt_max_default)
+        elif isinstance(time_step_limit, (list, tuple)) and len(time_step_limit) == 2:
+            lo = float(time_step_limit[0])
+            hi = float(time_step_limit[1])
+            if not math.isfinite(lo):
+                lo = 0.0
+            if not math.isfinite(hi):
+                hi = dt_max_default
+            time_step_limit = (lo, hi)
+        self.time_step_limit = time_step_limit
         self.use_conv_bias = use_conv_bias
         self.use_bias = use_bias
 
@@ -84,7 +99,7 @@ class NemotronHMamba2Block:
     in_proj_bias = Param(Tensor["P"], when="use_bias")
 
     # Convolution
-    conv_weight = Param(Tensor["D_conv", "K"])
+    conv_weight = Param(Tensor["D_conv", "K"], quantizable=False)
     conv_bias = Param(Tensor["D_conv"], when="use_conv_bias", quantizable=False)
 
     # SSM parameters (must be FP32 — C++ kernels use .get<float>())
@@ -137,19 +152,19 @@ class NemotronHMamba2Block:
         share_policy="fft_share",
     )
     conv_input = Activation(
-        Tensor["B", "T", "D_conv"],
+        Tensor["B", "D_conv", "T"],
         save=True,
         share_policy="fft_share",
     )
     dt = Activation(
-        Tensor["B", "T", "H"],
+        Tensor["B", "I", "T"],
         save=True,
         share_policy="fft_share",
     )
 
     # Conv output
     conv_out = Activation(
-        Tensor["B", "T", "D_conv"],
+        Tensor["B", "D_conv", "T"],
         save=True,
         recompute=True,
         recompute_from=["conv_input", "@param:conv_weight", "?@param:conv_bias"],
@@ -160,24 +175,24 @@ class NemotronHMamba2Block:
 
     # Split conv output: hidden_states, B, C
     hidden_states = Activation(
-        Tensor["B", "T", "I"],
+        Tensor["B", "I", "T"],
         save=True,
         share_policy="fft_share",
     )
     ssm_B = Activation(
-        Tensor["B", "T", "G", "N"],
+        Tensor["B", "G", "N", "T"],
         save=True,
         share_policy="fft_share",
     )
     ssm_C = Activation(
-        Tensor["B", "T", "G", "N"],
+        Tensor["B", "G", "N", "T"],
         save=True,
         share_policy="fft_share",
     )
 
     # SSM scan output
     ssm_out = Activation(
-        Tensor["B", "T", "H", "D"],
+        Tensor["B", "T", "I"],
         save=True,
         recompute=True,
         recompute_group="ssm_scan",
@@ -229,11 +244,11 @@ class NemotronHMamba2Block:
     d_ln = Gradient(Tensor["B", "T", "C"], gradient_of="ln")
     d_projected = Gradient(Tensor["B", "T", "P"], gradient_of="projected")
     d_gate = Gradient(Tensor["B", "T", "I"], gradient_of="gate")
-    d_conv_out = Gradient(Tensor["B", "T", "D_conv"], gradient_of="conv_out")
-    d_hidden_states = Gradient(Tensor["B", "T", "I"], gradient_of="hidden_states")
-    d_ssm_B = Gradient(Tensor["B", "T", "G", "N"], gradient_of="ssm_B")
-    d_ssm_C = Gradient(Tensor["B", "T", "G", "N"], gradient_of="ssm_C")
-    d_ssm_out = Gradient(Tensor["B", "T", "H", "D"], gradient_of="ssm_out")
+    d_conv_out = Gradient(Tensor["B", "D_conv", "T"], gradient_of="conv_out")
+    d_hidden_states = Gradient(Tensor["B", "I", "T"], gradient_of="hidden_states")
+    d_ssm_B = Gradient(Tensor["B", "G", "N", "T"], gradient_of="ssm_B")
+    d_ssm_C = Gradient(Tensor["B", "G", "N", "T"], gradient_of="ssm_C")
+    d_ssm_out = Gradient(Tensor["B", "T", "I"], gradient_of="ssm_out")
     d_gated_out = Gradient(Tensor["B", "T", "I"], gradient_of="gated_out")
     d_out = Gradient(Tensor["B", "T", "C"], gradient_of="out")
     d_res_in = Gradient(Tensor["B", "T", "C"], gradient_of="res_in")
@@ -268,6 +283,7 @@ class NemotronHMamba2Block:
                 intermediate_size=self.intermediate_size,
                 conv_dim=self.conv_dim,
                 num_heads=self.mamba_num_heads,
+                head_dim=self.mamba_head_dim,
                 gate_name="gate",
                 conv_input_name="conv_input",
                 dt_name="dt",
@@ -293,18 +309,13 @@ class NemotronHMamba2Block:
                 C_name="ssm_C",
             )
 
-            # Reshape for SSM scan
-            hidden_states_4d = g.view(hidden_states, shape=[B, T, self.H, self.D])
-            ssm_B_4d = g.view(ssm_B, shape=[B, T, self.G, self.N])
-            ssm_C_4d = g.view(ssm_C, shape=[B, T, self.G, self.N])
-
             # SSM scan
             ssm_out, ssm_state = g.mamba_ssm_scan(
-                hidden_states_4d, dt, "A_log", ssm_B_4d, ssm_C_4d, "D_param",
+                hidden_states, dt, "A_log", ssm_B, ssm_C, "D_param",
                 dt_bias="dt_bias",
                 dt_softplus=True,
-                dt_min=self.dt_min,
-                dt_max=self.dt_max,
+                dt_min=self.time_step_limit[0],
+                dt_max=self.time_step_limit[1],
                 chunk_size=self.chunk_size,
                 num_heads=self.mamba_num_heads,
                 head_dim=self.mamba_head_dim,
@@ -356,6 +367,7 @@ class NemotronHAttentionBlock:
         max_seq: int = 4096,
         eps: float = 1e-5,
         attention_bias: bool = False,
+        use_rope: bool = False,
     ):
         self.d_model = d_model
         self.num_query_heads = num_query_heads
@@ -364,6 +376,7 @@ class NemotronHAttentionBlock:
         self.max_seq = max_seq
         self.eps = eps
         self.attention_bias = attention_bias
+        self.use_rope = use_rope
 
         # Dimension aliases for Param shape annotations
         # Set to actual integer values for DSL shape resolution
@@ -385,7 +398,7 @@ class NemotronHAttentionBlock:
     qkv_bias = Param(Tensor["QKV"], when="attention_bias")
     out_weight = Param(Tensor["C", "AttnDim"])
     out_bias = Param(Tensor["C"], when="attention_bias")
-    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True, when="use_rope")
 
     # =========================================================================
     # Activation slots
@@ -408,14 +421,15 @@ class NemotronHAttentionBlock:
 
     qkv = Activation(
         Tensor["B", "T", "QKV"],
+        aliases=["qkv_flat"],
         save=True,
-        recompute=True,
+        recompute=False,
         recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
         recompute_op="matmul",
         recompute_attrs={"transpose": "NT"},
         recompute_policy="fft_only",
         lora_targets=["q", "k", "v"],
-        share_policy="fft_share",
+        share_policy="when_recomputed",
     )
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],
@@ -424,7 +438,8 @@ class NemotronHAttentionBlock:
         recompute_from=["qkv", "@global:freq_cis", "@input:position_ids"],
         recompute_op="rope",
         recompute_policy="fft_only",
-        share_policy="fft_share",
+        share_policy="when_recomputed",
+        when="use_rope",
     )
 
     att = Activation(
@@ -470,7 +485,7 @@ class NemotronHAttentionBlock:
 
     d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
     d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
-    d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope")
+    d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope", when="use_rope")
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_att_out = Gradient(Tensor["B", "T", "C"], gradient_of="att_out")
     d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
@@ -495,23 +510,31 @@ class NemotronHAttentionBlock:
             # QKV projection
             ln1_flat = g.view(ln1, shape=[B * T, self.C])
             if self.attention_bias:
-                qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias", transpose="NT")
+                qkv_flat = g.matmul_bias(ln1_flat, "qkv_weight", "qkv_bias",
+                                         transpose="NT", out_name="qkv_flat")
             else:
-                qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT")
-            qkv = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D], out_name="qkv")
+                qkv_flat = g.matmul(ln1_flat, "qkv_weight",
+                                    transpose="NT", out_name="qkv_flat")
+            # Keep packed QKV as [B, T, QKV] to align LoRA hooks and flash_attention expectations.
+            qkv = g.view(qkv_flat, shape=[B, T, self.QKV], out_name="qkv")
 
-            # RoPE
-            qkv_rope = g.rope(qkv, "rope_freqs", position_ids, rotary_dim=self.head_dim, out_name="qkv_rope")
+            # RoPE (optional — Nemotron-H attention does not use positional encoding)
+            if self.use_rope:
+                attn_input = g.rope(qkv, "rope_freqs", position_ids, rotary_dim=self.head_dim, out_name="qkv_rope")
+            else:
+                attn_input = qkv
 
             # FlashAttention
-            att, lse = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")
+            att, lse = g.flash_attention(attn_input, causal=True, out_name="att", lse_name="lse")
 
             # Output projection
             att_flat = g.view(att, shape=[B * T, self.AttnDim])
             if self.attention_bias:
-                att_out_flat = g.matmul_bias(att_flat, "out_weight", "out_bias", transpose="NT")
+                att_out_flat = g.matmul_bias(att_flat, "out_weight", "out_bias",
+                                             transpose="NT", out_name="att_out_flat")
             else:
-                att_out_flat = g.matmul(att_flat, "out_weight", transpose="NT")
+                att_out_flat = g.matmul(att_flat, "out_weight",
+                                        transpose="NT", out_name="att_out_flat")
             att_out = g.view(att_out_flat, shape=[B, T, self.C], out_name="att_out")
 
             return att_out, res_att
@@ -583,26 +606,28 @@ class NemotronHMLPBlock:
         recompute_from=["ln", "@param:up_weight", "?@param:up_bias"],
         recompute_op="matmul",
         recompute_attrs={"transpose": "NT"},
-        recompute_policy="fft_only",
-        share_policy="fft_share",
+        recompute_policy="always",
+        lora_targets=["up"],
+        share_policy="when_recomputed",
     )
-    mlp_act = Activation(
+    swiglu = Activation(
         Tensor["B", "T", "M"],
         save=True,
         recompute=True,
         recompute_from=["mlp_up"],
         recompute_op="relu2",  # Default for Nemotron
-        recompute_policy="fft_only",
-        share_policy="fft_share",
+        recompute_policy="always",
+        share_policy="when_recomputed",
     )
     mlp_down = Activation(
         Tensor["B", "T", "C"],
         recompute=True,
-        recompute_from=["mlp_act", "@param:down_weight"],
+        recompute_from=["swiglu", "@param:down_weight"],
         recompute_op="matmul",
         recompute_attrs={"transpose": "NT"},
-        recompute_policy="fft_only",
-        share_policy="fft_share",
+        recompute_policy="always",
+        lora_targets=["down"],
+        share_policy="when_recomputed",
     )
 
     out = Activation(
@@ -620,7 +645,7 @@ class NemotronHMLPBlock:
 
     d_ln = Gradient(Tensor["B", "T", "C"], gradient_of="ln")
     d_mlp_up = Gradient(Tensor["B", "T", "M"], gradient_of="mlp_up")
-    d_mlp_act = Gradient(Tensor["B", "T", "M"], gradient_of="mlp_act")
+    d_swiglu = Gradient(Tensor["B", "T", "M"], gradient_of="swiglu")
     d_mlp_down = Gradient(Tensor["B", "T", "C"], gradient_of="mlp_down")
     d_out = Gradient(Tensor["B", "T", "C"], gradient_of="out")
     d_res_in = Gradient(Tensor["B", "T", "C"], gradient_of="res_in")
@@ -651,20 +676,20 @@ class NemotronHMLPBlock:
 
             # Activation (relu2 for Nemotron, configurable)
             if self.activation == "relu2":
-                mlp_act = g.relu2(mlp_up, out_name="mlp_act")
+                swiglu = g.relu2(mlp_up, out_name="swiglu")
             elif self.activation == "silu":
-                mlp_act = g.silu(mlp_up, out_name="mlp_act")
+                swiglu = g.silu(mlp_up, out_name="swiglu")
             elif self.activation == "gelu":
-                mlp_act = g.gelu(mlp_up, out_name="mlp_act")
+                swiglu = g.gelu(mlp_up, out_name="swiglu")
             else:
-                mlp_act = g.relu2(mlp_up, out_name="mlp_act")  # Default
+                swiglu = g.relu2(mlp_up, out_name="swiglu")  # Default
 
             # Down projection
-            mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M])
+            swiglu_flat = g.view(swiglu, shape=[B * T, self.M])
             if self.mlp_bias:
-                out_flat = g.matmul_bias(mlp_act_flat, "down_weight", "down_bias", transpose="NT")
+                out_flat = g.matmul_bias(swiglu_flat, "down_weight", "down_bias", transpose="NT")
             else:
-                out_flat = g.matmul(mlp_act_flat, "down_weight", transpose="NT")
+                out_flat = g.matmul(swiglu_flat, "down_weight", transpose="NT")
             out = g.view(out_flat, shape=[B, T, self.C], out_name="out")
 
             return out, res_in
@@ -718,7 +743,8 @@ class NemotronHMoEBlock:
     norm_weight = Param(Tensor["C"], quantizable=False)
 
     # Router
-    router_weight = Param(Tensor["E", "C"])
+    router_weight = Param(Tensor["E", "C"], quantizable=False)
+    e_score_correction_bias = Param(Tensor["E", "fp32"], quantizable=False)
 
     # Experts (batched format)
     # offload_group="moe_experts" signals the runtime to store these on CPU
@@ -737,9 +763,9 @@ class NemotronHMoEBlock:
     ln = Activation(Tensor["B", "T", "C"])
     ln_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True)
 
-    router_logits = Activation(Tensor["B * T", "E"], save=True)
-    router_probs = Activation(Tensor["B * T", "E"], save=True)
-    routing_weights = Activation(Tensor["B * T", "K"], save=True)
+    router_logits = Activation(Tensor["B * T", "E"], dtype="fp32", save=True)
+    router_probs = Activation(Tensor["B * T", "E"], dtype="fp32", save=True)
+    routing_weights = Activation(Tensor["B * T", "K"], dtype="fp32", save=True)
     routing_indices = Activation(Tensor["B * T", "K"], dtype="int32", save=True)
 
     permuted_input = Activation(Tensor["B * T * K", "C"], save=True)
@@ -763,7 +789,8 @@ class NemotronHMoEBlock:
     # =========================================================================
 
     d_ln = Gradient(Tensor["B", "T", "C"], gradient_of="ln")
-    d_router_logits = Gradient(Tensor["B * T", "E"], gradient_of="router_logits")
+    d_router_logits = Gradient(Tensor["B * T", "E"], dtype="fp32", gradient_of="router_logits")
+    d_routing_weights = Gradient(Tensor["B * T", "K"], dtype="fp32", gradient_of="routing_weights")
     d_permuted_input = Gradient(Tensor["B * T * K", "C"], gradient_of="permuted_input")
     d_expert_up = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_up")
     d_expert_act = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_act")
@@ -795,10 +822,11 @@ class NemotronHMoEBlock:
             # Nemotron-H uses sigmoid routing
             router_probs = g.moe_sigmoid(router_logits, out_name="router_probs")
 
-            # Top-k selection with optional scaling factor
+            # Top-k selection with optional scaling factor and correction bias
             routing_weights, routing_indices = g.moe_topk(
                 router_probs, top_k=self.num_experts_per_tok, normalize=self.norm_topk_prob,
                 scaling_factor=self.routed_scaling_factor,
+                correction_bias="e_score_correction_bias",
                 weights_name="routing_weights", indices_name="routing_indices",
             )
 

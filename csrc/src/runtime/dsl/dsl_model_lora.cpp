@@ -28,6 +28,9 @@
 #include "utilities/comm.h"
 #include "utilities/safetensors.h"
 
+#include <cuda_bf16.h>
+#include <cmath>
+
 namespace dsl {
 
 // LoRA adapter export/import
@@ -210,7 +213,15 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
     const int rank = mLoRAConfig->rank;
     const int BT = B * T;
     const int qkv_features = std::max(0, mModelConfig.qkv_channels());
-    const int max_features = std::max({mModelConfig.HiddenSize, mModelConfig.IntermediateSize, qkv_features});
+    int max_features = std::max({mModelConfig.HiddenSize, mModelConfig.IntermediateSize, qkv_features});
+    if (mModelConfig.moe_config.has_value() && mModelConfig.moe_config->use_shared_expert) {
+        const int shared_D = mModelConfig.moe_config->shared_expert_size > 0
+                                 ? mModelConfig.moe_config->shared_expert_size
+                                 : (mModelConfig.moe_config->moe_intermediate_size > 0
+                                        ? mModelConfig.moe_config->moe_intermediate_size
+                                        : mModelConfig.IntermediateSize);
+        max_features = std::max(max_features, shared_D);
+    }
     const ETensorDType work_dtype = mModelConfig.DType;
 
     mLoRARunState->intermediate = mAllocator->allocate(
@@ -222,8 +233,9 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
 
     auto& rs = *mRunState;
     const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(rs.DeviceProp)));
+    // +4: [0..N-1] block sums, [N] norm, [N+1] scale, [N+2] amax, [N+3] prescale
     mLoRARunState->norm_buffer = mAllocator->allocate(
-        ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 2});
+        ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 4});
 
     if (mOptions.recompute_enabled()) {
         const int C = mModelConfig.HiddenSize;
@@ -274,51 +286,104 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     Tensor& buf = mLoRARunState->norm_buffer;
     fill_zero(buf, stream);
 
-    int grad_count = 0;
+    // Buffer layout: [0..N-1] block sums, [N] norm, [N+1] scale, [N+2] amax, [N+3] prescale
+    const long num_block_sums = buf.nelem() - 4;
+    float* amax_ptr = buf.template get<float>() + num_block_sums + 2;
+    float* prescale_ptr = buf.template get<float>() + num_block_sums + 3;
 
-    auto norm_squared = [&](const Tensor& grad) {
-        if (grad.Data) {
-            grad_count++;
-            global_norm_squared(buf, grad, grad.nelem(), rs.DeviceProp, stream);
-        }
+    // Collect all LoRA gradient tensors for the two-pass approach
+    auto collect_grad = [&](const Tensor& grad) {
+        if (!grad.Data) return;
+        // Pass 1: accumulate amax across all LoRA gradients
+        global_amax(amax_ptr, grad, grad.nelem(), rs.DeviceProp, stream);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         bool unused_acc = false;
         auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
 
-        if (g.attention.q.has_value()) { norm_squared(g.attention.q->A); norm_squared(g.attention.q->B); }
-        if (g.attention.k.has_value()) { norm_squared(g.attention.k->A); norm_squared(g.attention.k->B); }
-        if (g.attention.v.has_value()) { norm_squared(g.attention.v->A); norm_squared(g.attention.v->B); }
-        if (g.attention.o.has_value()) { norm_squared(g.attention.o->A); norm_squared(g.attention.o->B); }
-        if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A); norm_squared(g.mlp.gate->B); }
-        if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A); norm_squared(g.mlp.up->B); }
-        if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A); norm_squared(g.mlp.down->B); }
+        if (g.attention.q.has_value()) { collect_grad(g.attention.q->A); collect_grad(g.attention.q->B); }
+        if (g.attention.k.has_value()) { collect_grad(g.attention.k->A); collect_grad(g.attention.k->B); }
+        if (g.attention.v.has_value()) { collect_grad(g.attention.v->A); collect_grad(g.attention.v->B); }
+        if (g.attention.o.has_value()) { collect_grad(g.attention.o->A); collect_grad(g.attention.o->B); }
+        if (g.mlp.gate.has_value()) { collect_grad(g.mlp.gate->A); collect_grad(g.mlp.gate->B); }
+        if (g.mlp.up.has_value()) { collect_grad(g.mlp.up->A); collect_grad(g.mlp.up->B); }
+        if (g.mlp.down.has_value()) { collect_grad(g.mlp.down->A); collect_grad(g.mlp.down->B); }
         if (g.moe.use_grouped) {
-            if (g.moe.grouped.gate.has_value()) { norm_squared(g.moe.grouped.gate->A); norm_squared(g.moe.grouped.gate->B); }
-            if (g.moe.grouped.up.has_value()) { norm_squared(g.moe.grouped.up->A); norm_squared(g.moe.grouped.up->B); }
-            if (g.moe.grouped.down.has_value()) { norm_squared(g.moe.grouped.down->A); norm_squared(g.moe.grouped.down->B); }
+            if (g.moe.grouped.gate.has_value()) {
+                collect_grad(g.moe.grouped.gate->A); collect_grad(g.moe.grouped.gate->B);
+            }
+            if (g.moe.grouped.up.has_value()) {
+                collect_grad(g.moe.grouped.up->A); collect_grad(g.moe.grouped.up->B);
+            }
+            if (g.moe.grouped.down.has_value()) {
+                collect_grad(g.moe.grouped.down->A); collect_grad(g.moe.grouped.down->B);
+            }
         } else {
-            for (const auto& expert : g.moe.experts) {
-                if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
-                if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
-                if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
+            for (std::size_t ei = 0; ei < g.moe.experts.size(); ++ei) {
+                const auto& expert = g.moe.experts[ei];
+                if (expert.gate.has_value()) {
+                    collect_grad(expert.gate->A); collect_grad(expert.gate->B);
+                }
+                if (expert.up.has_value()) {
+                    collect_grad(expert.up->A); collect_grad(expert.up->B);
+                }
+                if (expert.down.has_value()) {
+                    collect_grad(expert.down->A); collect_grad(expert.down->B);
+                }
             }
         }
-
-        if (g.router.has_value()) { norm_squared(g.router->A); norm_squared(g.router->B); }
+        if (g.router.has_value()) {
+            collect_grad(g.router->A); collect_grad(g.router->B);
+        }
     }
 
-    deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);
+    // Compute prescale = 1/amax on device (no host sync needed)
+    compute_prescale(prescale_ptr, amax_ptr, stream);
+
+    // Pass 2: compute prescaled squared norm sum((g / amax)^2)
+    auto norm_squared_prescaled = [&](const Tensor& grad) {
+        if (!grad.Data) return;
+        global_norm_squared_prescaled(buf.template get<float>(), grad, grad.nelem(), prescale_ptr, rs.DeviceProp, stream);
+    };
+
+    for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+        bool unused_acc = false;
+        auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
+
+        if (g.attention.q.has_value()) { norm_squared_prescaled(g.attention.q->A); norm_squared_prescaled(g.attention.q->B); }
+        if (g.attention.k.has_value()) { norm_squared_prescaled(g.attention.k->A); norm_squared_prescaled(g.attention.k->B); }
+        if (g.attention.v.has_value()) { norm_squared_prescaled(g.attention.v->A); norm_squared_prescaled(g.attention.v->B); }
+        if (g.attention.o.has_value()) { norm_squared_prescaled(g.attention.o->A); norm_squared_prescaled(g.attention.o->B); }
+        if (g.mlp.gate.has_value()) { norm_squared_prescaled(g.mlp.gate->A); norm_squared_prescaled(g.mlp.gate->B); }
+        if (g.mlp.up.has_value()) { norm_squared_prescaled(g.mlp.up->A); norm_squared_prescaled(g.mlp.up->B); }
+        if (g.mlp.down.has_value()) { norm_squared_prescaled(g.mlp.down->A); norm_squared_prescaled(g.mlp.down->B); }
+        if (g.moe.use_grouped) {
+            if (g.moe.grouped.gate.has_value()) { norm_squared_prescaled(g.moe.grouped.gate->A); norm_squared_prescaled(g.moe.grouped.gate->B); }
+            if (g.moe.grouped.up.has_value()) { norm_squared_prescaled(g.moe.grouped.up->A); norm_squared_prescaled(g.moe.grouped.up->B); }
+            if (g.moe.grouped.down.has_value()) { norm_squared_prescaled(g.moe.grouped.down->A); norm_squared_prescaled(g.moe.grouped.down->B); }
+        } else {
+            for (const auto& expert : g.moe.experts) {
+                if (expert.gate.has_value()) { norm_squared_prescaled(expert.gate->A); norm_squared_prescaled(expert.gate->B); }
+                if (expert.up.has_value()) { norm_squared_prescaled(expert.up->A); norm_squared_prescaled(expert.up->B); }
+                if (expert.down.has_value()) { norm_squared_prescaled(expert.down->A); norm_squared_prescaled(expert.down->B); }
+            }
+        }
+        if (g.router.has_value()) { norm_squared_prescaled(g.router->A); norm_squared_prescaled(g.router->B); }
+    }
+
+    // Reduce partial block sums
+    deterministic_sum(buf.template get<float>(), buf.template get<float>(), num_block_sums, stream);
 
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
-                        
+
+    // Final: norm = amax * sqrt(prescaled_sum), with token scaling and clipping
     const bool capturing = internal::stream_is_capturing(stream);
-    global_norm_sqrt(buf.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
-                     rs.ValidTokenCount.template get<int>(), total_tokens,
-                     rs.DeviceProp, stream);
+    global_norm_sqrt_prescaled(buf.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
+                                rs.ValidTokenCount.template get<int>(), total_tokens,
+                                amax_ptr, rs.DeviceProp, stream);
     internal::record_event_if_not_capturing(rs.NormDone, stream);
 }
 
@@ -364,6 +429,11 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
                 if (expert.up.has_value()) { collect_tensor(expert.up->A); collect_tensor(expert.up->B); }
                 if (expert.down.has_value()) { collect_tensor(expert.down->A); collect_tensor(expert.down->B); }
             }
+        }
+
+        if (lora_w.moe.shared.has_value()) {
+            if (lora_w.moe.shared->up.has_value()) { collect_tensor(lora_w.moe.shared->up->A); collect_tensor(lora_w.moe.shared->up->B); }
+            if (lora_w.moe.shared->down.has_value()) { collect_tensor(lora_w.moe.shared->down->A); collect_tensor(lora_w.moe.shared->down->B); }
         }
 
         if (lora_w.router.has_value() && lora_w.router->has_value()) {
@@ -441,6 +511,11 @@ void DslModel::update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t st
                 collect_grad(expert.up);
                 collect_grad(expert.down);
             }
+        }
+
+        if (lora_g.moe.shared.has_value()) {
+            collect_grad(lora_g.moe.shared->up);
+            collect_grad(lora_g.moe.shared->down);
         }
 
         collect_grad(lora_g.router);
@@ -681,6 +756,11 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
                 }
             }
 
+            if (lora_w.moe.shared.has_value()) {
+                if (lora_w.moe.shared->up.has_value()) { add_param(lora_w.moe.shared->up->A); add_param(lora_w.moe.shared->up->B); }
+                if (lora_w.moe.shared->down.has_value()) { add_param(lora_w.moe.shared->down->A); add_param(lora_w.moe.shared->down->B); }
+            }
+
             if (lora_w.router.has_value() && lora_w.router->has_value()) {
                 add_param(lora_w.router->A);
                 add_param(lora_w.router->B);
@@ -805,6 +885,17 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
                 if (w_exp.gate.has_value() && g_exp.gate.has_value()) { update_param(w_exp.gate->A, g_exp.gate->A); update_param(w_exp.gate->B, g_exp.gate->B); }
                 if (w_exp.up.has_value() && g_exp.up.has_value()) { update_param(w_exp.up->A, g_exp.up->A); update_param(w_exp.up->B, g_exp.up->B); }
                 if (w_exp.down.has_value() && g_exp.down.has_value()) { update_param(w_exp.down->A, g_exp.down->A); update_param(w_exp.down->B, g_exp.down->B); }
+            }
+        }
+
+        if (lora_w.moe.shared.has_value() && lora_g.moe.shared.has_value()) {
+            if (lora_w.moe.shared->up.has_value() && lora_g.moe.shared->up.has_value()) {
+                update_param(lora_w.moe.shared->up->A, lora_g.moe.shared->up->A);
+                update_param(lora_w.moe.shared->up->B, lora_g.moe.shared->up->B);
+            }
+            if (lora_w.moe.shared->down.has_value() && lora_g.moe.shared->down.has_value()) {
+                update_param(lora_w.moe.shared->down->A, lora_g.moe.shared->down->A);
+                update_param(lora_w.moe.shared->down->B, lora_g.moe.shared->down->B);
             }
         }
 

@@ -130,7 +130,7 @@ public:
                         modules::LoRARunState* run_state);
 
     // Set optional weight manager for streaming/sharding
-    void set_weight_manager(DslWeightManager* weight_manager) { mWeightManager = weight_manager; }
+    void set_weight_manager(DslWeightManager* weight_manager);
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;

@@ -30,19 +30,35 @@ void CompiledExecutor::dispatch_moe_unpermute(const CompiledOp& op) {
     Tensor out = view_tensor(acts.mlp_down, {static_cast<long>(num_tokens), static_cast<long>(hidden_size)});
 
     if (expert_out.DType == ETensorDType::BF16) {
-        moe_unpermute_and_combine(out.get<nv_bfloat16>(),
-                                  expert_out.get<nv_bfloat16>(),
-                                  routing_weights.get<nv_bfloat16>(),
-                                  scatter_indices.get<int>(),
-                                  num_tokens, total_tokens, hidden_size, top_k,
-                                  mRunState.MainStream);
-    } else {
+        if (routing_weights.DType == ETensorDType::FP32) {
+            moe_unpermute_and_combine(out.get<nv_bfloat16>(),
+                                      expert_out.get<nv_bfloat16>(),
+                                      routing_weights.get<float>(),
+                                      scatter_indices.get<int>(),
+                                      num_tokens, total_tokens, hidden_size, top_k,
+                                      mRunState.MainStream);
+        } else if (routing_weights.DType == ETensorDType::BF16) {
+            moe_unpermute_and_combine(out.get<nv_bfloat16>(),
+                                      expert_out.get<nv_bfloat16>(),
+                                      routing_weights.get<nv_bfloat16>(),
+                                      scatter_indices.get<int>(),
+                                      num_tokens, total_tokens, hidden_size, top_k,
+                                      mRunState.MainStream);
+        } else {
+            throw std::logic_error("moe_unpermute: unsupported routing_weights dtype");
+        }
+    } else if (expert_out.DType == ETensorDType::FP32) {
+        if (routing_weights.DType != ETensorDType::FP32) {
+            throw std::logic_error("moe_unpermute: routing_weights dtype must match FP32 expert_out");
+        }
         moe_unpermute_and_combine(out.get<float>(),
                                   expert_out.get<float>(),
                                   routing_weights.get<float>(),
                                   scatter_indices.get<int>(),
                                   num_tokens, total_tokens, hidden_size, top_k,
                                   mRunState.MainStream);
+    } else {
+        throw std::logic_error("moe_unpermute: unsupported expert_out dtype");
     }
 
     mTensorMap[op.outputs[0].name] = out;
@@ -81,15 +97,31 @@ void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
     }
 
     if (d_output.DType == ETensorDType::BF16) {
-        moe_combine_backward(d_expert_out.get<nv_bfloat16>(),
-                             d_routing_weights.get<nv_bfloat16>(),
-                             d_output.get<nv_bfloat16>(),
-                             expert_out.get<nv_bfloat16>(),
-                             routing_weights.get<nv_bfloat16>(),
-                             scatter_indices.get<int>(),
-                             num_tokens, total_tokens, hidden_size, top_k,
-                             mRunState.MainStream);
-    } else {
+        if (routing_weights.DType == ETensorDType::FP32) {
+            moe_combine_backward(d_expert_out.get<nv_bfloat16>(),
+                                 d_routing_weights.get<float>(),
+                                 d_output.get<nv_bfloat16>(),
+                                 expert_out.get<nv_bfloat16>(),
+                                 routing_weights.get<float>(),
+                                 scatter_indices.get<int>(),
+                                 num_tokens, total_tokens, hidden_size, top_k,
+                                 mRunState.MainStream);
+        } else if (routing_weights.DType == ETensorDType::BF16) {
+            moe_combine_backward(d_expert_out.get<nv_bfloat16>(),
+                                 d_routing_weights.get<nv_bfloat16>(),
+                                 d_output.get<nv_bfloat16>(),
+                                 expert_out.get<nv_bfloat16>(),
+                                 routing_weights.get<nv_bfloat16>(),
+                                 scatter_indices.get<int>(),
+                                 num_tokens, total_tokens, hidden_size, top_k,
+                                 mRunState.MainStream);
+        } else {
+            throw std::logic_error("moe_unpermute_backward: unsupported routing_weights dtype");
+        }
+    } else if (d_output.DType == ETensorDType::FP32) {
+        if (routing_weights.DType != ETensorDType::FP32) {
+            throw std::logic_error("moe_unpermute_backward: routing_weights dtype must match FP32 d_output");
+        }
         moe_combine_backward(d_expert_out.get<float>(),
                              d_routing_weights.get<float>(),
                              d_output.get<float>(),
@@ -98,6 +130,8 @@ void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
                              scatter_indices.get<int>(),
                              num_tokens, total_tokens, hidden_size, top_k,
                              mRunState.MainStream);
+    } else {
+        throw std::logic_error("moe_unpermute_backward: unsupported d_output dtype");
     }
 
     mTensorMap[op.outputs[0].name] = d_expert_out;

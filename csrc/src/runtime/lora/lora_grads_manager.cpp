@@ -36,6 +36,12 @@ void ModularLoRAGradsManager::allocate_gradients() {
     const int kv_out = mConfig.num_kv_heads * mConfig.head_size;
     const int r = mConfig.lora_config.rank;
     const int E = mConfig.num_experts;
+    const bool use_shared_expert = mConfig.model_config &&
+                                   mConfig.model_config->moe_config.has_value() &&
+                                   mConfig.model_config->moe_config->use_shared_expert;
+    const int shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
+                             ? mConfig.model_config->moe_config->shared_expert_size
+                             : D_moe;
 
     auto alloc_full = [&](int in_f, int out_f, const std::string& name) -> LoRALayerWeights<Tensor> {
         LoRALayerWeights<Tensor> w;
@@ -99,12 +105,11 @@ void ModularLoRAGradsManager::allocate_gradients() {
             }
         }
 
-        // MoE LoRA grads: only for non-hybrid MoE block types or Dense blocks in global MoE models.
-        // Hybrid MoE blocks skip MoE LoRA — no backward hooks exist for MoE grouped GEMM
-        // in the DSL compiled executor.
-        const bool layer_is_moe = !is_hybrid &&
-                                   ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
-                                    (bt == BlockType::Dense && mConfig.is_moe));
+        // MoE LoRA grads: enable for MoE block types or Dense blocks in global MoE models.
+        // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
+        const bool layer_is_moe =
+            (bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
+            (bt == BlockType::Dense && mConfig.is_moe);
         const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
                                          (bt == BlockType::Dense && !mConfig.is_moe);
 
@@ -128,6 +133,23 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 if (mConfig.lora_config.applies_to_down()) {
                     full.moe.grouped.down = alloc_grouped_full(D_moe, C, exp_prefix + "_down");
                     shard.moe.grouped.down = alloc_grouped_shard(D_moe, C, exp_prefix + "_down_shard");
+                }
+            }
+
+            if (use_shared_expert) {
+                const bool has_shared_lora = mConfig.lora_config.applies_to_up() ||
+                                             mConfig.lora_config.applies_to_down();
+                if (has_shared_lora) {
+                    full.moe.shared.emplace();
+                    shard.moe.shared.emplace();
+                    if (mConfig.lora_config.applies_to_up()) {
+                        full.moe.shared->up = alloc_full(C, shared_D, prefix + "_shared_up");
+                        shard.moe.shared->up = alloc_shard(C, shared_D, prefix + "_shared_up_shard");
+                    }
+                    if (mConfig.lora_config.applies_to_down()) {
+                        full.moe.shared->down = alloc_full(shared_D, C, prefix + "_shared_down");
+                        shard.moe.shared->down = alloc_shard(shared_D, C, prefix + "_shared_down_shard");
+                    }
                 }
             }
 
@@ -185,6 +207,11 @@ void ModularLoRAGradsManager::start_micro_step(cudaStream_t stream, int micro_st
                     zero_layer(expert.up);
                     zero_layer(expert.down);
                 }
+            }
+
+            if (block.moe.shared.has_value()) {
+                zero_layer(block.moe.shared->up);
+                zero_layer(block.moe.shared->down);
             }
 
             // Router LoRA gradients
@@ -255,6 +282,11 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
                 all_reduce_layer(expert.up);
                 all_reduce_layer(expert.down);
             }
+        }
+
+        if (block.moe.shared.has_value()) {
+            all_reduce_layer(block.moe.shared->up);
+            all_reduce_layer(block.moe.shared->down);
         }
 
         // Router LoRA gradients

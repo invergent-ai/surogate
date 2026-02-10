@@ -170,7 +170,7 @@ std::string canonicalize_ref(const std::unordered_map<std::string, std::string>&
 }
 
 bool is_residual_name(const std::string& name) {
-    return name == "residual" || name == "res_ffn" || name == "res_att" ||
+    return name == "residual" || name == "res_ffn" || name == "res_in" || name == "res_att" ||
            name.find("residual") != std::string::npos;
 }
 
@@ -357,7 +357,9 @@ Tensor& ensure_activation(RecomputeContext& ctx, int layer_idx, const std::strin
     if (name == "expert_act") return ensure(acts.expert_act);
     if (name == "expert_down") return ensure(acts.expert_down);
     if (name == "moe_out" || name == "moe_out_flat") return ensure(acts.moe_out);
-    if (name == "res_ffn" || name == "residual_ffn") return rs.get_residual(layer_idx, stream);
+    if (name == "res_ffn" || name == "residual_ffn" || name == "res_in") {
+        return rs.get_residual(layer_idx, stream);
+    }
     throw std::runtime_error("DSL recompute: unknown activation output: " + name);
 }
 
@@ -419,7 +421,9 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
     if (name == "expert_act") return get(acts.expert_act);
     if (name == "expert_down") return get(acts.expert_down);
     if (name == "moe_out" || name == "moe_out_flat") return get(acts.moe_out);
-    if (name == "res_ffn" || name == "residual_ffn") return &rs.get_residual(layer_idx, rs.MainStream);
+    if (name == "res_ffn" || name == "residual_ffn" || name == "res_in") {
+        return &rs.get_residual(layer_idx, rs.MainStream);
+    }
     if (Tensor* t = try_saved(name)) {
         return t;
     }
@@ -873,7 +877,8 @@ void execute_fused_residual(RecomputeContext& ctx,
     // are stored in shared buffers and contain garbage. Instead, we use the saved res_ffn
     // (stored in get_residual during forward) and recompute ln1 only.
     // This applies to BOTH FFT mode and LoRA mode because both have the shared buffer problem.
-    const bool is_res_ffn_output = (res_out_name == "res_ffn" || res_out_name == "residual_ffn");
+    const bool is_res_ffn_output = (res_out_name == "res_ffn" || res_out_name == "residual_ffn" ||
+                                    res_out_name == "res_in");
 
     if (is_res_ffn_output) {
         // ln1_fused group: Recompute ln1 only from saved res_ffn[layer_idx] and ln1_rstd[layer_idx].
@@ -1166,8 +1171,6 @@ void execute_flash_attention(RecomputeContext& ctx,
     const int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
     const int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
     const int Hs = static_cast<int>(ctx.cfg.head_size());
-    const bool cudnn_gqa_ok = (Hq == Hkv);
-
     if (!ctx.rs.scratch().cudnn_workspace.Data) {
         ctx.rs.temp_acquire(ctx.rs.scratch().cudnn_workspace);
     }
@@ -1178,15 +1181,11 @@ void execute_flash_attention(RecomputeContext& ctx,
         ? *qkv
         : view_tensor(*qkv, {B, T, Hq + 2 * Hkv, Hs});
 
-    if (!cudnn_gqa_ok) {
-        attention_forward_custom(att_view, lse_view, qkv_view,
-                                 static_cast<int>(B), static_cast<int>(T),
-                                 Hq, Hkv, Hs, ctx.rs.MainStream);
-    } else {
-        attention_forward_cudnn(att_view, lse_view, qkv_view, ctx.rs.scratch().cudnn_workspace,
-                                ctx.rs.CudnnHandle, static_cast<int>(B), static_cast<int>(T),
-                                Hq, Hkv, Hs, ctx.rs.MainStream);
-    }
+    // Match the main forward path: always use the cuDNN-backed implementation.
+    // The cuDNN wrapper already falls back to the custom kernel for FP32.
+    attention_forward_cudnn(att_view, lse_view, qkv_view, ctx.rs.scratch().cudnn_workspace,
+                            ctx.rs.CudnnHandle, static_cast<int>(B), static_cast<int>(T),
+                            Hq, Hkv, Hs, ctx.rs.MainStream);
 }
 
 void execute_swiglu(RecomputeContext& ctx,
@@ -1306,6 +1305,14 @@ void execute_moe_topk(RecomputeContext& ctx,
     Tensor& weights = *out_w->second;
     Tensor& indices = *out_i->second;
 
+    // Optional correction bias
+    const float* correction_bias = nullptr;
+    Tensor* bias_tensor = nullptr;
+    if (auto it = inputs.tensors.find("e_score_correction_bias"); it != inputs.tensors.end()) {
+        bias_tensor = it->second;
+        correction_bias = bias_tensor->get<float>();
+    }
+
     const int num_tokens = static_cast<int>(probs->Sizes[0]);
     const int num_experts = static_cast<int>(probs->Sizes[1]);
     const int top_k = resolve_top_k(op.attrs, ctx.cfg);
@@ -1315,11 +1322,13 @@ void execute_moe_topk(RecomputeContext& ctx,
         moe_topk_forward(indices.get<int>(),
                          weights.get<nv_bfloat16>(),
                          probs->get<nv_bfloat16>(),
+                         correction_bias,
                          num_tokens, num_experts, top_k, normalize, ctx.rs.MainStream);
     } else {
         moe_topk_forward(indices.get<int>(),
                          weights.get<float>(),
                          probs->get<float>(),
+                         correction_bias,
                          num_tokens, num_experts, top_k, normalize, ctx.rs.MainStream);
     }
 }
@@ -1873,7 +1882,7 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         for (const auto& op : mPlan.topo_ops) {
             // Check for ln1_fused group (res_ffn output) - these need prev residual in FFT mode
             for (const auto& out : op.outputs) {
-                if (out == "res_ffn" || out == "residual_ffn") {
+                if (out == "res_ffn" || out == "residual_ffn" || out == "res_in") {
                     has_ln1_fused_group = true;
                     break;
                 }
@@ -1881,7 +1890,7 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             for (const auto& raw : op.inputs) {
                 std::string stripped;
                 is_optional_ref(raw, stripped);
-                if (stripped == "res_ffn" || stripped == "residual_ffn") {
+                if (stripped == "res_ffn" || stripped == "residual_ffn" || stripped == "res_in") {
                     needs_residual = true;
                 }
                 std::string input_name;

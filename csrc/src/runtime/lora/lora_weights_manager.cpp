@@ -60,6 +60,12 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     const int Hs = mConfig.head_size;
     const int q_out = Hq * Hs;
     const int kv_out = Hkv * Hs;
+    const bool use_shared_expert = mConfig.model_config &&
+                                   mConfig.model_config->moe_config.has_value() &&
+                                   mConfig.model_config->moe_config->use_shared_expert;
+    const int shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
+                             ? mConfig.model_config->moe_config->shared_expert_size
+                             : mConfig.effective_moe_intermediate();
 
     auto& master = mMaster.blocks[layer_idx];
     auto& work = mWork.blocks[layer_idx];
@@ -101,12 +107,11 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         }
     }
 
-    // MoE LoRA: only for non-hybrid MoE block types or Dense blocks in global MoE models.
-    // Hybrid MoE blocks skip MoE LoRA — no backward hooks exist for MoE grouped GEMM
-    // in the DSL compiled executor.
-    const bool layer_is_moe = !is_hybrid &&
-                               ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
-                                (bt == BlockType::Dense && mConfig.is_moe));
+    // MoE LoRA: enable for MoE block types or Dense blocks in global MoE models.
+    // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
+    const bool layer_is_moe =
+        (bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
+        (bt == BlockType::Dense && mConfig.is_moe);
     // Dense MLP LoRA: only for Dense (non-MoE) or MLP block types
     const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
                                      (bt == BlockType::Dense && !mConfig.is_moe);
@@ -127,6 +132,27 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
             master.router.emplace();
             work.router.emplace();
             allocate_layer_weights(*master.router, *work.router, /*in=*/C, /*out=*/E, router_prefix);
+        }
+
+        if (use_shared_expert) {
+            const bool has_shared_lora = mConfig.lora_config.applies_to_up() ||
+                                         mConfig.lora_config.applies_to_down();
+            if (has_shared_lora) {
+                master.moe.shared.emplace();
+                work.moe.shared.emplace();
+                if (mConfig.lora_config.applies_to_up()) {
+                    master.moe.shared->up.emplace();
+                    work.moe.shared->up.emplace();
+                    allocate_layer_weights(*master.moe.shared->up, *work.moe.shared->up,
+                                           /*in=*/C, /*out=*/shared_D, prefix + "_shared_up");
+                }
+                if (mConfig.lora_config.applies_to_down()) {
+                    master.moe.shared->down.emplace();
+                    work.moe.shared->down.emplace();
+                    allocate_layer_weights(*master.moe.shared->down, *work.moe.shared->down,
+                                           /*in=*/shared_D, /*out=*/C, prefix + "_shared_down");
+                }
+            }
         }
     } else if (layer_is_dense_mlp) {
         if (mConfig.lora_config.applies_to_gate()) {
@@ -234,6 +260,12 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
     const int D_moe = mConfig.effective_moe_intermediate();
+    const bool use_shared_expert = mConfig.model_config &&
+                                   mConfig.model_config->moe_config.has_value() &&
+                                   mConfig.model_config->moe_config->use_shared_expert;
+    const int shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
+                             ? mConfig.model_config->moe_config->shared_expert_size
+                             : D_moe;
     const int q_out = mConfig.num_query_heads * mConfig.head_size;
     const int E = mConfig.num_experts;
 
@@ -264,6 +296,11 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
                 init_layer(expert.up, C, expert_base + 1);
                 init_layer(expert.down, D_moe, expert_base + 2);
             }
+        }
+
+        if (b.moe.shared.has_value()) {
+            init_layer(b.moe.shared->up, C, base + 100);
+            init_layer(b.moe.shared->down, shared_D, base + 101);
         }
     }
 
@@ -361,6 +398,11 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
         }
     }
 
+    if (work.moe.shared.has_value() && master.moe.shared.has_value()) {
+        sync_layer(work.moe.shared->up, master.moe.shared->up, "moe_shared_up");
+        sync_layer(work.moe.shared->down, master.moe.shared->down, "moe_shared_down");
+    }
+
     // Sync router LoRA (when train_router is enabled)
     sync_layer(work.router, master.router, "router");
 
@@ -385,6 +427,12 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
     const std::size_t q_out = Hq * Hs;
     const std::size_t kv_out = Hkv * Hs;
     const std::size_t E = static_cast<std::size_t>(mConfig.num_experts);
+    const bool use_shared_expert = mConfig.model_config &&
+                                   mConfig.model_config->moe_config.has_value() &&
+                                   mConfig.model_config->moe_config->use_shared_expert;
+    const std::size_t shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
+                                     ? static_cast<std::size_t>(mConfig.model_config->moe_config->shared_expert_size)
+                                     : D_moe;
 
     std::size_t per_layer = 0;
 
@@ -402,6 +450,11 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
         if (mConfig.lora_config.applies_to_up()) per_expert += r * C + D_moe * r;
         if (mConfig.lora_config.applies_to_down()) per_expert += r * D_moe + C * r;
         per_layer += per_expert * E;
+
+        if (use_shared_expert) {
+            if (mConfig.lora_config.applies_to_up()) per_layer += r * C + shared_D * r;
+            if (mConfig.lora_config.applies_to_down()) per_layer += r * shared_D + C * r;
+        }
 
         // Router LoRA parameters (when train_router is enabled)
         // Router shape: (hidden_size -> num_experts), so lora_A: (r, C), lora_B: (E, r)
@@ -507,6 +560,18 @@ void ModularLoRAWeightsManager::iterate_tensors(
                     callback(expert_prefix + ".down_proj.lora_A.weight", expert.down->A);
                     callback(expert_prefix + ".down_proj.lora_B.weight", expert.down->B);
                 }
+            }
+        }
+
+        if (block.moe.shared.has_value()) {
+            std::string shared_prefix = fmt::format("{}.mlp.shared_experts", prefix);
+            if (block.moe.shared->up.has_value()) {
+                callback(shared_prefix + ".up_proj.lora_A.weight", block.moe.shared->up->A);
+                callback(shared_prefix + ".up_proj.lora_B.weight", block.moe.shared->up->B);
+            }
+            if (block.moe.shared->down.has_value()) {
+                callback(shared_prefix + ".down_proj.lora_A.weight", block.moe.shared->down->A);
+                callback(shared_prefix + ".down_proj.lora_B.weight", block.moe.shared->down->B);
             }
         }
 

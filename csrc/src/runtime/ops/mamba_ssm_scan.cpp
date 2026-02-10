@@ -79,16 +79,38 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
 
     // Call selective scan forward
     mamba_selective_scan_forward(out, u, delta, A, B_ssm, C_ssm, D_expanded, dt_bias_expanded,
+                                  op.attrs.dt_min, op.attrs.dt_max,
                                   x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
 
     // Transpose output from [B, D, T] to [B, T, D] for downstream ops (gated RMSNorm, out_proj)
     // which expect standard [B, T, D] layout.  Gate from split_proj is [B, T, I] physical,
     // so SSM output must also be [B, T, D] physical to match for element-wise operations.
-    Tensor out_btd = mRunState.temp_alloc(out.DType, {B, T, D});
-    mTemps.push_back(out_btd);
-    mamba_transpose_bdt_to_btd(out_btd, out, B, T, D, mRunState.MainStream);
+    const long expected = static_cast<long>(B) * T * D;
+    auto shape_matches = [](const TensorRef& ref, long expected_nelem) -> bool {
+        if (ref.shape.empty()) return false;
+        long prod = 1;
+        for (auto d : ref.shape) {
+            if (d <= 0) return false;
+            prod *= d;
+        }
+        return prod == expected_nelem;
+    };
 
-    mTensorMap[op.outputs[0].name] = out_btd;
+    Tensor* out_ptr = nullptr;
+    if (shape_matches(op.outputs[0], expected)) {
+        Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
+        if (out_ref.nelem() == expected) {
+            out_ptr = &out_ref;
+        }
+    }
+    if (!out_ptr) {
+        Tensor out_btd = mRunState.temp_alloc(out.DType, {B, T, D});
+        mTemps.push_back(out_btd);
+        out_ptr = &mTemps.back();
+    }
+
+    mamba_transpose_bdt_to_btd(*out_ptr, out, B, T, D, mRunState.MainStream);
+    mTensorMap[op.outputs[0].name] = *out_ptr;
 
     // Optionally save ssm_state for backward
     if (op.outputs.size() > 1) {
@@ -174,6 +196,7 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     // Call selective scan backward (using transposed d_out in [B, D, T] layout)
     mamba_selective_scan_backward(du, ddelta, dA, dB, dC, &dD_expanded, &ddelta_bias_expanded,
                                    u, delta, A, B_ssm, C_ssm, D_expanded, dt_bias_expanded,
+                                   op.attrs.dt_min, op.attrs.dt_max,
                                    d_out_bdt, x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
 
     // Reduce expanded gradients back to per-head

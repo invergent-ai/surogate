@@ -781,18 +781,28 @@ class GraphBuilder:
         top_k: int,
         normalize: bool = True,
         scaling_factor: float = 1.0,
+        correction_bias: str | GraphRef | None = None,
         weights_name: str | None = None,
         indices_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
-        """MoE top-k selection. Returns (weights, indices)."""
+        """MoE top-k selection. Returns (weights, indices).
+
+        Args:
+            correction_bias: Optional per-expert bias for expert selection (e.g.,
+                e_score_correction_bias). When provided, expert selection uses
+                (score + bias) but routing weights use original unbiased scores.
+        """
         weights = weights_name or self._fresh_name("moe_weights")
         indices = indices_name or self._fresh_name("moe_indices")
         attrs: dict = {"top_k": top_k, "normalize": normalize}
         if scaling_factor != 1.0:
             attrs["scaling_factor"] = scaling_factor
+        inputs = [self._resolve_input(probs)]
+        if correction_bias is not None:
+            inputs.append(self._resolve_input(correction_bias))
         self._add_node(GraphNode(
             op="moe_topk",
-            inputs=[self._resolve_input(probs)],
+            inputs=inputs,
             outputs=[weights, indices],
             attrs=attrs,
         ))
@@ -934,13 +944,13 @@ class GraphBuilder:
         """Causal 1D convolution for Mamba.
 
         Args:
-            x: Input tensor [B, T, D_conv]
+            x: Input tensor [B, D_conv, T]
             weight: Conv weight [D_conv, kernel_size]
             bias: Optional conv bias [D_conv]
             activation: Activation function ("silu" or "swish")
 
         Returns:
-            Convolved output [B, T, D_conv]
+            Convolved output [B, D_conv, T]
         """
         out = out_name or self._fresh_name("mamba_conv")
         inputs = [self._resolve_input(x), self._resolve_input(weight)]
@@ -966,7 +976,7 @@ class GraphBuilder:
         dt_bias: str | GraphRef | None = None,
         dt_softplus: bool = True,
         dt_min: float = 0.0,
-        dt_max: float = float("inf"),
+        dt_max: float = 1e9,
         chunk_size: int = 256,
         num_heads: int = 0,
         head_dim: int = 0,
@@ -978,11 +988,11 @@ class GraphBuilder:
         """Mamba2 State Space Model scan.
 
         Args:
-            hidden_states: Input [B, T, H, D]
-            dt: Time step [B, T, H]
+            hidden_states: Input [B, I, T]
+            dt: Time step [B, I, T]
             A_log: Log of state decay [H]
-            B: Input-to-state [B, T, G, N]
-            C: State-to-output [B, T, G, N]
+            B: Input-to-state [B, G, N, T]
+            C: State-to-output [B, G, N, T]
             D: Skip connection [H]
             dt_bias: Time step bias [H]
             dt_softplus: Apply softplus to dt
@@ -1074,6 +1084,7 @@ class GraphBuilder:
         intermediate_size: int,
         conv_dim: int,
         num_heads: int,
+        head_dim: int,
         gate_name: str | None = None,
         conv_input_name: str | None = None,
         dt_name: str | None = None,
@@ -1084,7 +1095,8 @@ class GraphBuilder:
             projected: Input projection output [B, T, P]
             intermediate_size: Gate size
             conv_dim: Conv input size
-            num_heads: Number of heads (dt size)
+            num_heads: Number of heads (dt size in projection)
+            head_dim: Dimension per head (dt expanded from num_heads to num_heads * head_dim)
 
         Returns:
             (gate, conv_input, dt)
@@ -1100,6 +1112,7 @@ class GraphBuilder:
                 "intermediate_size": intermediate_size,
                 "conv_dim": conv_dim,
                 "num_heads": num_heads,
+                "head_dim": head_dim,
             },
         ))
         return self._make_outputs([gate, conv_input, dt])
@@ -1119,7 +1132,7 @@ class GraphBuilder:
         """Split conv output into hidden_states, B, C.
 
         Args:
-            conv_out: Conv output [B, T, conv_dim]
+            conv_out: Conv output [B, conv_dim, T]
             intermediate_size: Hidden states size
             groups_state_size: n_groups * ssm_state_size
             n_groups: Number of SSM groups
@@ -1165,7 +1178,7 @@ class GraphBuilder:
         eps: float = 1e-5,
         activation: str = "silu",
         dt_min: float = 0.0,
-        dt_max: float = float("inf"),
+        dt_max: float = 1e9,
         out_name: str | None = None,
     ) -> GraphRef:
         """Fused Mamba2 forward: conv + SSM scan + gated norm + out proj."""

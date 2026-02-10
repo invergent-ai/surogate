@@ -1,1 +1,1 @@
-from . import (chatml, llama, qwen)
+from . import (chatml, llama, qwen, nvidia)

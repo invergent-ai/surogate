@@ -11,12 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <atomic>
-#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -197,10 +194,6 @@ int env_int(const char* name, int fallback) {
     }
     return static_cast<int>(out);
 }
-
-namespace {  // Reopen anonymous namespace for internal helpers
-
-}  // namespace
 
 // ============================================================================
 // Operation type conversion
@@ -568,12 +561,9 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             }
             if (base_field == "mlp_down" || base_field == "mlp_down_flat") return acts.mlp_down;
             if (base_field == "res_att" || base_field == "residual_att") return acts.residual_att;
-            if (base_field == "res_ffn" || base_field == "residual_ffn") {
-                auto it2 = mTensorMap.find(name);
-                if (it2 != mTensorMap.end()) {
-                    return it2->second;
-                }
-                return std::nullopt;
+            if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
+                Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
+                return res;
             }
             if (base_field == "router_logits") return acts.router_logits;
             if (base_field == "router_probs") return acts.router_probs;
@@ -622,7 +612,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         const long Hs = mConfig.head_size();
         const long QKV = Hs * (Hq + 2 * Hkv);
         const long AttnDim = Hq * Hs;
-        const long MUp = 2 * D;
+        const long MUp = mConfig.mlp_up_rows();
 
         std::vector<long> shape;
         if (base_field == "qkv_flat" || base_field == "qkv_biased") {
@@ -638,7 +628,8 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         } else if (base_field == "mlp_down_flat") {
             shape = {B * T, C};
         } else if (base_field == "ln1" || base_field == "ln2" || base_field == "res_att" ||
-                   base_field == "res_ffn" || base_field == "att_out" || base_field == "mlp_down") {
+                   base_field == "res_ffn" || base_field == "res_in" || base_field == "att_out" ||
+                   base_field == "mlp_down") {
             shape = {B, T, C};
         } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd") {
             shape = {B, T};
@@ -752,12 +743,34 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         return mSlotRegistry->is_shared(strip_ssa_suffix(name));
     };
 
+    auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
+        if (!mSlotRegistry) {
+            return std::nullopt;
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(name, layer_idx, field)) {
+            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
+                return entry->slot == TensorSlot::Mapped;
+            }
+        }
+        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
+            return entry->slot == TensorSlot::Mapped;
+        }
+        return std::nullopt;
+    };
+
     auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
         if (force_persist) {
             return true;
         }
-        if (!recompute_enabled || prefer_live) {
+        if (prefer_live) {
             return false;
+        }
+        auto mapped = is_mapped_slot(name);
+        if (mapped.has_value() && mapped.value()) {
+            // Slot resolves to Mapped: no persistent buffer, so saved data must be copied.
+            return true;
         }
         auto shared = is_shared_slot(name);
         if (shared.has_value()) {
@@ -896,7 +909,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_down, prefer_live, false);
             } else if (field == "res_att" || field == "residual_att") {
                 save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).residual_att, prefer_live, false);
-            } else if (field == "res_ffn" || field == "residual_ffn") {
+            } else if (field == "res_ffn" || field == "residual_ffn" || field == "res_in") {
                 // res_ffn is the residual stream after FFN block (residual_att + mlp_down)
                 Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
                 save_tensor_with_policy(name, res, prefer_live, false);
@@ -1022,7 +1035,7 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
         if (field == "expert_act") return map_view(acts.expert_act);
         if (field == "expert_down") return map_view(acts.expert_down);
         if (field == "moe_out" || field == "moe_out_flat") return map_view(acts.moe_out);
-        if (field == "res_ffn" || field == "residual_ffn") {
+        if (field == "res_ffn" || field == "residual_ffn" || field == "res_in") {
             Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
             return map_view(res);
         }
@@ -1427,6 +1440,129 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
         }
     };
+    auto persist_saved_layer_tensors = [&](int layer_idx) {
+        if (!mSaved || !mSaveList) {
+            return;
+        }
+        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+        auto resolve_saved_source = [&](const std::string& name) -> std::optional<Tensor> {
+            // Prefer exact match from the tensor map.
+            auto it = mTensorMap.find(name);
+            if (it != mTensorMap.end() && it->second.Data) {
+                return it->second;
+            }
+            // Fall back to SSA-suffixed entries.
+            auto ssa_suffix = [](const std::string& key) -> int {
+                auto pos = key.rfind('_');
+                if (pos == std::string::npos || pos + 1 >= key.size()) {
+                    return -1;
+                }
+                int value = 0;
+                for (std::size_t i = pos + 1; i < key.size(); ++i) {
+                    char c = key[i];
+                    if (c < '0' || c > '9') {
+                        return -1;
+                    }
+                    value = value * 10 + (c - '0');
+                }
+                return value;
+            };
+            int best_suffix = -1;
+            const Tensor* best = nullptr;
+            for (const auto& kv : mTensorMap) {
+                if (strip_ssa_suffix(kv.first) != name || !kv.second.Data) {
+                    continue;
+                }
+                const int suffix = ssa_suffix(kv.first);
+                if (!best || suffix > best_suffix) {
+                    best = &kv.second;
+                    best_suffix = suffix;
+                }
+            }
+            if (best) {
+                return *best;
+            }
+
+            int resolved_layer = -1;
+            std::string field;
+            if (!parse_block_param(name, resolved_layer, field)) {
+                return std::nullopt;
+            }
+            const std::string base_field = strip_ssa_suffix(field);
+            auto& acts = mRunState.simplified_acts(resolved_layer);
+            if (base_field == "ln1_rstd" || base_field == "ln_rstd") return acts.ln1_rstd;
+            if (base_field == "ln2_rstd") return acts.ln2_rstd;
+            if (base_field == "q_rstd") return acts.q_rstd;
+            if (base_field == "k_rstd") return acts.k_rstd;
+            if (base_field == "lse") return acts.lse;
+            if (base_field == "ln1" || base_field == "ln1_flat" ||
+                base_field == "ln" || base_field == "ln_flat") return acts.ln1;
+            if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
+            if (base_field == "qkv") return acts.qkv;
+            if (base_field == "qkv_rope") {
+                Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+                return src;
+            }
+            if (base_field == "qkv_flat") {
+                Tensor qkv = acts.qkv;
+                return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+            }
+            if (base_field == "att" || base_field == "att_flat") return acts.att;
+            if (base_field == "att_out" || base_field == "att_out_flat") return acts.att_out;
+            if (base_field == "mlp_up" || base_field == "mlp_up_flat") return acts.mlp_up;
+            if (base_field == "swiglu") return acts.swiglu;
+            if (base_field == "swiglu_flat") {
+                Tensor swiglu = acts.swiglu;
+                return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+            }
+            if (base_field == "mlp_down" || base_field == "mlp_down_flat") return acts.mlp_down;
+            if (base_field == "res_att" || base_field == "residual_att") return acts.residual_att;
+            if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
+                Tensor& res = mRunState.get_residual(resolved_layer, mRunState.MainStream);
+                return res;
+            }
+            return std::nullopt;
+        };
+        int saved_count = 0;
+        for (const auto& name : *mSaveList) {
+            if (name.rfind(prefix, 0) != 0) {
+                continue;
+            }
+            if (mSaved->find(name) != mSaved->end()) {
+                continue;
+            }
+            auto src_opt = resolve_saved_source(name);
+            if (!src_opt.has_value()) {
+                continue;
+            }
+            const Tensor& src = *src_opt;
+            if (!src.Data || !mRunState.Stack.owns(src.Data)) {
+                continue;
+            }
+            const size_t bytes = src.bytes();
+            if (bytes == 0) {
+                continue;
+            }
+            auto buf_it = mMoESavedBuffers.find(name);
+            if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+                if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                    CUDA_CHECK(cudaFree(buf_it->second));
+                }
+                void* new_buffer = nullptr;
+                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+                mMoESavedBuffers[name] = new_buffer;
+                mMoESavedSizes[name] = bytes;
+            }
+            void* dst_buffer = mMoESavedBuffers[name];
+            CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            Tensor saved_tensor = src;
+            saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
+            (*mSaved)[name] = saved_tensor;
+            mTensorMap[name] = saved_tensor;
+            saved_count++;
+        }
+    };
 
     // Bind known inputs
     mTensorMap["token_ids"] = mRunState.Inputs;
@@ -1574,28 +1710,15 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             throw std::runtime_error(oss.str());
         }
 
-        // Debug: sync after each op to pinpoint CUDA errors
-        if (env_enabled("SUROGATE_SYNC_OPS")) {
-            auto err = cudaDeviceSynchronize();
-            if (err != cudaSuccess) {
-                fprintf(stderr, "[SYNC_CHECK] CUDA error after op %zu (type=%s): %s\n",
-                        idx, op_type_to_string(op.type), cudaGetErrorString(err));
-                throw std::runtime_error(
-                    fmt::format("CUDA error after op {} (type={}): {}",
-                                idx, op_type_to_string(op.type), cudaGetErrorString(err)));
-            }
-        }
-
         // Handle layer end
         if (op.layer_end >= 0) {
-            // Note: Forward activation stats are not printed because with recompute_block=true,
-            // the activation buffers are shared across layers, so they only contain the last
-            // layer's data at this point, not the per-layer values.
             if (op.layer_end < num_layers &&
                 layer_active[static_cast<std::size_t>(op.layer_end)]) {
                 if (mConfig.NumExperts > 0) {
                     save_moe_layer_tensors(op.layer_end);
                 }
+                // Persist stack-backed saved tensors for this layer before the stack is restored.
+                persist_saved_layer_tensors(op.layer_end);
                 mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
                 if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
                     mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
@@ -2313,18 +2436,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     oss << "CompiledExecutor: unsupported backward op type at idx " << idx
                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
                     throw std::runtime_error(oss.str());
-                }
-            }
-
-            // Debug: sync after each backward op to pinpoint CUDA errors
-            if (env_enabled("SUROGATE_SYNC_OPS")) {
-                auto err = cudaDeviceSynchronize();
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "[BWD_SYNC] CUDA error after BWD_OP %zu (type=%s, id=%s): %s\n",
-                            idx, op_type_to_string(op.type), op.op_id.c_str(), cudaGetErrorString(err));
-                    throw std::runtime_error(
-                        fmt::format("CUDA error after BWD_OP {} (type={}, id={}): {}",
-                                    idx, op_type_to_string(op.type), op.op_id, cudaGetErrorString(err)));
                 }
             }
 

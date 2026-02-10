@@ -704,6 +704,27 @@ void global_norm_squared(Tensor& out, const Tensor& values, size_t count, const 
     }
 }
 
+void global_amax(float* out, const Tensor& values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (values.DType == ETensorDType::FP32) {
+        global_amax(out, values.get<float>(), count, dp, stream);
+    } else if (values.DType == ETensorDType::BF16) {
+        global_amax(out, values.get<nv_bfloat16>(), count, dp, stream);
+    } else {
+        throw std::logic_error("global_amax: unsupported dtype");
+    }
+}
+
+void global_norm_squared_prescaled(float* out, const Tensor& values, size_t count, const float* prescale_device,
+                                    const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (values.DType == ETensorDType::FP32) {
+        global_norm_squared_prescaled(out, values.get<float>(), count, prescale_device, dp, stream);
+    } else if (values.DType == ETensorDType::BF16) {
+        global_norm_squared_prescaled(out, values.get<nv_bfloat16>(), count, prescale_device, dp, stream);
+    } else {
+        throw std::logic_error("global_norm_squared_prescaled: unsupported dtype");
+    }
+}
+
 
 /**
  * @brief Transposes a 2D tensor asynchronously on a CUDA stream.

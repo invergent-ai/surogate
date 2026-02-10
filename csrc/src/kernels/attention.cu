@@ -15,7 +15,6 @@
 
 #include <cmath>
 #include <cstdio>
-
 #include <cooperative_groups.h>
 #include "kernels/kernels.h"
 #include "utilities/tensor.h"
@@ -294,6 +293,7 @@ cudaError_t attention_gpu_forward(floatX* out, float* stats, float scale,
             out, stats, scale, qkv,  B, T, Hq, Hkv);
     } else {
         printf("Unsupported head dimension");
+        return cudaErrorInvalidValue;
     }
     return cudaGetLastError();
 }
@@ -365,6 +365,7 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
             dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv);
     } else {
         printf("Unsupported head dimension");
+        return cudaErrorInvalidValue;
     }
     return cudaGetLastError();
 }

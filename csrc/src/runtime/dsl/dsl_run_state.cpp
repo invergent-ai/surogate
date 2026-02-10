@@ -22,10 +22,20 @@
 #include "runtime/core/fp8_scaling_config.h"
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/core/matmul_context.h"
+#include "runtime/core/model_config.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
 namespace dsl {
+
+namespace {
+int resolve_mlp_up_factor(const PretrainedConfig& cfg) {
+    if (auto* model_cfg = dynamic_cast<const modules::ModelConfig*>(&cfg)) {
+        return model_cfg->mlp_up_factor();
+    }
+    return 2;
+}
+}  // namespace
 
 DslRunState::DslRunState(const PretrainedConfig& config,
                          const DslRuntimeConfig& runtime_config,
@@ -189,13 +199,13 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const long AttnDim = Hq * D;
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
-    const long MUp = 2 * M;
+    const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
     const long NumExperts = mRuntimeConfig.num_experts;
     const long TopK = (mRuntimeConfig.num_experts_per_tok > 0) ? mRuntimeConfig.num_experts_per_tok : 1;
     const long MoeM = (mRuntimeConfig.moe_intermediate_size > 0)
         ? mRuntimeConfig.moe_intermediate_size
         : cfg.IntermediateSize;
-    const long MoeMUp = 2 * MoeM;
+    const long MoeMUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * MoeM;
     const bool use_qk_norm = mRuntimeConfig.use_qk_norm;
 
     const auto dtype = mActivationDtype;
@@ -385,7 +395,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const long AttnDim = Hq * D;
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
-    const long MUp = 2 * M;
+    const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
 
     const auto dtype = mGradDtype;
     const auto kind = EAllocationType::ON_DEVICE;
@@ -595,7 +605,7 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
     const long AttnDim = Hq * D;
     const long QKV = D * (Hq + 2 * Hkv);
     const long M = cfg.IntermediateSize;
-    const long MUp = 2 * M;
+    const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
 
     if (mEnableFp8Forward) {
         modules::allocate_fp8_forward_buffers(
@@ -655,7 +665,7 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         ETensorDType::BYTE, "rmsnorm_scratch", EAllocationType::ON_DEVICE, {rmsnorm_scratch_bytes});
 
     const long M = cfg.IntermediateSize;
-    const long MUp = 2 * M;
+    const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
     const long V = cfg.VocabSize;
     const long max_bias_channels = std::max<long>(QKV, std::max<long>(C, std::max<long>(MUp, V)));
     const long bias_scratch_bytes =

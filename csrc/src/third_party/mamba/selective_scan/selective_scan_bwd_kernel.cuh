@@ -442,18 +442,27 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             }
         }
 
-        if constexpr (kDeltaSoftplus) {
+        {
             __syncthreads();
             input_t delta_vals_load[kNItems];
             load_input<Ktraits>(delta, delta_vals_load, smem_load, params.seqlen - chunk * kChunkSize);
             delta -= kChunkSize;
             #pragma unroll
             for (int i = 0; i < kNItems; ++i) {
-                float delta_val = float(delta_vals_load[i]) + delta_bias;
-                float delta_val_neg_exp = expf(-delta_val);
-                ddelta_vals[i] = delta_val <= 20.f
-                    ? ddelta_vals[i] / (1.f + delta_val_neg_exp)
-                    : ddelta_vals[i];
+                float delta_pre = float(delta_vals_load[i]) + delta_bias;
+                float delta_soft = delta_pre;
+                if constexpr (kDeltaSoftplus) {
+                    delta_soft = delta_pre <= 20.f ? log1pf(expf(delta_pre)) : delta_pre;
+                }
+                float grad = ddelta_vals[i];
+                if (delta_soft < params.delta_min || delta_soft > params.delta_max) {
+                    grad = 0.f;
+                }
+                if constexpr (kDeltaSoftplus) {
+                    float delta_pre_neg_exp = expf(-delta_pre);
+                    grad = delta_pre <= 20.f ? grad / (1.f + delta_pre_neg_exp) : grad;
+                }
+                ddelta_vals[i] = grad;
             }
         }
         for (int i = 0; i < kNItems; ++i) { ddelta_bias_val += ddelta_vals[i]; }

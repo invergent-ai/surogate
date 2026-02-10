@@ -948,6 +948,22 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
             if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
         };
+        auto add_grouped_layer = [&](const std::string& module_prefix,
+                                     const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& layer) {
+            if (!layer.has_value()) return;
+            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
+        };
+        auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+            auto to_lower = [](std::string_view in) {
+                std::string out(in);
+                for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return out;
+            };
+            const std::string h = to_lower(haystack);
+            const std::string n = to_lower(needle);
+            return h.find(n) != std::string::npos;
+        };
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("get_lora_gradients: DSL model required");
@@ -956,32 +972,72 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             throw std::runtime_error("get_lora_gradients: DSL model is not configured for LoRA");
         }
         const auto& config = *ctx.Model->get_run_state().Config;
+        const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
+                                 contains_ci(config.ArchitectureName, "nemotron") ||
+                                 contains_ci(config.ModelTypeName, "nemotron");
         const bool is_moe = dsl_model->is_moe_model();
         CUDA_CHECK(cudaDeviceSynchronize());
 
         for (int l = 0; l < config.NumLayers; ++l) {
             bool unused_accumulate = false;
             auto& block = dsl_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-            std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
+            std::string prefix;
+            if (is_nemotron) {
+                prefix = fmt::format("base_model.model.backbone.layers.{}", l);
+            } else {
+                prefix = fmt::format("base_model.model.model.layers.{}", l);
+            }
 
             // Attention LoRA (same for dense and MoE)
-            add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-            add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-            add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-            add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            if (is_nemotron) {
+                const std::string mixer_prefix = prefix + ".mixer";
+                add_layer(mixer_prefix + ".q_proj", block.attention.q);
+                add_layer(mixer_prefix + ".k_proj", block.attention.k);
+                add_layer(mixer_prefix + ".v_proj", block.attention.v);
+                add_layer(mixer_prefix + ".o_proj", block.attention.o);
+            } else {
+                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            }
 
             if (is_moe) {
+                if (block.moe.use_grouped) {
+                    std::string expert_prefix;
+                    if (is_nemotron) {
+                        expert_prefix = fmt::format("{}.mixer.experts", prefix);
+                    } else {
+                        expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                    }
+                    add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                    add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
+                    add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+                } else {
                 for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
                     auto& expert = block.moe.experts[e];
-                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                    std::string expert_prefix;
+                    if (is_nemotron) {
+                        expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+                    } else {
+                        expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                    }
                     add_layer(expert_prefix + ".gate_proj", expert.gate);
                     add_layer(expert_prefix + ".up_proj", expert.up);
                     add_layer(expert_prefix + ".down_proj", expert.down);
                 }
+                }
             } else {
-                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                if (is_nemotron) {
+                    const std::string mixer_prefix = prefix + ".mixer";
+                    add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
+                    add_layer(mixer_prefix + ".up_proj", block.mlp.up);
+                    add_layer(mixer_prefix + ".down_proj", block.mlp.down);
+                } else {
+                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                }
             }
         }
         CUDA_CHECK(cudaDeviceSynchronize());

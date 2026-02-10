@@ -101,9 +101,8 @@ __device__ void rmsnorm_forward_kernel(floatX* __restrict__ out, float* __restri
         x128 out_data;
         for(int k = 0; k < x128::size; ++k) {
             float n = s * (float)in_data[k]; // normalized output
-            // Note: would make sense to do this in fp32, but transformers uses bf16 here,
-            // so we try to match
-            out_data[k] = (floatX)n * (floatX)w[k]; // scale
+            float w_val = (float)w[k];
+            out_data[k] = (floatX)(n * w_val); // scale in fp32 then cast
             if (abs_max_ptr) {
                 thread_abs_max = fmaxf(thread_abs_max, fabsf(out_data[k]));
             }
@@ -157,7 +156,6 @@ __device__ void fused_residual_rmsnorm_forward_kernel(floatX* residual, floatX* 
     // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
     // let's keep everything as x128
     x128* s_weight = reinterpret_cast<x128*>(params);
-    x128* s_res = reinterpret_cast<x128*>(params) + ((1 + threadIdx.y) * C / x128::size);
 
     int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
     for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
@@ -188,7 +186,6 @@ __device__ void fused_residual_rmsnorm_forward_kernel(floatX* residual, floatX* 
             sum_squared += (float)out[k] * (float)out[k];
         }
         out.store(residual + c);   // TODO cs
-        s_res[c / x128::size] = out;
     }
 
     sum_squared = warpReduceSum(sum_squared) / C;
@@ -196,12 +193,15 @@ __device__ void fused_residual_rmsnorm_forward_kernel(floatX* residual, floatX* 
     float thread_abs_max = 0.f;
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
+        const x128 in1 = x128::load_cs(inp1 + c);
+        const x128 in2 = x128::load_cs(inp2 + c);
         const x128 w = s_weight[c / x128::size];
         x128 out;
         for(int k = 0; k < x128::size; ++k) {
-            float n = s * (float)res[k]; // normalized output
-            out[k] = (floatX)n * (floatX)w[k]; // scale
+            float res_f = (float)in1[k] + (float)in2[k];
+            float n = s * res_f; // normalized output
+            float w_val = (float)w[k];
+            out[k] = (floatX)(n * w_val); // scale in fp32 then cast
             if (abs_max_ptr) {
                 thread_abs_max = fmaxf(thread_abs_max, fabsf(out[k]));
             }
@@ -322,7 +322,8 @@ __device__ void rmsnorm_forward_quant_kernel(__nv_fp8_e4m3* __restrict__ out, fl
         f8v_t packed_out;
         for(int k = 0; k < x128::size; ++k) {
             float n = s * (float)in_data[k];  // normalize
-            float scaled = (float)((floatX)n * (floatX)w[k]);  // scale by weight
+            float w_val = (float)w[k];
+            float scaled = n * w_val;  // scale by weight in fp32
             __nv_fp8_e4m3 quant;
             quant.__x = __nv_cvt_float_to_fp8(scale * scaled, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
             packed_out[k] = quant;
@@ -431,9 +432,9 @@ __global__ void rmsnorm_apply_saved_kernel(floatX* __restrict__ out,
     out += row * C;
 
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
-        // Match forward kernel precision: normalize in FP32, then multiply in floatX
         float n = s * (float)inp[c];  // normalize in FP32
-        out[c] = (floatX)n * weight[c];  // convert to floatX then multiply by floatX weight
+        float w_val = (float)weight[c];
+        out[c] = (floatX)(n * w_val);  // scale in FP32 then cast
     }
 }
 
@@ -482,12 +483,9 @@ __global__ void fused_residual_rmsnorm_apply_saved_kernel(floatX* __restrict__ r
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         float r = (float)inp1[c] + (float)inp2[c];
         residual[c] = (floatX)r;
-        // CRITICAL: Match forward kernel precision exactly.
-        // Forward stores residual as floatX then reads back, losing precision.
-        // We must do the same: read back the stored floatX value before normalization.
-        float res_back = (float)residual[c];  // Read back from floatX storage
-        float n = res_back * s;               // Normalize the rounded value
-        normed[c] = (floatX)n * weight[c];
+        float n = r * s;  // normalize using fp32 residual
+        float w_val = (float)weight[c];
+        normed[c] = (floatX)(n * w_val);
     }
 }
 

@@ -186,12 +186,16 @@ __device__ __forceinline__ void topk_insert(float* vals, int* idxs, float val, i
 // Warp-level tournament top-K selection.
 // Each lane scans its stripe of experts, maintains a local sorted top-K,
 // then 5 rounds of shuffle-based merging produce the global top-K on all lanes.
+// When correction_bias is non-null, selection is based on (score + bias) but
+// the values stored in out_vals are the biased scores (caller must re-read
+// original scores after if needed).
 template<int K, typename T>
 __device__ __forceinline__ void warp_topk(
     const T* __restrict__ token_scores,
     int num_experts,
     float* out_vals,
-    int* out_idxs
+    int* out_idxs,
+    const float* __restrict__ correction_bias = nullptr
 ) {
     const int lane = threadIdx.x & (MOE_WARP_SIZE - 1);
 
@@ -208,8 +212,10 @@ __device__ __forceinline__ void warp_topk(
     // Each lane processes experts at stride MOE_WARP_SIZE
     for (int e = lane; e < num_experts; e += MOE_WARP_SIZE) {
         float val = static_cast<float>(token_scores[e]);
-        if (val > my_vals[K - 1]) {
-            topk_insert<K>(my_vals, my_idxs, val, e);
+        // Use biased score for selection if correction_bias is provided
+        float selection_val = correction_bias ? (val + correction_bias[e]) : val;
+        if (selection_val > my_vals[K - 1]) {
+            topk_insert<K>(my_vals, my_idxs, selection_val, e);
         }
     }
 
@@ -265,11 +271,14 @@ __device__ __forceinline__ void warp_topk(
 }
 
 // Warp-per-token top-K kernel. Packs multiple warps per block.
+// When correction_bias is non-null, expert selection uses (score + bias) but
+// routing weights are computed from the original unbiased scores.
 template<typename T, int K>
 __global__ void moe_topk_forward_kernel(
     int* __restrict__ expert_indices,      // (num_tokens, top_k)
     T* __restrict__ routing_weights,       // (num_tokens, top_k)
     const T* __restrict__ scores,          // (num_tokens, num_experts)
+    const float* __restrict__ correction_bias,  // (num_experts) or nullptr
     int num_tokens,
     int num_experts,
     int top_k,
@@ -283,10 +292,21 @@ __global__ void moe_topk_forward_kernel(
 
     const T* token_scores = scores + token_idx * num_experts;
 
-    // Warp-cooperative top-K selection
+    // Warp-cooperative top-K selection (uses biased scores if bias present)
     float topk_vals[MOE_TOPK_MAX_K];
     int topk_idxs[MOE_TOPK_MAX_K];
-    warp_topk<K>(token_scores, num_experts, topk_vals, topk_idxs);
+    warp_topk<K>(token_scores, num_experts, topk_vals, topk_idxs, correction_bias);
+
+    // If correction_bias was used, topk_vals contain biased scores.
+    // Re-read original unbiased scores for the selected experts (used for weights).
+    if (correction_bias) {
+        for (int k = 0; k < top_k; k++) {
+            int idx = topk_idxs[k];
+            if (idx >= 0 && idx < num_experts) {
+                topk_vals[k] = static_cast<float>(token_scores[idx]);
+            }
+        }
+    }
 
     // Optionally normalize weights (sum of selected scores → 1).
     // Must sum over top_k (runtime), not K (template), since K may be larger
@@ -558,6 +578,66 @@ __global__ void moe_unpermute_and_combine_kernel(
     int expert_pos[MAX_K];
     for (int k = 0; k < top_k && k < MAX_K; k++) {
         w[k] = static_cast<float>(weights_ptr[k]);
+        int assignment_idx = token_idx * top_k + k;
+        expert_pos[k] = scatter_indices[assignment_idx];
+    }
+
+    // Vectorized accumulation with 128-bit loads/stores
+    int d = threadIdx.x * x128::size;
+    for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+        x128 acc_vec;
+        for (int i = 0; i < x128::size; i++) {
+            acc_vec[i] = static_cast<T>(0);
+        }
+
+        for (int k = 0; k < top_k && k < MAX_K; k++) {
+            if (expert_pos[k] < 0 || expert_pos[k] >= total_tokens) continue;
+            x128 val = x128::load(expert_out + expert_pos[k] * hidden_size + d);
+            for (int i = 0; i < x128::size; i++) {
+                acc_vec[i] = static_cast<T>(static_cast<float>(acc_vec[i]) + w[k] * static_cast<float>(val[i]));
+            }
+        }
+
+        acc_vec.store(dst + d);
+    }
+
+    // Scalar remainder
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 0; k < top_k && k < MAX_K; k++) {
+            if (expert_pos[k] < 0 || expert_pos[k] >= total_tokens) continue;
+            acc += w[k] * static_cast<float>(expert_out[expert_pos[k] * hidden_size + r]);
+        }
+        dst[r] = static_cast<T>(acc);
+    }
+}
+
+// Unpermute and weight-combine expert outputs back to token order (FP32 routing weights)
+template<typename T>
+__global__ void moe_unpermute_and_combine_kernel_mixed(
+    T* __restrict__ out,                    // (num_tokens, hidden_size)
+    const T* __restrict__ expert_out,       // (total_tokens, hidden_size)
+    const float* __restrict__ routing_weights,  // (num_tokens, top_k) in FP32
+    const int* __restrict__ scatter_indices, // (total_tokens,)
+    int num_tokens,
+    int total_tokens,
+    int hidden_size,
+    int top_k
+) {
+    using x128 = GenericVector<T, 16/sizeof(T)>;
+
+    int token_idx = blockIdx.x;
+    if (token_idx >= num_tokens) return;
+
+    T* dst = out + token_idx * hidden_size;
+    const float* weights_ptr = routing_weights + token_idx * top_k;
+
+    // Pre-load routing weights and expert positions into registers
+    constexpr int MAX_K = 8;
+    float w[MAX_K];
+    int expert_pos[MAX_K];
+    for (int k = 0; k < top_k && k < MAX_K; k++) {
+        w[k] = weights_ptr[k];
         int assignment_idx = token_idx * top_k + k;
         expert_pos[k] = scatter_indices[assignment_idx];
     }
@@ -939,6 +1019,7 @@ static void moe_topk_forward_dispatch(
     int* expert_indices,
     T* routing_weights,
     const T* scores,
+    const float* correction_bias,
     int num_tokens,
     int num_experts,
     int top_k,
@@ -954,21 +1035,21 @@ static void moe_topk_forward_dispatch(
     switch (top_k) {
     case 1:
         moe_topk_forward_kernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
         break;
     case 2:
         moe_topk_forward_kernel<T, 2><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
         break;
     case 4:
         moe_topk_forward_kernel<T, 4><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
         break;
     default:
         // K=8 covers top_k 3,5,6,7,8 — the merge always produces K entries,
         // but we only write top_k of them via the lane < top_k guard.
         moe_topk_forward_kernel<T, 8><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
         break;
     }
 }
@@ -977,13 +1058,14 @@ void moe_topk_forward(
     int* expert_indices,
     nv_bfloat16* routing_weights,
     const nv_bfloat16* scores,
+    const float* correction_bias,
     int num_tokens,
     int num_experts,
     int top_k,
     bool normalize_weights,
     cudaStream_t stream
 ) {
-    moe_topk_forward_dispatch(expert_indices, routing_weights, scores,
+    moe_topk_forward_dispatch(expert_indices, routing_weights, scores, correction_bias,
                               num_tokens, num_experts, top_k, normalize_weights, stream);
 }
 
@@ -991,13 +1073,14 @@ void moe_topk_forward(
     int* expert_indices,
     float* routing_weights,
     const float* scores,
+    const float* correction_bias,
     int num_tokens,
     int num_experts,
     int top_k,
     bool normalize_weights,
     cudaStream_t stream
 ) {
-    moe_topk_forward_dispatch(expert_indices, routing_weights, scores,
+    moe_topk_forward_dispatch(expert_indices, routing_weights, scores, correction_bias,
                               num_tokens, num_experts, top_k, normalize_weights, stream);
 }
 
@@ -1176,6 +1259,25 @@ void moe_unpermute_and_combine(
     int block_size = 256;
     int grid_size = num_tokens;
     moe_unpermute_and_combine_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+        out, expert_out, routing_weights, scatter_indices,
+        num_tokens, total_tokens, hidden_size, top_k
+    );
+}
+
+void moe_unpermute_and_combine(
+    nv_bfloat16* out,
+    const nv_bfloat16* expert_out,
+    const float* routing_weights,
+    const int* scatter_indices,
+    int num_tokens,
+    int total_tokens,
+    int hidden_size,
+    int top_k,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = num_tokens;
+    moe_unpermute_and_combine_kernel_mixed<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
         out, expert_out, routing_weights, scatter_indices,
         num_tokens, total_tokens, hidden_size, top_k
     );
@@ -2820,6 +2922,89 @@ __global__ void moe_combine_backward_kernel(
     }
 }
 
+// Backward through unpermute+combine with FP32 routing weights and BF16 expert outputs.
+// d_expert_outputs[permuted_idx] = routing_weights[token, k] * d_output[token]
+template<typename T>
+__global__ void moe_combine_backward_kernel_mixed(
+    T* __restrict__ d_expert_out,          // (total_tokens, hidden_size)
+    float* __restrict__ d_routing_weights, // (num_tokens, top_k) - optional, can be NULL
+    const T* __restrict__ d_output,        // (num_tokens, hidden_size)
+    const T* __restrict__ expert_out,      // (total_tokens, hidden_size) - for weight gradient
+    const float* __restrict__ routing_weights, // (num_tokens, top_k) in FP32
+    const int* __restrict__ scatter_indices,  // (total_tokens,)
+    int num_tokens,
+    int total_tokens,
+    int hidden_size,
+    int top_k
+) {
+    using x128 = GenericVector<T, 16/sizeof(T)>;
+
+    int token_idx = blockIdx.x;
+    if (token_idx >= num_tokens) return;
+
+    const T* d_out = d_output + token_idx * hidden_size;
+    const float* weights = routing_weights + token_idx * top_k;
+
+    // For each expert assigned to this token
+    for (int k = 0; k < top_k; k++) {
+        int assignment_idx = token_idx * top_k + k;
+        int expert_pos = scatter_indices[assignment_idx];
+
+        T* d_exp_out = d_expert_out + expert_pos * hidden_size;
+        float weight = weights[k];
+
+        // d_expert_out[expert_pos] = weight * d_output[token]
+        // Vectorized 128-bit loads/stores
+        int d = threadIdx.x * x128::size;
+        for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+            x128 grad_in = x128::load(d_out + d);
+            x128 grad_out;
+            for (int i = 0; i < x128::size; i++) {
+                grad_out[i] = static_cast<T>(weight * static_cast<float>(grad_in[i]));
+            }
+            grad_out.store(d_exp_out + d);
+        }
+        // Scalar remainder
+        for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+            d_exp_out[r] = static_cast<T>(weight * static_cast<float>(d_out[r]));
+        }
+
+        // Compute gradient w.r.t. routing weights (if needed)
+        // d_routing_weights[token, k] = dot(expert_out[expert_pos], d_output[token])
+        if (d_routing_weights != nullptr) {
+            const T* exp_out = expert_out + expert_pos * hidden_size;
+            float thread_dot = 0.0f;
+            int dv = threadIdx.x * x128::size;
+            for (; dv + x128::size <= hidden_size; dv += blockDim.x * x128::size) {
+                x128 ev = x128::load(exp_out + dv);
+                x128 dv_out = x128::load(d_out + dv);
+                for (int i = 0; i < x128::size; i++) {
+                    thread_dot += static_cast<float>(ev[i]) * static_cast<float>(dv_out[i]);
+                }
+            }
+            for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
+                thread_dot += static_cast<float>(exp_out[r]) * static_cast<float>(d_out[r]);
+            }
+            // Warp-level reduction
+            thread_dot = warpReduceSum(thread_dot);
+            // Block-level reduction
+            __shared__ float smem_dot[32];
+            int warp_id = threadIdx.x / 32;
+            int lane_id = threadIdx.x % 32;
+            if (lane_id == 0) smem_dot[warp_id] = thread_dot;
+            __syncthreads();
+            if (warp_id == 0) {
+                float val = (lane_id < (blockDim.x / 32)) ? smem_dot[lane_id] : 0.0f;
+                val = warpReduceSum(val);
+                if (lane_id == 0) {
+                    d_routing_weights[assignment_idx] = val;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // Backward through permute: gather gradient back to original token order
 // d_input[token] += d_permuted[permuted_idx] for each assignment
 // FP32 version - uses native atomicAdd
@@ -2944,6 +3129,27 @@ void moe_combine_backward(
     int block_size = 256;
     int grid_size = num_tokens;
     moe_combine_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+        d_expert_out, d_routing_weights, d_output, expert_out,
+        routing_weights, scatter_indices, num_tokens, total_tokens, hidden_size, top_k
+    );
+}
+
+void moe_combine_backward(
+    nv_bfloat16* d_expert_out,
+    float* d_routing_weights,
+    const nv_bfloat16* d_output,
+    const nv_bfloat16* expert_out,
+    const float* routing_weights,
+    const int* scatter_indices,
+    int num_tokens,
+    int total_tokens,
+    int hidden_size,
+    int top_k,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int grid_size = num_tokens;
+    moe_combine_backward_kernel_mixed<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
         d_expert_out, d_routing_weights, d_output, expert_out,
         routing_weights, scatter_indices, num_tokens, total_tokens, hidden_size, top_k
     );

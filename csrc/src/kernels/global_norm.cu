@@ -189,6 +189,152 @@ __global__ void global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_c
 
 
 // ----------------------------------------------------------------------------
+// Prescaled norm kernels (overflow-safe for large BF16 gradients)
+//
+// When BF16 gradients have very large values (e.g., ~1e18 from Mamba backward pass),
+// sum(g^2) overflows FP32. The prescaled approach uses:
+//   1. Find amax = max(|g_i|) across all gradients
+//   2. Compute sum((g_i / amax)^2) — each term <= 1.0, no overflow
+//   3. norm = amax * sqrt(sum)
+
+/**
+ * @brief Atomic max for non-negative floats using integer CAS.
+ *
+ * For non-negative IEEE 754 floats, the integer representation is
+ * monotonically increasing, so integer atomicMax gives float max.
+ */
+__device__ void atomicMaxFloat(float* addr, float val) {
+    if (val <= 0.f) return;
+    int* addr_as_int = reinterpret_cast<int*>(addr);
+    int val_as_int = __float_as_int(val);
+    int old = *addr_as_int;
+    while (val_as_int > old) {
+        old = atomicCAS(addr_as_int, old, val_as_int);
+    }
+}
+
+/**
+ * @brief Kernel to find max absolute value across a tensor.
+ *
+ * Uses warp/block reduction + atomicMax. Output must be zeroed before first call.
+ */
+template<class T>
+__global__ void global_amax_kernel(float* out, const T* data, size_t count) {
+    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float local_max = 0.f;
+    for (size_t i = index; i < count; i += grid_width) {
+        float val = fabsf((float)data[i]);
+        if (val > local_max) local_max = val;
+    }
+
+    cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+    auto warp = cooperative_groups::tiled_partition<32>(block);
+    for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+        float other = warp.shfl_xor(local_max, offset);
+        if (other > local_max) local_max = other;
+    }
+
+    __shared__ float shared_max[32];
+    if (warp.thread_rank() == 0) {
+        shared_max[warp.meta_group_rank()] = local_max;
+    }
+    __syncthreads();
+
+    if (warp.meta_group_rank() == 0) {
+        float val = warp.thread_rank() < warp.meta_group_size() ? shared_max[warp.thread_rank()] : 0.f;
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            float other = warp.shfl_xor(val, offset);
+            if (other > val) val = other;
+        }
+        if (threadIdx.x == 0) {
+            atomicMaxFloat(out, val);
+        }
+    }
+}
+
+/**
+ * @brief Prescaled squared norm kernel.
+ *
+ * Computes sum((x * prescale)^2) where prescale is read from device memory.
+ * Each prescaled element has |value| <= 1.0, preventing FP32 overflow.
+ */
+template<class T>
+__global__ void global_norm_squared_prescaled_kernel(float* out, const T* data, size_t count,
+                                                      const float* prescale_device) {
+    const float prescale = *prescale_device;
+    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float accumulator = 0.f;
+    for (size_t i = index; i < count; i += grid_width) {
+        float val = (float)data[i] * prescale;
+        accumulator += val * val;
+    }
+
+    cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+    auto warp = cooperative_groups::tiled_partition<32>(block);
+    accumulator = reduce_group_add(warp, accumulator);
+    __shared__ float shared_accumulator[32];
+    if (warp.thread_rank() == 0) {
+        shared_accumulator[warp.meta_group_rank()] = accumulator;
+    }
+    __syncthreads();
+    float total = warp.thread_rank() < warp.meta_group_size() ? shared_accumulator[warp.thread_rank()] : 0.f;
+    total = reduce_group_add(warp, total);
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = out[blockIdx.x] + total;
+    }
+}
+
+/**
+ * @brief Computes prescale = 1/amax on device.
+ */
+__global__ void compute_prescale_kernel(float* prescale_out, const float* amax_in) {
+    float amax = *amax_in;
+    *prescale_out = (amax > 1e-30f) ? (1.0f / amax) : 1.0f;
+}
+
+/**
+ * @brief Final norm computation with prescale correction.
+ *
+ * The accumulated squared norm was prescaled: sum((x/amax)^2).
+ * True norm = amax * sqrt(sum).
+ */
+__global__ void global_norm_sqrt_prescaled_kernel(float* out, float* out_cpu, float grad_clip,
+                                                   const int* valid_token_count, float total_tokens,
+                                                   const float* amax_device) {
+    (void)total_tokens;
+
+    float n_squared_prescaled = out[0];
+    float amax = *amax_device;
+    float norm = amax * std::sqrt(n_squared_prescaled);
+
+    float token_scale = 1.0f;
+    if (valid_token_count) {
+        int valid = *valid_token_count;
+        if (valid > 0) {
+            token_scale = 1.0f / static_cast<float>(valid);
+        }
+    }
+
+    float scaled_norm = norm * token_scale;
+
+    float clip_scale = 1.0f;
+    if (grad_clip > 0.f && scaled_norm > 0.f && scaled_norm > grad_clip) {
+        clip_scale = grad_clip / scaled_norm;
+    }
+
+    float total_scale = token_scale * clip_scale;
+
+    out[0] = scaled_norm;
+    out[1] = total_scale;
+    if (out_cpu) {
+        *out_cpu = scaled_norm;
+    }
+}
+
+
+// ----------------------------------------------------------------------------
 // kernel launcher
 
 /**
@@ -315,5 +461,62 @@ void deterministic_sum(float* out, const float* values, std::size_t count, cudaS
  */
 void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count, cudaStream_t stream) {
     deterministic_sum_kernel<<<1, 512, 0, stream>>>(out, values, count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// --- Prescaled norm wrappers ---
+
+template<typename T>
+void global_amax_imp(float* out, const T* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
+    const int block_size = 512;
+    const int max_grid_size = get_max_num_block_sums(dp);
+    const int max_useful_blocks = div_ceil(count, (size_t)block_size);
+    const int grid_size = std::min(max_grid_size, max_useful_blocks);
+    if (grid_size <= 0) return;
+    global_amax_kernel<<<grid_size, block_size, 0, stream>>>(out, values, count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void global_amax(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
+    global_amax_imp(out, values, count, dp, stream);
+}
+
+void global_amax(float* out, const nv_bfloat16* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
+    global_amax_imp(out, values, count, dp, stream);
+}
+
+void compute_prescale(float* prescale_out, const float* amax_in, cudaStream_t stream) {
+    compute_prescale_kernel<<<1, 1, 0, stream>>>(prescale_out, amax_in);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename T>
+void global_norm_squared_prescaled_imp(float* out, const T* values, size_t count, const float* prescale_device,
+                                        const cudaDeviceProp& dp, cudaStream_t stream) {
+    const int block_size = 512;
+    const int max_grid_size = get_max_num_block_sums(dp);
+    const int max_useful_blocks = div_ceil(count, (size_t)block_size);
+    const int grid_size = std::min(max_grid_size, max_useful_blocks);
+    if (grid_size <= 0) return;
+    global_norm_squared_prescaled_kernel<<<grid_size, block_size, 0, stream>>>(out, values, count, prescale_device);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void global_norm_squared_prescaled(float* out, const float* values, size_t count, const float* prescale_device,
+                                    const cudaDeviceProp& dp, cudaStream_t stream) {
+    global_norm_squared_prescaled_imp(out, values, count, prescale_device, dp, stream);
+}
+
+void global_norm_squared_prescaled(float* out, const nv_bfloat16* values, size_t count, const float* prescale_device,
+                                    const cudaDeviceProp& dp, cudaStream_t stream) {
+    global_norm_squared_prescaled_imp(out, values, count, prescale_device, dp, stream);
+}
+
+void global_norm_sqrt_prescaled(float* out, float* out_cpu, float grad_clip,
+                                 const int* valid_token_count, float total_tokens,
+                                 const float* amax_device,
+                                 const cudaDeviceProp& dp, cudaStream_t stream) {
+    (void)dp;
+    global_norm_sqrt_prescaled_kernel<<<1, 1, 0, stream>>>(out, out_cpu, grad_clip, valid_token_count, total_tokens, amax_device);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -1,8 +1,10 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
@@ -232,7 +234,29 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     Tensor& d_output = resolve_tensor(op.inputs[0]);
     Tensor& inp = resolve_tensor(op.inputs[1]);
     Tensor& weights = resolve_tensor(op.inputs[2]);
-    Tensor& d_input = ensure_output_tensor(op.outputs[0]);
+    // Output shape for MoE backward can be dynamic (B*T*K, M). Use input shape when
+    // compiled shape is missing or mismatched to avoid incorrect allocations.
+    auto needs_dynamic = [&](const TensorRef& out_ref, const Tensor& in) -> bool {
+        if (out_ref.shape.empty()) return true;
+        if (in.Rank <= 0) return false;
+        if (static_cast<int>(out_ref.shape.size()) != in.Rank) return true;
+        for (int i = 0; i < in.Rank; ++i) {
+            if (out_ref.shape[i] != in.Sizes[i]) return true;
+        }
+        return false;
+    };
+    Tensor d_input_local;
+    Tensor* d_input_ptr = nullptr;
+    if (needs_dynamic(op.outputs[0], inp)) {
+        std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
+        d_input_local = mRunState.temp_alloc(inp.DType, shape);
+        mTemps.push_back(d_input_local);
+        auto [it, _] = mTensorMap.insert_or_assign(op.outputs[0].name, d_input_local);
+        d_input_ptr = &it->second;
+    } else {
+        d_input_ptr = &ensure_output_tensor(op.outputs[0]);
+    }
+    Tensor& d_input = *d_input_ptr;
     int layer_idx = op.attrs.layer_idx;
     if (layer_idx < 0 && !op.inputs.empty()) {
         std::string_view name = op.inputs[0].name;

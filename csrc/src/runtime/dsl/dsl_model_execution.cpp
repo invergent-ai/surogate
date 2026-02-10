@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
-#include <iostream>
 
 #include "kernels/kernels.h"
 #include "runtime/core/forward_hooks.h"
@@ -22,9 +21,9 @@
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/optimizers/adamw_8bit.h"
 #include "utilities/comm.h"
+#include "utilities/dtype.h"
 
 namespace dsl {
-
 void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
@@ -59,6 +58,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         const float scaling = mLoRAConfig->scaling();
         const float dropout = mLoRAConfig->dropout;
         const bool is_training = mLoRARunState->is_training;
+        const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
 
         // Helper to compute unique dropout seed per layer and projection type
         auto get_dropout_seed = [&](int proj_type) -> unsigned int {
@@ -107,15 +107,16 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
                 }
             } break;
             case modules::ForwardHookPoint::AfterMLPUpProjection: {
+                Tensor& ln2_input = acts.ln2.Data ? acts.ln2 : acts.ln1;
                 if (lora_block.mlp.up.has_value()) {
-                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
+                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, ln2_input, lora_block.mlp.up.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(4), is_training,
                                                     B * T, C, D, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
-                if (lora_block.mlp.gate.has_value()) {
-                    modules::detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
+                if (gated_mlp && lora_block.mlp.gate.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, D, ln2_input, lora_block.mlp.gate.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, dropout, get_dropout_seed(5), is_training,
                                                     B * T, C, D, rank,
@@ -163,6 +164,7 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
         const int Hs = (int)cfg.head_size();
         const int rank = mLoRAConfig->rank;
         const float scaling = mLoRAConfig->scaling();
+        const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
 
         auto& acts = rs.simplified_acts(layer_idx);
         auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
@@ -202,15 +204,16 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
                 }
             } break;
             case modules::ForwardHookPoint::AfterMLPUpProjection: {
+                Tensor& ln2_input = acts.ln2.Data ? acts.ln2 : acts.ln1;
                 if (lora_block.mlp.up.has_value()) {
-                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
+                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, ln2_input, lora_block.mlp.up.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, D, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
-                if (lora_block.mlp.gate.has_value()) {
-                    modules::detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
+                if (gated_mlp && lora_block.mlp.gate.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, D, ln2_input, lora_block.mlp.gate.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
                                                     scaling, 0.0f, 0, false,
                                                     B * T, C, D, rank,
@@ -266,6 +269,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
         const float dropout = mLoRAConfig->dropout;
         const bool is_training = mLoRARunState->is_training;
         const int micro_step = mLoRARunState->micro_step;
+        const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
 
         // Helper to compute unique dropout seed per layer and projection type
         auto get_dropout_seed = [&](int proj_type) -> unsigned int {
@@ -311,6 +315,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
+                Tensor& d_ln2 = da.d_ln2.Data ? da.d_ln2 : da.d_ln1;
 
                 // Get ln2 input: either from stored activation or recompute from residual stream
                 // LN2 input is residual_att = res_ffn[L-1] + att_out[L]
@@ -345,50 +350,71 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                         ln2_input = recompute_lora_rmsnorm(*mLoRARunState, ln2_residual, ln2_weight,
                                                           mModelConfig.RmsNormEps, B, T, C, stream);
                     } else {
-                        ln2_input = a.ln2;
+                        ln2_input = a.ln2.Data ? a.ln2 : a.ln1;
                     }
                 } else {
-                    ln2_input = a.ln2;
+                    ln2_input = a.ln2.Data ? a.ln2 : a.ln1;
                 }
 
                 // Prepare gradient tensors (use empty tensor if projection not enabled)
                 Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
                 modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
 
-                if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
+                if (gated_mlp) {
+                    if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
+                        dA_up = lora_grads.mlp.up->A;
+                        dB_up = lora_grads.mlp.up->B;
+                        lora_up = *lora_block.mlp.up;
+                    }
+                    if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
+                        dA_gate = lora_grads.mlp.gate->A;
+                        dB_gate = lora_grads.mlp.gate->B;
+                        lora_gate = *lora_block.mlp.gate;
+                    }
+
+                    if (!dA_up.Data && !dA_gate.Data) break;
+
+                    // Projection types: 4=Up, 5=Gate
+                    modules::detail::backward_lora_mlp_up_gate_fused(
+                        dA_up, dB_up,
+                        dA_gate, dB_gate,
+                        d_ln2,
+                        da.d_mlp_up,
+                        ln2_input,
+                        lora_up, lora_gate,
+                        mLoRAConfig->scaling(),
+                        dropout, get_dropout_seed(4), get_dropout_seed(5), is_training,
+                        B * T,
+                        C,
+                        D,
+                        rank,
+                        lora_accum,
+                        mLoRARunState->intermediate,
+                        mLoRARunState->intermediate2,
+                        mLoRARunState->slice,
+                        rs.CublasLtHandle,
+                        rs.CuBlasWorkspace,
+                        stream);
+                } else {
+                    if (!lora_block.mlp.up.has_value() || !lora_grads.mlp.up.has_value()) break;
                     dA_up = lora_grads.mlp.up->A;
                     dB_up = lora_grads.mlp.up->B;
                     lora_up = *lora_block.mlp.up;
-                }
-                if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
-                    dA_gate = lora_grads.mlp.gate->A;
-                    dB_gate = lora_grads.mlp.gate->B;
-                    lora_gate = *lora_block.mlp.gate;
-                }
 
-                if (!dA_up.Data && !dA_gate.Data) break;
-
-                // Projection types: 4=Up, 5=Gate
-                modules::detail::backward_lora_mlp_up_gate_fused(
-                    dA_up, dB_up,
-                    dA_gate, dB_gate,
-                    da.d_ln2,
-                    da.d_mlp_up,
-                    ln2_input,
-                    lora_up, lora_gate,
-                    mLoRAConfig->scaling(),
-                    dropout, get_dropout_seed(4), get_dropout_seed(5), is_training,
-                    B * T,
-                    C,
-                    D,
-                    rank,
-                    lora_accum,
-                    mLoRARunState->intermediate,
-                    mLoRARunState->intermediate2,
-                    mLoRARunState->slice,
-                    rs.CublasLtHandle,
-                    rs.CuBlasWorkspace,
-                    stream);
+                    // Projection type: 4=Up
+                    const unsigned int dropout_seed = get_dropout_seed(4);
+                    modules::detail::backward_lora_layer(
+                        dA_up, dB_up,
+                        d_ln2,
+                        da.d_mlp_up, 0,
+                        ln2_input,
+                        lora_up.A, lora_up.B,
+                        mLoRAConfig->scaling(),
+                        dropout, dropout_seed, is_training,
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        B * T, C, D, rank, lora_accum,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
             } break;
             case modules::BackwardHookPoint::AfterAttnOutBackward: {
                 if (!lora_block.attention.o.has_value()) break;
@@ -534,7 +560,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const ActivationLayoutIR* layout = mModule->activation_layout.has_value()
                                            ? &*mModule->activation_layout
                                            : nullptr;
-    mRunState = std::make_unique<DslRunState>(*mConfig, mRuntimeConfig, mOptions, B, T, mAllocator, lora_enabled(),
+    mRunState = std::make_unique<DslRunState>(mModelConfig, mRuntimeConfig, mOptions, B, T, mAllocator, lora_enabled(),
                                               dummy_stack_bytes, /*allocate_stack=*/false, layout);
     mRunState->WorldSize = comm.world_size();
     if (mParams) {

@@ -33,6 +33,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     Tensor& y = ensure_output_tensor(op.outputs[1]);
     Tensor& rstd = ensure_output_tensor(op.outputs[2]);
 
+    const bool is_final_norm =
+        (op.inputs[2].name.find("final_norm") != std::string::npos ||
+         op.inputs[2].name.find("ln_final") != std::string::npos ||
+         op.inputs[2].name.find("ln_f") != std::string::npos);
+
     // Validate dtypes before calling kernel
     if (rstd.DType != ETensorDType::FP32) {
         std::ostringstream oss;
@@ -45,6 +50,28 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
                                    op.attrs.eps, static_cast<int>(mB * mT),
                                    mConfig.HiddenSize, mRunState.MainStream);
+
+    // Hybrid/Nemotron blocks use a single norm ("norm_weight") and rely on the per-layer
+    // residual buffer (res_in) for backward/recompute. The graph output for res_in is
+    // often a temporary (e.g., layerN.res_in), so explicitly persist it here.
+    // Also persist rstd to the per-layer ln1_rstd slot for the same reason.
+    int norm_layer_idx = -1;
+    std::string norm_field;
+    if (parse_block_param(op.inputs[2].name, norm_layer_idx, norm_field) && norm_field == "norm_weight") {
+        if (norm_layer_idx >= 0 && norm_layer_idx < static_cast<int>(mConfig.NumLayers)) {
+            Tensor& res_buf = mRunState.get_residual(norm_layer_idx, mRunState.MainStream);
+            if (residual_out.Data && res_buf.Data && residual_out.Data != res_buf.Data) {
+                CUDA_CHECK(cudaMemcpyAsync(res_buf.Data, residual_out.Data, residual_out.bytes(),
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+            // Persist rstd to the per-layer activation slot
+            Tensor& rstd_buf = mRunState.simplified_acts(norm_layer_idx).ln1_rstd;
+            if (rstd.Data && rstd_buf.Data && rstd.Data != rstd_buf.Data) {
+                CUDA_CHECK(cudaMemcpyAsync(rstd_buf.Data, rstd.Data, rstd.bytes(),
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        }
+    }
 
     // For LN2 output (res_att), copy to simplified_acts.residual_att when the
     // graph compiler assigned the wrong slot. This happens for the last layer where
@@ -78,7 +105,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 
     Tensor* residual_out_ptr = &resolve_tensor(op.inputs[2]);
     Tensor& weight = resolve_tensor(op.inputs[3]);
-    Tensor& rstd = resolve_tensor(op.inputs[4]);
+    Tensor* rstd_ptr = &resolve_tensor(op.inputs[4]);
 
     int ln_layer_idx = -1;
     std::string ln_field;
@@ -93,6 +120,15 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
         }
         residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
+        rstd_ptr = &mRunState.simplified_acts(ln_layer_idx).ln1_rstd;
+    } else if (ln_layer_idx >= 0 && ln_field == "norm_weight") {
+        // Hybrid/Nemotron single-norm blocks store res_in in the per-layer residual buffer.
+        // Use it instead of the ephemeral saved tensor.
+        if (mRunState.has_residual_offloading()) {
+            mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
+        }
+        residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
+        rstd_ptr = &mRunState.simplified_acts(ln_layer_idx).ln1_rstd;
     }
     // LN2 backward needs the saved/recomputed residual_att from simplified_acts.
     // The backward graph may have wrong tensor names for the last layer (e.g., "StackedBlocks_N"
@@ -102,6 +138,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
         auto& acts = mRunState.simplified_acts(ln_layer_idx);
         residual_out_ptr = &acts.residual_att;
+        rstd_ptr = &acts.ln2_rstd;
     }
     Tensor& residual_out = *residual_out_ptr;
 
@@ -152,11 +189,10 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 
 
     rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
-                     *d_residual_input, d_y, residual_out, weight, rstd,
+                     *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
                      abs_max_ptr,
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
-
 
     // Copy d_input to d_residual if they're different outputs
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {

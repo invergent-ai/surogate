@@ -376,6 +376,10 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
                               Tensor& workspace, cudnnHandle_t handle,
                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
+// Debug utilities for GQA: repeat/sum K/V heads to emulate explicit repeat_kv.
+void repeat_kv_qkv(Tensor& out, const Tensor& in, int B, int T, int Hq, int Hkv, int Hs, cudaStream_t stream);
+void reduce_kv_qkv(Tensor& out, const Tensor& in, int B, int T, int Hq, int Hkv, int Hs, cudaStream_t stream);
+
 void fused_classifier(float* logits, float* losses,
                       float dloss, const int* targets, int* valid_token_count,
                       int BT, int V, int P, bool write_dlogits, cudaStream_t stream);
@@ -462,6 +466,23 @@ void global_norm_sqrt(float* out, float* out_cpu, float grad_clip,
 
 void deterministic_sum(float* out, const float* values, std::size_t count, cudaStream_t stream);
 void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count, cudaStream_t stream);
+
+// Prescaled norm computation (overflow-safe for large BF16 gradients).
+// Two-pass: 1) global_amax, 2) global_norm_squared_prescaled, 3) global_norm_sqrt_prescaled.
+void global_amax(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
+void global_amax(float* out, const nv_bfloat16* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
+void global_amax(float* out, const Tensor& values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
+void compute_prescale(float* prescale_out, const float* amax_in, cudaStream_t stream);
+void global_norm_squared_prescaled(float* out, const float* values, size_t count, const float* prescale_device,
+                                    const cudaDeviceProp& dp, cudaStream_t stream);
+void global_norm_squared_prescaled(float* out, const nv_bfloat16* values, size_t count, const float* prescale_device,
+                                    const cudaDeviceProp& dp, cudaStream_t stream);
+void global_norm_squared_prescaled(float* out, const Tensor& values, size_t count, const float* prescale_device,
+                                    const cudaDeviceProp& dp, cudaStream_t stream);
+void global_norm_sqrt_prescaled(float* out, float* out_cpu, float grad_clip,
+                                 const int* valid_token_count, float total_tokens,
+                                 const float* amax_device,
+                                 const cudaDeviceProp& dp, cudaStream_t stream);
 
 
 // 8-bit AdamW optimizer - functions moved to runtime/adamw_8bit.h
@@ -1316,14 +1337,18 @@ void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, in
 /// @param expert_indices Output expert indices (num_tokens, top_k).
 /// @param routing_weights Output routing weights (num_tokens, top_k).
 /// @param scores Input routing scores (num_tokens, num_experts).
+/// @param correction_bias Optional per-expert bias added to scores for selection only (num_experts), or nullptr.
+///        When non-null, expert selection uses (score + bias) but routing weights use original unbiased scores.
 /// @param num_tokens Number of tokens.
 /// @param num_experts Number of experts.
 /// @param top_k Number of experts per token.
 /// @param normalize_weights Whether to normalize weights to sum to 1.
 /// @param stream CUDA stream.
 void moe_topk_forward(int* expert_indices, float* routing_weights, const float* scores,
+                      const float* correction_bias,
                       int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
 void moe_topk_forward(int* expert_indices, nv_bfloat16* routing_weights, const nv_bfloat16* scores,
+                      const float* correction_bias,
                       int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
 
 /// @brief Backward through top-k selection (with optional post-selection normalization).
@@ -1414,6 +1439,9 @@ void moe_unpermute_and_combine(float* out, const float* expert_out, const float*
 void moe_unpermute_and_combine(nv_bfloat16* out, const nv_bfloat16* expert_out, const nv_bfloat16* routing_weights,
                                const int* scatter_indices, int num_tokens, int total_tokens,
                                int hidden_size, int top_k, cudaStream_t stream);
+void moe_unpermute_and_combine(nv_bfloat16* out, const nv_bfloat16* expert_out, const float* routing_weights,
+                               const int* scatter_indices, int num_tokens, int total_tokens,
+                               int hidden_size, int top_k, cudaStream_t stream);
 
 /// @brief Compute auxiliary load-balancing loss for MoE training.
 /// aux_loss = coef * num_experts * sum_e(fraction_e * prob_e)
@@ -1464,6 +1492,10 @@ void moe_combine_backward(float* d_expert_out, float* d_routing_weights,
                           int hidden_size, int top_k, cudaStream_t stream);
 void moe_combine_backward(nv_bfloat16* d_expert_out, nv_bfloat16* d_routing_weights,
                           const nv_bfloat16* d_output, const nv_bfloat16* expert_out, const nv_bfloat16* routing_weights,
+                          const int* scatter_indices, int num_tokens, int total_tokens,
+                          int hidden_size, int top_k, cudaStream_t stream);
+void moe_combine_backward(nv_bfloat16* d_expert_out, float* d_routing_weights,
+                          const nv_bfloat16* d_output, const nv_bfloat16* expert_out, const float* routing_weights,
                           const int* scatter_indices, int num_tokens, int total_tokens,
                           int hidden_size, int top_k, cudaStream_t stream);
 
@@ -1753,9 +1785,10 @@ void mamba_reduce_head_param(Tensor& d_param, const Tensor& d_param_exp,
 void mamba_reduce_delta_to_dt(Tensor& d_dt, const Tensor& d_delta,
                               int B, int T, int num_heads, int head_dim, cudaStream_t stream);
 
-// Pack d_proj from d_gate (B,T,D), d_conv_in (B,conv_dim,T), d_dt (B,T,H).
-void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv_in, const Tensor& d_dt,
-                      int B, int T, int D, int conv_dim, int num_heads, cudaStream_t stream);
+// Pack d_proj from d_gate (B,T,D), d_conv_in (B,conv_dim,T), d_delta (B,D,T).
+// Reduces d_delta back to per-head d_dt by summing over head_dim elements.
+void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv_in, const Tensor& d_delta,
+                      int B, int T, int D, int conv_dim, int num_heads, int head_dim, cudaStream_t stream);
 
 // Group RMSNorm (gated) helpers.
 void mamba_group_rmsnorm_forward(Tensor& out, Tensor& rstd, const Tensor& inp, const Tensor& weight,
@@ -1777,6 +1810,7 @@ void mamba_causal_conv1d_backward(Tensor& dx, Tensor& dweight_fp32, Tensor* dbia
 void mamba_selective_scan_forward(Tensor& out, const Tensor& u, const Tensor& delta,
                                   const Tensor& A, const Tensor& B, const Tensor& C,
                                   const Tensor& D, const Tensor& delta_bias,
+                                  float delta_min, float delta_max,
                                   Tensor& x, int Bsz, int T, int Ddim, int dstate,
                                   int groups, int n_chunks, cudaStream_t stream);
 void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tensor& dB, Tensor& dC,
@@ -1784,6 +1818,7 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
                                    const Tensor& u, const Tensor& delta,
                                    const Tensor& A, const Tensor& B, const Tensor& C,
                                    const Tensor& D, const Tensor& delta_bias,
+                                   float delta_min, float delta_max,
                                    const Tensor& dout, Tensor& x,
                                    int Bsz, int T, int Ddim, int dstate,
                                    int groups, int n_chunks, cudaStream_t stream);

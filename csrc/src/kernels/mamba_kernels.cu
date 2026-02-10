@@ -202,8 +202,8 @@ __global__ void mamba_reduce_delta_kernel(T* d_dt, const T* d_delta, long total,
 }
 
 template<typename T>
-__global__ void mamba_pack_dproj_kernel(T* d_proj, const T* d_gate, const T* d_conv_in, const T* d_dt,
-                                        long total, int Tlen, int D, int conv_dim, int num_heads) {
+__global__ void mamba_pack_dproj_kernel(T* d_proj, const T* d_gate, const T* d_conv_in, const T* d_delta,
+                                        long total, int Tlen, int D, int conv_dim, int num_heads, int head_dim) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long k = idx % (D + conv_dim + num_heads);
@@ -217,8 +217,15 @@ __global__ void mamba_pack_dproj_kernel(T* d_proj, const T* d_gate, const T* d_c
         long c = k - D;
         d_proj[idx] = d_conv_in[(b * conv_dim + c) * Tlen + t];
     } else {
+        // Reduce d_delta [B, D, T] back to per-head d_dt [B, T, num_heads]
+        // by summing over head_dim elements for each head
         long h = k - D - conv_dim;
-        d_proj[idx] = d_dt[(b * Tlen + t) * num_heads + h];
+        float sum = 0.f;
+        long base = (b * D + h * head_dim) * Tlen + t;
+        for (int i = 0; i < head_dim; ++i) {
+            sum += to_float(d_delta[base + i * Tlen]);
+        }
+        d_proj[idx] = from_float<T>(sum);
     }
 }
 
@@ -460,8 +467,8 @@ void mamba_reduce_delta_to_dt(Tensor& d_dt, const Tensor& d_delta,
     }
 }
 
-void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv_in, const Tensor& d_dt,
-                      int B, int Tlen, int D, int conv_dim, int num_heads, cudaStream_t stream) {
+void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv_in, const Tensor& d_delta,
+                      int B, int Tlen, int D, int conv_dim, int num_heads, int head_dim, cudaStream_t stream) {
     const long total = static_cast<long>(B) * Tlen * (D + conv_dim + num_heads);
     const int threads = 256;
     if (d_proj.DType == ETensorDType::BF16) {
@@ -469,15 +476,15 @@ void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv
             d_proj.get<nv_bfloat16>(),
             d_gate.get<nv_bfloat16>(),
             d_conv_in.get<nv_bfloat16>(),
-            d_dt.get<nv_bfloat16>(),
-            total, Tlen, D, conv_dim, num_heads);
+            d_delta.get<nv_bfloat16>(),
+            total, Tlen, D, conv_dim, num_heads, head_dim);
     } else if (d_proj.DType == ETensorDType::FP16) {
         mamba_pack_dproj_kernel<<<div_up(total, threads), threads, 0, stream>>>(
             d_proj.get<half>(),
             d_gate.get<half>(),
             d_conv_in.get<half>(),
-            d_dt.get<half>(),
-            total, Tlen, D, conv_dim, num_heads);
+            d_delta.get<half>(),
+            total, Tlen, D, conv_dim, num_heads, head_dim);
     } else {
         throw std::logic_error("mamba_pack_dproj: unsupported dtype");
     }
@@ -674,6 +681,7 @@ void selective_scan_bwd_cuda(SSMParamsBwd &params, cudaStream_t stream);
 void mamba_selective_scan_forward(Tensor& out, const Tensor& u, const Tensor& delta,
                                   const Tensor& A, const Tensor& B, const Tensor& C,
                                   const Tensor& D, const Tensor& delta_bias,
+                                  float delta_min, float delta_max,
                                   Tensor& x, int Bsz, int Tlen, int Ddim, int dstate,
                                   int groups, int n_chunks, cudaStream_t stream) {
     SSMParamsBase params{};
@@ -687,6 +695,8 @@ void mamba_selective_scan_forward(Tensor& out, const Tensor& u, const Tensor& de
     params.is_variable_B = true;
     params.is_variable_C = true;
     params.delta_softplus = true;
+    params.delta_min = delta_min;
+    params.delta_max = delta_max;
 
     params.A_ptr = A.Data;
     params.B_ptr = B.Data;
@@ -731,6 +741,7 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
                                    const Tensor& u, const Tensor& delta,
                                    const Tensor& A, const Tensor& B, const Tensor& C,
                                    const Tensor& D, const Tensor& delta_bias,
+                                   float delta_min, float delta_max,
                                    const Tensor& dout, Tensor& x,
                                    int Bsz, int Tlen, int Ddim, int dstate,
                                    int groups, int n_chunks, cudaStream_t stream) {
@@ -745,6 +756,8 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
     params.is_variable_B = true;
     params.is_variable_C = true;
     params.delta_softplus = true;
+    params.delta_min = delta_min;
+    params.delta_max = delta_max;
 
     params.A_ptr = A.Data;
     params.B_ptr = B.Data;

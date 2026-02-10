@@ -1686,7 +1686,7 @@ void register_builtin_shape_signatures() {
         OpShapeSignature sig;
         sig.op_name = "moe_topk";
         sig.min_inputs = 1;
-        sig.max_inputs = 1;
+        sig.max_inputs = 2;  // optional correction_bias as 2nd input
         sig.min_outputs = 2;
         sig.max_outputs = 2;
         sig.validator = [](const auto& inputs, const auto& outputs,

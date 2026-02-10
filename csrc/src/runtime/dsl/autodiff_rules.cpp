@@ -1014,7 +1014,7 @@ std::vector<Operation> mamba_split_proj_backward(const BackwardRuleContext& ctx)
     if (ctx.needs_grad(0)) {
         const auto& fwd = ctx.fwd_op;
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "conv_dim", "mamba_num_heads", "mamba_head_dim"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "conv_dim", "num_heads", "head_dim"});
 
         // d_outputs[0..2] are the gradients of the 3 forward outputs: gate, conv_in, delta
         // d_inputs[0] is where to write the gradient of the forward input: projected

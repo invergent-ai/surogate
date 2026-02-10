@@ -159,6 +159,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 if (params.delta_softplus) {
                     delta_vals[r][i] = delta_vals[r][i] <= 20.f ? log1pf(expf(delta_vals[r][i])) : delta_vals[r][i];
                 }
+                delta_vals[r][i] = fminf(fmaxf(delta_vals[r][i], params.delta_min), params.delta_max);
                 delta_u_vals[r][i] = delta_vals[r][i] * u_val;
                 out_vals[r][i] = D_val[r] * u_val;
             }

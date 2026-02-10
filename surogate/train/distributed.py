@@ -6,14 +6,11 @@ import os
 import shutil
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from surogate.core.model.loader import get_model_info_and_tokenizer
-
-if TYPE_CHECKING:
-    from surogate.core.config.sft_config import SFTConfig
+from surogate.core.config.sft_config import SFTConfig
 
 # Lazy import Ray to avoid dependency when not using distributed training
 _ray = None
@@ -187,10 +184,7 @@ class NodeTrainer:
         logger = get_logger()
         
         logger.info(f"Node {self.node_rank}: Starting model download...")
-        # self.model_info, self.model_template, _, self.tokenizer = get_model_info_and_tokenizer(**self._config.get_model_kwargs(), load_model=False)
-        # self.config.model_dir = self.model_info.model_dir
         model_weights_path = get_model_weights_path(self._config.model_dir)
-        # logger.info(f"Node {self.node_rank}: Model download complete, weights at {model_weights_path}")
 
         # Store for later use
         self._model_weights_path = model_weights_path
@@ -850,11 +844,12 @@ class RayDistributedTrainer:
             config.gradient_accumulation_steps
         )
         total_tokens_per_step = tokens_per_step_per_node * self.num_nodes
-
-        # Chinchilla token budget (optimal tokens ≈ 20 × params)
-        from surogate.utils.model import estimate_model_parameters
-        num_params = estimate_model_parameters(config.model_info.config)
-        chinchilla_tokens = 20 * num_params
+        
+        if config.from_scratch:
+            # Chinchilla token budget (optimal tokens ≈ 20 × params)
+            from surogate.utils.model import estimate_model_parameters
+            num_params = estimate_model_parameters(config.model_info.config)
+            chinchilla_tokens = 20 * num_params
 
         # Determine max steps
         # Note: In distributed mode, each node sees 1/num_nodes of the data (sharded via strided access)
@@ -862,7 +857,7 @@ class RayDistributedTrainer:
         steps_per_epoch = num_tokens // total_tokens_per_step
         if config.max_steps > 0:
             max_steps = config.max_steps
-        elif config.epoch_adjustment:
+        elif config.epoch_adjustment and config.from_scratch:
             import math as _math
             chinchilla_epochs = max(1, _math.ceil(chinchilla_tokens / max(num_tokens, 1)))
             if chinchilla_epochs != config.num_epochs:
@@ -920,19 +915,20 @@ class RayDistributedTrainer:
         logger.info(f"  Tokens per step: {total_tokens_per_step}")
         logger.info(f"  Starting from step: {start_step}")
         logger.info(f"  Max steps: {max_steps}")
-
-        # Chinchilla token budget
-        planned_tokens = max_steps * total_tokens_per_step
-        ratio = planned_tokens / max(chinchilla_tokens, 1)
-        def _fmt(n):
-            if n >= 1e12: return f"{n/1e12:.1f}T"
-            if n >= 1e9: return f"{n/1e9:.1f}B"
-            if n >= 1e6: return f"{n/1e6:.1f}M"
-            return f"{n/1e3:.1f}K"
-        logger.info(
-            f"  Chinchilla budget: {_fmt(chinchilla_tokens)} tokens (20 × {_fmt(num_params)} params) | "
-            f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
-        )
+        
+        if config.from_scratch:
+            # Chinchilla token budget
+            planned_tokens = max_steps * total_tokens_per_step
+            ratio = planned_tokens / max(chinchilla_tokens, 1)
+            def _fmt(n):
+                if n >= 1e12: return f"{n/1e12:.1f}T"
+                if n >= 1e9: return f"{n/1e9:.1f}B"
+                if n >= 1e6: return f"{n/1e6:.1f}M"
+                return f"{n/1e3:.1f}K"
+            logger.info(
+                f"  Chinchilla budget: {_fmt(chinchilla_tokens)} tokens (20 × {_fmt(num_params)} params) | "
+                f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
+            )
 
         # Training loop
         import time

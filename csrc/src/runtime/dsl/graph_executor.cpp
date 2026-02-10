@@ -191,6 +191,13 @@ void GraphExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
     }
 }
 
+void GraphExecutor::set_weight_manager(DslWeightManager* weight_manager) {
+    mWeightManager = weight_manager;
+    if (mCompiledExecutor) {
+        mCompiledExecutor->set_weight_manager(mWeightManager);
+    }
+}
+
 void GraphExecutor::reset_cuda_graphs() {
     // Reset whole-graph captures
     if (mForwardGraph) {

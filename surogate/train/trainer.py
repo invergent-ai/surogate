@@ -1,4 +1,6 @@
+import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -24,6 +26,7 @@ from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
 from surogate.utils.tensor import to_surogate_dtype
+from surogate.utils.model import estimate_model_parameters
 
 logger = get_logger()
 
@@ -36,6 +39,7 @@ class SurogateTrainerWrapper():
             eval_files: Optional[List[str]] = None
     ):
         self.config = config
+        self._block_types = None
 
         model_weights_path = get_model_weights_path(config.model_dir)
 
@@ -116,6 +120,7 @@ class SurogateTrainerWrapper():
                     qlora_config=config.qlora_config
                 )
                 self.trainer.import_weights(model_weights_path)
+
             elif config.from_scratch:
                 self.trainer = _surogate.SurogateTrainer(
                     ngpu=config.gpus,
@@ -140,17 +145,17 @@ class SurogateTrainerWrapper():
                     memcpy_all_gather=config.memcpy_all_gather,
                     memcpy_send_recv=config.memcpy_send_recv
                 )
-
-        # Chinchilla token budget (optimal tokens ≈ 20 × params)
-        from surogate.utils.model import estimate_model_parameters
-        self.num_params = estimate_model_parameters(config.model_info.config)
-        self.chinchilla_tokens = 20 * self.num_params
-        self.tokens_per_step = self.total_batch_size
+                
+        if self.config.from_scratch:
+            # Chinchilla token budget (optimal tokens ≈ 20 × params)
+            self.num_params = estimate_model_parameters(config.model_info.config)
+            self.chinchilla_tokens = 20 * self.num_params
+            self.tokens_per_step = self.total_batch_size
 
         # Determine max_steps
         if config.max_steps > 0:
             self.max_steps = config.max_steps
-        elif config.epoch_adjustment:
+        elif config.epoch_adjustment and self.config.from_scratch:
             # Adjust epochs to reach Chinchilla-optimal token budget
             chinchilla_epochs = max(1, int(np.ceil(self.chinchilla_tokens / max(self.train_loader.num_tokens, 1))))
             if chinchilla_epochs != self.config.num_epochs:
@@ -181,6 +186,44 @@ class SurogateTrainerWrapper():
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type
         )
+
+    def _load_block_types(self) -> Optional[list]:
+        if self._block_types is not None:
+            return self._block_types
+
+        try:
+            from surogate.dsl.ir_builder import load_hf_config
+        except Exception:
+            self._block_types = None
+            return None
+
+        try:
+            cfg = load_hf_config(self.config.model_dir)
+        except Exception:
+            self._block_types = None
+            return None
+
+        block_types = None
+        if isinstance(cfg.get("layers_block_type"), list):
+            block_types = [str(x).lower() for x in cfg["layers_block_type"]]
+        else:
+            pattern = cfg.get("hybrid_override_pattern")
+            if isinstance(pattern, str) and pattern:
+                mapping = {
+                    "M": "mamba",
+                    "*": "attention",
+                    "A": "attention",
+                    "-": "mlp",
+                    "P": "mlp",
+                    "E": "moe",
+                }
+                try:
+                    block_types = [mapping[c] for c in pattern]
+                except KeyError:
+                    block_types = None
+
+        self._block_types = block_types
+        return self._block_types
 
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer and vocab files from source model to output directory."""
@@ -219,19 +262,20 @@ class SurogateTrainerWrapper():
             logger.info(f"Max steps: {self.max_steps}")
             logger.info(
                 f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.warmup_steps}, cooldown={self.config.cooldown_steps})")
-
-            # Chinchilla token budget
-            planned_tokens = self.max_steps * self.tokens_per_step
-            ratio = planned_tokens / max(self.chinchilla_tokens, 1)
-            def _fmt(n):
-                if n >= 1e12: return f"{n/1e12:.1f}T"
-                if n >= 1e9: return f"{n/1e9:.1f}B"
-                if n >= 1e6: return f"{n/1e6:.1f}M"
-                return f"{n/1e3:.1f}K"
-            logger.info(
-                f"Chinchilla budget: {_fmt(self.chinchilla_tokens)} tokens (20 × {_fmt(self.num_params)} params) | "
-                f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
-            )
+            
+            if self.config.from_scratch:
+                # Chinchilla token budget
+                planned_tokens = self.max_steps * self.tokens_per_step
+                ratio = planned_tokens / max(self.chinchilla_tokens, 1)
+                def _fmt(n):
+                    if n >= 1e12: return f"{n/1e12:.1f}T"
+                    if n >= 1e9: return f"{n/1e9:.1f}B"
+                    if n >= 1e6: return f"{n/1e6:.1f}M"
+                    return f"{n/1e3:.1f}K"
+                logger.info(
+                    f"Chinchilla budget: {_fmt(self.chinchilla_tokens)} tokens (20 × {_fmt(self.num_params)} params) | "
+                    f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
+                )
 
             # Print LoRA info if enabled
             if self.config.lora and self.config.lora_config:
@@ -514,6 +558,13 @@ class SurogateTrainerWrapper():
         max_abs = None
         any_nan = False
         tensor_count = 0
+        module_stats = {}
+        layer_stats = {}
+        proj_stats = {}
+        try:
+            topk = int(os.environ.get("SUROGATE_DEBUG_LORA_GRADS_TOPK", "10"))
+        except ValueError:
+            topk = 10
 
         for name, arr in grads.items():
             try:
@@ -541,6 +592,57 @@ class SurogateTrainerWrapper():
             t_max = t_f.abs().max()
             max_abs = t_max if max_abs is None else torch.maximum(max_abs, t_max)
 
+            module_name = name.rsplit(".lora_", 1)[0] if ".lora_" in name else name
+            mstat = module_stats.get(module_name)
+            if mstat is None:
+                module_stats[module_name] = {
+                    "sq": sq.item(),
+                    "max_abs": t_max.item(),
+                    "tensors": 1,
+                    "nan": bool(has_nan or has_inf),
+                }
+            else:
+                mstat["sq"] += sq.item()
+                mstat["max_abs"] = max(mstat["max_abs"], t_max.item())
+                mstat["tensors"] += 1
+                if has_nan or has_inf:
+                    mstat["nan"] = True
+
+            proj_name = module_name.rsplit(".", 1)[-1]
+            if proj_name in {"q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"}:
+                pstat = proj_stats.get(proj_name)
+                if pstat is None:
+                    proj_stats[proj_name] = {
+                        "sq": sq.item(),
+                        "max_abs": t_max.item(),
+                        "tensors": 1,
+                        "nan": bool(has_nan or has_inf),
+                    }
+                else:
+                    pstat["sq"] += sq.item()
+                    pstat["max_abs"] = max(pstat["max_abs"], t_max.item())
+                    pstat["tensors"] += 1
+                    if has_nan or has_inf:
+                        pstat["nan"] = True
+
+            layer_match = re.search(r"\.layers\.(\d+)\.", module_name)
+            if layer_match:
+                layer_idx = int(layer_match.group(1))
+                lstat = layer_stats.get(layer_idx)
+                if lstat is None:
+                    layer_stats[layer_idx] = {
+                        "sq": sq.item(),
+                        "max_abs": t_max.item(),
+                        "modules": {module_name},
+                        "nan": bool(has_nan or has_inf),
+                    }
+                else:
+                    lstat["sq"] += sq.item()
+                    lstat["max_abs"] = max(lstat["max_abs"], t_max.item())
+                    lstat["modules"].add(module_name)
+                    if has_nan or has_inf:
+                        lstat["nan"] = True
+
         if total_sq is None:
             logger.info("LoRA grad debug: no gradients found")
             return
@@ -551,6 +653,80 @@ class SurogateTrainerWrapper():
             "LoRA grad debug: step=%d tensors=%d norm=%.6g max_abs=%.6g nan=%s",
             step, tensor_count, total_norm, max_abs_val, any_nan
         )
+
+        if module_stats:
+            sorted_modules = sorted(module_stats.items(), key=lambda kv: kv[1]["sq"], reverse=True)
+            for module_name, stat in sorted_modules[:topk]:
+                logger.info(
+                    "  LoRA grad module: %s norm=%.6g max_abs=%.6g tensors=%d nan=%s",
+                    module_name,
+                    math.sqrt(stat["sq"]),
+                    stat["max_abs"],
+                    stat["tensors"],
+                    stat["nan"],
+                )
+
+        if layer_stats:
+            block_types = self._load_block_types()
+            sorted_layers = sorted(layer_stats.items(), key=lambda kv: kv[1]["sq"], reverse=True)
+            for layer_idx, stat in sorted_layers[:topk]:
+                logger.info(
+                    "  LoRA grad layer: %d norm=%.6g max_abs=%.6g modules=%d nan=%s%s",
+                    layer_idx,
+                    math.sqrt(stat["sq"]),
+                    stat["max_abs"],
+                    len(stat["modules"]),
+                    stat["nan"],
+                    f" type={block_types[layer_idx]}" if block_types and layer_idx < len(block_types) else "",
+                )
+
+            if block_types:
+                block_stats = {}
+                for layer_idx, stat in layer_stats.items():
+                    if layer_idx < len(block_types):
+                        block = block_types[layer_idx]
+                    else:
+                        block = "unknown"
+                    entry = block_stats.get(block)
+                    if entry is None:
+                        entry = {
+                            "sq": 0.0,
+                            "max_layer_sq": 0.0,
+                            "max_abs": 0.0,
+                            "layers": 0,
+                            "nan": False,
+                        }
+                        block_stats[block] = entry
+                    entry["sq"] += stat["sq"]
+                    entry["max_layer_sq"] = max(entry["max_layer_sq"], stat["sq"])
+                    entry["max_abs"] = max(entry["max_abs"], stat["max_abs"])
+                    entry["layers"] += 1
+                    if stat["nan"]:
+                        entry["nan"] = True
+
+                sorted_blocks = sorted(block_stats.items(), key=lambda kv: kv[1]["sq"], reverse=True)
+                for block, stat in sorted_blocks:
+                    logger.info(
+                        "  LoRA grad block: %s norm=%.6g max_layer_norm=%.6g max_abs=%.6g layers=%d nan=%s",
+                        block,
+                        math.sqrt(stat["sq"]),
+                        math.sqrt(stat["max_layer_sq"]),
+                        stat["max_abs"],
+                        stat["layers"],
+                        stat["nan"],
+                    )
+
+        if proj_stats:
+            sorted_projs = sorted(proj_stats.items(), key=lambda kv: kv[1]["sq"], reverse=True)
+            for proj_name, stat in sorted_projs:
+                logger.info(
+                    "  LoRA grad proj: %s norm=%.6g max_abs=%.6g tensors=%d nan=%s",
+                    proj_name,
+                    math.sqrt(stat["sq"]),
+                    stat["max_abs"],
+                    stat["tensors"],
+                    stat["nan"],
+                )
 
     def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
         """

@@ -34,16 +34,36 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     // Determine if SiLU activation should be applied
     bool silu = (op.attrs.activation == "silu");
 
-    // Allocate output
-    Tensor out = mRunState.temp_alloc(x.DType, {B, conv_dim, T});
-    mTemps.push_back(out);
+    const long expected = static_cast<long>(B) * conv_dim * T;
+    auto shape_matches = [&](const TensorRef& ref) -> bool {
+        if (ref.shape.empty()) return false;
+        long prod = 1;
+        for (auto d : ref.shape) {
+            if (d <= 0) return false;
+            prod *= d;
+        }
+        return prod == expected;
+    };
+
+    Tensor* out_ptr = nullptr;
+    if (shape_matches(op.outputs[0])) {
+        Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
+        if (out_ref.nelem() == expected) {
+            out_ptr = &out_ref;
+        }
+    }
+    if (!out_ptr) {
+        Tensor out = mRunState.temp_alloc(x.DType, {B, conv_dim, T});
+        mTemps.push_back(out);
+        out_ptr = &mTemps.back();
+    }
 
     // Call kernel
-    mamba_causal_conv1d_forward(out, x, weight, bias,
+    mamba_causal_conv1d_forward(*out_ptr, x, weight, bias,
                                  B, T, conv_dim, kernel, silu,
                                  mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = out;
+    mTensorMap[op.outputs[0].name] = *out_ptr;
 }
 
 void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {

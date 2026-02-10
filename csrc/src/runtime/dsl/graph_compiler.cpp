@@ -62,13 +62,14 @@ bool infer_known_tensor_shape(std::string_view name,
     if (parse_block_param(name, layer_idx, field)) {
         const long C = config.HiddenSize;
         const long D = config.IntermediateSize;
+        const long MUp = config.mlp_up_rows();
         const long Hq = config.NumQueryHeads;
         const long Hkv = config.NumKeyValHeads;
         const long Hs = config.head_size();
         const long QKV = config.qkv_channels();
 
         if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" ||
-            field == "res_att" || field == "res_ffn") {
+            field == "res_att" || field == "res_ffn" || field == "res_in") {
             shape = {B, T, C};
             return true;
         }
@@ -109,11 +110,11 @@ bool infer_known_tensor_shape(std::string_view name,
             return true;
         }
         if (field == "mlp_up") {
-            shape = {B, T, 2 * D};
+            shape = {B, T, MUp};
             return true;
         }
         if (field == "mlp_up_flat") {
-            shape = {B * T, 2 * D};
+            shape = {B * T, MUp};
             return true;
         }
         if (field == "swiglu") {
@@ -275,8 +276,9 @@ void GraphCompiler::update_dimensions(long B, long T) {
     const long moe_m = (mConfig.MoeIntermediateSize > 0)
         ? mConfig.MoeIntermediateSize
         : mConfig.IntermediateSize;
+    const long up_factor = mConfig.mlp_up_factor();
     mShapeEnv.values["M"] = moe_m;
-    mShapeEnv.values["MUp"] = 2 * moe_m;
+    mShapeEnv.values["MUp"] = up_factor * moe_m;
     mShapeEnv.values["V"] = mConfig.VocabSize;
     mShapeEnv.values["Hq"] = mConfig.NumQueryHeads;
     mShapeEnv.values["Hkv"] = mConfig.NumKeyValHeads;
@@ -293,10 +295,10 @@ void GraphCompiler::update_dimensions(long B, long T) {
     // Shared expert intermediate size (default to regular intermediate size)
     if (mConfig.moe_config.has_value() && mConfig.moe_config->shared_expert_size > 0) {
         mShapeEnv.values["SharedM"] = mConfig.moe_config->shared_expert_size;
-        mShapeEnv.values["SharedMUp"] = 2 * mConfig.moe_config->shared_expert_size;
+        mShapeEnv.values["SharedMUp"] = up_factor * mConfig.moe_config->shared_expert_size;
     } else {
         mShapeEnv.values["SharedM"] = mConfig.IntermediateSize;
-        mShapeEnv.values["SharedMUp"] = 2 * mConfig.IntermediateSize;
+        mShapeEnv.values["SharedMUp"] = up_factor * mConfig.IntermediateSize;
     }
 }
 
@@ -581,10 +583,10 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 } else if (field == "out_weight") {
                     attrs.matmul_op = modules::MatmulOp::AttnOut;
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterAttnOutBackward;
-                } else if (field == "mlp_up_weight") {
+                } else if (field == "mlp_up_weight" || field == "up_weight") {
                     attrs.matmul_op = modules::MatmulOp::MLPUp;
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
-                } else if (field == "mlp_down_weight") {
+                } else if (field == "mlp_down_weight" || field == "down_weight") {
                     attrs.matmul_op = modules::MatmulOp::MLPDown;
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPDownBackward;
                 }
@@ -602,7 +604,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
             int layer_idx = -1;
             std::string field;
             if (parse_block_param(op.inputs[2], layer_idx, field)) {
-                if (field == "mlp_up_weight") {
+                if (field == "mlp_up_weight" || field == "up_weight") {
                     attrs.matmul_op = modules::MatmulOp::MLPUp;
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
                 }
@@ -1225,11 +1227,6 @@ void GraphCompiler::validate_operation_shapes(
 
     using namespace shape_checker;
 
-    // Check if validation is disabled via environment variable
-    if (env_enabled("SUROGATE_NO_SHAPE_CHECK")) {
-        return;
-    }
-
     // Get operation signature
     const auto* sig = OpShapeRegistry::instance().get_signature(op.name);
     if (!sig) {
@@ -1493,8 +1490,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             // Re-throw with additional context if validation fails
             std::cerr << "Shape validation failed during graph compilation.\n"
                       << "Operation: " << op.name << " (id: " << op.id << ")\n"
-                      << "Error: " << e.what() << "\n"
-                      << "To disable shape checking (not recommended), set SUROGATE_NO_SHAPE_CHECK=1\n";
+                      << "Error: " << e.what() << "\n";
             throw;
         }
 

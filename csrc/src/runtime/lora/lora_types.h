@@ -55,6 +55,12 @@ struct LoRAMLPWeights {
     std::optional<LoRALayerWeights<TTensor>> gate;  ///< Gate projection
     std::optional<LoRALayerWeights<TTensor>> up;    ///< Up projection
     std::optional<LoRALayerWeights<TTensor>> down;  ///< Down projection
+
+    [[nodiscard]] bool has_any() const {
+        return (gate.has_value() && gate->has_value()) ||
+               (up.has_value() && up->has_value()) ||
+               (down.has_value() && down->has_value());
+    }
 };
 
 /**
@@ -110,6 +116,9 @@ struct LoRAGroupedExpertWeights {
 
 template<typename TTensor>
 struct LoRAMoEWeights {
+    // Optional shared expert (Nemotron/DeepSeek)
+    std::optional<LoRAMLPWeights<TTensor>> shared;
+
     // Layout 1: Separate (Sequential)
     std::vector<LoRAExpertWeights<TTensor>> experts;
 
@@ -119,6 +128,9 @@ struct LoRAMoEWeights {
     bool use_grouped = false;  ///< Whether to use the grouped layout
 
     [[nodiscard]] bool has_any() const {
+        if (shared.has_value() && shared->has_any()) {
+            return true;
+        }
         if (use_grouped) {
             return grouped.has_any();
         }

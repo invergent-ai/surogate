@@ -1,15 +1,14 @@
 model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-model_type: qwen3_moe
 output_dir: ./output_nemo
 
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 
 sample_packing: true
-sequence_len: 256
+sequence_len: 512
 
-max_steps: 2
-eval_steps: 25
+max_steps: 50
+eval_steps: 10
 save_steps: 0
 
 learning_rate: 2e-4

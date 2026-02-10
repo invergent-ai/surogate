@@ -11,6 +11,7 @@ module.exports = {
       collapsed: false,
       items: [
         'about/how-it-works',
+        'about/adaptive-training',
         'about/dsl',
         'about/automatic-differentiation'
       ],

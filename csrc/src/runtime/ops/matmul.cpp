@@ -11,6 +11,8 @@
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "runtime/dsl/graph_executor_helpers.h"
+#include "runtime/lora/lora_model_utils.h"
+#include "runtime/lora/lora_run_state.h"
 
 namespace dsl {
 
@@ -27,6 +29,58 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
     int M = 0, N = 0, K = 0;
     matmul_dims(a, b, op.attrs.transpose, M, N, K);
+
+    // Router matmul: match HF by computing logits in FP32 using FP32 inputs/weights.
+    const bool is_router = (weight_name.find("router_weight") != std::string::npos);
+    if (is_router && out.DType == ETensorDType::FP32 &&
+        (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32)) {
+        auto shape_vec = [](const Tensor& t) {
+            return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
+        };
+        Tensor a_f = a;
+        if (a.DType != ETensorDType::FP32) {
+            a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a));
+            mTemps.push_back(a_f);
+            if (a.DType == ETensorDType::BF16) {
+                convert_dtype(a_f.get<float>(), a.get<nv_bfloat16>(), a.nelem(), mRunState.MainStream);
+            } else {
+                throw std::runtime_error("router matmul: unsupported input dtype");
+            }
+        }
+
+        Tensor b_f = b;
+        if (b.DType != ETensorDType::FP32) {
+            b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b));
+            mTemps.push_back(b_f);
+            if (b.DType == ETensorDType::BF16) {
+                convert_dtype(b_f.get<float>(), b.get<nv_bfloat16>(), b.nelem(), mRunState.MainStream);
+            } else {
+                throw std::runtime_error("router matmul: unsupported weight dtype");
+            }
+        }
+
+        std::optional<Tensor> bias_f;
+        if (bias.has_value()) {
+            if (bias->DType == ETensorDType::FP32) {
+                bias_f = bias;
+            } else {
+                Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias));
+                mTemps.push_back(tmp);
+                if (bias->DType == ETensorDType::BF16) {
+                    convert_dtype(tmp.get<float>(), bias->get<nv_bfloat16>(), bias->nelem(), mRunState.MainStream);
+                } else {
+                    throw std::runtime_error("router matmul: unsupported bias dtype");
+                }
+                bias_f = tmp;
+            }
+        }
+
+        EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
+        matmul(out, b_f, a_f, bias_f, nullptr, nullptr,
+               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               N, M, K, mode_col, false, mRunState.MainStream);
+        return;
+    }
 
     bool used_recipe = false;
     modules::MatmulContext ctx{};
@@ -82,6 +136,53 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         matmul(out, b, a, bias, nullptr, nullptr,
                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                N, M, K, mode_col, false, mRunState.MainStream);
+    }
+
+    // Apply shared-expert LoRA contributions (Nemotron/DeepSeek) for shared expert matmuls.
+    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled()) {
+        int shared_layer = -1;
+        std::string field;
+        if (parse_block_param(weight_name, shared_layer, field)) {
+            const bool is_shared_up = (field == "shared_expert_up");
+            const bool is_shared_down = (field == "shared_expert_down");
+            if ((is_shared_up || is_shared_down) && shared_layer >= 0) {
+                auto& lora_block = mLoRAWeights->get_block(shared_layer, mRunState.MainStream);
+                if (lora_block.moe.shared.has_value()) {
+                    auto& shared = *lora_block.moe.shared;
+                    const auto& lora_layer = is_shared_up ? shared.up : shared.down;
+                    if (lora_layer.has_value() && lora_layer->has_value()) {
+                        Tensor a_flat = a;
+                        Tensor out_flat = out;
+                        if (a_flat.Rank > 2 && a_flat.Sizes[0] == mB && a_flat.Sizes[1] == mT) {
+                            a_flat = view_tensor(a_flat, {mB * mT, a_flat.Sizes[a_flat.Rank - 1]});
+                        }
+                        if (out_flat.Rank > 2 && out_flat.Sizes[0] == mB && out_flat.Sizes[1] == mT) {
+                            out_flat = view_tensor(out_flat, {mB * mT, out_flat.Sizes[out_flat.Rank - 1]});
+                        }
+
+                        const int BT = static_cast<int>(a_flat.Sizes[0]);
+                        const int in_features = static_cast<int>(a_flat.Sizes[1]);
+                        const int out_features = static_cast<int>(out_flat.Sizes[1]);
+                        const int rank = mLoRAConfig->rank;
+                        const float scaling = mLoRAConfig->scaling();
+                        const float dropout = mLoRAConfig->dropout;
+                        const bool training = mLoRARunState->is_training;
+                        const int proj_type = is_shared_up ? 7 : 8;
+                        const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                            + static_cast<unsigned int>(shared_layer) * 1000000u
+                            + static_cast<unsigned int>(proj_type) * 100000u
+                            + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+
+                        modules::detail::apply_lora_contribution(
+                            out_flat, 0, a_flat, lora_layer.value(),
+                            mLoRARunState->intermediate, mLoRARunState->slice,
+                            scaling, dropout, dropout_seed, training,
+                            BT, in_features, out_features, rank,
+                            mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                    }
+                }
+            }
+        }
     }
 
     if (mForwardPlan && op.attrs.matmul_op.has_value() && op.attrs.layer_idx >= 0 &&
@@ -386,6 +487,77 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         }
     }
 
+    // Shared-expert LoRA backward (Nemotron/DeepSeek).
+    if (mLoRAConfig && mLoRAWeights && mLoRAGrads && mLoRARunState &&
+        mLoRAConfig->enabled() && mComm) {
+        int shared_layer = -1;
+        std::string field;
+        if (parse_block_param(weight_name, shared_layer, field)) {
+            const bool is_shared_up = (field == "shared_expert_up");
+            const bool is_shared_down = (field == "shared_expert_down");
+            if ((is_shared_up || is_shared_down) && shared_layer >= 0) {
+                auto& lora_block = mLoRAWeights->get_block(shared_layer, mRunState.MainStream);
+                if (lora_block.moe.shared.has_value()) {
+                    auto& shared = *lora_block.moe.shared;
+                    const auto& lora_layer = is_shared_up ? shared.up : shared.down;
+                    if (lora_layer.has_value() && lora_layer->has_value()) {
+                        bool lora_accum = false;
+                        auto& lora_grads = mLoRAGrads->get_block_full(shared_layer, mRunState.MainStream, *mComm, lora_accum);
+                        lora_accum = lora_accum || do_accumulate;
+
+                        if (lora_grads.moe.shared.has_value()) {
+                            auto* grad_layer = is_shared_up ? &lora_grads.moe.shared->up : &lora_grads.moe.shared->down;
+                            if (grad_layer && grad_layer->has_value() && grad_layer->value().has_value()) {
+                            Tensor a_flat = a;
+                            Tensor d_out_flat = d_out;
+                            if (a_flat.Rank > 2 && a_flat.Sizes[0] == mB && a_flat.Sizes[1] == mT) {
+                                a_flat = view_tensor(a_flat, {mB * mT, a_flat.Sizes[a_flat.Rank - 1]});
+                            }
+                            if (d_out_flat.Rank > 2 && d_out_flat.Sizes[0] == mB && d_out_flat.Sizes[1] == mT) {
+                                d_out_flat = view_tensor(d_out_flat, {mB * mT, d_out_flat.Sizes[d_out_flat.Rank - 1]});
+                            }
+
+                            Tensor dA_tmp{};
+                            Tensor* dA_use = dA_ptr;
+                            if (!dA_use) {
+                                dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]});
+                                fill_zero(dA_tmp, mRunState.MainStream);
+                                mTemps.push_back(dA_tmp);
+                                dA_use = &dA_tmp;
+                            }
+
+                            const int BT = static_cast<int>(a_flat.Sizes[0]);
+                            const int in_features = static_cast<int>(a_flat.Sizes[1]);
+                            const int out_features = static_cast<int>(d_out_flat.Sizes[1]);
+                            const int rank = mLoRAConfig->rank;
+                            const float scaling = mLoRAConfig->scaling();
+                            const float dropout = mLoRAConfig->dropout;
+                            const bool training = mLoRARunState->is_training;
+                            const int proj_type = is_shared_up ? 7 : 8;
+                            const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                                + static_cast<unsigned int>(shared_layer) * 1000000u
+                                + static_cast<unsigned int>(proj_type) * 100000u
+                                + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+
+                            modules::detail::backward_lora_layer(
+                                grad_layer->value().A, grad_layer->value().B,
+                                *dA_use,
+                                d_out_flat, 0,
+                                a_flat,
+                                lora_layer->A, lora_layer->B,
+                                scaling,
+                                dropout, dropout_seed, training,
+                                mLoRARunState->intermediate, mLoRARunState->slice,
+                                BT, in_features, out_features, rank, lora_accum,
+                                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     // Hook invocation for LoRA backward
     // Skip dense MLP hooks for MoE models - MoE has different backward path (grouped GEMM)
@@ -467,7 +639,22 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     const int Bv = static_cast<int>(mB);
                     const int Tv = static_cast<int>(mT);
                     const int D = static_cast<int>(mConfig.IntermediateSize);
-                    swiglu_forward(acts.swiglu, acts.mlp_up, nullptr, Bv, Tv, D, mRunState.MainStream);
+                    switch (mConfig.activation_type) {
+                        case modules::ActivationType::SwiGLU:
+                        case modules::ActivationType::GeGLU:
+                            swiglu_forward(acts.swiglu, acts.mlp_up, nullptr, Bv, Tv, D, mRunState.MainStream);
+                            break;
+                        case modules::ActivationType::ReLU2: {
+                            const long N = static_cast<long>(Bv) * static_cast<long>(Tv) * static_cast<long>(D);
+                            relu2_forward(acts.swiglu, acts.mlp_up, N, mRunState.MainStream);
+                        } break;
+                        case modules::ActivationType::SiLU: {
+                            const long N = static_cast<long>(Bv) * static_cast<long>(Tv) * static_cast<long>(D);
+                            silu_forward(acts.swiglu, acts.mlp_up, N, mRunState.MainStream);
+                        } break;
+                        default:
+                            throw std::runtime_error("matmul: unsupported activation type for LoRA swiglu recompute");
+                    }
                 }
             }
         }

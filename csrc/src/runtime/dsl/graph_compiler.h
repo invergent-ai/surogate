@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <limits>
 
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
@@ -166,8 +167,8 @@ struct CompiledAttrs {
     int chunk_size = 256;
     int intermediate_size = 0;
     int conv_dim = 0;
-    float dt_min = 0.001f;
-    float dt_max = 0.1f;
+    float dt_min = 0.0f;
+    float dt_max = std::numeric_limits<float>::infinity();
     bool dt_softplus = true;
     bool use_conv_bias = true;
     std::string activation;  // for mamba_conv1d (e.g., "silu")

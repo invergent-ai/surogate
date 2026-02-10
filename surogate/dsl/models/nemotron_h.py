@@ -16,6 +16,8 @@ This allows mixing the efficiency of SSMs with the expressiveness of attention.
 
 from __future__ import annotations
 
+import math
+
 from ..tensor_type import Tensor, Array
 from ..decorators import model, forward, hf_config, Param, Activation, Gradient
 from ..graph_builder import graph
@@ -88,6 +90,9 @@ def to_standard_hybrid_pattern(nemotron_pattern: str) -> str:
     n_groups="n_groups",
     conv_kernel="conv_kernel",
     chunk_size="chunk_size",
+    time_step_limit="time_step_limit",
+    time_step_min="time_step_min",
+    time_step_max="time_step_max",
     # Common config
     vocab_size="vocab_size",
     max_seq="max_position_embeddings",
@@ -138,9 +143,13 @@ class NemotronHModel:
         n_groups: int = 8,
         conv_kernel: int = 4,
         chunk_size: int = 128,
+        time_step_limit: tuple[float, float] | None = None,
+        time_step_min: float = 0.001,
+        time_step_max: float = 0.1,
         # Common params
         max_seq: int = 4096,
         eps: float = 1e-5,
+        use_rope: bool = False,
         # Hybrid pattern
         hybrid_pattern: str = "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
         # Bias options
@@ -171,6 +180,20 @@ class NemotronHModel:
         self.n_groups = n_groups
         self.conv_kernel = conv_kernel
         self.chunk_size = chunk_size
+        dt_max_default = 1e9
+        if time_step_limit is None:
+            time_step_limit = (0.0, dt_max_default)
+        elif isinstance(time_step_limit, (list, tuple)) and len(time_step_limit) == 2:
+            lo = float(time_step_limit[0])
+            hi = float(time_step_limit[1])
+            if not math.isfinite(lo):
+                lo = 0.0
+            if not math.isfinite(hi):
+                hi = dt_max_default
+            time_step_limit = (lo, hi)
+        self.time_step_limit = time_step_limit
+        self.time_step_min = time_step_min
+        self.time_step_max = time_step_max
         self.max_seq = max_seq
         self.eps = eps
         # Store in standard alphabet (M/A/P/E) for export to C++ runtime
@@ -187,6 +210,9 @@ class NemotronHModel:
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.routed_scaling_factor = routed_scaling_factor
         self.mlp_activation = mlp_activation
+
+        # Nemotron-H attention does not use RoPE (Mamba provides positional info)
+        self.use_rope = use_rope
 
         # Parse hybrid pattern to get block types
         self.block_types = parse_hybrid_pattern(hybrid_pattern)
@@ -215,9 +241,9 @@ class NemotronHModel:
         self.mamba_proj_size = self.mamba_intermediate + self.mamba_conv_dim + mamba_num_heads
 
     # Model weights
-    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="backbone.embeddings.weight")
+    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="backbone.embeddings.weight", quantizable=False)
     final_norm = Param(Tensor["d_model"], hf_mapping="backbone.norm_f.weight", quantizable=False)
-    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
+    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight", quantizable=False)
 
     # Block arrays - using specialized block types based on pattern
     # The runtime will handle dispatching to correct block based on layer index
@@ -238,9 +264,10 @@ class NemotronHModel:
     targets = Activation(Tensor["B", "T"], dtype="int32", scope="global",
                          aliases=["labels"], description="Target labels for loss")
 
-    # Precomputed constants (for attention blocks)
+    # Precomputed constants (for attention blocks that use RoPE)
     freq_cis = Activation(Tensor["max_seq", "D", 2], dtype="fp32", scope="global",
-                          aliases=["rope_freqs"], description="Precomputed RoPE frequencies")
+                          aliases=["rope_freqs"], description="Precomputed RoPE frequencies",
+                          when="use_rope")
 
     # =========================================================================
     # Global activation slots
@@ -310,6 +337,7 @@ class NemotronHModel:
         # MoE block weights (NemotronMoEBlock uses experts_up, not experts_gate_up)
         # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj
         "router_weight": "backbone.layers.{layer}.mixer.gate.weight",
+        "e_score_correction_bias": "backbone.layers.{layer}.mixer.gate.e_score_correction_bias",
         "experts_up": stack_experts(
             "backbone.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
         ),
@@ -375,6 +403,20 @@ def from_hf_config(config: dict) -> NemotronHModel:
     Returns:
         NemotronHModel instance
     """
+    dt_max_default = 1e9
+    time_step_min = config.get("time_step_min", 0.001)
+    time_step_max = config.get("time_step_max", 0.1)
+    time_step_limit = config.get("time_step_limit")
+    if not time_step_limit:
+        time_step_limit = (0.0, dt_max_default)
+    elif isinstance(time_step_limit, (list, tuple)) and len(time_step_limit) == 2:
+        lo = float(time_step_limit[0])
+        hi = float(time_step_limit[1])
+        if not math.isfinite(lo):
+            lo = 0.0
+        if not math.isfinite(hi):
+            hi = dt_max_default
+        time_step_limit = (lo, hi)
     return NemotronHModel(
         vocab_size=config.get("vocab_size", 131072),
         d_model=config.get("hidden_size", 4096),
@@ -389,6 +431,9 @@ def from_hf_config(config: dict) -> NemotronHModel:
         n_groups=config.get("n_groups", 8),
         conv_kernel=config.get("conv_kernel", 4),
         chunk_size=config.get("chunk_size", 128),
+        time_step_limit=time_step_limit,
+        time_step_min=time_step_min,
+        time_step_max=time_step_max,
         max_seq=config.get("max_position_embeddings", 4096),
         eps=config.get("layer_norm_epsilon", 1e-5),
         hybrid_pattern=config.get("hybrid_override_pattern",

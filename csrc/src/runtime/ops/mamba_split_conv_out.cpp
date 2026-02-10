@@ -32,24 +32,67 @@ void CompiledExecutor::dispatch_mamba_split_conv_out(const CompiledOp& op) {
     // D = intermediate_size (mamba_num_heads * mamba_head_dim)
     const int D = intermediate_size;
 
-    // Allocate outputs
-    Tensor u = mRunState.temp_alloc(conv_out.DType, {B, D, T});
-    mTemps.push_back(u);
+    auto shape_matches = [](const TensorRef& ref, long expected) -> bool {
+        if (ref.shape.empty()) return false;
+        long prod = 1;
+        for (auto d : ref.shape) {
+            if (d <= 0) return false;
+            prod *= d;
+        }
+        return prod == expected;
+    };
 
-    Tensor B_ssm = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T});
-    mTemps.push_back(B_ssm);
+    const long u_expected = static_cast<long>(B) * D * T;
+    const long bc_expected = static_cast<long>(B) * groups * dstate * T;
 
-    Tensor C_ssm = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T});
-    mTemps.push_back(C_ssm);
+    Tensor* u_ptr = nullptr;
+    Tensor* b_ptr = nullptr;
+    Tensor* c_ptr = nullptr;
+
+    if (shape_matches(op.outputs[0], u_expected)) {
+        Tensor& u_ref = ensure_output_tensor(op.outputs[0]);
+        if (u_ref.nelem() == u_expected) {
+            u_ptr = &u_ref;
+        }
+    }
+    if (!u_ptr) {
+        Tensor u = mRunState.temp_alloc(conv_out.DType, {B, D, T});
+        mTemps.push_back(u);
+        u_ptr = &mTemps.back();
+    }
+
+    if (shape_matches(op.outputs[1], bc_expected)) {
+        Tensor& b_ref = ensure_output_tensor(op.outputs[1]);
+        if (b_ref.nelem() == bc_expected) {
+            b_ptr = &b_ref;
+        }
+    }
+    if (!b_ptr) {
+        Tensor B_ssm = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T});
+        mTemps.push_back(B_ssm);
+        b_ptr = &mTemps.back();
+    }
+
+    if (shape_matches(op.outputs[2], bc_expected)) {
+        Tensor& c_ref = ensure_output_tensor(op.outputs[2]);
+        if (c_ref.nelem() == bc_expected) {
+            c_ptr = &c_ref;
+        }
+    }
+    if (!c_ptr) {
+        Tensor C_ssm = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T});
+        mTemps.push_back(C_ssm);
+        c_ptr = &mTemps.back();
+    }
 
     // Call kernel
-    mamba_split_conv_out(u, B_ssm, C_ssm, conv_out,
+    mamba_split_conv_out(*u_ptr, *b_ptr, *c_ptr, conv_out,
                          B, T, D, groups, dstate,
                          mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = u;
-    mTensorMap[op.outputs[1].name] = B_ssm;
-    mTensorMap[op.outputs[2].name] = C_ssm;
+    mTensorMap[op.outputs[0].name] = *u_ptr;
+    mTensorMap[op.outputs[1].name] = *b_ptr;
+    mTensorMap[op.outputs[2].name] = *c_ptr;
 }
 
 void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& op) {
@@ -59,12 +102,12 @@ void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& 
     Tensor& d_B = resolve_tensor(op.inputs[1]);
     Tensor& d_C = resolve_tensor(op.inputs[2]);
 
-    const int B = static_cast<int>(d_u.Sizes[0]);
-    const int D = static_cast<int>(d_u.Sizes[1]);
-    const int T = static_cast<int>(d_u.Sizes[2]);
-
     const int groups = op.attrs.n_groups;
     const int dstate = op.attrs.ssm_state_size;
+    const int D = op.attrs.intermediate_size;
+    const int B = (mB > 0) ? static_cast<int>(mB) : static_cast<int>(d_u.Sizes[0]);
+    const int T = (mT > 0) ? static_cast<int>(mT)
+                           : static_cast<int>(d_u.nelem() / (static_cast<long>(B) * D));
     const int conv_dim = D + 2 * groups * dstate;
 
     // Allocate output

@@ -37,20 +37,44 @@ void CompiledExecutor::dispatch_moe_sigmoid(const CompiledOp& op) {
         }
     }
 
+    const ETensorDType out_dtype = op.outputs[0].dtype;
+
     // Allocate output with same shape as input
-    Tensor out = mRunState.temp_alloc(inp.DType, shape);
+    Tensor out = mRunState.temp_alloc(out_dtype, shape);
     mTemps.push_back(out);
 
     const int num_elements = static_cast<int>(out.nelem());
 
-    if (inp.DType == ETensorDType::BF16) {
-        moe_sigmoid_forward(out.get<nv_bfloat16>(),
-                            inp.get<nv_bfloat16>(),
-                            num_elements, mRunState.MainStream);
-    } else {
+    if (out_dtype == inp.DType) {
+        if (inp.DType == ETensorDType::BF16) {
+            moe_sigmoid_forward(out.get<nv_bfloat16>(),
+                                inp.get<nv_bfloat16>(),
+                                num_elements, mRunState.MainStream);
+        } else if (inp.DType == ETensorDType::FP32) {
+            moe_sigmoid_forward(out.get<float>(),
+                                inp.get<float>(),
+                                num_elements, mRunState.MainStream);
+        } else {
+            throw std::logic_error("moe_sigmoid_forward: unsupported input dtype");
+        }
+    } else if (out_dtype == ETensorDType::FP32 && inp.DType == ETensorDType::BF16) {
+        Tensor inp_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape);
+        mTemps.push_back(inp_f32);
+        convert_dtype(inp_f32.get<float>(), inp.get<nv_bfloat16>(),
+                      num_elements, mRunState.MainStream);
         moe_sigmoid_forward(out.get<float>(),
+                            inp_f32.get<float>(),
+                            num_elements, mRunState.MainStream);
+    } else if (out_dtype == ETensorDType::BF16 && inp.DType == ETensorDType::FP32) {
+        Tensor out_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape);
+        mTemps.push_back(out_f32);
+        moe_sigmoid_forward(out_f32.get<float>(),
                             inp.get<float>(),
                             num_elements, mRunState.MainStream);
+        convert_dtype(out.get<nv_bfloat16>(), out_f32.get<float>(),
+                      num_elements, mRunState.MainStream);
+    } else {
+        throw std::logic_error("moe_sigmoid_forward: unsupported dtype conversion");
     }
 
     mTensorMap[op.outputs[0].name] = out;
@@ -65,21 +89,71 @@ void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
     for (int i = 0; i < d_out.Rank; ++i) {
         d_inp_shape.push_back(d_out.Sizes[i]);
     }
-    Tensor d_inp = mRunState.temp_alloc(d_out.DType, d_inp_shape);
+    const ETensorDType out_dtype = op.outputs[0].dtype;
+    Tensor d_inp = mRunState.temp_alloc(out_dtype, d_inp_shape);
     mTemps.push_back(d_inp);
 
     const int num_elements = static_cast<int>(d_out.nelem());
 
-    if (d_out.DType == ETensorDType::BF16) {
-        moe_sigmoid_backward(d_inp.get<nv_bfloat16>(),
-                             d_out.get<nv_bfloat16>(),
-                             sigmoid_out.get<nv_bfloat16>(),
-                             num_elements, mRunState.MainStream);
-    } else {
+    if (out_dtype == ETensorDType::FP32) {
+        Tensor d_out_f32 = d_out;
+        Tensor sig_f32 = sigmoid_out;
+        if (d_out.DType == ETensorDType::BF16) {
+            d_out_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape);
+            mTemps.push_back(d_out_f32);
+            convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(),
+                          num_elements, mRunState.MainStream);
+        } else if (d_out.DType != ETensorDType::FP32) {
+            throw std::logic_error("moe_sigmoid_backward: unsupported d_out dtype");
+        }
+        if (sigmoid_out.DType == ETensorDType::BF16) {
+            sig_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape);
+            mTemps.push_back(sig_f32);
+            convert_dtype(sig_f32.get<float>(), sigmoid_out.get<nv_bfloat16>(),
+                          num_elements, mRunState.MainStream);
+        } else if (sigmoid_out.DType != ETensorDType::FP32) {
+            throw std::logic_error("moe_sigmoid_backward: unsupported sigmoid_out dtype");
+        }
         moe_sigmoid_backward(d_inp.get<float>(),
-                             d_out.get<float>(),
-                             sigmoid_out.get<float>(),
+                             d_out_f32.get<float>(),
+                             sig_f32.get<float>(),
                              num_elements, mRunState.MainStream);
+    } else if (out_dtype == ETensorDType::BF16) {
+        if (d_out.DType == ETensorDType::BF16 && sigmoid_out.DType == ETensorDType::BF16) {
+            moe_sigmoid_backward(d_inp.get<nv_bfloat16>(),
+                                 d_out.get<nv_bfloat16>(),
+                                 sigmoid_out.get<nv_bfloat16>(),
+                                 num_elements, mRunState.MainStream);
+        } else {
+            Tensor d_out_f32 = d_out;
+            Tensor sig_f32 = sigmoid_out;
+            if (d_out.DType == ETensorDType::BF16) {
+                d_out_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape);
+                mTemps.push_back(d_out_f32);
+                convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(),
+                              num_elements, mRunState.MainStream);
+            } else if (d_out.DType != ETensorDType::FP32) {
+                throw std::logic_error("moe_sigmoid_backward: unsupported d_out dtype");
+            }
+            if (sigmoid_out.DType == ETensorDType::BF16) {
+                sig_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape);
+                mTemps.push_back(sig_f32);
+                convert_dtype(sig_f32.get<float>(), sigmoid_out.get<nv_bfloat16>(),
+                              num_elements, mRunState.MainStream);
+            } else if (sigmoid_out.DType != ETensorDType::FP32) {
+                throw std::logic_error("moe_sigmoid_backward: unsupported sigmoid_out dtype");
+            }
+            Tensor d_inp_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape);
+            mTemps.push_back(d_inp_f32);
+            moe_sigmoid_backward(d_inp_f32.get<float>(),
+                                 d_out_f32.get<float>(),
+                                 sig_f32.get<float>(),
+                                 num_elements, mRunState.MainStream);
+            convert_dtype(d_inp.get<nv_bfloat16>(), d_inp_f32.get<float>(),
+                          num_elements, mRunState.MainStream);
+        }
+    } else {
+        throw std::logic_error("moe_sigmoid_backward: unsupported output dtype");
     }
 
     mTensorMap[op.outputs[0].name] = d_inp;

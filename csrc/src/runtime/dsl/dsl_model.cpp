@@ -136,6 +136,7 @@ struct DslConfigView {
     std::optional<long> shared_expert_intermediate;
     std::optional<std::string> hybrid_pattern;
     std::optional<double> routed_scaling_factor;
+    std::optional<std::string> mlp_activation;
 };
 
 std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
@@ -177,6 +178,23 @@ std::optional<std::string> get_string_attr(const AttrMap& map, const char* key) 
     return std::nullopt;
 }
 
+std::optional<modules::ActivationType> parse_activation_type(std::string_view name) {
+    std::string clean;
+    clean.reserve(name.size());
+    for (char c : name) {
+        clean.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (clean == "swiglu") return modules::ActivationType::SwiGLU;
+    if (clean == "geglu") return modules::ActivationType::GeGLU;
+    if (clean == "relu") return modules::ActivationType::ReLU;
+    if (clean == "relu2") return modules::ActivationType::ReLU2;
+    if (clean == "gelu" || clean == "gelu_new" || clean == "gelu_fast") {
+        return modules::ActivationType::GeLU;
+    }
+    if (clean == "silu" || clean == "swish") return modules::ActivationType::SiLU;
+    return std::nullopt;
+}
+
 DslConfigView parse_dsl_config(const Module& module) {
     DslConfigView view;
     const auto& cfg = module.config;
@@ -202,6 +220,9 @@ DslConfigView parse_dsl_config(const Module& module) {
         view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate_size");
     view.hybrid_pattern = get_string_attr(cfg, "hybrid_pattern");
     view.routed_scaling_factor = get_double_attr(cfg, "routed_scaling_factor");
+    view.mlp_activation = get_string_attr(cfg, "mlp_activation");
+    if (!view.mlp_activation) view.mlp_activation = get_string_attr(cfg, "mlp_hidden_act");
+    if (!view.mlp_activation) view.mlp_activation = get_string_attr(cfg, "activation");
     return view;
 }
 
@@ -220,6 +241,9 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     runtime.norm_topk_prob = view.norm_topk_prob.value_or(false);
     runtime.use_shared_expert = view.use_shared_expert.value_or(false);
     runtime.shared_expert_intermediate = static_cast<int>(view.shared_expert_intermediate.value_or(0));
+    if (!runtime.use_shared_expert && runtime.shared_expert_intermediate > 0) {
+        runtime.use_shared_expert = true;
+    }
 
     if (view.moe_intermediate_size.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
@@ -394,6 +418,12 @@ modules::ModelConfig build_model_config(const Module& module,
         }
         if (has_multiple_types) {
             cfg.architecture = modules::ArchitectureType::Hybrid;
+        }
+    }
+
+    if (view.mlp_activation.has_value()) {
+        if (auto act = parse_activation_type(*view.mlp_activation)) {
+            cfg.activation_type = *act;
         }
     }
 

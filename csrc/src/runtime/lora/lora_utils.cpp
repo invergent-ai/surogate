@@ -18,6 +18,13 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
     const std::size_t Hs = static_cast<std::size_t>(model_config.head_size());
     const std::size_t q_out = Hq * Hs;
     const std::size_t kv_out = Hkv * Hs;
+    const bool use_shared_expert = model_config.moe_config.has_value() &&
+                                   model_config.moe_config->use_shared_expert;
+    const std::size_t shared_D = use_shared_expert && model_config.moe_config->shared_expert_size > 0
+                                     ? static_cast<std::size_t>(model_config.moe_config->shared_expert_size)
+                                     : static_cast<std::size_t>(model_config.MoeIntermediateSize > 0
+                                                                    ? model_config.MoeIntermediateSize
+                                                                    : model_config.IntermediateSize);
 
     std::size_t per_layer = 0;
     if (lora_config.applies_to_q()) per_layer += r * C + q_out * r;
@@ -27,6 +34,11 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
     if (lora_config.applies_to_gate()) per_layer += r * C + D * r;
     if (lora_config.applies_to_up()) per_layer += r * C + D * r;
     if (lora_config.applies_to_down()) per_layer += r * D + C * r;
+
+    if (use_shared_expert) {
+        if (lora_config.applies_to_up()) per_layer += r * C + shared_D * r;
+        if (lora_config.applies_to_down()) per_layer += r * shared_D + C * r;
+    }
 
     return per_layer * static_cast<std::size_t>(model_config.NumLayers);
 }

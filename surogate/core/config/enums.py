@@ -21,6 +21,7 @@ class LLMChatTemplateType:
     llama3 = 'llama3'
     llama3_2 = 'llama3_2'
     gpt_oss = 'gpt_oss'
+    nemotron_nano = 'nemotron_nano'
 
 class MLLMChatTemplateType:
     qwen2_5_vl = 'qwen2_5_vl'
@@ -42,6 +43,8 @@ class LLMModelType:
     llama3_2 = 'llama3_2'
 
     gpt_oss = 'gpt_oss'
+    
+    nemotron_nano = 'nemotron_nano'
 
 class MLLMModelType:
     qwen2_5_vl = 'qwen2_5_vl'

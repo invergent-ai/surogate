@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/python.h>
+#include <limits>
 #include <vector>
 
 #include "selective_scan.h"
@@ -79,7 +80,9 @@ void set_ssm_params_fwd(SSMParamsBase &params,
                         void* delta_bias_ptr,
                         void* x_ptr,
                         bool has_z,
-                        bool delta_softplus) {
+                        bool delta_softplus,
+                        float delta_min,
+                        float delta_max) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -93,6 +96,8 @@ void set_ssm_params_fwd(SSMParamsBase &params,
     params.dim_ngroups_ratio = dim / n_groups;
 
     params.delta_softplus = delta_softplus;
+    params.delta_min = delta_min;
+    params.delta_max = delta_max;
 
     params.is_variable_B = is_variable_B;
     params.is_variable_C = is_variable_C;
@@ -173,6 +178,8 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                         void* ddelta_bias_ptr,
                         bool has_z,
                         bool delta_softplus,
+                        float delta_min,
+                        float delta_max,
                         bool recompute_out_z) {
     // Pass in "dout" instead of "out", we're not gonna use "out" unless we have z
     set_ssm_params_fwd(params, batch, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
@@ -181,7 +188,7 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                        // If not recompute_out_z, pass dout instead of out_z.
                        // This won't be used by the bwd kernel
                        recompute_out_z ? out_z : dout,
-                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus);
+                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus, delta_min, delta_max);
     if (!recompute_out_z) { params.out_z_ptr = nullptr; }
 
     // Set the pointers and strides.
@@ -313,13 +320,17 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     x = torch::empty({batch_size, dim, n_chunks, dstate * 2}, u.options().dtype(weight_type));
 
     SSMParamsBase params;
+    const float delta_min = 0.f;
+    const float delta_max = std::numeric_limits<float>::infinity();
     set_ssm_params_fwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
                        u, delta, A, B, C, out, z, out_z,
                        D_.has_value() ? D_.value().data_ptr() : nullptr,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
                        x.data_ptr(),
                        has_z,
-                       delta_softplus);
+                       delta_softplus,
+                       delta_min,
+                       delta_max);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
@@ -466,6 +477,8 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     if (delta_bias_.has_value()) { ddelta_bias = torch::zeros_like(delta_bias_.value()); }
 
     SSMParamsBwd params;
+    const float delta_min = 0.f;
+    const float delta_max = std::numeric_limits<float>::infinity();
     set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
                        u, delta, A, B, C, z, out, out_z,
                        D_.has_value() ? D_.value().data_ptr() : nullptr,
@@ -474,7 +487,7 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                        dout, du, ddelta, dA, dB, dC, dz,
                        D_.has_value() ? dD.data_ptr() : nullptr,
                        delta_bias_.has_value() ? ddelta_bias.data_ptr() : nullptr,
-                       has_z, delta_softplus, recompute_out_z);
+                       has_z, delta_softplus, delta_min, delta_max, recompute_out_z);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing

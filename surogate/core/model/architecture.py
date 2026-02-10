@@ -6,6 +6,7 @@ MODEL_ARCH_MAPPING = {}
 class LLMArchitecture:
     qwen = 'qwen'
     llama = 'llama'
+    nemotron_nano = 'nemotron_nano'
 
 class MLLMArchitecture:
     qwen2_vl = 'qwen2_vl'

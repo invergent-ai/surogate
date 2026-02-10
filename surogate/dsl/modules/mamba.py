@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from ..tensor_type import Tensor
 from ..decorators import module, forward, Param
 from ..graph_builder import graph
@@ -50,6 +52,7 @@ class Mamba2Mixer:
         eps: float = 1e-5,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
+        time_step_limit: tuple[float, float] | None = None,
         use_conv_bias: bool = True,
         use_bias: bool = False,
     ):
@@ -63,6 +66,18 @@ class Mamba2Mixer:
         self.eps = eps
         self.dt_min = dt_min
         self.dt_max = dt_max
+        dt_max_default = 1e9
+        if time_step_limit is None:
+            time_step_limit = (0.0, dt_max_default)
+        elif isinstance(time_step_limit, (list, tuple)) and len(time_step_limit) == 2:
+            lo = float(time_step_limit[0])
+            hi = float(time_step_limit[1])
+            if not math.isfinite(lo):
+                lo = 0.0
+            if not math.isfinite(hi):
+                hi = dt_max_default
+            time_step_limit = (lo, hi)
+        self.time_step_limit = time_step_limit
         self.use_conv_bias = use_conv_bias
         self.use_bias = use_bias
 
@@ -127,6 +142,7 @@ class Mamba2Mixer:
                 intermediate_size=self.intermediate_size,
                 conv_dim=self.conv_dim,
                 num_heads=self.mamba_num_heads,
+                head_dim=self.mamba_head_dim,
             )
 
             # Causal 1D convolution
@@ -144,18 +160,13 @@ class Mamba2Mixer:
                 ssm_state_size=self.ssm_state_size,
             )
 
-            # Reshape for SSM scan
-            hidden_states_4d = g.view(hidden_states, shape=[B, T, self.H, self.D])
-            ssm_B_4d = g.view(ssm_B, shape=[B, T, self.G, self.N])
-            ssm_C_4d = g.view(ssm_C, shape=[B, T, self.G, self.N])
-
             # State Space Model scan
             ssm_out, ssm_state = g.mamba_ssm_scan(
-                hidden_states_4d, dt, "A_log", ssm_B_4d, ssm_C_4d, "D_param",
+                hidden_states, dt, "A_log", ssm_B, ssm_C, "D_param",
                 dt_bias="dt_bias",
                 dt_softplus=True,
-                dt_min=self.dt_min,
-                dt_max=self.dt_max,
+                dt_min=self.time_step_limit[0],
+                dt_max=self.time_step_limit[1],
                 chunk_size=self.chunk_size,
                 num_heads=self.mamba_num_heads,
                 head_dim=self.mamba_head_dim,
