@@ -33,14 +33,18 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
       CUDAARCHS: ${{ matrix.archs }}
+      UV_NO_SYNC: 1
 
     defaults:
       run:
         working-directory: ${{ github.workspace }}
 
     steps:
-      - name: Install git first
-        run: apt update && apt install -y git
+      - name: Install System Dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+          git wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev \
+          g++-13
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,21 +52,17 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Install remaining deps
-        run: apt install -y g++-13 wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev
-        
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: ccache
+      
+      - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: wheel-${{ matrix.wheel_tag }}
+          key: ${{ runner.os }}-cuda${{ matrix.cuda_version }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cuda${{ matrix.cuda_version }}-
 
-      - name: Install the latest version of uv@
+      - name: Install uv
         uses: astral-sh/setup-uv@v7
 
       - name: Add CUDA runtime dependencies
@@ -71,16 +71,30 @@ jobs:
       - name: Build wheel
         run: uv build --wheel
 
-      - name: Repair wheel with auditwheel
+      - name: Repair wheel
         run: |
-          uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl -w wheelhouse/ --exclude libcuda.so.1 --exclude libcudart.so.12 --exclude libcudart.so.13 --exclude libcudnn.so.9 --exclude libcufile.so.0 --exclude libnccl.so.2 --exclude libcublas.so.12 --exclude libcublas.so.13 --exclude libcublasLt.so.12 --exclude libcublasLt.so.13 --exclude libnvidia-ml.so.1
-          rm dist/*-linux_*.whl  # Remove non-repaired wheel
+          mkdir -p wheelhouse
+          uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
+            -w wheelhouse/ \
+            --exclude libcuda.so.1 \
+            --exclude libcudart.so.12 \
+            --exclude libcudart.so.13 \
+            --exclude libcudnn.so.9 \
+            --exclude libcufile.so.0 \
+            --exclude libnccl.so.2 \
+            --exclude libcublas.so.12 \
+            --exclude libcublas.so.13 \
+            --exclude libcublasLt.so.12 \
+            --exclude libcublasLt.so.13 \
+            --exclude libnvidia-ml.so.1
+
+            ls -lh wheelhouse/
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.wheel_tag }}
-          path: wheelhouse/surogate*.whl
+          path: wheelhouse/*.whl
 
   release:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release-') || startsWith(github.ref, 'refs/tags/')
