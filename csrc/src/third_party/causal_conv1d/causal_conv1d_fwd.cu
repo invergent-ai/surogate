@@ -211,7 +211,6 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
     constexpr int kWidth = Ktraits::kWidth;
     constexpr int kNThreads = Ktraits::kNThreads;
     constexpr int kNElts = Ktraits::kNElts;
-    constexpr int kNWarp = Ktraits::kNWarps;
     constexpr int kNThreadsPerC = Ktraits::kNThreadsPerRow;
     constexpr int kLPerLoad = Ktraits::kNColsPerLoad;
     constexpr int kChunkSizeL = Ktraits::kChunkSizeL;

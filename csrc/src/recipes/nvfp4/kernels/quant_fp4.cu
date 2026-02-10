@@ -95,32 +95,6 @@ __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
 }
 
 /**
- * @brief Convert 4 float2 values to 8 FP4 E2M1 values packed into a uint32_t.
- *
- * Variant that takes float2 inputs for better memory coalescing when
- * loading from half2/bfloat162 after conversion to float2.
- */
-__device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float2 (&array)[4]) {
-    uint32_t val;
-    asm volatile(
-        "{\n"
-        ".reg .b8 byte0;\n"
-        ".reg .b8 byte1;\n"
-        ".reg .b8 byte2;\n"
-        ".reg .b8 byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "}"
-        : "=r"(val)
-        : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y),
-          "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
-    return val;
-}
-
-/**
  * @brief Compute global encode scale for FP4 quantization.
  *
  * The global encode scale maps the tensor's dynamic range to the FP4 range.

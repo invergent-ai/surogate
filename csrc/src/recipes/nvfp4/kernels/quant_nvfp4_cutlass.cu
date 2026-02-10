@@ -57,41 +57,6 @@ __device__ __forceinline__ float rcp_approx_ftz(float a) {
 }
 
 /**
- * @brief Convert 8 float32 values to 8 FP4 E2M1 values packed into a uint32_t.
- *
- * Uses PTX cvt.rn.satfinite.e2m1x2.f32 instruction which converts 2 floats to
- * 2 e2m1 values in a single byte. Four such conversions produce a uint32_t
- * with 8 packed FP4 values.
- *
- * This is significantly faster than scalar __nv_cvt_float_to_fp4 calls:
- * - Single instruction converts 2 values vs 2 separate conversions
- * - Direct byte assembly avoids intermediate storage
- * - Better instruction-level parallelism
- *
- * @param array Input array of 8 float values to quantize.
- * @return uint32_t with 8 packed FP4 E2M1 values.
- */
-[[maybe_unused]] __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
-    uint32_t val;
-    asm volatile(
-        "{\n"
-        ".reg .b8 byte0;\n"
-        ".reg .b8 byte1;\n"
-        ".reg .b8 byte2;\n"
-        ".reg .b8 byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "}"
-        : "=r"(val)
-        : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
-          "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
-    return val;
-}
-
-/**
  * @brief Compute global encode scale for two-level NVFP4 quantization.
  *
  * Maps the tensor's dynamic range to the FP4 range using FP8 as intermediate.
