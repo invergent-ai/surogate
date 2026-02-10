@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from surogate.core.config.sft_config import SFTConfig
+from surogate.train.on_the_fly_mm import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 
 # Lazy import Ray to avoid dependency when not using distributed training
 _ray = None
@@ -145,6 +146,15 @@ class NodeTrainer:
         self._trainer = None
         self._train_loader = None
         self._eval_loader = None
+        self._mm_on_the_fly = False
+        self._mm_batcher = None
+        self._mm_train_dataset = None
+        self._mm_eval_dataset = None
+        self._mm_hf_model = None
+        self._mm_processor = None
+        self._mm_template_processor = None
+        self._mm_vision_device = None
+        self._mm_rope_fn = None
 
     def setup(self) -> None:
         """Initialize data and model config on this node (non-blocking phase)."""
@@ -160,12 +170,28 @@ class NodeTrainer:
         
         logger.info(f"Node {self.node_rank}: Model download complete, weights at {config.model_dir}")
 
-        # Handle per-node tokenization if enabled
-        if self.tokenize_on_node:
+        self._mm_on_the_fly = bool(config.multimodal_on_the_fly and config.model_template.is_multimodal)
+
+        if self._mm_on_the_fly:
+            if config.sample_packing:
+                logger.warning("multimodal_on_the_fly disables sample_packing; forcing sample_packing=False.")
+                config.sample_packing = False
+            if config.padding_free:
+                logger.warning("multimodal_on_the_fly disables padding_free; forcing padding_free=False.")
+                config.padding_free = False
+
+        # Handle per-node tokenization if enabled (disabled for on-the-fly multimodal)
+        if self.tokenize_on_node and not self._mm_on_the_fly:
             train_files, eval_files = self._tokenize_node_data(config)
         else:
             train_files = self.train_files
             eval_files = self.eval_files
+
+        if self._mm_on_the_fly:
+            # Shard training data across nodes for on-the-fly mode
+            self._mm_train_dataset, self._mm_eval_dataset = load_multimodal_datasets(
+                config, node_rank=self.node_rank, num_nodes=self.num_nodes
+            )
 
         # Store for init_trainer phase
         self._train_files = train_files
@@ -270,43 +296,47 @@ class NodeTrainer:
         local_gpus = self.gpus_per_node if self.gpus_per_node > 0 else self._config.gpus
         self.chunk_size = self._config.per_device_train_batch_size * self._config.sequence_len * local_gpus
 
-        # Create data loaders
+        # Create data loaders (skip for on-the-fly multimodal)
         # When tokenize_on_node=True, each node has its own complete shard,
         # so we use rank=0, world_size=1 (no further sharding needed)
         # When tokenize_on_node=False, we use strided access across pre-tokenized files
-        if self.tokenize_on_node:
-            self._train_loader = _surogate.DataLoader(
-                self._train_files,
-                self.chunk_size,
-                rank=0,
-                world_size=1,
-                seed=self._config.train_seed
-            )
-            if self._eval_files:
-                self._eval_loader = _surogate.DataLoader(
-                    self._eval_files,
+        if not self._mm_on_the_fly:
+            if self.tokenize_on_node:
+                self._train_loader = _surogate.DataLoader(
+                    self._train_files,
                     self.chunk_size,
                     rank=0,
                     world_size=1,
-                    seed=self._config.eval_seed
+                    seed=self._config.train_seed
                 )
-        else:
-            # strided access across shared pre-tokenized files
-            self._train_loader = _surogate.DataLoader(
-                self._train_files,
-                self.chunk_size,
-                rank=self.node_rank,
-                world_size=self.num_nodes,
-                seed=self._config.train_seed
-            )
-            if self._eval_files:
-                self._eval_loader = _surogate.DataLoader(
-                    self._eval_files,
+                if self._eval_files:
+                    self._eval_loader = _surogate.DataLoader(
+                        self._eval_files,
+                        self.chunk_size,
+                        rank=0,
+                        world_size=1,
+                        seed=self._config.eval_seed
+                    )
+            else:
+                # strided access across shared pre-tokenized files
+                self._train_loader = _surogate.DataLoader(
+                    self._train_files,
                     self.chunk_size,
                     rank=self.node_rank,
                     world_size=self.num_nodes,
-                    seed=self._config.eval_seed
+                    seed=self._config.train_seed
                 )
+                if self._eval_files:
+                    self._eval_loader = _surogate.DataLoader(
+                        self._eval_files,
+                        self.chunk_size,
+                        rank=self.node_rank,
+                        world_size=self.num_nodes,
+                        seed=self._config.eval_seed
+                    )
+        else:
+            self._train_loader = None
+            self._eval_loader = None
 
         # Create model config
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -401,6 +431,30 @@ class NodeTrainer:
             # Import weights from pretrained model
             self._trainer.import_weights(model_weights_path)
 
+        if self._mm_on_the_fly:
+            (self._mm_hf_model,
+             self._mm_processor,
+             self._mm_template_processor,
+             self._mm_vision_device,
+             self._mm_rope_fn) = init_mm_helpers(self._config)
+            pad_token_id = self._config.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
+            global_batch = self._config.per_device_train_batch_size * local_gpus
+            self._mm_batcher = OnTheFlyMultimodalBatcher(
+                dataset=self._mm_train_dataset,
+                template_processor=self._mm_template_processor,
+                hf_model=self._mm_hf_model,
+                vision_device=self._mm_vision_device,
+                rope_fn=self._mm_rope_fn,
+                batch_size=global_batch,
+                seq_len=self._config.sequence_len,
+                pad_token_id=pad_token_id,
+                seed=self._config.train_seed,
+                shuffle=True,
+                repeat=True,
+            )
+
         self.local_gpus = local_gpus
 
         logger.info(f"Node {self.node_rank}: Completed init_trainer at {time.time()}")
@@ -480,6 +534,33 @@ class NodeTrainer:
         B = config.per_device_train_batch_size
         T = config.sequence_len
         local_gpus = self.local_gpus
+
+        if self._mm_on_the_fly:
+            for micro_step in range(config.gradient_accumulation_steps):
+                batch = self._mm_batcher.next_batch()
+                self._trainer.set_visual_inputs(
+                    batch["visual_pos_masks"],
+                    batch["visual_embeds"],
+                    batch["deepstack_visual_embeds"],
+                )
+                self._trainer.step(batch["inputs"], batch["targets"], batch["position_ids"])
+
+            opt_config = _surogate.OptimizerConfig(
+                optimizer=config.optimizer,
+                learning_rate=lr,
+                weight_decay=config.weight_decay,
+                grad_clip=config.max_grad_norm,
+                adamw_beta1=config.adamw_beta1,
+                adamw_beta2=config.adamw_beta2,
+                adamw_epsilon=config.adamw_epsilon,
+                normuon_momentum=config.normuon_momentum,
+                normuon_beta2=config.normuon_beta2,
+                normuon_lr=lr,
+                normuon_cautious_wd=config.normuon_cautious_wd
+            )
+            result = self._trainer.update_with_config(opt_config, step + 1)
+            return result['loss'], result['norm']
+
         use_full_step_graphs = True
         if use_full_step_graphs and config.optimizer not in ("adamw_8bit", "normuon"):
             raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
@@ -531,6 +612,19 @@ class NodeTrainer:
 
         return result['loss'], result['norm']
 
+    def get_num_tokens(self) -> int:
+        if self._mm_on_the_fly:
+            if self._mm_train_dataset is None:
+                return -1
+            try:
+                num_samples = len(self._mm_train_dataset)
+            except Exception:
+                return -1
+            return num_samples * self._config.sequence_len * max(self.num_nodes, 1)
+        if self._train_loader is not None:
+            return self._train_loader.num_tokens
+        return 0
+
     def get_moe_stats(self) -> Dict[str, Any]:
         """Get MoE training statistics from the last forward pass."""
         if self._trainer is not None:
@@ -539,6 +633,43 @@ class NodeTrainer:
 
     def validate(self, max_steps: int = 100) -> float:
         """Run validation and return mean loss."""
+        if self._mm_on_the_fly:
+            if self._mm_eval_dataset is None:
+                return 0.0
+            pad_token_id = self._config.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
+            global_batch = self._config.per_device_train_batch_size * self.local_gpus
+            eval_batcher = OnTheFlyMultimodalBatcher(
+                dataset=self._mm_eval_dataset,
+                template_processor=self._mm_template_processor,
+                hf_model=self._mm_hf_model,
+                vision_device=self._mm_vision_device,
+                rope_fn=self._mm_rope_fn,
+                batch_size=global_batch,
+                seq_len=self._config.sequence_len,
+                pad_token_id=pad_token_id,
+                seed=self._config.eval_seed,
+                shuffle=False,
+                repeat=False,
+            )
+            total_loss = 0.0
+            batches = 0
+            while max_steps < 0 or batches < max_steps:
+                try:
+                    batch = eval_batcher.next_batch()
+                except StopIteration:
+                    break
+                self._trainer.set_visual_inputs(
+                    batch["visual_pos_masks"],
+                    batch["visual_embeds"],
+                    batch["deepstack_visual_embeds"],
+                )
+                loss = self._trainer.validate(batch["inputs"], batch["targets"], batch["position_ids"])
+                total_loss += loss
+                batches += 1
+            return total_loss / batches if batches > 0 else 0.0
+
         if not self._eval_loader:
             return 0.0
 
@@ -764,7 +895,7 @@ class RayDistributedTrainer:
 
             def get_num_tokens(self) -> int:
                 """Get the number of tokens in the training dataset."""
-                return self.trainer._train_loader.num_tokens
+                return self.trainer.get_num_tokens()
 
             def get_moe_stats(self) -> Dict[str, Any]:
                 """Get MoE training statistics from the last forward pass."""
@@ -854,9 +985,13 @@ class RayDistributedTrainer:
         # Determine max steps
         # Note: In distributed mode, each node sees 1/num_nodes of the data (sharded via strided access)
         num_tokens = ray.get(self.node_trainers[0].get_num_tokens.remote())
-        steps_per_epoch = num_tokens // total_tokens_per_step
+        steps_per_epoch = 0
+        if num_tokens and num_tokens > 0:
+            steps_per_epoch = num_tokens // total_tokens_per_step
         if config.max_steps > 0:
             max_steps = config.max_steps
+        elif num_tokens <= 0:
+            raise ValueError("multimodal_on_the_fly requires max_steps when dataset length is unknown.")
         elif config.epoch_adjustment and config.from_scratch:
             import math as _math
             chinchilla_epochs = max(1, _math.ceil(chinchilla_tokens / max(num_tokens, 1)))
@@ -915,6 +1050,12 @@ class RayDistributedTrainer:
         logger.info(f"  Tokens per step: {total_tokens_per_step}")
         logger.info(f"  Starting from step: {start_step}")
         logger.info(f"  Max steps: {max_steps}")
+
+        has_eval = False
+        if self.eval_files:
+            has_eval = True
+        elif config.multimodal_on_the_fly:
+            has_eval = bool(config.validation_datasets) or (config.validation_split_ratio and config.validation_split_ratio > 0)
         
         if config.from_scratch:
             # Chinchilla token budget
@@ -996,7 +1137,7 @@ class RayDistributedTrainer:
             step_start_time = time.time()
 
             # Periodic evaluation
-            if self.eval_files and config.eval_steps > 0 and step % config.eval_steps == 0 and step > start_step:
+            if has_eval and config.eval_steps > 0 and step % config.eval_steps == 0 and step > start_step:
                 eval_futures = [t.validate.remote(100) for t in self.node_trainers]
                 eval_losses = ray.get(eval_futures)
                 avg_eval_loss = sum(eval_losses) / len(eval_losses)

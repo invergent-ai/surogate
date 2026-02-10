@@ -42,6 +42,31 @@ def rope(
     ...
 
 
+@primitive(impl="kernels.mrope")
+def mrope(
+    qkv: Tensor["B", "T", "H", "D"],
+    freqs: Tensor["T", "D // 2", 2, "fp32"],
+    position_ids: Tensor[3, "B", "T", "int32"],
+    *,
+    rotary_dim: int | None = None,
+    mrope_section: list[int] | tuple[int, int, int] | None = None,
+) -> Tensor["B", "T", "H", "D"]:
+    """Apply multimodal rotary position embedding (MRoPE)."""
+    ...
+
+
+@primitive(impl="kernels.qkv_qk_norm")
+def qkv_qk_norm(
+    qkv: Tensor["B", "T", "Hq + 2 * Hkv", "D"],
+    q_norm_weight: Tensor["D"],
+    k_norm_weight: Tensor["D"],
+    *,
+    eps: float = 1e-6,
+) -> tuple[Tensor["B", "T", "Hq + 2 * Hkv", "D"], Tensor["*"], Tensor["*"]]:
+    """QK norm (no RoPE). Returns (qkv_out, q_rstd, k_rstd)."""
+    ...
+
+
 @primitive(impl="kernels.qkv_qk_norm_rope")
 def qkv_qk_norm_rope(
     qkv: Tensor["B", "T", "Hq + 2 * Hkv", "D"],

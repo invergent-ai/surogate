@@ -6,6 +6,7 @@
 #ifndef SUROGATE_SRC_KERNELS_KERNELS_H
 #define SUROGATE_SRC_KERNELS_KERNELS_H
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -217,6 +218,14 @@ void rope_backward(float* dinp, const float* dout, const float *freqs_cis, const
 void rope_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16 *freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
 void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
 
+// Multimodal RoPE (MRoPE) with 3D position IDs.
+void mrope_forward(Tensor& out, const Tensor& inp, const Tensor& freqs_cis, const int* position_ids, int pos_planes,
+                   int section_t, int section_h, int section_w, float* abs_max_ptr,
+                   int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+void mrope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, int pos_planes,
+                    int section_t, int section_h, int section_w, float* abs_max_ptr,
+                    int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream);
+
 void rope_forward_quant(__nv_fp8_e4m3* out, float* scale_ptr, const nv_bfloat16* inp, const nv_bfloat16* freqs_cis, const int* position_ids, const float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_forward_quant(Tensor& out, float* scale_ptr, const Tensor& inp, const Tensor& freqs_cis, const int* position_ids, const float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 
@@ -229,6 +238,19 @@ void rope_fused_forward(Tensor& out, const Tensor& inp, const int* position_ids,
 void rope_fused_backward(float* dinp, const float* dout, const int* position_ids, float* abs_max_ptr, float theta, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_fused_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const int* position_ids, float* abs_max_ptr, float theta, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
 void rope_fused_backward(Tensor& dinp, const Tensor& dout, const int* position_ids, float* abs_max_ptr, float theta, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream);
+
+// Masked scatter for visual embeddings (Qwen3-VL)
+std::size_t mask_scatter_temp_bytes(int n);
+void mask_scatter_forward(Tensor& out, const Tensor& inp, const Tensor& mask, const Tensor& src,
+                          Tensor& prefix, Tensor& temp, int B, int T, int C, cudaStream_t stream);
+void mask_scatter_backward(Tensor& d_inp, Tensor& d_src, const Tensor& d_out, const Tensor& mask,
+                           Tensor& prefix, Tensor& temp, int B, int T, int C, cudaStream_t stream,
+                           bool write_inp, bool write_src);
+void deepstack_inject_forward(Tensor& out, const Tensor& inp, const Tensor& mask, const Tensor& src,
+                              Tensor& prefix, Tensor& temp, int B, int T, int C, cudaStream_t stream);
+void deepstack_inject_backward(Tensor& d_inp, Tensor& d_src, const Tensor& d_out, const Tensor& mask,
+                               Tensor& prefix, Tensor& temp, int B, int T, int C, cudaStream_t stream,
+                               bool write_inp, bool write_src);
 
 // swiglu assumes that input is the concatenation of up and gate projection.
 void swiglu_forward(nv_bfloat16* out, const nv_bfloat16* inp, float* abs_max_ptr, int B, int T, int C, cudaStream_t stream);
@@ -249,6 +271,12 @@ void silu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
 void silu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
 void silu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
 void silu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
+void gelu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
+void gelu_forward(float* out, const float* inp, long n, cudaStream_t stream);
+void gelu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
+void gelu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
+void gelu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
+void gelu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
 
 void relu2_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
 void relu2_forward(float* out, const float* inp, long n, cudaStream_t stream);

@@ -647,13 +647,19 @@ void qkv_head_rmsnorm_forward(Tensor& qkv, Tensor& rstd, const Tensor& weight,
         throw std::logic_error("qkv_head_rmsnorm_forward: rstd must be FP32");
     }
     if (qkv.DType != weight.DType) {
+        fprintf(stderr, "[qk_norm] qkv/weight dtype mismatch: received=%d, wanted=%d\n",
+                (int)qkv.DType, (int)weight.DType);
         throw std::logic_error("qkv_head_rmsnorm_forward: qkv/weight dtype mismatch");
     }
     const int tokens = B * T;
     if (qkv.Rank != 3 || qkv.Sizes[0] != B || qkv.Sizes[1] != T || qkv.Sizes[2] != qkv_channels) {
+        fprintf(stderr, "[qk_norm] qkv shape mismatch: qkv.Sizes=[%ld,%ld,%ld], expected=[%d,%d,%d]\n",
+                qkv.Sizes[0], qkv.Sizes[1], qkv.Sizes[2], B, T, qkv_channels);
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected qkv shape");
     }
     if (weight.Rank != 1 || weight.Sizes[0] != head_size) {
+        fprintf(stderr, "[qk_norm] weight shape mismatch: weight.Rank=%d (expected 1), weight.Sizes[0]=%ld (expected %d)\n",
+                weight.Rank, weight.Sizes[0], head_size);
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected weight shape");
     }
     if (rstd.Rank != 3 || rstd.Sizes[0] != B || rstd.Sizes[1] != T || rstd.Sizes[2] != num_heads) {

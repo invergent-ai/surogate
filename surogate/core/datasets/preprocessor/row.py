@@ -230,20 +230,20 @@ class RowPreprocessor:
         def _new_init(self, schema=None, features=None, *args, **kwargs):
 
             if features is not None:
-                messages_feature = [{
+                messages_feature = Sequence(feature={
                     'role': Value(dtype='string'),
                     'content': Value(dtype='string'),
-                }]
-                messages_feature_with_loss = [{
+                })
+                messages_feature_with_loss = Sequence(feature={
                     'role': Value(dtype='string'),
                     'content': Value(dtype='string'),
                     'loss': Value(dtype='float64'),
-                }]
+                })
                 features['messages'] = messages_feature_with_loss
                 features['rejected_messages'] = messages_feature_with_loss
-                features['positive_messages'] = [messages_feature]
-                features['negative_messages'] = [messages_feature]
-                features['images'] = [{'bytes': Value(dtype='binary'), 'path': Value(dtype='string')}]
+                features['positive_messages'] = Sequence(feature=messages_feature)
+                features['negative_messages'] = Sequence(feature=messages_feature)
+                features['images'] = Sequence(feature={'bytes': Value(dtype='binary'), 'path': Value(dtype='string')})
                 features['objects'] = {
                     'ref': Sequence(feature=Value(dtype='string'), length=-1),
                     'bbox': Sequence(feature=Sequence(feature=Value(dtype='float64'), length=-1), length=-1),

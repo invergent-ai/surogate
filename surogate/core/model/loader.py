@@ -198,17 +198,6 @@ def get_model_info_and_template(
 
     model_info.torch_dtype = torch_dtype
 
-    if model_template.attention_cls is None:
-        try:
-            # Dynamically import the module and attention class
-            module_path = f"transformers.models.{model_type}.modeling_{model_type}"
-            model_cls_prefix, _ = get_causal_lm_model_cls_prefix(model_type)
-            module = __import__(module_path, fromlist=[f"{model_cls_prefix}Attention"])
-            attention_cls = getattr(module, f"{model_cls_prefix}Attention")
-            model_template.attention_cls = attention_cls
-        except (ImportError, AttributeError) as e:
-            logger.warning(f"Could not determine attention class for model type '{model_type}': {e}")
-
     return model_info, model_template
 
 
@@ -260,12 +249,9 @@ def get_model_and_tokenizer_from_local(
         if model is None:
             context = partial(patch_automodel, **context_kwargs)
             with context():
-                if model_template.fast_cls:
-                    model = model_template.fast_cls.from_pretrained(
-                        model_dir, model_config=model_config, **model_kwargs)
-                else:
-                    model = automodel_class.from_pretrained(
+                model = automodel_class.from_pretrained(
                         model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
+                    
 
         # fix not save modeling_xxx.py (transformers 4.45)
         # https://github.com/huggingface/transformers/issues/24737

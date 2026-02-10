@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-
 from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.early_stopping import EarlyStopping
@@ -22,6 +21,7 @@ from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
 from surogate.train.training_plot import generate_training_plot
+from surogate.train.on_the_fly_mm import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
@@ -40,6 +40,7 @@ class SurogateTrainerWrapper():
     ):
         self.config = config
         self._block_types = None
+        self._mm_on_the_fly = bool(config.multimodal_on_the_fly and config.model_template.is_multimodal)
 
         model_weights_path = get_model_weights_path(config.model_dir)
 
@@ -47,16 +48,47 @@ class SurogateTrainerWrapper():
         ir_json = build_dsl_ir_for_model(config.model_dir)
         config.runtime_config.dsl_ir_json = ir_json
         
-        # Setup data loaders
+        # Setup data loaders / on-the-fly batcher
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
         self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
 
-        self.train_loader = _surogate.DataLoader(train_files, self.chunk_size, seed=config.train_seed)
-        self.eval_loader = _surogate.DataLoader(eval_files, self.chunk_size,
-                                                seed=config.eval_seed) if eval_files else None
+        if self._mm_on_the_fly:
+            if config.sample_packing:
+                logger.warning("multimodal_on_the_fly disables sample_packing; forcing sample_packing=False.")
+                config.sample_packing = False
+            if config.padding_free:
+                logger.warning("multimodal_on_the_fly disables padding_free; forcing padding_free=False.")
+                config.padding_free = False
 
-        # Calculate steps
-        self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size    
+            self.train_loader = None
+            self.eval_loader = None
+            self._mm_hf_model, self._mm_processor, self._mm_template_processor, self._mm_vision_device, self._mm_rope_fn = init_mm_helpers(self.config)
+            self.mm_train_dataset, self.mm_eval_dataset = load_multimodal_datasets(self.config)
+            pad_token_id = config.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = config.tokenizer.eos_token_id if config.tokenizer.eos_token_id is not None else 0
+            global_batch = config.per_device_train_batch_size * config.gpus
+            self.mm_batcher = OnTheFlyMultimodalBatcher(
+                dataset=self.mm_train_dataset,
+                template_processor=self._mm_template_processor,
+                hf_model=self._mm_hf_model,
+                vision_device=self._mm_vision_device,
+                rope_fn=self._mm_rope_fn,
+                batch_size=global_batch,
+                seq_len=config.sequence_len,
+                pad_token_id=pad_token_id,
+                seed=config.train_seed,
+                shuffle=True,
+                repeat=True,
+            )
+            self.steps_per_epoch = self.mm_batcher.steps_per_epoch
+        else:
+            self.train_loader = _surogate.DataLoader(train_files, self.chunk_size, seed=config.train_seed)
+            self.eval_loader = _surogate.DataLoader(eval_files, self.chunk_size,
+                                                    seed=config.eval_seed) if eval_files else None
+
+            # Calculate steps
+            self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
             
         # Create trainer
         self.start_step = 0
@@ -155,6 +187,11 @@ class SurogateTrainerWrapper():
         # Determine max_steps
         if config.max_steps > 0:
             self.max_steps = config.max_steps
+        elif self._mm_on_the_fly:
+            if self.steps_per_epoch == 0:
+                raise ValueError("multimodal_on_the_fly requires max_steps when dataset length is unknown.")
+            self.max_steps = self.steps_per_epoch * self.config.num_epochs
+            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
         elif config.epoch_adjustment and self.config.from_scratch:
             # Adjust epochs to reach Chinchilla-optimal token budget
             chinchilla_epochs = max(1, int(np.ceil(self.chinchilla_tokens / max(self.train_loader.num_tokens, 1))))
@@ -242,8 +279,21 @@ class SurogateTrainerWrapper():
     def train(self):
         with training_logger_context(self.config) as train_logger:
             # Log dataset information
-            if self.eval_loader:
+            if not self._mm_on_the_fly and self.eval_loader:
                 train_logger.log_dataset(self.train_loader, self.eval_loader)
+            elif self._mm_on_the_fly:
+                try:
+                    train_len = len(self.mm_train_dataset)
+                except Exception:
+                    train_len = None
+                try:
+                    eval_len = len(self.mm_eval_dataset) if self.mm_eval_dataset is not None else None
+                except Exception:
+                    eval_len = None
+                if train_len is not None:
+                    logger.info(f"Multimodal train dataset: {train_len} samples")
+                if eval_len is not None:
+                    logger.info(f"Multimodal eval dataset: {eval_len} samples")
 
             # Log allocator stats
             for idx in range(self.config.gpus):
@@ -291,7 +341,10 @@ class SurogateTrainerWrapper():
                     logger.info("  QLoRA-FP4 enabled: NVFP4 (E2M1)")
                 logger.info("Note: Base model weights are frozen, only LoRA adapters will be trained")
 
-            self.run_training_loop(train_logger)
+            if self._mm_on_the_fly:
+                self.run_training_loop_mm(train_logger)
+            else:
+                self.run_training_loop(train_logger)
 
             # Save final model
             if self.config.lora:
@@ -336,6 +389,194 @@ class SurogateTrainerWrapper():
                 generate_training_plot(self.config.log_file, Path(self.config.output_dir) / "training_plot.png")
 
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
+
+    def run_training_loop_mm(self, train_logger: _surogate.TrainingRunLogger):
+        use_full_step_graphs = False
+        if self.config.use_cuda_graphs:
+            logger.info("CUDA graphs disabled for multimodal on-the-fly training.")
+
+        # Auto LR reduction guard
+        loss_guard = LossGuard(self.lr_schedule, logger) if self.config.auto_lr_reduction else None
+        plateau_detector = PlateauDetector(logger)
+        phase_detector = PhaseDetector(logger)
+        gradient_tracker = GradientTracker(logger)
+        moe_monitor = MoEMonitor(logger)
+        advisor = TrainingAdvisor(
+            logger, phase_detector, gradient_tracker, plateau_detector,
+            loss_guard, moe_monitor, self.lr_schedule, self.max_steps,
+            warmup_steps=self.warmup_steps,
+        )
+
+        # Early stopping
+        if self.config.early_stop:
+            num_params = estimate_model_parameters(self.config.model_info.config)
+            tokens_per_step = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            early_stopping = EarlyStopping(logger, num_params, tokens_per_step)
+        else:
+            early_stopping = None
+
+        # Training loop
+        logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
+        for step in range(self.start_step, self.max_steps):
+            # Periodic evaluation (before training step)
+            if self.mm_eval_dataset is not None and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
+                val_loss, elapsed_ms, batches_processed = self.run_evaluation_mm(max_steps=100)
+                epoch = self.mm_batcher.epoch() + 0.01 * self.mm_batcher.progress()
+                eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
+                train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
+                if early_stopping is not None and early_stopping.check_eval(val_loss, step):
+                    break
+
+            # Periodic checkpointing (before training step)
+            if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
+                logger.info(f"Saving checkpoint to {self.config.checkpoint_dir}...")
+                try:
+                    self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+                    logger.info(f"Checkpoint saved successfully at step {step}")
+
+                    checkpoint_plot_path = Path(self.config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"
+                    generate_training_plot(self.config.log_file, checkpoint_plot_path)
+
+                    if self.config.save_total_limit > 0:
+                        removed = _surogate.clean_old_checkpoints(self.config.checkpoint_dir, self.config.save_total_limit,
+                                                                  -1)
+                        if removed:
+                            logger.info(
+                                f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}")
+                except Exception as e:
+                    logger.error(f"Failed to save checkpoint at step {step}: {e}")
+                    logger.error(f"Exception type: {type(e).__name__}")
+                    logger.warning("Training will continue without saving this checkpoint")
+                    import traceback
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+
+            # Training step
+            step_start = time.time()
+            for micro_step in range(self.config.gradient_accumulation_steps):
+                batch = self.mm_batcher.next_batch()
+                self.trainer.set_visual_inputs(
+                    batch["visual_pos_masks"],
+                    batch["visual_embeds"],
+                    batch["deepstack_visual_embeds"],
+                )
+                self.trainer.step(batch["inputs"], batch["targets"], batch["position_ids"])
+
+            # Log GPU utilization
+            if self.config.log_gpu_util > 0 and step % self.config.log_gpu_util == 0:
+                infos = self.trainer.get_gpu_info()
+                for i, info in enumerate(infos):
+                    train_logger.log_gpu_state(step, i, info)
+
+            lr = self.lr_schedule.get_lr(step)
+            opt_config = _surogate.OptimizerConfig(
+                optimizer=self.config.optimizer,
+                learning_rate=lr,
+                weight_decay=self.config.weight_decay,
+                grad_clip=self.config.max_grad_norm,
+                adamw_beta1=self.config.adamw_beta1,
+                adamw_beta2=self.config.adamw_beta2,
+                adamw_epsilon=self.config.adamw_epsilon,
+                normuon_momentum=self.config.normuon_momentum,
+                normuon_beta2=self.config.normuon_beta2,
+                normuon_lr=lr,
+                normuon_cautious_wd=self.config.normuon_cautious_wd
+            )
+
+            self._maybe_log_lora_grad_stats(step)
+            result = self.trainer.update_with_config(opt_config, step + 1)
+
+            step_time = time.time() - step_start
+            tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+
+            if loss_guard is not None:
+                loss_guard.step(result['loss'], result['norm'], step)
+            plateau_detector.step(result['loss'], step)
+            phase = phase_detector.step(result['loss'], step)
+            gradient_tracker.step(result['norm'], step)
+            train_logger.set_phase(phase.value)
+
+            metrics = StepMetrics(
+                step=step,
+                epoch=self.mm_batcher.epoch() + 0.01 * self.mm_batcher.progress(),
+                loss=result['loss'],
+                grad_norm=result['norm'],
+                grad_norm_mean=gradient_tracker.mean,
+                grad_norm_max=gradient_tracker.max,
+                grad_norm_trend=gradient_tracker.trend,
+                lr=lr,
+                tokens=tokens_processed,
+                elapsed_ms=int(step_time * 1000),
+                phase=phase.value,
+                lr_overridden=self.lr_schedule.has_override,
+                moe=MoEMetrics.from_dict(self.trainer.get_moe_stats()),
+            )
+            moe_monitor.step(metrics.moe, step)
+            advisor.step(metrics, step)
+
+            if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
+                break
+
+            if metrics.moe is not None:
+                train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                          metrics.grad_norm, metrics.loss, metrics.lr,
+                                          metrics.moe.aux_loss,
+                                          metrics.moe.z_loss,
+                                          metrics.moe.load_imbalance,
+                                          metrics.moe.expert_utilization)
+            else:
+                train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                      metrics.grad_norm, metrics.loss, metrics.lr)
+
+        logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
+
+    def run_evaluation_mm(self, max_steps: int) -> Tuple[float, int, int]:
+        if max_steps == 0:
+            return 0.0, 0, 0
+        if self.mm_eval_dataset is None:
+            return 0.0, 0, 0
+
+        pad_token_id = self.config.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.config.tokenizer.eos_token_id if self.config.tokenizer.eos_token_id is not None else 0
+
+        global_batch = self.config.per_device_train_batch_size * self.config.gpus
+        eval_batcher = OnTheFlyMultimodalBatcher(
+            dataset=self.mm_eval_dataset,
+            template_processor=self._mm_template_processor,
+            hf_model=self._mm_hf_model,
+            vision_device=self._mm_vision_device,
+            rope_fn=self._mm_rope_fn,
+            batch_size=global_batch,
+            seq_len=self.config.sequence_len,
+            pad_token_id=pad_token_id,
+            seed=self.config.eval_seed,
+            shuffle=False,
+            repeat=False,
+        )
+
+        start_time = time.time()
+        total_loss = 0.0
+        batches = 0
+
+        while max_steps < 0 or batches < max_steps:
+            try:
+                batch = eval_batcher.next_batch()
+            except StopIteration:
+                break
+            self.trainer.set_visual_inputs(
+                batch["visual_pos_masks"],
+                batch["visual_embeds"],
+                batch["deepstack_visual_embeds"],
+            )
+            loss = self.trainer.validate(batch["inputs"], batch["targets"], batch["position_ids"])
+            total_loss += loss
+            batches += 1
+
+        if batches == 0:
+            logger.warning("Insufficient validation data")
+            return 0.0, 0, 0
+
+        return total_loss / batches, int((time.time() - start_time) * 1000), batches
 
     def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
         use_full_step_graphs = True

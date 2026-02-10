@@ -69,6 +69,10 @@ struct PretrainedConfig {
     bool UseQKVBias = false;
     bool UseQKNorm = false;
 
+    // Vision-language inputs (Qwen3-VL style)
+    bool UseVisualInputs = false;   ///< Enable visual_pos_masks/visual_embeds inputs
+    int DeepstackVisualLayers = 0;  ///< Number of deepstack visual embeddings (0 = disabled)
+
     // Data type
     ETensorDType DType = ETensorDType::BF16;
 

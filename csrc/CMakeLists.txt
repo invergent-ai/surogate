@@ -280,7 +280,13 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/matmul.cpp
     src/runtime/ops/swiglu.cpp
     src/runtime/ops/matmul_swiglu.cpp
+    src/runtime/ops/qkv_qk_norm.cpp
     src/runtime/ops/qkv_qk_norm_rope.cpp
+    src/runtime/ops/mrope.cpp
+    src/runtime/ops/mask_scatter.cpp
+    src/runtime/ops/deepstack_inject.cpp
+    src/runtime/ops/gelu.cpp
+    src/runtime/ops/layernorm.cpp
     src/runtime/ops/rope.cpp
     src/runtime/ops/flash_attention.cpp
     src/runtime/ops/cross_entropy_loss.cpp
@@ -344,6 +350,8 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe_kernels.cu
     src/kernels/mamba_kernels.cu
     src/kernels/rope.cu
+    src/kernels/mrope.cu
+    src/kernels/mask_scatter.cu
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
     src/kernels/cudnn_att.cpp

@@ -204,6 +204,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::Embedding: return "embedding";
         case CompiledOpType::Zeros: return "zeros";
         case CompiledOpType::FusedResidualRMSNorm: return "fused_residual_rmsnorm";
+        case CompiledOpType::LayerNorm: return "layernorm";
         case CompiledOpType::View: return "view";
         case CompiledOpType::Add: return "add";
         case CompiledOpType::Matmul: return "matmul";
@@ -211,10 +212,15 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::BiasAdd: return "bias_add";
         case CompiledOpType::SwiGLU: return "swiglu";
         case CompiledOpType::Silu: return "silu";
+        case CompiledOpType::Gelu: return "gelu";
         case CompiledOpType::Relu2: return "relu2";
         case CompiledOpType::Mul: return "mul";
+        case CompiledOpType::MaskScatter: return "mask_scatter";
+        case CompiledOpType::DeepstackInject: return "deepstack_inject";
         case CompiledOpType::MatmulSwiGLU: return "matmul_swiglu";
+        case CompiledOpType::QKVQKNorm: return "qkv_qk_norm";
         case CompiledOpType::QKVQKNormRoPE: return "qkv_qk_norm_rope";
+        case CompiledOpType::MRoPE: return "mrope";
         case CompiledOpType::RoPE: return "rope";
         case CompiledOpType::FlashAttention: return "flash_attention";
         case CompiledOpType::CrossEntropyLoss: return "cross_entropy_loss";
@@ -235,14 +241,20 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::BiasAddBackward: return "bias_add_backward";
         case CompiledOpType::SwiGLUBackward: return "swiglu_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
+        case CompiledOpType::GeluBackward: return "gelu_backward";
         case CompiledOpType::Relu2Backward: return "relu2_backward";
         case CompiledOpType::MulBackward: return "mul_backward";
+        case CompiledOpType::MaskScatterBackward: return "mask_scatter_backward";
+        case CompiledOpType::DeepstackInjectBackward: return "deepstack_inject_backward";
         case CompiledOpType::MatmulSwiGLUBackward: return "matmul_swiglu_backward";
+        case CompiledOpType::QKVQKNormBackward: return "qkv_qk_norm_backward";
         case CompiledOpType::RoPEBackward: return "rope_backward";
         case CompiledOpType::QKVQKNormRoPEBackward: return "qkv_qk_norm_rope_backward";
+        case CompiledOpType::MRoPEBackward: return "mrope_backward";
         case CompiledOpType::FlashAttentionBackward: return "flash_attention_backward";
         case CompiledOpType::ZerosBackward: return "zeros_backward";
         case CompiledOpType::FusedResidualRMSNormBackward: return "fused_residual_rmsnorm_backward";
+        case CompiledOpType::LayerNormBackward: return "layernorm_backward";
         case CompiledOpType::EmbeddingBackward: return "embedding_backward";
         case CompiledOpType::CrossEntropyLossBackward: return "cross_entropy_backward";
         case CompiledOpType::FusedLMHeadLossBackward: return "fused_lm_head_loss_backward";
@@ -617,7 +629,8 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         std::vector<long> shape;
         if (base_field == "qkv_flat" || base_field == "qkv_biased") {
             shape = {B * T, QKV};
-        } else if (base_field == "ln1_flat" || base_field == "ln2_flat") {
+        } else if (base_field == "ln1_flat" || base_field == "ln2_flat" ||
+                   base_field == "ln_flat") {
             shape = {B * T, C};
         } else if (base_field == "att_out_flat") {
             shape = {B * T, C};
@@ -627,11 +640,16 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             shape = {B * T, MUp};
         } else if (base_field == "mlp_down_flat") {
             shape = {B * T, C};
-        } else if (base_field == "ln1" || base_field == "ln2" || base_field == "res_att" ||
-                   base_field == "res_ffn" || base_field == "res_in" || base_field == "att_out" ||
+        } else if (base_field == "swiglu_flat") {
+            shape = {B * T, D};
+        } else if (base_field == "ln1" || base_field == "ln2" || base_field == "ln" ||
+                   base_field == "res_att" || base_field == "residual_att" ||
+                   base_field == "res_ffn" || base_field == "residual_ffn" ||
+                   base_field == "res_in" || base_field == "att_out" ||
                    base_field == "mlp_down") {
             shape = {B, T, C};
-        } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd") {
+        } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd" ||
+                   base_field == "ln_rstd") {
             shape = {B, T};
         } else if (base_field == "mlp_up") {
             shape = {B, T, MUp};
@@ -648,15 +666,18 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         } else if (base_field == "lse") {
             shape = {B, Hq, T};
         } else {
-            return false;
+            // Fallback: use conservative upper bound for any unrecognized block tensor.
+            // This ensures persist_saved_layer_tensors won't cudaMalloc during capture.
+            const long max_dim = std::max({C, QKV, MUp, D});
+            shape = {B, T, max_dim};
         }
 
         ETensorDType dtype = ETensorDType::BF16;
         if (mConfig.NumLayers > 0) {
             dtype = mRunState.simplified_acts(0).ln1.DType;
         }
-        if (base_field == "ln1_rstd" || base_field == "ln2_rstd" || base_field == "q_rstd" ||
-            base_field == "k_rstd" || base_field == "lse") {
+        if (base_field == "ln1_rstd" || base_field == "ln2_rstd" || base_field == "ln_rstd" ||
+            base_field == "q_rstd" || base_field == "k_rstd" || base_field == "lse") {
             dtype = ETensorDType::FP32;
         }
         const std::size_t nelem = shape_nelem(shape);
@@ -680,7 +701,15 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         const bool prefer_live = prefer_live_tensor(name);
         const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
         const bool need_persist = should_persist(name, prefer_live, force_persist);
-        if (!need_persist) {
+
+        // Even when should_persist returns false, block-level tensors may be stack-backed
+        // and will be persisted by persist_saved_layer_tensors() during execute_forward.
+        // We must pre-allocate buffers for those too, since cudaMalloc is not allowed
+        // during CUDA graph capture.
+        int layer_idx = -1;
+        std::string field;
+        const bool is_block_tensor = parse_block_param(name, layer_idx, field);
+        if (!need_persist && !is_block_tensor) {
             continue;
         }
 
@@ -1440,6 +1469,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
         }
     };
+    // Detect if the stream is being captured (either by internal graphs via mCapturing,
+    // or by an outer full-step graph from train_step_graphed in py_train.cpp).
+    cudaStreamCaptureStatus fwd_capture_status = cudaStreamCaptureStatusNone;
+    const bool fwd_stream_capturing =
+        mCapturing ||
+        (cudaStreamIsCapturing(mRunState.MainStream, &fwd_capture_status) == cudaSuccess &&
+         fwd_capture_status != cudaStreamCaptureStatusNone);
+
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
@@ -1545,6 +1582,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             auto buf_it = mMoESavedBuffers.find(name);
             if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+                if (fwd_stream_capturing) {
+                    // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
+                    // Skip this tensor — the outer capture warmup or
+                    // prepare_saved_buffers_for_capture should have pre-allocated it.
+                    continue;
+                }
                 if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
@@ -1567,6 +1610,20 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Bind known inputs
     mTensorMap["token_ids"] = mRunState.Inputs;
     mTensorMap["position_ids"] = mRunState.PositionIDs;
+    if (mRunState.VisualPosMasks.Data) {
+        mTensorMap["visual_pos_masks"] = mRunState.VisualPosMasks;
+    }
+    if (mRunState.VisualEmbeds.Data) {
+        mTensorMap["visual_embeds"] = mRunState.VisualEmbeds;
+    }
+    if (!mRunState.DeepstackVisualEmbeds.empty()) {
+        for (std::size_t i = 0; i < mRunState.DeepstackVisualEmbeds.size(); ++i) {
+            if (!mRunState.DeepstackVisualEmbeds[i].Data) {
+                continue;
+            }
+            mTensorMap["deepstack_visual_embeds_" + std::to_string(i)] = mRunState.DeepstackVisualEmbeds[i];
+        }
+    }
     mTensorMap["x0"] = mRunState.non_block_activations().encoded;
 
     // Ensure non-block weights are gathered if streaming/offload is enabled
@@ -1613,6 +1670,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::FusedResidualRMSNorm:
                     dispatch_fused_residual_rmsnorm(op);
                     break;
+                case CompiledOpType::LayerNorm:
+                    dispatch_layernorm(op);
+                    break;
                 case CompiledOpType::View:
                     dispatch_view(op);
                     break;
@@ -1632,17 +1692,32 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::Silu:
                     dispatch_silu(op);
                     break;
+                case CompiledOpType::Gelu:
+                    dispatch_gelu(op);
+                    break;
                 case CompiledOpType::Relu2:
                     dispatch_relu2(op);
                     break;
                 case CompiledOpType::Mul:
                     dispatch_mul(op);
                     break;
+                case CompiledOpType::MaskScatter:
+                    dispatch_mask_scatter(op);
+                    break;
+                case CompiledOpType::DeepstackInject:
+                    dispatch_deepstack_inject(op);
+                    break;
                 case CompiledOpType::MatmulSwiGLU:
                     dispatch_matmul_swiglu(op, hook);
                     break;
+                case CompiledOpType::QKVQKNorm:
+                    dispatch_qkv_qk_norm(op);
+                    break;
                 case CompiledOpType::QKVQKNormRoPE:
                     dispatch_qkv_qk_norm_rope(op);
+                    break;
+                case CompiledOpType::MRoPE:
+                    dispatch_mrope(op);
                     break;
                 case CompiledOpType::RoPE:
                     dispatch_rope(op);
@@ -2038,6 +2113,20 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Also bind standard inputs that backward ops may reference
     mTensorMap["token_ids"] = mRunState.Inputs;
     mTensorMap["position_ids"] = mRunState.PositionIDs;
+    if (mRunState.VisualPosMasks.Data) {
+        mTensorMap["visual_pos_masks"] = mRunState.VisualPosMasks;
+    }
+    if (mRunState.VisualEmbeds.Data) {
+        mTensorMap["visual_embeds"] = mRunState.VisualEmbeds;
+    }
+    if (!mRunState.DeepstackVisualEmbeds.empty()) {
+        for (std::size_t i = 0; i < mRunState.DeepstackVisualEmbeds.size(); ++i) {
+            if (!mRunState.DeepstackVisualEmbeds[i].Data) {
+                continue;
+            }
+            mTensorMap["deepstack_visual_embeds_" + std::to_string(i)] = mRunState.DeepstackVisualEmbeds[i];
+        }
+    }
 
     // Build the set of gradients that require accumulation (not the first micro-step).
     // Also bind parameter gradient tensors to mTensorMap so they're used instead of temporaries.
@@ -2317,20 +2406,35 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::SiluBackward:
                     dispatch_silu_backward(op);
                     break;
+                case CompiledOpType::GeluBackward:
+                    dispatch_gelu_backward(op);
+                    break;
                 case CompiledOpType::Relu2Backward:
                     dispatch_relu2_backward(op);
                     break;
                 case CompiledOpType::MulBackward:
                     dispatch_mul_backward(op);
                     break;
+                case CompiledOpType::MaskScatterBackward:
+                    dispatch_mask_scatter_backward(op);
+                    break;
+                case CompiledOpType::DeepstackInjectBackward:
+                    dispatch_deepstack_inject_backward(op);
+                    break;
                 case CompiledOpType::MatmulSwiGLUBackward:
                     dispatch_matmul_swiglu_backward(op, hook);
+                    break;
+                case CompiledOpType::QKVQKNormBackward:
+                    dispatch_qkv_qk_norm_backward(op);
                     break;
                 case CompiledOpType::RoPEBackward:
                     dispatch_rope_backward(op);
                     break;
                 case CompiledOpType::QKVQKNormRoPEBackward:
                     dispatch_qkv_qk_norm_rope_backward(op);
+                    break;
+                case CompiledOpType::MRoPEBackward:
+                    dispatch_mrope_backward(op);
                     break;
                 case CompiledOpType::FlashAttentionBackward:
                     dispatch_flash_attention_backward(op);
@@ -2340,6 +2444,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::FusedResidualRMSNormBackward:
                     dispatch_fused_residual_rmsnorm_backward(op);
+                    break;
+                case CompiledOpType::LayerNormBackward:
+                    dispatch_layernorm_backward(op);
                     break;
                 case CompiledOpType::EmbeddingBackward:
                     dispatch_embedding_backward(op);

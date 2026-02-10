@@ -30,6 +30,7 @@ class GQAAttention:
             dim=0,
         ),
         "out_weight": "{prefix}.o_proj.weight",
+        "out_bias": "{prefix}.o_proj.bias",
     }
 
     def __init__(
@@ -63,6 +64,7 @@ class GQAAttention:
     qkv_weight = Param(Tensor["QKV", "C"])
     qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
     out_weight = Param(Tensor["C", "AttnDim"])
+    out_bias = Param(Tensor["C"], when="use_qkv_bias")
     rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
 
     @forward
@@ -89,7 +91,10 @@ class GQAAttention:
 
             # Output projection
             attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
-            out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
+            if self.use_qkv_bias:
+                out_flat = g.matmul_bias(attn_flat, "out_weight", "out_bias", transpose="NT")
+            else:
+                out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
             out = g.view(out_flat, shape=[B, T, self.C])
 
             return out
@@ -141,6 +146,7 @@ class Qwen3Attention:
     qkv_weight = Param(Tensor["QKV", "C"])
     qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
     out_weight = Param(Tensor["C", "AttnDim"])
+    out_bias = Param(Tensor["C"], when="use_qkv_bias")
     q_norm_weight = Param(Tensor["D"], when="use_qk_norm", quantizable=False)
     k_norm_weight = Param(Tensor["D"], when="use_qk_norm", quantizable=False)
     rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
@@ -174,7 +180,10 @@ class Qwen3Attention:
             attn_out, _ = g.flash_attention(qkv_rope, causal=True)
 
             attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
-            out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
+            if self.use_qkv_bias:
+                out_flat = g.matmul_bias(attn_flat, "out_weight", "out_bias", transpose="NT")
+            else:
+                out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
             out = g.view(out_flat, shape=[B, T, self.C])
 
             return out

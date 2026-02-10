@@ -1,6 +1,8 @@
 import re
 from typing import Dict, Any, Union, Tuple, List, Set, Optional, Type
 
+import torch
+
 Tool = Dict[str, Union[str, Dict]]
 History = List[Union[Tuple[str, str], List[str]]]
 Message = Dict[str, Union[str, List[Dict[str, Any]], List[int], None]]
@@ -117,3 +119,37 @@ def get_last_user_round(messages):
         if messages[i]['role'] == 'user':
             return i
     return -1
+
+def findall(token_list: List[int], sub_token_list: Union[int, List[int]]) -> List[int]:
+    """Find the index of a token in the token_list."""
+    if isinstance(sub_token_list, int):
+        sub_token_list = [sub_token_list]
+    res = []
+    idx = -1
+    try:
+        while True:
+            idx = token_list.index(sub_token_list[0], idx + 1)
+            if len(sub_token_list) == 1 or sub_token_list == token_list[idx:idx + len(sub_token_list)]:
+                res.append(idx)
+    except ValueError:
+        pass
+    return res
+
+
+def get_packed_seq_params(position_ids: torch.Tensor):
+    assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
+    position_ids_f = position_ids.flatten()
+    indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
+
+    cu_seqlens = torch.cat([
+        indices_q[position_ids_f == 0],
+        torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
+    ])
+
+    max_length = cu_seqlens.diff().max()  # position_ids_f.max() + 1
+    return {
+        'cu_seq_lens_q': cu_seqlens,
+        'cu_seq_lens_k': cu_seqlens,
+        'max_length_q': max_length,
+        'max_length_k': max_length,
+    }

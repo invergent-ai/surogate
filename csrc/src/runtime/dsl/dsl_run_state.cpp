@@ -6,6 +6,8 @@
 #include "runtime/dsl/dsl_run_state.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
@@ -34,6 +36,239 @@ int resolve_mlp_up_factor(const PretrainedConfig& cfg) {
         return model_cfg->mlp_up_factor();
     }
     return 2;
+}
+
+constexpr double kPi = 3.14159265358979323846;
+
+struct RopeInvFreq {
+    std::vector<float> inv_freq;
+    float attention_scale = 1.0f;
+    int dim = 0;
+};
+
+inline float clampf(float v, float lo, float hi) {
+    return std::max(lo, std::min(v, hi));
+}
+
+inline float get_mscale(float scale, float mscale = 1.0f) {
+    if (scale <= 1.0f) return 1.0f;
+    return 0.1f * mscale * std::log(scale) + 1.0f;
+}
+
+std::string to_lower(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, int seq_len) {
+    RopeInvFreq out;
+    const auto& rope = cfg.Rope;
+    int dim = rope.rotary_dim(head_size);
+    dim = (dim / 2) * 2;
+    out.dim = dim;
+    if (dim <= 0) return out;
+
+    const int half = dim / 2;
+    out.inv_freq.resize(static_cast<std::size_t>(half), 0.0f);
+
+    const std::string rope_type = rope.rope_type.empty() ? "default" : to_lower(rope.rope_type);
+    const double base = static_cast<double>(rope.theta);
+    const double factor = static_cast<double>(rope.scaling_factor);
+
+    auto compute_default = [&](double base_val) {
+        for (int i = 0; i < half; ++i) {
+            const double exponent = (2.0 * i) / static_cast<double>(dim);
+            out.inv_freq[static_cast<std::size_t>(i)] = static_cast<float>(1.0 / std::pow(base_val, exponent));
+        }
+    };
+
+    if (rope_type == "linear") {
+        compute_default(base);
+        if (factor != 0.0) {
+            for (auto& v : out.inv_freq) v = static_cast<float>(v / factor);
+        }
+        return out;
+    }
+
+    if (rope_type == "dynamic") {
+        const double max_pos = static_cast<double>(cfg.MaxPositionEmbeddings);
+        const double seq = static_cast<double>(std::max(seq_len, cfg.MaxPositionEmbeddings));
+        if (dim > 2 && max_pos > 0.0 && factor > 0.0) {
+            const double term = (factor * seq / max_pos) - (factor - 1.0);
+            if (term > 0.0) {
+                const double power = static_cast<double>(dim) / static_cast<double>(dim - 2);
+                const double scaled_base = base * std::pow(term, power);
+                compute_default(scaled_base);
+                return out;
+            }
+        }
+        compute_default(base);
+        return out;
+    }
+
+    if (rope_type == "yarn") {
+        const double max_pos = static_cast<double>(
+            rope.original_max_position_embeddings.value_or(cfg.MaxPositionEmbeddings));
+        const double beta_fast = static_cast<double>(rope.beta_fast.value_or(32.0f));
+        const double beta_slow = static_cast<double>(rope.beta_slow.value_or(1.0f));
+        const bool truncate = rope.truncate.value_or(true);
+
+        if (rope.attention_factor) {
+            out.attention_scale = *rope.attention_factor;
+        } else if (rope.mscale && rope.mscale_all_dim) {
+            out.attention_scale = get_mscale(static_cast<float>(factor), *rope.mscale) /
+                                  get_mscale(static_cast<float>(factor), *rope.mscale_all_dim);
+        } else {
+            out.attention_scale = get_mscale(static_cast<float>(factor));
+        }
+
+        std::vector<double> pos_freqs(half);
+        for (int i = 0; i < half; ++i) {
+            const double exponent = (2.0 * i) / static_cast<double>(dim);
+            pos_freqs[static_cast<std::size_t>(i)] = std::pow(base, exponent);
+        }
+        std::vector<double> inv_freq_extrapolation(half);
+        std::vector<double> inv_freq_interpolation(half);
+        for (int i = 0; i < half; ++i) {
+            const double pf = pos_freqs[static_cast<std::size_t>(i)];
+            inv_freq_extrapolation[static_cast<std::size_t>(i)] = 1.0 / pf;
+            inv_freq_interpolation[static_cast<std::size_t>(i)] = (factor > 0.0) ? (1.0 / (factor * pf)) : (1.0 / pf);
+        }
+
+        auto find_correction_dim = [&](double num_rot, double dim_val, double base_val, double max_pos_val) {
+            return (dim_val * std::log(max_pos_val / (num_rot * 2.0 * kPi))) / (2.0 * std::log(base_val));
+        };
+        auto find_correction_range = [&](double low_rot, double high_rot, double dim_val,
+                                         double base_val, double max_pos_val, bool truncate_val) {
+            double low = find_correction_dim(low_rot, dim_val, base_val, max_pos_val);
+            double high = find_correction_dim(high_rot, dim_val, base_val, max_pos_val);
+            if (truncate_val) {
+                low = std::floor(low);
+                high = std::ceil(high);
+            }
+            low = std::max(low, 0.0);
+            high = std::min(high, dim_val - 1.0);
+            return std::pair<double, double>(low, high);
+        };
+
+        auto [low, high] = find_correction_range(beta_fast, beta_slow, static_cast<double>(dim), base, max_pos, truncate);
+        if (low == high) {
+            high += 0.001;
+        }
+
+        for (int i = 0; i < half; ++i) {
+            const double linear = (static_cast<double>(i) - low) / (high - low);
+            const double ramp = clampf(static_cast<float>(linear), 0.0f, 1.0f);
+            const double extrap_factor = 1.0 - ramp;
+            const double inv_val = inv_freq_interpolation[static_cast<std::size_t>(i)] * (1.0 - extrap_factor) +
+                                   inv_freq_extrapolation[static_cast<std::size_t>(i)] * extrap_factor;
+            out.inv_freq[static_cast<std::size_t>(i)] = static_cast<float>(inv_val);
+        }
+        return out;
+    }
+
+    if (rope_type == "longrope") {
+        const int original_max = rope.original_max_position_embeddings_config.value_or(cfg.MaxPositionEmbeddings);
+        double attention_factor = rope.attention_factor.value_or(0.0f);
+        double factor_for_attn = factor;
+        if (original_max > 0 && rope.original_max_position_embeddings_config) {
+            factor_for_attn = static_cast<double>(cfg.MaxPositionEmbeddings) / static_cast<double>(original_max);
+        }
+        if (attention_factor <= 0.0) {
+            if (factor_for_attn <= 1.0) {
+                attention_factor = 1.0;
+            } else if (original_max > 0) {
+                attention_factor = std::sqrt(1.0 + std::log(factor_for_attn) / std::log(static_cast<double>(original_max)));
+            } else {
+                attention_factor = 1.0;
+            }
+        }
+        out.attention_scale = static_cast<float>(attention_factor);
+
+        const bool use_long = (seq_len > original_max);
+        const auto& factors = use_long ? rope.long_factor : rope.short_factor;
+        std::vector<float> ext_factors;
+        if (factors.size() == static_cast<std::size_t>(half)) {
+            ext_factors.assign(factors.begin(), factors.end());
+        } else {
+            ext_factors.assign(static_cast<std::size_t>(half), 1.0f);
+        }
+
+        for (int i = 0; i < half; ++i) {
+            const double exponent = (2.0 * i) / static_cast<double>(dim);
+            const double pf = std::pow(base, exponent);
+            const double ext = static_cast<double>(ext_factors[static_cast<std::size_t>(i)]);
+            out.inv_freq[static_cast<std::size_t>(i)] = static_cast<float>(1.0 / (ext * pf));
+        }
+        return out;
+    }
+
+    if (rope_type == "llama3") {
+        if (!rope.low_freq_factor || !rope.high_freq_factor) {
+            compute_default(base);
+            return out;
+        }
+        const double factor_llama = factor;
+        const double low_freq_factor = static_cast<double>(*rope.low_freq_factor);
+        const double high_freq_factor = static_cast<double>(*rope.high_freq_factor);
+        const int old_ctx = rope.original_max_position_embeddings.value_or(cfg.MaxPositionEmbeddings);
+        if (old_ctx <= 0 || factor_llama <= 0.0 || high_freq_factor == low_freq_factor) {
+            compute_default(base);
+            return out;
+        }
+
+        compute_default(base);
+        const double low_freq_wavelen = static_cast<double>(old_ctx) / low_freq_factor;
+        const double high_freq_wavelen = static_cast<double>(old_ctx) / high_freq_factor;
+
+        for (int i = 0; i < half; ++i) {
+            const double inv = static_cast<double>(out.inv_freq[static_cast<std::size_t>(i)]);
+            const double wavelen = 2.0 * kPi / inv;
+            double inv_llama = (wavelen > low_freq_wavelen) ? (inv / factor_llama) : inv;
+            const double smooth_factor = (static_cast<double>(old_ctx) / wavelen - low_freq_factor) /
+                                         (high_freq_factor - low_freq_factor);
+            const double smoothed = (1.0 - smooth_factor) * inv_llama / factor_llama + smooth_factor * inv_llama;
+            const bool is_medium = !(wavelen < high_freq_wavelen) && !(wavelen > low_freq_wavelen);
+            const double final_inv = is_medium ? smoothed : inv_llama;
+            out.inv_freq[static_cast<std::size_t>(i)] = static_cast<float>(final_inv);
+        }
+        return out;
+    }
+
+    // default
+    compute_default(base);
+    return out;
+}
+
+template<typename T>
+inline T rope_cast(float v) {
+    return static_cast<T>(v);
+}
+
+template<>
+inline nv_bfloat16 rope_cast<nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
+}
+
+template<typename T>
+void fill_rope_freqs(std::vector<T>& out, const RopeInvFreq& params, int head_size, int max_seq_len) {
+    if (params.dim <= 0 || params.inv_freq.empty()) return;
+    const int dim = params.dim;
+    const int half = dim / 2;
+    const std::size_t stride = static_cast<std::size_t>(dim);
+    std::fill(out.begin(), out.end(), T{});
+    for (int t = 0; t < max_seq_len; ++t) {
+        const std::size_t base = static_cast<std::size_t>(t) * stride;
+        for (int i = 0; i < half; ++i) {
+            const float angle = static_cast<float>(t) * params.inv_freq[static_cast<std::size_t>(i)];
+            const float c = std::cos(angle) * params.attention_scale;
+            const float s = std::sin(angle) * params.attention_scale;
+            out[base + static_cast<std::size_t>(2 * i)] = rope_cast<T>(c);
+            out[base + static_cast<std::size_t>(2 * i + 1)] = rope_cast<T>(s);
+        }
+    }
 }
 }  // namespace
 
@@ -155,21 +390,22 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {out_size, V});
 
     // RoPE frequencies (if not using fused RoPE).
-    const int max_seq_len = std::min(static_cast<int>(T), cfg.MaxPositionEmbeddings);
+    const int max_seq_len = static_cast<int>(T);
     if (max_seq_len > 0) {
         const int head_size = cfg.head_size();
+        const RopeInvFreq rope_params = compute_rope_inv_freq(cfg, head_size, max_seq_len);
         if (dtype == ETensorDType::BF16) {
             mNonBlockActivations.freq_cis = mAllocator->allocate(
                 dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
             std::vector<nv_bfloat16> freq_cpu(static_cast<std::size_t>(max_seq_len) * 2 * head_size);
-            precompute_freqs_cis(freq_cpu.data(), head_size, max_seq_len, cfg.RopeTheta);
+            fill_rope_freqs(freq_cpu, rope_params, head_size, max_seq_len);
             CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data, freq_cpu.data(),
                                   freq_cpu.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
         } else if (dtype == ETensorDType::FP32) {
             mNonBlockActivations.freq_cis = mAllocator->allocate(
                 dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
             std::vector<float> freq_cpu(static_cast<std::size_t>(max_seq_len) * 2 * head_size);
-            precompute_freqs_cis(freq_cpu.data(), head_size, max_seq_len, cfg.RopeTheta);
+            fill_rope_freqs(freq_cpu, rope_params, head_size, max_seq_len);
             CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data, freq_cpu.data(),
                                   freq_cpu.size() * sizeof(float), cudaMemcpyHostToDevice));
         } else {

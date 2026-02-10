@@ -70,6 +70,8 @@ class WarningCode(str, Enum):
     W003 = "W003"  # Suboptimal auto-derived backward
     W004 = "W004"  # Unused saved tensor
     W005 = "W005"  # Implicit dtype narrowing
+    W006 = "W006"  # Unresolved string dimension in IR shape
+    W007 = "W007"  # Graph tensor has no matching activation slot
 
 
 @dataclass

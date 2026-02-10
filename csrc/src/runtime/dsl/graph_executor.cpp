@@ -703,7 +703,7 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
+        const std::size_t pos_bytes = position_ids.bytes();
         if (position_ids.Device == -1) {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
@@ -714,6 +714,26 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
             CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, rs.Targets_CPU.Data, target_bytes,
                                        cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
+            const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
+            const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+            for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
+                if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
+                    continue;
+                }
+                const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
+                                           cudaMemcpyHostToDevice, rs.MainStream));
+            }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
@@ -761,7 +781,7 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
+        const std::size_t pos_bytes = position_ids.bytes();
         if (position_ids.Device == -1) {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
@@ -774,6 +794,26 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
                 CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.MainStream));
             } else {
                 CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
+        }
+        if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
+            const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
+            const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+            for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
+                if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
+                    continue;
+                }
+                const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
+                                           cudaMemcpyHostToDevice, rs.MainStream));
             }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
@@ -948,7 +988,7 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
+        const std::size_t pos_bytes = position_ids.bytes();
         if (position_ids.Device == -1) {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
@@ -959,6 +999,26 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
             CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, rs.Targets_CPU.Data, target_bytes,
                                        cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
+            const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
+            const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+            for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
+                if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
+                    continue;
+                }
+                const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
+                                           cudaMemcpyHostToDevice, rs.MainStream));
+            }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
@@ -1012,7 +1072,7 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(position_ids.DType);
+        const std::size_t pos_bytes = position_ids.bytes();
         if (position_ids.Device == -1) {
             CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         } else {
@@ -1025,6 +1085,26 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
                 CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.MainStream));
             } else {
                 CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+            }
+        }
+        if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
+            const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
+            const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
+                                       cudaMemcpyHostToDevice, rs.MainStream));
+        }
+        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+            for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
+                if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
+                    continue;
+                }
+                const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
+                                           cudaMemcpyHostToDevice, rs.MainStream));
             }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);

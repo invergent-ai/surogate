@@ -11,6 +11,7 @@
 #include <utility>
 #include <thread>
 #include <functional>
+#include <vector>
 #include <cuda_runtime.h>
 
 #include "config/pretrained_config.h"
@@ -96,6 +97,9 @@ public:
     std::vector<std::pair<std::string, long>> get_stack_info(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
+    void set_visual_inputs(const std::int32_t* visual_pos_masks,
+                           const float* visual_embeds,
+                           const std::vector<const float*>& deepstack_visual_embeds);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism

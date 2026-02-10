@@ -25,7 +25,6 @@ register_model(
         ChatTemplateType.qwen3,
         get_model_tokenizer_with_flash_attn,
         architectures=['Qwen3ForCausalLM'],
-        attention_cls='Qwen3Attention',
         model_arch=ModelArchitecture.llama))
 
 
@@ -39,7 +38,6 @@ register_model(
         LLMModelType.qwen3_moe,
         ChatTemplateType.qwen3,
         get_model_tokenizer_with_flash_attn,
-        attention_cls='Qwen3MoeAttention',
         architectures=['Qwen3MoeForCausalLM']))
 
 """
@@ -50,7 +48,6 @@ register_model(
         LLMModelType.qwen3_thinking,
         ChatTemplateType.qwen3_thinking,
         get_model_tokenizer_with_flash_attn,
-        attention_cls='Qwen3Attention',
         architectures=['Qwen3ForCausalLM']))
 
 """
@@ -62,5 +59,4 @@ register_model(
         LLMModelType.qwen3_nothinking,
         ChatTemplateType.qwen3_nothinking,
         get_model_tokenizer_with_flash_attn,
-        attention_cls='Qwen3MoeAttention',
         architectures=['Qwen3MoeForCausalLM', 'Qwen3ForCausalLM']))

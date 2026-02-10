@@ -496,6 +496,62 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
+    def mrope(
+        self,
+        qkv: str | GraphRef,
+        freqs: str | GraphRef,
+        position_ids: str | GraphRef,
+        *,
+        rotary_dim: int | str | None = None,
+        mrope_section: list[int] | tuple[int, int, int] | None = None,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Apply multimodal rotary position embedding (MRoPE)."""
+        out = out_name if out_name else self._fresh_name("mrope")
+        attrs = {}
+        if rotary_dim is not None:
+            attrs["rotary_dim"] = rotary_dim
+        if mrope_section is not None:
+            attrs["mrope_section"] = list(mrope_section)
+        self._add_node(GraphNode(
+            op="mrope",
+            inputs=[
+                self._resolve_input(qkv),
+                self._resolve_input(freqs),
+                self._resolve_input(position_ids),
+            ],
+            outputs=[out],
+            attrs=attrs,
+        ))
+        return self._make_output(out)
+
+    def qkv_qk_norm(
+        self,
+        qkv: str | GraphRef,
+        q_norm_weight: str | GraphRef,
+        k_norm_weight: str | GraphRef,
+        *,
+        eps: float = 1e-6,
+        out_name: str | None = None,
+        q_rstd_name: str | None = None,
+        k_rstd_name: str | None = None,
+    ) -> tuple[GraphRef, GraphRef, GraphRef]:
+        """QK norm (no RoPE). Returns (qkv_out, q_rstd, k_rstd)."""
+        qkv_out = out_name if out_name else self._fresh_name("qkv_norm")
+        q_rstd = q_rstd_name if q_rstd_name else self._fresh_name("q_rstd")
+        k_rstd = k_rstd_name if k_rstd_name else self._fresh_name("k_rstd")
+        self._add_node(GraphNode(
+            op="qkv_qk_norm",
+            inputs=[
+                self._resolve_input(qkv),
+                self._resolve_input(q_norm_weight),
+                self._resolve_input(k_norm_weight),
+            ],
+            outputs=[qkv_out, q_rstd, k_rstd],
+            attrs={"eps": eps},
+        ))
+        return self._make_outputs([qkv_out, q_rstd, k_rstd])
+
     def qkv_qk_norm_rope(
         self,
         qkv: str | GraphRef,
@@ -654,6 +710,40 @@ class GraphBuilder:
         self._add_node(GraphNode(
             op="mul",
             inputs=[self._resolve_input(a), self._resolve_input(b)],
+            outputs=[out],
+        ))
+        return self._make_output(out)
+
+    def mask_scatter(
+        self,
+        x: str | GraphRef,
+        mask: str | GraphRef,
+        src: str | GraphRef,
+        *,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Replace rows in x at masked positions with src (visual embeddings)."""
+        out = out_name if out_name else self._fresh_name("mask_scatter")
+        self._add_node(GraphNode(
+            op="mask_scatter",
+            inputs=[self._resolve_input(x), self._resolve_input(mask), self._resolve_input(src)],
+            outputs=[out],
+        ))
+        return self._make_output(out)
+
+    def deepstack_inject(
+        self,
+        x: str | GraphRef,
+        mask: str | GraphRef,
+        src: str | GraphRef,
+        *,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Add src to x at masked positions (deepstack visual embeddings)."""
+        out = out_name if out_name else self._fresh_name("deepstack")
+        self._add_node(GraphNode(
+            op="deepstack_inject",
+            inputs=[self._resolve_input(x), self._resolve_input(mask), self._resolve_input(src)],
             outputs=[out],
         ))
         return self._make_output(out)

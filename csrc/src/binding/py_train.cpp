@@ -11,9 +11,13 @@
 #include <vector>
 #include <iostream>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 #include <fmt/format.h>
 
 #include "utilities/gpu_info.h"
+#include "utilities/dtype.h"
 #include "runtime/training/checkpoint.h"
 #include "runtime/training/dataloader.h"
 #include "runtime/training/logging.h"
@@ -44,11 +48,53 @@ bool env_enabled(const char* name) {
 
 }  // namespace
 
-static void fill_sequential_position_ids(std::int32_t* dst, int B, int T) {
-    for (int b = 0; b < B; ++b) {
-        std::int32_t* row = dst + b * T;
-        for (int t = 0; t < T; ++t) {
-            row[t] = t;
+namespace {
+void copy_from_float(void* dst, ETensorDType dtype, const float* src, std::size_t n) {
+    if (!dst || n == 0) {
+        return;
+    }
+    if (!src) {
+        std::memset(dst, 0, n * get_dtype_size(dtype));
+        return;
+    }
+    switch (dtype) {
+        case ETensorDType::FP32: {
+            std::memcpy(dst, src, n * sizeof(float));
+            break;
+        }
+        case ETensorDType::BF16: {
+            auto* out = reinterpret_cast<nv_bfloat16*>(dst);
+            for (std::size_t i = 0; i < n; ++i) {
+                out[i] = __float2bfloat16(src[i]);
+            }
+            break;
+        }
+        case ETensorDType::FP16: {
+            auto* out = reinterpret_cast<half*>(dst);
+            for (std::size_t i = 0; i < n; ++i) {
+                out[i] = __float2half(src[i]);
+            }
+            break;
+        }
+        default:
+            throw std::runtime_error("set_visual_inputs: unsupported dtype for visual embeds");
+    }
+}
+
+void zero_tensor(Tensor& t) {
+    if (t.Data && t.bytes() > 0) {
+        std::memset(t.Data, 0, static_cast<std::size_t>(t.bytes()));
+    }
+}
+}  // namespace
+
+static void fill_sequential_position_ids(std::int32_t* dst, int planes, int B, int T) {
+    for (int p = 0; p < planes; ++p) {
+        for (int b = 0; b < B; ++b) {
+            std::int32_t* row = dst + (p * B + b) * T;
+            for (int t = 0; t < T; ++t) {
+                row[t] = t;
+            }
         }
     }
 }
@@ -338,14 +384,17 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         }
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
-        auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) * static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
-            std::memcpy(pb, position_ids + i * B * T, B * T * sizeof(std::int32_t));
+            std::memcpy(pb, position_ids + i * pos_stride, pos_stride * sizeof(std::int32_t));
         } else {
-            fill_sequential_position_ids(pb, B, T);
+            fill_sequential_position_ids(pb, pos_planes, B, T);
         }
     }
 
@@ -368,6 +417,58 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
     ++mTrainMicroStep;
 }
 
+void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
+                                          const float* visual_embeds,
+                                          const std::vector<const float*>& deepstack_visual_embeds) {
+    if (!mConfig || !mConfig->UseVisualInputs) {
+        if (visual_pos_masks || visual_embeds || !deepstack_visual_embeds.empty()) {
+            throw std::runtime_error("set_visual_inputs: visual inputs requested but model config has UseVisualInputs=false");
+        }
+        return;
+    }
+
+    const int world = local_world_size();
+    const std::size_t mask_stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+    const std::size_t embed_stride = mask_stride * static_cast<std::size_t>(mConfig->HiddenSize);
+
+    for (int i = 0; i < world; ++i) {
+        const std::int32_t* mask_ptr = visual_pos_masks ? (visual_pos_masks + i * mask_stride) : nullptr;
+        const float* embed_ptr = visual_embeds ? (visual_embeds + i * embed_stride) : nullptr;
+        std::vector<const float*> deepstack_ptrs;
+        deepstack_ptrs.reserve(deepstack_visual_embeds.size());
+        for (const float* base_ptr : deepstack_visual_embeds) {
+            deepstack_ptrs.push_back(base_ptr ? (base_ptr + i * embed_stride) : nullptr);
+        }
+
+        run_work([mask_ptr, embed_ptr, deepstack_ptrs](sThreadContext& ctx) {
+            auto& rs = ctx.Model->get_run_state();
+            if (!rs.VisualPosMasks_CPU.Data || !rs.VisualEmbeds_CPU.Data) {
+                if (mask_ptr || embed_ptr || !deepstack_ptrs.empty()) {
+                    throw std::runtime_error("set_visual_inputs: visual buffers not allocated in run state");
+                }
+                return;
+            }
+
+            if (mask_ptr) {
+                std::memcpy(rs.VisualPosMasks_CPU.Data, mask_ptr, rs.VisualPosMasks_CPU.bytes());
+            } else {
+                zero_tensor(rs.VisualPosMasks_CPU);
+            }
+
+            copy_from_float(rs.VisualEmbeds_CPU.Data, rs.VisualEmbeds_CPU.DType, embed_ptr,
+                            rs.VisualEmbeds_CPU.nelem());
+
+            if (!rs.DeepstackVisualEmbeds_CPU.empty()) {
+                for (std::size_t j = 0; j < rs.DeepstackVisualEmbeds_CPU.size(); ++j) {
+                    Tensor& dst = rs.DeepstackVisualEmbeds_CPU[j];
+                    const float* src = (j < deepstack_ptrs.size()) ? deepstack_ptrs[j] : nullptr;
+                    copy_from_float(dst.Data, dst.DType, src, dst.nelem());
+                }
+            }
+        }, i);
+    }
+}
+
 /**
  * @brief Run one validation step and return the loss (rank 0).
  *
@@ -383,14 +484,17 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t
         auto& ctx = mContexts.at(i);
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
-        auto* pb = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) * static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
-            std::memcpy(pb, position_ids + i * B * T, B * T * sizeof(std::int32_t));
+            std::memcpy(pb, position_ids + i * pos_stride, pos_stride * sizeof(std::int32_t));
         } else {
-            fill_sequential_position_ids(pb, B, T);
+            fill_sequential_position_ids(pb, pos_planes, B, T);
         }
     }
 
@@ -448,6 +552,12 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
     const int local_gpus = static_cast<int>(mContexts.size());
     const int micro_steps = mGradAccumulation;
     const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+    const int pos_planes = (mContexts.empty() || !mContexts.front().Model)
+        ? 1
+        : ((mContexts.front().Model->get_position_ids_buffer().Rank == 3)
+              ? static_cast<int>(mContexts.front().Model->get_position_ids_buffer().Sizes[0])
+              : 1);
+    const std::size_t pos_stride = stride * static_cast<std::size_t>(pos_planes);
 
     run_work([&](sThreadContext& ctx) {
         auto& rs = ctx.Model->get_run_state();
@@ -488,7 +598,11 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
                 gs.inputs.push_back(rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
                 gs.targets.push_back(rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
-                gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+                if (pos_planes > 1) {
+                    gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {pos_planes, B, T}));
+                } else {
+                    gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+                }
             }
 
             gs.captured_B = B;
@@ -514,12 +628,13 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         const int rank = ctx.Communicator->local_rank();
         for (int j = 0; j < micro_steps; ++j) {
             const std::size_t offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) + static_cast<std::size_t>(rank)) * stride;
+            const std::size_t pos_offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) + static_cast<std::size_t>(rank)) * pos_stride;
             std::memcpy(gs.inputs[j].Data, inputs + offset, stride * sizeof(std::int32_t));
             std::memcpy(gs.targets[j].Data, targets + offset, stride * sizeof(std::int32_t));
             if (position_ids) {
-                std::memcpy(gs.position_ids[j].Data, position_ids + offset, stride * sizeof(std::int32_t));
+                std::memcpy(gs.position_ids[j].Data, position_ids + pos_offset, pos_stride * sizeof(std::int32_t));
             } else {
-                fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data), B, T);
+                fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data), pos_planes, B, T);
             }
         }
 
@@ -573,7 +688,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         // CUDA graph capture path (both AdamW and NorMuon support graph capture)
-        const bool warmup_full_graph = !gs.captured && !dsl_model->lora_enabled()
+        const bool warmup_full_graph = !gs.captured
                                        && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
         const bool warmup_skip_bwd = env_enabled("SUROGATE_DSL_GRAPH_WARMUP_SKIP_BWD");
         const bool prev_internal_graphs = dsl_model->internal_graphs_enabled();

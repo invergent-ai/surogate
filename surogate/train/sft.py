@@ -24,9 +24,14 @@ class SurogateSFT(TokenizeDatasets):
         # Check if distributed training is configured
         # In distributed mode, each worker node tokenizes its own shard of the data
         if self.config.distributed and self.config.distributed.num_nodes > 1:
-            logger.info("Distributed mode: each node will tokenize its own data shard")
+            logger.info("Distributed mode: each node will process its own data shard")
             logger.info(f"Starting training run '{self.config.run_name}'...")
             return self._train_distributed()
+
+        if self.config.multimodal_on_the_fly and self.config.model_template.is_multimodal:
+            logger.info("Multimodal on-the-fly enabled; skipping tokenization.")
+            logger.info(f"Starting training run '{self.config.run_name}'...")
+            return self.train_with_oom_recovery([], [])
 
         # Single-node mode: tokenize datasets on the driver
         super().run()
@@ -59,7 +64,8 @@ class SurogateSFT(TokenizeDatasets):
         logger.metric("Ray address", dist_cfg.ray_address)
         logger.metric("Nodes", dist_cfg.num_nodes)
         logger.metric("GPUs per node", dist_cfg.gpus_per_node or self.config.gpus)
-        logger.metric("Per-node tokenization", "enabled")
+        tokenize_on_node = not (self.config.multimodal_on_the_fly and self.config.model_template.is_multimodal)
+        logger.metric("Per-node tokenization", "enabled" if tokenize_on_node else "disabled (on-the-fly)")
 
         trainer = RayDistributedTrainer(
             config=self.config,
@@ -68,7 +74,7 @@ class SurogateSFT(TokenizeDatasets):
             ray_address=dist_cfg.ray_address,
             num_nodes=dist_cfg.num_nodes,
             gpus_per_node=dist_cfg.gpus_per_node or self.config.gpus,
-            tokenize_on_node=True,  # Each node tokenizes its own shard
+            tokenize_on_node=tokenize_on_node,  # Tokenize per node unless on-the-fly mode
         )
 
         try:

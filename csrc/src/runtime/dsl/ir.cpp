@@ -445,7 +445,11 @@ IRFile load_ir_from_json(const nlohmann::json& root) {
     }
     if (root.contains("warnings") && root["warnings"].is_array()) {
         for (const auto& warning : root["warnings"]) {
-            ir.warnings.push_back(warning.get<std::string>());
+            if (warning.is_string()) {
+                ir.warnings.push_back(warning.get<std::string>());
+            } else if (warning.is_object()) {
+                ir.warnings.push_back(warning.value("message", "unknown warning"));
+            }
         }
     }
     if (root.contains("errors") && root["errors"].is_array()) {

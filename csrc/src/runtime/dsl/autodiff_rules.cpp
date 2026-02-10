@@ -27,12 +27,20 @@ std::string get_string_attr(const AttrMap& attrs, const std::string& key, const 
     return default_val;
 }
 
-// Helper to copy attributes
-AttrMap copy_attrs(const AttrMap& src, const std::vector<std::string>& keys) {
+// Helper to copy attributes from forward op to backward op.
+// Warns when a requested key is missing — this catches attr name mismatches
+// between forward IR and backward rules (e.g., "mamba_num_heads" vs "num_heads").
+AttrMap copy_attrs(const AttrMap& src, const std::vector<std::string>& keys,
+                   const char* rule_name = nullptr) {
     AttrMap dst;
     for (const auto& key : keys) {
         if (auto* attr = find_attr(src, key)) {
             dst[key] = *attr;
+        } else if (rule_name) {
+            fprintf(stderr,
+                    "WARNING [autodiff]: backward rule '%s' requested attr '%s' "
+                    "not found in forward op attrs\n",
+                    rule_name, key.c_str());
         }
     }
     return dst;
@@ -190,6 +198,68 @@ std::vector<Operation> multiply_backward(const BackwardRuleContext& ctx) {
             {ctx.d_inputs[1]}));
     }
 
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Masked scatter backward rule
+// Forward: out = mask_scatter(x, mask, src)
+// Backward: d_x, d_src (mask is non-differentiable)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mask_scatter_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 2) {
+        return ops;
+    }
+    const std::string& mask = fwd.inputs[1];
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back("");  // mask has no gradient
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");
+
+    if (outputs[0].empty() && outputs[2].empty()) {
+        return ops;
+    }
+
+    ops.push_back(make_operation(
+        "mask_scatter_backward_" + std::to_string(ctx.op_counter++),
+        "mask_scatter_backward",
+        "mask_scatter_backward",
+        {ctx.d_output, mask},
+        outputs));
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Deepstack inject backward rule
+// Forward: out = deepstack_inject(x, mask, src)  (adds src at masked positions)
+// Backward: d_x, d_src (mask is non-differentiable)
+// -----------------------------------------------------------------------------
+std::vector<Operation> deepstack_inject_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 2) {
+        return ops;
+    }
+    const std::string& mask = fwd.inputs[1];
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back("");  // mask has no gradient
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");
+
+    if (outputs[0].empty() && outputs[2].empty()) {
+        return ops;
+    }
+
+    ops.push_back(make_operation(
+        "deepstack_inject_backward_" + std::to_string(ctx.op_counter++),
+        "deepstack_inject_backward",
+        "deepstack_inject_backward",
+        {ctx.d_output, mask},
+        outputs));
     return ops;
 }
 
@@ -507,6 +577,36 @@ std::vector<Operation> rope_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// MRoPE backward rule
+// Forward: out = mrope(qkv, freqs, position_ids)
+// Backward: d_qkv = mrope_backward(d_out, freqs, position_ids)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mrope_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() >= 3) {
+        std::string freqs = fwd.inputs[1];
+        std::string pos_ids = fwd.inputs[2];
+
+        std::vector<std::string> outputs;
+        outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+
+        AttrMap attrs = copy_attrs(fwd.attrs, {"rotary_dim", "mrope_section"});
+
+        ops.push_back(make_operation(
+            "mrope_backward_" + std::to_string(ctx.op_counter++),
+            "mrope_backward",
+            "mrope_backward",
+            {ctx.d_output, freqs, pos_ids},
+            outputs,
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // FlashAttention backward rule
 // Forward: out, lse = flash_attention(qkv)
 // Backward: d_qkv = flash_attention_backward(d_out, out, lse, qkv)
@@ -565,6 +665,41 @@ std::vector<Operation> qkv_qk_norm_rope_backward(const BackwardRuleContext& ctx)
          fwd.inputs[1], fwd.inputs[2],
          saved_ref(q_rstd), saved_ref(k_rstd),
          fwd.inputs[3], fwd.inputs[4]},
+        outputs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// QK-Norm backward rule (no RoPE)
+// Forward: qkv_out, q_rstd, k_rstd = qkv_qk_norm(qkv, q_norm_w, k_norm_w)
+// Backward: d_qkv, d_q_norm_w, d_k_norm_w = qkv_qk_norm_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> qkv_qk_norm_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 3 || fwd.outputs.size() < 3) {
+        return ops;
+    }
+
+    std::string qkv_out = fwd.outputs[0];
+    std::string q_rstd = fwd.outputs[1];
+    std::string k_rstd = fwd.outputs[2];
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");
+
+    ops.push_back(make_operation(
+        "qkv_qk_norm_backward_" + std::to_string(ctx.op_counter++),
+        "qkv_qk_norm_backward",
+        "qkv_qk_norm_backward",
+        {ctx.d_output,
+         saved_ref(qkv_out),
+         fwd.inputs[1], fwd.inputs[2],
+         saved_ref(q_rstd), saved_ref(k_rstd)},
         outputs));
 
     return ops;
@@ -1014,7 +1149,8 @@ std::vector<Operation> mamba_split_proj_backward(const BackwardRuleContext& ctx)
     if (ctx.needs_grad(0)) {
         const auto& fwd = ctx.fwd_op;
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "conv_dim", "num_heads", "head_dim"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "conv_dim", "num_heads", "head_dim"},
+                                    "mamba_split_proj");
 
         // d_outputs[0..2] are the gradients of the 3 forward outputs: gate, conv_in, delta
         // d_inputs[0] is where to write the gradient of the forward input: projected
@@ -1053,7 +1189,7 @@ std::vector<Operation> mamba_conv1d_backward(const BackwardRuleContext& ctx) {
         outputs.push_back(ctx.d_inputs[2]);
     }
 
-    AttrMap attrs = copy_attrs(fwd.attrs, {"activation"});
+    AttrMap attrs = copy_attrs(fwd.attrs, {"activation"}, "mamba_conv1d");
 
     ops.push_back(make_operation(
         "mamba_conv1d_backward_" + std::to_string(ctx.op_counter++),
@@ -1077,7 +1213,8 @@ std::vector<Operation> mamba_split_conv_out_backward(const BackwardRuleContext& 
     if (ctx.needs_grad(0)) {
         const auto& fwd = ctx.fwd_op;
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "n_groups", "ssm_state_size"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"intermediate_size", "n_groups", "ssm_state_size"},
+                                    "mamba_split_conv_out");
 
         // d_outputs[0..2] are the gradients of the 3 forward outputs: u, B, C
         // d_inputs[0] is where to write the gradient of the forward input: conv_out
@@ -1139,7 +1276,8 @@ std::vector<Operation> mamba_ssm_scan_backward(const BackwardRuleContext& ctx) {
     }
 
     AttrMap attrs = copy_attrs(fwd.attrs, {"num_heads", "head_dim", "chunk_size",
-                                           "ssm_state_size", "n_groups", "intermediate_size"});
+                                           "ssm_state_size", "n_groups", "intermediate_size"},
+                                "mamba_ssm_scan");
 
     ops.push_back(make_operation(
         "mamba_ssm_scan_backward_" + std::to_string(ctx.op_counter++),
@@ -1179,7 +1317,7 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
     outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // dgate
     outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // dweight
 
-    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups"});
+    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups"}, "mamba_gated_rmsnorm");
 
     ops.push_back(make_operation(
         "mamba_gated_rmsnorm_backward_" + std::to_string(ctx.op_counter++),
@@ -1217,6 +1355,8 @@ void register_builtin_backward_rules() {
     reg.register_rule("add", add_backward);
     reg.register_rule("multiply", multiply_backward);
     reg.register_rule("mul", multiply_backward);
+    reg.register_rule("mask_scatter", mask_scatter_backward);
+    reg.register_rule("deepstack_inject", deepstack_inject_backward);
 
     // Normalization
     reg.register_rule("rmsnorm", rmsnorm_backward);
@@ -1234,6 +1374,8 @@ void register_builtin_backward_rules() {
 
     // Attention
     reg.register_rule("rope", rope_backward);
+    reg.register_rule("mrope", mrope_backward);
+    reg.register_rule("qkv_qk_norm", qkv_qk_norm_backward);
     reg.register_rule("qkv_qk_norm_rope", qkv_qk_norm_rope_backward);
     reg.register_rule("flash_attention", flash_attention_backward);
     reg.register_rule("flash_attention_qkv", flash_attention_backward);

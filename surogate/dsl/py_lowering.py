@@ -81,6 +81,8 @@ def _kernel_type_from_op(op_name: str) -> KernelType:
         "flash_attention": KernelType.FLASH_ATTENTION,
         "flash_attention_qkv": KernelType.FLASH_ATTENTION,
         "rope": KernelType.ROPE,
+        "mrope": KernelType.ROPE,
+        "qkv_qk_norm": KernelType.QK_NORM,
         "qkv_qk_norm_rope": KernelType.QK_NORM,
         "view": KernelType.VIEW,
         "transpose": KernelType.TRANSPOSE,

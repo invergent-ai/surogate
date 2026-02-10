@@ -4,10 +4,10 @@ from .common import TransposeMode
 from .matmul import matmul, batched_matmul
 from .normalization import rmsnorm, fused_residual_rmsnorm
 from .activations import swiglu, silu, relu2, silu_mul
-from .attention import flash_attention, rope, qkv_qk_norm_rope
+from .attention import flash_attention, rope, mrope, qkv_qk_norm, qkv_qk_norm_rope
 from .embedding import embedding
 from .tensor_ops import view, transpose, concat, split
-from .elementwise import add, mul, scale, bias_add
+from .elementwise import add, mul, scale, bias_add, mask_scatter, deepstack_inject
 from .initialization import zeros, ones, fill_normal
 from .losses import fused_lm_head_loss
 from .moe import (
@@ -45,6 +45,8 @@ __all__ = [
     # Attention
     "flash_attention",
     "rope",
+    "mrope",
+    "qkv_qk_norm",
     "qkv_qk_norm_rope",
     # Embedding
     "embedding",
@@ -58,6 +60,8 @@ __all__ = [
     "mul",
     "scale",
     "bias_add",
+    "mask_scatter",
+    "deepstack_inject",
     # Initialization
     "zeros",
     "ones",

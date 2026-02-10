@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Simple elementwise activation kernels (ReLU^2, SiLU)
+// Simple elementwise activation kernels (ReLU^2, SiLU, GeLU)
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -58,12 +58,43 @@ __device__ __forceinline__ float sigmoid(float x) {
 }
 
 template<typename T>
+__device__ __forceinline__ float gelu_tanh(float x) {
+    // GeLU tanh approximation (HF gelu_pytorch_tanh)
+    constexpr float k0 = 0.7978845608f;  // sqrt(2/pi)
+    constexpr float k1 = 0.044715f;
+    float x3 = x * x * x;
+    float tanh_out = tanhf(k0 * (x + k1 * x3));
+    return 0.5f * x * (1.0f + tanh_out);
+}
+
+template<typename T>
+__device__ __forceinline__ float gelu_tanh_grad(float x) {
+    // Derivative of tanh-approx GeLU.
+    constexpr float k0 = 0.7978845608f;  // sqrt(2/pi)
+    constexpr float k1 = 0.044715f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float u = k0 * (x + k1 * x3);
+    float t = tanhf(u);
+    float dt = (1.0f - t * t) * k0 * (1.0f + 3.0f * k1 * x2);
+    return 0.5f * (1.0f + t) + 0.5f * x * dt;
+}
+
+template<typename T>
 __global__ void silu_forward_kernel(T* out, const T* inp, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float x = to_float(inp[idx]);
     float s = sigmoid<T>(x);
     out[idx] = from_float<T>(x * s);
+}
+
+template<typename T>
+__global__ void gelu_forward_kernel(T* out, const T* inp, long n) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float x = to_float(inp[idx]);
+    out[idx] = from_float<T>(gelu_tanh<T>(x));
 }
 
 template<typename T>
@@ -74,6 +105,16 @@ __global__ void silu_backward_kernel(T* dinp, const T* inp, const T* dout, long 
     float dy = to_float(dout[idx]);
     float s = sigmoid<T>(x);
     float dx = dy * (s * (1.0f + x * (1.0f - s)));
+    dinp[idx] = from_float<T>(dx);
+}
+
+template<typename T>
+__global__ void gelu_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float x = to_float(inp[idx]);
+    float dy = to_float(dout[idx]);
+    float dx = dy * gelu_tanh_grad<T>(x);
     dinp[idx] = from_float<T>(dx);
 }
 
@@ -105,11 +146,29 @@ void launch_silu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
 }
 
 template<typename T>
+void launch_gelu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    gelu_forward_kernel<T><<<grid, block, 0, stream>>>(out, inp, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename T>
 void launch_silu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
     int grid = (int)((n + block - 1) / block);
     silu_backward_kernel<T><<<grid, block, 0, stream>>>(dinp, inp, dout, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename T>
+void launch_gelu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    gelu_backward_kernel<T><<<grid, block, 0, stream>>>(dinp, inp, dout, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -139,10 +198,26 @@ void silu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t
     launch_silu_forward(out, inp, n, stream);
 }
 
+void gelu_forward(float* out, const float* inp, long n, cudaStream_t stream) {
+    launch_gelu_forward(out, inp, n, stream);
+}
+
+void gelu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream) {
+    launch_gelu_forward(out, inp, n, stream);
+}
+
 void silu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream) {
     launch_silu_backward(dinp, inp, dout, n, stream);
 }
 
 void silu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream) {
     launch_silu_backward(dinp, inp, dout, n, stream);
+}
+
+void gelu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream) {
+    launch_gelu_backward(dinp, inp, dout, n, stream);
+}
+
+void gelu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream) {
+    launch_gelu_backward(dinp, inp, dout, n, stream);
 }

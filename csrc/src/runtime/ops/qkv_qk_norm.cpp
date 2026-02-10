@@ -54,15 +54,12 @@ void log_qkv_mismatch(const char* op_name,
 }
 
 }  // namespace
-    
-void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
+
+void CompiledExecutor::dispatch_qkv_qk_norm(const CompiledOp& op) {
     Tensor& qkv_in = resolve_tensor(op.inputs[0]);
     Tensor& q_norm = resolve_tensor(op.inputs[1]);
     Tensor& k_norm = resolve_tensor(op.inputs[2]);
-    Tensor& freqs = resolve_tensor(op.inputs[3]);
-    Tensor& pos_ids = resolve_tensor(op.inputs[4]);
 
-    // Get output tensor from pre-allocated slot if available
     Tensor& qkv_out = ensure_output_tensor(op.outputs[0]);
     Tensor& q_rstd = ensure_output_tensor(op.outputs[1]);
     Tensor& k_rstd = ensure_output_tensor(op.outputs[2]);
@@ -70,16 +67,13 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
-    const bool cudnn_gqa_ok = (Hq == Hkv);
     int qkv_channels = Hs * (Hq + 2 * Hkv);
     const int qkv_expected = qkv_channels;
 
-    // If input and output are different buffers, copy input to output first.
-    // The kernel operates in-place on the output buffer.
     if (qkv_in.Data != qkv_out.Data) {
-        cudaMemcpyAsync(qkv_out.Data, qkv_in.Data,
-                        qkv_in.bytes(),
-                        cudaMemcpyDeviceToDevice, mRunState.MainStream);
+        CUDA_CHECK(cudaMemcpyAsync(qkv_out.Data, qkv_in.Data,
+                                   qkv_in.bytes(),
+                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
 
     auto actual_qkv_channels = [](const Tensor& t) -> long {
@@ -94,12 +88,12 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     const long qkv_actual = actual_qkv_channels(qkv_in) > 0 ? actual_qkv_channels(qkv_in)
                                                             : actual_qkv_channels(qkv_out);
     if (qkv_actual > 0 && qkv_actual != qkv_expected && !mOptions.ShardWeights) {
-        log_qkv_mismatch("qkv_qk_norm_rope",
+        log_qkv_mismatch("qkv_qk_norm",
                          static_cast<int>(mB), static_cast<int>(mT),
                          qkv_expected, qkv_actual,
                          Hq, Hkv, Hs, false,
                          qkv_in, q_norm, k_norm, q_rstd, k_rstd);
-        throw std::runtime_error("qkv_qk_norm_rope: unexpected qkv shape (no sharding enabled)");
+        throw std::runtime_error("qkv_qk_norm: unexpected qkv shape (no sharding enabled)");
     }
     if (qkv_actual > 0 && qkv_actual != qkv_channels) {
         int q_heads = (q_rstd.Rank == 3) ? static_cast<int>(q_rstd.Sizes[2]) : -1;
@@ -123,11 +117,26 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
             }
         }
     }
+
     Tensor qkv_view = qkv_out;
     const long qkv_needed = static_cast<long>(mB) * static_cast<long>(mT) * qkv_channels;
     if ((qkv_out.Rank == 4 || (qkv_out.Rank == 3 && qkv_out.Sizes[2] != qkv_channels)) &&
         static_cast<long>(qkv_out.nelem()) >= qkv_needed) {
         qkv_view = view_tensor(qkv_out, {mB, mT, qkv_channels});
+    }
+    if (qkv_view.Rank != 3 || qkv_view.Sizes[0] != mB || qkv_view.Sizes[1] != mT ||
+        qkv_view.Sizes[2] != qkv_channels) {
+        fprintf(stderr, "[QKV_DEBUG] qkv_qk_norm pre-kernel shape mismatch\n");
+        fprintf(stderr, "  expected=[%ld,%ld,%d] cfg: Hq=%d Hkv=%d Hs=%d shard_weights=%d\n",
+                mB, mT, qkv_channels, Hq, Hkv, Hs, mOptions.ShardWeights ? 1 : 0);
+        log_tensor_shape("qkv_in", qkv_in);
+        log_tensor_shape("qkv_out", qkv_out);
+        log_tensor_shape("qkv_view", qkv_view);
+        log_tensor_shape("q_norm", q_norm);
+        log_tensor_shape("k_norm", k_norm);
+        log_tensor_shape("q_rstd", q_rstd);
+        log_tensor_shape("k_rstd", k_rstd);
+        throw std::runtime_error("qkv_qk_norm: unexpected qkv shape (pre-kernel)");
     }
     auto view_rstd = [&](Tensor& rstd, int heads) -> Tensor {
         const long needed = static_cast<long>(mB) * static_cast<long>(mT) * heads;
@@ -141,63 +150,27 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     };
     Tensor q_rstd_view = view_rstd(q_rstd, Hq);
     Tensor k_rstd_view = view_rstd(k_rstd, Hkv);
-    int rotary_dim = op.attrs.rotary_dim;
+    const int q_rows = Hq * Hs;
 
-    const bool rope_fusable = (rotary_dim > 0)
-        && ((Hs % 2) == 0)
-        && (((Hs / 2) % 32) == 0)
-        && (freqs.Rank >= 2)
-        && (freqs.Sizes[1] >= Hs)
-        && (qkv_view.Rank == 3);
-
-    if (mForwardPlan) {
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(op.inputs[0].name, layer_idx, field) &&
-            layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mForwardPlan->size()) {
-            AttnForwardPlan plan{};
-            plan.valid = true;
-            plan.use_qk_norm = true;
-            plan.rope_fused = rope_fusable;
-            plan.use_cudnn = cudnn_gqa_ok;
-            plan.rotary_dim = rotary_dim;
-            (*mForwardPlan)[static_cast<std::size_t>(layer_idx)].attn = plan;
-        }
-    }
-
-    if (rope_fusable) {
-        qkv_qk_norm_rope_forward(qkv_view, q_rstd_view, k_rstd_view, q_norm, k_norm,
-                                 freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                 op.attrs.eps,
-                                 static_cast<int>(mB), static_cast<int>(mT),
-                                 Hq, Hkv, Hs, mRunState.MainStream);
-    } else {
-        const int q_rows = Hq * Hs;
-        qkv_head_rmsnorm_forward(qkv_view, q_rstd_view, q_norm,
-                                 op.attrs.eps,
-                                 static_cast<int>(mB), static_cast<int>(mT),
-                                 qkv_channels, Hq, Hs, 0, mRunState.MainStream);
-        qkv_head_rmsnorm_forward(qkv_view, k_rstd_view, k_norm,
-                                 op.attrs.eps,
-                                 static_cast<int>(mB), static_cast<int>(mT),
-                                 qkv_channels, Hkv, Hs, q_rows, mRunState.MainStream);
-        rope_forward(qkv_out, qkv_out, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
-                     static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs, rotary_dim, mRunState.MainStream);
-    }
+    qkv_head_rmsnorm_forward(qkv_view, q_rstd_view, q_norm,
+                             op.attrs.eps,
+                             static_cast<int>(mB), static_cast<int>(mT),
+                             qkv_channels, Hq, Hs, 0, mRunState.MainStream);
+    qkv_head_rmsnorm_forward(qkv_view, k_rstd_view, k_norm,
+                             op.attrs.eps,
+                             static_cast<int>(mB), static_cast<int>(mT),
+                             qkv_channels, Hkv, Hs, q_rows, mRunState.MainStream);
 
     mTensorMap[op.outputs[0].name] = qkv_out;
 }
 
-void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) {
-    // inputs (from autodiff): d_qkv_out, qkv_out (saved), q_norm_weight, k_norm_weight, q_rstd, k_rstd, freqs, pos_ids
+void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
-    Tensor& qkv = resolve_tensor(op.inputs[1]);       // Saved QKV output from forward
+    Tensor& qkv = resolve_tensor(op.inputs[1]);
     Tensor& q_norm = resolve_tensor(op.inputs[2]);
     Tensor& k_norm = resolve_tensor(op.inputs[3]);
-    Tensor& q_rstd = resolve_tensor(op.inputs[4]);    // Saved RSTD (FP32)
-    Tensor& k_rstd = resolve_tensor(op.inputs[5]);    // Saved RSTD (FP32)
-    Tensor& freqs = resolve_tensor(op.inputs[6]);
-    Tensor& pos_ids = resolve_tensor(op.inputs[7]);
+    Tensor& q_rstd = resolve_tensor(op.inputs[4]);
+    Tensor& k_rstd = resolve_tensor(op.inputs[5]);
 
     Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
 
@@ -219,12 +192,12 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     const long qkv_actual = actual_qkv_channels(qkv) > 0 ? actual_qkv_channels(qkv)
                                                          : actual_qkv_channels(d_out);
     if (qkv_actual > 0 && qkv_actual != qkv_expected && !mOptions.ShardWeights) {
-        log_qkv_mismatch("qkv_qk_norm_rope_backward",
+        log_qkv_mismatch("qkv_qk_norm_backward",
                          static_cast<int>(mB), static_cast<int>(mT),
                          qkv_expected, qkv_actual,
                          Hq, Hkv, Hs, false,
                          qkv, q_norm, k_norm, q_rstd, k_rstd);
-        throw std::runtime_error("qkv_qk_norm_rope_backward: unexpected qkv shape (no sharding enabled)");
+        throw std::runtime_error("qkv_qk_norm_backward: unexpected qkv shape (no sharding enabled)");
     }
     if (qkv_actual > 0 && qkv_actual != qkv_channels) {
         int q_heads = (q_rstd.Rank == 3) ? static_cast<int>(q_rstd.Sizes[2]) : -1;
@@ -291,47 +264,28 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
 
     // Compute d_weight before overwriting d_out_view.
     if (d_q_norm) {
-        qkv_head_rmsnorm_rope_backward_dweight(*d_q_norm, d_out_view, qkv_view, q_norm,
-                                               freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                               static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                               Hq, Hs, 0, accum_q, mRunState.MainStream);
+        qkv_head_rmsnorm_backward_dweight(*d_q_norm, d_out_view, qkv_view, q_norm,
+                                          static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                          Hq, Hs, 0, accum_q, mRunState.MainStream);
     }
     if (d_k_norm) {
-        qkv_head_rmsnorm_rope_backward_dweight(*d_k_norm, d_out_view, qkv_view, k_norm,
-                                               freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                               static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                               Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
+        qkv_head_rmsnorm_backward_dweight(*d_k_norm, d_out_view, qkv_view, k_norm,
+                                          static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                          Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
     }
 
-    // Initialize d_qkv with upstream gradient (d_out) so V gradients pass through unchanged.
-    // The fused or fallback kernels update Q/K channels in-place.
     if (d_qkv_view.Data != d_out_view.Data) {
         const std::size_t bytes = static_cast<std::size_t>(d_out_view.nelem()) * get_dtype_size(d_out_view.DType);
-        CUDA_CHECK(cudaMemcpyAsync(d_qkv_view.Data, d_out_view.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(d_qkv_view.Data, d_out_view.Data, bytes,
+                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
 
-    // Combined backward for Q and K norms with RoPE
-    // Q norm backward (with RoPE): channel_offset=0
-    qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd_view,
-                                        freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                        static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                        Hq, Hs, 0, mRunState.MainStream, nullptr);
-
-    // K norm backward (with RoPE): channel_offset=q_rows
-    qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd_view,
-                                        freqs, reinterpret_cast<int*>(pos_ids.Data),
-                                        static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                        Hkv, Hs, q_rows, mRunState.MainStream, nullptr);
-
-    // V doesn't have normalization - its gradients pass through unchanged
-    // The d_out already contains the V gradients at the correct offset
-
-    // For FP8 hybrid backward, record abs_max of the final d_qkv for subsequent quantization
-    if (mRunState.has_fp8_hybrid_backward()) {
-        float* abs_max_ptr = mRunState.simplified_quant_grads().d_qkv.abs_max();
-        abs_max(abs_max_ptr, d_qkv_view, static_cast<long>(d_qkv_view.nelem()),
-                mRunState.DeviceProp, mRunState.MainStream);
-    }
+    qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd_view,
+                                 static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                 Hq, Hs, 0, mRunState.MainStream);
+    qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd_view,
+                                 static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                 Hkv, Hs, q_rows, mRunState.MainStream);
 }
 
 }  // namespace dsl

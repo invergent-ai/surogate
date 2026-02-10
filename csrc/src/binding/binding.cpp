@@ -11,6 +11,7 @@
 #include <nanobind/ndarray.h>
 
 #include <filesystem>
+#include <cstring>
 #include <fmt/format.h>
 
 #include "py_train.h"
@@ -30,6 +31,8 @@
 namespace nb = nanobind;
 
 using TokenArray = nb::ndarray<std::int32_t, nb::shape<-1, -1>, nb::c_contig, nb::device::cpu>;
+using TokenArray3 = nb::ndarray<std::int32_t, nb::shape<-1, -1, -1>, nb::c_contig, nb::device::cpu>;
+using FloatArray = nb::ndarray<float, nb::shape<-1, -1>, nb::c_contig, nb::device::cpu>;
 
 static std::optional<ETensorDType> opt_dtype_from_str(const std::string& dtype_str) {
     if (dtype_str.empty()) {
@@ -842,6 +845,81 @@ NB_MODULE(_surogate, m) {
              "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].")
+        .def("step", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {
+            const int local_gpus = trainer->local_world_size();
+            const int batch_size = trainer->batch_size();
+            const int seq_len = trainer->seq_length();
+            CHECK_SHAPE(inputs, batch_size * local_gpus, seq_len);
+            CHECK_SHAPE(targets, batch_size * local_gpus, seq_len);
+            if (position_ids.shape(0) < 1) {
+                throw std::runtime_error("position_ids must have at least 1 plane");
+            }
+            if (position_ids.shape(1) != batch_size * local_gpus || position_ids.shape(2) != seq_len) {
+                throw std::runtime_error("position_ids must have shape [planes, batch_size * local_gpus, seq_length]");
+            }
+
+            if (local_gpus == 1) {
+                trainer->step(inputs.data(), targets.data(), position_ids.data());
+                return;
+            }
+
+            const int planes = static_cast<int>(position_ids.shape(0));
+            const std::size_t per_rank = static_cast<std::size_t>(planes) *
+                                         static_cast<std::size_t>(batch_size) *
+                                         static_cast<std::size_t>(seq_len);
+            std::vector<std::int32_t> reordered(static_cast<std::size_t>(local_gpus) * per_rank);
+            const std::int32_t* src = position_ids.data();
+            for (int r = 0; r < local_gpus; ++r) {
+                std::int32_t* dst_rank = reordered.data() + static_cast<std::size_t>(r) * per_rank;
+                for (int p = 0; p < planes; ++p) {
+                    for (int b = 0; b < batch_size; ++b) {
+                        const std::size_t src_base = (static_cast<std::size_t>(p) * batch_size * local_gpus +
+                                                      static_cast<std::size_t>(r) * batch_size +
+                                                      static_cast<std::size_t>(b)) * seq_len;
+                        const std::size_t dst_base = (static_cast<std::size_t>(p) * batch_size +
+                                                      static_cast<std::size_t>(b)) * seq_len;
+                        std::memcpy(dst_rank + dst_base, src + src_base, sizeof(std::int32_t) * seq_len);
+                    }
+                }
+            }
+            trainer->step(inputs.data(), targets.data(), reordered.data());
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Perform one training step (forward + backward) with 3D position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- position_ids: int32 position ids shaped [planes, batch_size * local_gpus, seq_length].")
+        .def("set_visual_inputs", [](MultiGPUPyTrainer* trainer,
+                                     TokenArray visual_pos_masks,
+                                     FloatArray visual_embeds,
+                                     std::vector<FloatArray> deepstack_visual_embeds) {
+            const int local_gpus = trainer->local_world_size();
+            const int batch_size = trainer->batch_size();
+            const int seq_len = trainer->seq_length();
+            const int hidden = trainer->config().HiddenSize;
+            CHECK_SHAPE(visual_pos_masks, batch_size * local_gpus, seq_len);
+            if (visual_embeds.shape(0) != static_cast<std::size_t>(batch_size * local_gpus * seq_len) ||
+                visual_embeds.shape(1) != hidden) {
+                throw std::runtime_error("visual_embeds must have shape [batch_size * local_gpus * seq_length, hidden]");
+            }
+            for (const auto& arr : deepstack_visual_embeds) {
+                if (arr.shape(0) != visual_embeds.shape(0) || arr.shape(1) != visual_embeds.shape(1)) {
+                    throw std::runtime_error("deepstack_visual_embeds entries must match visual_embeds shape");
+                }
+            }
+            std::vector<const float*> deepstack_ptrs;
+            deepstack_ptrs.reserve(deepstack_visual_embeds.size());
+            for (const auto& arr : deepstack_visual_embeds) {
+                deepstack_ptrs.push_back(arr.data());
+            }
+            trainer->set_visual_inputs(visual_pos_masks.data(), visual_embeds.data(), deepstack_ptrs);
+        }, nb::arg("visual_pos_masks"), nb::arg("visual_embeds"), nb::arg("deepstack_visual_embeds") = std::vector<FloatArray>{},
+             "Set visual inputs for multimodal models.\n\n"
+             "Parameters:\n"
+             "- visual_pos_masks: int32 mask shaped [batch_size * local_gpus, seq_length] (non-zero = visual).\n"
+             "- visual_embeds: float32 packed embeds shaped [batch_size * local_gpus * seq_length, hidden].\n"
+             "- deepstack_visual_embeds: optional list of float32 packed embeds, same shape as visual_embeds.\n"
+             "  List length should match config.DeepstackVisualLayers.")
         .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
             // Use local_world_size (GPUs on this node) not global world_size
             CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());

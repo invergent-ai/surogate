@@ -1,4 +1,4 @@
-"""Qwen3 Transformer Block."""
+"""Qwen3-VL Transformer Block (text)."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from ..dim import Dim, B, T
 
 
 @block
-class Qwen3Block:
-    """Qwen3 transformer block with QK-Norm."""
+class Qwen3VLBlock:
+    """Qwen3-VL text transformer block with QK-Norm + MRoPE."""
 
     def __init__(
         self,
@@ -22,7 +22,7 @@ class Qwen3Block:
         max_seq: int,
         eps: float = 1e-6,
         use_qkv_bias: bool = False,
-        use_qk_norm: bool = True,
+        mrope_section: tuple[int, int, int] | list[int] = (24, 20, 20),
     ):
         self.d_model = d_model
         self.num_query_heads = num_query_heads
@@ -32,7 +32,7 @@ class Qwen3Block:
         self.max_seq = max_seq
         self.eps = eps
         self.use_qkv_bias = use_qkv_bias
-        self.use_qk_norm = use_qk_norm
+        self.mrope_section = list(mrope_section)
 
         # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
         self.C = Dim("C")
@@ -47,15 +47,15 @@ class Qwen3Block:
         self.AttnDim = self.Hq * self.D
         self.MUp = 2 * self.M
 
-    # Parameters using class attribute style
+    # Parameters
     ln1_weight = Param(Tensor["C"])
     ln2_weight = Param(Tensor["C"])
     qkv_weight = Param(Tensor["QKV", "C"])
     qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
     out_weight = Param(Tensor["C", "AttnDim"])
     out_bias = Param(Tensor["C"], when="use_qkv_bias")
-    q_norm_weight = Param(Tensor["D"], when="use_qk_norm")
-    k_norm_weight = Param(Tensor["D"], when="use_qk_norm")
+    q_norm_weight = Param(Tensor["D"], quantizable=False)
+    k_norm_weight = Param(Tensor["D"], quantizable=False)
     rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
     mlp_up_weight = Param(Tensor["MUp", "C"])
     mlp_down_weight = Param(Tensor["C", "M"])
@@ -69,66 +69,57 @@ class Qwen3Block:
         Tensor["B", "T", "C"],
         aliases=["ln1_flat"],
         recompute=True,
-        # Recompute LN1 directly from saved res_ffn + rstd.
-        # This matches implementation (res_ffn is retrieved from residual storage, not re-derived).
         recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
         recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",  # Recompute in both FFT and LoRA modes
-        share_policy="when_recomputed",  # Share across layers when recomputed
+        recompute_policy="always",
+        share_policy="when_recomputed",
     )
     ln1_rstd = Activation(
         Tensor["B", "T"], dtype="fp32", save=True,
-        share_policy="per_layer",  # Always save per-layer (needed for recompute)
+        share_policy="per_layer",
         description="RMSNorm reciprocal std for LN1",
     )
 
-    # QKV projection and RoPE
-    # NOTE: qkv is safe to recompute in FFT mode (cuDNN attention is deterministic in latest release).
-    # We still save qkv for backward fallbacks.
+    # QKV projection
     qkv = Activation(
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat", "qkv_biased"],
-        save=True,  # Save in FFT mode for consistency
+        save=True,
         recompute=True,
         recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
         recompute_op="matmul",
         recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["q", "k", "v"],
-        share_policy="when_recomputed",  # Share when recomputed in backward
-    )
-    # NOTE: qkv_rope is safe to recompute in FFT mode (cuDNN attention is deterministic).
-    qkv_rope = Activation(
-        Tensor["B", "T", "QKV"],
-        save=True,  # Save in FFT mode for consistency with att/lse
-        recompute=True,
-        recompute_group="qk_norm_rope",
-        recompute_outputs=["qkv_rope", "q_rstd", "k_rstd"],
-        recompute_from=[
-            "qkv",
-            "@global:freq_cis",
-            "@input:position_ids",
-            "?@param:q_norm_weight",
-            "?@param:k_norm_weight",
-        ],
-        recompute_op="qkv_qk_norm_rope",
-        recompute_attrs={"rotary_dim": "D"},
-        recompute_policy="always",
-        share_policy="when_recomputed",  # Share when recomputed in backward
-        description="QKV after QK-Norm + RoPE",
+        share_policy="when_recomputed",
     )
 
-    # QK-norm RSTDs (conditional on use_qk_norm)
-    # NOTE: Match qkv_rope policy - recompute in FFT mode
+    # QK-Norm (no RoPE)
+    qkv_norm = Activation(
+        Tensor["B", "T", "QKV"],
+        save=True,
+        recompute=True,
+        recompute_group="qk_norm",
+        recompute_outputs=["qkv_norm", "q_rstd", "k_rstd"],
+        recompute_from=[
+            "qkv",
+            "@param:q_norm_weight",
+            "@param:k_norm_weight",
+        ],
+        recompute_op="qkv_qk_norm",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+        description="QKV after QK-Norm",
+    )
+
     q_rstd = Activation(
         Tensor["B", "T", "Hq"],
         dtype="fp32",
         save=True,
         recompute=True,
-        recompute_group="qk_norm_rope",
+        recompute_group="qk_norm",
         recompute_policy="always",
-        share_policy="when_recomputed",  # Share when recomputed in backward
-        when="use_qk_norm",
+        share_policy="when_recomputed",
         description="Q head RMSNorm rstd",
     )
     k_rstd = Activation(
@@ -136,19 +127,30 @@ class Qwen3Block:
         dtype="fp32",
         save=True,
         recompute=True,
-        recompute_group="qk_norm_rope",
+        recompute_group="qk_norm",
         recompute_policy="always",
-        share_policy="when_recomputed",  # Share when recomputed in backward
-        when="use_qk_norm",
+        share_policy="when_recomputed",
         description="K head RMSNorm rstd",
     )
 
+    # MRoPE
+    qkv_rope = Activation(
+        Tensor["B", "T", "QKV"],
+        save=True,
+        recompute=True,
+        recompute_from=["qkv_norm", "@global:freq_cis", "@input:position_ids"],
+        recompute_op="mrope",
+        recompute_attrs={"rotary_dim": "D", "mrope_section": "mrope_section"},
+        recompute_policy="always",
+        share_policy="when_recomputed",
+        description="QKV after QK-Norm + MRoPE",
+    )
+
     # Attention
-    # NOTE: cuDNN flash attention is deterministic in latest release, so we can recompute in FFT.
     att = Activation(
         Tensor["B", "T", "AttnDim"],
         aliases=["att_flat", "attn"],
-        save=True,  # Save for FFT mode backward (needed by att_out backward AND attention backward)
+        save=True,
         recompute=True,
         recompute_group="attn_fwd",
         recompute_outputs=["att", "lse"],
@@ -156,7 +158,6 @@ class Qwen3Block:
         recompute_op="flash_attention",
         recompute_attrs={"attn_impl": "cudnn"},
         recompute_policy="fft_only",
-        # Share only in FFT mode - LoRA O-proj hook needs per-layer att values
         share_policy="fft_share",
         description="Attention output (pre out-proj)",
     )
@@ -167,7 +168,6 @@ class Qwen3Block:
         recompute=True,
         recompute_group="attn_fwd",
         recompute_policy="fft_only",
-        # Share only in FFT mode - needed per-layer for attention backward in LoRA
         share_policy="fft_share",
         description="Log-sum-exp from flash attention",
     )
@@ -180,7 +180,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["o"],
-        share_policy="when_recomputed",  # Can share in both FFT and LoRA modes
+        share_policy="when_recomputed",
         description="After output projection",
     )
 
@@ -193,8 +193,8 @@ class Qwen3Block:
         recompute_outputs=["res_att", "ln2"],
         recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
         recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="always",  # Recompute in both FFT and LoRA modes
-        share_policy="when_recomputed",  # Share across layers when recomputed
+        recompute_policy="always",
+        share_policy="when_recomputed",
         description="Residual + attention",
     )
 
@@ -204,12 +204,12 @@ class Qwen3Block:
         aliases=["ln2_flat"],
         recompute=True,
         recompute_group="ln2_fused",
-        recompute_policy="always",  # Recompute in both FFT and LoRA modes
-        share_policy="when_recomputed",  # Share across layers when recomputed
+        recompute_policy="always",
+        share_policy="when_recomputed",
     )
     ln2_rstd = Activation(
         Tensor["B", "T"], dtype="fp32", save=True,
-        share_policy="per_layer",  # Always save per-layer (needed for recompute)
+        share_policy="per_layer",
         description="RMSNorm reciprocal std for LN2",
     )
 
@@ -223,7 +223,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["up", "gate"],
-        share_policy="when_recomputed",  # Share across layers when recomputed
+        share_policy="when_recomputed",
     )
     swiglu = Activation(
         Tensor["B", "T", "M"],
@@ -233,7 +233,7 @@ class Qwen3Block:
         recompute_op="swiglu",
         recompute_attrs={"activation": "swiglu"},
         recompute_policy="always",
-        share_policy="when_recomputed",  # Share across layers when recomputed
+        share_policy="when_recomputed",
         description="SwiGLU activation output",
     )
     mlp_down = Activation(
@@ -245,7 +245,7 @@ class Qwen3Block:
         recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
         recompute_policy="always",
         lora_targets=["down"],
-        share_policy="when_recomputed",  # Share across layers when recomputed
+        share_policy="when_recomputed",
         description="MLP down projection output",
     )
 
@@ -253,8 +253,7 @@ class Qwen3Block:
     res_ffn = Activation(
         Tensor["B", "T", "C"],
         aliases=["residual_ffn"],
-        # res_ffn is stored via residual manager; do not mark as recompute.
-        share_policy="per_layer",  # Managed by residual manager, not shared
+        share_policy="per_layer",
         description="Residual + MLP (block output)",
     )
 
@@ -264,6 +263,7 @@ class Qwen3Block:
 
     d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
     d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+    d_qkv_norm = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_norm")
     d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope")
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
@@ -278,7 +278,7 @@ class Qwen3Block:
         self,
         x: Tensor["B", "T", "C"],
         residual: Tensor["B", "T", "C"],
-        position_ids: Tensor["T", "int32"],
+        position_ids: Tensor[3, "B", "T", "int32"],
     ) -> tuple[Tensor["B", "T", "C"], Tensor["B", "T", "C"]]:
         with graph() as g:
             # Pre-attention norm
@@ -297,21 +297,26 @@ class Qwen3Block:
                 qkv_flat = g.matmul(ln1_flat, "qkv_weight", transpose="NT", out_name="qkv_flat")
             qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D], out_name="qkv")
 
-            # QK-Norm + RoPE (fused)
-            if self.use_qk_norm:
-                qkv_rope, q_rstd, k_rstd = g.qkv_qk_norm_rope(
-                    qkv_packed,
-                    "q_norm_weight",
-                    "k_norm_weight",
-                    "rope_freqs",
-                    position_ids,
-                    eps=self.eps,
-                    out_name="qkv_rope",
-                    q_rstd_name="q_rstd",
-                    k_rstd_name="k_rstd",
-                )
-            else:
-                qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, out_name="qkv_rope")
+            # QK-Norm
+            qkv_norm, q_rstd, k_rstd = g.qkv_qk_norm(
+                qkv_packed,
+                "q_norm_weight",
+                "k_norm_weight",
+                eps=self.eps,
+                out_name="qkv_norm",
+                q_rstd_name="q_rstd",
+                k_rstd_name="k_rstd",
+            )
+
+            # MRoPE
+            qkv_rope = g.mrope(
+                qkv_norm,
+                "rope_freqs",
+                position_ids,
+                rotary_dim="D",
+                mrope_section=self.mrope_section,
+                out_name="qkv_rope",
+            )
 
             # Attention
             attn_out, lse = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")

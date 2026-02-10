@@ -110,5 +110,4 @@ register_model(
         ChatTemplateType.qwen2_5_vl,
         get_model_tokenizer_qwen2_5_vl,
         architectures=['Qwen2_5_VLForConditionalGeneration'],
-        attention_cls='Qwen2_5_VLAttention',
         tags=['vision', 'video']))

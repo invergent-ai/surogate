@@ -264,6 +264,23 @@ std::optional<bool> attr_bool(const AttrValue& value) {
     return std::nullopt;
 }
 
+std::optional<std::vector<long>> attr_list_int(const AttrValue& value) {
+    auto list_ptr = std::get_if<AttrValue::ListPtr>(&value.value);
+    if (!list_ptr || !(*list_ptr)) {
+        return std::nullopt;
+    }
+    std::vector<long> out;
+    out.reserve((*list_ptr)->size());
+    for (const auto& item : *(*list_ptr)) {
+        if (auto v = attr_int(item)) {
+            out.push_back(*v);
+        } else {
+            return std::nullopt;
+        }
+    }
+    return out;
+}
+
 // Shape environment augmentation
 void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     auto get_long = [&](std::string_view key) -> std::optional<long> {

@@ -44,6 +44,7 @@ std::optional<std::string> attr_string(const AttrValue& value);
 std::optional<long> attr_int(const AttrValue& value);
 std::optional<double> attr_double(const AttrValue& value);
 std::optional<bool> attr_bool(const AttrValue& value);
+std::optional<std::vector<long>> attr_list_int(const AttrValue& value);
 
 // Shape environment augmentation
 void augment_shape_env(ShapeEnv& env, const AttrMap& config);

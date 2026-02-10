@@ -297,7 +297,7 @@ const SafeTensorEntry& SafeTensorsReader::find_entry(std::string_view name) cons
     for (auto& entry : mEntries)
         if (entry.name() == name)
             return entry;
-    throw std::out_of_range("Entry not found");
+    throw std::out_of_range(fmt::format("Entry not found: {}", name));
 }
 
 /**

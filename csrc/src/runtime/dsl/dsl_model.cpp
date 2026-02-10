@@ -231,9 +231,10 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     const auto view = parse_dsl_config(module);
 
     runtime.use_qk_norm = view.use_qk_norm.value_or(base.UseQKNorm);
-    // If the IR graph uses qkv_qk_norm_rope, force-enable qk-norm even when
+    // If the IR graph uses qkv_qk_norm(_rope), force-enable qk-norm even when
     // config.json does not expose a flag (e.g., Qwen3 defaults).
-    if (!runtime.use_qk_norm && graph_has_kernel(module, "qkv_qk_norm_rope")) {
+    if (!runtime.use_qk_norm &&
+        (graph_has_kernel(module, "qkv_qk_norm_rope") || graph_has_kernel(module, "qkv_qk_norm"))) {
         runtime.use_qk_norm = true;
     }
     runtime.num_experts = static_cast<int>(view.num_experts.value_or(0));
@@ -339,6 +340,8 @@ modules::ModelConfig build_model_config(const Module& module,
     cfg.TiedWordEmbeddings = base.TiedWordEmbeddings;
     cfg.UseQKVBias = base.UseQKVBias;
     cfg.UseQKNorm = base.UseQKNorm;
+    cfg.UseVisualInputs = base.UseVisualInputs;
+    cfg.DeepstackVisualLayers = base.DeepstackVisualLayers;
     cfg.DType = base.DType;
 
     // Override with DSL-provided values when available
@@ -681,6 +684,10 @@ DslModel::DslModel(const PretrainedConfig& config,
     apply_arch_from_hf_config(*mConfig, *mModule);
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
     mModelConfig = build_model_config(*mModule, *mConfig, mRuntimeConfig);
+    // Keep base PretrainedConfig in sync with DSL-resolved ModelConfig.
+    // This ensures run-state allocations (which use PretrainedConfig) match
+    // the compiled graph/kernel expectations derived from ModelConfig.
+    *mConfig = static_cast<const PretrainedConfig&>(mModelConfig);
 
     if (!mModule->forward.has_value()) {
         throw std::runtime_error("DSL model: module missing forward graph");

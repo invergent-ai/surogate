@@ -7,6 +7,9 @@
 
 #include <array>
 #include <cmath>
+#include <optional>
+#include <string>
+#include <vector>
 
 /**
  * @brief Configuration for Rotary Position Embedding (RoPE)
@@ -58,6 +61,24 @@ struct RoPEConfig {
     /// Scaling factor for extended context (for models trained with scaled RoPE)
     /// 1.0 = no scaling, >1.0 = extend context length
     float scaling_factor = 1.0f;
+
+    /// RoPE scaling type (HF rope_scaling["rope_type"] / ["type"]).
+    /// Supported: default, linear, dynamic, yarn, longrope, llama3
+    std::string rope_type = "default";
+
+    // Optional rope_scaling fields (HF modeling_rope_utils)
+    std::optional<float> attention_factor;
+    std::optional<float> beta_fast;
+    std::optional<float> beta_slow;
+    std::optional<float> mscale;
+    std::optional<float> mscale_all_dim;
+    std::optional<int> original_max_position_embeddings;
+    std::optional<int> original_max_position_embeddings_config;
+    std::vector<float> long_factor;
+    std::vector<float> short_factor;
+    std::optional<float> low_freq_factor;
+    std::optional<float> high_freq_factor;
+    std::optional<bool> truncate;
 
     /**
      * @brief Compute the number of dimensions to apply RoPE to

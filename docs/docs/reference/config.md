@@ -160,6 +160,7 @@ Used when `optimizer: "normuon"`. NorMuon uses a hybrid approach: AdamW for embe
 | `gradient_accumulation_steps` | int  | `4`     | Number of update steps to accumulate gradients before performing backward/update pass. Effective batch size = batch_size × grad_accumulation × num_gpus. |
 | `max_steps`                   | int  | `-1`    | Total number of training steps. `-1` derives from epochs and dataset size.                                                                               |
 | `eval_steps`                  | int  | `100`   | Run evaluation every N optimizer steps.                                                                                                                  |
+| `multimodal_on_the_fly`       | bool | `null`  | If `true`, compute visual inputs on-the-fly during training instead of using pre-tokenized files. If `null` and the model is multimodal, defaults to `true`. |
 
 ## Dataset Settings
 

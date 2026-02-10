@@ -82,6 +82,15 @@ public:
     //! Gets the tensor into which model position ids are to be placed.
     Tensor& get_position_ids_buffer();
 
+    //! Gets the tensor into which visual position masks are to be placed (optional).
+    Tensor& get_visual_pos_mask_buffer();
+
+    //! Gets the tensor into which visual embeddings are to be placed (optional).
+    Tensor& get_visual_embeds_buffer();
+
+    //! Gets the tensor into which deepstack visual embeddings are to be placed (optional).
+    Tensor& get_deepstack_visual_embeds_buffer(int index);
+
     //! Model (master) weights. Sharded.
     virtual ITensorContainer& weights() = 0;
 
@@ -203,8 +212,11 @@ public:
     DeviceMemoryStack Stack;
 
     Tensor Inputs;                      // (B, T) Int32
-    Tensor PositionIDs;                 // (B, T) Int32 - explicit position IDs
+    Tensor PositionIDs;                 // (B, T) or (3, B, T) Int32 - explicit position IDs
     Tensor Targets;                     // (B, T) Int32
+    Tensor VisualPosMasks;              // (B, T) Int32 - positions of visual tokens
+    Tensor VisualEmbeds;                // (B*T, C) model dtype - visual embeddings (ordered by mask)
+    std::vector<Tensor> DeepstackVisualEmbeds; // (B*T, C) per deepstack layer
     Tensor Losses;                      // (B, T) FP32
     Tensor ValidTokenCount;             // (1,) Int32 - count of non-masked tokens
     Tensor CorrectCount;                // (1,) Int32 - count of correct predictions
@@ -244,8 +256,11 @@ public:
     std::vector<cudaEvent_t> TimingBackwardEnd;
 
     Tensor Inputs_CPU;      // (B, T) Int32
-    Tensor PositionIDs_CPU; // (B, T) Int32
+    Tensor PositionIDs_CPU; // (B, T) or (3, B, T) Int32
     Tensor Targets_CPU;     // (B, T) Int32
+    Tensor VisualPosMasks_CPU; // (B, T) Int32
+    Tensor VisualEmbeds_CPU;   // (B*T, C) model dtype
+    std::vector<Tensor> DeepstackVisualEmbeds_CPU; // (B*T, C) per deepstack layer
 
     // =========================================================================
     // Virtual accessors for recipe-driven matmul dispatch

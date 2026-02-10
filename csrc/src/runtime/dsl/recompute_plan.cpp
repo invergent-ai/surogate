@@ -6,6 +6,7 @@
 #include "runtime/dsl/recompute_plan.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <deque>
 #include <functional>
@@ -27,6 +28,58 @@
 
 namespace dsl {
 namespace {
+
+// Strip trailing SSA-style numeric suffix (e.g., "qkv_rope_7" -> "qkv_rope")
+std::string strip_ssa_suffix(const std::string& field) {
+    auto pos = field.rfind('_');
+    if (pos == std::string::npos || pos == 0) {
+        return field;
+    }
+    bool all_digits = true;
+    for (std::size_t i = pos + 1; i < field.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(field[i]))) {
+            all_digits = false;
+            break;
+        }
+    }
+    if (all_digits && pos + 1 < field.size()) {
+        return field.substr(0, pos);
+    }
+    return field;
+}
+
+void log_tensor_shape(const char* label, const Tensor& t) {
+    fprintf(stderr, "  %s rank=%d dtype=%d sizes=[", label, t.Rank, (int)t.DType);
+    for (int i = 0; i < t.Rank; ++i) {
+        fprintf(stderr, "%ld%s", t.Sizes[i], (i + 1 < t.Rank) ? "," : "");
+    }
+    fprintf(stderr, "]\n");
+}
+
+void log_qkv_mismatch(const char* op_name,
+                      int B,
+                      int T,
+                      int expected_qkv,
+                      long actual_qkv,
+                      int Hq,
+                      int Hkv,
+                      int Hs,
+                      bool shard_weights,
+                      const Tensor& qkv,
+                      const Tensor* q_norm,
+                      const Tensor* k_norm,
+                      const Tensor* q_rstd,
+                      const Tensor* k_rstd) {
+    fprintf(stderr, "[QKV_DEBUG] %s qkv shape mismatch\n", op_name);
+    fprintf(stderr, "  B=%d T=%d expected_qkv=%d actual_qkv=%ld Hq=%d Hkv=%d Hs=%d shard_weights=%d\n",
+            B, T, expected_qkv, actual_qkv, Hq, Hkv, Hs, shard_weights ? 1 : 0);
+    log_tensor_shape("qkv", qkv);
+    if (q_norm) log_tensor_shape("q_norm", *q_norm);
+    if (k_norm) log_tensor_shape("k_norm", *k_norm);
+    if (q_rstd) log_tensor_shape("q_rstd", *q_rstd);
+    if (k_rstd) log_tensor_shape("k_rstd", *k_rstd);
+    fprintf(stderr, "[QKV_DEBUG] aborting: qkv size does not match config and sharding is disabled\n");
+}
 
 bool is_optional_ref(const std::string& name, std::string& stripped) {
     if (!name.empty() && name.front() == '?') {
@@ -197,6 +250,19 @@ int resolve_rotary_dim(const AttrMap& attrs, const modules::ModelConfig& cfg) {
     return static_cast<int>(cfg.head_size());
 }
 
+std::array<int, 3> resolve_mrope_section(const AttrMap& attrs, const modules::ModelConfig& cfg) {
+    if (const auto* attr = find_attr(attrs, "mrope_section")) {
+        if (auto list = attr_list_int(*attr)) {
+            if (list->size() >= 3) {
+                return {static_cast<int>((*list)[0]),
+                        static_cast<int>((*list)[1]),
+                        static_cast<int>((*list)[2])};
+            }
+        }
+    }
+    return cfg.Rope.mrope_section;
+}
+
 float resolve_eps(const AttrMap& attrs, const modules::ModelConfig& cfg) {
     if (const auto* attr = find_attr(attrs, "eps")) {
         if (auto v = attr_int(*attr)) {
@@ -292,6 +358,7 @@ struct InputMap {
     std::unordered_map<std::string, std::string> param_names;
 };
 
+
 struct RecomputeScratch {
     std::vector<Tensor> temps;
     Tensor zero_residual{};
@@ -327,37 +394,46 @@ Tensor& ensure_activation(RecomputeContext& ctx, int layer_idx, const std::strin
         return t;
     };
 
-    if (name == "ln1" || name == "ln1_flat" || name == "ln" || name == "ln_flat") return ensure(acts.ln1);
-    if (name == "ln1_rstd" || name == "ln_rstd") return ensure(acts.ln1_rstd);
-    if (name == "ln2" || name == "ln2_flat") return ensure(acts.ln2);
-    if (name == "ln2_rstd") return ensure(acts.ln2_rstd);
-    if (name == "q_rstd") return ensure(acts.q_rstd);
-    if (name == "k_rstd") return ensure(acts.k_rstd);
-    if (name == "qkv" || name == "qkv_flat" || name == "qkv_biased") return ensure(acts.qkv);
-    if (name == "qkv_rope") {
+    std::string base = strip_ssa_suffix(name);
+    int idx = -1;
+    std::string field;
+    if (parse_block_param(base, idx, field)) {
+        base = strip_ssa_suffix(field);
+    }
+
+    if (base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat") return ensure(acts.ln1);
+    if (base == "ln1_rstd" || base == "ln_rstd") return ensure(acts.ln1_rstd);
+    if (base == "ln2" || base == "ln2_flat") return ensure(acts.ln2);
+    if (base == "ln2_rstd") return ensure(acts.ln2_rstd);
+    if (base == "q_rstd") return ensure(acts.q_rstd);
+    if (base == "k_rstd") return ensure(acts.k_rstd);
+    if (base == "qkv" || base == "qkv_flat" || base == "qkv_biased" || base == "qkv_norm") {
+        return ensure(acts.qkv);
+    }
+    if (base == "qkv_rope") {
         if (acts.qkv_rope.Data) {
             return ensure(acts.qkv_rope);
         }
         return ensure(acts.qkv);
     }
-    if (name == "lse") return ensure(acts.lse);
-    if (name == "att" || name == "att_flat" || name == "attn") return ensure(acts.att);
-    if (name == "att_out" || name == "att_out_flat") return ensure(acts.att_out);
-    if (name == "res_att" || name == "residual_att") return ensure(acts.residual_att);
-    if (name == "mlp_up" || name == "mlp_up_flat") return ensure(acts.mlp_up);
-    if (name == "swiglu" || name == "swiglu_flat") return ensure(acts.swiglu);
-    if (name == "mlp_down" || name == "mlp_down_flat") return ensure(acts.mlp_down);
-    if (name == "router_logits") return ensure(acts.router_logits);
-    if (name == "router_probs") return ensure(acts.router_probs);
-    if (name == "routing_weights") return ensure(acts.routing_weights);
-    if (name == "routing_indices") return ensure(acts.routing_indices);
-    if (name == "permuted_input") return ensure(acts.permuted_input);
-    if (name == "scatter_indices") return ensure(acts.scatter_indices);
-    if (name == "expert_gate_up") return ensure(acts.expert_gate_up);
-    if (name == "expert_act") return ensure(acts.expert_act);
-    if (name == "expert_down") return ensure(acts.expert_down);
-    if (name == "moe_out" || name == "moe_out_flat") return ensure(acts.moe_out);
-    if (name == "res_ffn" || name == "residual_ffn" || name == "res_in") {
+    if (base == "lse") return ensure(acts.lse);
+    if (base == "att" || base == "att_flat" || base == "attn") return ensure(acts.att);
+    if (base == "att_out" || base == "att_out_flat") return ensure(acts.att_out);
+    if (base == "res_att" || base == "residual_att") return ensure(acts.residual_att);
+    if (base == "mlp_up" || base == "mlp_up_flat") return ensure(acts.mlp_up);
+    if (base == "swiglu" || base == "swiglu_flat") return ensure(acts.swiglu);
+    if (base == "mlp_down" || base == "mlp_down_flat") return ensure(acts.mlp_down);
+    if (base == "router_logits") return ensure(acts.router_logits);
+    if (base == "router_probs") return ensure(acts.router_probs);
+    if (base == "routing_weights") return ensure(acts.routing_weights);
+    if (base == "routing_indices") return ensure(acts.routing_indices);
+    if (base == "permuted_input") return ensure(acts.permuted_input);
+    if (base == "scatter_indices") return ensure(acts.scatter_indices);
+    if (base == "expert_gate_up") return ensure(acts.expert_gate_up);
+    if (base == "expert_act") return ensure(acts.expert_act);
+    if (base == "expert_down") return ensure(acts.expert_down);
+    if (base == "moe_out" || base == "moe_out_flat") return ensure(acts.moe_out);
+    if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
         return rs.get_residual(layer_idx, stream);
     }
     throw std::runtime_error("DSL recompute: unknown activation output: " + name);
@@ -393,35 +469,44 @@ Tensor* resolve_activation(RecomputeContext& ctx, int layer_idx, const std::stri
         }
     }
 
-    if (name == "ln1" || name == "ln1_flat" || name == "ln" || name == "ln_flat") return get(acts.ln1);
-    if (name == "ln1_rstd" || name == "ln_rstd") return get(acts.ln1_rstd);
-    if (name == "ln2" || name == "ln2_flat") return get(acts.ln2);
-    if (name == "ln2_rstd") return get(acts.ln2_rstd);
-    if (name == "q_rstd") return get(acts.q_rstd);
-    if (name == "k_rstd") return get(acts.k_rstd);
-    if (name == "qkv" || name == "qkv_flat" || name == "qkv_biased") return get(acts.qkv);
-    if (name == "qkv_rope") {
+    std::string base = strip_ssa_suffix(name);
+    int idx = -1;
+    std::string field;
+    if (parse_block_param(base, idx, field)) {
+        base = strip_ssa_suffix(field);
+    }
+
+    if (base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat") return get(acts.ln1);
+    if (base == "ln1_rstd" || base == "ln_rstd") return get(acts.ln1_rstd);
+    if (base == "ln2" || base == "ln2_flat") return get(acts.ln2);
+    if (base == "ln2_rstd") return get(acts.ln2_rstd);
+    if (base == "q_rstd") return get(acts.q_rstd);
+    if (base == "k_rstd") return get(acts.k_rstd);
+    if (base == "qkv" || base == "qkv_flat" || base == "qkv_biased" || base == "qkv_norm") {
+        return get(acts.qkv);
+    }
+    if (base == "qkv_rope") {
         if (acts.qkv_rope.Data) return get(acts.qkv_rope);
         return get(acts.qkv);
     }
-    if (name == "lse") return get(acts.lse);
-    if (name == "att" || name == "att_flat" || name == "attn") return get(acts.att);
-    if (name == "att_out" || name == "att_out_flat") return get(acts.att_out);
-    if (name == "res_att" || name == "residual_att") return get(acts.residual_att);
-    if (name == "mlp_up" || name == "mlp_up_flat") return get(acts.mlp_up);
-    if (name == "swiglu" || name == "swiglu_flat") return get(acts.swiglu);
-    if (name == "mlp_down" || name == "mlp_down_flat") return get(acts.mlp_down);
-    if (name == "router_logits") return get(acts.router_logits);
-    if (name == "router_probs") return get(acts.router_probs);
-    if (name == "routing_weights") return get(acts.routing_weights);
-    if (name == "routing_indices") return get(acts.routing_indices);
-    if (name == "permuted_input") return get(acts.permuted_input);
-    if (name == "scatter_indices") return get(acts.scatter_indices);
-    if (name == "expert_gate_up") return get(acts.expert_gate_up);
-    if (name == "expert_act") return get(acts.expert_act);
-    if (name == "expert_down") return get(acts.expert_down);
-    if (name == "moe_out" || name == "moe_out_flat") return get(acts.moe_out);
-    if (name == "res_ffn" || name == "residual_ffn" || name == "res_in") {
+    if (base == "lse") return get(acts.lse);
+    if (base == "att" || base == "att_flat" || base == "attn") return get(acts.att);
+    if (base == "att_out" || base == "att_out_flat") return get(acts.att_out);
+    if (base == "res_att" || base == "residual_att") return get(acts.residual_att);
+    if (base == "mlp_up" || base == "mlp_up_flat") return get(acts.mlp_up);
+    if (base == "swiglu" || base == "swiglu_flat") return get(acts.swiglu);
+    if (base == "mlp_down" || base == "mlp_down_flat") return get(acts.mlp_down);
+    if (base == "router_logits") return get(acts.router_logits);
+    if (base == "router_probs") return get(acts.router_probs);
+    if (base == "routing_weights") return get(acts.routing_weights);
+    if (base == "routing_indices") return get(acts.routing_indices);
+    if (base == "permuted_input") return get(acts.permuted_input);
+    if (base == "scatter_indices") return get(acts.scatter_indices);
+    if (base == "expert_gate_up") return get(acts.expert_gate_up);
+    if (base == "expert_act") return get(acts.expert_act);
+    if (base == "expert_down") return get(acts.expert_down);
+    if (base == "moe_out" || base == "moe_out_flat") return get(acts.moe_out);
+    if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
         return &rs.get_residual(layer_idx, rs.MainStream);
     }
     if (Tensor* t = try_saved(name)) {
@@ -961,6 +1046,143 @@ void execute_rmsnorm(RecomputeContext& ctx,
 
 }
 
+void execute_qkv_qk_norm(RecomputeContext& ctx,
+                         const RecomputeOp& op,
+                         int layer_idx,
+                         long B,
+                         long T,
+                         const InputMap& inputs,
+                         const std::unordered_map<std::string, Tensor*>& outputs) {
+    (void)layer_idx;
+    Tensor* qkv_in = nullptr;
+    Tensor* q_norm = nullptr;
+    Tensor* k_norm = nullptr;
+
+    for (const auto& kv : inputs.tensors) {
+        const std::string& key = kv.first;
+        if (key == "qkv" || key == "qkv_norm") {
+            qkv_in = kv.second;
+        } else if (key == "q_norm_weight") {
+            q_norm = kv.second;
+        } else if (key == "k_norm_weight") {
+            k_norm = kv.second;
+        }
+    }
+
+    if (!qkv_in || !q_norm || !k_norm) {
+        throw std::runtime_error("DSL recompute: qkv_qk_norm missing inputs");
+    }
+
+    Tensor* qkv_out = nullptr;
+    if (!op.outputs.empty()) {
+        if (auto it = outputs.find(op.outputs.front()); it != outputs.end()) {
+            qkv_out = it->second;
+        }
+    }
+    if (!qkv_out) {
+        if (auto it = outputs.find("qkv_norm"); it != outputs.end()) {
+            qkv_out = it->second;
+        } else if (auto it2 = outputs.find("qkv"); it2 != outputs.end()) {
+            qkv_out = it2->second;
+        }
+    }
+    if (!qkv_out) {
+        throw std::runtime_error("DSL recompute: qkv_qk_norm missing qkv output");
+    }
+
+    Tensor* q_rstd = nullptr;
+    Tensor* k_rstd = nullptr;
+    if (auto it = outputs.find("q_rstd"); it != outputs.end()) q_rstd = it->second;
+    if (auto it = outputs.find("k_rstd"); it != outputs.end()) k_rstd = it->second;
+    if (!q_rstd || !k_rstd) {
+        throw std::runtime_error("DSL recompute: qkv_qk_norm missing qk-norm buffers");
+    }
+
+    if (qkv_in->Data != qkv_out->Data) {
+        cudaMemcpyAsync(qkv_out->Data, qkv_in->Data, qkv_in->bytes(),
+                        cudaMemcpyDeviceToDevice, ctx.rs.MainStream);
+    }
+
+    int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
+    int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
+    const int Hs = static_cast<int>(ctx.cfg.head_size());
+    int qkv_channels = Hs * (Hq + 2 * Hkv);
+    const int qkv_expected = qkv_channels;
+
+    auto actual_qkv_channels = [](const Tensor& t) -> long {
+        if (t.Rank == 4) {
+            return t.Sizes[2] * t.Sizes[3];
+        }
+        if (t.Rank == 3) {
+            return t.Sizes[2];
+        }
+        return 0;
+    };
+    const long qkv_actual = actual_qkv_channels(*qkv_in) > 0 ? actual_qkv_channels(*qkv_in)
+                                                             : actual_qkv_channels(*qkv_out);
+    if (qkv_actual > 0 && qkv_actual != qkv_expected && !ctx.options.ShardWeights) {
+        log_qkv_mismatch("recompute_qkv_qk_norm",
+                         static_cast<int>(B), static_cast<int>(T),
+                         qkv_expected, qkv_actual,
+                         Hq, Hkv, Hs, false,
+                         *qkv_in, q_norm, k_norm, q_rstd, k_rstd);
+        throw std::runtime_error("DSL recompute: qkv_qk_norm unexpected qkv shape (no sharding enabled)");
+    }
+    if (qkv_actual > 0 && qkv_actual != qkv_channels) {
+        int q_heads = (q_rstd->Rank == 3) ? static_cast<int>(q_rstd->Sizes[2]) : -1;
+        int k_heads = (k_rstd->Rank == 3) ? static_cast<int>(k_rstd->Sizes[2]) : -1;
+        if (q_heads > 0 && k_heads > 0) {
+            const long expected = static_cast<long>(Hs) * (q_heads + 2 * k_heads);
+            if (expected == qkv_actual) {
+                Hq = q_heads;
+                Hkv = k_heads;
+                qkv_channels = static_cast<int>(qkv_actual);
+            }
+        }
+        if (qkv_channels != qkv_actual) {
+            if (qkv_channels % qkv_actual == 0) {
+                const int shard_factor = static_cast<int>(qkv_channels / qkv_actual);
+                if (shard_factor > 1 && (Hq % shard_factor) == 0 && (Hkv % shard_factor) == 0) {
+                    Hq /= shard_factor;
+                    Hkv /= shard_factor;
+                    qkv_channels = static_cast<int>(qkv_actual);
+                }
+            }
+        }
+    }
+    const int q_rows = Hq * Hs;
+
+    Tensor qkv_view = *qkv_out;
+    const long qkv_needed = static_cast<long>(B) * static_cast<long>(T) * qkv_channels;
+    if ((qkv_out->Rank == 4 || (qkv_out->Rank == 3 && qkv_out->Sizes[2] != qkv_channels)) &&
+        static_cast<long>(qkv_out->nelem()) >= qkv_needed) {
+        qkv_view = view_tensor(*qkv_out, {B, T, qkv_channels});
+    }
+    auto view_rstd = [&](Tensor& rstd, int heads) -> Tensor {
+        const long needed = static_cast<long>(B) * static_cast<long>(T) * heads;
+        if (rstd.Rank == 3 && rstd.Sizes[0] == B && rstd.Sizes[1] == T && rstd.Sizes[2] == heads) {
+            return rstd;
+        }
+        if (static_cast<long>(rstd.nelem()) >= needed) {
+            return view_tensor(rstd, {B, T, heads});
+        }
+        return rstd;
+    };
+    Tensor q_rstd_view = (q_rstd ? view_rstd(*q_rstd, Hq) : Tensor{});
+    Tensor k_rstd_view = (k_rstd ? view_rstd(*k_rstd, Hkv) : Tensor{});
+
+    const float eps = resolve_eps(op.attrs, ctx.cfg);
+
+    qkv_head_rmsnorm_forward(qkv_view, q_rstd_view, *q_norm,
+                             eps,
+                             static_cast<int>(B), static_cast<int>(T),
+                             qkv_channels, Hq, Hs, 0, ctx.rs.MainStream);
+    qkv_head_rmsnorm_forward(qkv_view, k_rstd_view, *k_norm,
+                             eps,
+                             static_cast<int>(B), static_cast<int>(T),
+                             qkv_channels, Hkv, Hs, q_rows, ctx.rs.MainStream);
+}
+
 void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
                               const RecomputeOp& op,
                               int layer_idx,
@@ -1016,14 +1238,73 @@ void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
                         cudaMemcpyDeviceToDevice, ctx.rs.MainStream);
     }
 
-    const int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
-    const int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
+    int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
+    int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
     const int Hs = static_cast<int>(ctx.cfg.head_size());
-    const int qkv_channels = Hs * (Hq + 2 * Hkv);
+    int qkv_channels = Hs * (Hq + 2 * Hkv);
+    const int qkv_expected = qkv_channels;
 
-    Tensor qkv_view = (qkv_out->Rank == 4)
-        ? view_tensor(*qkv_out, {B, T, qkv_channels})
-        : *qkv_out;
+    auto actual_qkv_channels = [](const Tensor& t) -> long {
+        if (t.Rank == 4) {
+            return t.Sizes[2] * t.Sizes[3];
+        }
+        if (t.Rank == 3) {
+            return t.Sizes[2];
+        }
+        return 0;
+    };
+    const long qkv_actual = actual_qkv_channels(*qkv_in) > 0 ? actual_qkv_channels(*qkv_in)
+                                                             : actual_qkv_channels(*qkv_out);
+    if (qkv_actual > 0 && qkv_actual != qkv_expected && !ctx.options.ShardWeights) {
+        log_qkv_mismatch("recompute_qkv_qk_norm_rope",
+                         static_cast<int>(B), static_cast<int>(T),
+                         qkv_expected, qkv_actual,
+                         Hq, Hkv, Hs, false,
+                         *qkv_in, q_norm, k_norm, q_rstd, k_rstd);
+        throw std::runtime_error("DSL recompute: qkv_qk_norm_rope unexpected qkv shape (no sharding enabled)");
+    }
+    if (qkv_actual > 0 && qkv_actual != qkv_channels) {
+        int q_heads = (q_rstd && q_rstd->Rank == 3) ? static_cast<int>(q_rstd->Sizes[2]) : -1;
+        int k_heads = (k_rstd && k_rstd->Rank == 3) ? static_cast<int>(k_rstd->Sizes[2]) : -1;
+        if (q_heads > 0 && k_heads > 0) {
+            const long expected = static_cast<long>(Hs) * (q_heads + 2 * k_heads);
+            if (expected == qkv_actual) {
+                Hq = q_heads;
+                Hkv = k_heads;
+                qkv_channels = static_cast<int>(qkv_actual);
+            }
+        }
+        if (qkv_channels != qkv_actual) {
+            if (qkv_channels % qkv_actual == 0) {
+                const int shard_factor = static_cast<int>(qkv_channels / qkv_actual);
+                if (shard_factor > 1 && (Hq % shard_factor) == 0 && (Hkv % shard_factor) == 0) {
+                    Hq /= shard_factor;
+                    Hkv /= shard_factor;
+                    qkv_channels = static_cast<int>(qkv_actual);
+                }
+            }
+        }
+    }
+
+    Tensor qkv_view = *qkv_out;
+    const long qkv_needed = static_cast<long>(B) * static_cast<long>(T) * qkv_channels;
+    if ((qkv_out->Rank == 4 || (qkv_out->Rank == 3 && qkv_out->Sizes[2] != qkv_channels)) &&
+        static_cast<long>(qkv_out->nelem()) >= qkv_needed) {
+        qkv_view = view_tensor(*qkv_out, {B, T, qkv_channels});
+    }
+    auto view_rstd = [&](Tensor& rstd, int heads) -> Tensor {
+        const long needed = static_cast<long>(B) * static_cast<long>(T) * heads;
+        if (rstd.Rank == 3 && rstd.Sizes[0] == B && rstd.Sizes[1] == T && rstd.Sizes[2] == heads) {
+            return rstd;
+        }
+        if (static_cast<long>(rstd.nelem()) >= needed) {
+            return view_tensor(rstd, {B, T, heads});
+        }
+        return rstd;
+    };
+
+    Tensor q_rstd_view = (q_rstd ? view_rstd(*q_rstd, Hq) : Tensor{});
+    Tensor k_rstd_view = (k_rstd ? view_rstd(*k_rstd, Hkv) : Tensor{});
 
     const LayerForwardPlan* fwd_plan = ctx.layer_plan;
     bool use_qk_norm = ctx.cfg.use_qk_norm || ctx.cfg.UseQKNorm;
@@ -1045,18 +1326,18 @@ void execute_qkv_qk_norm_rope(RecomputeContext& ctx,
             throw std::runtime_error("DSL recompute: qkv_qk_norm_rope missing qk-norm buffers");
         }
         if (rope_fused) {
-            qkv_qk_norm_rope_forward(qkv_view, *q_rstd, *k_rstd, *q_norm, *k_norm,
+            qkv_qk_norm_rope_forward(qkv_view, q_rstd_view, k_rstd_view, *q_norm, *k_norm,
                                      *freqs, reinterpret_cast<int*>(pos_ids->Data),
                                      eps,
                                      static_cast<int>(B), static_cast<int>(T),
                                      Hq, Hkv, Hs, ctx.rs.MainStream);
         } else {
             const int q_rows = Hq * Hs;
-            qkv_head_rmsnorm_forward(qkv_view, *q_rstd, *q_norm,
+            qkv_head_rmsnorm_forward(qkv_view, q_rstd_view, *q_norm,
                                      eps,
                                      static_cast<int>(B), static_cast<int>(T),
                                      qkv_channels, Hq, Hs, 0, ctx.rs.MainStream);
-            qkv_head_rmsnorm_forward(qkv_view, *k_rstd, *k_norm,
+            qkv_head_rmsnorm_forward(qkv_view, k_rstd_view, *k_norm,
                                      eps,
                                      static_cast<int>(B), static_cast<int>(T),
                                      qkv_channels, Hkv, Hs, q_rows, ctx.rs.MainStream);
@@ -1092,11 +1373,17 @@ void execute_rope(RecomputeContext& ctx,
 
     for (const auto& kv : inputs.tensors) {
         const std::string& key = kv.first;
-        if (key == "qkv" || key == "qkv_rope") {
+        std::string base = strip_ssa_suffix(key);
+        int idx = -1;
+        std::string field;
+        if (parse_block_param(base, idx, field)) {
+            base = strip_ssa_suffix(field);
+        }
+        if (base == "qkv" || base == "qkv_rope" || base == "qkv_norm") {
             qkv_in = kv.second;
-        } else if (key == "freq_cis" || key == "rope_freqs") {
+        } else if (base == "freq_cis" || base == "rope_freqs") {
             freqs = kv.second;
-        } else if (key == "position_ids") {
+        } else if (base == "position_ids") {
             pos_ids = kv.second;
         }
     }
@@ -1142,6 +1429,87 @@ void execute_rope(RecomputeContext& ctx,
     rope_forward(qkv_rope, qkv_rope, *freqs, reinterpret_cast<int*>(pos_ids->Data), nullptr,
                  static_cast<int>(B), static_cast<int>(T),
                  Hq, Hkv, Hs, rotary_dim, ctx.rs.MainStream);
+}
+
+void execute_mrope(RecomputeContext& ctx,
+                   const RecomputeOp& op,
+                   int layer_idx,
+                   long B,
+                   long T,
+                   const InputMap& inputs,
+                   const std::unordered_map<std::string, Tensor*>& outputs) {
+    (void)layer_idx;
+    Tensor* qkv_in = nullptr;
+    Tensor* freqs = nullptr;
+    Tensor* pos_ids = nullptr;
+
+    for (const auto& kv : inputs.tensors) {
+        const std::string& key = kv.first;
+        std::string base = strip_ssa_suffix(key);
+        int idx = -1;
+        std::string field;
+        if (parse_block_param(base, idx, field)) {
+            base = strip_ssa_suffix(field);
+        }
+        if (base == "qkv" || base == "qkv_rope" || base == "qkv_norm") {
+            qkv_in = kv.second;
+        } else if (base == "freq_cis" || base == "rope_freqs") {
+            freqs = kv.second;
+        } else if (base == "position_ids") {
+            pos_ids = kv.second;
+        }
+    }
+
+    if (!qkv_in || !freqs || !pos_ids) {
+        throw std::runtime_error("DSL recompute: mrope missing inputs (qkv, freq_cis, position_ids)");
+    }
+
+    Tensor* qkv_out = nullptr;
+    if (!op.outputs.empty()) {
+        if (auto it = outputs.find(op.outputs.front()); it != outputs.end()) {
+            qkv_out = it->second;
+        }
+    }
+    if (!qkv_out) {
+        if (auto it = outputs.find("qkv_rope"); it != outputs.end()) {
+            qkv_out = it->second;
+        } else if (auto it2 = outputs.find("qkv"); it2 != outputs.end()) {
+            qkv_out = it2->second;
+        }
+    }
+    if (!qkv_out) {
+        throw std::runtime_error("DSL recompute: mrope missing qkv_rope output");
+    }
+
+    if (qkv_in->Data != qkv_out->Data) {
+        cudaMemcpyAsync(qkv_out->Data, qkv_in->Data, qkv_in->bytes(),
+                        cudaMemcpyDeviceToDevice, ctx.rs.MainStream);
+    }
+
+    const int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
+    const int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
+    const int Hs = static_cast<int>(ctx.cfg.head_size());
+    int rotary_dim = resolve_rotary_dim(op.attrs, ctx.cfg);
+    const auto mrope_section = resolve_mrope_section(op.attrs, ctx.cfg);
+
+    Tensor qkv_rope = (qkv_out->Rank == 4)
+        ? *qkv_out
+        : view_tensor(*qkv_out, {B, T, Hq + 2 * Hkv, Hs});
+
+    const int* pos_ptr = reinterpret_cast<int*>(pos_ids->Data);
+    int pos_planes = 1;
+    if (pos_ids->Rank == 3) {
+        pos_planes = static_cast<int>(pos_ids->Sizes[0]);
+        if (pos_planes == 4) {
+            pos_ptr += static_cast<int>(B * T);
+            pos_planes = 3;
+        }
+    }
+
+    mrope_forward(qkv_rope, qkv_rope, *freqs, pos_ptr, pos_planes,
+                  mrope_section[0], mrope_section[1], mrope_section[2], nullptr,
+                  static_cast<int>(B), static_cast<int>(T),
+                  Hq, Hkv, Hs, rotary_dim, ctx.rs.MainStream);
 }
 
 void execute_flash_attention(RecomputeContext& ctx,
@@ -1992,10 +2360,14 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             execute_moe_grouped_gemm_down(ctx, scratch, inputs, outputs);
         } else if (op.op_type == "moe_unpermute") {
             execute_moe_unpermute(ctx, op, inputs, outputs);
+        } else if (op.op_type == "qkv_qk_norm") {
+            execute_qkv_qk_norm(ctx, op, layer_idx, B, T, inputs, outputs);
         } else if (op.op_type == "qkv_qk_norm_rope") {
             execute_qkv_qk_norm_rope(ctx, op, layer_idx, B, T, inputs, outputs);
         } else if (op.op_type == "rope") {
             execute_rope(ctx, op, layer_idx, B, T, inputs, outputs);
+        } else if (op.op_type == "mrope") {
+            execute_mrope(ctx, op, layer_idx, B, T, inputs, outputs);
         } else if (op.op_type == "flash_attention") {
             execute_flash_attention(ctx, B, T, inputs, outputs);
         } else if (op.op_type == "swiglu") {

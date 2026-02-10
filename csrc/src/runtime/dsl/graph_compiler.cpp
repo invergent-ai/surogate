@@ -56,6 +56,11 @@ bool infer_known_tensor_shape(std::string_view name,
     if (starts_with(name, kSavedPrefix)) {
         name = name.substr(kSavedPrefix.size());
     }
+    // Strip gradient prefix so d_blocks[N].field matches the same patterns
+    // as blocks[N].field — gradient tensors have the same shape as activations.
+    if (starts_with(name, "d_")) {
+        name = name.substr(2);
+    }
 
     int layer_idx = -1;
     std::string field;
@@ -161,6 +166,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"embedding", CompiledOpType::Embedding},
         {"zeros", CompiledOpType::Zeros},
         {"fused_residual_rmsnorm", CompiledOpType::FusedResidualRMSNorm},
+        {"layernorm", CompiledOpType::LayerNorm},
         {"view", CompiledOpType::View},
         {"add", CompiledOpType::Add},
         {"matmul", CompiledOpType::Matmul},
@@ -168,10 +174,15 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"bias_add", CompiledOpType::BiasAdd},
         {"swiglu", CompiledOpType::SwiGLU},
         {"silu", CompiledOpType::Silu},
+        {"gelu", CompiledOpType::Gelu},
         {"relu2", CompiledOpType::Relu2},
         {"mul", CompiledOpType::Mul},
+        {"mask_scatter", CompiledOpType::MaskScatter},
+        {"deepstack_inject", CompiledOpType::DeepstackInject},
         {"matmul_swiglu", CompiledOpType::MatmulSwiGLU},
+        {"qkv_qk_norm", CompiledOpType::QKVQKNorm},
         {"qkv_qk_norm_rope", CompiledOpType::QKVQKNormRoPE},
+        {"mrope", CompiledOpType::MRoPE},
         {"rope", CompiledOpType::RoPE},
         {"flash_attention", CompiledOpType::FlashAttention},
         {"flash_attention_qkv", CompiledOpType::FlashAttention},
@@ -195,14 +206,20 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"bias_add_backward", CompiledOpType::BiasAddBackward},
         {"swiglu_backward", CompiledOpType::SwiGLUBackward},
         {"silu_backward", CompiledOpType::SiluBackward},
+        {"gelu_backward", CompiledOpType::GeluBackward},
         {"relu2_backward", CompiledOpType::Relu2Backward},
         {"mul_backward", CompiledOpType::MulBackward},
+        {"mask_scatter_backward", CompiledOpType::MaskScatterBackward},
+        {"deepstack_inject_backward", CompiledOpType::DeepstackInjectBackward},
         {"matmul_swiglu_backward", CompiledOpType::MatmulSwiGLUBackward},
+        {"qkv_qk_norm_backward", CompiledOpType::QKVQKNormBackward},
         {"rope_backward", CompiledOpType::RoPEBackward},
         {"qkv_qk_norm_rope_backward", CompiledOpType::QKVQKNormRoPEBackward},
+        {"mrope_backward", CompiledOpType::MRoPEBackward},
         {"flash_attention_backward", CompiledOpType::FlashAttentionBackward},
         {"zeros_backward", CompiledOpType::ZerosBackward},
         {"fused_residual_rmsnorm_backward", CompiledOpType::FusedResidualRMSNormBackward},
+        {"layernorm_backward", CompiledOpType::LayerNormBackward},
         {"embedding_backward", CompiledOpType::EmbeddingBackward},
         {"cross_entropy_backward", CompiledOpType::CrossEntropyLossBackward},
         {"fused_lm_head_loss_backward", CompiledOpType::FusedLMHeadLossBackward},
@@ -257,6 +274,11 @@ GraphCompiler::GraphCompiler(const Module& module,
         mSlotRegistry.init_from_layout(*mModule.activation_layout);
     }
     // If no layout, registry remains empty - all tensors will use Mapped slot
+
+    // Enable shape debug output via SUROGATE_DEBUG_SHAPES=1
+    if (const char* env = std::getenv("SUROGATE_DEBUG_SHAPES")) {
+        mDebugShapes = (std::string(env) == "1");
+    }
 }
 
 void GraphCompiler::update_dimensions(long B, long T) {
@@ -417,12 +439,10 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             const std::string grad_name = "d_" + strip_ssa_suffix(field);
             if (auto slot_entry = mSlotRegistry.lookup(grad_name)) {
                 ref.slot = slot_entry->slot;
-                // Use shape from DSL if available
                 if (!slot_entry->shape.empty()) {
                     ref.shape = resolve_shape(slot_entry->shape, mShapeEnv);
                 }
             } else {
-                // Try looking up the activation slot and use its shape for the gradient
                 const std::string act_name = strip_ssa_suffix(field);
                 if (auto act_entry = mSlotRegistry.lookup(act_name)) {
                     if (!act_entry->shape.empty()) {
@@ -430,6 +450,18 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                     }
                 }
                 ref.slot = TensorSlot::Mapped;
+            }
+
+            // Override with infer_known_tensor_shape when available.
+            // The slot registry may return a parent slot's shape for aliases
+            // (e.g., "mlp_down_flat" is an alias of "mlp_down" with shape (B,T,C)),
+            // but _flat tensors need 2D shape (B*T,C). infer_known_tensor_shape
+            // correctly distinguishes _flat vs non-flat shapes.
+            {
+                std::vector<long> known_shape;
+                if (infer_known_tensor_shape(base, mConfig, mB, mT, known_shape)) {
+                    ref.shape = known_shape;
+                }
             }
 
             if (ref.shape.empty()) {
@@ -521,6 +553,20 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
     if (auto* acc_attr = find_attr(op.attrs, "compute_accuracy")) {
         if (auto v = attr_bool(*acc_attr)) {
             attrs.compute_accuracy = *v;
+        }
+    }
+
+    if (auto* mrope_attr = find_attr(op.attrs, "mrope_section")) {
+        if (auto list = attr_list_int(*mrope_attr)) {
+            if (list->size() >= 3) {
+                attrs.mrope_section = {static_cast<int>((*list)[0]),
+                                       static_cast<int>((*list)[1]),
+                                       static_cast<int>((*list)[2])};
+            }
+        } else if (auto s = attr_string(*mrope_attr)) {
+            if (*s == "mrope_section") {
+                attrs.mrope_section = mConfig.Rope.mrope_section;
+            }
         }
     }
 
@@ -881,15 +927,31 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
 // ============================================================================
 
 bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<long>& shape) {
+    auto format_shape = [](const std::vector<long>& s) -> std::string {
+        std::string r = "(";
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (i > 0) r += ", ";
+            r += std::to_string(s[i]);
+        }
+        r += ")";
+        return r;
+    };
+
     // Check shape cache first
     auto it = mTensorShapes.find(name);
     if (it != mTensorShapes.end()) {
         shape = it->second.dims;
+        if (mDebugShapes && starts_with(name, "d_")) {
+            fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> cache %s (src: %s)\n",
+                    name.c_str(), format_shape(shape).c_str(),
+                    it->second.source_op.c_str());
+        }
         return true;
     }
 
     // Check IR tensor info
-    auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors) {
+    auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors,
+                                  const char* source) {
         auto it = tensors.find(name);
         if (it != tensors.end() && !it->second.shape.empty()) {
             shape = resolve_shape(it->second.shape, mShapeEnv);
@@ -897,16 +959,20 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
             ts.dims = shape;
             ts.inferred = false;
             mTensorShapes[name] = ts;
+            if (mDebugShapes && starts_with(name, "d_")) {
+                fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> IR %s %s\n",
+                        name.c_str(), source, format_shape(shape).c_str());
+            }
             return true;
         }
         return false;
     };
 
     // Check in graph tensors
-    if (check_tensor_info(mModule.forward->inputs)) return true;
-    if (check_tensor_info(mModule.forward->outputs)) return true;
-    if (check_tensor_info(mModule.forward->params)) return true;
-    if (check_tensor_info(mModule.forward->intermediates)) return true;
+    if (check_tensor_info(mModule.forward->inputs, "fwd.inputs")) return true;
+    if (check_tensor_info(mModule.forward->outputs, "fwd.outputs")) return true;
+    if (check_tensor_info(mModule.forward->params, "fwd.params")) return true;
+    if (check_tensor_info(mModule.forward->intermediates, "fwd.intermediates")) return true;
 
     // Try pattern-based inference for known tensor names
     if (infer_known_tensor_shape(name, mConfig, mB, mT, shape)) {
@@ -914,6 +980,10 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
         ts.dims = shape;
         ts.inferred = true;
         mTensorShapes[name] = ts;
+        if (mDebugShapes && starts_with(name, "d_")) {
+            fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> inferred %s\n",
+                    name.c_str(), format_shape(shape).c_str());
+        }
         return true;
     }
 
@@ -923,6 +993,10 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
         return resolve_tensor_shape(base_name, shape);
     }
 
+    if (mDebugShapes && starts_with(name, "d_")) {
+        fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> FAILED (no shape found)\n",
+                name.c_str());
+    }
     return false;
 }
 
@@ -973,10 +1047,29 @@ void GraphCompiler::infer_output_shapes(
         }
 
         case CompiledOpType::View: {
-            // Output shape from attributes
+            // Output shape from attributes ("shape" for forward views,
+            // "shape_like" for backward views referencing a forward tensor)
             if (auto* shape_attr = find_attr(op.attrs, "shape")) {
                 auto out_shape = resolve_attr_shape(*shape_attr, mShapeEnv);
                 output_shapes.push_back(out_shape);
+            } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
+                if (auto ref_name = attr_string(*shape_like_attr)) {
+                    std::string ref = *ref_name;
+                    if (starts_with(ref, kSavedPrefix)) {
+                        ref = ref.substr(kSavedPrefix.size());
+                    }
+                    std::vector<long> ref_shape;
+                    // Try mExtraShapes first (populated from forward view pre-scan)
+                    auto it = mExtraShapes.find(ref);
+                    if (it != mExtraShapes.end()) {
+                        ref_shape = it->second;
+                    } else if (!resolve_tensor_shape(ref, ref_shape)) {
+                        infer_known_tensor_shape(ref, mConfig, mB, mT, ref_shape);
+                    }
+                    if (!ref_shape.empty()) {
+                        output_shapes.push_back(ref_shape);
+                    }
+                }
             }
             break;
         }
@@ -1095,6 +1188,17 @@ void GraphCompiler::infer_output_shapes(
             // Element-wise ops (and their backward) preserve shape
             if (!input_shapes.empty() && !input_shapes[0].empty()) {
                 output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::QKVQKNorm: {
+            // Output qkv_norm has same shape as input qkv
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);  // qkv_norm
+                // q_rstd and k_rstd shapes - hard to infer without config
+                output_shapes.push_back({});
+                output_shapes.push_back({});
             }
             break;
         }
@@ -1251,7 +1355,14 @@ void GraphCompiler::validate_operation_shapes(
 
     // If we couldn't resolve some input shapes, we can't validate
     if (!unresolved_inputs.empty()) {
-        // Skip validation when input shapes are unknown
+        if (mDebugShapes && starts_with(op.name, "matmul")) {
+            fprintf(stderr, "[DEBUG_SHAPES] validate '%s' (id: %s) SKIPPED — unresolved inputs:",
+                    op.name.c_str(), op.id.c_str());
+            for (const auto& u : unresolved_inputs) {
+                fprintf(stderr, " '%s'", u.c_str());
+            }
+            fprintf(stderr, "\n");
+        }
         return;
     }
 
@@ -1464,6 +1575,44 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         }
     }
 
+    // Also pre-scan the current graph for view/reshape ops (important for backward
+    // graphs where view_backward ops use shape_like referencing forward tensors).
+    // The forward pre-scan above already populated mExtraShapes with forward tensor
+    // shapes, so shape_like references can resolve here.
+    if (!mModule.forward.has_value() || &graph != &(*mModule.forward)) {
+        for (const auto& op : graph.operations) {
+            const std::string& op_type =
+                (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+            if (op_type != "view" && op_type != "reshape") {
+                continue;
+            }
+            std::vector<long> shape;
+            if (auto* shape_attr = find_attr(op.attrs, "shape")) {
+                shape = resolve_attr_shape(*shape_attr, mShapeEnv);
+            } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
+                if (auto ref_name = attr_string(*shape_like_attr)) {
+                    std::string ref = *ref_name;
+                    if (starts_with(ref, kSavedPrefix)) {
+                        ref = ref.substr(kSavedPrefix.size());
+                    }
+                    auto it = mExtraShapes.find(ref);
+                    if (it != mExtraShapes.end()) {
+                        shape = it->second;
+                    } else {
+                        infer_known_tensor_shape(ref, mConfig, B, T, shape);
+                    }
+                }
+            }
+            if (!shape.empty()) {
+                for (const auto& out : op.outputs) {
+                    if (!out.empty()) {
+                        mExtraShapes[out] = shape;
+                    }
+                }
+            }
+        }
+    }
+
     CompiledGraph result;
     result.name = graph.name;
     result.ops.reserve(graph.operations.size());
@@ -1578,6 +1727,60 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                             ref.dtype = grad_dtype;
                         }
                         ref.shape = {C};
+                    }
+                } else if (compiled.type == CompiledOpType::QKVQKNorm) {
+                    // output[0] = qkv_out [B, T, QKV] (match input dtype)
+                    // output[1] = q_rstd [B, T, Hq] FP32
+                    // output[2] = k_rstd [B, T, Hkv] FP32
+                    if (i == 0) {
+                        // Match input dtype (first input is qkv tensor)
+                        if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                        } else {
+                            ref.dtype = ETensorDType::BF16;
+                        }
+                        if (ref.shape.empty()) {
+                            ref.shape = {B, T, QKV};
+                        }
+                    } else if (i == 1) {
+                        ref.dtype = ETensorDType::FP32;
+                        if (ref.shape.empty()) {
+                            ref.shape = {B, T, Hq};
+                        }
+                    } else if (i == 2) {
+                        ref.dtype = ETensorDType::FP32;
+                        if (ref.shape.empty()) {
+                            ref.shape = {B, T, static_cast<long>(mConfig.NumKeyValHeads)};
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::QKVQKNormBackward ||
+                           compiled.type == CompiledOpType::QKVQKNormRoPEBackward) {
+                    // outputs: d_qkv, d_q_norm_weight, d_k_norm_weight
+                    // d_qkv matches qkv input; d_weight matches weight shape [D]
+                    if (i == 0) {
+                        if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                            ref.dtype = compiled.inputs[1].dtype;
+                            ref.shape = compiled.inputs[1].shape;
+                        } else if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                            ref.shape = compiled.inputs[0].shape;
+                        }
+                    } else if (i == 1) {
+                        if (compiled.inputs.size() > 2 && !compiled.inputs[2].shape.empty()) {
+                            ref.dtype = compiled.inputs[2].dtype;
+                            ref.shape = compiled.inputs[2].shape;
+                        } else {
+                            ref.dtype = !compiled.inputs.empty() ? compiled.inputs[0].dtype : ETensorDType::BF16;
+                            ref.shape = {static_cast<long>(mConfig.head_size())};
+                        }
+                    } else if (i == 2) {
+                        if (compiled.inputs.size() > 3 && !compiled.inputs[3].shape.empty()) {
+                            ref.dtype = compiled.inputs[3].dtype;
+                            ref.shape = compiled.inputs[3].shape;
+                        } else {
+                            ref.dtype = !compiled.inputs.empty() ? compiled.inputs[0].dtype : ETensorDType::BF16;
+                            ref.shape = {static_cast<long>(mConfig.head_size())};
+                        }
                     }
                 } else if (compiled.type == CompiledOpType::QKVQKNormRoPE) {
                     // output[0] = qkv_out [B, T, QKV] (match input dtype)
@@ -1758,11 +1961,57 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     }
                 } else if (compiled.type == CompiledOpType::View ||
                            compiled.type == CompiledOpType::ViewBackward) {
-                    // View preserves dtype from input; shape comes from attributes
+                    // View preserves dtype from input; shape comes from mExtraShapes
+                    // (populated by the pre-scan) or from resolve_tensor_ref.
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
                     }
-                    // Shape is set from attrs in resolve_attrs, not here
+                    // If shape wasn't set by resolve_tensor_ref or mExtraShapes,
+                    // try resolving from op attributes (shape or shape_like).
+                    if (ref.shape.empty()) {
+                        if (auto* shape_attr = find_attr(op.attrs, "shape")) {
+                            ref.shape = resolve_attr_shape(*shape_attr, mShapeEnv);
+                        } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
+                            if (auto ref_name = attr_string(*shape_like_attr)) {
+                                std::string sref = *ref_name;
+                                if (starts_with(sref, kSavedPrefix)) {
+                                    sref = sref.substr(kSavedPrefix.size());
+                                }
+                                // Prefer infer_known_tensor_shape for well-known names
+                                // (it correctly distinguishes _flat vs non-flat shapes),
+                                // then fall back to mExtraShapes / resolve_tensor_shape.
+                                std::vector<long> ref_shape;
+                                if (infer_known_tensor_shape(sref, mConfig, B, T, ref_shape)) {
+                                    ref.shape = ref_shape;
+                                } else {
+                                    auto eit = mExtraShapes.find(sref);
+                                    if (eit != mExtraShapes.end()) {
+                                        ref.shape = eit->second;
+                                    } else if (resolve_tensor_shape(sref, ref_shape)) {
+                                        ref.shape = ref_shape;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (mDebugShapes && starts_with(op.outputs[i], "d_")) {
+                        auto fmt = [](const std::vector<long>& s) -> std::string {
+                            std::string r = "(";
+                            for (size_t j = 0; j < s.size(); ++j) {
+                                if (j > 0) r += ", ";
+                                r += std::to_string(s[j]);
+                            }
+                            r += ")";
+                            return r;
+                        };
+                        const char* source = "resolve_tensor_ref";
+                        if (find_attr(op.attrs, "shape")) source = "shape attr";
+                        else if (find_attr(op.attrs, "shape_like")) source = "shape_like attr";
+                        fprintf(stderr, "[DEBUG_SHAPES] View output '%s' shape=%s (via %s)\n",
+                                op.outputs[i].c_str(),
+                                ref.shape.empty() ? "<empty>" : fmt(ref.shape).c_str(),
+                                source);
+                    }
                 } else if (compiled.type == CompiledOpType::MoESigmoid ||
                            compiled.type == CompiledOpType::MoESoftmax) {
                     // Output dtype/shape matches input (router logits)
@@ -1991,6 +2240,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
             // Also fix dtype for pre-allocated RSTD slots (must be FP32)
             if ((compiled.type == CompiledOpType::FusedResidualRMSNorm && i == 2) ||
+                (compiled.type == CompiledOpType::QKVQKNorm && (i == 1 || i == 2)) ||
                 (compiled.type == CompiledOpType::QKVQKNormRoPE && (i == 1 || i == 2))) {
                 ref.dtype = ETensorDType::FP32;
             }

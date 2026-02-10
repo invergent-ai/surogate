@@ -9,6 +9,7 @@
 #ifndef SUROGATE_SRC_DSL_GRAPH_COMPILER_H
 #define SUROGATE_SRC_DSL_GRAPH_COMPILER_H
 
+#include <array>
 #include <string>
 #include <vector>
 #include <optional>
@@ -45,6 +46,7 @@ enum class CompiledOpType : std::uint8_t {
     Embedding,
     Zeros,
     FusedResidualRMSNorm,
+    LayerNorm,
     View,
     Add,
     Matmul,
@@ -52,10 +54,15 @@ enum class CompiledOpType : std::uint8_t {
     BiasAdd,
     SwiGLU,
     Silu,
+    Gelu,
     Relu2,
     Mul,
+    MaskScatter,
+    DeepstackInject,
     MatmulSwiGLU,
+    QKVQKNorm,
     QKVQKNormRoPE,
+    MRoPE,
     RoPE,
     FlashAttention,
     CrossEntropyLoss,
@@ -76,14 +83,20 @@ enum class CompiledOpType : std::uint8_t {
     BiasAddBackward,
     SwiGLUBackward,
     SiluBackward,
+    GeluBackward,
     Relu2Backward,
     MulBackward,
+    MaskScatterBackward,
+    DeepstackInjectBackward,
     MatmulSwiGLUBackward,
+    QKVQKNormBackward,
     RoPEBackward,
     QKVQKNormRoPEBackward,
+    MRoPEBackward,
     FlashAttentionBackward,
     ZerosBackward,
     FusedResidualRMSNormBackward,
+    LayerNormBackward,
     EmbeddingBackward,
     CrossEntropyLossBackward,
     FusedLMHeadLossBackward,
@@ -139,6 +152,7 @@ struct CompiledAttrs {
     EMMTranspose transpose = EMMTranspose::NN;
     int rotary_dim = 0;
     bool compute_accuracy = false;
+    std::array<int, 3> mrope_section{0, 0, 0};
 
     // Shape info
     std::vector<long> shape;
@@ -277,6 +291,7 @@ private:
     std::unordered_map<std::string, std::vector<long>> mExtraShapes;
     std::unordered_map<std::string, TensorShape> mTensorShapes;
     std::unordered_map<std::string, ETensorDType> mTensorDtypes;
+    bool mDebugShapes = false;  // Set via SUROGATE_DEBUG_SHAPES env var
 };
 
 

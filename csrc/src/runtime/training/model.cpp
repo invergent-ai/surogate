@@ -6,6 +6,8 @@
 #include "model.h"
 
 #include <cmath>
+#include <cstring>
+#include <stdexcept>
 
 #include "utilities/allocator.h"
 #include "kernels/kernels.h"
@@ -42,6 +44,22 @@ Tensor& IModel::get_position_ids_buffer() {
     return get_run_state().PositionIDs_CPU;
 }
 
+Tensor& IModel::get_visual_pos_mask_buffer() {
+    return get_run_state().VisualPosMasks_CPU;
+}
+
+Tensor& IModel::get_visual_embeds_buffer() {
+    return get_run_state().VisualEmbeds_CPU;
+}
+
+Tensor& IModel::get_deepstack_visual_embeds_buffer(int index) {
+    auto& buffers = get_run_state().DeepstackVisualEmbeds_CPU;
+    if (index < 0 || static_cast<std::size_t>(index) >= buffers.size()) {
+        throw std::out_of_range("deepstack visual embeds buffer index out of range");
+    }
+    return buffers[static_cast<std::size_t>(index)];
+}
+
 
 IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc) : Config(std::move(config)), B(batch_size), T(seq_len), Allocator(std::move(alloc)) {
     int did;
@@ -50,11 +68,50 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
     CUDA_CHECK(cudaGetDeviceProperties(&DeviceProp, did));
 
     Inputs = Allocator->allocate(ETensorDType::INT32, "inputs", {B, T});
-    PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {B, T});
+    const bool multimodal_rope = Config && Config->Rope.is_multimodal();
+    const long pos_planes = multimodal_rope ? 3 : 1;
+    if (pos_planes > 1) {
+        PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {pos_planes, B, T});
+    } else {
+        PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {B, T});
+    }
     Targets = Allocator->allocate(ETensorDType::INT32, "targets", {B, T});
     Inputs_CPU = Allocator->allocate(ETensorDType::INT32, "inputs_cpu", EAllocationType::PINNED, {B, T});
-    PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {B, T});
+    if (pos_planes > 1) {
+        PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {pos_planes, B, T});
+    } else {
+        PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {B, T});
+    }
     Targets_CPU = Allocator->allocate(ETensorDType::INT32, "targets_cpu", EAllocationType::PINNED, {B, T});
+    if (Config && Config->UseVisualInputs) {
+        const long C = Config->HiddenSize;
+        const long max_visual = B * T;
+        VisualPosMasks = Allocator->allocate(ETensorDType::INT32, "visual_pos_masks", {B, T});
+        VisualPosMasks_CPU = Allocator->allocate(ETensorDType::INT32, "visual_pos_masks_cpu", EAllocationType::PINNED, {B, T});
+        VisualEmbeds = Allocator->allocate(Config->DType, "visual_embeds", {max_visual, C});
+        VisualEmbeds_CPU = Allocator->allocate(Config->DType, "visual_embeds_cpu", EAllocationType::PINNED, {max_visual, C});
+        std::memset(VisualPosMasks_CPU.Data, 0, static_cast<std::size_t>(VisualPosMasks_CPU.bytes()));
+        std::memset(VisualEmbeds_CPU.Data, 0, static_cast<std::size_t>(VisualEmbeds_CPU.bytes()));
+        int deepstack_layers = Config->DeepstackVisualLayers;
+        if (deepstack_layers < 0) {
+            deepstack_layers = 0;
+        }
+        if (deepstack_layers > 0) {
+            DeepstackVisualEmbeds.resize(static_cast<std::size_t>(deepstack_layers));
+            DeepstackVisualEmbeds_CPU.resize(static_cast<std::size_t>(deepstack_layers));
+            for (int i = 0; i < deepstack_layers; ++i) {
+                const std::string suffix = std::to_string(i);
+                const std::string name = "deepstack_visual_embeds_" + suffix;
+                const std::string cpu_name = "deepstack_visual_embeds_cpu_" + suffix;
+                DeepstackVisualEmbeds[static_cast<std::size_t>(i)] =
+                    Allocator->allocate(Config->DType, name.c_str(), {max_visual, C});
+                DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)] =
+                    Allocator->allocate(Config->DType, cpu_name.c_str(), EAllocationType::PINNED, {max_visual, C});
+                std::memset(DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].Data, 0,
+                            static_cast<std::size_t>(DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].bytes()));
+            }
+        }
+    }
     Losses = Allocator->allocate(ETensorDType::FP32, "losses", {B, T});
     ValidTokenCount = Allocator->allocate(ETensorDType::INT32, "valid_token_count", {1});
     CorrectCount = Allocator->allocate(ETensorDType::INT32, "correct_count", {1});
@@ -164,6 +221,9 @@ IRunState::IRunState(IRunState&& other) noexcept
       Inputs(std::move(other.Inputs)),
       PositionIDs(std::move(other.PositionIDs)),
       Targets(std::move(other.Targets)),
+      VisualPosMasks(std::move(other.VisualPosMasks)),
+      VisualEmbeds(std::move(other.VisualEmbeds)),
+      DeepstackVisualEmbeds(std::move(other.DeepstackVisualEmbeds)),
       Losses(std::move(other.Losses)),
       ValidTokenCount(std::move(other.ValidTokenCount)),
       CorrectCount(std::move(other.CorrectCount)),
@@ -191,7 +251,10 @@ IRunState::IRunState(IRunState&& other) noexcept
       TimingBackwardEnd(std::move(other.TimingBackwardEnd)),
       Inputs_CPU(std::move(other.Inputs_CPU)),
       PositionIDs_CPU(std::move(other.PositionIDs_CPU)),
-      Targets_CPU(std::move(other.Targets_CPU))
+      Targets_CPU(std::move(other.Targets_CPU)),
+      VisualPosMasks_CPU(std::move(other.VisualPosMasks_CPU)),
+      VisualEmbeds_CPU(std::move(other.VisualEmbeds_CPU)),
+      DeepstackVisualEmbeds_CPU(std::move(other.DeepstackVisualEmbeds_CPU))
 {
     // Null out the source's CUDA handles so its destructor doesn't free them
     other.MainStream = nullptr;

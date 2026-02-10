@@ -1,17 +1,15 @@
-model: Qwen/Qwen3-0.6B
-output_dir: ./output
+model: Qwen/Qwen3-VL-2B-Instruct
+output_dir: ./output_vl
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
 
-sample_packing: true
-sequence_len: 2048
-
-max_steps: 3
+max_steps: 5
 
 learning_rate: 2e-4
 
 recipe: bf16
+use_cuda_graphs: false
 
 lora: true
 lora_rank: 16
@@ -27,5 +25,6 @@ lora_target_modules:
 
 dataloader_num_workers: 4
 datasets:
-  - path: "OpenLLM-Ro/ro_gsm8k"
+  - path: "unsloth/LaTeX_OCR"
+    samples: 5000
     type: auto

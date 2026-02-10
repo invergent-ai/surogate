@@ -9,7 +9,7 @@ sample_packing: true
 sequence_len: 512
 gpus: 1
 
-max_steps: 3
+max_steps: 10
 eval_steps: 25
 save_steps: 0
 

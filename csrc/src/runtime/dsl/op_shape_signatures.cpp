@@ -285,7 +285,7 @@ void register_builtin_shape_signatures() {
         sig.min_inputs = 2;
         sig.max_inputs = 2;
         sig.min_outputs = 1;
-        sig.max_outputs = 1;
+        sig.max_outputs = 3;
         sig.validator = [](const auto& inputs, const auto& outputs,
                           const AttrMap& attrs, const ShapeEnv&) {
             if (inputs.size() < 2 || outputs.empty()) {
@@ -308,7 +308,7 @@ void register_builtin_shape_signatures() {
         sig.min_inputs = 3;
         sig.max_inputs = 3;
         sig.min_outputs = 1;
-        sig.max_outputs = 1;
+        sig.max_outputs = 3;
         sig.validator = [](const auto& inputs, const auto& outputs,
                           const AttrMap& attrs, const ShapeEnv&) {
             if (inputs.size() < 3 || outputs.empty()) {
@@ -392,6 +392,94 @@ void register_builtin_shape_signatures() {
                 return std::make_optional(err);
             }
             return validators::check_broadcastable(inputs[0], inputs[1], "add");
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // Masked scatter (visual embedding replacement)
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "mask_scatter";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.size() < 3 || outputs.empty()) {
+                ShapeValidationError err;
+                err.message = "mask_scatter requires 3 inputs and 1 output";
+                return std::make_optional(err);
+            }
+            if (auto err = validators::check_rank(inputs[0], 3, "input", "mask_scatter")) return err;
+            if (auto err = validators::check_rank(inputs[1], 2, "mask", "mask_scatter")) return err;
+            if (auto err = validators::check_rank(inputs[2], 2, "src", "mask_scatter")) return err;
+
+            if (!inputs[0].empty() && !inputs[2].empty()) {
+                long C = inputs[0].back();
+                if (inputs[2].back() != C) {
+                    ShapeValidationError err;
+                    err.message = "mask_scatter: src last dim must match input last dim";
+                    return std::make_optional(err);
+                }
+                long N = inputs[0][0] * inputs[0][1];
+                if (inputs[2][0] != N) {
+                    ShapeValidationError err;
+                    err.message = "mask_scatter: src first dim must equal B*T";
+                    return std::make_optional(err);
+                }
+            }
+
+            if (!outputs[0].empty()) {
+                return validators::check_same_numel(inputs[0], outputs[0], "input", "output", "mask_scatter");
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // Deepstack inject (visual embedding addition)
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "deepstack_inject";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.size() < 3 || outputs.empty()) {
+                ShapeValidationError err;
+                err.message = "deepstack_inject requires 3 inputs and 1 output";
+                return std::make_optional(err);
+            }
+            if (auto err = validators::check_rank(inputs[0], 3, "input", "deepstack_inject")) return err;
+            if (auto err = validators::check_rank(inputs[1], 2, "mask", "deepstack_inject")) return err;
+            if (auto err = validators::check_rank(inputs[2], 2, "src", "deepstack_inject")) return err;
+
+            if (!inputs[0].empty() && !inputs[2].empty()) {
+                long C = inputs[0].back();
+                if (inputs[2].back() != C) {
+                    ShapeValidationError err;
+                    err.message = "deepstack_inject: src last dim must match input last dim";
+                    return std::make_optional(err);
+                }
+                long N = inputs[0][0] * inputs[0][1];
+                if (inputs[2][0] != N) {
+                    ShapeValidationError err;
+                    err.message = "deepstack_inject: src first dim must equal B*T";
+                    return std::make_optional(err);
+                }
+            }
+
+            if (!outputs[0].empty()) {
+                return validators::check_same_numel(inputs[0], outputs[0], "input", "output", "deepstack_inject");
+            }
+            return std::optional<ShapeValidationError>();
         };
         reg.register_signature(sig);
     }
@@ -710,6 +798,64 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // QKVQKNorm
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "qkv_qk_norm";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 3;
+        sig.max_outputs = 3;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            const auto& qkv = inputs[0];
+            const auto& q_norm = inputs[1];
+            const auto& k_norm = inputs[2];
+            const auto& qkv_out = outputs[0];
+            const auto& q_rstd = outputs[1];
+            const auto& k_rstd = outputs[2];
+
+            // Check qkv rank >= 2
+            if (qkv.size() < 2) {
+                ShapeValidationError err;
+                err.message = "qkv_qk_norm: qkv must have rank >= 2";
+                return std::make_optional(err);
+            }
+
+            // Check q_norm and k_norm are 1D
+            if (auto err = validators::check_rank(q_norm, 1, "q_norm", "qkv_qk_norm")) {
+                return err;
+            }
+            if (auto err = validators::check_rank(k_norm, 1, "k_norm", "qkv_qk_norm")) {
+                return err;
+            }
+
+            // Check output shape matches input
+            if (auto err = validators::check_same_numel(qkv_out, qkv, "qkv_out", "qkv", "qkv_qk_norm")) {
+                return err;
+            }
+
+            // Check q_rstd/k_rstd rank (allow 1, 2, or 3)
+            if (!q_rstd.empty() && q_rstd.size() > 3) {
+                ShapeValidationError err;
+                err.message = "qkv_qk_norm: q_rstd must be rank 1, 2, or 3";
+                return std::make_optional(err);
+            }
+            if (!k_rstd.empty() && k_rstd.size() > 3) {
+                ShapeValidationError err;
+                err.message = "qkv_qk_norm: k_rstd must be rank 1, 2, or 3";
+                return std::make_optional(err);
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
     // QKVQKNormRoPE
     // ------------------------------------------------------------------------
     {
@@ -815,6 +961,56 @@ void register_builtin_shape_signatures() {
 
             // Check output matches input
             if (auto err = validators::check_same_numel(out, qkv, "out", "qkv", "rope")) {
+                return err;
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MRoPE (multimodal RoPE)
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "mrope";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            const auto& qkv = inputs[0];
+            const auto& freqs = inputs[1];
+            const auto& pos_ids = inputs[2];
+            const auto& out = outputs[0];
+
+            // Check qkv rank >= 2
+            if (qkv.size() < 2) {
+                ShapeValidationError err;
+                err.message = "mrope: qkv must have rank >= 2";
+                return std::make_optional(err);
+            }
+
+            // Check freqs rank >= 2
+            if (freqs.size() < 2) {
+                ShapeValidationError err;
+                err.message = "mrope: freqs must have rank >= 2";
+                return std::make_optional(err);
+            }
+
+            // Check position_ids rank (allow 2 or 3)
+            if (!pos_ids.empty() && (pos_ids.size() < 2 || pos_ids.size() > 3)) {
+                ShapeValidationError err;
+                err.message = "mrope: position_ids must have rank 2 or 3";
+                return std::make_optional(err);
+            }
+
+            // Check output matches input
+            if (auto err = validators::check_same_numel(out, qkv, "out", "qkv", "mrope")) {
                 return err;
             }
 
@@ -1075,7 +1271,7 @@ void register_builtin_shape_signatures() {
     {
         OpShapeSignature sig;
         sig.op_name = "matmul_swiglu_backward";
-        sig.min_inputs = 4;
+        sig.min_inputs = 3;
         sig.max_inputs = 4;
         sig.min_outputs = 2;
         sig.max_outputs = 2;
@@ -1156,6 +1352,92 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // MRoPEBackward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "mrope_backward";
+        sig.min_inputs = 3;
+        sig.max_inputs = 4;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            const auto& d_out = inputs[0];
+            const auto& freqs = inputs.size() > 2 ? inputs[inputs.size() - 2] : inputs[1];
+            const auto& pos_ids = inputs.size() > 2 ? inputs[inputs.size() - 1] : inputs[2];
+            const auto& qkv = inputs.size() > 3 ? inputs[1] : d_out;
+            const auto& d_qkv = outputs[0];
+
+            // d_qkv should match d_out and qkv
+            if (auto err = validators::check_same_numel(d_qkv, d_out, "d_qkv", "d_out", "mrope_backward")) {
+                return err;
+            }
+            if (auto err = validators::check_same_numel(d_qkv, qkv, "d_qkv", "qkv", "mrope_backward")) {
+                return err;
+            }
+
+            // Check freqs rank >= 2
+            if (freqs.size() < 2) {
+                ShapeValidationError err;
+                err.message = "mrope_backward: freqs must have rank >= 2";
+                return std::make_optional(err);
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // QKVQKNormBackward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "qkv_qk_norm_backward";
+        sig.min_inputs = 6;
+        sig.max_inputs = 6;
+        sig.min_outputs = 1;
+        sig.max_outputs = 3;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            const auto& d_out = inputs[0];
+            const auto& qkv = inputs[1];
+            const auto& q_norm = inputs[2];
+            const auto& k_norm = inputs[3];
+            const auto& d_qkv = outputs[0];
+
+            // d_qkv should match d_out and qkv
+            if (auto err = validators::check_same_numel(d_qkv, d_out, "d_qkv", "d_out", "qkv_qk_norm_backward")) {
+                return err;
+            }
+            if (auto err = validators::check_same_numel(d_qkv, qkv, "d_qkv", "qkv", "qkv_qk_norm_backward")) {
+                return err;
+            }
+
+            if (outputs.size() > 1) {
+                const auto& d_q_norm = outputs[1];
+                if (auto err = validators::check_same_numel(d_q_norm, q_norm, "d_q_norm", "q_norm", "qkv_qk_norm_backward")) {
+                    return err;
+                }
+            }
+            if (outputs.size() > 2) {
+                const auto& d_k_norm = outputs[2];
+                if (auto err = validators::check_same_numel(d_k_norm, k_norm, "d_k_norm", "k_norm", "qkv_qk_norm_backward")) {
+                    return err;
+                }
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
     // QKVQKNormRoPEBackward
     // ------------------------------------------------------------------------
     {
@@ -1180,6 +1462,21 @@ void register_builtin_shape_signatures() {
             }
             if (auto err = validators::check_same_numel(d_qkv, qkv, "d_qkv", "qkv", "qkv_qk_norm_rope_backward")) {
                 return err;
+            }
+
+            if (outputs.size() > 1) {
+                const auto& d_q_norm = outputs[1];
+                const auto& q_norm = inputs[2];
+                if (auto err = validators::check_same_numel(d_q_norm, q_norm, "d_q_norm", "q_norm", "qkv_qk_norm_rope_backward")) {
+                    return err;
+                }
+            }
+            if (outputs.size() > 2) {
+                const auto& d_k_norm = outputs[2];
+                const auto& k_norm = inputs[3];
+                if (auto err = validators::check_same_numel(d_k_norm, k_norm, "d_k_norm", "k_norm", "qkv_qk_norm_rope_backward")) {
+                    return err;
+                }
             }
 
             return std::optional<ShapeValidationError>();

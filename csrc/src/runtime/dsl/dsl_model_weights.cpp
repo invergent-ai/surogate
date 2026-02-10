@@ -199,7 +199,32 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 entry_ptr = &reader.find_entry(hf_name);
             } catch (const std::out_of_range&) {
                 if (mConfig->TiedWordEmbeddings && hf_name == "lm_head.weight") {
-                    entry_ptr = &reader.find_entry("model.embed_tokens.weight");
+                    std::vector<std::string> candidates;
+                    int emb_layer_idx = -1;
+                    if (const auto* emb_spec = internal::find_mapping_spec(mHfMapping, "embedding", emb_layer_idx)) {
+                        if (emb_spec->kind == MappingSpec::Kind::Direct && !emb_spec->source.empty()) {
+                            candidates.push_back(internal::format_hf_name(emb_spec->source, emb_layer_idx));
+                        }
+                    }
+                    candidates.push_back("model.embed_tokens.weight");
+                    candidates.push_back("model.language_model.embed_tokens.weight");
+
+                    for (const auto& candidate : candidates) {
+                        if (candidate.empty()) {
+                            continue;
+                        }
+                        try {
+                            entry_ptr = &reader.find_entry(candidate);
+                            break;
+                        } catch (const std::out_of_range&) {
+                            continue;
+                        }
+                    }
+
+                    if (!entry_ptr) {
+                        throw std::runtime_error("DSL model: missing HF tensor '" + hf_name
+                                                 + "' (and tied fallback) for param '" + name + "'");
+                    }
                 } else {
                     throw std::runtime_error("DSL model: missing HF tensor '" + hf_name + "' for param '" + name + "'");
                 }

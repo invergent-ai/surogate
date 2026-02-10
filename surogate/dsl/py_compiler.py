@@ -326,6 +326,91 @@ def _param_spec_to_ref(
     )
 
 
+def _is_symbolic_dim_expr(dim: str) -> bool:
+    """Return True if *dim* looks like a valid symbolic Dim expression.
+
+    Symbolic dim expressions come from ``_build_dim_map`` and are intentionally
+    left as strings for the C++ runtime to resolve.  Examples::
+
+        "C", "D", "E", "Hq", "MaxSeq", "Hq * D", "D // 2", "2 * M"
+
+    Config parameter names that *should* have been resolved look like::
+
+        "d_model", "head_size", "num_experts", "unknown_dim"
+
+    Heuristic: a dim is symbolic if it starts with an uppercase letter or
+    contains arithmetic operators.
+    """
+    if not dim:
+        return False
+    if any(op in dim for op in ("*", "+", "//", " - ")):
+        return True
+    if dim[0].isupper():
+        return True
+    return False
+
+
+def _validate_param_shapes(
+    params: Dict[str, TensorRef],
+    *,
+    warnings: WarningCollector | None = None,
+) -> None:
+    """Validate compiled parameter shapes.
+
+    Checks:
+    1. No parameter has a zero dimension (catches missing config exports like head_dim=0).
+    2. Warn on unresolved string dimensions that look like config keys (lowercase/snake_case)
+       but were not resolved to concrete values.  Symbolic Dim expressions (uppercase, arithmetic)
+       are expected and silently passed through.
+    """
+    for name, ref in params.items():
+        for i, dim in enumerate(ref.shape):
+            if dim == 0:
+                raise DSLShapeError(
+                    f"param '{name}' has zero dimension at axis {i}",
+                    hint="Ensure the dimension is exported to the IR config "
+                         "(check @hf_config param_mapping and __init__).",
+                )
+            if isinstance(dim, str) and not dim.isdigit() and not _is_symbolic_dim_expr(dim):
+                _warn(
+                    warnings,
+                    WarningCode.W006,
+                    f"param '{name}' has unresolved string dimension '{dim}' at axis {i}",
+                )
+
+
+def _validate_graph_activation_slots(
+    graph: GraphIR,
+    layout: ActivationLayoutIR,
+    *,
+    warnings: WarningCollector | None = None,
+) -> None:
+    """Validate that graph intermediates have matching activation slots.
+
+    Cross-references every graph intermediate/output name against the model's
+    ActivationSlotIR names and aliases. This catches naming mismatches between
+    the hybrid stacked blocks inlining and the activation layout declarations.
+    """
+    known: set[str] = {s.name for s in layout.slots}
+    known |= set(layout.alias_map.keys())
+    # Also include gradient slot names
+    known |= {s.name for s in layout.gradient_slots}
+
+    for name in graph.outputs:
+        # Strip block prefix for matching (e.g., "blocks[0].mlp_down" -> "mlp_down")
+        base_name = name
+        dot = name.rfind(".")
+        if dot >= 0:
+            base_name = name[dot + 1:]
+
+        if name not in known and base_name not in known:
+            _warn(
+                warnings,
+                WarningCode.W007,
+                f"graph output '{name}' has no matching activation slot",
+            )
+
+
 def _serialize_hf_spec(spec: Any) -> Any:
     """Serialize an HF weight mapping spec to JSON-compatible dict."""
     if isinstance(spec, str):
@@ -954,11 +1039,17 @@ def _inline_stacked_blocks(
 
             # StackedBlocks inputs are (x, residual, position_ids)
             cur_inputs = list(node.inputs)
-            if len(cur_inputs) != len(block_inputs):
+            if len(cur_inputs) < len(block_inputs):
                 raise DSLTypeError(
-                    f"StackedBlocks input mismatch: expected {len(block_inputs)}, got {len(cur_inputs)}",
+                    f"StackedBlocks input mismatch: expected at least {len(block_inputs)}, got {len(cur_inputs)}",
                     hint="Make sure g.call('StackedBlocks', ...) inputs match the block forward signature.",
                 )
+            extra_inputs = []
+            if len(cur_inputs) > len(block_inputs):
+                extra_inputs = cur_inputs[len(block_inputs):]
+                cur_inputs = cur_inputs[:len(block_inputs)]
+            position_ids_input = cur_inputs[-1]
+            deepstack_layers = int(node.attrs.get("deepstack_layers", 0)) if node.attrs else 0
 
             for layer_idx in range(int(n_layers)):
                 # Outputs for this layer
@@ -993,9 +1084,24 @@ def _inline_stacked_blocks(
                         attrs=dict(bnode.attrs),
                     ))
 
+                # Inject deepstack visual embeddings after the layer output (first N layers only)
+                if deepstack_layers > 0 and extra_inputs:
+                    visual_mask = extra_inputs[0]
+                    deepstack_inputs = extra_inputs[1:]
+                    if layer_idx < deepstack_layers and layer_idx < len(deepstack_inputs):
+                        op_id += 1
+                        new_nodes.append(OpIR(
+                            id=op_id,
+                            name="deepstack_inject",
+                            kernel_type="deepstack_inject",
+                            inputs=[layer_outputs[0], visual_mask, deepstack_inputs[layer_idx]],
+                            outputs=[layer_outputs[0]],
+                            attrs={},
+                        ))
+
                 # Next layer inputs
                 cur_inputs = list(layer_outputs[:len(block_inputs) - 1])
-                cur_inputs.append(node.inputs[-1])  # position_ids stays constant
+                cur_inputs.append(position_ids_input)  # position_ids stays constant
 
     # Rebuild intermediates
     new_intermediates: Dict[str, TensorRef] = {}
@@ -1402,6 +1508,15 @@ def compile_model_spec(
     # Compile activation layout - merge model's global activations with block activations
     ir.activation_layout = _compile_merged_activation_layout(spec, config, dim_map)
 
+    # --- Validation passes ---
+    # 1. Validate param shapes (zero dims and unresolved string dims)
+    if ir.forward_graph:
+        _validate_param_shapes(ir.forward_graph.params, warnings=warnings)
+
+    # 2. Validate graph outputs against activation slots
+    if ir.forward_graph and ir.activation_layout:
+        _validate_graph_activation_slots(ir.forward_graph, ir.activation_layout, warnings=warnings)
+
     return ir
 
 
@@ -1476,6 +1591,10 @@ def compile_block_spec(
     if spec.activations:
         ir.activation_layout = _compile_activation_layout(spec.activations, config, dim_map)
 
+    # Validate param shapes (zero dims and unresolved string dims)
+    if ir.forward_graph:
+        _validate_param_shapes(ir.forward_graph.params, warnings=warnings)
+
     return ir
 
 
@@ -1548,6 +1667,10 @@ def compile_module_spec(
                     )
             else:
                 ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
+
+    # Validate param shapes (zero dims and unresolved string dims)
+    if ir.forward_graph:
+        _validate_param_shapes(ir.forward_graph.params, warnings=warnings)
 
     return ir
 
@@ -1882,11 +2005,24 @@ def compile_model_for_hf(
         return json.dumps(result)
 
     # Build config from HF config using the mapping
+    def _get_hf_value(config_dict: Dict[str, Any], key: str) -> Any | None:
+        if key in config_dict:
+            return config_dict[key]
+        if "." not in key:
+            return None
+        cur: Any = config_dict
+        for part in key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return None
+            cur = cur[part]
+        return cur
+
     config = {}
     if spec.hf_config:
         for dsl_param, hf_key in spec.hf_config.param_mapping.items():
-            if hf_key in hf_config and hf_config[hf_key] is not None:
-                config[dsl_param] = hf_config[hf_key]
+            value = _get_hf_value(hf_config, hf_key)
+            if value is not None:
+                config[dsl_param] = value
 
     try:
         # Compile
