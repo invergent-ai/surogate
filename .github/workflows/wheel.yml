@@ -32,6 +32,7 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
       CUDAARCHS: ${{ matrix.archs }}
       UV_NO_SYNC: 1
 
