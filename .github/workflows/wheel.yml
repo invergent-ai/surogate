@@ -9,7 +9,7 @@ on:
 jobs:
   wheel:
     name: Build wheel (CUDA ${{ matrix.cuda_version }})
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     container:
       image: ${{ matrix.cuda_image }}
 
