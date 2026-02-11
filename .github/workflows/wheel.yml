@@ -1,4 +1,5 @@
 name: Build Wheels
+
 on:
   workflow_dispatch:
   push:
@@ -32,7 +33,7 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-      CMAKE_BUILD_PARALLEL_LEVEL: 1
+      CMAKE_BUILD_PARALLEL_LEVEL: 8
       CUDAARCHS: ${{ matrix.archs }}
       UV_NO_SYNC: 1
 
