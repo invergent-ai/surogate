@@ -770,114 +770,142 @@ inline void backward_lora_mlp_up_gate_fused(
 
     if (!has_up && !has_gate) return;
 
-    // dL_dy is packed as [d_up (D), d_gate (D)]
-    const int up_offset = 0;
-    const int gate_offset = out_features;
+    // dL_dy is packed as [d_up (D), d_gate (D)] with full_features columns per row.
+    // Instead of copying slices via cudaMemcpy2D, we create view tensors and use
+    // strided matmul (ldb = full_features) to read directly from the packed layout.
     const long full_features = dL_dy.Sizes[dL_dy.Rank - 1];
+    const std::size_t elem_size = get_dtype_size(dL_dy.DType);
+    const int ldb_stride = (int)full_features;  // leading dim override for strided dL_dy reads
 
-    auto extract_slice = [&](int offset, int features) -> Tensor {
-        if (offset == 0 && features == full_features) {
-            return dL_dy;
-        }
-        Tensor packed = slice_buffer;
-        packed.DType = dL_dy.DType;
-        packed.Rank = 2;
-        packed.Sizes[0] = BT;
-        packed.Sizes[1] = features;
-        for (int i = 2; i < MAX_TENSOR_DIM; ++i) packed.Sizes[i] = 1;
-
-        const std::size_t elem_size = get_dtype_size(dL_dy.DType);
-        const std::size_t src_pitch = (std::size_t)full_features * elem_size;
-        const std::size_t dst_pitch = (std::size_t)features * elem_size;
-        const std::size_t width = (std::size_t)features * elem_size;
-        const std::byte* src_ptr = dL_dy.Data + (std::size_t)offset * elem_size;
-        CUDA_CHECK(cudaMemcpy2DAsync(packed.Data, dst_pitch, src_ptr, src_pitch, width, (std::size_t)BT,
-                                     cudaMemcpyDeviceToDevice, stream));
-        return packed;
+    // Zero-copy dL_dy views (just pointer arithmetic, no memory copy)
+    auto make_dL_dy_view = [&](int offset) -> Tensor {
+        Tensor view = dL_dy;
+        view.Data = dL_dy.Data + (std::size_t)offset * elem_size;
+        view.Sizes[view.Rank - 1] = out_features;
+        return view;
     };
 
-    // Process up projection
-    if (has_up) {
-        Tensor dL_dy_up = extract_slice(up_offset, out_features);
-
-        // intermediate1 = x @ A_up^T
-        matmul(intermediate1, lora_up.A, x, std::nullopt, nullptr, nullptr,
+    // Helper: process one projection's backward pass using strided dL_dy reads.
+    // Computes h, dB, g, dA into the provided outputs; leaves g in intermediate2.
+    auto process_projection = [&](
+        const LoRALayerWeights<Tensor>& lora,
+        Tensor& dA, Tensor& dB,
+        const Tensor& dL_dy_view,
+        unsigned int dropout_seed)
+    {
+        // intermediate1 = x @ A^T  (recompute forward activation)
+        matmul(intermediate1, lora.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
 
-        // Apply same dropout mask as forward
         if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_up, stream);
+            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed, stream);
         }
-
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
 
-        // dB_up = intermediate1^T @ dL_dy_up
-        matmul(dB_up, intermediate1, dL_dy_up, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+        // dB = intermediate1^T @ dL_dy  (strided read from packed gradient)
+        matmul_strided(dB, intermediate1, dL_dy_view, std::nullopt, nullptr, nullptr,
+                       handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate,
+                       /*lda=*/-1, /*ldb=*/ldb_stride, /*ldc=*/-1, stream);
 
-        // intermediate2 = B_up @ dL_dy_up^T
-        matmul(intermediate2, lora_up.B, dL_dy_up, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+        // intermediate2 = dL_dy @ B^T  (strided read from packed gradient)
+        matmul_strided(intermediate2, lora.B, dL_dy_view, std::nullopt, nullptr, nullptr,
+                       handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false,
+                       /*lda=*/-1, /*ldb=*/ldb_stride, /*ldc=*/-1, stream);
 
-        // Apply same dropout mask to gradient (backprop through dropout)
         if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_up, stream);
+            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed, stream);
         }
-
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
 
-        // dA_up = x^T @ intermediate2
-        matmul(dA_up, x, intermediate2, std::nullopt, nullptr, nullptr,
+        // dA = x^T @ intermediate2
+        matmul(dA, x, intermediate2, std::nullopt, nullptr, nullptr,
                handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+    };
 
-        // dx += intermediate2 @ A_up
+    // When both projections are present, fuse the dx accumulation:
+    // dx += g_up @ A_up + g_gate @ A_gate  →  dx += g_cat @ A_cat  (single GEMM)
+    if (has_up && has_gate) {
+        // Carve g_cat (BT, 2*rank) and A_cat (2*rank, C) from slice_buffer.
+        const std::size_t g_cat_elems = (std::size_t)BT * 2 * rank;
+        const std::size_t a_cat_elems = (std::size_t)2 * rank * in_features;
+
+        Tensor g_cat;
+        g_cat.DType = dL_dy.DType;
+        g_cat.Rank = 2;
+        g_cat.Sizes[0] = BT;
+        g_cat.Sizes[1] = 2 * rank;
+        for (int i = 2; i < MAX_TENSOR_DIM; ++i) g_cat.Sizes[i] = 1;
+        g_cat.Data = slice_buffer.Data;
+
+        Tensor A_cat;
+        A_cat.DType = lora_up.A.DType;
+        A_cat.Rank = 2;
+        A_cat.Sizes[0] = 2 * rank;
+        A_cat.Sizes[1] = in_features;
+        for (int i = 2; i < MAX_TENSOR_DIM; ++i) A_cat.Sizes[i] = 1;
+        A_cat.Data = slice_buffer.Data + g_cat_elems * elem_size;
+
+        // --- Phase 1: up projection ---
+        Tensor dL_dy_up = make_dL_dy_view(0);
+        process_projection(lora_up, dA_up, dB_up, dL_dy_up, dropout_seed_up);
+
+        // Pack g_up (contiguous BT x rank in intermediate2) into g_cat[:, 0:r]
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            g_cat.Data,                                        // dst
+            (std::size_t)(2 * rank) * elem_size,               // dst pitch
+            intermediate2.Data,                                // src
+            (std::size_t)rank * elem_size,                     // src pitch
+            (std::size_t)rank * elem_size,                     // width
+            (std::size_t)BT,                                   // height
+            cudaMemcpyDeviceToDevice, stream));
+
+        // --- Phase 2: gate projection ---
+        Tensor dL_dy_gate = make_dL_dy_view(out_features);
+        process_projection(lora_gate, dA_gate, dB_gate, dL_dy_gate, dropout_seed_gate);
+
+        // Pack g_gate (contiguous BT x rank in intermediate2) into g_cat[:, r:2r]
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            g_cat.Data + (std::size_t)rank * elem_size,        // dst (offset to second half)
+            (std::size_t)(2 * rank) * elem_size,               // dst pitch
+            intermediate2.Data,                                // src
+            (std::size_t)rank * elem_size,                     // src pitch
+            (std::size_t)rank * elem_size,                     // width
+            (std::size_t)BT,                                   // height
+            cudaMemcpyDeviceToDevice, stream));
+
+        // --- Phase 3: fused dx accumulation ---
+        // Concatenate A_up and A_gate into A_cat = [A_up; A_gate] (contiguous rows)
+        CUDA_CHECK(cudaMemcpyAsync(
+            A_cat.Data,
+            lora_up.A.Data,
+            (std::size_t)rank * in_features * elem_size,
+            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            A_cat.Data + (std::size_t)rank * in_features * elem_size,
+            lora_gate.A.Data,
+            (std::size_t)rank * in_features * elem_size,
+            cudaMemcpyDeviceToDevice, stream));
+
+        // dx += g_cat @ A_cat  (single GEMM: M=C, N=BT, K=2r)
+        matmul(dx, A_cat, g_cat, std::nullopt, nullptr, nullptr,
+               handle, workspace, in_features, BT, 2 * rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+
+    } else if (has_up) {
+        // Single projection: strided dL_dy + standard dx accumulation
+        Tensor dL_dy_up = make_dL_dy_view(0);
+        process_projection(lora_up, dA_up, dB_up, dL_dy_up, dropout_seed_up);
+
         matmul(dx, lora_up.A, intermediate2, std::nullopt, nullptr, nullptr,
                handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
-    }
 
-    // Process gate projection
-    if (has_gate) {
-        Tensor dL_dy_gate = extract_slice(gate_offset, out_features);
+    } else { // has_gate only
+        Tensor dL_dy_gate = make_dL_dy_view(out_features);
+        process_projection(lora_gate, dA_gate, dB_gate, dL_dy_gate, dropout_seed_gate);
 
-        // intermediate1 = x @ A_gate^T
-        matmul(intermediate1, lora_gate.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask as forward
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_gate, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
-
-        // dB_gate = intermediate1^T @ dL_dy_gate
-        matmul(dB_gate, intermediate1, dL_dy_gate, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // intermediate2 = B_gate @ dL_dy_gate^T
-        matmul(intermediate2, lora_gate.B, dL_dy_gate, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask to gradient (backprop through dropout)
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_gate, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
-
-        // dA_gate = x^T @ intermediate2
-        matmul(dA_gate, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // dx += intermediate2 @ A_gate
         matmul(dx, lora_gate.A, intermediate2, std::nullopt, nullptr, nullptr,
                handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
     }

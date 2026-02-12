@@ -189,6 +189,37 @@ void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional
                       cublasLtHandle_t handle, Tensor& workspace,
                       int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream);
 
+// Like `matmul`, but allows overriding the leading dimensions of A, B, and C.
+// Useful for reading from strided input slices (e.g. packed [up|gate] gradient).
+// Use -1 for any dimension that should use the default.
+void matmul_strided(nv_bfloat16* c, const nv_bfloat16* a, const nv_bfloat16* b, const nv_bfloat16* bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream);
+
+void matmul_strided(float* c, const float* a, const float* b, const float* bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream);
+
+void matmul_strided(float* c, const nv_bfloat16* a, const nv_bfloat16* b, const float* bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream);
+
+void matmul_strided(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, Tensor& workspace,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream);
+
 void add_bias(float* out, const float* bias, int B, int T, int OC, cudaStream_t stream);
 void add_bias(nv_bfloat16* out, const nv_bfloat16* bias, int B, int T, int OC, cudaStream_t stream);
 int get_bias_backward_scratch_size(ETensorDType dtype, int OC, const cudaDeviceProp& dp);

@@ -1256,6 +1256,34 @@ void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional
     }
 }
 
+void matmul_strided(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, Tensor& workspace,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream) {
+    std::byte* ws = workspace.get<std::byte>();
+    std::size_t ws_size = workspace.bytes();
+    if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
+        float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
+        matmul_strided(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b,
+                       handle, ws, ws_size, M, N, K, mode, accumulate, lda, ldb, ldc, stream);
+    } else if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
+        float* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().DType == ETensorDType::FP32) {
+            bias_ptr = bias.value().get<float>();
+        }
+        matmul_strided(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b,
+                       handle, ws, ws_size, M, N, K, mode, accumulate, lda, ldb, ldc, stream);
+    } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
+        nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
+        matmul_strided(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b,
+                       handle, ws, ws_size, M, N, K, mode, accumulate, lda, ldb, ldc, stream);
+    } else {
+        throw std::logic_error("matmul_strided: unsupported dtype combination");
+    }
+}
+
 /**
  * @brief Computes the backward pass for the bias term.
  *

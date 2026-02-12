@@ -110,7 +110,8 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
                      std::byte* workspace, std::size_t workspace_size,
                      int m, int n, int k, cudaStream_t stream, cublasLtHandle_t handle,
                      const float* scale_a, const float* scale_b, EMMTranspose mode,
-                     float alpha_val, float beta_val, int ldc_override = -1)
+                     float alpha_val, float beta_val, int ldc_override = -1,
+                     int lda_override = -1, int ldb_override = -1)
 {
     bool has_bias = (bias != nullptr);
 
@@ -140,15 +141,17 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
     cublasLtMatrixLayout_t BLayout;
     cublasLtMatrixLayout_t DLayout;
     cublasLtMatrixLayout_t CLayout;
+    int lda = (lda_override > 0) ? lda_override : (transA ? k : m);
     if (transA) {
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&ALayout, to_cuda_lib_type_enum<FloatA>, k, m, k));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&ALayout, to_cuda_lib_type_enum<FloatA>, k, m, lda));
     } else {
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&ALayout, to_cuda_lib_type_enum<FloatA>, m, k, m));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&ALayout, to_cuda_lib_type_enum<FloatA>, m, k, lda));
     }
+    int ldb = (ldb_override > 0) ? ldb_override : (transB ? n : k);
     if (transB) {
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&BLayout, to_cuda_lib_type_enum<FloatB>, n, k, n));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&BLayout, to_cuda_lib_type_enum<FloatB>, n, k, ldb));
     } else {
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&BLayout, to_cuda_lib_type_enum<FloatB>, k, n, k));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&BLayout, to_cuda_lib_type_enum<FloatB>, k, n, ldb));
     }
     int ldc = (ldc_override > 0) ? ldc_override : m;
     // cuBLASLt requires C in FP8 mode to be BF16 or FP32... (sigh)
@@ -235,8 +238,8 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
 
                 const cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
                 const cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
-                const int lda = transA ? k : m;
-                const int ldb = transB ? n : k;
+                const int lda_fb = (lda_override > 0) ? lda_override : (transA ? k : m);
+                const int ldb_fb = (ldb_override > 0) ? ldb_override : (transB ? n : k);
 
                 // Use the explicit alpha/beta values
                 float alpha_copy = alpha_val;
@@ -249,8 +252,8 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
                     opA, opB,
                     m, n, k,
                     alpha_ptr,
-                    a, to_cuda_lib_type_enum<FloatA>, lda,
-                    b, to_cuda_lib_type_enum<FloatB>, ldb,
+                    a, to_cuda_lib_type_enum<FloatA>, lda_fb,
+                    b, to_cuda_lib_type_enum<FloatB>, ldb_fb,
                     beta_ptr,
                     d, to_cuda_lib_type_enum<FloatC>, ldc_fallback,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -262,8 +265,8 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
                         opA, opB,
                         m, n, k,
                         alpha_ptr,
-                        a, to_cuda_lib_type_enum<FloatA>, lda,
-                        b, to_cuda_lib_type_enum<FloatB>, ldb,
+                        a, to_cuda_lib_type_enum<FloatA>, lda_fb,
+                        b, to_cuda_lib_type_enum<FloatB>, ldb_fb,
                         beta_ptr,
                         d, to_cuda_lib_type_enum<FloatC>, ldc_fallback,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
@@ -387,6 +390,45 @@ void matmul_strided_c(float* c, const float* a, const float* b, const float* bia
     float alpha = 1.0f;
     float beta = accumulate ? 1.0f : 0.0f;
     matmul_cublaslt(c, a, b, bias, workspace, workspace_size, M, N, K, stream, handle, scale_a, scale_b, mode, alpha, beta, ldc);
+}
+
+/**
+ * @brief Performs matrix multiplication with explicit leading dimensions for A, B, and C.
+ *
+ * Allows reading from strided input matrices and writing to strided output.
+ * Use lda/ldb/ldc = -1 for default leading dimensions.
+ */
+void matmul_strided(nv_bfloat16* c, const nv_bfloat16* a, const nv_bfloat16* b, const nv_bfloat16* bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream) {
+    float alpha = 1.0f;
+    float beta = accumulate ? 1.0f : 0.0f;
+    matmul_cublaslt(c, a, b, bias, workspace, workspace_size, M, N, K, stream, handle, scale_a, scale_b, mode, alpha, beta, ldc, lda, ldb);
+}
+
+void matmul_strided(float* c, const float* a, const float* b, const float* bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream) {
+    float alpha = 1.0f;
+    float beta = accumulate ? 1.0f : 0.0f;
+    matmul_cublaslt(c, a, b, bias, workspace, workspace_size, M, N, K, stream, handle, scale_a, scale_b, mode, alpha, beta, ldc, lda, ldb);
+}
+
+void matmul_strided(float* c, const nv_bfloat16* a, const nv_bfloat16* b, const float* bias,
+                    const float* scale_a, const float* scale_b,
+                    cublasLtHandle_t handle, std::byte* workspace, std::size_t workspace_size,
+                    int M, int N, int K, EMMTranspose mode, bool accumulate,
+                    int lda, int ldb, int ldc,
+                    cudaStream_t stream) {
+    float alpha = 1.0f;
+    float beta = accumulate ? 1.0f : 0.0f;
+    matmul_cublaslt(c, a, b, bias, workspace, workspace_size, M, N, K, stream, handle, scale_a, scale_b, mode, alpha, beta, ldc, lda, ldb);
 }
 
 /**
