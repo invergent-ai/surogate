@@ -2533,9 +2533,10 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             continue;
         }
         if (op.policy == RecomputePolicy::FftOnly && lora_only_mode) {
-            // Avoid recomputing attention outputs in LoRA mode.
-            // LoRA O-proj backward expects the original forward attention activations.
-            if (op.op_type == "flash_attention") {
+            // Avoid recomputing attention outputs in LoRA mode only when we have a single
+            // micro-step. With gradient accumulation, we must recompute per micro-step
+            // to avoid stale attention activations from micro-step 0.
+            if (op.op_type == "flash_attention" && ctx.rs.GradAccumSteps <= 1) {
                 continue;
             }
         }
@@ -2554,7 +2555,9 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         // In LoRA mode, only skip recompute for non-deterministic ops that must reuse
         // the original forward activations (e.g., flash_attention outputs for O-proj).
         if (lora_only_mode && !op.lora_targets.empty() && op.op_type == "flash_attention") {
-            continue;
+            if (ctx.rs.GradAccumSteps <= 1) {
+                continue;
+            }
         }
 
         // In hybrid models, the recompute plan contains ops for all block types

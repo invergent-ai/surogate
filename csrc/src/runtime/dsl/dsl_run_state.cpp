@@ -399,7 +399,10 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {out_size, V});
 
     // RoPE frequencies (if not using fused RoPE).
-    const int max_seq_len = static_cast<int>(T);
+    int max_seq_len = static_cast<int>(T);
+    if (cfg.Rope.is_multimodal() && cfg.MaxPositionEmbeddings > max_seq_len) {
+        max_seq_len = cfg.MaxPositionEmbeddings;
+    }
     if (max_seq_len > 0) {
         const int head_size = cfg.head_size();
         const RopeInvFreq rope_params = compute_rope_inv_freq(cfg, head_size, max_seq_len);

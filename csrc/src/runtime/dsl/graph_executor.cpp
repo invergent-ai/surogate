@@ -14,6 +14,8 @@
 #include "runtime/dsl/recompute_plan.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -23,6 +25,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
 
 #include <cuda_fp16.h>
 #include "runtime/core/fp8_scaling_state.h"
@@ -134,6 +137,104 @@ Tensor recompute_lora_rmsnorm(modules::LoRARunState& lora_rs, const Tensor& resi
     rmsnorm_forward(lora_rs.recompute_ln, lora_rs.recompute_rstd,
                     residual, weight, nullptr, eps, B, T, C, stream);
     return lora_rs.recompute_ln;
+}
+
+// ---------------------------------------------------------------------------
+// Debug tensor dump helpers (env-driven, for onboarding / forward-match tests)
+// ---------------------------------------------------------------------------
+
+std::string debug_dump_sanitize(const std::string& name) {
+    std::string result;
+    result.reserve(name.size());
+    for (char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.') {
+            result += c;
+        } else {
+            result += '_';
+        }
+    }
+    return result;
+}
+
+void debug_dump_tensor(const std::string& name, const Tensor& t,
+                       const std::string& dump_dir, cudaStream_t stream) {
+    if (!t.Data || t.nelem() <= 0) {
+        return;
+    }
+    const std::string safe = debug_dump_sanitize(name);
+    const std::size_t nelem = static_cast<std::size_t>(t.nelem());
+    std::vector<float> host_data(nelem);
+
+    if (t.DType == ETensorDType::FP32) {
+        CUDA_CHECK(cudaMemcpy(host_data.data(), t.Data,
+                              nelem * sizeof(float), cudaMemcpyDeviceToHost));
+    } else if (t.DType == ETensorDType::BF16) {
+        std::vector<uint16_t> bf16_data(nelem);
+        CUDA_CHECK(cudaMemcpy(bf16_data.data(), t.Data,
+                              nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < nelem; ++i) {
+            uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+            float val;
+            std::memcpy(&val, &bits, sizeof(float));
+            host_data[i] = val;
+        }
+    } else if (t.DType == ETensorDType::FP16) {
+        std::vector<uint16_t> fp16_data(nelem);
+        CUDA_CHECK(cudaMemcpy(fp16_data.data(), t.Data,
+                              nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < nelem; ++i) {
+            __half h;
+            std::memcpy(&h, &fp16_data[i], sizeof(__half));
+            host_data[i] = __half2float(h);
+        }
+    } else {
+        // Unsupported dtype for dump — skip silently
+        return;
+    }
+
+    // Write binary data
+    const std::string bin_path = dump_dir + "/" + safe + ".bin";
+    FILE* bin_f = std::fopen(bin_path.c_str(), "wb");
+    if (bin_f) {
+        std::fwrite(host_data.data(), sizeof(float), nelem, bin_f);
+        std::fclose(bin_f);
+    }
+
+    // Write JSON metadata
+    const std::string json_path = dump_dir + "/" + safe + ".json";
+    FILE* json_f = std::fopen(json_path.c_str(), "w");
+    if (json_f) {
+        std::fprintf(json_f, "{\"name\": \"%s\", \"dtype\": \"float32\", \"shape\": [", name.c_str());
+        for (int i = 0; i < t.Rank; ++i) {
+            std::fprintf(json_f, "%ld%s", t.Sizes[i], (i + 1 < t.Rank) ? ", " : "");
+        }
+        std::fprintf(json_f, "]}\n");
+        std::fclose(json_f);
+    }
+}
+
+std::vector<std::string> debug_dump_parse_tensor_list(const char* env_val) {
+    std::vector<std::string> names;
+    if (!env_val || !*env_val) {
+        return names;
+    }
+    std::string s(env_val);
+    std::size_t pos = 0;
+    while (pos < s.size()) {
+        auto next = s.find(',', pos);
+        if (next == std::string::npos) {
+            next = s.size();
+        }
+        std::string tok = s.substr(pos, next - pos);
+        // Trim whitespace
+        while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+        while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+        if (!tok.empty()) {
+            names.push_back(std::move(tok));
+        }
+        pos = next + 1;
+    }
+    return names;
 }
 
 }  // namespace
@@ -517,7 +618,53 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
     mCompiledExecutor->set_embedding_outputs(mEmbeddingOutputs);
     mCompiledExecutor->set_slot_registry(&mCompiler->slot_registry());
-    mCompiledExecutor->set_debug_dump_fn(nullptr);
+    // Wire up debug dump callback (used by ops for non-finite diagnostics).
+    mCompiledExecutor->set_debug_dump_fn(
+        [this](const std::vector<std::string>& names, int /*layer_idx*/) {
+            const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            if (!dir_env || !*dir_env) {
+                return;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            for (const auto& name : names) {
+                const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
+                if (t && t->Data) {
+                    debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
+                }
+            }
+        });
+    // Per-layer dump callback: dump block-prefixed tensors at layer boundaries
+    // (before shared activation buffers are overwritten by the next layer).
+    mCompiledExecutor->set_debug_dump_layer_fn(
+        [this](int layer_idx) {
+            const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+            const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
+                return;
+            }
+            const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+            auto tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+            bool found = false;
+            for (const auto& name : tensor_names) {
+                if (name.rfind(prefix, 0) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            for (const auto& name : tensor_names) {
+                if (name.rfind(prefix, 0) != 0) {
+                    continue;
+                }
+                const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
+                if (t && t->Data) {
+                    debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
+                }
+            }
+        });
 
     // Graphs will be compiled lazily on first forward when B/T are known
     mCompiledB = 0;
@@ -620,6 +767,25 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mCompiledExecutor->save_tensors(mSaveList);
     }
     mCompiledExecutor->set_capturing(false);
+
+    // Post-forward debug tensor dump (env-driven).
+    const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+    const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+    if (dump_tensors_env && dump_dir_env && *dump_tensors_env && *dump_dir_env) {
+        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        const std::string dump_dir(dump_dir_env);
+        auto tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        for (const auto& name : tensor_names) {
+            // Skip block-prefixed tensors — already dumped at layer boundaries.
+            if (name.rfind("blocks[", 0) == 0) {
+                continue;
+            }
+            const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
+            if (t && t->Data) {
+                debug_dump_tensor(name, *t, dump_dir, rs.MainStream);
+            }
+        }
+    }
 }
 
 void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,

@@ -419,6 +419,9 @@ Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_ma
         if (it == saved.end()) {
             return nullptr;
         }
+        if (it->second.Data != nullptr) {
+            return &it->second;
+        }
         std::vector<long> shape(it->second.Sizes.begin(), it->second.Sizes.begin() + it->second.Rank);
         if (auto it_live = st.tensors.find(key); it_live != st.tensors.end()) {
             if (tensor_shape_matches(it_live->second, shape)) {

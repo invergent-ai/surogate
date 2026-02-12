@@ -23,6 +23,12 @@ void CompiledExecutor::dispatch_deepstack_inject(const CompiledOp& op) {
                                  : static_cast<int>(mConfig.HiddenSize);
     const int N = B * T;
 
+    // Visual embeddings are external inputs; sanitize any NaN/Inf to avoid
+    // corrupting the residual stream and downstream loss/gradients.
+    if (src.DType == ETensorDType::BF16 || src.DType == ETensorDType::FP32) {
+        sanitize_non_finite(src, mRunState.MainStream);
+    }
+
     std::size_t temp_bytes = mask_scatter_temp_bytes(N);
     Tensor temp = mRunState.temp_alloc(ETensorDType::BYTE, {static_cast<long>(temp_bytes)});
     mTemps.push_back(temp);
@@ -70,4 +76,3 @@ void CompiledExecutor::dispatch_deepstack_inject_backward(const CompiledOp& op) 
 }
 
 }  // namespace dsl
-

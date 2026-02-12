@@ -11,7 +11,6 @@ sequence_len: 2048
 
 num_epochs: 2
 eval_steps: 25
-save_steps: 0
 
 learning_rate: 2e-4
 

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import os
 
 from surogate.core.datasets.datasets import disable_datasets_caching
 from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \

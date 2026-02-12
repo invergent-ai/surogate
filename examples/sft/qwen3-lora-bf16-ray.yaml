@@ -1,7 +1,5 @@
 model: Qwen/Qwen3-0.6B
 output_dir: ./output
-merge_adapter: false
-apply_recommended_values: false
 
 distributed:
   ray_address: "auto"      # or "ray://192.168.1.100:6379"

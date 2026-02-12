@@ -148,7 +148,7 @@ bool refresh_moe_experts_if_needed(int layer_idx,
         return false;
     }
     auto* provider = weights.qlora_provider();
-    if (!provider) {
+    if (!provider || !provider->supports_selective_moe()) {
         return false;
     }
     modules::SelectiveExpertInfo selection;
@@ -452,7 +452,7 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     if (base_field == "ln1" || base_field == "ln1_flat" ||
         base_field == "ln" || base_field == "ln_flat") return &acts.ln1;
     if (base_field == "ln2" || base_field == "ln2_flat") return &acts.ln2;
-    if (base_field == "qkv") return &acts.qkv;
+    if (base_field == "qkv" || base_field == "qkv_norm") return &acts.qkv;
     if (base_field == "qkv_rope") {
         Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
         return &src;
@@ -571,12 +571,33 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         return mSlotRegistry->is_shared(strip_ssa_suffix(name));
     };
 
+    auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
+        if (!mSlotRegistry) {
+            return std::nullopt;
+        }
+        int lid = -1;
+        std::string fld;
+        if (parse_block_param(name, lid, fld)) {
+            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(fld))) {
+                return entry->slot == TensorSlot::Mapped;
+            }
+        }
+        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
+            return entry->slot == TensorSlot::Mapped;
+        }
+        return std::nullopt;
+    };
+
     auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
         if (force_persist) {
             return true;
         }
         if (!recompute_enabled || prefer_live) {
             return false;
+        }
+        auto mapped = is_mapped_slot(name);
+        if (mapped.has_value() && mapped.value()) {
+            return true;
         }
         auto shared = is_shared_slot(name);
         if (shared.has_value()) {
@@ -630,7 +651,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             if (base_field == "ln1" || base_field == "ln1_flat" ||
                 base_field == "ln" || base_field == "ln_flat") return acts.ln1;
             if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
-            if (base_field == "qkv") return acts.qkv;
+            if (base_field == "qkv" || base_field == "qkv_norm") return acts.qkv;
             if (base_field == "qkv_rope") {
                 Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
                 return src;
@@ -731,7 +752,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             shape = {B, T, MUp};
         } else if (base_field == "swiglu") {
             shape = {B, T, D};
-        } else if (base_field == "qkv" || base_field == "qkv_rope") {
+        } else if (base_field == "qkv" || base_field == "qkv_rope" || base_field == "qkv_norm") {
             shape = {B, T, QKV};
         } else if (base_field == "att") {
             shape = {B, T, AttnDim};
@@ -766,6 +787,9 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             continue;
         }
 
+        const bool force_persist_name =
+            (name == "xF_flat" || name == "xF" || name == "ln_final" ||
+             name == "ln_final_rstd" || name == "residual_final" || name == "final_residual");
         const bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
                                     name.find("scatter_indices") != std::string::npos ||
                                     name.find("routing_weights") != std::string::npos ||
@@ -776,7 +800,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
                                     name.find("expert_") != std::string::npos);
         const bool prefer_live = prefer_live_tensor(name);
         const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
-        const bool need_persist = should_persist(name, prefer_live, force_persist);
+        const bool need_persist = should_persist(name, prefer_live, force_persist || force_persist_name);
 
         // Block-level tensors may be stack-backed and persisted by
         // persist_saved_layer_tensors() during execute_forward.  Pre-allocate
@@ -809,6 +833,31 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         std::size_t inferred_bytes = 0;
         if (infer_block_bytes(name, inferred_bytes)) {
             ensure_buffer(name, inferred_bytes);
+            continue;
+        }
+        // Infer sizes for non-block tensors (xF_flat, ln_final, etc.)
+        {
+            const long B = (mB > 0) ? mB : mRunState.B;
+            const long T = (mT > 0) ? mT : mRunState.T;
+            const long C = mConfig.HiddenSize;
+            if (B > 0 && T > 0 && C > 0) {
+                const std::size_t elem_size = static_cast<std::size_t>(get_dtype_size(ETensorDType::BF16));
+                std::size_t nbytes = 0;
+                if (name == "xF_flat") {
+                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
+                } else if (name == "ln_final" || name == "xF") {
+                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
+                } else if (name == "ln_final_rstd") {
+                    nbytes = static_cast<std::size_t>(B * T) * sizeof(float);
+                } else if (name == "encoded" || name == "x0") {
+                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
+                } else if (name == "final_residual" || name == "residual_final") {
+                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
+                }
+                if (nbytes > 0) {
+                    ensure_buffer(name, nbytes);
+                }
+            }
         }
     }
 }
@@ -949,6 +998,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     };
 
     for (const auto& name : save_list) {
+        const bool force_persist_name =
+            (name == "xF_flat" || name == "xF" || name == "ln_final" ||
+             name == "ln_final_rstd" || name == "residual_final" || name == "final_residual");
         // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed),
         // unless we are forcing a persistent copy to replace metadata-only entries.
         auto saved_it = mSaved->find(name);
@@ -973,17 +1025,17 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                                         name.find("expert_") != std::string::npos);
             const bool prefer_live = prefer_live_tensor(name);
             const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
-            save_tensor_with_policy(name, it->second, prefer_live, force_persist);
+            save_tensor_with_policy(name, it->second, prefer_live, force_persist || force_persist_name);
             continue;
         }
 
         // Check special tensors
         if (name == "token_ids") {
-            save_tensor_with_policy(name, mRunState.Inputs, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.Inputs, prefer_live_tensor(name), force_persist_name);
             continue;
         }
         if (name == "position_ids") {
-            save_tensor_with_policy(name, mRunState.PositionIDs, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.PositionIDs, prefer_live_tensor(name), force_persist_name);
             continue;
         }
 
@@ -998,71 +1050,71 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             // Map common saved fields
             const bool prefer_live = prefer_live_tensor(name);
             if (field == "ln1_rstd" || field == "ln_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1_rstd, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1_rstd, prefer_live, force_persist_name);
             } else if (field == "ln2_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2_rstd, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2_rstd, prefer_live, force_persist_name);
             } else if (field == "q_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).q_rstd, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).q_rstd, prefer_live, force_persist_name);
             } else if (field == "k_rstd") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).k_rstd, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).k_rstd, prefer_live, force_persist_name);
             } else if (field == "lse") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).lse, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).lse, prefer_live, force_persist_name);
             } else if (field == "ln1" || field == "ln1_flat" || field == "ln" || field == "ln_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln1, prefer_live, force_persist_name);
             } else if (field == "ln2" || field == "ln2_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2, prefer_live, false);
-            } else if (field == "qkv") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).qkv, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).ln2, prefer_live, force_persist_name);
+            } else if (field == "qkv" || field == "qkv_norm") {
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).qkv, prefer_live, force_persist_name);
             } else if (field == "qkv_rope") {
                 // qkv_rope has RoPE applied - save it if available, otherwise fall back to qkv
                 auto& acts = mRunState.simplified_acts(layer_idx);
                 Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                save_tensor_with_policy(name, src, prefer_live, false);
+                save_tensor_with_policy(name, src, prefer_live, force_persist_name);
             } else if (field == "qkv_flat") {
                 // Save the flattened version for matmul backward shape resolution
                 Tensor qkv = mRunState.simplified_acts(layer_idx).qkv;
                 Tensor flat = view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
-                save_tensor_with_policy(name, flat, prefer_live, false);
+                save_tensor_with_policy(name, flat, prefer_live, force_persist_name);
             } else if (field == "att" || field == "att_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att, prefer_live, force_persist_name);
             } else if (field == "att_out" || field == "att_out_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att_out, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).att_out, prefer_live, force_persist_name);
             } else if (field == "mlp_up" || field == "mlp_up_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_up, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_up, prefer_live, force_persist_name);
             } else if (field == "swiglu") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).swiglu, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).swiglu, prefer_live, force_persist_name);
             } else if (field == "swiglu_flat") {
                 Tensor swiglu = mRunState.simplified_acts(layer_idx).swiglu;
                 Tensor flat = view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
-                save_tensor_with_policy(name, flat, prefer_live, false);
+                save_tensor_with_policy(name, flat, prefer_live, force_persist_name);
             } else if (field == "mlp_down" || field == "mlp_down_flat") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_down, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).mlp_down, prefer_live, force_persist_name);
             } else if (field == "res_att" || field == "residual_att") {
-                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).residual_att, prefer_live, false);
+                save_tensor_with_policy(name, mRunState.simplified_acts(layer_idx).residual_att, prefer_live, force_persist_name);
             } else if (field == "res_ffn" || field == "residual_ffn" || field == "res_in") {
                 // res_ffn is the residual stream after FFN block (residual_att + mlp_down)
                 Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
-                save_tensor_with_policy(name, res, prefer_live, false);
+                save_tensor_with_policy(name, res, prefer_live, force_persist_name);
             } else if (mWeights.has(name)) {
                 (*mSaved)[name] = mWeights.get(name);
             } else {
                 throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
             }
         } else if (name == "ln_final" || name == "xF") {
-            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final, prefer_live_tensor(name), force_persist_name);
         } else if (name == "final_residual" || name == "residual_final") {
-            save_tensor_with_policy(name, mRunState.get_final_residual(), prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.get_final_residual(), prefer_live_tensor(name), force_persist_name);
         } else if (name == "xF_flat") {
             // Save the flattened version for matmul backward
             Tensor ln_final = mRunState.non_block_activations().ln_final;
             Tensor flat = view_tensor(ln_final, {ln_final.Sizes[0] * ln_final.Sizes[1], ln_final.Sizes[2]});
-            save_tensor_with_policy(name, flat, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, flat, prefer_live_tensor(name), force_persist_name);
         } else if (name == "ln_final_rstd") {
-            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final_rstd, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.non_block_activations().ln_final_rstd, prefer_live_tensor(name), force_persist_name);
         } else if (name == "encoded" || name == "x0") {
-            save_tensor_with_policy(name, mRunState.non_block_activations().encoded, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.non_block_activations().encoded, prefer_live_tensor(name), force_persist_name);
         } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-            save_tensor_with_policy(name, mRunState.non_block_activations().freq_cis, prefer_live_tensor(name), false);
+            save_tensor_with_policy(name, mRunState.non_block_activations().freq_cis, prefer_live_tensor(name), force_persist_name);
         } else if (mWeights.has(name)) {
             (*mSaved)[name] = mWeights.get(name);
         } else {
@@ -1143,7 +1195,7 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
         if (field == "ln2_rstd") return map_view(acts.ln2_rstd);
         if (field == "q_rstd") return map_view(acts.q_rstd);
         if (field == "k_rstd") return map_view(acts.k_rstd);
-        if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased") return map_view(acts.qkv);
+        if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased" || field == "qkv_norm") return map_view(acts.qkv);
         if (field == "qkv_rope") {
             Tensor* base = acts.qkv_rope.Data ? &acts.qkv_rope : &acts.qkv;
             return map_view(*base);
@@ -1651,7 +1703,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (base_field == "ln1" || base_field == "ln1_flat" ||
                 base_field == "ln" || base_field == "ln_flat") return acts.ln1;
             if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
-            if (base_field == "qkv") return acts.qkv;
+            if (base_field == "qkv" || base_field == "qkv_norm") return acts.qkv;
             if (base_field == "qkv_rope") {
                 Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
                 return src;
@@ -1926,6 +1978,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (op.layer_end >= 0) {
             if (op.layer_end < num_layers &&
                 layer_active[static_cast<std::size_t>(op.layer_end)]) {
+                // Debug dump per-layer tensors before shared buffers are overwritten.
+                if (mDebugDumpLayerFn) {
+                    mDebugDumpLayerFn(op.layer_end);
+                }
                 if (mConfig.NumExperts > 0) {
                     save_moe_layer_tensors(op.layer_end);
                 }

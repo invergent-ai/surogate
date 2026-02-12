@@ -201,8 +201,15 @@ def build_multimodal_payload(model, tokenizer) -> Tuple[Dict[str, np.ndarray], D
     input_ids = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
     attention_mask = torch.ones_like(input_ids)
 
-    pixel_values = torch.zeros((1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32, device=device)
-    image_embeds, deepstack_image_embeds = model.get_image_features(pixel_values, image_grid_thw=image_grid_thw)
+    # pixel_values must be shaped so patch_embed.view(-1, C, temporal_ps, ps, ps) works.
+    # For Qwen3-VL: Conv3d(3, dim, kernel_size=(2, 16, 16), stride=(2, 16, 16))
+    temporal_ps = config.vision_config.temporal_patch_size
+    n_patches = grid_h * grid_w  # spatial patches (temporal already folded in grid)
+    pixel_values = torch.zeros(
+        (n_patches, 3, temporal_ps, patch_size, patch_size), dtype=torch.float32, device=device
+    )
+    with torch.no_grad():
+        image_embeds, deepstack_image_embeds = model.get_image_features(pixel_values, image_grid_thw=image_grid_thw)
     image_embeds = image_embeds[0]
 
     expected_layers = len(getattr(model.visual, "deepstack_visual_indexes", []))
@@ -276,6 +283,8 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     result: Dict[str, np.ndarray] = {}
     layer_outs: Dict[int, torch.Tensor] = {}
     mid_states: Dict[int, torch.Tensor] = {}
+    pre_norm: Dict[str, torch.Tensor] = {}
+    post_norm: Dict[str, torch.Tensor] = {}
     hooks = []
 
     text_model = model.model.language_model
@@ -299,6 +308,17 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
             )
         )
 
+    def pre_norm_hook(_module, args):
+        if args and isinstance(args[0], torch.Tensor):
+            pre_norm["value"] = args[0].detach().clone()
+
+    def post_norm_hook(_module, _args, output):
+        if isinstance(output, torch.Tensor):
+            post_norm["value"] = output.detach().clone()
+
+    hooks.append(text_model.norm.register_forward_pre_hook(pre_norm_hook))
+    hooks.append(text_model.norm.register_forward_hook(post_norm_hook))
+
     with torch.no_grad():
         input_ids = torch.tensor(inputs, device="cuda", dtype=torch.long)
         _ = model(input_ids=input_ids, use_cache=False)
@@ -307,13 +327,15 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
             result[f"layer_output_{i}"] = layer_outs[i].float().cpu().numpy()
             result[f"mid_state_{i}"] = mid_states[i].float().cpu().numpy()
 
-        pre_norm = layer_outs[NUM_LAYERS - 1]
-        result["pre_norm"] = pre_norm.float().cpu().numpy()
+        pre = pre_norm.get("value", layer_outs[NUM_LAYERS - 1])
+        post = post_norm.get("value")
+        if post is None:
+            post = text_model.norm(pre)
 
-        post_norm = text_model.norm(pre_norm)
-        result["post_norm"] = post_norm.float().cpu().numpy()
+        result["pre_norm"] = pre.float().cpu().numpy()
+        result["post_norm"] = post.float().cpu().numpy()
 
-        logits = model.lm_head(post_norm)
+        logits = model.lm_head(post)
         result["logits"] = logits.float().cpu().numpy()
 
     for h in hooks:
@@ -340,6 +362,8 @@ def run_hf_forward_multimodal(model_dir: Path) -> Tuple[Dict[str, np.ndarray], D
     result: Dict[str, np.ndarray] = {}
     layer_outs: Dict[int, torch.Tensor] = {}
     mid_states: Dict[int, torch.Tensor] = {}
+    pre_norm: Dict[str, torch.Tensor] = {}
+    post_norm: Dict[str, torch.Tensor] = {}
     hooks = []
 
     text_model = model.model.language_model
@@ -363,6 +387,17 @@ def run_hf_forward_multimodal(model_dir: Path) -> Tuple[Dict[str, np.ndarray], D
             )
         )
 
+    def pre_norm_hook(_module, args):
+        if args and isinstance(args[0], torch.Tensor):
+            pre_norm["value"] = args[0].detach().clone()
+
+    def post_norm_hook(_module, _args, output):
+        if isinstance(output, torch.Tensor):
+            post_norm["value"] = output.detach().clone()
+
+    hooks.append(text_model.norm.register_forward_pre_hook(pre_norm_hook))
+    hooks.append(text_model.norm.register_forward_hook(post_norm_hook))
+
     with torch.no_grad():
         _ = model(
             input_ids=hf_inputs["input_ids"],
@@ -376,13 +411,15 @@ def run_hf_forward_multimodal(model_dir: Path) -> Tuple[Dict[str, np.ndarray], D
             result[f"layer_output_{i}"] = layer_outs[i].float().cpu().numpy()
             result[f"mid_state_{i}"] = mid_states[i].float().cpu().numpy()
 
-        pre_norm = layer_outs[NUM_LAYERS - 1]
-        result["pre_norm"] = pre_norm.float().cpu().numpy()
+        pre = pre_norm.get("value", layer_outs[NUM_LAYERS - 1])
+        post = post_norm.get("value")
+        if post is None:
+            post = text_model.norm(pre)
 
-        post_norm = text_model.norm(pre_norm)
-        result["post_norm"] = post_norm.float().cpu().numpy()
+        result["pre_norm"] = pre.float().cpu().numpy()
+        result["post_norm"] = post.float().cpu().numpy()
 
-        logits = model.lm_head(post_norm)
+        logits = model.lm_head(post)
         result["logits"] = logits.float().cpu().numpy()
 
     for h in hooks:

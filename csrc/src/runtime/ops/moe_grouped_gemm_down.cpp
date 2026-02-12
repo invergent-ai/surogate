@@ -350,7 +350,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     const int num_active = compact.num_active;
 
     // Refresh MoE experts for this layer (selective dequant) before using weights in backward.
-    if (mWeights.qlora_provider()) {
+    auto* qlora_provider = mWeights.qlora_provider();
+    if (qlora_provider && qlora_provider->supports_selective_moe()) {
         if (!compact.host_offsets.empty()) {
             (void)refresh_moe_experts_if_needed(layer_idx,
                                                 compact.host_offsets.data(),

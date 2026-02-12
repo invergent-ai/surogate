@@ -430,7 +430,6 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
     const int world = local_world_size();
     const std::size_t mask_stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
     const std::size_t embed_stride = mask_stride * static_cast<std::size_t>(mConfig->HiddenSize);
-
     for (int i = 0; i < world; ++i) {
         const std::int32_t* mask_ptr = visual_pos_masks ? (visual_pos_masks + i * mask_stride) : nullptr;
         const float* embed_ptr = visual_embeds ? (visual_embeds + i * embed_stride) : nullptr;
@@ -439,7 +438,6 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
         for (const float* base_ptr : deepstack_visual_embeds) {
             deepstack_ptrs.push_back(base_ptr ? (base_ptr + i * embed_stride) : nullptr);
         }
-
         run_work([mask_ptr, embed_ptr, deepstack_ptrs](sThreadContext& ctx) {
             auto& rs = ctx.Model->get_run_state();
             if (!rs.VisualPosMasks_CPU.Data || !rs.VisualEmbeds_CPU.Data) {

@@ -103,6 +103,9 @@ public:
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }
+    void set_debug_dump_layer_fn(std::function<void(int)> fn) {
+        mDebugDumpLayerFn = std::move(fn);
+    }
 
     // Cache management
     void set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache);
@@ -273,6 +276,7 @@ private:
     std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
     std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
     std::function<void(const std::vector<std::string>&, int)> mDebugDumpFn;
+    std::function<void(int)> mDebugDumpLayerFn;
 
     // For embedding backward
     const Tensor* mLastInputsCpu = nullptr;

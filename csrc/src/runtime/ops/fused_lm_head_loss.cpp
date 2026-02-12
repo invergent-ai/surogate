@@ -159,9 +159,11 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     // Robustly seed d_loss even if the name has SSA suffixes or mapped to loss/losses.
     const std::string d_loss_name = strip_ssa_suffix(op.inputs[0].name);
     bool d_loss_seeded = false;
+    const bool d_loss_like = starts_with(d_loss_name, "d_loss") ||
+        d_loss_name == "loss" || d_loss_name == "losses";
     if (op.inputs[0].slot == TensorSlot::DLoss ||
         op.inputs[0].slot == TensorSlot::Losses ||
-        d_loss_name == "d_loss" || d_loss_name == "loss" || d_loss_name == "losses") {
+        d_loss_like) {
         fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
         d_loss_seeded = true;
     }

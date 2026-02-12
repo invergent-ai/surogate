@@ -140,7 +140,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     }
 
     // Refresh MoE expert weights for this layer using the current routing offsets.
-    if (host_offsets_ptr && layer_idx_any >= 0) {
+    auto* qlora_provider = mWeights.qlora_provider();
+    if (host_offsets_ptr && layer_idx_any >= 0 &&
+        qlora_provider && qlora_provider->supports_selective_moe()) {
         (void)refresh_moe_experts_if_needed(layer_idx_any,
                                             host_offsets_ptr,
                                             num_experts,
@@ -489,7 +491,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     const int num_active = compact.num_active;
 
     // Refresh MoE experts for this layer (selective dequant) before using weights in backward.
-    if (mWeights.qlora_provider()) {
+    auto* qlora_provider = mWeights.qlora_provider();
+    if (qlora_provider && qlora_provider->supports_selective_moe()) {
         if (!compact.host_offsets.empty()) {
             (void)refresh_moe_experts_if_needed(layer_idx,
                                                 compact.host_offsets.data(),

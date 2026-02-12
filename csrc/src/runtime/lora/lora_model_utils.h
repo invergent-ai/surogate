@@ -686,164 +686,35 @@ inline void backward_lora_qkv_fused(
 
     if (!has_q && !has_k && !has_v) return;
 
+    (void)intermediate2;
+
     // Offsets into packed QKV gradient tensor
     const int q_offset = 0;
     const int k_offset = q_out_features;
     const int v_offset = q_out_features + kv_out_features;
-    const long full_qkv_features = dL_dy.Sizes[dL_dy.Rank - 1];
 
-    // Helper to extract a slice from packed QKV gradient
-    auto extract_slice = [&](int offset, int features) -> Tensor {
-        if (offset == 0 && features == full_qkv_features) {
-            return dL_dy;
-        }
-        Tensor packed = slice_buffer;
-        packed.DType = dL_dy.DType;
-        packed.Rank = 2;
-        packed.Sizes[0] = BT;
-        packed.Sizes[1] = features;
-        for (int i = 2; i < MAX_TENSOR_DIM; ++i) packed.Sizes[i] = 1;
-
-        const std::size_t elem_size = get_dtype_size(dL_dy.DType);
-        const std::size_t src_pitch = (std::size_t)full_qkv_features * elem_size;
-        const std::size_t dst_pitch = (std::size_t)features * elem_size;
-        const std::size_t width = (std::size_t)features * elem_size;
-        const std::byte* src_ptr = dL_dy.Data + (std::size_t)offset * elem_size;
-        CUDA_CHECK(cudaMemcpy2DAsync(packed.Data, dst_pitch, src_ptr, src_pitch, width, (std::size_t)BT,
-                                     cudaMemcpyDeviceToDevice, stream));
-        return packed;
+    auto backward_proj = [&](bool enabled,
+                             Tensor& dA, Tensor& dB,
+                             const LoRALayerWeights<Tensor>& lora,
+                             int offset, int out_features,
+                             unsigned int seed) {
+        if (!enabled) return;
+        backward_lora_layer(
+            dA, dB,
+            dx,
+            dL_dy, offset,
+            x,
+            lora.A, lora.B,
+            scaling,
+            dropout_prob, seed, is_training,
+            intermediate1, slice_buffer,
+            BT, in_features, out_features, rank, accumulate,
+            handle, workspace, stream);
     };
 
-    // =======================================================================
-    // Phase 1 & 2: For each projection, compute x @ A^T, then dB
-    // This reuses x across all projections
-    // =======================================================================
-
-    if (has_q) {
-        Tensor dL_dy_q = extract_slice(q_offset, q_out_features);
-
-        // intermediate1 = x @ A_q^T (BT x rank)
-        matmul(intermediate1, lora_q.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask as forward
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_q, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
-
-        // dB_q = intermediate1^T @ dL_dy_q
-        matmul(dB_q, intermediate1, dL_dy_q, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, q_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // intermediate2 = B_q @ dL_dy_q^T (for dA_q and dx)
-        matmul(intermediate2, lora_q.B, dL_dy_q, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, q_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask to gradient (backprop through dropout)
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_q, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
-
-        // dA_q = x^T @ intermediate2
-        matmul(dA_q, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // dx += intermediate2 @ A_q
-        matmul(dx, lora_q.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
-    }
-
-    if (has_k) {
-        Tensor dL_dy_k = extract_slice(k_offset, kv_out_features);
-
-        // intermediate1 = x @ A_k^T (BT x rank)
-        matmul(intermediate1, lora_k.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask as forward
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_k, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
-
-        // dB_k = intermediate1^T @ dL_dy_k
-        matmul(dB_k, intermediate1, dL_dy_k, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // intermediate2 = B_k @ dL_dy_k^T
-        matmul(intermediate2, lora_k.B, dL_dy_k, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask to gradient (backprop through dropout)
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_k, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
-
-        // dA_k = x^T @ intermediate2
-        matmul(dA_k, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // dx += intermediate2 @ A_k
-        matmul(dx, lora_k.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
-    }
-
-    if (has_v) {
-        Tensor dL_dy_v = extract_slice(v_offset, kv_out_features);
-
-        // intermediate1 = x @ A_v^T (BT x rank)
-        matmul(intermediate1, lora_v.A, x, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask as forward
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_v, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
-        }
-
-        // dB_v = intermediate1^T @ dL_dy_v
-        matmul(dB_v, intermediate1, dL_dy_v, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, kv_out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // intermediate2 = B_v @ dL_dy_v^T
-        matmul(intermediate2, lora_v.B, dL_dy_v, std::nullopt, nullptr, nullptr,
-               handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
-
-        // Apply same dropout mask to gradient (backprop through dropout)
-        if (is_training && dropout_prob > 0.0f) {
-            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_v, stream);
-        }
-
-        if (scaling != 1.0f) {
-            vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
-        }
-
-        // dA_v = x^T @ intermediate2
-        matmul(dA_v, x, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
-
-        // dx += intermediate2 @ A_v
-        matmul(dx, lora_v.A, intermediate2, std::nullopt, nullptr, nullptr,
-               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
-    }
+    backward_proj(has_q, dA_q, dB_q, lora_q, q_offset, q_out_features, dropout_seed_q);
+    backward_proj(has_k, dA_k, dB_k, lora_k, k_offset, kv_out_features, dropout_seed_k);
+    backward_proj(has_v, dA_v, dB_v, lora_v, v_offset, kv_out_features, dropout_seed_v);
 }
 
 /**

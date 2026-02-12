@@ -1367,11 +1367,23 @@ class SurogateTrainer:
     def validate(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32]) -> float:
         """
         Compute validation loss for one batch (forward only).
-        
+
         Parameters:
         - inputs: int32 token ids shaped [batch_size * world_size, seq_length].
         - targets: int32 token ids shaped [batch_size * world_size, seq_length].
-        
+
+        Returns: loss (float).
+        """
+    def validate(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32],
+                 position_ids: npt.NDArray[np.int32]) -> float:
+        """
+        Compute validation loss for one batch (forward only) with explicit position ids.
+
+        Parameters:
+        - inputs: int32 token ids shaped [batch_size * world_size, seq_length].
+        - targets: int32 token ids shaped [batch_size * world_size, seq_length].
+        - position_ids: int32 position ids shaped [planes, batch_size * world_size, seq_length].
+
         Returns: loss (float).
         """
     @property

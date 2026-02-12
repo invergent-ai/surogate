@@ -9,7 +9,8 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 10
+num_epochs: 2
+eval_steps: 25
 
 learning_rate: 2e-4
 recipe: nvfp4

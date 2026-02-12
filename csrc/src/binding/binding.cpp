@@ -999,6 +999,51 @@ NB_MODULE(_surogate, m) {
              "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
              "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].\n\n"
              "Returns: loss (float).")
+        .def("validate", [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {
+            const int local_gpus = trainer->local_world_size();
+            const int batch_size = trainer->batch_size();
+            const int seq_len = trainer->seq_length();
+            CHECK_SHAPE(inputs, batch_size * local_gpus, seq_len);
+            CHECK_SHAPE(targets, batch_size * local_gpus, seq_len);
+            if (position_ids.shape(0) < 1) {
+                throw std::runtime_error("position_ids must have at least 1 plane");
+            }
+            if (position_ids.shape(1) != batch_size * local_gpus || position_ids.shape(2) != seq_len) {
+                throw std::runtime_error("position_ids must have shape [planes, batch_size * local_gpus, seq_length]");
+            }
+
+            if (local_gpus == 1) {
+                return trainer->validate(inputs.data(), targets.data(), position_ids.data());
+            }
+
+            const int planes = static_cast<int>(position_ids.shape(0));
+            const std::size_t per_rank = static_cast<std::size_t>(planes) *
+                                         static_cast<std::size_t>(batch_size) *
+                                         static_cast<std::size_t>(seq_len);
+            std::vector<std::int32_t> reordered(static_cast<std::size_t>(local_gpus) * per_rank);
+            const std::int32_t* src = position_ids.data();
+            for (int r = 0; r < local_gpus; ++r) {
+                std::int32_t* dst_rank = reordered.data() + static_cast<std::size_t>(r) * per_rank;
+                for (int p = 0; p < planes; ++p) {
+                    for (int b = 0; b < batch_size; ++b) {
+                        const std::size_t src_base = (static_cast<std::size_t>(p) * batch_size * local_gpus +
+                                                      static_cast<std::size_t>(r) * batch_size +
+                                                      static_cast<std::size_t>(b)) * seq_len;
+                        const std::size_t dst_base = (static_cast<std::size_t>(p) * batch_size +
+                                                      static_cast<std::size_t>(b)) * seq_len;
+                        std::memcpy(dst_rank + dst_base, src + src_base, sizeof(std::int32_t) * seq_len);
+                    }
+                }
+            }
+
+            return trainer->validate(inputs.data(), targets.data(), reordered.data());
+        }, nb::arg("inputs"), nb::arg("targets"), nb::arg("position_ids"),
+             "Compute validation loss for one batch (forward only) with 3D position ids.\n\n"
+             "Parameters:\n"
+             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
+             "- position_ids: int32 position ids shaped [planes, batch_size * local_gpus, seq_length].\n\n"
+             "Returns: loss (float).")
         .def("update_with_config", [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& config, int step){
             auto [loss, norm] = trainer->update_with_config(config, step);
             nb::dict ret;

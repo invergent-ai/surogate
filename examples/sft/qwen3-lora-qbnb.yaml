@@ -13,7 +13,7 @@ eval_steps: 25
 learning_rate: 2e-4
 
 recipe: bf16
-debug_memory_breakdown: true
+
 lora: true
 lora_rank: 16
 lora_alpha: 32

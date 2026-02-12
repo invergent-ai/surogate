@@ -53,6 +53,9 @@ public:
         return false;
     }
 
+    /// Returns true if provider supports selective MoE expert refresh.
+    [[nodiscard]] virtual bool supports_selective_moe() const { return false; }
+
     /// Prefetch offloaded weights for a given layer to GPU.
     ///
     /// Called by the graph executor ahead of layer computation to overlap
