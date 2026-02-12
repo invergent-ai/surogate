@@ -11,6 +11,7 @@
 
 #include <array>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <optional>
 #include <limits>
@@ -144,6 +145,7 @@ struct TensorRef {
     std::string name;            // For Parameter/Saved/Mapped slots
     std::vector<long> shape;     // Pre-computed shape (empty = use base tensor shape)
     ETensorDType dtype = ETensorDType::BF16;
+    bool is_gradient = false;    // True for gradient tensors (d_ prefix) — avoids runtime string checks
 };
 
 // ============================================================================
@@ -238,6 +240,13 @@ struct CompiledGraph {
 
     // Pre-computed skip mask for partial execution
     std::vector<char> required_mask;
+
+    // Pre-computed last-use information for tensor lifetime management in backward pass.
+    // last_use_names[i] contains the names of tensors whose last use is at op index i.
+    // last_use_index maps tensor name -> last op index that references it.
+    // Both computed once during graph compilation instead of rebuilt every backward call.
+    std::vector<std::vector<std::string>> last_use_names;
+    std::unordered_map<std::string, std::size_t> last_use_index;
 
     // Statistics
     std::size_t total_ops = 0;

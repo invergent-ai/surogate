@@ -308,7 +308,8 @@ private:
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
                          const modules::ForwardHook* hook);
     void execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
-                          int micro_step, const modules::BackwardHook* hook);
+                          int micro_step, const modules::BackwardHook* hook,
+                          bool skip_zeroing = false);
 };
 
 }  // namespace dsl

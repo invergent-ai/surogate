@@ -237,6 +237,12 @@ private:
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
 
+    // Pre-built name tables for LoRA backward (avoids per-layer string construction).
+    // Indexed by layer. Populated lazily on first use.
+    std::vector<std::string> mLoRALn1Names;  // ln1_weight or norm_weight per layer
+    std::vector<std::string> mLoRALn2Names;  // ln2_weight or norm_weight per layer
+    void build_lora_name_tables();
+
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;
     int mShardIdx = 0;

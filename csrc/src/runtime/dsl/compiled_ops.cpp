@@ -1232,7 +1232,10 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
 
-    if (!ref.name.empty()) {
+    // Only check gradient resolution for tensors flagged as gradients at compile time.
+    // This avoids calling base_param_from_grad() (string substr + find) for the ~80%
+    // of tensors that are activations/weights, not gradients.
+    if (ref.is_gradient && !ref.name.empty()) {
         if (auto base = base_param_from_grad(ref.name)) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
@@ -1589,9 +1592,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
-    std::vector<DeviceMemoryStack::Checkpoint> layer_checkpoints;
-    std::vector<std::size_t> layer_temp_marks;
-    std::vector<char> layer_active;
+    // Reuse member vectors to avoid per-forward heap allocations.
+    auto& layer_checkpoints = mLayerCheckpoints;
+    auto& layer_temp_marks = mLayerTempMarks;
+    auto& layer_active = mLayerActive;
     if (num_layers > 0) {
         layer_checkpoints.resize(static_cast<std::size_t>(num_layers));
         layer_temp_marks.resize(static_cast<std::size_t>(num_layers));
@@ -2020,7 +2024,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         NCCLCommunicator& comm,
                                         int grad_accum_steps,
                                         int micro_step,
-                                        const modules::BackwardHook* hook) {
+                                        const modules::BackwardHook* hook,
+                                        bool skip_zeroing) {
     mComm = &comm;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
@@ -2031,16 +2036,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mMicroStep = micro_step;
 
     // Clear activation/non-block gradients for each micro-step.
-    // Compiled executor does not go through GraphExecutor's zeroing path.
-    fill_zero(mRunState.non_block_gradients().d_ln_final, mRunState.MainStream);
-    if (mRunState.non_block_gradients().d_embeddings.Data && !mRunState.is_lora_only_mode()) {
-        fill_zero(mRunState.non_block_gradients().d_embeddings, mRunState.MainStream);
+    // When called from GraphExecutor::backward_with_hook(), the caller already zeroes these
+    // buffers, so skip_zeroing=true avoids redundant GPU work.
+    if (!skip_zeroing) {
+        fill_zero(mRunState.non_block_gradients().d_ln_final, mRunState.MainStream);
+        if (mRunState.non_block_gradients().d_embeddings.Data && !mRunState.is_lora_only_mode()) {
+            fill_zero(mRunState.non_block_gradients().d_embeddings, mRunState.MainStream);
+        }
+        if (mConfig.NumLayers > 0) {
+            fill_zero(mRunState.simplified_grads(static_cast<int>(mConfig.NumLayers) - 1).d_res_ffn,
+                      mRunState.MainStream);
+        }
+        mRunState.zero_activation_gradients(mRunState.MainStream);
     }
-    if (mConfig.NumLayers > 0) {
-        fill_zero(mRunState.simplified_grads(static_cast<int>(mConfig.NumLayers) - 1).d_res_ffn,
-                  mRunState.MainStream);
-    }
-    mRunState.zero_activation_gradients(mRunState.MainStream);
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
         mWeightManager->gather_final_norm(comm, mRunState.MainStream);
@@ -2456,30 +2464,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return false;
     };
 
-    // Build last-use map for backward tensors to enable safe pruning/stack restores.
-    // Conservative: includes all ops in the backward graph (even if some are skipped).
-    std::unordered_map<std::string, std::size_t> last_use;
-    if (!graph.ops.empty()) {
-        for (std::size_t i = 0; i < graph.ops.size(); ++i) {
-            const auto& op = graph.ops[i];
-            for (const auto& ref : op.inputs) {
-                if (!ref.name.empty()) {
-                    last_use[ref.name] = i;
-                }
-            }
-            for (const auto& ref : op.outputs) {
-                if (!ref.name.empty()) {
-                    last_use[ref.name] = i;
-                }
-            }
-        }
-    }
-    std::vector<std::vector<std::string>> last_use_names(graph.ops.size());
-    for (const auto& [name, idx] : last_use) {
-        if (idx < last_use_names.size()) {
-            last_use_names[idx].push_back(name);
-        }
-    }
+    // Use pre-computed last-use data from graph compilation (avoids rebuilding every backward).
+    const auto& last_use_names = graph.last_use_names;
+    const auto& last_use = graph.last_use_index;
     auto prune_by_last_use = [&](std::size_t idx) {
         if (idx >= last_use_names.size()) {
             return;

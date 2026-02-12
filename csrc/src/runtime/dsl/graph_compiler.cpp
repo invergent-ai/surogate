@@ -336,6 +336,8 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                                             const Operation& op, const ShapeEnv& env) {
     TensorRef ref;
     ref.name = name;
+    // Pre-compute gradient flag at compile time to avoid runtime string prefix checks.
+    ref.is_gradient = starts_with(name, "d_");
 
     // Check for saved tensor prefix
     std::string effective_name = name;
@@ -2341,6 +2343,31 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);
+
+    // Pre-compute last-use information for tensor lifetime management.
+    // This avoids rebuilding the last_use map on every backward pass.
+    {
+        auto& last_use = result.last_use_index;
+        for (std::size_t i = 0; i < result.ops.size(); ++i) {
+            const auto& cop = result.ops[i];
+            for (const auto& ref : cop.inputs) {
+                if (!ref.name.empty()) {
+                    last_use[ref.name] = i;
+                }
+            }
+            for (const auto& ref : cop.outputs) {
+                if (!ref.name.empty()) {
+                    last_use[ref.name] = i;
+                }
+            }
+        }
+        result.last_use_names.resize(result.ops.size());
+        for (const auto& [tname, idx] : last_use) {
+            if (idx < result.last_use_names.size()) {
+                result.last_use_names[idx].push_back(tname);
+            }
+        }
+    }
 
     return result;
 }

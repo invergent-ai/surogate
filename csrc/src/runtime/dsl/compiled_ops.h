@@ -28,6 +28,7 @@
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "kernels/kernels.h"
+#include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
 
@@ -81,11 +82,14 @@ public:
                          const modules::ForwardHook* hook);
 
     // Execute a compiled backward graph
+    // When skip_zeroing is true, gradient buffers are assumed to already be zeroed by the caller
+    // (e.g., GraphExecutor::backward_with_hook zeros them before calling execute_backward).
     void execute_backward(const CompiledGraph& graph,
                           NCCLCommunicator& comm,
                           int grad_accum_steps,
                           int micro_step,
-                          const modules::BackwardHook* hook);
+                          const modules::BackwardHook* hook,
+                          bool skip_zeroing = false);
 
     // Set optional components
     void set_lora_state(const modules::ModularLoRAConfig* config,
@@ -308,6 +312,11 @@ private:
     // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)
     std::unordered_map<std::string, void*> mMoeSavedBuffers;
     std::unordered_map<std::string, size_t> mMoeSavedSizes;
+
+    // Reusable per-forward layer tracking vectors (avoid heap allocation every forward call).
+    std::vector<DeviceMemoryStack::Checkpoint> mLayerCheckpoints;
+    std::vector<std::size_t> mLayerTempMarks;
+    std::vector<char> mLayerActive;
 
 public:
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).

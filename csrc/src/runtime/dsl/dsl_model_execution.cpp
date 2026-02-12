@@ -24,6 +24,27 @@
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+void DslModel::build_lora_name_tables() {
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    mLoRALn1Names.resize(num_layers);
+    mLoRALn2Names.resize(num_layers);
+    for (int i = 0; i < num_layers; ++i) {
+        const std::string idx = std::to_string(i);
+        std::string ln1 = "blocks[" + idx + "].ln1_weight";
+        if (!mParams->has(ln1)) {
+            ln1 = "blocks[" + idx + "].norm_weight";
+        }
+        mLoRALn1Names[i] = std::move(ln1);
+
+        std::string ln2 = "blocks[" + idx + "].ln2_weight";
+        if (!mParams->has(ln2)) {
+            ln2 = "blocks[" + idx + "].norm_weight";
+        }
+        mLoRALn2Names[i] = std::move(ln2);
+    }
+}
+
 void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
@@ -252,6 +273,11 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
 
+    // Lazily build pre-formatted weight name tables (once, avoids per-layer string construction).
+    if (mLoRALn1Names.empty()) {
+        build_lora_name_tables();
+    }
+
     mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
 
     auto hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream, modules::BackwardHookPoint point, void* context) {
@@ -322,12 +348,8 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 Tensor ln2_input;
                 if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
-                        // Standard blocks use "ln2_weight"; some architectures may use "norm_weight"
-                        std::string ln2_name = "blocks[" + std::to_string(layer_idx) + "].ln2_weight";
-                        if (!mParams->has(ln2_name)) {
-                            ln2_name = "blocks[" + std::to_string(layer_idx) + "].norm_weight";
-                        }
-                        Tensor& ln2_weight = mParams->get(ln2_name);
+                        // Use pre-built name table (avoids per-layer string construction).
+                        Tensor& ln2_weight = mParams->get(mLoRALn2Names[layer_idx]);
                         // Prefer using recomputed residual_att from simplified_acts.
                         // Fallback: Standard blocks use res_ffn[L-1]; hybrid blocks use res_in[L].
                         Tensor ln2_residual;
@@ -456,12 +478,8 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 Tensor ln1_input;
                 if (mOptions.recompute_enabled()) {
                     if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
-                        // Standard blocks use "ln1_weight"; Nemotron-H blocks use "norm_weight"
-                        std::string ln1_name = "blocks[" + std::to_string(layer_idx) + "].ln1_weight";
-                        if (!mParams->has(ln1_name)) {
-                            ln1_name = "blocks[" + std::to_string(layer_idx) + "].norm_weight";
-                        }
-                        Tensor& ln1_weight = mParams->get(ln1_name);
+                        // Use pre-built name table (avoids per-layer string construction).
+                        Tensor& ln1_weight = mParams->get(mLoRALn1Names[layer_idx]);
                         Tensor ln1_residual;
                         if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
                             // Hybrid blocks store their own LN input as res_in[L] at index L

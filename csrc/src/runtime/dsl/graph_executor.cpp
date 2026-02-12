@@ -621,7 +621,7 @@ void GraphExecutor::init_compiled_execution() {
     // Wire up debug dump callback (used by ops for non-finite diagnostics).
     mCompiledExecutor->set_debug_dump_fn(
         [this](const std::vector<std::string>& names, int /*layer_idx*/) {
-            const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            static const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
             if (!dir_env || !*dir_env) {
                 return;
             }
@@ -637,8 +637,8 @@ void GraphExecutor::init_compiled_execution() {
     // (before shared activation buffers are overwritten by the next layer).
     mCompiledExecutor->set_debug_dump_layer_fn(
         [this](int layer_idx) {
-            const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-            const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+            static const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
             if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
                 return;
             }
@@ -768,9 +768,9 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
     }
     mCompiledExecutor->set_capturing(false);
 
-    // Post-forward debug tensor dump (env-driven).
-    const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-    const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+    // Post-forward debug tensor dump (env-driven, cached to avoid per-step getenv).
+    static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+    static const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
     if (dump_tensors_env && dump_dir_env && *dump_tensors_env && *dump_dir_env) {
         CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
         const std::string dump_dir(dump_dir_env);
@@ -789,7 +789,8 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
 }
 
 void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
-                                     int micro_step, const modules::BackwardHook* hook) {
+                                     int micro_step, const modules::BackwardHook* hook,
+                                     bool skip_zeroing) {
     compile_graphs(B, T);
 
     if (!mCompiledBackward || !mCompiledExecutor) {
@@ -820,7 +821,8 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
         mCompiledExecutor->set_recompute_enabled(mOptions.recompute_enabled());
         mCompiledExecutor->set_recompute_use_graphs(use_graphs && !capturing);
         mCompiledExecutor->set_capturing(capturing);
-        mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook);
+        mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook,
+                                             skip_zeroing);
     };
 
     trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mBackwardGraph[graph_idx], use_graphs,
@@ -1107,7 +1109,7 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         }
     }
 
-    execute_backward(B, T, comm, grad_accum_steps, micro_step, nullptr);
+    execute_backward(B, T, comm, grad_accum_steps, micro_step, nullptr, /*skip_zeroing=*/true);
 
     grads.end_micro_step(rs.MainStream, comm);
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
@@ -1406,7 +1408,7 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         rs.configure_backward_graphs(/*hooked=*/true);
     }
 
-    execute_backward(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr);
+    execute_backward(B, T, comm, grad_accum_steps, micro_step, hook ? &hook : nullptr, /*skip_zeroing=*/true);
 
     grads.end_micro_step(rs.MainStream, comm);
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRAGrads) {
