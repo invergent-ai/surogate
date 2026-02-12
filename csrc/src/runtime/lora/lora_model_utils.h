@@ -410,35 +410,26 @@ inline void backward_lora_layer(
     bool accumulate,
     cublasLtHandle_t handle,
     Tensor& workspace,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool skip_dx = false) {
 
     if (!A.Data || !B.Data) return;
 
-    Tensor dL_dy_slice = dL_dy;
     const long full_out_features = dL_dy.Sizes[dL_dy.Rank - 1];
     if (dL_dy_offset < 0 || dL_dy_offset + out_features > full_out_features) {
         throw std::logic_error("backward_lora_layer: dL_dy_offset out of bounds");
     }
 
-    // Pack fused slice into a contiguous buffer.
-    if (dL_dy_offset != 0 || out_features != full_out_features) {
-        Tensor packed = slice_buffer;
-        packed.DType = dL_dy.DType;
-        packed.Rank = 2;
-        packed.Sizes[0] = BT;
-        packed.Sizes[1] = out_features;
-        for (int i = 2; i < MAX_TENSOR_DIM; ++i) packed.Sizes[i] = 1;
+    // Instead of copying the slice via cudaMemcpy2D, create a strided view and
+    // use matmul_strided to read directly from the packed layout.
+    const bool needs_stride = (dL_dy_offset != 0 || out_features != (int)full_out_features);
+    const int ldb_stride = needs_stride ? (int)full_out_features : -1;
 
+    Tensor dL_dy_view = dL_dy;
+    if (needs_stride) {
         const std::size_t elem_size = get_dtype_size(dL_dy.DType);
-        const std::size_t src_pitch = (std::size_t)full_out_features * elem_size;
-        const std::size_t dst_pitch = (std::size_t)out_features * elem_size;
-        const std::size_t width = (std::size_t)out_features * elem_size;
-        const std::byte* src_ptr = dL_dy.Data + (std::size_t)dL_dy_offset * elem_size;
-        CUDA_CHECK(cudaMemcpy2DAsync(packed.Data, dst_pitch, src_ptr, src_pitch, width, (std::size_t)BT,
-                                     cudaMemcpyDeviceToDevice, stream));
-
-        dL_dy_slice = packed;
-        dL_dy_offset = 0;
+        dL_dy_view.Data = dL_dy.Data + (std::size_t)dL_dy_offset * elem_size;
+        dL_dy_view.Sizes[dL_dy_view.Rank - 1] = out_features;
     }
 
     // intermediate = x @ A^T (BT x rank) - recompute forward for dB
@@ -454,13 +445,15 @@ inline void backward_lora_layer(
         vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
     }
 
-    // dB = (x @ A^T)^T @ dL_dy (uses dropout-ed intermediate)
-    matmul(dB, intermediate, dL_dy_slice, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
+    // dB = (x @ A^T)^T @ dL_dy (strided read from packed gradient if needed)
+    matmul_strided(dB, intermediate, dL_dy_view, std::nullopt, nullptr, nullptr,
+                   handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate,
+                   /*lda=*/-1, /*ldb=*/ldb_stride, /*ldc=*/-1, stream);
 
-    // intermediate = B @ dL_dy^T  => (BT x rank) view - gradient w.r.t. dropped activations
-    matmul(intermediate, B, dL_dy_slice, std::nullopt, nullptr, nullptr,
-           handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+    // intermediate = dL_dy @ B^T  => (BT x rank) - gradient w.r.t. dropped activations
+    matmul_strided(intermediate, B, dL_dy_view, std::nullopt, nullptr, nullptr,
+                   handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false,
+                   /*lda=*/-1, /*ldb=*/ldb_stride, /*ldc=*/-1, stream);
 
     // Apply same dropout mask to gradient (backprop through dropout)
     if (is_training && dropout_prob > 0.0f) {
@@ -476,8 +469,10 @@ inline void backward_lora_layer(
            handle, workspace, in_features, rank, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
 
     // dx += (dL_dy @ B) @ A
-    matmul(dx, A, intermediate, std::nullopt, nullptr, nullptr,
-           handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+    if (!skip_dx) {
+        matmul(dx, A, intermediate, std::nullopt, nullptr, nullptr,
+               handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+    }
 }
 
 /**
@@ -627,20 +622,15 @@ inline void backward_lora_expert(
  * @brief Fused backward pass for QKV LoRA projections
  *
  * Optimizes QKV backward by:
- * 1. Computing dL_dy @ B^T for all projections, then batching the dx accumulation
- * 2. Reusing x (ln1) across all three projections instead of redundant loads
- * 3. Reducing kernel launch overhead from 15 matmuls to 12 matmuls
+ * 1. Using strided matmul reads to avoid cudaMemcpy2D slice copies
+ * 2. Reusing x (ln1) across all three projections
+ * 3. Fusing dx accumulation: dx += g_cat @ A_cat (single GEMM instead of 3)
  *
  * Mathematical formulation (for each projection p in {q,k,v}):
  *   dA_p = x^T @ (dL_dy_p @ B_p^T) * scaling
  *   dB_p = (x @ A_p^T)^T @ dL_dy_p * scaling
- *   dx += (dL_dy_p @ B_p^T) @ A_p * scaling
- *
- * Fusion strategy:
- * - Phase 1: Compute x @ A^T for all projections (reuses x)
- * - Phase 2: Compute dB for all projections
- * - Phase 3: Compute dL_dy @ B^T and dA for all projections
- * - Phase 4: Accumulate dx contributions
+ *   dx += (dL_dy_q @ B_q^T) @ A_q + (dL_dy_k @ B_k^T) @ A_k + (dL_dy_v @ B_v^T) @ A_v
+ *       = g_cat @ A_cat  (single fused GEMM)
  */
 inline void backward_lora_qkv_fused(
     // Gradient outputs for Q
@@ -673,9 +663,9 @@ inline void backward_lora_qkv_fused(
     int rank,
     bool accumulate,
     // Intermediates (must be pre-allocated)
-    Tensor& intermediate1,  // (BT, rank) for x @ A^T
-    Tensor& intermediate2,  // (BT, rank) for dL_dy @ B^T
-    Tensor& slice_buffer,   // For slicing packed QKV gradients
+    Tensor& intermediate1,  // (BT, rank) for x @ A^T and g
+    Tensor& intermediate2,  // (BT, rank) — unused (kept for API compat)
+    Tensor& slice_buffer,   // Scratch for g_cat / A_cat packing
     cublasLtHandle_t handle,
     Tensor& workspace,
     cudaStream_t stream) {
@@ -693,28 +683,94 @@ inline void backward_lora_qkv_fused(
     const int k_offset = q_out_features;
     const int v_offset = q_out_features + kv_out_features;
 
-    auto backward_proj = [&](bool enabled,
-                             Tensor& dA, Tensor& dB,
-                             const LoRALayerWeights<Tensor>& lora,
-                             int offset, int out_features,
-                             unsigned int seed) {
-        if (!enabled) return;
-        backward_lora_layer(
-            dA, dB,
-            dx,
-            dL_dy, offset,
-            x,
-            lora.A, lora.B,
-            scaling,
-            dropout_prob, seed, is_training,
-            intermediate1, slice_buffer,
-            BT, in_features, out_features, rank, accumulate,
-            handle, workspace, stream);
+    // Collect active projections for dynamic handling
+    struct ProjInfo {
+        const LoRALayerWeights<Tensor>* lora;
+        Tensor* dA;
+        Tensor* dB;
+        int offset;
+        int out_features;
+        unsigned int seed;
     };
 
-    backward_proj(has_q, dA_q, dB_q, lora_q, q_offset, q_out_features, dropout_seed_q);
-    backward_proj(has_k, dA_k, dB_k, lora_k, k_offset, kv_out_features, dropout_seed_k);
-    backward_proj(has_v, dA_v, dB_v, lora_v, v_offset, kv_out_features, dropout_seed_v);
+    ProjInfo active_projs[3];
+    int n_active = 0;
+
+    if (has_q) active_projs[n_active++] = {&lora_q, &dA_q, &dB_q, q_offset, q_out_features, dropout_seed_q};
+    if (has_k) active_projs[n_active++] = {&lora_k, &dA_k, &dB_k, k_offset, kv_out_features, dropout_seed_k};
+    if (has_v) active_projs[n_active++] = {&lora_v, &dA_v, &dB_v, v_offset, kv_out_features, dropout_seed_v};
+
+    // Single projection: no fusion needed, just call backward_lora_layer directly
+    if (n_active == 1) {
+        const auto& p = active_projs[0];
+        backward_lora_layer(
+            *p.dA, *p.dB, dx,
+            dL_dy, p.offset, x,
+            p.lora->A, p.lora->B,
+            scaling, dropout_prob, p.seed, is_training,
+            intermediate1, slice_buffer,
+            BT, in_features, p.out_features, rank, accumulate,
+            handle, workspace, stream, /*skip_dx=*/false);
+        return;
+    }
+
+    // Multiple projections: fused dx accumulation via g_cat @ A_cat
+    const std::size_t elem_size = get_dtype_size(dL_dy.DType);
+    const std::size_t g_cat_elems = (std::size_t)BT * n_active * rank;
+    const std::size_t a_cat_elems = (std::size_t)n_active * rank * in_features;
+
+    // Carve g_cat (BT, n_active*rank) and A_cat (n_active*rank, C) from slice_buffer
+    Tensor g_cat;
+    g_cat.DType = dL_dy.DType;
+    g_cat.Rank = 2;
+    g_cat.Sizes[0] = BT;
+    g_cat.Sizes[1] = n_active * rank;
+    for (int i = 2; i < MAX_TENSOR_DIM; ++i) g_cat.Sizes[i] = 1;
+    g_cat.Data = slice_buffer.Data;
+
+    Tensor A_cat;
+    A_cat.DType = lora_q.has_value() ? lora_q.A.DType : (lora_k.has_value() ? lora_k.A.DType : lora_v.A.DType);
+    A_cat.Rank = 2;
+    A_cat.Sizes[0] = n_active * rank;
+    A_cat.Sizes[1] = in_features;
+    for (int i = 2; i < MAX_TENSOR_DIM; ++i) A_cat.Sizes[i] = 1;
+    A_cat.Data = slice_buffer.Data + g_cat_elems * elem_size;
+
+    // Process each projection: compute h, dB, g, dA (skip dx — handled below)
+    for (int i = 0; i < n_active; ++i) {
+        const auto& p = active_projs[i];
+
+        // backward_lora_layer with skip_dx=true; intermediate1 holds g after return
+        backward_lora_layer(
+            *p.dA, *p.dB, dx,
+            dL_dy, p.offset, x,
+            p.lora->A, p.lora->B,
+            scaling, dropout_prob, p.seed, is_training,
+            intermediate1, slice_buffer,
+            BT, in_features, p.out_features, rank, accumulate,
+            handle, workspace, stream, /*skip_dx=*/true);
+
+        // Pack g from intermediate1 (BT, rank) into g_cat[:, i*rank:(i+1)*rank]
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            g_cat.Data + (std::size_t)i * rank * elem_size,   // dst (column offset)
+            (std::size_t)(n_active * rank) * elem_size,        // dst pitch
+            intermediate1.Data,                                 // src
+            (std::size_t)rank * elem_size,                      // src pitch
+            (std::size_t)rank * elem_size,                      // width
+            (std::size_t)BT,                                    // height
+            cudaMemcpyDeviceToDevice, stream));
+
+        // Copy A matrix into A_cat[i*rank:(i+1)*rank, :]
+        CUDA_CHECK(cudaMemcpyAsync(
+            A_cat.Data + (std::size_t)i * rank * in_features * elem_size,
+            p.lora->A.Data,
+            (std::size_t)rank * in_features * elem_size,
+            cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // Fused dx += g_cat @ A_cat  (single GEMM: M=C, N=BT, K=n_active*rank)
+    matmul(dx, A_cat, g_cat, std::nullopt, nullptr, nullptr,
+           handle, workspace, in_features, BT, n_active * rank, EMMTranspose::NN, /*accumulate=*/true, stream);
 }
 
 /**
