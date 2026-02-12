@@ -30,7 +30,7 @@ void CompiledExecutor::dispatch_bias_add_backward(const CompiledOp& op) {
 
     // d_input = d_out (pass through)
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
-        mTensorMap[op.outputs[0].name] = d_out;
+        store_tensor(op.outputs[0], d_out);
     }
 
     // d_bias = sum(d_out, axis=[0,1]) for [B,T,C] or axis=0 for [N,C]

@@ -83,7 +83,7 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
 
     mamba_group_rmsnorm_forward(*out_ptr, rstd, gated, weight, eps, B, T, D, groups, mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = *out_ptr;
+    store_tensor(op.outputs[0], *out_ptr);
 
     // Save rstd and gated for backward.
     // Must persist via cudaMalloc because temp_alloc'd stack memory is freed at
@@ -190,9 +190,9 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
     mTemps.push_back(d_gate);
     silu_backward(d_gate, gate, d_gated_times_x, n, mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = d_x;
-    mTensorMap[op.outputs[1].name] = d_gate;
-    mTensorMap[op.outputs[2].name] = d_weight_fp32;
+    store_tensor(op.outputs[0], d_x);
+    store_tensor(op.outputs[1], d_gate);
+    store_tensor(op.outputs[2], d_weight_fp32);
 }
 
 }  // namespace dsl

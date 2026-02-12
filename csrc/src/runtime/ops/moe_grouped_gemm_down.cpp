@@ -66,11 +66,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         }
     }
     if (!expert_offsets_ptr) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it == mTensorMap.end()) {
+        Tensor* moe_offsets_ptr = nullptr;
+        if (op.attrs.moe_offsets_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+            moe_offsets_ptr = &mTensors[op.attrs.moe_offsets_tensor_id];
+        }
+        if (!moe_offsets_ptr) {
             throw std::runtime_error("moe_grouped_gemm_down: expert_offsets not found");
         }
-        expert_offsets_ptr = &it->second;
+        expert_offsets_ptr = moe_offsets_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
     std::vector<int> host_offsets_local;
@@ -231,7 +236,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         }
     }
 
-    mTensorMap[op.outputs[0].name] = out;
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op) {
@@ -255,8 +260,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
         d_input_local = mRunState.temp_alloc(inp.DType, shape);
         mTemps.push_back(d_input_local);
-        auto [it, _] = mTensorMap.insert_or_assign(op.outputs[0].name, d_input_local);
-        d_input_ptr = &it->second;
+        store_tensor(op.outputs[0], d_input_local);
+        d_input_ptr = &mTensors[op.outputs[0].tensor_id];
     } else {
         d_input_ptr = &ensure_output_tensor(op.outputs[0]);
     }
@@ -556,7 +561,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         }
     }
 
-    mTensorMap[op.outputs[0].name] = d_input;
+    store_tensor(op.outputs[0], d_input);
 
     // Weight gradient computation would go here if needed (for fine-tuning experts)
 }

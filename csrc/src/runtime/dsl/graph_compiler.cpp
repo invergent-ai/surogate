@@ -373,6 +373,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                 ref.shape = it->second;
             }
         }
+        ref.tensor_id = assign_tensor_id(ref.name);
         return ref;
     }
 
@@ -393,6 +394,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             // Handle global slots that appear with block indices (e.g., rope_freqs)
             if (slot_entry->scope == ActivationScope::Global) {
                 ref.layer_idx = -1;  // Global, not layer-indexed
+                ref.tensor_id = assign_tensor_id(ref.name);
                 return ref;
             }
 
@@ -411,6 +413,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             if (tmpl.Rank > 0) {
                 ref.shape.assign(tmpl.Sizes.begin(), tmpl.Sizes.begin() + tmpl.Rank);
             }
+            ref.tensor_id = assign_tensor_id(ref.name);
             return ref;
         } else {
             ref.slot = TensorSlot::Mapped;
@@ -432,6 +435,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             }
         }
 
+        ref.tensor_id = assign_tensor_id(ref.name);
         return ref;
     }
 
@@ -477,6 +481,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                     ref.shape = it->second;
                 }
             }
+            ref.tensor_id = assign_tensor_id(ref.name);
             return ref;
         }
     }
@@ -515,6 +520,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     if (auto it = mTensorDtypes.find(ref.name); it != mTensorDtypes.end()) {
         ref.dtype = it->second;
     }
+    ref.tensor_id = assign_tensor_id(ref.name);
     return ref;
 }
 
@@ -830,6 +836,41 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 if (attrs.intermediate_size > 0 && *v > 0) {
                     attrs.n_groups = attrs.intermediate_size / static_cast<int>(*v);
                 }
+            }
+        }
+    }
+
+    // Pre-resolve tensor IDs for side-channel lookups (avoids runtime string hash)
+    if (!attrs.shape_like.empty()) {
+        // Strip __saved_ prefix if present for shape_like references
+        std::string effective = attrs.shape_like;
+        if (starts_with(effective, kSavedPrefix)) {
+            effective = effective.substr(kSavedPrefix.size());
+        }
+        auto it = mTensorIdMap.find(effective);
+        if (it != mTensorIdMap.end()) {
+            attrs.shape_like_tensor_id = it->second;
+        }
+    }
+    if (mConfig.NumExperts > 0) {
+        // MoE ops need pre-resolved IDs for expert_offsets and gather_indices
+        if (type == CompiledOpType::MoEGroupedGemm ||
+            type == CompiledOpType::MoEGroupedGemmGateUp ||
+            type == CompiledOpType::MoEGroupedGemmDown ||
+            type == CompiledOpType::MoEGroupedGemmBackward ||
+            type == CompiledOpType::MoEGroupedGemmGateUpBackward ||
+            type == CompiledOpType::MoEGroupedGemmDownBackward ||
+            type == CompiledOpType::MoEExpertBiasAdd ||
+            type == CompiledOpType::MoEExpertBiasAddBackward ||
+            type == CompiledOpType::MoEPermute ||
+            type == CompiledOpType::MoEPermuteBackward) {
+            if (auto it = mTensorIdMap.find("moe_expert_offsets"); it != mTensorIdMap.end()) {
+                attrs.moe_offsets_tensor_id = it->second;
+            }
+        }
+        if (type == CompiledOpType::MoEPermuteBackward) {
+            if (auto it = mTensorIdMap.find("moe_gather_indices"); it != mTensorIdMap.end()) {
+                attrs.moe_gather_tensor_id = it->second;
             }
         }
     }
@@ -1553,12 +1594,132 @@ void GraphCompiler::validate_operation_shapes(
 }
 
 
+int GraphCompiler::assign_tensor_id(const std::string& name) {
+    auto [it, inserted] = mTensorIdMap.emplace(name, mNextTensorId);
+    if (inserted) mNextTensorId++;
+    return it->second;
+}
+
+void GraphCompiler::register_external_names(CompiledGraph& graph) {
+    // Register well-known tensor names that are bound during execute_forward/backward init
+    // but may not appear in any op's TensorRef (e.g., they are injected before the dispatch loop).
+    static const char* const kForwardNames[] = {
+        "token_ids", "position_ids", "visual_pos_masks", "visual_embeds", "x0",
+    };
+    for (const char* name : kForwardNames) {
+        assign_tensor_id(name);
+    }
+
+    // Backward init bindings
+    static const char* const kBackwardNames[] = {
+        "d_logits", "d_logits_flat",
+        "d_xF_flat", "d_xF", "d_ln_final", "d_ln_final_flat",
+        "d_encoded", "d_x0",
+        "d_xN", "d_residualN",
+    };
+    for (const char* name : kBackwardNames) {
+        assign_tensor_id(name);
+    }
+
+    // MoE side-channel tensors (produced by moe_permute, consumed by grouped_gemm ops)
+    if (mConfig.NumExperts > 0) {
+        assign_tensor_id("moe_expert_offsets");
+        assign_tensor_id("moe_gather_indices");
+    }
+
+    // Deepstack visual embed tensors (dynamically named)
+    if (mConfig.DeepstackVisualLayers > 0) {
+        for (int i = 0; i < mConfig.DeepstackVisualLayers; ++i) {
+            assign_tensor_id("deepstack_visual_embeds_" + std::to_string(i));
+        }
+    }
+
+    // Parameter gradient tensors (d_<param_name>) — bound during backward init
+    for (const auto& pname : mGrads.param_names()) {
+        assign_tensor_id("d_" + pname);
+    }
+}
+
+void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
+    graph.num_tensors = mNextTensorId;
+    graph.tensor_name_to_id = mTensorIdMap;
+    graph.tensor_meta.resize(static_cast<std::size_t>(mNextTensorId));
+
+    for (const auto& [name, id] : mTensorIdMap) {
+        TensorMeta meta;
+
+        // Check "layer" prefix (cross-layer connector tensors)
+        if (name.rfind("layer", 0) == 0) {
+            meta.flags |= TensorMeta::kCrossLayer;
+        }
+
+        // Check MoE special names
+        if (name == "moe_expert_offsets") {
+            meta.flags |= TensorMeta::kMoeOffsets;
+        }
+        if (name == "moe_gather_indices") {
+            meta.flags |= TensorMeta::kMoeGather;
+        }
+
+        // Check "d_blocks[N]." pattern
+        if (name.rfind("d_blocks[", 0) == 0) {
+            meta.flags |= TensorMeta::kDBlocks;
+            auto bracket_pos = name.find('[');
+            auto close_pos = name.find(']');
+            if (bracket_pos != std::string::npos && close_pos != std::string::npos && close_pos > bracket_pos) {
+                try {
+                    meta.block_layer_idx = std::stoi(name.substr(bracket_pos + 1, close_pos - bracket_pos - 1));
+                } catch (...) {
+                    meta.block_layer_idx = -1;
+                }
+            }
+        }
+        // Check "blocks[N]." pattern (non-gradient)
+        else if (name.rfind("blocks[", 0) == 0) {
+            meta.flags |= TensorMeta::kBlocks;
+            auto bracket_pos = name.find('[');
+            auto close_pos = name.find(']');
+            if (bracket_pos != std::string::npos && close_pos != std::string::npos && close_pos > bracket_pos) {
+                try {
+                    meta.block_layer_idx = std::stoi(name.substr(bracket_pos + 1, close_pos - bracket_pos - 1));
+                } catch (...) {
+                    meta.block_layer_idx = -1;
+                }
+            }
+        }
+
+        graph.tensor_meta[static_cast<std::size_t>(id)] = meta;
+    }
+
+    // Build SSA-stripped name -> highest-suffix tensor_id map
+    for (const auto& [name, id] : mTensorIdMap) {
+        const std::string base = strip_ssa_suffix(name);
+        auto [it, inserted] = graph.ssa_base_to_id.emplace(base, id);
+        if (!inserted) {
+            // Keep the highest SSA suffix ID (which is the latest version)
+            // Compare suffix values to determine which is "highest"
+            const auto& existing_name = [&]() -> const std::string& {
+                for (const auto& [n, i] : mTensorIdMap) {
+                    if (i == it->second) return n;
+                }
+                return name; // fallback
+            }();
+            // Simple heuristic: higher tensor_id = later in compilation = latest SSA version
+            if (id > it->second) {
+                it->second = id;
+            }
+        }
+    }
+}
+
 CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     update_dimensions(B, T);
 
     mExtraShapes.clear();
     mTensorShapes.clear();
     mTensorDtypes.clear();
+    mTensorIdMap.clear();
+    mNextTensorId = 0;
 
     // Initialize shape database from graph inputs and params
     for (const auto& [name, info] : graph.inputs) {
@@ -2343,6 +2504,13 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);
+
+    // Register external tensor names (init bindings, MoE side-channel, param gradients)
+    // that may not appear in any op's TensorRef but are used at runtime.
+    register_external_names(result);
+
+    // Build per-tensor metadata for pruning and the SSA base-to-ID map.
+    build_tensor_metadata(result);
 
     // Pre-compute last-use information for tensor lifetime management.
     // This avoids rebuilding the last_use map on every backward pass.

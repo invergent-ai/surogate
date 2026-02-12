@@ -44,7 +44,7 @@ void CompiledExecutor::dispatch_moe_softmax(const CompiledOp& op) {
                             num_tokens, num_experts, mRunState.MainStream);
     }
 
-    mTensorMap[op.outputs[0].name] = out;
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_softmax_backward(const CompiledOp& op) {
@@ -79,7 +79,7 @@ void CompiledExecutor::dispatch_moe_softmax_backward(const CompiledOp& op) {
                              num_tokens, num_experts, mRunState.MainStream);
     }
 
-    mTensorMap[op.outputs[0].name] = d_logits;
+    store_tensor(op.outputs[0], d_logits);
 }
 
 

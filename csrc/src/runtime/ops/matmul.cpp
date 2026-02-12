@@ -296,8 +296,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             Tensor t = mRunState.temp_alloc(shape_source.DType, shape);
             fill_zero(t, mRunState.MainStream);
             mTemps.push_back(t);
-            auto [it, _] = mTensorMap.insert_or_assign(ref.name, t);
-            return it->second;
+            store_tensor(ref, t);
+            return mTensors[ref.tensor_id];
         }
         return ensure_output_tensor(ref);
     };

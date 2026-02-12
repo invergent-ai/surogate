@@ -59,11 +59,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
         }
     }
     if (!expert_offsets_ptr) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it == mTensorMap.end()) {
+        Tensor* moe_offsets_fwd_ptr = nullptr;
+        if (op.attrs.moe_offsets_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+            moe_offsets_fwd_ptr = &mTensors[op.attrs.moe_offsets_tensor_id];
+        }
+        if (!moe_offsets_fwd_ptr) {
             throw std::runtime_error("moe_grouped_gemm_gate_up: expert_offsets not found");
         }
-        expert_offsets_ptr = &it->second;
+        expert_offsets_ptr = moe_offsets_fwd_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
     if (expert_offsets.DType != ETensorDType::INT32) {
@@ -379,8 +384,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             }
         }
     }
-    
-    mTensorMap[op.outputs[0].name] = out;
+
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const CompiledOp& op) {
@@ -394,8 +399,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
         std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
         Tensor tmp = mRunState.temp_alloc(inp.DType, shape);
         mTemps.push_back(tmp);
-        auto [it, _] = mTensorMap.insert_or_assign(op.outputs[0].name, tmp);
-        d_input_ptr = &it->second;
+        store_tensor(op.outputs[0], tmp);
+        d_input_ptr = &mTensors[op.outputs[0].tensor_id];
     }
     if (d_input_ptr->Device == -1 && mRunState.Stack.owns(d_input_ptr->Data)) {
         d_input_ptr->Device = mRunState.Stack.device_id();
@@ -429,11 +434,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
         }
     }
     if (!expert_offsets_ptr) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it == mTensorMap.end()) {
+        Tensor* moe_offsets_bwd_ptr = nullptr;
+        if (op.attrs.moe_offsets_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+            moe_offsets_bwd_ptr = &mTensors[op.attrs.moe_offsets_tensor_id];
+        }
+        if (!moe_offsets_bwd_ptr) {
             throw std::runtime_error("moe_grouped_gemm_gate_up_backward: expert_offsets not found");
         }
-        expert_offsets_ptr = &it->second;
+        expert_offsets_ptr = moe_offsets_bwd_ptr;
     }
 
     // Use the persistent buffer directly instead of tensorMap
@@ -750,7 +760,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
         }
     }
 
-    mTensorMap[op.outputs[0].name] = *d_input_ptr;
+    store_tensor(op.outputs[0], *d_input_ptr);
 
     // Weight gradient computation would go here if needed (for fine-tuning experts)
 }

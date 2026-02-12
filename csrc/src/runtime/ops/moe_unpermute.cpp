@@ -61,7 +61,7 @@ void CompiledExecutor::dispatch_moe_unpermute(const CompiledOp& op) {
         throw std::logic_error("moe_unpermute: unsupported expert_out dtype");
     }
 
-    mTensorMap[op.outputs[0].name] = out;
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
@@ -141,8 +141,8 @@ void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
         throw std::logic_error("moe_unpermute_backward: unsupported d_output dtype");
     }
 
-    mTensorMap[op.outputs[0].name] = d_expert_out;
-    mTensorMap[op.outputs[1].name] = d_routing_weights;
+    store_tensor(op.outputs[0], d_expert_out);
+    store_tensor(op.outputs[1], d_routing_weights);
 }
 
 

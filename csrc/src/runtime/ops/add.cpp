@@ -40,7 +40,7 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // the data pointer causes shared storage between residual and branch gradients,
     // which breaks LoRA (it does in-place dx accumulation).
     // IMPORTANT: We must get the base tensor directly from simplified_grads(), not via
-    // resolve_tensor(), because resolve_tensor() may return a view from mTensorMap.
+    // resolve_tensor(), because resolve_tensor() may return a cached view from mTensors.
     auto assign_output = [&](const TensorRef& ref) {
         Tensor* base_grad = nullptr;
         if (ref.layer_idx >= 0) {
@@ -69,7 +69,7 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                     CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
                                                cudaMemcpyDeviceToDevice, mRunState.MainStream));
                 }
-                mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+                store_tensor(ref, view_tensor(*base_grad, ref.shape));
                 return;
             }
             // For stack-allocated gradient temps, allocate proper storage instead of aliasing.
@@ -85,16 +85,16 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                 mTemps.push_back(*base_grad);
                 CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
                                            cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+                store_tensor(ref, view_tensor(*base_grad, ref.shape));
                 return;
             }
             // Fall back to aliasing if the base grad has no storage yet (non-stack temps).
             base_grad->Data = d_out.Data;
-            mTensorMap[ref.name] = view_tensor(*base_grad, ref.shape);
+            store_tensor(ref, view_tensor(*base_grad, ref.shape));
             return;
         }
         // Default: just expose d_out as-is.
-        mTensorMap[ref.name] = d_out;
+        store_tensor(ref, d_out);
     };
 
     assign_output(op.outputs[0]);

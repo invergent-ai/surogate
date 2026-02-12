@@ -63,7 +63,7 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
                                  B, T, conv_dim, kernel, silu,
                                  mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = *out_ptr;
+    store_tensor(op.outputs[0], *out_ptr);
 }
 
 void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
@@ -103,10 +103,10 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
                                   B, T, conv_dim, kernel, silu,
                                   mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = dx;
-    mTensorMap[op.outputs[1].name] = dweight_fp32;
+    store_tensor(op.outputs[0], dx);
+    store_tensor(op.outputs[1], dweight_fp32);
     if (op.outputs.size() > 2 && dbias_fp32) {
-        mTensorMap[op.outputs[2].name] = *dbias_fp32;
+        store_tensor(op.outputs[2], *dbias_fp32);
     }
 }
 

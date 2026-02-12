@@ -19,7 +19,7 @@ namespace dsl {
 void CompiledExecutor::dispatch_view(const CompiledOp& op) {
     Tensor& src = resolve_tensor(op.inputs[0]);
     Tensor view = view_tensor(src, op.attrs.shape);
-    mTensorMap[op.outputs[0].name] = view;
+    store_tensor(op.outputs[0], view);
 }
 
 void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
@@ -47,11 +47,18 @@ void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
             }
         }
 
-        // Check tensor map
-        if (!ref) {
-            auto it = mTensorMap.find(ref_name);
-            if (it != mTensorMap.end()) {
-                ref = &it->second;
+        // Check flat tensor vector via pre-resolved shape_like_tensor_id
+        if (!ref && op.attrs.shape_like_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.shape_like_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.shape_like_tensor_id].Data) {
+            ref = &mTensors[op.attrs.shape_like_tensor_id];
+        }
+
+        // Fall back to name-based lookup in flat vector
+        if (!ref && mCurrentGraph) {
+            int tid = mCurrentGraph->find_tensor_id(ref_name);
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+                ref = &mTensors[tid];
             }
         }
 
@@ -112,7 +119,7 @@ void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
                                 " shape_like=" + op.attrs.shape_like);
     }
     Tensor view = view_tensor(d_out, shape);
-    mTensorMap[op.outputs[0].name] = view;
+    store_tensor(op.outputs[0], view);
 }
 
 

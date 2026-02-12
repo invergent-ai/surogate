@@ -36,7 +36,7 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act(const CompiledOp& op) {
             throw std::logic_error("gpt_oss_moe_act: unsupported input dtype");
         }
 
-        mTensorMap[op.outputs[0].name] = out;
+        store_tensor(op.outputs[0], out);
 
         const char* debug_env = std::getenv("SUROGATE_DEBUG_MOE_LOGITS");
         const bool debug_logits = (debug_env && *debug_env && std::string(debug_env) != "0");
@@ -146,8 +146,8 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act_backward(const CompiledOp& op) {
         if (static_cast<long>(d_inp_ptr->nelem()) != expected_inp) {
             d_inp_local = mRunState.temp_alloc(inp.DType, {N, D * 2});
             mTemps.push_back(d_inp_local);
-            auto [it, _] = mTensorMap.insert_or_assign(op.outputs[0].name, d_inp_local);
-            d_inp_ptr = &it->second;
+            store_tensor(op.outputs[0], d_inp_local);
+            d_inp_ptr = &mTensors[op.outputs[0].tensor_id];
         }
         Tensor& d_inp = *d_inp_ptr;
         if (d_out.DType == ETensorDType::BF16) {
@@ -173,8 +173,8 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act_backward(const CompiledOp& op) {
     if (static_cast<long>(d_inp_ptr->nelem()) != expected_inp) {
         d_inp_local = mRunState.temp_alloc(inp.DType, {d_out.Sizes[0], d_out.Sizes[1], D * 2});
         mTemps.push_back(d_inp_local);
-        auto [it, _] = mTensorMap.insert_or_assign(op.outputs[0].name, d_inp_local);
-        d_inp_ptr = &it->second;
+        store_tensor(op.outputs[0], d_inp_local);
+        d_inp_ptr = &mTensors[op.outputs[0].tensor_id];
     }
     Tensor& d_inp = *d_inp_ptr;
     if (d_out.DType == ETensorDType::BF16) {

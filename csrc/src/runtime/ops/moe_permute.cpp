@@ -143,13 +143,13 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     // Store expert_offsets in scatter_indices output for later use
     // Note: scatter_indices tensor is already populated by moe_build_indices
 
-    mTensorMap[op.outputs[0].name] = permuted;
-    mTensorMap[op.outputs[1].name] = scatter_indices;
+    store_tensor(op.outputs[0], permuted);
+    store_tensor(op.outputs[1], scatter_indices);
     // Store expert_offsets for use by grouped GEMM and unpermute
     // Note: expert_offsets lives on the stack; store for this layer in case we need it,
     // but grouped GEMM should prefer host offsets to avoid touching possibly-stale device memory.
-    mTensorMap["moe_expert_offsets"] = expert_offsets;
-    mTensorMap["moe_gather_indices"] = gather_indices;
+    bind_tensor("moe_expert_offsets", expert_offsets);
+    bind_tensor("moe_gather_indices", gather_indices);
 
     // Keep temps for later use
     mTemps.push_back(expert_counts);
@@ -193,8 +193,15 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
         }
     }
     if (!gather_indices) {
-        auto it = mTensorMap.find("moe_gather_indices");
-        gather_indices = (it != mTensorMap.end()) ? &it->second : &gather_indices_saved;
+        // Try flat vector via pre-resolved gather tensor ID
+        if (op.attrs.moe_gather_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_gather_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_gather_tensor_id].Data) {
+            gather_indices = &mTensors[op.attrs.moe_gather_tensor_id];
+        }
+    }
+    if (!gather_indices) {
+        gather_indices = &gather_indices_saved;
     }
 
     const int top_k = op.attrs.top_k;
@@ -217,7 +224,7 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
                              mRunState.MainStream);
     }
 
-    mTensorMap[op.outputs[0].name] = d_input;
+    store_tensor(op.outputs[0], d_input);
 }
 
 

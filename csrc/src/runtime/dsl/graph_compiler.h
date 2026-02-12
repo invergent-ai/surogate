@@ -142,6 +142,7 @@ enum class CompiledOpType : std::uint8_t {
 struct TensorRef {
     TensorSlot slot = TensorSlot::Mapped;
     int layer_idx = -1;          // For block-indexed slots
+    int tensor_id = -1;          // Index into CompiledExecutor::mTensors flat vector (compile-time assigned)
     std::string name;            // For Parameter/Saved/Mapped slots
     std::vector<long> shape;     // Pre-computed shape (empty = use base tensor shape)
     ETensorDType dtype = ETensorDType::BF16;
@@ -164,6 +165,11 @@ struct CompiledAttrs {
     // Shape info
     std::vector<long> shape;
     std::string shape_like;  // Reference tensor name for runtime shape lookup (used by view backward)
+    int shape_like_tensor_id = -1;  // Pre-resolved tensor_id for shape_like (avoids runtime map lookup)
+
+    // MoE side-channel tensor IDs (pre-resolved to avoid runtime string lookups)
+    int moe_offsets_tensor_id = -1;    // Pre-resolved "moe_expert_offsets"
+    int moe_gather_tensor_id = -1;     // Pre-resolved "moe_gather_indices"
 
     // Matmul-specific
     std::optional<modules::MatmulOp> matmul_op;
@@ -227,6 +233,27 @@ struct CompiledOp {
 };
 
 // ============================================================================
+// Tensor metadata for integer-indexed pruning (replaces runtime string parsing)
+// ============================================================================
+
+struct TensorMeta {
+    static constexpr uint8_t kCrossLayer   = 1 << 0;  // name starts with "layer"
+    static constexpr uint8_t kMoeOffsets   = 1 << 1;  // name == "moe_expert_offsets"
+    static constexpr uint8_t kDBlocks      = 1 << 2;  // name starts with "d_blocks["
+    static constexpr uint8_t kBlocks       = 1 << 3;  // name starts with "blocks["
+    static constexpr uint8_t kMoeGather    = 1 << 4;  // name == "moe_gather_indices"
+
+    uint8_t flags = 0;
+    int block_layer_idx = -1;  // For "blocks[N].*" or "d_blocks[N].*", the parsed N
+
+    bool is_cross_layer() const { return flags & kCrossLayer; }
+    bool is_moe_offsets() const { return flags & kMoeOffsets; }
+    bool is_d_blocks() const { return flags & kDBlocks; }
+    bool is_blocks() const { return flags & kBlocks; }
+    bool is_moe_gather() const { return flags & kMoeGather; }
+};
+
+// ============================================================================
 // Compiled Graph
 // ============================================================================
 
@@ -247,6 +274,20 @@ struct CompiledGraph {
     // Both computed once during graph compilation instead of rebuilt every backward call.
     std::vector<std::vector<std::string>> last_use_names;
     std::unordered_map<std::string, std::size_t> last_use_index;
+
+    // Integer-indexed tensor ID system for O(1) runtime tensor lookups.
+    // All tensor names referenced by ops or init bindings are assigned a unique integer ID
+    // during compilation. At runtime, tensors are stored in a flat vector indexed by these IDs.
+    int num_tensors = 0;
+    std::unordered_map<std::string, int> tensor_name_to_id;  // name -> tensor_id (for init bindings + debug)
+    std::vector<TensorMeta> tensor_meta;                     // per-ID pruning metadata
+    std::unordered_map<std::string, int> ssa_base_to_id;     // SSA-stripped name -> highest-suffix tensor_id
+
+    // Look up or return -1
+    int find_tensor_id(const std::string& name) const {
+        auto it = tensor_name_to_id.find(name);
+        return (it != tensor_name_to_id.end()) ? it->second : -1;
+    }
 
     // Statistics
     std::size_t total_ops = 0;
@@ -314,6 +355,19 @@ private:
     std::unordered_map<std::string, TensorShape> mTensorShapes;
     std::unordered_map<std::string, ETensorDType> mTensorDtypes;
     bool mDebugShapes = false;  // Set via SUROGATE_DEBUG_SHAPES env var
+
+    // Tensor ID assignment state (per-compile, reset at start of compile())
+    std::unordered_map<std::string, int> mTensorIdMap;  // name -> tensor_id
+    int mNextTensorId = 0;
+
+    // Assign or retrieve a tensor ID for the given name
+    int assign_tensor_id(const std::string& name);
+
+    // Register well-known external tensor names (init bindings, MoE side-channel, etc.)
+    void register_external_names(CompiledGraph& graph);
+
+    // Build per-ID metadata for pruning (flags, block_layer_idx, ssa_base_to_id)
+    void build_tensor_metadata(CompiledGraph& graph);
 };
 
 

@@ -37,12 +37,17 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
     }
 
     // Get the pre-allocated gradient tensor
-    auto it = mTensorMap.find(op.outputs[0].name);
-    if (it == mTensorMap.end()) {
+    Tensor* d_emb_ptr = nullptr;
+    if (op.outputs[0].tensor_id >= 0 &&
+        static_cast<std::size_t>(op.outputs[0].tensor_id) < mTensors.size() &&
+        mTensors[op.outputs[0].tensor_id].Data) {
+        d_emb_ptr = &mTensors[op.outputs[0].tensor_id];
+    }
+    if (!d_emb_ptr) {
         // Gradient not allocated (embedding frozen in LoRA mode)
         return;
     }
-    Tensor& d_emb = it->second;
+    Tensor& d_emb = *d_emb_ptr;
 
     // encoder_backward requires CPU-side inputs for deterministic bucketing
     if (!mLastInputsCpu || !mLastInputsCpu->Data) {

@@ -110,11 +110,11 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
     }
 
     mamba_transpose_bdt_to_btd(*out_ptr, out, B, T, D, mRunState.MainStream);
-    mTensorMap[op.outputs[0].name] = *out_ptr;
+    store_tensor(op.outputs[0], *out_ptr);
 
     // Optionally save ssm_state for backward
     if (op.outputs.size() > 1) {
-        mTensorMap[op.outputs[1].name] = x;
+        store_tensor(op.outputs[1], x);
     }
 }
 
@@ -213,13 +213,13 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     mamba_reduce_head_param(ddelta_bias, ddelta_bias_expanded, num_heads, head_dim, false, mRunState.MainStream);
 
     // Store outputs
-    mTensorMap[op.outputs[0].name] = du;
-    mTensorMap[op.outputs[1].name] = ddelta;
-    mTensorMap[op.outputs[2].name] = dA_log;
-    mTensorMap[op.outputs[3].name] = dB;
-    mTensorMap[op.outputs[4].name] = dC;
-    mTensorMap[op.outputs[5].name] = dD;
-    mTensorMap[op.outputs[6].name] = ddelta_bias;
+    store_tensor(op.outputs[0], du);
+    store_tensor(op.outputs[1], ddelta);
+    store_tensor(op.outputs[2], dA_log);
+    store_tensor(op.outputs[3], dB);
+    store_tensor(op.outputs[4], dC);
+    store_tensor(op.outputs[5], dD);
+    store_tensor(op.outputs[6], ddelta_bias);
 }
 
 }  // namespace dsl

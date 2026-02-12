@@ -161,7 +161,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm(const CompiledOp& op) {
                              static_cast<int>(mB), static_cast<int>(mT),
                              qkv_channels, Hkv, Hs, q_rows, mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = qkv_out;
+    store_tensor(op.outputs[0], qkv_out);
 }
 
 void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {

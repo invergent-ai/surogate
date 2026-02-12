@@ -30,12 +30,19 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
     if (layer_idx_any >= 0) {
         // For the last MoE layer, prefer the global expert_offsets restored for backward.
         if (layer_idx_any == static_cast<int>(mConfig.NumLayers) - 1) {
-            auto it_global = mTensorMap.find("moe_expert_offsets");
-            if (it_global != mTensorMap.end() && it_global->second.Data) {
+            // Try flat vector first via pre-resolved offsets tensor ID, fall back to mirror
+            Tensor* global_offsets = nullptr;
+            if (op.attrs.moe_offsets_tensor_id >= 0 &&
+                static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+                mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+                global_offsets = &mTensors[op.attrs.moe_offsets_tensor_id];
+            }
+            // mTensors lookup is the only path (no mirror fallback)
+            if (global_offsets && global_offsets->Data) {
                 cudaPointerAttributes attr{};
-                cudaError_t err = cudaPointerGetAttributes(&attr, it_global->second.Data);
+                cudaError_t err = cudaPointerGetAttributes(&attr, global_offsets->Data);
                 if (err == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
-                    return it_global->second;
+                    return *global_offsets;
                 }
                 cudaGetLastError();
             }
@@ -57,19 +64,24 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
         }
     }
     if (!expert_offsets_ptr) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it == mTensorMap.end()) {
+        Tensor* moe_offsets_ptr = nullptr;
+        if (op.attrs.moe_offsets_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+            moe_offsets_ptr = &mTensors[op.attrs.moe_offsets_tensor_id];
+        }
+        if (!moe_offsets_ptr) {
             throw std::runtime_error("moe_expert_bias_add: expert_offsets not found");
         }
-        if (it->second.Data) {
+        if (moe_offsets_ptr->Data) {
             cudaPointerAttributes attr{};
-            cudaError_t err = cudaPointerGetAttributes(&attr, it->second.Data);
+            cudaError_t err = cudaPointerGetAttributes(&attr, moe_offsets_ptr->Data);
             if (err != cudaSuccess || attr.type != cudaMemoryTypeDevice) {
                 cudaGetLastError();
                 throw std::runtime_error("moe_expert_bias_add: expert_offsets is not device memory");
             }
         }
-        expert_offsets_ptr = &it->second;
+        expert_offsets_ptr = moe_offsets_ptr;
     }
     if (expert_offsets_ptr->DType != ETensorDType::INT32) {
         throw std::runtime_error("moe_expert_bias_add: expert_offsets dtype is not INT32");
@@ -105,7 +117,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
         throw std::logic_error("moe_expert_bias_add: unsupported input dtype");
     }
 
-    mTensorMap[op.outputs[0].name] = out;
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& op) {
@@ -113,7 +125,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
 
     // d_input = d_out (pass through)
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
-        mTensorMap[op.outputs[0].name] = d_out;
+        store_tensor(op.outputs[0], d_out);
     }
 
     if (op.outputs.size() < 2 || op.outputs[1].name.empty()) {
@@ -127,7 +139,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
             bool grad_accum = false;
             if (Tensor* grad_tensor = mGrads.get_param_grad(*base, grad_accum)) {
                 if (grad_tensor->Data) {
-                    mTensorMap[op.outputs[1].name] = *grad_tensor;
+                    store_tensor(op.outputs[1], *grad_tensor);
                 }
             }
         }
@@ -163,7 +175,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     }
     Tensor& d_bias = (grad_tensor && grad_tensor->Data) ? *grad_tensor : ensure_output_tensor(op.outputs[1]);
     if (grad_tensor && grad_tensor->Data) {
-        mTensorMap[op.outputs[1].name] = d_bias;
+        store_tensor(op.outputs[1], d_bias);
     }
     bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
     if (!accumulate && grad_accum) {

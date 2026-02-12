@@ -91,9 +91,9 @@ void CompiledExecutor::dispatch_mamba_split_proj(const CompiledOp& op) {
                      mRunState.MainStream);
 
     // Store outputs (ensure_output_tensor may already insert into map)
-    mTensorMap[op.outputs[0].name] = *gate_ptr;
-    mTensorMap[op.outputs[1].name] = *conv_ptr;
-    mTensorMap[op.outputs[2].name] = *delta_ptr;
+    store_tensor(op.outputs[0], *gate_ptr);
+    store_tensor(op.outputs[1], *conv_ptr);
+    store_tensor(op.outputs[2], *delta_ptr);
 }
 
 void CompiledExecutor::dispatch_mamba_split_proj_backward(const CompiledOp& op) {
@@ -122,7 +122,7 @@ void CompiledExecutor::dispatch_mamba_split_proj_backward(const CompiledOp& op) 
                      B, T, intermediate_size, conv_dim, num_heads, head_dim,
                      mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = d_proj;
+    store_tensor(op.outputs[0], d_proj);
 }
 
 }  // namespace dsl

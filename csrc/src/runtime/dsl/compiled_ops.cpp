@@ -391,47 +391,29 @@ void CompiledExecutor::set_rng_seed_fn(std::function<unsigned int()> fn) {
 }
 
 const Tensor* CompiledExecutor::try_get_tensor(const std::string& name) const {
-    auto it = mTensorMap.find(name);
-    if (it == mTensorMap.end()) {
-        return nullptr;
+    // Fast path: check flat tensor vector using compile-time ID
+    if (mCurrentGraph) {
+        int tid = mCurrentGraph->find_tensor_id(name);
+        if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+            return &mTensors[tid];
+        }
     }
-    return &it->second;
+    return nullptr;
 }
 
 const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     if (const Tensor* direct = try_get_tensor(name)) {
         return direct;
     }
-    // Try SSA-suffixed entries.
-    auto ssa_suffix = [](const std::string& key) -> int {
-        auto pos = key.rfind('_');
-        if (pos == std::string::npos || pos + 1 >= key.size()) {
-            return -1;
-        }
-        int value = 0;
-        for (std::size_t i = pos + 1; i < key.size(); ++i) {
-            char c = key[i];
-            if (c < '0' || c > '9') {
-                return -1;
+    // Try SSA-suffixed entries via pre-computed ssa_base_to_id (O(1) vs O(N) scan).
+    if (mCurrentGraph) {
+        auto ssa_it = mCurrentGraph->ssa_base_to_id.find(name);
+        if (ssa_it != mCurrentGraph->ssa_base_to_id.end()) {
+            int sid = ssa_it->second;
+            if (sid >= 0 && static_cast<std::size_t>(sid) < mTensors.size() && mTensors[sid].Data) {
+                return &mTensors[sid];
             }
-            value = value * 10 + (c - '0');
         }
-        return value;
-    };
-    int best_suffix = -1;
-    const Tensor* best = nullptr;
-    for (const auto& kv : mTensorMap) {
-        if (strip_ssa_suffix(kv.first) != name || !kv.second.Data) {
-            continue;
-        }
-        const int suffix = ssa_suffix(kv.first);
-        if (!best || suffix > best_suffix) {
-            best = &kv.second;
-            best_suffix = suffix;
-        }
-    }
-    if (best) {
-        return best;
     }
 
     int layer_idx = -1;
@@ -480,11 +462,13 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
         return;
     }
 
+    if (!mCurrentGraph) return;
+
     // Build layer prefix pattern (e.g., "blocks[5].")
     std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
 
-    // Iterate through tensor map looking for MoE tensors from this layer
-    for (auto& [name, tensor] : mTensorMap) {
+    // Iterate through compile-time tensor name map looking for MoE tensors from this layer
+    for (const auto& [name, tid] : mCurrentGraph->tensor_name_to_id) {
         // Skip global MoE tensors - these are scratch space reused each layer
         // and are NOT needed for backward (backward uses mMoEExpertOffsetsGPU).
         if (name == "moe_expert_offsets" || name == "moe_gather_indices") {
@@ -505,9 +489,10 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
                               name.find("permuted") != std::string::npos ||
                               name.find("expert_") != std::string::npos);
 
-        if (!is_moe_tensor || tensor.Data == nullptr) {
-            continue;
-        }
+        if (!is_moe_tensor) continue;
+        if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+        auto& tensor = mTensors[static_cast<std::size_t>(tid)];
+        if (!tensor.Data) continue;
 
         const size_t bytes = tensor.bytes();
         if (bytes == 0) {
@@ -624,9 +609,11 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
     };
 
     auto resolve_source = [&](const std::string& name) -> std::optional<Tensor> {
-        auto it = mTensorMap.find(name);
-        if (it != mTensorMap.end()) {
-            return it->second;
+        if (mCurrentGraph) {
+            int tid = mCurrentGraph->find_tensor_id(name);
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+                return mTensors[tid];
+            }
         }
         if (name == "token_ids") {
             return mRunState.Inputs;
@@ -1012,9 +999,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             mSaved->erase(saved_it);
         }
 
-        // First check the tensor map (intermediate tensors)
-        auto it = mTensorMap.find(name);
-        if (it != mTensorMap.end()) {
+        // First check intermediate tensors via flat vector (fast path) or mirror map
+        Tensor* found_tensor = nullptr;
+        if (mCurrentGraph) {
+            int tid = mCurrentGraph->find_tensor_id(name);
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+                found_tensor = &mTensors[tid];
+            }
+        }
+        if (found_tensor) {
             const bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
                                         name.find("scatter_indices") != std::string::npos ||
                                         name.find("routing_weights") != std::string::npos ||
@@ -1025,7 +1018,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                                         name.find("expert_") != std::string::npos);
             const bool prefer_live = prefer_live_tensor(name);
             const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
-            save_tensor_with_policy(name, it->second, prefer_live, force_persist || force_persist_name);
+            save_tensor_with_policy(name, *found_tensor, prefer_live, force_persist || force_persist_name);
             continue;
         }
 
@@ -1125,9 +1118,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     // For MoE models, copy expert_offsets data to persistent storage for backward pass
     // The original tensor is stack-allocated and will be freed before backward runs
     if (mConfig.NumExperts > 0) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it != mTensorMap.end() && it->second.Data) {
-            const Tensor& src = it->second;
+        Tensor* moe_offsets = nullptr;
+        if (mCurrentGraph) {
+            int tid = mCurrentGraph->find_tensor_id("moe_expert_offsets");
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+                moe_offsets = &mTensors[tid];
+            }
+        }
+        if (moe_offsets) {
+            const Tensor& src = *moe_offsets;
             const int num_elements = static_cast<int>(src.nelem());
             mMoEExpertOffsetsData.resize(num_elements);
             CUDA_CHECK(cudaMemcpy(mMoEExpertOffsetsData.data(), src.Data,
@@ -1156,8 +1155,15 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
         if (shape_nelem(shape) != base.nelem()) {
             return nullptr;
         }
-        auto [it, _] = mTensorMap.insert_or_assign(name, view_tensor(base, shape));
-        return &it->second;
+        Tensor view = view_tensor(base, shape);
+        if (mCurrentGraph) {
+            int tid = mCurrentGraph->find_tensor_id(name);
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+                mTensors[tid] = view;
+                return &mTensors[tid];
+            }
+        }
+        return &base;  // Can't cache view without tensor_id, return base
     };
 
     if (name == "token_ids") {
@@ -1231,6 +1237,7 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
 
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
+    const int tid = ref.tensor_id;
 
     // Only check gradient resolution for tensors flagged as gradients at compile time.
     // This avoids calling base_param_from_grad() (string substr + find) for the ~80%
@@ -1240,12 +1247,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
                 if (grad->Data) {
-                    if (!ref.shape.empty()) {
-                        auto [it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*grad, ref.shape));
-                        return it->second;
+                    Tensor resolved = ref.shape.empty() ? *grad : view_tensor(*grad, ref.shape);
+                    if (tid >= 0) {
+                        mTensors[static_cast<std::size_t>(tid)] = resolved;
+                        return mTensors[static_cast<std::size_t>(tid)];
                     }
-                    auto [it, _] = mTensorMap.insert_or_assign(ref.name, *grad);
-                    return it->second;
+                    return *grad;
                 }
             }
         }
@@ -1254,25 +1261,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
-        // Check if we already have a tensor in the map (e.g., from MoE temp allocation)
-        auto it = mTensorMap.find(ref.name);
-        if (it != mTensorMap.end() && it->second.Data) {
-            // For MoE operations, the tensor map may contain dynamically-shaped temps
-            // that differ from the statically-compiled shapes. Prioritize the map tensor
-            // if it has valid data, even if shapes differ.
-            // Verify shape matches
-            bool shape_matches = (it->second.Rank == static_cast<int>(ref.shape.size()));
-            if (shape_matches) {
-                for (int i = 0; i < it->second.Rank && shape_matches; ++i) {
-                    shape_matches = (it->second.Sizes[i] == ref.shape[i]);
-                }
+        // Check if we already have a tensor cached (e.g., from MoE temp allocation)
+        if (tid >= 0) {
+            auto& cached = mTensors[static_cast<std::size_t>(tid)];
+            if (cached.Data) {
+                return cached;
             }
-            if (shape_matches) {
-                return it->second;
-            }
-            // Shape doesn't match, but we have valid data - use it for MoE dynamic shapes
-            // This handles cases like swiglu output [total_tokens, D] vs expected [B, T, D]
-            return it->second;
         }
         // Need to create a view - get the base tensor and create view
         Tensor* base = nullptr;
@@ -1303,21 +1297,20 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             default: break;
         }
         if (base && base->Data) {
-            auto [ins_it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*base, ref.shape));
-            return ins_it->second;
+            Tensor view = view_tensor(*base, ref.shape);
+            if (tid >= 0) {
+                mTensors[static_cast<std::size_t>(tid)] = view;
+                return mTensors[static_cast<std::size_t>(tid)];
+            }
+            return *base;  // tid < 0 should not happen, return base as fallback
         }
     }
 
-    // Always check mTensorMap first for gradient slots before falling back to simplified_grads.
-    // This is critical because view_backward stores aliases in mTensorMap, and subsequent ops
+    // Check flat tensor vector first for cached/aliased tensors (e.g., view_backward aliases).
+    // This is critical because view_backward stores aliases, and subsequent ops
     // (like rmsnorm_backward) must use that aliased tensor, not the pre-allocated simplified_grads buffer.
-    // Without this check, the gradient chain can break when view_backward creates an alias that
-    // points to a different buffer than the pre-allocated slot.
-    if (!ref.name.empty()) {
-        auto it = mTensorMap.find(ref.name);
-        if (it != mTensorMap.end() && it->second.Data) {
-            return it->second;
-        }
+    if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+        return mTensors[static_cast<std::size_t>(tid)];
     }
 
     switch (ref.slot) {
@@ -1403,14 +1396,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                 if (it != mSaved->end()) {
                     // If the saved tensor has actual data, use it directly.
                     // Only resolve from live buffers when Data == nullptr (metadata-only mode).
-                    // This is critical for FFT mode where tensors with lora_only recompute_policy
-                    // are saved with actual data and should NOT use live buffers.
                     if (it->second.Data != nullptr) {
                         return it->second;
                     }
-                    // Metadata-only: try to resolve from live buffer or recompute
-                    if (auto live_it = mTensorMap.find(ref.name); live_it != mTensorMap.end()) {
-                        return live_it->second;
+                    // Metadata-only: try to resolve from live buffer via flat vector
+                    if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+                        return mTensors[static_cast<std::size_t>(tid)];
                     }
                     if (Tensor* live = try_resolve_saved_live(ref.name, it->second)) {
                         return *live;
@@ -1420,9 +1411,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             }
             throw std::runtime_error("CompiledExecutor: saved tensor not found: " + ref.name);
         case TensorSlot::Mapped: {
-            auto it = mTensorMap.find(ref.name);
-            if (it != mTensorMap.end()) {
-                return it->second;
+            // Already checked mTensors[tid] above; if we get here, tensor was not found
+            if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+                return mTensors[static_cast<std::size_t>(tid)];
             }
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
@@ -1433,17 +1424,19 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
+    const int tid = ref.tensor_id;
+
     if (!ref.name.empty()) {
         if (auto base = base_param_from_grad(ref.name)) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
                 if (grad->Data) {
-                    if (!ref.shape.empty()) {
-                        auto [it, _] = mTensorMap.insert_or_assign(ref.name, view_tensor(*grad, ref.shape));
-                        return it->second;
+                    Tensor resolved = ref.shape.empty() ? *grad : view_tensor(*grad, ref.shape);
+                    if (tid >= 0) {
+                        mTensors[static_cast<std::size_t>(tid)] = resolved;
+                        return mTensors[static_cast<std::size_t>(tid)];
                     }
-                    auto [it, _] = mTensorMap.insert_or_assign(ref.name, *grad);
-                    return it->second;
+                    return *grad;
                 }
             }
         }
@@ -1475,14 +1468,21 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                     alias_ref.slot = alias_entry->slot;
                     alias_ref.shape = ref.shape;
                     alias_ref.dtype = ref.dtype;
+                    // Resolve alias tensor_id from current graph
+                    if (mCurrentGraph) {
+                        alias_ref.tensor_id = mCurrentGraph->find_tensor_id(alias_name);
+                    }
                     if (mSaveSet.find(alias_name) != mSaveSet.end()) {
                         alias_ref.slot = TensorSlot::Saved;
                     }
                     try {
                         Tensor& base = resolve_tensor(alias_ref);
                         Tensor view = ref.shape.empty() ? base : view_tensor(base, ref.shape);
-                        auto [it, _] = mTensorMap.insert_or_assign(ref.name, view);
-                        return it->second;
+                        if (tid >= 0) {
+                            mTensors[static_cast<std::size_t>(tid)] = view;
+                            return mTensors[static_cast<std::size_t>(tid)];
+                        }
+                        return base;
                     } catch (const std::exception&) {
                         // Fall through to normal allocation if alias resolution fails.
                     }
@@ -1499,36 +1499,34 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
             mTemps.push_back(t);
         }
         if (!ref.shape.empty()) {
-            // Create a view if needed
-            auto [it, inserted] = mTensorMap.emplace(ref.name, view_tensor(t, ref.shape));
-            if (!inserted) {
-                it->second = view_tensor(t, ref.shape);
+            Tensor view = view_tensor(t, ref.shape);
+            if (tid >= 0) {
+                mTensors[static_cast<std::size_t>(tid)] = view;
+                return mTensors[static_cast<std::size_t>(tid)];
             }
-            return it->second;
+            return t;  // tid < 0 should not happen for pre-allocated slots
         }
         return t;
     }
 
-    // For mapped/temporary tensors, allocate if needed
-    auto it = mTensorMap.find(ref.name);
-    if (it != mTensorMap.end()) {
-        return it->second;
+    // For mapped/temporary tensors, check flat vector first
+    if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+        return mTensors[static_cast<std::size_t>(tid)];
     }
 
     Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape);
 
     // Zero gradient tensors to prevent stale values from accumulating.
-    // Gradient tensor names start with "d_" (e.g., "d_blocks[0].ln1").
-    // Many backward kernels accumulate (+=) to their outputs, so they
-    // need zeroed buffers to start with. Stack memory is reused across
-    // micro-batches and contains stale values from previous backward passes.
-    if (ref.name.size() >= 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
+    if (ref.is_gradient) {
         fill_zero(t, mRunState.MainStream);
     }
 
     mTemps.push_back(t);
-    auto [ins_it, inserted] = mTensorMap.emplace(ref.name, t);
-    return ins_it->second;
+    if (tid >= 0) {
+        mTensors[static_cast<std::size_t>(tid)] = t;
+        return mTensors[static_cast<std::size_t>(tid)];
+    }
+    throw std::runtime_error("CompiledExecutor: ensure_output_tensor requires valid tensor_id for: " + ref.name);
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
@@ -1570,8 +1568,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        bool full,
                                        const modules::ForwardHook* hook) {
     mComm = &comm;
+    mCurrentGraph = &graph;
     mTemps.clear();
-    mTensorMap.clear();
+    // Initialize flat tensor vector indexed by compile-time tensor IDs
+    mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mCurrentLayer = -1;
 
     // Match GraphExecutor behavior: initialize loss/counter buffers for full forward runs.
@@ -1602,27 +1602,29 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         layer_active.assign(static_cast<std::size_t>(num_layers), 0);
     }
 
+    // Build save mask for fast per-ID lookup during pruning
+    mSaveMask.assign(static_cast<std::size_t>(graph.num_tensors), false);
+    if (mSaveList) {
+        for (const auto& name : *mSaveList) {
+            int sid = graph.find_tensor_id(name);
+            if (sid >= 0) {
+                mSaveMask[static_cast<std::size_t>(sid)] = true;
+            }
+        }
+    }
+
     auto prune_stack_tensors = [&]() {
-        for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
-            // Skip tensors that are needed for backward (in save list)
-            if (mSaveSet.count(it->first) > 0) {
-                ++it;
-                continue;
-            }
+        // Prune flat tensor vector using pre-computed metadata (no string parsing)
+        for (int id = 0; id < graph.num_tensors; ++id) {
+            auto& t = mTensors[static_cast<std::size_t>(id)];
+            if (!t.Data) continue;
+            // Skip tensors needed for backward (in save list)
+            if (mSaveMask[static_cast<std::size_t>(id)]) continue;
             // Skip cross-layer connector tensors (layerN.out, layerN.res_in, etc.)
-            // These are produced by HybridStackedBlocks and consumed by the next layer's
-            // fused_residual_rmsnorm. They use "layerN.name" naming which doesn't match
-            // parse_block_param, so they're stored in the tensor map and would be pruned
-            // when the producing layer's stack frame is freed.
-            if (it->first.rfind("layer", 0) == 0) {
-                ++it;
-                continue;
-            }
-            if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
-                !mRunState.Stack.is_live(it->second.Data)) {
-                it = mTensorMap.erase(it);
-            } else {
-                ++it;
+            const auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
+            if (meta.is_cross_layer()) continue;
+            if (mRunState.Stack.owns(t.Data) && !mRunState.Stack.is_live(t.Data)) {
+                t = Tensor{};
             }
         }
     };
@@ -1655,41 +1657,20 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
         const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
         auto resolve_saved_source = [&](const std::string& name) -> std::optional<Tensor> {
-            // Prefer exact match from the tensor map.
-            auto it = mTensorMap.find(name);
-            if (it != mTensorMap.end() && it->second.Data) {
-                return it->second;
-            }
-            // Fall back to SSA-suffixed entries.
-            auto ssa_suffix = [](const std::string& key) -> int {
-                auto pos = key.rfind('_');
-                if (pos == std::string::npos || pos + 1 >= key.size()) {
-                    return -1;
+            // Prefer exact match from the flat tensor vector (O(1) lookup).
+            if (mCurrentGraph) {
+                int tid = mCurrentGraph->find_tensor_id(name);
+                if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+                    return mTensors[tid];
                 }
-                int value = 0;
-                for (std::size_t i = pos + 1; i < key.size(); ++i) {
-                    char c = key[i];
-                    if (c < '0' || c > '9') {
-                        return -1;
+                // Fall back to SSA-suffixed entries via pre-computed ssa_base_to_id (O(1) vs O(N) scan).
+                auto ssa_it = mCurrentGraph->ssa_base_to_id.find(name);
+                if (ssa_it != mCurrentGraph->ssa_base_to_id.end()) {
+                    int sid = ssa_it->second;
+                    if (sid >= 0 && static_cast<std::size_t>(sid) < mTensors.size() && mTensors[sid].Data) {
+                        return mTensors[sid];
                     }
-                    value = value * 10 + (c - '0');
                 }
-                return value;
-            };
-            int best_suffix = -1;
-            const Tensor* best = nullptr;
-            for (const auto& kv : mTensorMap) {
-                if (strip_ssa_suffix(kv.first) != name || !kv.second.Data) {
-                    continue;
-                }
-                const int suffix = ssa_suffix(kv.first);
-                if (!best || suffix > best_suffix) {
-                    best = &kv.second;
-                    best_suffix = suffix;
-                }
-            }
-            if (best) {
-                return *best;
             }
 
             int resolved_layer = -1;
@@ -1789,29 +1770,29 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             Tensor saved_tensor = src;
             saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
             (*mSaved)[name] = saved_tensor;
-            mTensorMap[name] = saved_tensor;
+            bind_tensor(name, saved_tensor);
             saved_count++;
         }
     };
 
-    // Bind known inputs
-    mTensorMap["token_ids"] = mRunState.Inputs;
-    mTensorMap["position_ids"] = mRunState.PositionIDs;
+    // Bind known inputs (into both flat vector and write-through mirror)
+    bind_tensor("token_ids", mRunState.Inputs);
+    bind_tensor("position_ids", mRunState.PositionIDs);
     if (mRunState.VisualPosMasks.Data) {
-        mTensorMap["visual_pos_masks"] = mRunState.VisualPosMasks;
+        bind_tensor("visual_pos_masks", mRunState.VisualPosMasks);
     }
     if (mRunState.VisualEmbeds.Data) {
-        mTensorMap["visual_embeds"] = mRunState.VisualEmbeds;
+        bind_tensor("visual_embeds", mRunState.VisualEmbeds);
     }
     if (!mRunState.DeepstackVisualEmbeds.empty()) {
         for (std::size_t i = 0; i < mRunState.DeepstackVisualEmbeds.size(); ++i) {
             if (!mRunState.DeepstackVisualEmbeds[i].Data) {
                 continue;
             }
-            mTensorMap["deepstack_visual_embeds_" + std::to_string(i)] = mRunState.DeepstackVisualEmbeds[i];
+            bind_tensor("deepstack_visual_embeds_" + std::to_string(i), mRunState.DeepstackVisualEmbeds[i]);
         }
     }
-    mTensorMap["x0"] = mRunState.non_block_activations().encoded;
+    bind_tensor("x0", mRunState.non_block_activations().encoded);
 
     // Ensure non-block weights are gathered if streaming/offload is enabled
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
@@ -2027,9 +2008,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         const modules::BackwardHook* hook,
                                         bool skip_zeroing) {
     mComm = &comm;
+    mCurrentGraph = &graph;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
-    mTensorMap.clear();
+    mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mAccumulateTensors.clear();
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
@@ -2079,61 +2061,23 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     };
     auto prune_stack_tensors = [&](int current_layer) {
-        for (auto it = mTensorMap.begin(); it != mTensorMap.end(); ) {
-            // Skip MoE expert_offsets - needed throughout backward for grouped GEMM ops
-            if (mConfig.NumExperts > 0 && it->first == "moe_expert_offsets") {
-                ++it;
-                continue;
-            }
-            // Skip cross-layer gradients - these are needed by the previous layer's backward
-            // Cross-layer gradients have names like "d_blocks[N].XXX" where N < current_layer
-            // They flow from one layer's backward to the previous layer's backward
-            if (current_layer >= 0 && it->first.rfind("d_blocks[", 0) == 0) {
-                // Parse the layer index from the gradient name
-                auto bracket_pos = it->first.find('[');
-                auto close_pos = it->first.find(']');
-                if (bracket_pos != std::string::npos && close_pos != std::string::npos) {
-                    std::string layer_str = it->first.substr(bracket_pos + 1, close_pos - bracket_pos - 1);
-                    try {
-                        int grad_layer = std::stoi(layer_str);
-                        // Preserve gradients for layers below the current one (they'll be needed)
-                        if (grad_layer < current_layer) {
-                            ++it;
-                            continue;
-                        }
-                    } catch (...) {
-                        // If parsing fails, skip this tensor to be safe
-                        ++it;
-                        continue;
-                    }
-                }
-            }
-            // Skip saved tensors for layers below current (needed for their backward)
-            // Saved tensors have names like "blocks[N].XXX" where N < current_layer
-            if (current_layer >= 0 && it->first.rfind("blocks[", 0) == 0) {
-                auto bracket_pos = it->first.find('[');
-                auto close_pos = it->first.find(']');
-                if (bracket_pos != std::string::npos && close_pos != std::string::npos) {
-                    std::string layer_str = it->first.substr(bracket_pos + 1, close_pos - bracket_pos - 1);
-                    try {
-                        int saved_layer = std::stoi(layer_str);
-                        // Preserve saved tensors for layers below the current one
-                        if (saved_layer < current_layer) {
-                            ++it;
-                            continue;
-                        }
-                    } catch (...) {
-                        // If parsing fails, skip this tensor to be safe
-                        ++it;
-                        continue;
-                    }
-                }
-            }
-            if (it->second.Data && mRunState.Stack.owns(it->second.Data) &&
-                !mRunState.Stack.is_live(it->second.Data)) {
-                it = mTensorMap.erase(it);
-            } else {
-                ++it;
+        // Prune flat tensor vector using pre-computed metadata (no string parsing)
+        for (int id = 0; id < graph.num_tensors; ++id) {
+            auto& t = mTensors[static_cast<std::size_t>(id)];
+            if (!t.Data) continue;
+            const auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
+            // Skip MoE expert_offsets
+            if (meta.is_moe_offsets()) continue;
+            // Skip cross-layer gradients for earlier layers
+            if (current_layer >= 0 && meta.is_d_blocks() &&
+                meta.block_layer_idx >= 0 && meta.block_layer_idx < current_layer) continue;
+            // Skip saved tensors for earlier layers
+            if (current_layer >= 0 && meta.is_blocks() &&
+                meta.block_layer_idx >= 0 && meta.block_layer_idx < current_layer) continue;
+            // Skip tensors with unparseable layer index (be safe)
+            if ((meta.is_d_blocks() || meta.is_blocks()) && meta.block_layer_idx < 0) continue;
+            if (mRunState.Stack.owns(t.Data) && !mRunState.Stack.is_live(t.Data)) {
+                t = Tensor{};
             }
         }
     };
@@ -2148,20 +2092,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     if (mOptions.LMHeadChunks <= 1) {
         Tensor logits_view = view_tensor(output, {mB, mT, static_cast<long>(mConfig.VocabSize)});
-        mTensorMap["d_logits"] = logits_view;
+        bind_tensor("d_logits", logits_view);
         // Also provide flattened version for matmul backward ops
         Tensor logits_flat = view_tensor(output, {mB * mT, static_cast<long>(mConfig.VocabSize)});
         if (logits_flat.Rank != 2) {
             throw std::runtime_error("CompiledExecutor: d_logits_flat has wrong rank=" +
                                     std::to_string(logits_flat.Rank) + " expected 2");
         }
-        mTensorMap["d_logits_flat"] = logits_flat;
-        // Verify the map entry
-        auto& check = mTensorMap["d_logits_flat"];
-        if (check.Rank != 2) {
-            throw std::runtime_error("CompiledExecutor: d_logits_flat in map has wrong rank=" +
-                                    std::to_string(check.Rank));
-        }
+        bind_tensor("d_logits_flat", logits_flat);
     }
 
     // Bind gradient output buffers for final layer norm backward
@@ -2191,14 +2129,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     // Bind global gradient tensors - these are always needed regardless of DSL layout
     // The DSL gradient slots declare shape/dtype but the actual buffers come from RunState
-    mTensorMap["d_xF_flat"] = d_ln_final_flat;
-    mTensorMap["d_xF"] = d_ln_final_buf;
-    mTensorMap["d_ln_final"] = d_ln_final_buf;
-    mTensorMap["d_ln_final_flat"] = d_ln_final_flat;
+    bind_tensor("d_xF_flat", d_ln_final_flat);
+    bind_tensor("d_xF", d_ln_final_buf);
+    bind_tensor("d_ln_final", d_ln_final_buf);
+    bind_tensor("d_ln_final_flat", d_ln_final_flat);
 
     if (!mRunState.is_lora_only_mode()) {
-        mTensorMap["d_encoded"] = d_embeddings_buf;
-        mTensorMap["d_x0"] = d_embeddings_buf;
+        bind_tensor("d_encoded", d_embeddings_buf);
+        bind_tensor("d_x0", d_embeddings_buf);
     }
 
     // DSL-driven binding for any additional gradient slots declared in the Python model
@@ -2207,11 +2145,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                     const TensorSlotRegistry::SlotEntry& entry) {
             if (entry.scope != ActivationScope::GlobalGradient) return;
             // Skip if already bound above
-            if (mTensorMap.find(slot_name) != mTensorMap.end()) return;
+            if (mCurrentGraph) {
+                int sid = mCurrentGraph->find_tensor_id(slot_name);
+                if (sid >= 0 && static_cast<std::size_t>(sid) < mTensors.size() && mTensors[sid].Data) return;
+            }
 
             Tensor* target_buf = get_target_buffer(entry.gradient_of);
             if (target_buf && target_buf->Data) {
-                mTensorMap[slot_name] = *target_buf;
+                bind_tensor(slot_name, *target_buf);
             }
         });
     }
@@ -2222,10 +2163,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
         auto& last_grads = mRunState.simplified_grads(last_layer);
         if (last_grads.d_mlp_down.Data) {
-            mTensorMap["d_xN"] = last_grads.d_mlp_down;
+            bind_tensor("d_xN", last_grads.d_mlp_down);
         }
         if (last_grads.d_res_att.Data) {
-            mTensorMap["d_residualN"] = last_grads.d_res_att;
+            bind_tensor("d_residualN", last_grads.d_res_att);
         }
 
         // Heuristic aliasing for non-inlined StackedBlocks outputs (e.g., "StackedBlocks_4").
@@ -2255,14 +2196,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                           [](const auto& a, const auto& b) { return a.first < b.first; });
                 if (stacked.size() == 1) {
                     if (last_grads.d_res_att.Data) {
-                        mTensorMap["d_" + stacked[0].second] = last_grads.d_res_att;
+                        bind_tensor("d_" + stacked[0].second, last_grads.d_res_att);
                     }
                 } else {
                     if (last_grads.d_mlp_down.Data) {
-                        mTensorMap["d_" + stacked[0].second] = last_grads.d_mlp_down;
+                        bind_tensor("d_" + stacked[0].second, last_grads.d_mlp_down);
                     }
                     if (last_grads.d_res_att.Data) {
-                        mTensorMap["d_" + stacked[1].second] = last_grads.d_res_att;
+                        bind_tensor("d_" + stacked[1].second, last_grads.d_res_att);
                     }
                 }
             }
@@ -2274,7 +2215,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (!mRunState.is_lora_only_mode()) {
         for (const auto& emb_out : mEmbeddingOutputs) {
             std::string grad_name = "d_" + emb_out;
-            mTensorMap[grad_name] = d_embeddings_buf;
+            bind_tensor(grad_name, d_embeddings_buf);
         }
     }
 
@@ -2307,30 +2248,30 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         expert_offsets.Sizes[0] = num_elements;
         expert_offsets.Data = static_cast<std::byte*>(mMoEExpertOffsetsGPU);
 
-        mTensorMap["moe_expert_offsets"] = expert_offsets;
+        bind_tensor("moe_expert_offsets", expert_offsets);
         // Note: NOT adding to mTemps since this is persistent memory managed separately
     }
 
     // Also bind standard inputs that backward ops may reference
-    mTensorMap["token_ids"] = mRunState.Inputs;
-    mTensorMap["position_ids"] = mRunState.PositionIDs;
+    bind_tensor("token_ids", mRunState.Inputs);
+    bind_tensor("position_ids", mRunState.PositionIDs);
     if (mRunState.VisualPosMasks.Data) {
-        mTensorMap["visual_pos_masks"] = mRunState.VisualPosMasks;
+        bind_tensor("visual_pos_masks", mRunState.VisualPosMasks);
     }
     if (mRunState.VisualEmbeds.Data) {
-        mTensorMap["visual_embeds"] = mRunState.VisualEmbeds;
+        bind_tensor("visual_embeds", mRunState.VisualEmbeds);
     }
     if (!mRunState.DeepstackVisualEmbeds.empty()) {
         for (std::size_t i = 0; i < mRunState.DeepstackVisualEmbeds.size(); ++i) {
             if (!mRunState.DeepstackVisualEmbeds[i].Data) {
                 continue;
             }
-            mTensorMap["deepstack_visual_embeds_" + std::to_string(i)] = mRunState.DeepstackVisualEmbeds[i];
+            bind_tensor("deepstack_visual_embeds_" + std::to_string(i), mRunState.DeepstackVisualEmbeds[i]);
         }
     }
 
     // Build the set of gradients that require accumulation (not the first micro-step).
-    // Also bind parameter gradient tensors to mTensorMap so they're used instead of temporaries.
+    // Also bind parameter gradient tensors so they're used instead of temporaries.
     // This mirrors the logic in graph_executor_backward.cpp (bind_param_grad).
     for (const auto& param_name : mGrads.param_names()) {
         if (param_name.find("rope_freqs") != std::string::npos) {
@@ -2340,7 +2281,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         Tensor* grad_tensor = mGrads.get_param_grad(param_name, accumulate);
         if (grad_tensor && grad_tensor->Data) {
             std::string grad_name = "d_" + param_name;
-            mTensorMap[grad_name] = *grad_tensor;
+            bind_tensor(grad_name, *grad_tensor);
             if (accumulate) {
                 mAccumulateTensors.insert(grad_name);
             }
@@ -2472,24 +2413,22 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             return;
         }
         for (const auto& name : last_use_names[idx]) {
-            auto it = mTensorMap.find(name);
-            if (it == mTensorMap.end()) {
-                continue;
+            if (mCurrentGraph) {
+                int tid = mCurrentGraph->find_tensor_id(name);
+                if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+                    mTensors[tid] = Tensor{};
+                }
             }
-            // Saved tensors can be re-resolved from mSaved/mMoeSavedBuffers if needed.
-            mTensorMap.erase(it);
         }
     };
     auto can_restore_stack = [&](std::size_t idx) -> bool {
-        for (const auto& [name, tensor] : mTensorMap) {
-            if (!tensor.Data) {
-                continue;
-            }
-            if (!mRunState.Stack.owns(tensor.Data)) {
-                continue;
-            }
-            auto it = last_use.find(name);
-            if (it != last_use.end() && it->second > idx) {
+        // Check if any tensor still needed after idx lives on the stack
+        for (const auto& [name, use_idx] : last_use) {
+            if (use_idx <= idx) continue;  // Already past last use
+            int tid = graph.find_tensor_id(name);
+            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+            auto& tensor = mTensors[static_cast<std::size_t>(tid)];
+            if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
                 return false;
             }
         }
@@ -2772,7 +2711,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // NOTE: When recompute is disabled, we cannot aggressively prune tensors because
             // the backward graph may reference intermediate tensors (like d_blocks[N].view_K)
             // that were produced earlier but are still needed. The stack restore + prune
-            // would remove these tensors from mTensorMap, causing "tensor not found" errors.
+            // would remove these tensors from mTensors, causing "tensor not found" errors.
             // For now, skip periodic cleanup when recompute is disabled to preserve correctness.
             // Memory usage will be higher but the backward pass will complete successfully.
         } catch (const std::exception& e) {

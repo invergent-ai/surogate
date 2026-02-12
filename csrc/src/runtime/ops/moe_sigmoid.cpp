@@ -77,7 +77,7 @@ void CompiledExecutor::dispatch_moe_sigmoid(const CompiledOp& op) {
         throw std::logic_error("moe_sigmoid_forward: unsupported dtype conversion");
     }
 
-    mTensorMap[op.outputs[0].name] = out;
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
@@ -156,7 +156,7 @@ void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
         throw std::logic_error("moe_sigmoid_backward: unsupported output dtype");
     }
 
-    mTensorMap[op.outputs[0].name] = d_inp;
+    store_tensor(op.outputs[0], d_inp);
 }
 
 

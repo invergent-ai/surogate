@@ -54,7 +54,7 @@ void CompiledExecutor::dispatch_mrope(const CompiledOp& op) {
                  nullptr, static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs, rotary_dim,
                  mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = qkv_out;
+    store_tensor(op.outputs[0], qkv_out);
 }
 
 void CompiledExecutor::dispatch_mrope_backward(const CompiledOp& op) {

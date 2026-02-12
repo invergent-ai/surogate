@@ -37,7 +37,7 @@ void CompiledExecutor::dispatch_swiglu(const CompiledOp& op) {
         swiglu_forward(out, inp, nullptr, 1, static_cast<int>(N), static_cast<int>(D), mRunState.MainStream);
 
         // Store output in tensor map for subsequent ops
-        mTensorMap[op.outputs[0].name] = out;
+        store_tensor(op.outputs[0], out);
     } else {
         // 3D input: [B, T, 2*D] -> [B, T, D] (standard path)
         Tensor& out = ensure_output_tensor(op.outputs[0]);

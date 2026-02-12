@@ -90,9 +90,9 @@ void CompiledExecutor::dispatch_mamba_split_conv_out(const CompiledOp& op) {
                          B, T, D, groups, dstate,
                          mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = *u_ptr;
-    mTensorMap[op.outputs[1].name] = *b_ptr;
-    mTensorMap[op.outputs[2].name] = *c_ptr;
+    store_tensor(op.outputs[0], *u_ptr);
+    store_tensor(op.outputs[1], *b_ptr);
+    store_tensor(op.outputs[2], *c_ptr);
 }
 
 void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& op) {
@@ -119,7 +119,7 @@ void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& 
                         B, T, D, groups, dstate,
                         mRunState.MainStream);
 
-    mTensorMap[op.outputs[0].name] = d_conv_out;
+    store_tensor(op.outputs[0], d_conv_out);
 }
 
 }  // namespace dsl

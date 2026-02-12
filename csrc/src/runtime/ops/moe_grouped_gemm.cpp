@@ -68,11 +68,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         }
     }
     if (!expert_offsets_ptr) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it == mTensorMap.end()) {
+        Tensor* moe_offsets_fwd_ptr = nullptr;
+        if (op.attrs.moe_offsets_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+            moe_offsets_fwd_ptr = &mTensors[op.attrs.moe_offsets_tensor_id];
+        }
+        if (!moe_offsets_fwd_ptr) {
             throw std::runtime_error("moe_grouped_gemm: expert_offsets not found");
         }
-        expert_offsets_ptr = &it->second;
+        expert_offsets_ptr = moe_offsets_fwd_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
     const int* expert_offsets_data = expert_offsets.get<int>();
@@ -212,7 +217,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         }
     }
 
-    mTensorMap[op.outputs[0].name] = out;
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) {
@@ -254,11 +259,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         }
     }
     if (!expert_offsets_ptr) {
-        auto it = mTensorMap.find("moe_expert_offsets");
-        if (it == mTensorMap.end()) {
+        Tensor* moe_offsets_bwd_ptr = nullptr;
+        if (op.attrs.moe_offsets_tensor_id >= 0 &&
+            static_cast<std::size_t>(op.attrs.moe_offsets_tensor_id) < mTensors.size() &&
+            mTensors[op.attrs.moe_offsets_tensor_id].Data) {
+            moe_offsets_bwd_ptr = &mTensors[op.attrs.moe_offsets_tensor_id];
+        }
+        if (!moe_offsets_bwd_ptr) {
             throw std::runtime_error("moe_grouped_gemm_backward: expert_offsets not found");
         }
-        expert_offsets_ptr = &it->second;
+        expert_offsets_ptr = moe_offsets_bwd_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
     const int* expert_offsets_data = expert_offsets.get<int>();
@@ -456,7 +466,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         }
     }
 
-    mTensorMap[op.outputs[0].name] = d_inp;
+    store_tensor(op.outputs[0], d_inp);
 }
 
 }  // namespace dsl

@@ -78,8 +78,8 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
         }
     }
 
-    mTensorMap[op.outputs[0].name] = weights;
-    mTensorMap[op.outputs[1].name] = indices;
+    store_tensor(op.outputs[0], weights);
+    store_tensor(op.outputs[1], indices);
 
 }
 
@@ -160,7 +160,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           num_tokens, num_experts, top_k, normalize, softmax, mRunState.MainStream);
     }
 
-    mTensorMap[op.outputs[0].name] = d_probs;
+    store_tensor(op.outputs[0], d_probs);
 }
 
 

@@ -297,7 +297,32 @@ private:
 
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;
-    std::unordered_map<std::string, Tensor> mTensorMap;
+
+    // Integer-indexed tensor storage (flat vector indexed by compile-time tensor IDs).
+    // Indexed by TensorRef::tensor_id assigned during graph compilation.
+    // Eliminates string hashing/comparison in the hot resolve_tensor path.
+    std::vector<Tensor> mTensors;
+    std::vector<bool> mSaveMask;               // Per-tensor-id: true if in save list (for prune)
+    const CompiledGraph* mCurrentGraph = nullptr;
+
+    // Bind a named tensor into the flat vector using the current graph's name-to-id map.
+    // No-op if the name is not in the graph (e.g., optional visual embeds when disabled).
+    void bind_tensor(const std::string& name, const Tensor& t) {
+        if (mCurrentGraph) {
+            int id = mCurrentGraph->find_tensor_id(name);
+            if (id >= 0 && id < static_cast<int>(mTensors.size())) {
+                mTensors[static_cast<std::size_t>(id)] = t;
+            }
+        }
+    }
+
+    // Store a tensor by its pre-resolved TensorRef into the flat vector.
+    // Use this in dispatch functions instead of direct mTensors assignment.
+    void store_tensor(const TensorRef& ref, const Tensor& t) {
+        if (ref.tensor_id >= 0 && static_cast<std::size_t>(ref.tensor_id) < mTensors.size()) {
+            mTensors[ref.tensor_id] = t;
+        }
+    }
 
     // Gradient accumulation tracking (set of gradient tensor names that need accumulation)
     std::unordered_set<std::string> mAccumulateTensors;
