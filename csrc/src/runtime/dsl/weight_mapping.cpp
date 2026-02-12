@@ -412,7 +412,11 @@ public:
                     // Tied weights do not require direct loading here.
                     break;
                 case WeightSpec::Kind::Transform:
-                    throw std::runtime_error("DSL weight mapping: transform mappings are not supported yet");
+                    if (spec.source.empty()) {
+                        throw std::runtime_error("DSL weight mapping: missing source for transform " + entry.internal_name);
+                    }
+                    add_pattern_for_source(spec.source, *target, nullptr, spec.optional);
+                    break;
                 case WeightSpec::Kind::Split:
                     // Split is export-only; ignore for import.
                     break;

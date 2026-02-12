@@ -111,6 +111,16 @@ public:
 
     // Set optional hook context (opaque pointer passed to hooks)
     virtual void set_hook_context(void* context) { (void)context; }
+
+    /// Total bytes of untracked persistent saved buffers (raw cudaMalloc).
+    virtual size_t saved_buffers_total_bytes() const { return 0; }
+    /// Number of persistent saved buffers.
+    virtual int saved_buffers_count() const { return 0; }
+    /// Per-buffer sizes for diagnostics.
+    virtual const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const {
+        static const std::unordered_map<std::string, size_t> empty;
+        return empty;
+    }
 };
 
 class GraphExecutor final : public IGraphExecutor {
@@ -153,6 +163,10 @@ public:
     void set_rng_state(const std::vector<std::byte>& state);
     void set_internal_graphs_enabled(bool enabled) override;
     bool internal_graphs_enabled() const override;
+
+    size_t saved_buffers_total_bytes() const override;
+    int saved_buffers_count() const override;
+    const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const override;
 
 private:
     friend class RecomputePlan;

@@ -33,11 +33,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     Tensor& y = ensure_output_tensor(op.outputs[1]);
     Tensor& rstd = ensure_output_tensor(op.outputs[2]);
 
-    const bool is_final_norm =
-        (op.inputs[2].name.find("final_norm") != std::string::npos ||
-         op.inputs[2].name.find("ln_final") != std::string::npos ||
-         op.inputs[2].name.find("ln_f") != std::string::npos);
-
     // Validate dtypes before calling kernel
     if (rstd.DType != ETensorDType::FP32) {
         std::ostringstream oss;
@@ -55,9 +50,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     // residual buffer (res_in) for backward/recompute. The graph output for res_in is
     // often a temporary (e.g., layerN.res_in), so explicitly persist it here.
     // Also persist rstd to the per-layer ln1_rstd slot for the same reason.
+    // Only applies to Hybrid architecture — skip parse_block_param for Dense/MoE models.
     int norm_layer_idx = -1;
     std::string norm_field;
-    if (parse_block_param(op.inputs[2].name, norm_layer_idx, norm_field) && norm_field == "norm_weight") {
+    if (mConfig.architecture == modules::ArchitectureType::Hybrid &&
+        parse_block_param(op.inputs[2].name, norm_layer_idx, norm_field) && norm_field == "norm_weight") {
         if (norm_layer_idx >= 0 && norm_layer_idx < static_cast<int>(mConfig.NumLayers)) {
             Tensor& res_buf = mRunState.get_residual(norm_layer_idx, mRunState.MainStream);
             if (residual_out.Data && res_buf.Data && residual_out.Data != res_buf.Data) {

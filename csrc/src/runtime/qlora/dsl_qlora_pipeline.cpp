@@ -8,13 +8,16 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #include <cuda_bf16.h>
 #include <fmt/format.h>
 
 #include "config/pretrained_config.h"
+#include "kernels/kernels.h"
 #include "runtime/dsl/dsl_weight_loader.h"
+#include "runtime/qlora/fp4_block_quantized_tensor.h"
 #include "utilities/allocator.h"
 #include "utilities/safetensors.h"
 #include "utilities/utils.h"
@@ -37,6 +40,128 @@ size_t spec_num_elements(const WeightLoadSpec& spec) {
 /// Check if a weight spec represents a 3D (expert-batched) weight.
 bool is_expert_weight(const WeightLoadSpec& spec) {
     return spec.shape.size() >= 3;
+}
+
+const SafeTensorEntry* try_find_entry(const SafeTensorsReader& reader, std::string_view name) {
+    for (const auto& entry : reader.entries()) {
+        if (entry.name() == name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+/// Read a safetensors entry into a (possibly padded) target tensor.
+/// FP4 scale storage is row-padded to 128-byte alignment, so the allocated
+/// tensor may have more elements than the HF entry. This helper reads the
+/// actual HF elements and zero-pads the remainder.
+void read_raw_padded(const SafeTensorEntry& entry, Tensor& target,
+                     cudaStream_t stream) {
+    long hf_nelem = 1;
+    for (auto d : entry.shape()) hf_nelem *= d;
+    long target_nelem = target.nelem();
+
+    if (hf_nelem < target_nelem) {
+        // Zero the full buffer, then read HF data into a view of the first hf_nelem elements
+        CUDA_CHECK(cudaMemsetAsync(target.Data, 0, target.bytes(), stream));
+        Tensor view = Tensor::from_pointer(
+            target.Data, target.Device, target.DType,
+            std::vector<long>(entry.shape().begin(), entry.shape().end()));
+        entry.read_raw(view, 0, hf_nelem, true);
+    } else {
+        entry.read_raw(target, 0, target_nelem, true);
+    }
+}
+
+/// Temporary GPU allocation for loading pre-quantized expert weights
+/// that will be relocated to pinned host memory for offloading.
+/// Uses raw cudaMalloc (not TensorAllocator) so we can free after relocation.
+struct GpuTempAlloc {
+    void* data = nullptr;
+    void* scales = nullptr;
+    void* meta = nullptr;
+
+    void free_all() {
+        if (data) { cudaFree(data); data = nullptr; }
+        if (scales) { cudaFree(scales); scales = nullptr; }
+        if (meta) { cudaFree(meta); meta = nullptr; }
+    }
+};
+
+/// Check if an expert weight spec should use CPU offloading.
+bool should_offload_expert(const WeightLoadSpec& spec,
+                           const DslQLoRAPipelineConfig& config) {
+    return spec.offload_group >= 0 &&
+           config.weight_manager_config.enable_offloading &&
+           config.weight_manager_config.offload_config.max_resident_groups > 0;
+}
+
+/// Allocate QuantizedTensor storage on GPU using raw cudaMalloc.
+/// Used for pre-quantized expert weights that need GPU for loading/swizzling
+/// before being relocated to pinned host memory for offloading.
+/// The returned GpuTempAlloc must be freed via free_all() after relocation.
+GpuTempAlloc allocate_qt_gpu_temp(
+    int M, int K, QuantizedTensor& qt, const QuantizerConfig& qconfig) {
+    GpuTempAlloc alloc;
+    qt.M = M;
+    qt.K = K;
+    qt.global_scale = 1.0f;
+    qt.double_quant = false;
+
+    if (qconfig.format == QuantFormat::FP4_BLOCK_2D) {
+        using C = modules::FP4BlockScaleConfig;
+        qt.format = QuantFormat::FP4_BLOCK_2D;
+        qt.block_size = C::BLOCK_SIZE;
+
+        const size_t data_bytes = C::packed_data_bytes(M, K);
+        CUDA_CHECK(cudaMalloc(&alloc.data, data_bytes));
+        qt.data = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.data), 0, ETensorDType::BYTE,
+            std::vector<long>{static_cast<long>(data_bytes)});
+
+        auto [sr, sc] = C::scale_dims(M, K);
+        const size_t scales_bytes =
+            static_cast<size_t>(sr) * sc * sizeof(__nv_fp8_e4m3);
+        CUDA_CHECK(cudaMalloc(&alloc.scales, scales_bytes));
+        qt.scales = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.scales), 0, ETensorDType::FP8_E4M3,
+            std::vector<long>{static_cast<long>(sr), static_cast<long>(sc)});
+
+        CUDA_CHECK(cudaMalloc(&alloc.meta, sizeof(float)));
+        qt.meta = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.meta), 0, ETensorDType::FP32,
+            std::vector<long>{1L});
+    } else {
+        throw std::runtime_error(
+            "allocate_qt_gpu_temp: unsupported format "
+            + std::to_string(static_cast<int>(qconfig.format)));
+    }
+
+    return alloc;
+}
+
+/// Relocate a QuantizedTensor from GPU to pinned host memory and free
+/// the GPU temp buffers. After this call, qt's data/scales/meta point
+/// to pinned host memory suitable for the OffloadManager.
+void relocate_qt_to_pinned(QuantizedTensor& qt, GpuTempAlloc& gpu,
+                           cudaStream_t stream) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto relocate_tensor = [](Tensor& t, void*& gpu_ptr) {
+        if (!gpu_ptr || t.is_null() || t.bytes() == 0) return;
+        void* pinned = nullptr;
+        CUDA_CHECK(cudaMallocHost(&pinned, t.bytes()));
+        CUDA_CHECK(cudaMemcpy(pinned, gpu_ptr, t.bytes(),
+                              cudaMemcpyDeviceToHost));
+        t.Data = static_cast<std::byte*>(pinned);
+        t.Device = -1;
+    };
+
+    relocate_tensor(qt.data, gpu.data);
+    relocate_tensor(qt.scales, gpu.scales);
+    relocate_tensor(qt.meta, gpu.meta);
+
+    gpu.free_all();
 }
 
 /// Find the maximum weight size (in elements) across all quantizable specs.
@@ -124,6 +249,274 @@ struct ScopedEvent {
     ScopedEvent(const ScopedEvent&) = delete;
     ScopedEvent& operator=(const ScopedEvent&) = delete;
 };
+
+// ---- Mapping resolution helpers for prequantized import ----
+// These replicate DslWeightLoader's private methods so we can resolve HF names
+// without going through the BF16 load path.
+
+/// Parse "blocks[N].param_name" or "xxx_blocks[N].param_name" -> (layer_idx, param_name).
+bool parse_block_param_local(std::string_view name, int& layer_idx, std::string& param_name) {
+    auto dot = name.find('.');
+    if (dot == std::string_view::npos) return false;
+    auto prefix = name.substr(0, dot);
+    auto rest = name.substr(dot + 1);
+
+    auto bracket = prefix.find("blocks[");
+    if (bracket != std::string_view::npos) {
+        auto close = prefix.find(']', bracket);
+        if (close == std::string_view::npos) return false;
+        auto idx_start = bracket + 7;
+        auto idx_str = prefix.substr(idx_start, close - idx_start);
+        try {
+            layer_idx = std::stoi(std::string(idx_str));
+        } catch (...) {
+            return false;
+        }
+        param_name = std::string(rest);
+        return true;
+    }
+
+    if (prefix == "blocks") {
+        auto idx_str = name.substr(dot + 1);
+        auto dot2 = idx_str.find('.');
+        if (dot2 == std::string_view::npos) return false;
+        try {
+            layer_idx = std::stoi(std::string(idx_str.substr(0, dot2)));
+        } catch (...) {
+            return false;
+        }
+        param_name = std::string(idx_str.substr(dot2 + 1));
+        return true;
+    }
+
+    return false;
+}
+
+/// Find mapping spec for an internal parameter name from the mapping table.
+const dsl::MappingSpec* resolve_mapping_spec(
+    const dsl::MappingTable& mapping,
+    const std::string& internal_name,
+    int& layer_idx) {
+    layer_idx = -1;
+
+    auto it = mapping.find(internal_name);
+    if (it != mapping.end()) {
+        return &it->second;
+    }
+
+    std::string base;
+    if (parse_block_param_local(internal_name, layer_idx, base)) {
+        std::string placeholder = std::string("blocks[{layer}].") + base;
+        it = mapping.find(placeholder);
+        if (it != mapping.end()) {
+            return &it->second;
+        }
+        it = mapping.find(base);
+        if (it != mapping.end()) {
+            return &it->second;
+        }
+    }
+
+    return nullptr;
+}
+
+/// Substitute {layer} and {expert} placeholders in HF name template.
+std::string resolve_hf_name(std::string templ, int layer_idx, int expert_idx = -1) {
+    {
+        const std::string placeholder = "{layer}";
+        std::size_t pos = templ.find(placeholder);
+        while (pos != std::string::npos) {
+            if (layer_idx < 0) {
+                throw std::runtime_error(
+                    "import_prequantized_weights: HF mapping uses {layer} but no layer index for '"
+                    + templ + "'");
+            }
+            templ.replace(pos, placeholder.size(), std::to_string(layer_idx));
+            pos = templ.find(placeholder, pos);
+        }
+    }
+    {
+        const std::string placeholder = "{expert}";
+        std::size_t pos = templ.find(placeholder);
+        while (pos != std::string::npos) {
+            if (expert_idx < 0) {
+                throw std::runtime_error(
+                    "import_prequantized_weights: HF mapping uses {expert} but no expert index for '"
+                    + templ + "'");
+            }
+            templ.replace(pos, placeholder.size(), std::to_string(expert_idx));
+            pos = templ.find(placeholder, pos);
+        }
+    }
+    return templ;
+}
+
+/// Simple glob-like matching: `*` matches any sequence of characters.
+/// Used for HF `modules_to_not_convert` patterns like "model.layers.*.self_attn".
+bool glob_match(const std::string& text, const std::string& pattern) {
+    size_t ti = 0, pi = 0;
+    size_t star_pi = std::string::npos, star_ti = 0;
+
+    while (ti < text.size()) {
+        if (pi < pattern.size() && pattern[pi] == '*') {
+            // Record star position and advance pattern
+            star_pi = pi++;
+            star_ti = ti;
+        } else if (pi < pattern.size() && (pattern[pi] == text[ti] || pattern[pi] == '?')) {
+            ++pi;
+            ++ti;
+        } else if (star_pi != std::string::npos) {
+            // Backtrack: let star consume one more character
+            pi = star_pi + 1;
+            ti = ++star_ti;
+        } else {
+            return false;
+        }
+    }
+    // Consume trailing stars
+    while (pi < pattern.size() && pattern[pi] == '*') ++pi;
+    return pi == pattern.size();
+}
+
+/// Check whether an HF weight name matches any module in `modules_to_not_convert`.
+/// Patterns may use `*` as wildcards (e.g., "model.layers.*.self_attn").
+/// A pattern matches if the HF name starts with or equals the pattern (allowing
+/// the HF name to have additional suffixes like ".weight").
+bool is_module_not_converted(const std::string& hf_name,
+                             const std::vector<std::string>& modules_to_not_convert) {
+    for (const auto& pattern : modules_to_not_convert) {
+        if (pattern.find('*') != std::string::npos) {
+            // Glob pattern: check if hf_name starts with the pattern
+            // (allow trailing .weight, .bias, etc.)
+            if (glob_match(hf_name, pattern) || glob_match(hf_name, pattern + ".*")) {
+                return true;
+            }
+        } else {
+            // Literal: check prefix or exact match
+            if (hf_name == pattern || hf_name.find(pattern) == 0 ||
+                hf_name.find(pattern + ".") != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Load pre-quantized expert weights from StackExperts mapping into a stacked QuantizedTensor.
+///
+/// Reads per-expert quantized data and scales from safetensors, placing them at the
+/// correct byte offset within the full stacked tensor. For fuse_gate_up specs,
+/// loads up_proj and gate_proj into the first and second halves of each expert's rows.
+void load_prequant_experts_stacked(
+    SafeTensorsReader& reader,
+    const dsl::MappingSpec& mspec,
+    const DslQLoRAPipelineConfig& config,
+    QuantizedTensor& qt,
+    int layer_idx,
+    int E, int /*per_M*/, int /*K*/,
+    cudaStream_t stream) {
+
+    const size_t total_data_bytes = qt.data.bytes();
+    const size_t total_scale_bytes = qt.scales.bytes();
+    const size_t per_expert_data_bytes = total_data_bytes / E;
+    const size_t per_expert_scale_bytes = total_scale_bytes / E;
+    const size_t data_elem_size = get_dtype_size(qt.data.DType);
+    const size_t scale_elem_size = get_dtype_size(qt.scales.DType);
+
+    if (mspec.fuse_gate_up) {
+        // Fused gate_up: source pattern points to gate_proj; derive up_proj pattern.
+        std::string gate_pattern = mspec.source;
+        std::string up_pattern = mspec.source;
+        auto pos = up_pattern.find("gate_proj");
+        if (pos != std::string::npos) {
+            up_pattern.replace(pos, 9, "up_proj");
+        }
+
+        // Each expert has 2*D rows: up_proj in first D, gate_proj in second D.
+        const size_t half_data_bytes = per_expert_data_bytes / 2;
+        const size_t half_scale_bytes = per_expert_scale_bytes / 2;
+        const long half_data_elems = static_cast<long>(half_data_bytes / data_elem_size);
+        const long half_scale_elems = static_cast<long>(half_scale_bytes / scale_elem_size);
+
+        for (int e = 0; e < E; ++e) {
+            const size_t expert_data_off = e * per_expert_data_bytes;
+            const size_t expert_scale_off = e * per_expert_scale_bytes;
+
+            // Load up_proj into first half of expert's data
+            std::string up_hf = resolve_hf_name(up_pattern, layer_idx, e);
+            std::string up_data_hf = config.data_suffix.empty()
+                ? up_hf : (up_hf + config.data_suffix);
+                
+            Tensor up_data = Tensor::from_pointer(
+                static_cast<std::byte*>(qt.data.Data) + expert_data_off,
+                qt.data.Device, qt.data.DType,
+                std::vector<long>{half_data_elems});
+            read_raw_padded(reader.find_entry(up_data_hf), up_data, stream);
+
+            std::string up_scale_hf = up_hf + config.scale_suffix;
+            Tensor up_scales = Tensor::from_pointer(
+                static_cast<std::byte*>(qt.scales.Data) + expert_scale_off,
+                qt.scales.Device, qt.scales.DType,
+                std::vector<long>{half_scale_elems});
+            read_raw_padded(reader.find_entry(up_scale_hf), up_scales, stream);
+
+            // Load gate_proj into second half of expert's data
+            std::string gate_hf = resolve_hf_name(gate_pattern, layer_idx, e);
+            std::string gate_data_hf = config.data_suffix.empty()
+                ? gate_hf : (gate_hf + config.data_suffix);
+            Tensor gate_data = Tensor::from_pointer(
+                static_cast<std::byte*>(qt.data.Data) + expert_data_off + half_data_bytes,
+                qt.data.Device, qt.data.DType,
+                std::vector<long>{half_data_elems});
+            read_raw_padded(reader.find_entry(gate_data_hf), gate_data, stream);
+
+            std::string gate_scale_hf = gate_hf + config.scale_suffix;
+            Tensor gate_scales = Tensor::from_pointer(
+                static_cast<std::byte*>(qt.scales.Data) + expert_scale_off + half_scale_bytes,
+                qt.scales.Device, qt.scales.DType,
+                std::vector<long>{half_scale_elems});
+            read_raw_padded(reader.find_entry(gate_scale_hf), gate_scales, stream);
+        }
+    } else {
+        const long per_expert_data_elems = static_cast<long>(per_expert_data_bytes / data_elem_size);
+        const long per_expert_scale_elems = static_cast<long>(per_expert_scale_bytes / scale_elem_size);
+
+        for (int e = 0; e < E; ++e) {
+            std::string hf_name = resolve_hf_name(mspec.source, layer_idx, e);
+            std::string data_hf = config.data_suffix.empty()
+                ? hf_name : (hf_name + config.data_suffix);
+
+            // Read quantized data for this expert
+            Tensor data_view = Tensor::from_pointer(
+                static_cast<std::byte*>(qt.data.Data) + e * per_expert_data_bytes,
+                qt.data.Device, qt.data.DType,
+                std::vector<long>{per_expert_data_elems});
+            read_raw_padded(reader.find_entry(data_hf), data_view, stream);
+
+            // Read scale for this expert
+            std::string scale_hf = hf_name + config.scale_suffix;
+            Tensor scale_view = Tensor::from_pointer(
+                static_cast<std::byte*>(qt.scales.Data) + e * per_expert_scale_bytes,
+                qt.scales.Device, qt.scales.DType,
+                std::vector<long>{per_expert_scale_elems});
+            read_raw_padded(reader.find_entry(scale_hf), scale_view, stream);
+        }
+    }
+
+    // Swizzle the full stacked scale buffer from row-major to F8_128x4 for NVFP4.
+    // After per-expert loading, the scale buffer is [E*per_M, K/16] row-major.
+    // Swizzle globally because the dequant kernel uses global scale_dims(E*per_M, K)
+    // offsets. Per-expert swizzle would be incorrect: when per_M is not 128-aligned,
+    // the per-expert padded dims differ from the global dims, and 128-row tiles can
+    // span expert boundaries in the global layout.
+    if (config.quantizer_config.format == QuantFormat::FP4_BLOCK_2D) {
+        auto [sr, sc] = modules::FP4BlockScaleConfig::scale_dims(qt.M, qt.K);
+        swizzle_fp8_scales_rowmajor_to_f8_128x4(
+            qt.scales.get<__nv_fp8_e4m3>(), sr, sc, stream);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
 
 }  // anonymous namespace
 
@@ -444,6 +837,719 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
                     static_cast<double>(om->cpu_memory_used()) / (1024.0 * 1024.0));
         }
     }
+
+    return weight_mgr;
+}
+
+// =============================================================================
+// Pre-quantized import pipeline
+// =============================================================================
+
+std::unique_ptr<GenericWeightManager> import_prequantized_weights(
+    const std::string& file_name,
+    const DslQLoRAPipelineConfig& config,
+    const PretrainedConfig& pt_config,
+    std::shared_ptr<TensorAllocator> allocator,
+    cudaStream_t stream) {
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    // ---- Step 1: Create quantizer and weight manager ----
+
+    auto quantizer_ptr = create_quantizer(config.quantizer_config);
+    if (!quantizer_ptr) {
+        throw std::runtime_error(
+            "import_prequantized_weights: failed to create quantizer for format "
+            + std::to_string(static_cast<int>(config.quantizer_config.format)));
+    }
+    IQuantizer* quantizer = quantizer_ptr.get();
+
+    auto weight_mgr = std::make_unique<GenericWeightManager>(
+        config.weight_manager_config,
+        std::move(quantizer_ptr),
+        allocator);
+
+    // ---- Step 2: Open SafeTensors and create weight loader ----
+    // We use DslWeightLoader for full-precision weights and tied param resolution.
+    // Quantized weights are loaded directly from safetensors using resolved HF names.
+
+    SafeTensorsReader reader(file_name);
+
+    dsl::ShardConfig shard_config;
+    shard_config.shard_idx = config.shard_idx;
+    shard_config.num_shards = config.num_shards;
+
+    dsl::MoEWeightConfig moe_config;
+    moe_config.num_experts = config.num_experts;
+    moe_config.moe_intermediate_size = config.moe_intermediate_size;
+
+    dsl::DslWeightLoader loader(
+        reader,
+        config.mapping,
+        pt_config,
+        *allocator,
+        shard_config,
+        moe_config);
+
+    auto load_full_precision = [&](const WeightLoadSpec& spec,
+                                   const char* reason) -> bool {
+        std::vector<long> shape;
+        if (!spec.shape.empty()) {
+            shape = spec.shape;
+        } else if (spec.K > 0) {
+            shape = {static_cast<long>(spec.M), static_cast<long>(spec.K)};
+        } else {
+            shape = {static_cast<long>(spec.M)};
+        }
+
+        Tensor tensor = allocator->allocate(
+            spec.target_dtype,
+            spec.name.c_str(),
+            EAllocationType::ON_DEVICE,
+            shape);
+
+        bool success = loader.load_param(
+            spec.name, tensor, true, spec.sharded, nullptr, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (success) {
+            weight_mgr->register_full_precision(spec.name, tensor);
+        }
+        return success;
+    };
+
+    // ---- Step 3: Load weights ----
+    //
+    // Two-pass loading (same structure as online quantization):
+    //   Pass 1: 2D weights + full-precision
+    //   Pass 2: 3D expert weights
+    //
+    // For truly pre-quantized weights, we read directly into quantized storage.
+    // If a weight's safetensors entry is still in float format (BF16/FP16/FP32),
+    // we fall back to online quantization using a reusable temporary buffer.
+
+    const int total = static_cast<int>(config.weight_specs.size());
+    int loaded = 0;
+
+    // Reusable BF16 buffer for on-the-fly quantization of non-packed weights.
+    // Allocated lazily on first use, freed after pass 1.
+    void* quant_tmp_ptr = nullptr;
+    size_t quant_tmp_bytes = 0;
+
+    // --- Pass 1: Non-expert weights (2D quantized + full-precision) ---
+
+    for (int i = 0; i < total; ++i) {
+        const auto& spec = config.weight_specs[i];
+
+        if (is_expert_weight(spec)) {
+            continue;  // Deferred to pass 2
+        }
+
+        show_progress(loaded, total, "Prequant Import");
+
+        if (spec.quantize && quantizer) {
+            // Resolve HF name from mapping table
+            int layer_idx = -1;
+            const auto* mspec = resolve_mapping_spec(config.mapping, spec.name, layer_idx);
+
+            // Fall back to Direct mapping with internal name as HF path
+            dsl::MappingSpec direct_fallback;
+            if (!mspec) {
+                direct_fallback.kind = dsl::MappingSpec::Kind::Direct;
+                direct_fallback.source = spec.name;
+                mspec = &direct_fallback;
+            }
+
+            // For Transform mappings (e.g. transpose): the raw quantized data is read
+            // as-is from HF safetensors. The transform (e.g. transpose) is applied
+            // after dequantization at runtime by GenericWeightManager.
+            //
+            // For Fuse mappings in pre-quantized models: each component is stored
+            // as packed quantized data (e.g., q_proj, k_proj, v_proj are each U8).
+            // We dequantize each component to BF16, fuse them, then re-quantize.
+            //
+            // For non-prequantized Fuse/Split/etc: fall back to full-precision
+            // loading via DslWeightLoader.
+            bool skip_quant = false;
+            if (!config.modules_to_not_convert.empty()) {
+                if (mspec->kind == dsl::MappingSpec::Kind::Fuse) {
+                    for (const auto& src : mspec->sources) {
+                        const std::string src_hf = resolve_hf_name(src, layer_idx);
+                        if (is_module_not_converted(src_hf, config.modules_to_not_convert)) {
+                            skip_quant = true;
+                            break;
+                        }
+                    }
+                } else if (mspec->kind == dsl::MappingSpec::Kind::Direct ||
+                           mspec->kind == dsl::MappingSpec::Kind::Transform) {
+                    std::string hf_name = resolve_hf_name(
+                        mspec->source.empty() ? spec.name : mspec->source, layer_idx);
+                    if (is_module_not_converted(hf_name, config.modules_to_not_convert)) {
+                        skip_quant = true;
+                    }
+                }
+            }
+            if (skip_quant) {
+                if (load_full_precision(spec, "modules_to_not_convert")) {
+                    loaded++;
+                }
+                continue;
+            }
+
+            if (mspec->kind == dsl::MappingSpec::Kind::Fuse && config.prequantized) {
+                bool missing_entries = false;
+                for (const auto& src : mspec->sources) {
+                    std::string comp_hf = resolve_hf_name(src, layer_idx);
+                    std::string comp_data_hf = config.data_suffix.empty()
+                        ? comp_hf : (comp_hf + config.data_suffix);
+                    const auto* comp_data_entry = try_find_entry(reader, comp_data_hf);
+                    if (!comp_data_entry) {
+                        missing_entries = true;
+                        break;
+                    }
+                    const auto comp_dtype = comp_data_entry->dtype();
+                    if (comp_dtype != ETensorDType::BF16 &&
+                        comp_dtype != ETensorDType::FP16 &&
+                        comp_dtype != ETensorDType::FP32) {
+                        std::string comp_scale_hf = comp_hf + config.scale_suffix;
+                        if (!try_find_entry(reader, comp_scale_hf)) {
+                            missing_entries = true;
+                            break;
+                        }
+                        if (!config.scale2_suffix.empty()) {
+                            std::string comp_scale2_hf = comp_hf + config.scale2_suffix;
+                            if (!try_find_entry(reader, comp_scale2_hf)) {
+                                missing_entries = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (missing_entries) {
+                    if (load_full_precision(spec, "missing prequant blocks")) {
+                        loaded++;
+                    }
+                    continue;
+                }
+                // Pre-quantized Fuse: dequant each component → BF16, concatenate,
+                // re-quantize. Only dim=0 (row concatenation) is supported.
+                if (mspec->dim != 0) {
+                    throw std::runtime_error(
+                        "Pre-quantized Fuse with dim != 0 is not supported for '"
+                        + spec.name + "'");
+                }
+
+                // Allocate quantized storage for the fused result
+                QuantizedTensor qt;
+                quantizer->allocate_storage(
+                    spec.M, spec.K, qt, *allocator,
+                    EAllocationType::ON_DEVICE, spec.name);
+
+                // Grow the reusable BF16 buffer to hold the full fused tensor
+                const size_t fused_bytes =
+                    static_cast<size_t>(spec.M) * spec.K * sizeof(nv_bfloat16);
+                if (fused_bytes > quant_tmp_bytes) {
+                    if (quant_tmp_ptr) CUDA_CHECK(cudaFree(quant_tmp_ptr));
+                    CUDA_CHECK(cudaMalloc(&quant_tmp_ptr, fused_bytes));
+                    quant_tmp_bytes = fused_bytes;
+                }
+
+                // Temp GPU buffers for per-component quantized data (reused across components)
+                void* comp_data_gpu = nullptr;
+                void* comp_scale_gpu = nullptr;
+                void* comp_meta_gpu = nullptr;
+                size_t comp_data_cap = 0;
+                size_t comp_scale_cap = 0;
+
+                int row_offset = 0;
+
+                // Helper: compute element count from safetensors entry shape
+                auto entry_nelem = [](const SafeTensorEntry& e) -> long {
+                    long n = 1;
+                    for (auto d : e.shape()) n *= d;
+                    return n;
+                };
+
+                for (const auto& src : mspec->sources) {
+                    std::string comp_hf = resolve_hf_name(src, layer_idx);
+                    std::string comp_data_hf = config.data_suffix.empty()
+                        ? comp_hf : (comp_hf + config.data_suffix);
+
+                    const auto& comp_data_entry = reader.find_entry(comp_data_hf);
+                    const auto comp_dtype = comp_data_entry.dtype();
+                    const auto& comp_shape = comp_data_entry.shape();
+
+                    // BF16 slice in the fused buffer for this component's output
+                    auto* slice_ptr = static_cast<std::byte*>(quant_tmp_ptr)
+                        + static_cast<size_t>(row_offset) * spec.K * sizeof(nv_bfloat16);
+
+                    if (comp_dtype == ETensorDType::BF16 ||
+                        comp_dtype == ETensorDType::FP16 ||
+                        comp_dtype == ETensorDType::FP32) {
+                        // Float component: shape is [M, K], read directly into BF16 slice
+                        int comp_M = static_cast<int>(comp_shape[0]);
+                        Tensor slice = Tensor::from_pointer(
+                            slice_ptr, 0, ETensorDType::BF16,
+                            std::vector<long>{static_cast<long>(comp_M),
+                                              static_cast<long>(spec.K)});
+                        comp_data_entry.read_tensor(slice, true);
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        row_offset += comp_M;
+                    } else {
+                        // Pre-quantized component (U8 packed FP4/FP8)
+                        // Derive component M from the data entry shape
+                        int comp_M;
+                        if (comp_shape.size() >= 2) {
+                            comp_M = static_cast<int>(comp_shape[0]);
+                        } else {
+                            // 1D packed: total_bytes * 2 / K for FP4 (2 values per byte)
+                            comp_M = static_cast<int>(
+                                (entry_nelem(comp_data_entry) * 2) / spec.K);
+                        }
+
+                        // Build temp QuantizedTensor for this component
+                        QuantizedTensor comp_qt;
+                        comp_qt.M = comp_M;
+                        comp_qt.K = spec.K;
+                        comp_qt.format = qt.format;
+                        comp_qt.block_size = qt.block_size;
+
+                        // Grow temp data buffer
+                        size_t need_data = static_cast<size_t>(entry_nelem(comp_data_entry));
+                        if (need_data > comp_data_cap) {
+                            if (comp_data_gpu) CUDA_CHECK(cudaFree(comp_data_gpu));
+                            CUDA_CHECK(cudaMalloc(&comp_data_gpu, need_data));
+                            comp_data_cap = need_data;
+                        }
+                        comp_qt.data = Tensor::from_pointer(
+                            static_cast<std::byte*>(comp_data_gpu), 0,
+                            ETensorDType::BYTE,
+                            std::vector<long>{static_cast<long>(need_data)});
+
+                        // Read packed quantized data
+                        comp_data_entry.read_raw(
+                            comp_qt.data, 0, comp_qt.data.nelem(), true);
+
+                        // Read per-block scales
+                        std::string comp_scale_hf = comp_hf + config.scale_suffix;
+                        const auto& comp_scale_entry =
+                            reader.find_entry(comp_scale_hf);
+                        size_t need_scale =
+                            static_cast<size_t>(entry_nelem(comp_scale_entry))
+                            * get_dtype_size(comp_scale_entry.dtype());
+                        if (need_scale > comp_scale_cap) {
+                            if (comp_scale_gpu) CUDA_CHECK(cudaFree(comp_scale_gpu));
+                            CUDA_CHECK(cudaMalloc(&comp_scale_gpu, need_scale));
+                            comp_scale_cap = need_scale;
+                        }
+                        comp_qt.scales = Tensor::from_pointer(
+                            static_cast<std::byte*>(comp_scale_gpu), 0,
+                            comp_scale_entry.dtype(),
+                            std::vector<long>(comp_scale_entry.shape().begin(),
+                                              comp_scale_entry.shape().end()));
+                        comp_scale_entry.read_raw(
+                            comp_qt.scales, 0, comp_qt.scales.nelem(), true);
+
+                        // Swizzle component scales (NVFP4: row-major → F8_128x4)
+                        if (config.quantizer_config.format == QuantFormat::FP4_BLOCK_2D) {
+                            auto [sr, sc] = modules::FP4BlockScaleConfig::scale_dims(
+                                comp_qt.M, comp_qt.K);
+                            swizzle_fp8_scales_rowmajor_to_f8_128x4(
+                                comp_qt.scales.get<__nv_fp8_e4m3>(), sr, sc, stream);
+                        }
+
+                        // Read second-level global scale (NVFP4: single float)
+                        if (!config.scale2_suffix.empty()) {
+                            if (!comp_meta_gpu) {
+                                CUDA_CHECK(cudaMalloc(&comp_meta_gpu, sizeof(float)));
+                            }
+                            comp_qt.meta = Tensor::from_pointer(
+                                static_cast<std::byte*>(comp_meta_gpu), 0,
+                                ETensorDType::FP32, std::vector<long>{1L});
+                            std::string comp_scale2_hf =
+                                comp_hf + config.scale2_suffix;
+                            const auto& comp_s2 =
+                                reader.find_entry(comp_scale2_hf);
+                            comp_s2.read_raw(comp_qt.meta, 0, 1, true);
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                &comp_qt.global_scale, comp_qt.meta.Data,
+                                sizeof(float), cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                        }
+
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                        // Dequantize into the BF16 slice
+                        Tensor slice = Tensor::from_pointer(
+                            slice_ptr, 0, ETensorDType::BF16,
+                            std::vector<long>{static_cast<long>(comp_M),
+                                              static_cast<long>(spec.K)});
+                        quantizer->dequantize(comp_qt, slice, stream);
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                        row_offset += comp_M;
+                    }
+                }
+
+                // Free temp component buffers
+                if (comp_data_gpu) CUDA_CHECK(cudaFree(comp_data_gpu));
+                if (comp_scale_gpu) CUDA_CHECK(cudaFree(comp_scale_gpu));
+                if (comp_meta_gpu) CUDA_CHECK(cudaFree(comp_meta_gpu));
+
+                if (row_offset != spec.M) {
+                    throw std::runtime_error(
+                        "Pre-quantized Fuse row mismatch for '" + spec.name
+                        + "': expected " + std::to_string(spec.M)
+                        + ", got " + std::to_string(row_offset));
+                }
+
+                // Re-quantize the full fused BF16 buffer
+                Tensor fused_bf16 = Tensor::from_pointer(
+                    static_cast<std::byte*>(quant_tmp_ptr), 0,
+                    ETensorDType::BF16,
+                    std::vector<long>{static_cast<long>(spec.M),
+                                     static_cast<long>(spec.K)});
+                quantizer->quantize(fused_bf16, qt, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                weight_mgr->store_prequantized(
+                    spec.name, std::move(qt), spec.offload_group, spec.shape);
+                loaded++;
+                continue;
+            }
+
+            if (mspec->kind != dsl::MappingSpec::Kind::Direct &&
+                mspec->kind != dsl::MappingSpec::Kind::Transform) {
+                // Non-Direct/Transform quantized param (Split, TiedTo, etc.)
+                // Fall back to full-precision loading via DslWeightLoader
+                std::vector<long> fp_shape;
+                if (!spec.shape.empty()) {
+                    fp_shape = spec.shape;
+                } else if (spec.K > 0) {
+                    fp_shape = {static_cast<long>(spec.M), static_cast<long>(spec.K)};
+                } else {
+                    fp_shape = {static_cast<long>(spec.M)};
+                }
+
+                Tensor tensor = allocator->allocate(
+                    spec.target_dtype, spec.name.c_str(),
+                    EAllocationType::ON_DEVICE, fp_shape);
+                bool success = loader.load_param(
+                    spec.name, tensor, true, spec.sharded, nullptr, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (success) {
+                    weight_mgr->register_full_precision(spec.name, tensor);
+                    loaded++;
+                }
+                continue;
+            }
+
+            std::string hf_name = resolve_hf_name(
+                mspec->source.empty() ? spec.name : mspec->source, layer_idx);
+
+            // Safety check: if HF module is in modules_to_not_convert, load as full-precision
+            if (is_module_not_converted(hf_name, config.modules_to_not_convert)) {
+                if (load_full_precision(spec, "modules_to_not_convert")) {
+                    loaded++;
+                }
+                continue;
+            }
+
+            // Allocate quantized storage
+            QuantizedTensor qt;
+            quantizer->allocate_storage(
+                spec.M, spec.K, qt, *allocator,
+                EAllocationType::ON_DEVICE, spec.name);
+
+            // Resolve HF data tensor name
+            std::string data_hf = config.data_suffix.empty()
+                ? hf_name : (hf_name + config.data_suffix);
+            const auto* data_entry_ptr = try_find_entry(reader, data_hf);
+            if (!data_entry_ptr) {
+                if (load_full_precision(spec, "missing prequant blocks")) {
+                    loaded++;
+                }
+                continue;
+            }
+            const auto& data_entry = *data_entry_ptr;
+
+            // Check if the HF entry is actually pre-quantized or still float.
+            // Some "pre-quantized" models store BF16 weights with quantization
+            // metadata in config.json but don't pack the data — quantize on the fly.
+            const auto file_dtype = data_entry.dtype();
+            if (file_dtype == ETensorDType::BF16 ||
+                file_dtype == ETensorDType::FP16 ||
+                file_dtype == ETensorDType::FP32) {
+                // Weight is still in float format — load as BF16 and quantize
+                const size_t needed = static_cast<size_t>(spec.M) * spec.K * sizeof(nv_bfloat16);
+                if (needed > quant_tmp_bytes) {
+                    if (quant_tmp_ptr) CUDA_CHECK(cudaFree(quant_tmp_ptr));
+                    CUDA_CHECK(cudaMalloc(&quant_tmp_ptr, needed));
+                    quant_tmp_bytes = needed;
+                }
+                Tensor bf16_buf = Tensor::from_pointer(
+                    static_cast<std::byte*>(quant_tmp_ptr), 0,
+                    ETensorDType::BF16,
+                    std::vector<long>{static_cast<long>(spec.M), static_cast<long>(spec.K)});
+
+                bool success = loader.load_param(
+                    spec.name, bf16_buf, true, spec.sharded, nullptr, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (success) {
+                    quantizer->quantize(bf16_buf, qt, stream);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    weight_mgr->store_prequantized(
+                        spec.name, std::move(qt), spec.offload_group, spec.shape);
+                    loaded++;
+                }
+                continue;
+            }
+
+            // Read pre-quantized weight data directly from safetensors
+            // For FP8/NVFP4: data_suffix is empty, reads from hf_name directly
+            // For MXFP4: data_suffix="_blocks", reads from hf_name + "_blocks"
+            read_raw_padded(data_entry, qt.data, stream);
+
+            // Read scale tensor
+            std::string scale_hf = hf_name + config.scale_suffix;
+            const auto* scale_entry_ptr = try_find_entry(reader, scale_hf);
+            if (!scale_entry_ptr) {
+                if (load_full_precision(spec, "missing prequant scales")) {
+                    loaded++;
+                }
+                continue;
+            }
+
+            const auto& scale_entry = *scale_entry_ptr;
+            read_raw_padded(scale_entry, qt.scales, stream);
+
+            // For NVFP4: HF stores scales in row-major order, but our dequant
+            // kernel expects the F8_128x4 swizzled layout. Swizzle in-place.
+            if (config.quantizer_config.format == QuantFormat::FP4_BLOCK_2D) {
+                auto [sr, sc] = modules::FP4BlockScaleConfig::scale_dims(spec.M, spec.K);
+                swizzle_fp8_scales_rowmajor_to_f8_128x4(
+                    qt.scales.get<__nv_fp8_e4m3>(), sr, sc, stream);
+            }
+
+            // For NVFP4: read second-level global scale (single float)
+            if (!config.scale2_suffix.empty() && qt.meta.Data != nullptr) {
+                std::string scale2_hf = hf_name + config.scale2_suffix;
+                const auto* scale2_entry_ptr = try_find_entry(reader, scale2_hf);
+                if (!scale2_entry_ptr) {
+                    if (load_full_precision(spec, "missing prequant scale2")) {
+                        loaded++;
+                    }
+                    continue;
+                }
+                const auto& scale2_entry = *scale2_entry_ptr;
+                // Read into qt.meta (device-side FP32), then copy to host
+                scale2_entry.read_raw(qt.meta, 0, 1, true);
+                CUDA_CHECK(cudaMemcpyAsync(&qt.global_scale, qt.meta.Data,
+                    sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Store in weight manager. Do NOT pass transform_fn for pre-quantized
+            // weights: pre-quantized HF models (MXFP4, FP8, NVFP4) store packed
+            // data in the GEMM-ready layout (matching DSL parameter shape), so the
+            // Transform("transpose") mapping only applies to BF16 weight import.
+            weight_mgr->store_prequantized(
+                spec.name, std::move(qt), spec.offload_group, spec.shape);
+            loaded++;
+        } else {
+            // Full-precision weight: use DslWeightLoader (handles all mapping kinds)
+            std::vector<long> shape;
+            if (!spec.shape.empty()) {
+                shape = spec.shape;
+            } else if (spec.K > 0) {
+                shape = {static_cast<long>(spec.M), static_cast<long>(spec.K)};
+            } else {
+                shape = {static_cast<long>(spec.M)};
+            }
+
+            Tensor tensor = allocator->allocate(
+                spec.target_dtype,
+                spec.name.c_str(),
+                EAllocationType::ON_DEVICE,
+                shape);
+
+            bool success = loader.load_param(
+                spec.name, tensor, true, spec.sharded, nullptr, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaGetLastError());
+            if (success) {
+                weight_mgr->register_full_precision(spec.name, tensor);
+                loaded++;
+            }
+        }
+    }
+
+    // Free temporary quantization buffer from pass 1
+    if (quant_tmp_ptr) {
+        CUDA_CHECK(cudaFree(quant_tmp_ptr));
+        quant_tmp_ptr = nullptr;
+        quant_tmp_bytes = 0;
+    }
+
+    // --- Pass 2: 3D expert weights (per-expert streaming from pre-quantized data) ---
+
+    for (int i = 0; i < total; ++i) {
+        const auto& spec = config.weight_specs[i];
+
+        if (!is_expert_weight(spec)) {
+            continue;  // Already handled in pass 1
+        }
+
+        if (!spec.quantize || !quantizer) {
+            // Full-precision expert weight
+            Tensor tensor = allocator->allocate(
+                spec.target_dtype,
+                spec.name.c_str(),
+                EAllocationType::ON_DEVICE,
+                spec.shape);
+
+            bool success = loader.load_param(
+                spec.name, tensor, true, spec.sharded, nullptr, stream);
+            if (success) {
+                weight_mgr->register_full_precision(spec.name, tensor);
+                loaded++;
+            }
+            continue;
+        }
+
+        show_progress(loaded, total, "Prequant Import");
+
+        // Resolve mapping spec
+        int layer_idx = -1;
+        const auto* mspec = resolve_mapping_spec(config.mapping, spec.name, layer_idx);
+        if (!mspec) {
+            throw std::runtime_error(
+                "import_prequantized_weights: no mapping for expert param '"
+                + spec.name + "'");
+        }
+
+        // 3D shape: [E, per_M, K]
+        const int E = static_cast<int>(spec.shape[0]);
+        const int per_M = static_cast<int>(spec.shape[1]);
+        const int K = static_cast<int>(spec.shape[2]);
+
+        // Allocate full stacked QuantizedTensor for [E*per_M, K].
+        // When offloading, use raw cudaMalloc (GPU temp) so we can relocate
+        // to pinned host after loading + swizzling without leaking
+        // TensorAllocator GPU memory.
+        QuantizedTensor qt;
+        GpuTempAlloc gpu_temp;
+        const bool offload_this = should_offload_expert(spec, config);
+
+        if (offload_this) {
+            gpu_temp = allocate_qt_gpu_temp(
+                spec.M, spec.K, qt, config.quantizer_config);
+        } else {
+            quantizer->allocate_storage(
+                spec.M, spec.K, qt, *allocator,
+                EAllocationType::ON_DEVICE, spec.name);
+        }
+
+        try {
+            if (mspec->kind == dsl::MappingSpec::Kind::StackExperts) {
+                load_prequant_experts_stacked(
+                    reader, *mspec, config, qt, layer_idx, E, per_M, K, stream);
+            } else if (mspec->kind == dsl::MappingSpec::Kind::Direct ||
+                       mspec->kind == dsl::MappingSpec::Kind::Transform) {
+                // Direct or Transform mapping: single stacked tensor in HF.
+                // Raw quantized data is read as-is. For Transform (e.g. transpose),
+                // the transform is applied after dequantization by GenericWeightManager.
+                std::string hf_name = resolve_hf_name(
+                    mspec->source.empty() ? spec.name : mspec->source, layer_idx);
+                std::string data_hf = config.data_suffix.empty()
+                    ? hf_name : (hf_name + config.data_suffix);
+                read_raw_padded(reader.find_entry(data_hf), qt.data, stream);
+
+                std::string scale_hf = hf_name + config.scale_suffix;
+                read_raw_padded(reader.find_entry(scale_hf), qt.scales, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            } else {
+                throw std::runtime_error(
+                    "import_prequantized_weights: unsupported mapping kind for expert param '"
+                    + spec.name + "' (expected Direct, Transform, or StackExperts)");
+            }
+
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        } catch (...) {
+            gpu_temp.free_all();
+            throw;
+        }
+
+        // Read weight_scale_2 (NVFP4 global scale) for expert weights.
+        // Each expert has its own scale2 in HF; our QuantizedTensor has a single
+        // global_scale. We use the max across all experts (values are typically
+        // very close for experts in the same layer).
+        if (!config.scale2_suffix.empty() && qt.meta.Data != nullptr) {
+            if (mspec->kind == dsl::MappingSpec::Kind::StackExperts) {
+                float max_scale2 = 0.0f;
+                float min_scale2 = std::numeric_limits<float>::max();
+                for (int e = 0; e < E; ++e) {
+                    std::string hf_name = resolve_hf_name(mspec->source, layer_idx, e);
+                    std::string scale2_hf = hf_name + config.scale2_suffix;
+                    const auto* entry = try_find_entry(reader, scale2_hf);
+                    if (!entry) continue;
+
+                    entry->read_raw(qt.meta, 0, 1, true);
+                    float val;
+                    CUDA_CHECK(cudaMemcpyAsync(&val, qt.meta.Data, sizeof(float),
+                                               cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    max_scale2 = std::max(max_scale2, val);
+                    min_scale2 = std::min(min_scale2, val);
+                }
+                qt.global_scale = max_scale2;
+            } else {
+                // Direct/Transform: single scale2 for the stacked tensor
+                std::string hf_name = resolve_hf_name(
+                    mspec->source.empty() ? spec.name : mspec->source, layer_idx);
+                std::string scale2_hf = hf_name + config.scale2_suffix;
+                const auto* entry = try_find_entry(reader, scale2_hf);
+                if (entry) {
+                    entry->read_raw(qt.meta, 0, 1, true);
+                    CUDA_CHECK(cudaMemcpyAsync(&qt.global_scale, qt.meta.Data,
+                                               sizeof(float),
+                                               cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            }
+
+            // Write final global_scale to meta tensor for consistency
+            CUDA_CHECK(cudaMemcpyAsync(qt.meta.Data, &qt.global_scale,
+                                       sizeof(float),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+
+        // Relocate from GPU temp to pinned host for offloading.
+        // After this, qt's data/scales/meta are on pinned host memory
+        // and the GPU temp buffers are freed.
+        if (offload_this) {
+            relocate_qt_to_pinned(qt, gpu_temp, stream);
+        }
+
+        // Do NOT pass transform_fn: pre-quantized data is already in DSL layout
+        // (e.g., MXFP4 gate_up_proj_blocks is stored as [E, MUp, C] even though
+        // the BF16 gate_up_proj is [E, C, MUp] — the quantizer pre-transposes).
+        weight_mgr->store_prequantized(
+            spec.name, std::move(qt), spec.offload_group, spec.shape);
+        loaded++;
+    }
+
+    // ---- Step 4: Resolve tied parameters ----
+
+    loader.resolve_tied_params([&](const std::string& name) -> Tensor& {
+        return weight_mgr->get(name, stream);
+    });
+
+    // ---- Step 5: Synchronize and report ----
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     return weight_mgr;
 }

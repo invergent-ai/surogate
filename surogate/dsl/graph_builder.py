@@ -422,6 +422,7 @@ class GraphBuilder:
         causal: bool = True,
         softmax_scale: float | None = None,
         window_size: int | None = None,
+        sinks: str | GraphRef | None = None,
         out_name: str | None = None,
         lse_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
@@ -433,9 +434,12 @@ class GraphBuilder:
             attrs["softmax_scale"] = softmax_scale
         if window_size is not None:
             attrs["window_size"] = window_size
+        inputs = [self._resolve_input(qkv)]
+        if sinks is not None:
+            inputs.append(self._resolve_input(sinks))
         self._add_node(GraphNode(
             op="flash_attention",
-            inputs=[self._resolve_input(qkv)],
+            inputs=inputs,
             outputs=[out, lse],
             attrs=attrs,
         ))
@@ -871,6 +875,9 @@ class GraphBuilder:
         top_k: int,
         normalize: bool = True,
         scaling_factor: float = 1.0,
+        rounding_scale: float | None = None,
+        sort_by_index: bool = False,
+        softmax: bool | None = None,
         correction_bias: str | GraphRef | None = None,
         weights_name: str | None = None,
         indices_name: str | None = None,
@@ -887,6 +894,12 @@ class GraphBuilder:
         attrs: dict = {"top_k": top_k, "normalize": normalize}
         if scaling_factor != 1.0:
             attrs["scaling_factor"] = scaling_factor
+        if rounding_scale is not None and rounding_scale != 0.0:
+            attrs["topk_rounding_scale"] = rounding_scale
+        if sort_by_index:
+            attrs["topk_sort_by_index"] = True
+        if softmax is not None:
+            attrs["softmax"] = softmax
         inputs = [self._resolve_input(probs)]
         if correction_bias is not None:
             inputs.append(self._resolve_input(correction_bias))
@@ -965,6 +978,7 @@ class GraphBuilder:
         x: str | GraphRef,
         weights: str,
         scatter_indices: str | GraphRef,
+        gate_up_interleaved: bool | None = None,
         out_name: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM for gate+up projection.
@@ -978,6 +992,10 @@ class GraphBuilder:
             Output tensor (total_tokens, 2*intermediate_size)
         """
         out = out_name or self._fresh_name("moe_gate_up")
+        attrs = {}
+        if gate_up_interleaved is not None:
+            attrs["gate_up_interleaved"] = gate_up_interleaved
+
         self._add_node(GraphNode(
             op="moe_grouped_gemm_gate_up",
             inputs=[
@@ -986,6 +1004,7 @@ class GraphBuilder:
                 self._resolve_input(scatter_indices),
             ],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -1014,6 +1033,40 @@ class GraphBuilder:
                 weights,  # Parameter name, not resolved
                 self._resolve_input(scatter_indices),
             ],
+            outputs=[out],
+        ))
+        return self._make_output(out)
+
+    def gpt_oss_moe_act(
+        self,
+        x: str | GraphRef,
+        *,
+        alpha: float = 1.702,
+        limit: float = 7.0,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """GPT-OSS gated activation (interleaved gate/up)."""
+        out = out_name or self._fresh_name("gpt_oss_act")
+        self._add_node(GraphNode(
+            op="gpt_oss_moe_act",
+            inputs=[self._resolve_input(x)],
+            outputs=[out],
+            attrs={"alpha": alpha, "limit": limit},
+        ))
+        return self._make_output(out)
+
+    def moe_expert_bias_add(
+        self,
+        x: str | GraphRef,
+        bias: str | GraphRef,
+        *,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Add per-expert bias to permuted MoE activations."""
+        out = out_name or self._fresh_name("moe_bias")
+        self._add_node(GraphNode(
+            op="moe_expert_bias_add",
+            inputs=[self._resolve_input(x), self._resolve_input(bias)],
             outputs=[out],
         ))
         return self._make_output(out)

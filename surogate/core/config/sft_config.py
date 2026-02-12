@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Literal
@@ -13,6 +13,8 @@ from surogate.utils.dict import DictDefault
 from surogate.utils.fs import to_abspath
 from surogate.utils.logger import get_logger
 from surogate.utils.model import estimate_model_parameters
+
+logger = get_logger()
 
 @dataclass
 class DistributedConfig:
@@ -607,15 +609,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         if self.zero_level >= 3:
             shard_weights = True
 
-        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
-            # QLoRA requires recompute enabled
+        # Check if model is pre-quantized (same runtime constraints as QLoRA)
+        _is_prequantized = (self.model_info.quant_info or {}).get('quant_method', '').startswith('prequant_')
+
+        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4 or _is_prequantized:
+            # QLoRA / pre-quantized requires recompute enabled
             if not self.recompute:
                 self.recompute = True
+                logger.info("[QLoRA]: enabling recompute for memory efficiency.")
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
+            logger.info("[QLoRA]: disabling CUDA graphs.")
 
 
         if self.lora and self.recompute and self.offload_residual:
             self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
+            logger.info("[LoRA]: disabling CUDA graphs because recompute with offloaded residuals is not compatible with CUDA graphs.")
 
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",
@@ -671,7 +679,32 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         )
 
     def create_qlora_config(self):
+        logger = get_logger()
         self.qlora_config = None
+
+        # Detect pre-quantized HF models (FP8, NVFP4, MXFP4)
+        is_prequantized = False
+        prequant_method = None
+        if self.model_info.quant_info:
+            qm = self.model_info.quant_info.get('quant_method', '')
+            if qm.startswith('prequant_'):
+                is_prequantized = True
+                prequant_method = qm
+
+        # Validate: pre-quantized + online QLoRA = error (mutually exclusive)
+        if is_prequantized and (self.qlora_fp4 or self.qlora_fp8 or self.qlora_bnb):
+            raise ValueError(
+                f"Model is already pre-quantized ({prequant_method}). "
+                "Cannot combine with online QLoRA quantization (qlora_bnb/qlora_fp8/qlora_fp4). "
+                "Remove the qlora_* options — the pre-quantized weights will be loaded directly."
+            )
+
+        # Validate: pre-quantized requires lora
+        if is_prequantized and not self.lora:
+            raise ValueError(
+                f"Pre-quantized model ({prequant_method}) requires `lora: true`. "
+                "Base weights are frozen (read-only quantized data); only LoRA adapters are trained."
+            )
 
         # QLoRA is only supported together with LoRA adapters in Surogate:
         # base weights remain frozen and only LoRA params are trained.
@@ -682,7 +715,20 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 "Either enable LoRA or disable QLoRA."
             )
 
-        if self.qlora_fp4:
+        # Create config for pre-quantized models
+        if is_prequantized:
+            if prequant_method == 'prequant_fp8':
+                self.qlora_config = _surogate.QLoRAConfig.prequant_fp8()
+            elif prequant_method == 'prequant_nvfp4':
+                self.qlora_config = _surogate.QLoRAConfig.prequant_nvfp4()
+            elif prequant_method == 'prequant_mxfp4':
+                self.qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
+            # Populate modules_to_not_convert from HF config
+            ignore_list = self.model_info.quant_info.get('modules_to_not_convert', [])
+            if ignore_list:
+                self.qlora_config.modules_to_not_convert = ignore_list
+            logger.info(f"Detected pre-quantized model: {prequant_method}")
+        elif self.qlora_fp4:
             self.qlora_config = _surogate.QLoRAConfig.nvfp4()
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six
         elif self.qlora_fp8:

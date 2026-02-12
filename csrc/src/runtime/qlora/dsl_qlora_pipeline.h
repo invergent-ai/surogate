@@ -90,6 +90,31 @@ struct DslQLoRAPipelineConfig {
 
     /// The HF mapping table (internal names -> HF SafeTensors paths).
     dsl::MappingTable mapping;
+
+    // =========================================================================
+    // Pre-quantized model loading
+    // =========================================================================
+
+    /// Whether this is a pre-quantized HF model (skip online quantization).
+    /// When true, quantized data and scales are loaded directly from safetensors.
+    bool prequantized = false;
+
+    /// Suffix appended to HF weight name to get the data tensor name.
+    /// Empty for FP8/NVFP4 (data tensor uses the same name as the weight).
+    /// "_blocks" for MXFP4 (HF stores packed data with _blocks suffix).
+    std::string data_suffix;
+
+    /// Suffix appended to HF weight name to get the scale tensor name.
+    /// "_scale_inv" for FP8, "_scale" for NVFP4, "_scales" for MXFP4.
+    std::string scale_suffix;
+
+    /// Suffix for second-level scale tensor (NVFP4 only: "_scale_2" for global scale).
+    /// Empty for formats with single-level scaling.
+    std::string scale2_suffix;
+
+    /// HF module paths that should NOT be quantized (loaded full-precision).
+    /// Populated from HF quantization_config "ignore" / "modules_to_not_convert".
+    std::vector<std::string> modules_to_not_convert;
 };
 
 /// Import weights from HuggingFace SafeTensors and quantize into a GenericWeightManager.
@@ -109,6 +134,26 @@ struct DslQLoRAPipelineConfig {
 ///
 /// @return Fully initialized GenericWeightManager with all weights loaded and quantized.
 std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
+    const std::string& file_name,
+    const DslQLoRAPipelineConfig& config,
+    const PretrainedConfig& pt_config,
+    std::shared_ptr<TensorAllocator> allocator,
+    cudaStream_t stream);
+
+/// Import pre-quantized weights from HuggingFace SafeTensors into a GenericWeightManager.
+///
+/// Unlike import_and_quantize_weights(), this loads already-quantized data
+/// (FP8/NVFP4/MXFP4) directly from safetensors without online quantization.
+/// Scale tensors are loaded using the configured suffixes.
+///
+/// @param file_name   Path to HuggingFace SafeTensors checkpoint directory or file.
+/// @param config      Pipeline configuration (must have prequantized=true).
+/// @param pt_config   Pretrained model configuration.
+/// @param allocator   Tensor allocator for all GPU/CPU memory.
+/// @param stream      CUDA stream for async operations.
+///
+/// @return Fully initialized GenericWeightManager with all weights loaded.
+std::unique_ptr<GenericWeightManager> import_prequantized_weights(
     const std::string& file_name,
     const DslQLoRAPipelineConfig& config,
     const PretrainedConfig& pt_config,

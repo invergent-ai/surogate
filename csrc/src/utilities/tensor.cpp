@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 
 /**
  * @brief Create a contiguous view into @p src by slicing the first dimension.
@@ -59,14 +60,25 @@ Tensor slice(const Tensor& src, int dim, long start, long end) {
  */
 void fill_zero(Tensor& dst, cudaStream_t stream) {
     if (!dst.Data || dst.bytes() == 0) return;
-    
+
     if (dst.Device == -1) {
+        cudaPointerAttributes attr{};
+        cudaError_t attr_err = cudaPointerGetAttributes(&attr, dst.Data);
+        if (attr_err == cudaSuccess) {
+            if (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged) {
+                CUDA_CHECK(cudaMemsetAsync(dst.Data, 0, dst.bytes(), stream));
+                return;
+            }
+        } else {
+            cudaGetLastError(); // clear sticky error
+        }
         // Host/pinned memory - use memset
         std::memset(dst.Data, 0, dst.bytes());
-    } else {
-        // Device memory - use async memset
-        CUDA_CHECK(cudaMemsetAsync(dst.Data, 0, dst.bytes(), stream));
+        return;
     }
+
+    // Device memory - use async memset
+    CUDA_CHECK(cudaMemsetAsync(dst.Data, 0, dst.bytes(), stream));
 }
 
 /**

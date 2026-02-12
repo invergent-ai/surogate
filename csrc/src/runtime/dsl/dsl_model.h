@@ -139,6 +139,9 @@ public:
     }
     [[nodiscard]] std::size_t qlora_quantized_weights_bytes() const;
     [[nodiscard]] float qlora_memory_savings_ratio() const;
+    [[nodiscard]] std::size_t saved_buffers_total_bytes() const;
+    [[nodiscard]] int saved_buffers_count() const;
+    [[nodiscard]] const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const;
     DslModel& base_model() { return *this; }
     [[nodiscard]] const modules::ModelConfig& config() const { return mModelConfig; }
 

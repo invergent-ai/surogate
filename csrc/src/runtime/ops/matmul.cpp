@@ -31,9 +31,10 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     matmul_dims(a, b, op.attrs.transpose, M, N, K);
 
     // Router matmul: match HF by computing logits in FP32 using FP32 inputs/weights.
-    const bool is_router = (weight_name.find("router_weight") != std::string::npos);
-    if (is_router && out.DType == ETensorDType::FP32 &&
-        (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32)) {
+    // Skip the string search for dense (non-MoE) models — they have no router.
+    const bool is_router = (mConfig.NumExperts > 0) &&
+                           (weight_name.find("router_weight") != std::string::npos);
+    if (is_router && (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
         auto shape_vec = [](const Tensor& t) {
             return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
         };
@@ -75,10 +76,25 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
             }
         }
 
+        Tensor out_f = out;
+        if (out.DType != ETensorDType::FP32) {
+            out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out));
+            mTemps.push_back(out_f);
+        }
+
         EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-        matmul(out, b_f, a_f, bias_f, nullptr, nullptr,
+        matmul(out_f, b_f, a_f, bias_f, nullptr, nullptr,
                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                N, M, K, mode_col, false, mRunState.MainStream);
+        if (out.DType != ETensorDType::FP32) {
+            if (out.DType == ETensorDType::BF16) {
+                convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);
+            } else if (out.DType == ETensorDType::FP32) {
+                // no-op
+            } else {
+                throw std::runtime_error("router matmul: unsupported output dtype");
+            }
+        }
         return;
     }
 
@@ -139,7 +155,8 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     }
 
     // Apply shared-expert LoRA contributions (Nemotron/DeepSeek) for shared expert matmuls.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled()) {
+    // Only applies to MoE models with shared experts — skip for dense models.
+    if (mConfig.NumExperts > 0 && mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled()) {
         int shared_layer = -1;
         std::string field;
         if (parse_block_param(weight_name, shared_layer, field)) {
@@ -222,7 +239,6 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
         (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
     }
-
 }
 
 void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
@@ -488,7 +504,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     }
 
     // Shared-expert LoRA backward (Nemotron/DeepSeek).
-    if (mLoRAConfig && mLoRAWeights && mLoRAGrads && mLoRARunState &&
+    // Only applies to MoE models with shared experts — skip for dense models.
+    if (mConfig.NumExperts > 0 && mLoRAConfig && mLoRAWeights && mLoRAGrads && mLoRARunState &&
         mLoRAConfig->enabled() && mComm) {
         int shared_layer = -1;
         std::string field;

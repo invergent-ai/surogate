@@ -20,6 +20,31 @@ BnBQuantizer::BnBQuantizer(const QuantizerConfig& config)
     CUDA_CHECK(cudaGetDeviceProperties(&mDeviceProps, config.device_id));
 }
 
+BnBQuantizer::~BnBQuantizer() {
+    if (mAbsmaxBuffer) {
+        cudaFree(mAbsmaxBuffer);
+        mAbsmaxBuffer = nullptr;
+        mAbsmaxCapacity = 0;
+    }
+}
+
+void BnBQuantizer::ensure_absmax_buffer(long num_blocks) {
+    if (!mDoubleQuant) {
+        return;
+    }
+    if (num_blocks <= mAbsmaxCapacity) {
+        return;
+    }
+    if (mAbsmaxBuffer) {
+        CUDA_CHECK(cudaFree(mAbsmaxBuffer));
+        mAbsmaxBuffer = nullptr;
+        mAbsmaxCapacity = 0;
+    }
+    const size_t bytes = static_cast<size_t>(num_blocks) * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&mAbsmaxBuffer, bytes));
+    mAbsmaxCapacity = num_blocks;
+}
+
 void BnBQuantizer::quantize(
     const Tensor& input,
     QuantizedTensor& output,
@@ -30,6 +55,7 @@ void BnBQuantizer::quantize(
     const long num_blocks = (num_elements + mBlockSize - 1) / mBlockSize;
 
     if (mDoubleQuant) {
+        ensure_absmax_buffer(num_blocks);
         // Two-step quantization:
         // 1. Quantize BF16 → NF4 with FP32 absmax into a temporary buffer on the QuantizedTensor's meta2
         //    (we reuse the scales tensor as a temporary FP32 absmax buffer, then overwrite with INT8)
@@ -45,8 +71,7 @@ void BnBQuantizer::quantize(
         // We need a temporary FP32 buffer of size num_blocks for the intermediate absmax.
         // The existing codebase allocates a dedicated mAbsmaxBuffer for this purpose.
         // Since our interface doesn't expose scratch buffers, we'll allocate a small temp buffer on stream.
-        float* temp_absmax = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&temp_absmax, num_blocks * sizeof(float), stream));
+        float* temp_absmax = mAbsmaxBuffer;
 
         // Step 1: Quantize BF16 → NF4 with FP32 absmax
         quantize_bnb_nf4(
@@ -69,7 +94,6 @@ void BnBQuantizer::quantize(
             mDeviceProps,
             stream);
 
-        CUDA_CHECK(cudaFreeAsync(temp_absmax, stream));
     } else {
         // Single-step: Quantize BF16 → NF4 with FP32 absmax directly
         quantize_bnb_nf4(

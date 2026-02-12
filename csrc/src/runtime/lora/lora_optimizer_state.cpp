@@ -268,6 +268,10 @@ void ModularLoRAOptimizerState::StateContainer::iterate_tensors(
             callback(prefix + ".mlp.gate_proj.lora_A.weight", block.mlp.gate->A);
             callback(prefix + ".mlp.gate_proj.lora_B.weight", block.mlp.gate->B);
         }
+        if (block.mlp.gate_up.has_value()) {
+            callback(prefix + ".mlp.gate_up_proj.lora_A.weight", block.mlp.gate_up->A);
+            callback(prefix + ".mlp.gate_up_proj.lora_B.weight", block.mlp.gate_up->B);
+        }
         if (block.mlp.up.has_value()) {
             callback(prefix + ".mlp.up_proj.lora_A.weight", block.mlp.up->A);
             callback(prefix + ".mlp.up_proj.lora_B.weight", block.mlp.up->B);
@@ -285,6 +289,10 @@ void ModularLoRAOptimizerState::StateContainer::iterate_tensors(
             if (expert.gate.has_value()) {
                 callback(expert_prefix + ".gate_proj.lora_A.weight", expert.gate->A);
                 callback(expert_prefix + ".gate_proj.lora_B.weight", expert.gate->B);
+            }
+            if (expert.gate_up.has_value()) {
+                callback(expert_prefix + ".gate_up_proj.lora_A.weight", expert.gate_up->A);
+                callback(expert_prefix + ".gate_up_proj.lora_B.weight", expert.gate_up->B);
             }
             if (expert.up.has_value()) {
                 callback(expert_prefix + ".up_proj.lora_A.weight", expert.up->A);

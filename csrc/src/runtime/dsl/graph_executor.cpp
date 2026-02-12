@@ -19,11 +19,12 @@
 #include <iostream>
 #include <optional>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
+#include <cuda_fp16.h>
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/core/fp8_scaling_config.h"
 #include "runtime/lora/lora_model_utils.h"
@@ -516,6 +517,7 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
     mCompiledExecutor->set_embedding_outputs(mEmbeddingOutputs);
     mCompiledExecutor->set_slot_registry(&mCompiler->slot_registry());
+    mCompiledExecutor->set_debug_dump_fn(nullptr);
 
     // Graphs will be compiled lazily on first forward when B/T are known
     mCompiledB = 0;
@@ -549,6 +551,22 @@ void GraphExecutor::set_internal_graphs_enabled(bool enabled) {
 
 bool GraphExecutor::internal_graphs_enabled() const {
     return mGraphsEnabled;
+}
+
+size_t GraphExecutor::saved_buffers_total_bytes() const {
+    return mCompiledExecutor ? mCompiledExecutor->saved_buffers_total_bytes() : 0;
+}
+
+int GraphExecutor::saved_buffers_count() const {
+    return mCompiledExecutor ? mCompiledExecutor->saved_buffers_count() : 0;
+}
+
+const std::unordered_map<std::string, size_t>& GraphExecutor::saved_buffers_sizes() const {
+    if (mCompiledExecutor) {
+        return mCompiledExecutor->saved_buffers_sizes();
+    }
+    static const std::unordered_map<std::string, size_t> empty;
+    return empty;
 }
 
 void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool full,

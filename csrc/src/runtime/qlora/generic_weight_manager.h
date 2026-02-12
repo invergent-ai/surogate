@@ -91,6 +91,19 @@ struct ManagedWeight {
     /// Empty means use default {M, K}.
     std::vector<long> dequant_shape;
 
+    /// Whether this weight needs per-expert 2D transpose after dequantization.
+    /// Used for pre-quantized weights loaded via Transform("transpose") mapping,
+    /// where the HF data is stored in the original (untransposed) layout but the
+    /// DSL expects the transposed layout.
+    bool needs_transpose = false;
+
+    /// Per-expert dimensions for post-dequant transpose (valid when needs_transpose).
+    /// hf_inner_rows × hf_inner_cols is the per-expert shape in HF (source) order.
+    /// After transpose, each expert becomes [hf_inner_cols, hf_inner_rows].
+    int hf_inner_rows = 0;
+    int hf_inner_cols = 0;
+    int num_experts_for_transpose = 0;
+
     /// Whether this weight currently holds a buffer from the pool.
     bool has_pool_buffer = false;
 
@@ -201,6 +214,31 @@ public:
         const std::string& name,
         const Tensor& bf16,
         cudaStream_t stream);
+
+    /// Store a pre-populated QuantizedTensor directly (no online quantization).
+    ///
+    /// Used for pre-quantized HF model loading: the caller reads quantized
+    /// data and scales from safetensors into a QuantizedTensor, then hands
+    /// it to this method for managed storage. Bypasses the quantize_and_store()
+    /// path which expects BF16 input.
+    ///
+    /// This method handles registration, dequant buffer allocation, and
+    /// offload setup in one step (do NOT call register_weight() first).
+    ///
+    /// @param name           Unique weight name (e.g., "blocks[0].qkv_weight")
+    /// @param qt             Pre-populated QuantizedTensor (moved in)
+    /// @param offload_group  Offload group ID (-1 = no offloading)
+    /// @param shape          Full tensor shape for dequant buffer (e.g., {E, M, K}).
+    ///                       If empty, uses {qt.M, qt.K}.
+    /// @param transform_fn   Transform function ("transpose" or empty). When set,
+    ///                       the dequantized output will be post-processed to match
+    ///                       the DSL layout (e.g., per-expert 2D transpose).
+    void store_prequantized(
+        const std::string& name,
+        QuantizedTensor&& qt,
+        int offload_group = -1,
+        const std::vector<long>& shape = {},
+        const std::string& transform_fn = "");
 
     /// Quantize a single expert's BF16 data into a slice of a registered weight.
     ///
@@ -357,6 +395,11 @@ private:
 
     /// Number of active dequant buffers (from pool, currently held by weights).
     int mActivePoolBuffers = 0;
+
+    /// Shared temporary buffer for post-dequant transpose operations.
+    /// Allocated lazily on first use, sized for the largest weight that needs
+    /// transpose. Reused across all transpose dequant calls.
+    Tensor mTransposeTemp;
 };
 
 }  // namespace qlora

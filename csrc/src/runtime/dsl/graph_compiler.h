@@ -53,6 +53,7 @@ enum class CompiledOpType : std::uint8_t {
     MatmulBias,
     BiasAdd,
     SwiGLU,
+    GptOssMoeAct,
     Silu,
     Gelu,
     Relu2,
@@ -76,12 +77,14 @@ enum class CompiledOpType : std::uint8_t {
     MoEGroupedGemmGateUp,
     MoEGroupedGemmDown,
     MoEUnpermute,
+    MoEExpertBiasAdd,
     // Backward operations
     ViewBackward,
     AddBackward,
     MatmulBackward,
     BiasAddBackward,
     SwiGLUBackward,
+    GptOssMoeActBackward,
     SiluBackward,
     GeluBackward,
     Relu2Backward,
@@ -109,6 +112,7 @@ enum class CompiledOpType : std::uint8_t {
     MoEGroupedGemmGateUpBackward,
     MoEGroupedGemmDownBackward,
     MoEUnpermuteBackward,
+    MoEExpertBiasAddBackward,
     // Mamba/SSM forward operations
     MambaSplitProj,
     MambaConv1d,
@@ -153,6 +157,7 @@ struct CompiledAttrs {
     int rotary_dim = 0;
     bool compute_accuracy = false;
     std::array<int, 3> mrope_section{0, 0, 0};
+    int window_size = 0;
 
     // Shape info
     std::vector<long> shape;
@@ -171,6 +176,14 @@ struct CompiledAttrs {
     int top_k = 0;
     bool normalize_weights = true;
     float scaling_factor = 1.0f;
+    bool topk_softmax = false;
+    float topk_rounding_scale = 0.0f;
+    bool topk_sort_by_index = false;
+    bool gate_up_interleaved = false;
+
+    // GPT-OSS gated MoE activation
+    float gpt_oss_alpha = 1.702f;
+    float gpt_oss_limit = 7.0f;
 
     // Mamba/SSM-specific
     int mamba_num_heads = 0;

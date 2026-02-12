@@ -211,6 +211,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MatmulBias: return "matmul_bias";
         case CompiledOpType::BiasAdd: return "bias_add";
         case CompiledOpType::SwiGLU: return "swiglu";
+        case CompiledOpType::GptOssMoeAct: return "gpt_oss_moe_act";
         case CompiledOpType::Silu: return "silu";
         case CompiledOpType::Gelu: return "gelu";
         case CompiledOpType::Relu2: return "relu2";
@@ -234,12 +235,14 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmGateUp: return "moe_grouped_gemm_gate_up";
         case CompiledOpType::MoEGroupedGemmDown: return "moe_grouped_gemm_down";
         case CompiledOpType::MoEUnpermute: return "moe_unpermute";
+        case CompiledOpType::MoEExpertBiasAdd: return "moe_expert_bias_add";
         // Backward
         case CompiledOpType::ViewBackward: return "view_backward";
         case CompiledOpType::AddBackward: return "add_backward";
         case CompiledOpType::MatmulBackward: return "matmul_backward";
         case CompiledOpType::BiasAddBackward: return "bias_add_backward";
         case CompiledOpType::SwiGLUBackward: return "swiglu_backward";
+        case CompiledOpType::GptOssMoeActBackward: return "gpt_oss_moe_act_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
         case CompiledOpType::GeluBackward: return "gelu_backward";
         case CompiledOpType::Relu2Backward: return "relu2_backward";
@@ -267,6 +270,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmGateUpBackward: return "moe_grouped_gemm_gate_up_backward";
         case CompiledOpType::MoEGroupedGemmDownBackward: return "moe_grouped_gemm_down_backward";
         case CompiledOpType::MoEUnpermuteBackward: return "moe_unpermute_backward";
+        case CompiledOpType::MoEExpertBiasAddBackward: return "moe_expert_bias_add_backward";
         // Mamba/SSM forward
         case CompiledOpType::MambaSplitProj: return "mamba_split_proj";
         case CompiledOpType::MambaConv1d: return "mamba_conv1d";
@@ -312,13 +316,13 @@ CompiledExecutor::~CompiledExecutor() {
     }
 
     // Free persistent MoE saved tensor buffers
-    for (auto& [name, buffer] : mMoESavedBuffers) {
+    for (auto& [name, buffer] : mMoeSavedBuffers) {
         if (buffer) {
             cudaFree(buffer);
         }
     }
-    mMoESavedBuffers.clear();
-    mMoESavedSizes.clear();
+    mMoeSavedBuffers.clear();
+    mMoeSavedSizes.clear();
 }
 
 void CompiledExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
@@ -394,6 +398,78 @@ const Tensor* CompiledExecutor::try_get_tensor(const std::string& name) const {
     return &it->second;
 }
 
+const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
+    if (const Tensor* direct = try_get_tensor(name)) {
+        return direct;
+    }
+    // Try SSA-suffixed entries.
+    auto ssa_suffix = [](const std::string& key) -> int {
+        auto pos = key.rfind('_');
+        if (pos == std::string::npos || pos + 1 >= key.size()) {
+            return -1;
+        }
+        int value = 0;
+        for (std::size_t i = pos + 1; i < key.size(); ++i) {
+            char c = key[i];
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+            value = value * 10 + (c - '0');
+        }
+        return value;
+    };
+    int best_suffix = -1;
+    const Tensor* best = nullptr;
+    for (const auto& kv : mTensorMap) {
+        if (strip_ssa_suffix(kv.first) != name || !kv.second.Data) {
+            continue;
+        }
+        const int suffix = ssa_suffix(kv.first);
+        if (!best || suffix > best_suffix) {
+            best = &kv.second;
+            best_suffix = suffix;
+        }
+    }
+    if (best) {
+        return best;
+    }
+
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(name, layer_idx, field)) {
+        return nullptr;
+    }
+    const std::string base_field = strip_ssa_suffix(field);
+    if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) {
+        return nullptr;
+    }
+    auto& acts = mRunState.simplified_acts(layer_idx);
+    if (base_field == "ln1_rstd" || base_field == "ln_rstd") return &acts.ln1_rstd;
+    if (base_field == "ln2_rstd") return &acts.ln2_rstd;
+    if (base_field == "q_rstd") return &acts.q_rstd;
+    if (base_field == "k_rstd") return &acts.k_rstd;
+    if (base_field == "lse") return &acts.lse;
+    if (base_field == "ln1" || base_field == "ln1_flat" ||
+        base_field == "ln" || base_field == "ln_flat") return &acts.ln1;
+    if (base_field == "ln2" || base_field == "ln2_flat") return &acts.ln2;
+    if (base_field == "qkv") return &acts.qkv;
+    if (base_field == "qkv_rope") {
+        Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+        return &src;
+    }
+    if (base_field == "att" || base_field == "att_flat") return &acts.att;
+    if (base_field == "att_out" || base_field == "att_out_flat") return &acts.att_out;
+    if (base_field == "mlp_up" || base_field == "mlp_up_flat") return &acts.mlp_up;
+    if (base_field == "swiglu" || base_field == "swiglu_flat") return &acts.swiglu;
+    if (base_field == "mlp_down" || base_field == "mlp_down_flat") return &acts.mlp_down;
+    if (base_field == "res_att" || base_field == "residual_att") return &acts.residual_att;
+    if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
+        Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
+        return &res;
+    }
+    return nullptr;
+}
+
 void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
     // Copy MoE tensors from this layer to persistent storage before stack restore.
     // This allows stack memory to be reclaimed while preserving tensors for backward.
@@ -439,21 +515,21 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
         }
 
         // Allocate or resize persistent buffer if needed
-        auto buf_it = mMoESavedBuffers.find(name);
-        if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+        auto buf_it = mMoeSavedBuffers.find(name);
+        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
             // Free old buffer if exists
-            if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                 CUDA_CHECK(cudaFree(buf_it->second));
             }
             // Allocate new buffer
             void* new_buffer = nullptr;
             CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-            mMoESavedBuffers[name] = new_buffer;
-            mMoESavedSizes[name] = bytes;
+            mMoeSavedBuffers[name] = new_buffer;
+            mMoeSavedSizes[name] = bytes;
         }
 
         // Copy data to persistent buffer
-        void* dst_buffer = mMoESavedBuffers[name];
+        void* dst_buffer = mMoeSavedBuffers[name];
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, tensor.Data, bytes,
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
@@ -514,15 +590,15 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (bytes == 0) {
             return;
         }
-        auto buf_it = mMoESavedBuffers.find(name);
-        if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
-            if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+        auto buf_it = mMoeSavedBuffers.find(name);
+        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                 CUDA_CHECK(cudaFree(buf_it->second));
             }
             void* new_buffer = nullptr;
             CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-            mMoESavedBuffers[name] = new_buffer;
-            mMoESavedSizes[name] = bytes;
+            mMoeSavedBuffers[name] = new_buffer;
+            mMoeSavedSizes[name] = bytes;
         }
     };
 
@@ -702,18 +778,30 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
         const bool need_persist = should_persist(name, prefer_live, force_persist);
 
-        // Even when should_persist returns false, block-level tensors may be stack-backed
-        // and will be persisted by persist_saved_layer_tensors() during execute_forward.
-        // We must pre-allocate buffers for those too, since cudaMalloc is not allowed
-        // during CUDA graph capture.
+        // Block-level tensors may be stack-backed and persisted by
+        // persist_saved_layer_tensors() during execute_forward.  Pre-allocate
+        // buffers for those too, since cudaMalloc is not allowed during CUDA
+        // graph capture.  However, skip tensors that will be recomputed in
+        // backward — they only need metadata-only saves, not persistent buffers.
         int layer_idx = -1;
         std::string field;
         const bool is_block_tensor = parse_block_param(name, layer_idx, field);
-        if (!need_persist && !is_block_tensor) {
+        if (!need_persist && !(is_block_tensor && !prefer_live)) {
             continue;
         }
 
+        // For tensors that need_persist from save_tensors, always pre-allocate.
+        // For block tensors that don't need_persist but might be stack-backed:
+        // only pre-allocate if the resolved source has null Data (indicating it
+        // will be stack-allocated at runtime). Per-layer allocator buffers
+        // (non-null Data) don't need persistent copies since they survive the
+        // entire training step.
         auto src_opt = resolve_source(name);
+        if (!need_persist && src_opt.has_value() && src_opt->Data) {
+            // Per-layer allocator buffer — persist_saved_layer_tensors will
+            // skip it (Stack.owns returns false), so no pre-allocation needed.
+            continue;
+        }
         if (src_opt.has_value() && src_opt->Data) {
             ensure_buffer(name, src_opt->bytes());
             continue;
@@ -725,7 +813,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
     }
 }
 
-void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
+void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, bool force_persist) {
     if (!mSaved) {
         return;
     }
@@ -742,6 +830,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     const bool recompute_enabled = mOptions.recompute_enabled();
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
+        if (force_persist) {
+            return false;
+        }
         if (!recompute_enabled || !mSlotRegistry) {
             return false;
         }
@@ -789,11 +880,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
         return std::nullopt;
     };
 
-    auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
-        if (force_persist) {
+    auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist_name) -> bool {
+        if (force_persist || force_persist_name) {
             return true;
         }
-        if (prefer_live) {
+        if (!recompute_enabled || prefer_live) {
             return false;
         }
         auto mapped = is_mapped_slot(name);
@@ -809,7 +900,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     };
 
     auto save_tensor_with_policy = [&](const std::string& name, const Tensor& src,
-                                       bool prefer_live, bool force_persist) -> void {
+                                       bool prefer_live, bool force_persist_name) -> void {
+        if (force_persist) {
+            prefer_live = false;
+            force_persist_name = true;
+        }
         if (prefer_live) {
             // Save metadata only - will resolve from live buffer or recompute
             Tensor meta = src;
@@ -818,24 +913,24 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
             return;
         }
 
-        const bool need_persist = should_persist(name, prefer_live, force_persist) && src.Data != nullptr;
+        const bool need_persist = should_persist(name, prefer_live, force_persist_name) && src.Data != nullptr;
         if (need_persist && src.Data != nullptr) {
             const size_t bytes = src.bytes();
-            auto buf_it = mMoESavedBuffers.find(name);
-            if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+            auto buf_it = mMoeSavedBuffers.find(name);
+            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
                 if (capturing) {
                     throw std::runtime_error("CompiledExecutor: missing preallocated save buffer for '" + name +
                                              "' during CUDA graph capture");
                 }
-                if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
                 void* new_buffer = nullptr;
                 CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoESavedBuffers[name] = new_buffer;
-                mMoESavedSizes[name] = bytes;
+                mMoeSavedBuffers[name] = new_buffer;
+                mMoeSavedSizes[name] = bytes;
             }
-            void* dst_buffer = mMoESavedBuffers[name];
+            void* dst_buffer = mMoeSavedBuffers[name];
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor;
@@ -854,9 +949,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list) {
     };
 
     for (const auto& name : save_list) {
-        // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed)
-        if (mSaved->find(name) != mSaved->end()) {
-            continue;
+        // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed),
+        // unless we are forcing a persistent copy to replace metadata-only entries.
+        auto saved_it = mSaved->find(name);
+        if (saved_it != mSaved->end()) {
+            if (!force_persist || saved_it->second.Data != nullptr) {
+                continue;
+            }
+            // Allow refresh when force_persist=true and existing entry is metadata-only.
+            mSaved->erase(saved_it);
         }
 
         // First check the tensor map (intermediate tensors)
@@ -1477,6 +1578,21 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         (cudaStreamIsCapturing(mRunState.MainStream, &fwd_capture_status) == cudaSuccess &&
          fwd_capture_status != cudaStreamCaptureStatusNone);
 
+    // Check if a tensor will be recomputed in backward (same logic as save_tensors).
+    const bool recompute_enabled_flag = mOptions.recompute_enabled();
+    auto will_recompute_tensor = [&](const std::string& tensor_name) -> bool {
+        if (!recompute_enabled_flag || !mSlotRegistry) {
+            return false;
+        }
+        const bool lora_only_mode = mRunState.is_lora_only_mode();
+        int lyr = -1;
+        std::string fld;
+        if (parse_block_param(tensor_name, lyr, fld)) {
+            return mSlotRegistry->will_recompute(strip_ssa_suffix(fld), lora_only_mode);
+        }
+        return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
+    };
+
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
@@ -1560,12 +1676,27 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             return std::nullopt;
         };
+        
         int saved_count = 0;
+        int recompute_count = 0;
         for (const auto& name : *mSaveList) {
             if (name.rfind(prefix, 0) != 0) {
                 continue;
             }
             if (mSaved->find(name) != mSaved->end()) {
+                continue;
+            }
+            // Skip tensors that will be recomputed in backward — save metadata only.
+            // This avoids allocating persistent cudaMalloc buffers for tensors like
+            // mlp_up and swiglu that are stack-backed but fully recomputable.
+            if (will_recompute_tensor(name)) {
+                auto src_opt = resolve_saved_source(name);
+                if (src_opt.has_value() && src_opt->Data) {
+                    Tensor meta = *src_opt;
+                    meta.Data = nullptr;  // Metadata only — no data pointer
+                    (*mSaved)[name] = meta;
+                    recompute_count++;
+                }
                 continue;
             }
             auto src_opt = resolve_saved_source(name);
@@ -1580,23 +1711,23 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (bytes == 0) {
                 continue;
             }
-            auto buf_it = mMoESavedBuffers.find(name);
-            if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
+            auto buf_it = mMoeSavedBuffers.find(name);
+            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
                 if (fwd_stream_capturing) {
                     // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
                     // Skip this tensor — the outer capture warmup or
                     // prepare_saved_buffers_for_capture should have pre-allocated it.
                     continue;
                 }
-                if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
                 void* new_buffer = nullptr;
                 CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoESavedBuffers[name] = new_buffer;
-                mMoESavedSizes[name] = bytes;
+                mMoeSavedBuffers[name] = new_buffer;
+                mMoeSavedSizes[name] = bytes;
             }
-            void* dst_buffer = mMoESavedBuffers[name];
+            void* dst_buffer = mMoeSavedBuffers[name];
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor = src;
@@ -1689,6 +1820,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::SwiGLU:
                     dispatch_swiglu(op);
                     break;
+                case CompiledOpType::GptOssMoeAct:
+                    dispatch_gpt_oss_moe_act(op);
+                    break;
                 case CompiledOpType::Silu:
                     dispatch_silu(op);
                     break;
@@ -1755,6 +1889,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::MoEUnpermute:
                     dispatch_moe_unpermute(op);
+                    break;
+                case CompiledOpType::MoEExpertBiasAdd:
+                    dispatch_moe_expert_bias_add(op);
                     break;
                 // Mamba/SSM forward operations
                 case CompiledOpType::MambaSplitProj:
@@ -2296,7 +2433,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (it == mTensorMap.end()) {
                 continue;
             }
-            // Saved tensors can be re-resolved from mSaved/mMoESavedBuffers if needed.
+            // Saved tensors can be re-resolved from mSaved/mMoeSavedBuffers if needed.
             mTensorMap.erase(it);
         }
     };
@@ -2403,6 +2540,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::SwiGLUBackward:
                     dispatch_swiglu_backward(op);
                     break;
+                case CompiledOpType::GptOssMoeActBackward:
+                    dispatch_gpt_oss_moe_act_backward(op);
+                    break;
                 case CompiledOpType::SiluBackward:
                     dispatch_silu_backward(op);
                     break;
@@ -2491,6 +2631,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::MoEUnpermuteBackward:
                     dispatch_moe_unpermute_backward(op);
+                    break;
+                case CompiledOpType::MoEExpertBiasAddBackward:
+                    dispatch_moe_expert_bias_add_backward(op);
                     break;
 
                 // MoE forward ops that may appear in backward graph

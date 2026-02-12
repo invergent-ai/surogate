@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -15,6 +17,7 @@
 #include "runtime/lora/lora_grads_manager.h"
 #include "runtime/lora/lora_run_state.h"
 #include "runtime/lora/lora_weights_manager.h"
+#include "utilities/tensor.h"
 
 namespace dsl {
 
@@ -53,8 +56,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-        auto it_saved = mMoESavedBuffers.find(key);
-        if (it_saved != mMoESavedBuffers.end() && it_saved->second != nullptr) {
+        auto it_saved = mMoeSavedBuffers.find(key);
+        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
@@ -161,6 +164,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
             const bool training = mLoRARunState->is_training;
             const long total_tokens_l = total_tokens;
             const int total_tokens_i = static_cast<int>(total_tokens_l);
+            const int micro_step = mLoRARunState->micro_step;
 
             auto get_dropout_seed = [&](int proj_type) -> unsigned int {
                 return mLoRARunState->dropout_base_seed
@@ -257,6 +261,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         d_input_ptr = &ensure_output_tensor(op.outputs[0]);
     }
     Tensor& d_input = *d_input_ptr;
+    if (d_input_ptr->Device == -1 && mRunState.Stack.owns(d_input_ptr->Data)) {
+        d_input_ptr->Device = mRunState.Stack.device_id();
+    }
     int layer_idx = op.attrs.layer_idx;
     if (layer_idx < 0 && !op.inputs.empty()) {
         std::string_view name = op.inputs[0].name;
@@ -276,8 +283,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     Tensor expert_offsets_view;
     if (layer_idx >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx) + "].moe_expert_offsets";
-        auto it = mMoESavedBuffers.find(key);
-        if (it != mMoESavedBuffers.end() && it->second != nullptr) {
+        auto it = mMoeSavedBuffers.find(key);
+        if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
@@ -308,33 +315,88 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                                     "moe_grouped_gemm_down_backward");
     const bool weight_is_compact = compact.weight_is_compact;
     const int* host_offsets_ptr = compact.host_offsets.empty() ? nullptr : compact.host_offsets.data();
+    if (!host_offsets_ptr &&
+        layer_idx == static_cast<int>(mConfig.NumLayers) - 1 &&
+        mMoEExpertOffsetsData.size() == static_cast<std::size_t>(num_experts + 1)) {
+        host_offsets_ptr = mMoEExpertOffsetsData.data();
+    }
+    std::vector<int> host_offsets_sanitized;
+    if (host_offsets_ptr && num_experts > 0) {
+        const long total_tokens = d_output.Sizes[0];
+        bool valid = (host_offsets_ptr[0] == 0);
+        int last = host_offsets_ptr[0];
+        for (int e = 1; e <= num_experts && valid; ++e) {
+            int v = host_offsets_ptr[e];
+            if (v < last || v < 0 || v > total_tokens) {
+                valid = false;
+                break;
+            }
+            last = v;
+        }
+        if (valid && last != total_tokens) {
+            valid = false;
+        }
+        if (!valid) {
+            host_offsets_sanitized.assign(static_cast<std::size_t>(num_experts + 1), 0);
+            const int clamped_total = static_cast<int>(total_tokens);
+            host_offsets_sanitized[1] = clamped_total;
+            for (int e = 2; e <= num_experts; ++e) {
+                host_offsets_sanitized[e] = clamped_total;
+            }
+            host_offsets_ptr = host_offsets_sanitized.data();
+        }
+    }
     const int* active_ptr = compact.active_experts.empty() ? nullptr : compact.active_experts.data();
     const int num_active = compact.num_active;
 
     // Refresh MoE experts for this layer (selective dequant) before using weights in backward.
-    if (!compact.host_offsets.empty()) {
-        (void)refresh_moe_experts_if_needed(layer_idx,
-                                            compact.host_offsets.data(),
-                                            num_experts,
-                                            mWeights,
-                                            mRunState.MainStream);
-    } else {
-        std::vector<int> host_offsets_fallback(static_cast<std::size_t>(num_experts + 1), 0);
-        CUDA_CHECK(cudaMemcpyAsync(host_offsets_fallback.data(),
-                                   expert_offsets_ptr,
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        (void)refresh_moe_experts_if_needed(layer_idx,
-                                            host_offsets_fallback.data(),
-                                            num_experts,
-                                            mWeights,
-                                            mRunState.MainStream);
+    if (mWeights.qlora_provider()) {
+        if (!compact.host_offsets.empty()) {
+            (void)refresh_moe_experts_if_needed(layer_idx,
+                                                compact.host_offsets.data(),
+                                                num_experts,
+                                                mWeights,
+                                                mRunState.MainStream);
+        } else {
+            std::vector<int> host_offsets_fallback(static_cast<std::size_t>(num_experts + 1), 0);
+            CUDA_CHECK(cudaMemcpyAsync(host_offsets_fallback.data(),
+                                       expert_offsets_ptr,
+                                       static_cast<std::size_t>(num_experts + 1) * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            (void)refresh_moe_experts_if_needed(layer_idx,
+                                                host_offsets_fallback.data(),
+                                                num_experts,
+                                                mWeights,
+                                                mRunState.MainStream);
+        }
     }
 
-    if (weight_is_compact && compact.active_experts.empty()) {
-        fill_zero(d_input, mRunState.MainStream);
+    const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState &&
+                              mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
+                              layer_idx >= 0;
+    bool skip_base_backward = false;
+    if (lora_enabled &&
+        mRunState.is_lora_only_mode() &&
+        mRunState.is_prequantized() &&
+        mConfig.Architecture == PretrainedConfig::GPT_OSS) {
+        const char* env = std::getenv("SUROGATE_PREQUANT_BASE_GRAD");
+        const bool allow_base_grad = (env && *env && std::string(env) != "0");
+        skip_base_backward = !allow_base_grad;
+    }
+
+    auto zero_d_input = [&]() {
+        if (!d_input_ptr->Data || d_input_ptr->bytes() == 0) return;
+        if (d_input_ptr->Device == -1 && mRunState.Stack.owns(d_input_ptr->Data)) {
+            CUDA_CHECK(cudaMemsetAsync(d_input_ptr->Data, 0, d_input_ptr->bytes(), mRunState.MainStream));
+        } else {
+            fill_zero(*d_input_ptr, mRunState.MainStream);
+        }
+    };
+
+    if (skip_base_backward || (weight_is_compact && compact.active_experts.empty())) {
+        zero_d_input();
     } else if (d_output.DType == ETensorDType::BF16) {
         moe_grouped_gemm_down_backward(d_input.get<nv_bfloat16>(),
                                        d_output.get<nv_bfloat16>(),
@@ -360,9 +422,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     }
 
     // Apply grouped MoE LoRA backward (down projection) when enabled.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState &&
-        mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
-        layer_idx >= 0) {
+    if (lora_enabled) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx, mRunState.MainStream);
         if (lora_block.moe.use_grouped && lora_block.moe.grouped.down.has_value() &&
             lora_block.moe.grouped.down->has_value()) {

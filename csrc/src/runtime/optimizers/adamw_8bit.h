@@ -15,8 +15,9 @@
 namespace optimizers {
 
 // Block size for 8-bit optimizer (number of elements processed per block)
-// This determines the granularity of quantization - each block has its own absmax
-constexpr int ADAMW8BIT_BLOCK_SIZE = 2048;
+// This determines the granularity of quantization - each block has its own absmax.
+// Match bitsandbytes block-wise optimizer (256 elements per block).
+constexpr int ADAMW8BIT_BLOCK_SIZE = 256;
 constexpr int ADAMW_GRAPH_PARAM_COUNT = 5;
 
 /**

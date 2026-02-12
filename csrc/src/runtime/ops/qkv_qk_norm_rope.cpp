@@ -275,16 +275,17 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     Tensor q_rstd_view = view_rstd(q_rstd, Hq);
     Tensor k_rstd_view = view_rstd(k_rstd, Hkv);
 
-    // Optional weight gradients
+    // Optional weight gradients — skip in LoRA mode where QK norm weights are frozen.
     Tensor* d_q_norm = nullptr;
     Tensor* d_k_norm = nullptr;
     bool accum_q = false;
     bool accum_k = false;
-    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+    const bool skip_norm_dweight = mRunState.is_lora_only_mode();
+    if (!skip_norm_dweight && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         d_q_norm = &ensure_output_tensor(op.outputs[1]);
         accum_q = mAccumulateTensors.count(op.outputs[1].name) > 0;
     }
-    if (op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+    if (!skip_norm_dweight && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
         d_k_norm = &ensure_output_tensor(op.outputs[2]);
         accum_k = mAccumulateTensors.count(op.outputs[2].name) > 0;
     }

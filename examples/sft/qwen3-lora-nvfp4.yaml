@@ -1,0 +1,32 @@
+model: surogate/Qwen3-8B-NVFP4
+output_dir: ./output
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+
+sample_packing: true
+sequence_len: 2048
+
+num_epochs: 2
+eval_steps: 25
+
+learning_rate: 2e-4
+
+recipe: bf16
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+dataloader_num_workers: 4
+datasets:
+  - path: "OpenLLM-Ro/ro_gsm8k"
+    type: auto

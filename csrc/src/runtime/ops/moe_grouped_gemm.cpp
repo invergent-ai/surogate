@@ -58,8 +58,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-        auto it_saved = mMoESavedBuffers.find(key);
-        if (it_saved != mMoESavedBuffers.end() && it_saved->second != nullptr) {
+        auto it_saved = mMoeSavedBuffers.find(key);
+        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
@@ -244,8 +244,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-        auto it_saved = mMoESavedBuffers.find(key);
-        if (it_saved != mMoESavedBuffers.end() && it_saved->second != nullptr) {
+        auto it_saved = mMoeSavedBuffers.find(key);
+        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);

@@ -92,23 +92,23 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
         auto persist_save = [&](const std::string& name, const Tensor& src) {
             const size_t bytes = src.bytes();
             if (bytes == 0) return;
-            auto buf_it = mMoESavedBuffers.find(name);
-            if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[name] < bytes) {
-                if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+            auto buf_it = mMoeSavedBuffers.find(name);
+            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
                 void* new_buffer = nullptr;
                 CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoESavedBuffers[name] = new_buffer;
-                mMoESavedSizes[name] = bytes;
+                mMoeSavedBuffers[name] = new_buffer;
+                mMoeSavedSizes[name] = bytes;
             }
-            CUDA_CHECK(cudaMemcpyAsync(mMoESavedBuffers[name], src.Data, bytes,
+            CUDA_CHECK(cudaMemcpyAsync(mMoeSavedBuffers[name], src.Data, bytes,
                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved;
             saved.DType = src.DType;
             saved.Rank = src.Rank;
             for (int d = 0; d < src.Rank; ++d) saved.Sizes[d] = src.Sizes[d];
-            saved.Data = static_cast<std::byte*>(mMoESavedBuffers[name]);
+            saved.Data = static_cast<std::byte*>(mMoeSavedBuffers[name]);
             (*mSaved)[name] = saved;
         };
 

@@ -325,6 +325,58 @@ bool resolve_norm_topk(const AttrMap& attrs, const modules::ModelConfig& cfg) {
     return cfg.moe_config.has_value() && cfg.moe_config->norm_topk_prob;
 }
 
+bool resolve_topk_softmax(const AttrMap& attrs) {
+    if (const auto* attr = find_attr(attrs, "softmax")) {
+        if (auto v = attr_bool(*attr)) {
+            return *v;
+        }
+        if (auto v = attr_int(*attr)) {
+            return *v != 0;
+        }
+        if (auto s = attr_string(*attr)) {
+            return *s == "true" || *s == "1" || *s == "yes";
+        }
+        if (auto v = std::get_if<double>(&attr->value)) {
+            return *v != 0.0;
+        }
+    }
+    return false;
+}
+
+float resolve_topk_rounding_scale(const AttrMap& attrs) {
+    if (const auto* attr = find_attr(attrs, "topk_rounding_scale")) {
+        if (auto v = attr_double(*attr)) {
+            return static_cast<float>(*v);
+        }
+        if (auto v = attr_int(*attr)) {
+            return static_cast<float>(*v);
+        }
+        if (auto s = attr_string(*attr)) {
+            try {
+                return std::stof(*s);
+            } catch (...) {
+                return 0.0f;
+            }
+        }
+    }
+    return 0.0f;
+}
+
+bool resolve_topk_sort_by_index(const AttrMap& attrs) {
+    if (const auto* attr = find_attr(attrs, "topk_sort_by_index")) {
+        if (auto v = attr_bool(*attr)) {
+            return *v;
+        }
+        if (auto v = attr_int(*attr)) {
+            return *v != 0;
+        }
+        if (auto s = attr_string(*attr)) {
+            return *s == "true" || *s == "1" || *s == "yes";
+        }
+    }
+    return false;
+}
+
 modules::MatmulOp parse_matmul_op(const AttrMap& attrs,
                                   const std::string& weight_name) {
     if (const auto* attr = find_attr(attrs, "matmul_op")) {
@@ -1513,6 +1565,7 @@ void execute_mrope(RecomputeContext& ctx,
 }
 
 void execute_flash_attention(RecomputeContext& ctx,
+                             const RecomputeOp& op,
                              long B,
                              long T,
                              const InputMap& inputs,
@@ -1539,8 +1592,14 @@ void execute_flash_attention(RecomputeContext& ctx,
     const int Hq = static_cast<int>(ctx.cfg.NumQueryHeads);
     const int Hkv = static_cast<int>(ctx.cfg.NumKeyValHeads);
     const int Hs = static_cast<int>(ctx.cfg.head_size());
-    if (!ctx.rs.scratch().cudnn_workspace.Data) {
-        ctx.rs.temp_acquire(ctx.rs.scratch().cudnn_workspace);
+    int window_size = 0;
+    if (const auto* attr = find_attr(op.attrs, "window_size")) {
+        if (auto v = attr_int(*attr)) {
+            window_size = static_cast<int>(*v);
+        }
+    }
+    if (window_size <= 0 && ctx.cfg.use_sliding_window && ctx.cfg.is_sliding_layer(ctx.layer_idx)) {
+        window_size = ctx.cfg.sliding_window_size;
     }
 
     Tensor att_view = view_tensor(att, {B, T, Hq, Hs});
@@ -1549,11 +1608,62 @@ void execute_flash_attention(RecomputeContext& ctx,
         ? *qkv
         : view_tensor(*qkv, {B, T, Hq + 2 * Hkv, Hs});
 
-    // Match the main forward path: always use the cuDNN-backed implementation.
-    // The cuDNN wrapper already falls back to the custom kernel for FP32.
-    attention_forward_cudnn(att_view, lse_view, qkv_view, ctx.rs.scratch().cudnn_workspace,
-                            ctx.rs.CudnnHandle, static_cast<int>(B), static_cast<int>(T),
-                            Hq, Hkv, Hs, ctx.rs.MainStream);
+    Tensor* sinks = nullptr;
+    if (auto it = inputs.tensors.find("sinks"); it != inputs.tensors.end()) {
+        sinks = it->second;
+    } else {
+        for (const auto& kv : inputs.tensors) {
+            if (kv.first.find("sinks") != std::string::npos) {
+                sinks = kv.second;
+                break;
+            }
+        }
+    }
+
+    if (window_size > 0) {
+        attention_forward_custom(att_view, lse_view, qkv_view,
+                                 static_cast<int>(B), static_cast<int>(T),
+                                 Hq, Hkv, Hs, window_size, ctx.rs.MainStream);
+    } else {
+        if (!ctx.rs.scratch().cudnn_workspace.Data) {
+            ctx.rs.temp_acquire(ctx.rs.scratch().cudnn_workspace);
+        }
+        // Match the main forward path: use cuDNN for full attention.
+        attention_forward_cudnn(att_view, lse_view, qkv_view, ctx.rs.scratch().cudnn_workspace,
+                                ctx.rs.CudnnHandle, static_cast<int>(B), static_cast<int>(T),
+                                Hq, Hkv, Hs, ctx.rs.MainStream);
+    }
+
+    if (sinks) {
+        Tensor* sinks_use = sinks;
+        Tensor sinks_cast;
+        if (sinks->DType != att_view.DType) {
+            sinks_cast = ctx.rs.temp_alloc(att_view.DType, {static_cast<long>(Hq)});
+            if (att_view.DType == ETensorDType::BF16) {
+                convert_dtype(sinks_cast.get<nv_bfloat16>(), sinks->get<float>(),
+                              sinks->nelem(), ctx.rs.MainStream);
+            } else if (att_view.DType == ETensorDType::FP32) {
+                convert_dtype(sinks_cast.get<float>(), sinks->get<nv_bfloat16>(),
+                              sinks->nelem(), ctx.rs.MainStream);
+            } else {
+                throw std::runtime_error("DSL recompute: unsupported sinks dtype conversion");
+            }
+            sinks_use = &sinks_cast;
+        }
+        if (att_view.DType == ETensorDType::BF16) {
+            attention_apply_sinks(att_view.get<nv_bfloat16>(), lse_view.get<float>(),
+                                  sinks_use->get<nv_bfloat16>(),
+                                  static_cast<int>(B), static_cast<int>(T),
+                                  Hq, Hs, ctx.rs.MainStream);
+        } else if (att_view.DType == ETensorDType::FP32) {
+            attention_apply_sinks(att_view.get<float>(), lse_view.get<float>(),
+                                  sinks_use->get<float>(),
+                                  static_cast<int>(B), static_cast<int>(T),
+                                  Hq, Hs, ctx.rs.MainStream);
+        } else {
+            throw std::runtime_error("DSL recompute: unsupported attention dtype for sinks");
+        }
+    }
 }
 
 void execute_swiglu(RecomputeContext& ctx,
@@ -1604,6 +1714,118 @@ void execute_swiglu(RecomputeContext& ctx,
         D = static_cast<int>(inp->Sizes[2] / 2);
     }
     swiglu_forward(out, *inp, nullptr, static_cast<int>(B), static_cast<int>(T), D, ctx.rs.MainStream);
+}
+
+void execute_gpt_oss_moe_act(RecomputeContext& ctx,
+                             const RecomputeOp& op,
+                             long B,
+                             long T,
+                             const InputMap& inputs,
+                             const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* inp = nullptr;
+    if (auto it = inputs.tensors.find("expert_gate_up_bias"); it != inputs.tensors.end()) {
+        inp = it->second;
+    } else {
+        for (const auto& kv : inputs.tensors) {
+            if (kv.second && kv.second->DType != ETensorDType::INT32) {
+                inp = kv.second;
+                break;
+            }
+        }
+    }
+    if (!inp) {
+        throw std::runtime_error("DSL recompute: gpt_oss_moe_act missing input");
+    }
+    if (op.outputs.empty()) {
+        throw std::runtime_error("DSL recompute: gpt_oss_moe_act missing output");
+    }
+    const std::string& out_name = op.outputs.front();
+    auto out_it = outputs.find(out_name);
+    if (out_it == outputs.end()) {
+        throw std::runtime_error("DSL recompute: gpt_oss_moe_act missing output");
+    }
+    Tensor& out = *out_it->second;
+
+    float alpha = 1.702f;
+    float limit = 7.0f;
+    if (const auto* attr = find_attr(op.attrs, "alpha")) {
+        if (auto v = attr_double(*attr)) {
+            alpha = static_cast<float>(*v);
+        }
+    }
+    if (const auto* attr = find_attr(op.attrs, "limit")) {
+        if (auto v = attr_double(*attr)) {
+            limit = static_cast<float>(*v);
+        }
+    }
+
+    if (inp->Rank == 2) {
+        const int N = static_cast<int>(inp->Sizes[0]);
+        const int D = static_cast<int>(inp->Sizes[1] / 2);
+        if (inp->DType == ETensorDType::BF16) {
+            gpt_oss_moe_act_forward(out.get<nv_bfloat16>(), inp->get<nv_bfloat16>(),
+                                    N, D, alpha, limit, ctx.rs.MainStream);
+        } else {
+            gpt_oss_moe_act_forward(out.get<float>(), inp->get<float>(),
+                                    N, D, alpha, limit, ctx.rs.MainStream);
+        }
+        return;
+    }
+
+    int D = static_cast<int>(inp->Sizes[2] / 2);
+    const int N = static_cast<int>(B * T);
+    if (inp->DType == ETensorDType::BF16) {
+        gpt_oss_moe_act_forward(out.get<nv_bfloat16>(), inp->get<nv_bfloat16>(),
+                                N, D, alpha, limit, ctx.rs.MainStream);
+    } else {
+        gpt_oss_moe_act_forward(out.get<float>(), inp->get<float>(),
+                                N, D, alpha, limit, ctx.rs.MainStream);
+    }
+}
+
+void execute_moe_expert_bias_add(RecomputeContext& ctx,
+                                 RecomputeScratch& scratch,
+                                 const InputMap& inputs,
+                                 const std::unordered_map<std::string, Tensor*>& outputs) {
+    Tensor* inp = nullptr;
+    Tensor* bias = nullptr;
+    for (const auto& kv : inputs.tensors) {
+        if (inputs.param_names.count(kv.first)) {
+            bias = kv.second;
+        } else if (kv.second && kv.second->DType != ETensorDType::INT32) {
+            inp = kv.second;
+        }
+    }
+    if (!inp || !bias) {
+        throw std::runtime_error("DSL recompute: moe_expert_bias_add missing inputs");
+    }
+    if (outputs.empty()) {
+        throw std::runtime_error("DSL recompute: moe_expert_bias_add missing output");
+    }
+    Tensor& out = *outputs.begin()->second;
+    if (!scratch.moe_expert_offsets.Data) {
+        throw std::runtime_error("DSL recompute: moe_expert_bias_add missing expert_offsets");
+    }
+
+    const int num_experts = static_cast<int>(ctx.cfg.NumExperts);
+    const int hidden_size = static_cast<int>(inp->Sizes[1]);
+    const int total_tokens = static_cast<int>(inp->Sizes[0]);
+
+    if (inp->DType == ETensorDType::BF16) {
+        moe_expert_bias_add_forward(out.get<nv_bfloat16>(),
+                                    inp->get<nv_bfloat16>(),
+                                    bias->get<nv_bfloat16>(),
+                                    scratch.moe_expert_offsets.get<int>(),
+                                    num_experts, hidden_size, total_tokens,
+                                    ctx.rs.MainStream);
+    } else {
+        moe_expert_bias_add_forward(out.get<float>(),
+                                    inp->get<float>(),
+                                    bias->get<float>(),
+                                    scratch.moe_expert_offsets.get<int>(),
+                                    num_experts, hidden_size, total_tokens,
+                                    ctx.rs.MainStream);
+    }
 }
 
 void execute_moe_router_probs(RecomputeContext& ctx,
@@ -1685,19 +1907,24 @@ void execute_moe_topk(RecomputeContext& ctx,
     const int num_experts = static_cast<int>(probs->Sizes[1]);
     const int top_k = resolve_top_k(op.attrs, ctx.cfg);
     const bool normalize = resolve_norm_topk(op.attrs, ctx.cfg);
+    const bool softmax = resolve_topk_softmax(op.attrs);
+    const float rounding_scale = resolve_topk_rounding_scale(op.attrs);
+    const bool sort_by_index = resolve_topk_sort_by_index(op.attrs);
 
     if (probs->DType == ETensorDType::BF16) {
         moe_topk_forward(indices.get<int>(),
                          weights.get<nv_bfloat16>(),
                          probs->get<nv_bfloat16>(),
                          correction_bias,
-                         num_tokens, num_experts, top_k, normalize, ctx.rs.MainStream);
+                         num_tokens, num_experts, top_k, normalize, softmax,
+                         sort_by_index, rounding_scale, ctx.rs.MainStream);
     } else {
         moe_topk_forward(indices.get<int>(),
                          weights.get<float>(),
                          probs->get<float>(),
                          correction_bias,
-                         num_tokens, num_experts, top_k, normalize, ctx.rs.MainStream);
+                         num_tokens, num_experts, top_k, normalize, softmax,
+                         sort_by_index, rounding_scale, ctx.rs.MainStream);
     }
 }
 
@@ -2369,9 +2596,13 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
         } else if (op.op_type == "mrope") {
             execute_mrope(ctx, op, layer_idx, B, T, inputs, outputs);
         } else if (op.op_type == "flash_attention") {
-            execute_flash_attention(ctx, B, T, inputs, outputs);
+            execute_flash_attention(ctx, op, B, T, inputs, outputs);
         } else if (op.op_type == "swiglu") {
             execute_swiglu(ctx, op, B, T, inputs, outputs);
+        } else if (op.op_type == "gpt_oss_moe_act") {
+            execute_gpt_oss_moe_act(ctx, op, B, T, inputs, outputs);
+        } else if (op.op_type == "moe_expert_bias_add") {
+            execute_moe_expert_bias_add(ctx, scratch, inputs, outputs);
         } else {
             throw std::runtime_error("DSL recompute: unsupported op " + op.op_type);
         }

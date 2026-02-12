@@ -264,6 +264,16 @@ void swiglu_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat
 void swiglu_backward(float* dinp, const float* dout, const float* inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
 void swiglu_backward(Tensor& dinp, const Tensor& dout, const Tensor& inp, float* abs_max, int B, int T, int C, cudaStream_t stream);
 
+// GPT-OSS MoE gated activation (interleaved gate/up).
+void gpt_oss_moe_act_forward(nv_bfloat16* out, const nv_bfloat16* inp, int N, int D,
+                             float alpha, float limit, cudaStream_t stream);
+void gpt_oss_moe_act_forward(float* out, const float* inp, int N, int D,
+                             float alpha, float limit, cudaStream_t stream);
+void gpt_oss_moe_act_backward(nv_bfloat16* dinp, const nv_bfloat16* dout, const nv_bfloat16* inp, int N, int D,
+                              float alpha, float limit, cudaStream_t stream);
+void gpt_oss_moe_act_backward(float* dinp, const float* dout, const float* inp, int N, int D,
+                              float alpha, float limit, cudaStream_t stream);
+
 // Simple elementwise activations (non-gated MLPs)
 void silu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
 void silu_forward(float* out, const float* inp, long n, cudaStream_t stream);
@@ -327,6 +337,29 @@ void split_gate_up(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gat
 void split_gate_up(const float* gate_up, float* up, float* gate, int N, int D, cudaStream_t stream);
 void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate, int N, int D, cudaStream_t stream);
 
+/// @brief Split interleaved gate_up tensor into separate up and gate tensors.
+/// Layout: gate_up = [gate0, up0, gate1, up1, ...] (interleaved pairs).
+void split_gate_up_interleaved(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gate, int N, int D, cudaStream_t stream);
+void split_gate_up_interleaved(const float* gate_up, float* up, float* gate, int N, int D, cudaStream_t stream);
+void split_gate_up_interleaved(const Tensor& gate_up, Tensor& up, Tensor& gate, int N, int D, cudaStream_t stream);
+
+/// @brief Replace NaN/Inf values with zero in-place.
+void sanitize_non_finite(nv_bfloat16* data, int n, cudaStream_t stream);
+void sanitize_non_finite(float* data, int n, cudaStream_t stream);
+void sanitize_non_finite(Tensor& data, cudaStream_t stream);
+void clamp_abs(nv_bfloat16* data, int n, float max_abs, cudaStream_t stream);
+void clamp_abs(float* data, int n, float max_abs, cudaStream_t stream);
+void clamp_abs(Tensor& data, float max_abs, cudaStream_t stream);
+
+/// @brief Count NaN/Inf entries in a tensor.
+void count_non_finite(int* out_count, const nv_bfloat16* data, int n, cudaStream_t stream);
+void count_non_finite(int* out_count, const float* data, int n, cudaStream_t stream);
+void count_non_finite(Tensor& out_count, const Tensor& data, cudaStream_t stream);
+
+/// @brief Count invalid expert indices (<0 or >= num_experts).
+void count_invalid_indices(int* out_count, const int* indices, int n, int num_experts, cudaStream_t stream);
+void count_invalid_indices(Tensor& out_count, const Tensor& indices, int num_experts, cudaStream_t stream);
+
 /// @brief Concatenate (N, D) dg and de tensors into (N, 2D) d_gate_up.
 /// Layout: d_gate_up = [dg | de], dg is columns [0,D), de is columns [D,2D).
 /// @param dg Gradient w.r.t. up output (N, D).
@@ -338,6 +371,20 @@ void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate, int N, int D
 void concat_d_gate_up(const nv_bfloat16* dg, const nv_bfloat16* de, nv_bfloat16* d_gate_up, int N, int D, cudaStream_t stream);
 void concat_d_gate_up(const float* dg, const float* de, float* d_gate_up, int N, int D, cudaStream_t stream);
 void concat_d_gate_up(const Tensor& dg, const Tensor& de, Tensor& d_gate_up, int N, int D, cudaStream_t stream);
+
+/// @brief Add interleaved gate/up LoRA deltas into a gate_up tensor in-place.
+/// Layout: gate_up = [gate0, up0, gate1, up1, ...].
+void add_gate_up_interleaved(nv_bfloat16* gate_up, const nv_bfloat16* up, const nv_bfloat16* gate, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved(float* gate_up, const float* up, const float* gate, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved(Tensor& gate_up, const Tensor& up, const Tensor& gate, int N, int D, cudaStream_t stream);
+
+/// @brief Add only gate (even) or up (odd) contributions into interleaved gate_up.
+void add_gate_up_interleaved_gate(nv_bfloat16* gate_up, const nv_bfloat16* gate, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved_gate(float* gate_up, const float* gate, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved_gate(Tensor& gate_up, const Tensor& gate, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved_up(nv_bfloat16* gate_up, const nv_bfloat16* up, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved_up(float* gate_up, const float* up, int N, int D, cudaStream_t stream);
+void add_gate_up_interleaved_up(Tensor& gate_up, const Tensor& up, int N, int D, cudaStream_t stream);
 
 void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Nq, HS)
                              float* stats, // output for backward pass: (B, Hq, T)
@@ -361,11 +408,11 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Nq, HS)
 void attention_forward_custom(Tensor& out,  // output: (B, T, Nq, HS)
                               Tensor& stats, // output for backward pass: (B, Hq, T)
                               const Tensor& inp,  // input: (B, T, Hq + 2Hkv, HS) QKV
-                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+                              int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream);
 // Custom (non-cuDNN) attention backward using the in-tree kernel (supports FP32/BF16).
 void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
                                const Tensor& out, const Tensor& dout, const Tensor& qkv,
-                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+                               int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream);
 
 struct AttnBwdDebugConfig {
     int enabled = 0;
@@ -403,6 +450,16 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
                               const Tensor& out, const Tensor& dout, const Tensor& qkv,
                               Tensor& workspace, cudnnHandle_t handle,
                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
+
+// Apply attention sinks: scale output and update LSE to include sink logits.
+void attention_apply_sinks(nv_bfloat16* out, float* lse, const nv_bfloat16* sinks,
+                           int B, int T, int Hq, int Hs, cudaStream_t stream);
+void attention_apply_sinks(float* out, float* lse, const float* sinks,
+                           int B, int T, int Hq, int Hs, cudaStream_t stream);
+void attention_sinks_backward(float* d_sinks, const nv_bfloat16* out, const nv_bfloat16* dout, const float* lse,
+                              const nv_bfloat16* sinks, int B, int T, int Hq, int Hs, cudaStream_t stream);
+void attention_sinks_backward(float* d_sinks, const float* out, const float* dout, const float* lse,
+                              const float* sinks, int B, int T, int Hq, int Hs, cudaStream_t stream);
 
 void fused_classifier(float* logits, float* losses,
                       float dloss, const int* targets, int* valid_token_count,
@@ -679,6 +736,20 @@ void quantize_fp4_weight_auto_scale(uint8_t* out_fp4, __nv_fp8_e4m3* block_scale
 void dequantize_fp4_block(nv_bfloat16* out, const uint8_t* in_fp4,
                           const __nv_fp8_e4m3* block_scales, float global_decode_scale,
                           int M, int K, const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Swizzle FP8 block scales from row-major to F8_128x4 layout (in-place).
+///
+/// Pre-quantized HF models store scales in row-major order, but our dequant
+/// kernel expects the F8_128x4 swizzled layout used by cuBLAS.
+/// Uses a temporary buffer internally for the in-place operation.
+///
+/// @param scales     FP8 scale tensor (modified in-place). Must have at least
+///                   scale_rows * scale_cols elements.
+/// @param scale_rows Number of rows in scale tensor (= ceil(M/128)*128).
+/// @param scale_cols Number of columns in scale tensor (= ceil(K/16/4)*4).
+/// @param stream     CUDA stream.
+void swizzle_fp8_scales_rowmajor_to_f8_128x4(
+    __nv_fp8_e4m3* scales, int scale_rows, int scale_cols, cudaStream_t stream);
 
 /// @brief FP4 block quantization with stochastic rounding (for gradients in backward pass).
 void quantize_fp4_block_stochastic(uint8_t* out_fp4, __nv_fp8_e4m3* block_scales, float* global_amax,
@@ -1155,6 +1226,48 @@ void quantize_nvfp4_4o6_stochastic_cutlass(Tensor& out_fp4, Tensor& block_scales
                                             const cudaDeviceProp& dp, cudaStream_t stream);
 
 // ============================================================================
+// MXFP4 Dequantization (Pre-quantized HF model loading)
+// ============================================================================
+// Dequantizes packed FP4 E2M1 data with E8M0 shared exponents (microscaling format)
+// to BF16. Used for loading HF pre-quantized MXFP4 models (e.g., OpenAI GPT-OSS).
+//
+// Memory layout:
+// - in_fp4:       Packed FP4 data (2 values per byte, lower nibble = even index),
+//                 M*K/2 bytes total
+// - e8m0_scales:  E8M0 shared exponents (uint8), one per 32-element block,
+//                 M*K/32 bytes total. Scale value = 2^(exponent - 127)
+//
+// Dequant formula: value = fp4_decode(nibble) * 2^(e8m0_exponent - 127)
+
+/// @brief MXFP4 dequantization: packed FP4 E2M1 + E8M0 shared exponents -> BF16.
+void dequantize_mxfp4(nv_bfloat16* out, const uint8_t* in_fp4,
+                       const uint8_t* e8m0_scales, int M, int K,
+                       const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Tensor-based MXFP4 dequantization.
+void dequantize_mxfp4(Tensor& out, const Tensor& in_fp4, const Tensor& e8m0_scales,
+                       int M, int K,
+                       const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Batched 2D BF16 matrix transpose.
+///
+/// For each of `batches` matrices, transposes [rows, cols] -> [cols, rows].
+/// src layout: [batches, rows, cols], dst layout: [batches, cols, rows].
+/// src and dst must not overlap.
+///
+/// @param[out] dst   Output BF16 array, shape [batches, cols, rows].
+/// @param[in]  src   Input BF16 array, shape [batches, rows, cols].
+/// @param batches    Number of independent matrices (e.g., num_experts).
+/// @param rows       Rows per matrix before transpose.
+/// @param cols       Columns per matrix before transpose.
+/// @param dp         CUDA device properties.
+/// @param stream     CUDA stream.
+void batched_transpose_2d_bf16(
+    nv_bfloat16* dst, const nv_bfloat16* src,
+    int batches, int rows, int cols,
+    const cudaDeviceProp& dp, cudaStream_t stream);
+
+// ============================================================================
 // CUTLASS FP4 GEMM Operations (Blackwell-only: SM100+)
 // ============================================================================
 
@@ -1367,13 +1480,16 @@ void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, in
 /// @param num_experts Number of experts.
 /// @param top_k Number of experts per token.
 /// @param normalize_weights Whether to normalize weights to sum to 1.
+/// @param softmax_weights Whether to apply softmax over selected logits.
 /// @param stream CUDA stream.
 void moe_topk_forward(int* expert_indices, float* routing_weights, const float* scores,
                       const float* correction_bias,
-                      int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+                      int num_tokens, int num_experts, int top_k, bool normalize_weights,
+                      bool softmax_weights, bool sort_by_index, float rounding_scale, cudaStream_t stream);
 void moe_topk_forward(int* expert_indices, nv_bfloat16* routing_weights, const nv_bfloat16* scores,
                       const float* correction_bias,
-                      int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+                      int num_tokens, int num_experts, int top_k, bool normalize_weights,
+                      bool softmax_weights, bool sort_by_index, float rounding_scale, cudaStream_t stream);
 
 /// @brief Backward through top-k selection (with optional post-selection normalization).
 /// Given gradients wrt the selected weights (num_tokens, top_k), scatter them back to a dense
@@ -1381,7 +1497,19 @@ void moe_topk_forward(int* expert_indices, nv_bfloat16* routing_weights, const n
 /// When @p normalize_weights is true, assumes forward did: w_k = p_k / sum_j p_j over selected experts.
 /// Inputs/outputs are FP32 because routing is computed in FP32 in the modular model path.
 void moe_topk_backward(float* d_probs, const float* d_routing_weights, const float* probs, const int* expert_indices,
-                       int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+                       int num_tokens, int num_experts, int top_k, bool normalize_weights,
+                       bool softmax_weights, cudaStream_t stream);
+
+/// @brief Add per-expert bias to permuted tokens.
+void moe_expert_bias_add_forward(float* out, const float* inp, const float* bias, const int* expert_offsets,
+                                 int num_experts, int hidden_size, int total_tokens, cudaStream_t stream);
+void moe_expert_bias_add_forward(nv_bfloat16* out, const nv_bfloat16* inp, const nv_bfloat16* bias, const int* expert_offsets,
+                                 int num_experts, int hidden_size, int total_tokens, cudaStream_t stream);
+/// @brief Backward for per-expert bias add. Accumulates bias grad in FP32.
+void moe_expert_bias_add_backward(float* d_inp, float* d_bias, const float* d_out, const int* expert_offsets,
+                                  int num_experts, int hidden_size, int total_tokens, cudaStream_t stream);
+void moe_expert_bias_add_backward(nv_bfloat16* d_inp, float* d_bias, const nv_bfloat16* d_out, const int* expert_offsets,
+                                  int num_experts, int hidden_size, int total_tokens, cudaStream_t stream);
 
 /// @brief Compute histogram of tokens assigned to each expert.
 /// @param expert_counts Output counts per expert (num_experts).

@@ -304,6 +304,41 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
         cfg->UseQKNorm = *v;
     }
 
+    // Sliding window attention (GPT-OSS)
+    if (auto v = get_opt_int("sliding_window")) {
+        cfg->SlidingWindow = *v;
+    } else if (text_cfg) {
+        if (auto v = get_opt<int>(*text_cfg, "sliding_window")) {
+            cfg->SlidingWindow = *v;
+        }
+    }
+
+    const nlohmann::json* layer_types = nullptr;
+    if (config_json.contains("layer_types") && config_json["layer_types"].is_array()) {
+        layer_types = &config_json["layer_types"];
+    } else if (text_cfg && (*text_cfg).contains("layer_types") && (*text_cfg)["layer_types"].is_array()) {
+        layer_types = &(*text_cfg)["layer_types"];
+    }
+    if (layer_types) {
+        cfg->LayerTypes.clear();
+        cfg->LayerTypes.reserve(layer_types->size());
+        for (const auto& item : *layer_types) {
+            if (!item.is_string()) {
+                cfg->LayerTypes.push_back(0);
+                continue;
+            }
+            const std::string v = item.get<std::string>();
+            const bool sliding = (v.find("sliding") != std::string::npos);
+            cfg->LayerTypes.push_back(sliding ? 1 : 0);
+        }
+    } else if (cfg->SlidingWindow > 0 && cfg->ModelTypeName == "gpt_oss" && cfg->NumLayers > 0) {
+        // GPT-OSS default: alternating sliding/full attention starting with sliding.
+        cfg->LayerTypes.resize(static_cast<std::size_t>(cfg->NumLayers));
+        for (int i = 0; i < cfg->NumLayers; ++i) {
+            cfg->LayerTypes[static_cast<std::size_t>(i)] = ((i + 1) % 2) ? 1 : 0;
+        }
+    }
+
     return cfg;
 }
 
@@ -348,6 +383,16 @@ void save_pretrained_config(const PretrainedConfig& config, const char* file_nam
     config_json["tie_word_embeddings"] = config.TiedWordEmbeddings;
     config_json["attention_bias"] = config.UseQKVBias;
     config_json["torch_dtype"] = dtype_to_torch_str(config.DType);
+    if (config.SlidingWindow > 0) {
+        config_json["sliding_window"] = config.SlidingWindow;
+    }
+    if (!config.LayerTypes.empty()) {
+        nlohmann::json layer_types = nlohmann::json::array();
+        for (int t : config.LayerTypes) {
+            layer_types.push_back(t ? "sliding_attention" : "full_attention");
+        }
+        config_json["layer_types"] = std::move(layer_types);
+    }
 
     nlohmann::json rope_scaling;
     bool has_rope_scaling = false;

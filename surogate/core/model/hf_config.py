@@ -1,3 +1,5 @@
+import json
+import os
 from typing import Union, Dict, Any, Optional, List, Tuple
 
 import torch
@@ -104,9 +106,71 @@ class HfConfigFactory:
         elif quant_method == 'hqq':
             res['quant_method'] = quant_method
             res['quant_bits'] = quantization_config['quant_config']['weight_quant_params']['nbits']
+        elif quant_method == 'fp8':
+            # Fine-grained FP8 (e.g., DeepSeek-V3/R1): per-block (128x128) FP8 E4M3
+            res['quant_method'] = 'prequant_fp8'
+            res['quant_bits'] = 8
+            res['weight_block_size'] = quantization_config.get('weight_block_size', [128, 128])
+            res['modules_to_not_convert'] = quantization_config.get(
+                'modules_to_not_convert', quantization_config.get('ignore', []))
+        elif quant_method == 'modelopt':
+            quant_algo = quantization_config.get('quant_algo', '')
+            if quant_algo == 'NVFP4':
+                # NVIDIA ModelOpt NVFP4: packed FP4 + FP8 block scales + FP32 global
+                res['quant_method'] = 'prequant_nvfp4'
+                res['quant_bits'] = 4
+                res['modules_to_not_convert'] = quantization_config.get(
+                    'ignore', quantization_config.get('modules_to_not_convert', []))
+            else:
+                res['quant_method'] = quant_method
+        elif quant_method == 'mxfp4':
+            # Microscaling FP4: packed FP4 E2M1 + E8M0 shared exponents per 32 elements
+            res['quant_method'] = 'prequant_mxfp4'
+            res['quant_bits'] = 4
+            res['modules_to_not_convert'] = quantization_config.get(
+                'modules_to_not_convert', quantization_config.get('ignore', []))
         elif quant_method is not None:
             res['quant_method'] = quant_method
         return res or None
+
+    @staticmethod
+    def get_quant_info_from_hf_quant_config(model_dir: str) -> Optional[Dict[str, Any]]:
+        """Fallback: read quantization info from hf_quant_config.json (ModelOpt convention).
+
+        Some ModelOpt-quantized models (e.g., Nemotron NVFP4) store quantization
+        metadata in a separate hf_quant_config.json instead of config.json.
+        """
+        # Try local path first
+        path = os.path.join(model_dir, 'hf_quant_config.json')
+        if not os.path.isfile(path):
+            # Try resolving from HuggingFace Hub cache
+            try:
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(model_dir, filename='hf_quant_config.json')
+            except Exception:
+                return None
+
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            return None
+
+        quant = data.get('quantization', {})
+        quant_algo = quant.get('quant_algo', '')
+        if quant_algo == 'NVFP4':
+            return {
+                'quant_method': 'prequant_nvfp4',
+                'quant_bits': 4,
+                'modules_to_not_convert': quant.get('exclude_modules', []),
+            }
+        elif quant_algo == 'FP8':
+            return {
+                'quant_method': 'prequant_fp8',
+                'quant_bits': 8,
+                'modules_to_not_convert': quant.get('exclude_modules', []),
+            }
+        return None
 
     @staticmethod
     def to_torch_dtype(torch_dtype: Union[str, torch.dtype, None]) -> Optional[torch.dtype]:

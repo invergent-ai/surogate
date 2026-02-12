@@ -249,6 +249,58 @@ __global__ void concat_d_gate_up_kernel(const floatX* __restrict__ dg,
     de_vec.store(d_gate_up + de_offset);
 }
 
+/**
+ * @brief Split interleaved gate_up = [gate0, up0, gate1, up1, ...] into up and gate.
+ */
+template<typename floatX>
+__global__ void split_gate_up_interleaved_kernel(const floatX* __restrict__ gate_up,
+                                                 floatX* __restrict__ up,
+                                                 floatX* __restrict__ gate,
+                                                 int N, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * D;
+    if (idx >= total) return;
+    const int base = idx * 2;
+    gate[idx] = gate_up[base];
+    up[idx] = gate_up[base + 1];
+}
+
+/**
+ * @brief Add interleaved gate/up contributions into gate_up in-place.
+ */
+template<typename floatX>
+__global__ void add_gate_up_interleaved_kernel(floatX* __restrict__ gate_up,
+                                               const floatX* __restrict__ up,
+                                               const floatX* __restrict__ gate,
+                                               int N, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * D;
+    if (idx >= total) return;
+    const int base = idx * 2;
+    gate_up[base] += gate[idx];
+    gate_up[base + 1] += up[idx];
+}
+
+template<typename floatX>
+__global__ void add_gate_up_interleaved_gate_kernel(floatX* __restrict__ gate_up,
+                                                    const floatX* __restrict__ gate,
+                                                    int N, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * D;
+    if (idx >= total) return;
+    gate_up[idx * 2] += gate[idx];
+}
+
+template<typename floatX>
+__global__ void add_gate_up_interleaved_up_kernel(floatX* __restrict__ gate_up,
+                                                  const floatX* __restrict__ up,
+                                                  int N, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * D;
+    if (idx >= total) return;
+    gate_up[idx * 2 + 1] += up[idx];
+}
+
 // ============================================================================
 // Kernel launchers
 // ============================================================================
@@ -388,6 +440,140 @@ void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate,
         split_gate_up(gate_up.get<float>(), up.get<float>(), gate.get<float>(), N, D, stream);
     } else {
         throw std::runtime_error("split_gate_up: unsupported dtype");
+    }
+}
+
+template<typename floatX>
+static void split_gate_up_interleaved_impl(const floatX* gate_up, floatX* up, floatX* gate,
+                                           int N, int D, cudaStream_t stream) {
+    const int total = N * D;
+    if (total <= 0) return;
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+    split_gate_up_interleaved_kernel<<<grid_size, block_size, 0, stream>>>(
+        gate_up, up, gate, N, D);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void split_gate_up_interleaved(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gate,
+                               int N, int D, cudaStream_t stream) {
+    split_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
+}
+
+void split_gate_up_interleaved(const float* gate_up, float* up, float* gate,
+                               int N, int D, cudaStream_t stream) {
+    split_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
+}
+
+void split_gate_up_interleaved(const Tensor& gate_up, Tensor& up, Tensor& gate,
+                               int N, int D, cudaStream_t stream) {
+    if (gate_up.DType == ETensorDType::BF16) {
+        split_gate_up_interleaved(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(),
+                                  gate.get<nv_bfloat16>(), N, D, stream);
+    } else if (gate_up.DType == ETensorDType::FP32) {
+        split_gate_up_interleaved(gate_up.get<float>(), up.get<float>(), gate.get<float>(), N, D, stream);
+    } else {
+        throw std::runtime_error("split_gate_up_interleaved: unsupported dtype");
+    }
+}
+
+template<typename floatX>
+static void add_gate_up_interleaved_impl(floatX* gate_up, const floatX* up, const floatX* gate,
+                                         int N, int D, cudaStream_t stream) {
+    const int total = N * D;
+    if (total <= 0) return;
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+    add_gate_up_interleaved_kernel<<<grid_size, block_size, 0, stream>>>(
+        gate_up, up, gate, N, D);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void add_gate_up_interleaved(nv_bfloat16* gate_up, const nv_bfloat16* up, const nv_bfloat16* gate,
+                             int N, int D, cudaStream_t stream) {
+    add_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
+}
+
+void add_gate_up_interleaved(float* gate_up, const float* up, const float* gate,
+                             int N, int D, cudaStream_t stream) {
+    add_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
+}
+
+void add_gate_up_interleaved(Tensor& gate_up, const Tensor& up, const Tensor& gate,
+                             int N, int D, cudaStream_t stream) {
+    if (gate_up.DType == ETensorDType::BF16) {
+        add_gate_up_interleaved(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(),
+                                gate.get<nv_bfloat16>(), N, D, stream);
+    } else if (gate_up.DType == ETensorDType::FP32) {
+        add_gate_up_interleaved(gate_up.get<float>(), up.get<float>(), gate.get<float>(), N, D, stream);
+    } else {
+        throw std::runtime_error("add_gate_up_interleaved: unsupported dtype");
+    }
+}
+
+template<typename floatX>
+static void add_gate_up_interleaved_gate_impl(floatX* gate_up, const floatX* gate,
+                                              int N, int D, cudaStream_t stream) {
+    const int total = N * D;
+    if (total <= 0) return;
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+    add_gate_up_interleaved_gate_kernel<<<grid_size, block_size, 0, stream>>>(
+        gate_up, gate, N, D);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void add_gate_up_interleaved_gate(nv_bfloat16* gate_up, const nv_bfloat16* gate,
+                                  int N, int D, cudaStream_t stream) {
+    add_gate_up_interleaved_gate_impl(gate_up, gate, N, D, stream);
+}
+
+void add_gate_up_interleaved_gate(float* gate_up, const float* gate,
+                                  int N, int D, cudaStream_t stream) {
+    add_gate_up_interleaved_gate_impl(gate_up, gate, N, D, stream);
+}
+
+void add_gate_up_interleaved_gate(Tensor& gate_up, const Tensor& gate,
+                                  int N, int D, cudaStream_t stream) {
+    if (gate_up.DType == ETensorDType::BF16) {
+        add_gate_up_interleaved_gate(gate_up.get<nv_bfloat16>(), gate.get<nv_bfloat16>(), N, D, stream);
+    } else if (gate_up.DType == ETensorDType::FP32) {
+        add_gate_up_interleaved_gate(gate_up.get<float>(), gate.get<float>(), N, D, stream);
+    } else {
+        throw std::runtime_error("add_gate_up_interleaved_gate: unsupported dtype");
+    }
+}
+
+template<typename floatX>
+static void add_gate_up_interleaved_up_impl(floatX* gate_up, const floatX* up,
+                                            int N, int D, cudaStream_t stream) {
+    const int total = N * D;
+    if (total <= 0) return;
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+    add_gate_up_interleaved_up_kernel<<<grid_size, block_size, 0, stream>>>(
+        gate_up, up, N, D);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void add_gate_up_interleaved_up(nv_bfloat16* gate_up, const nv_bfloat16* up,
+                                int N, int D, cudaStream_t stream) {
+    add_gate_up_interleaved_up_impl(gate_up, up, N, D, stream);
+}
+
+void add_gate_up_interleaved_up(float* gate_up, const float* up,
+                                int N, int D, cudaStream_t stream) {
+    add_gate_up_interleaved_up_impl(gate_up, up, N, D, stream);
+}
+
+void add_gate_up_interleaved_up(Tensor& gate_up, const Tensor& up,
+                                int N, int D, cudaStream_t stream) {
+    if (gate_up.DType == ETensorDType::BF16) {
+        add_gate_up_interleaved_up(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(), N, D, stream);
+    } else if (gate_up.DType == ETensorDType::FP32) {
+        add_gate_up_interleaved_up(gate_up.get<float>(), up.get<float>(), N, D, stream);
+    } else {
+        throw std::runtime_error("add_gate_up_interleaved_up: unsupported dtype");
     }
 }
 

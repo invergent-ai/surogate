@@ -32,6 +32,7 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
     if (lora_config.applies_to_v()) per_layer += r * C + kv_out * r;
     if (lora_config.applies_to_o()) per_layer += r * q_out + C * r;
     if (lora_config.applies_to_gate()) per_layer += r * C + D * r;
+    if (lora_config.applies_to_gate_up()) per_layer += r * C + (2 * D) * r;
     if (lora_config.applies_to_up()) per_layer += r * C + D * r;
     if (lora_config.applies_to_down()) per_layer += r * D + C * r;
 

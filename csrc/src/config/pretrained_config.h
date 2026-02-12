@@ -29,6 +29,7 @@ struct PretrainedConfig {
         QWEN3,
         QWEN3_MOE,
         NEMOTRON_H,
+        GPT_OSS,
     };
 
     // Architecture identifier
@@ -59,6 +60,10 @@ struct PretrainedConfig {
     float RopeTheta = 10000.0f;
     RoPEConfig Rope;  // Flexible RoPE configuration (GLM4 partial, Qwen2-VL M-RoPE, etc.)
 
+    // Sliding window attention (optional, per-layer when layer types provided)
+    int SlidingWindow = 0;
+    std::vector<int> LayerTypes;  // 0 = full attention, 1 = sliding attention
+
     // Normalization
     float RmsNormEps = 1e-5f;
 
@@ -86,8 +91,20 @@ struct PretrainedConfig {
 
     // Type checking methods
     [[nodiscard]] virtual bool is_moe() const { return false; }
-    [[nodiscard]] virtual bool has_sliding_window() const { return false; }
+    [[nodiscard]] virtual bool has_sliding_window() const { return SlidingWindow > 0; }
     [[nodiscard]] virtual bool has_qk_norm() const { return UseQKNorm; }
+
+    [[nodiscard]] bool is_sliding_layer(int layer_idx) const {
+        if (layer_idx < 0) {
+            return false;
+        }
+        if (!LayerTypes.empty()) {
+            if (layer_idx < static_cast<int>(LayerTypes.size())) {
+                return LayerTypes[static_cast<std::size_t>(layer_idx)] != 0;
+            }
+        }
+        return false;
+    }
 
     // MoE layer query (overridden by MoE configs)
     [[nodiscard]] virtual bool is_moe_layer(int /*layer_idx*/) const { return false; }

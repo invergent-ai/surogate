@@ -19,6 +19,7 @@
 #include "runtime/lora/lora_model_utils.h"
 #include "utilities/utils.h"
 #include "utilities/safetensors.h"
+#include "utilities/dtype.h"
 
 #include <cuda_bf16.h>
 
@@ -373,39 +374,108 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
             const std::string hf_name = internal::format_hf_name(spec->source, layer_idx);
             const auto& entry = reader.find_entry(hf_name);
-            if (entry.shape().size() != 2 || param.Rank != 2) {
-                throw std::runtime_error("DSL model: transpose expects 2D tensors for " + name);
-            }
-            if (!param_sharded) {
-                Tensor tmp = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
-                                                  EAllocationType::ON_DEVICE,
-                                                  {entry.shape().at(0), entry.shape().at(1)});
-                entry.read_tensor(tmp, allow_cast);
-                cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-                transpose(param, tmp, static_cast<int>(entry.shape().at(0)),
-                          static_cast<int>(entry.shape().at(1)), stream);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            } else {
-                const Tensor& global = mParams->template_tensor(name);
-                const long global_rows = global.Sizes[0];
-                auto [start, end] = shard_range(global_rows, param_sharded);
-                if (param.Sizes[0] != (end - start)) {
-                    throw std::runtime_error("DSL model: transpose shard size mismatch for " + name);
-                }
-                Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_src_" + name).c_str(),
+            cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+            if (entry.shape().size() == 2 && param.Rank == 2) {
+                if (!param_sharded) {
+                    Tensor tmp = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
                                                       EAllocationType::ON_DEVICE,
                                                       {entry.shape().at(0), entry.shape().at(1)});
-                entry.read_tensor(tmp_src, allow_cast);
-                Tensor tmp_full = mAllocator->allocate(param.DType, ("hf_tmp_full_" + name).c_str(),
-                                                       EAllocationType::ON_DEVICE,
-                                                       {global.Sizes[0], global.Sizes[1]});
-                cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-                transpose(tmp_full, tmp_src, static_cast<int>(entry.shape().at(0)),
-                          static_cast<int>(entry.shape().at(1)), stream);
-                Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
-                CUDA_CHECK(cudaMemcpyAsync(param.Data, slice.Data, param.bytes(),
-                                           cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                    entry.read_tensor(tmp, allow_cast);
+                    transpose(param, tmp, static_cast<int>(entry.shape().at(0)),
+                              static_cast<int>(entry.shape().at(1)), stream);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                } else {
+                    const Tensor& global = mParams->template_tensor(name);
+                    const long global_rows = global.Sizes[0];
+                    auto [start, end] = shard_range(global_rows, param_sharded);
+                    if (param.Sizes[0] != (end - start)) {
+                        throw std::runtime_error("DSL model: transpose shard size mismatch for " + name);
+                    }
+                    Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_src_" + name).c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          {entry.shape().at(0), entry.shape().at(1)});
+                    entry.read_tensor(tmp_src, allow_cast);
+                    Tensor tmp_full = mAllocator->allocate(param.DType, ("hf_tmp_full_" + name).c_str(),
+                                                           EAllocationType::ON_DEVICE,
+                                                           {global.Sizes[0], global.Sizes[1]});
+                    transpose(tmp_full, tmp_src, static_cast<int>(entry.shape().at(0)),
+                              static_cast<int>(entry.shape().at(1)), stream);
+                    Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
+                    CUDA_CHECK(cudaMemcpyAsync(param.Data, slice.Data, param.bytes(),
+                                               cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            } else if (entry.shape().size() == 3 && param.Rank == 3) {
+                const long E = static_cast<long>(entry.shape().at(0));
+                const long A = static_cast<long>(entry.shape().at(1));
+                const long B = static_cast<long>(entry.shape().at(2));
+                if (!param_sharded) {
+                    if (param.Sizes[0] != E || param.Sizes[1] != B || param.Sizes[2] != A) {
+                        throw std::runtime_error("DSL model: transpose (3D) shape mismatch for " + name);
+                    }
+                    Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          {E, A, B});
+                    entry.read_tensor(tmp_src, allow_cast);
+                    const std::size_t elem_size = get_dtype_size(param.DType);
+                    for (long e = 0; e < E; ++e) {
+                        Tensor src_view = tmp_src;
+                        src_view.Rank = 2;
+                        src_view.Sizes[0] = A;
+                        src_view.Sizes[1] = B;
+                        src_view.Data = static_cast<std::byte*>(tmp_src.Data)
+                                        + static_cast<std::size_t>(e) * A * B * elem_size;
+
+                        Tensor dst_view = param;
+                        dst_view.Rank = 2;
+                        dst_view.Sizes[0] = B;
+                        dst_view.Sizes[1] = A;
+                        dst_view.Data = static_cast<std::byte*>(param.Data)
+                                        + static_cast<std::size_t>(e) * B * A * elem_size;
+
+                        transpose(dst_view, src_view, static_cast<int>(A), static_cast<int>(B), stream);
+                    }
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                } else {
+                    const Tensor& global = mParams->template_tensor(name);
+                    const long global_rows = global.Sizes[0];
+                    auto [start, end] = shard_range(global_rows, param_sharded);
+                    if (param.Sizes[0] != (end - start) ||
+                        global.Sizes[1] != B || global.Sizes[2] != A) {
+                        throw std::runtime_error("DSL model: transpose (3D) shard size mismatch for " + name);
+                    }
+                    Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_src_" + name).c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          {E, A, B});
+                    entry.read_tensor(tmp_src, allow_cast);
+                    Tensor tmp_full = mAllocator->allocate(param.DType, ("hf_tmp_full_" + name).c_str(),
+                                                           EAllocationType::ON_DEVICE,
+                                                           {global.Sizes[0], global.Sizes[1], global.Sizes[2]});
+                    const std::size_t elem_size = get_dtype_size(param.DType);
+                    for (long e = 0; e < E; ++e) {
+                        Tensor src_view = tmp_src;
+                        src_view.Rank = 2;
+                        src_view.Sizes[0] = A;
+                        src_view.Sizes[1] = B;
+                        src_view.Data = static_cast<std::byte*>(tmp_src.Data)
+                                        + static_cast<std::size_t>(e) * A * B * elem_size;
+
+                        Tensor dst_view = tmp_full;
+                        dst_view.Rank = 2;
+                        dst_view.Sizes[0] = B;
+                        dst_view.Sizes[1] = A;
+                        dst_view.Data = static_cast<std::byte*>(tmp_full.Data)
+                                        + static_cast<std::size_t>(e) * B * A * elem_size;
+
+                        transpose(dst_view, src_view, static_cast<int>(A), static_cast<int>(B), stream);
+                    }
+                    Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
+                    CUDA_CHECK(cudaMemcpyAsync(param.Data, slice.Data, param.bytes(),
+                                               cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            } else {
+                throw std::runtime_error("DSL model: transpose expects 2D or 3D tensors for " + name);
             }
             continue;
         }

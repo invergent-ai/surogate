@@ -301,6 +301,8 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/moe_grouped_gemm.cpp
     src/runtime/ops/moe_grouped_gemm_gate_up.cpp
     src/runtime/ops/moe_grouped_gemm_down.cpp
+    src/runtime/ops/moe_expert_bias_add.cpp
+    src/runtime/ops/gpt_oss_moe_act.cpp
     src/runtime/ops/moe_unpermute.cpp
 
     src/runtime/ops/mamba_split_proj.cpp
@@ -316,6 +318,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/qlora/bnb_quantizer.cpp
     src/runtime/qlora/fp8_quantizer.cpp
     src/runtime/qlora/fp4_quantizer.cpp
+    src/runtime/qlora/mxfp4_quantizer.cpp
     src/runtime/qlora/offload_manager.cpp
     src/runtime/qlora/generic_weight_manager.cpp
     src/runtime/qlora/dsl_qlora_pipeline.cpp
@@ -356,6 +359,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/qk_norm.cu
     src/kernels/cudnn_att.cpp
     src/kernels/block_quant.cu
+    src/kernels/mxfp4_dequant.cu
     src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu

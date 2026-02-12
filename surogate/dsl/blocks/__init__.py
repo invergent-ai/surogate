@@ -5,6 +5,7 @@ from .dense import DenseTransformerBlock
 from .qwen3 import Qwen3Block
 from .qwen3_vl import Qwen3VLBlock
 from .qwen3_moe import Qwen3MoEBlock
+from .gpt_oss import GptOssBlock
 from .llama import LlamaBlock
 from .nemotron_h import (
     NemotronHMamba2Block,
@@ -19,6 +20,7 @@ __all__ = [
     "Qwen3Block",
     "Qwen3VLBlock",
     "Qwen3MoEBlock",
+    "GptOssBlock",
     "LlamaBlock",
     # NemotronH hybrid blocks
     "NemotronHMamba2Block",

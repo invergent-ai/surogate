@@ -151,14 +151,38 @@ bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
     int layer_idx = -1;
     const MappingSpec* spec = find_mapping_spec(name, layer_idx);
 
-    if (!spec || spec->kind != MappingSpec::Kind::StackExperts) {
-        throw std::runtime_error(
-            "DslWeightLoader: load_expert requires StackExperts mapping for '" + name + "'");
+    if (!spec) {
+        throw std::runtime_error("DslWeightLoader: load_expert missing mapping for '" + name + "'");
     }
 
     const std::size_t elem_size = get_dtype_size(target.DType);
+    if (!stream) {
+        stream = cudaStreamDefault;
+    }
+    auto get_expert_scratch = [&](ETensorDType dtype, const std::vector<long>& shape) -> Tensor {
+        std::size_t elems = 1;
+        for (long dim : shape) {
+            elems *= static_cast<std::size_t>(dim);
+        }
+        const std::size_t bytes = elems * get_dtype_size(dtype);
+        if (!mExpertScratch.Data || mExpertScratchBytes < bytes || mExpertScratch.DType != dtype) {
+            mExpertScratch = mAllocator.allocate(dtype, "wl_tmp_expert",
+                                                 EAllocationType::ON_DEVICE, shape);
+            mExpertScratchBytes = mExpertScratch.bytes();
+        }
+        Tensor scratch = mExpertScratch;
+        scratch.DType = dtype;
+        scratch.Rank = static_cast<int>(shape.size());
+        for (int i = 0; i < scratch.Rank; ++i) {
+            scratch.Sizes[i] = shape[i];
+        }
+        for (int i = scratch.Rank; i < MAX_TENSOR_DIM; ++i) {
+            scratch.Sizes[i] = 1;
+        }
+        return scratch;
+    };
 
-    if (spec->fuse_gate_up) {
+    if (spec->kind == MappingSpec::Kind::StackExperts && spec->fuse_gate_up) {
         // Fused gate_up: target is [2*D, C], load up_proj into first D rows, gate into next D.
         std::string gate_pattern = spec->source;
         std::string up_pattern = spec->source;
@@ -192,19 +216,109 @@ bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
         gate_slice.Sizes[0] = D;
         gate_slice.Data = static_cast<std::byte*>(target.Data) + sub_expert_elems * elem_size;
         gate_entry.read_tensor(gate_slice, allow_cast);
-    } else {
-        // Load single expert tensor.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return true;
+    }
+
+    if (spec->kind == MappingSpec::Kind::StackExperts) {
+        // Load single expert tensor from per-expert HF entries.
         std::string hf_name = format_hf_name(spec->source, layer_idx, expert_idx);
         const auto& entry = mReader.find_entry(hf_name);
         if (entry.shape().empty()) {
             throw std::runtime_error("DslWeightLoader: load_expert missing '" + hf_name + "'");
         }
         entry.read_tensor(target, allow_cast);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return true;
     }
 
-    if (stream) {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (spec->kind != MappingSpec::Kind::Direct && spec->kind != MappingSpec::Kind::Transform) {
+        throw std::runtime_error(
+            "DslWeightLoader: load_expert unsupported mapping kind for '" + name + "'");
     }
+    if (spec->kind == MappingSpec::Kind::Transform && spec->fn != "transpose") {
+        throw std::runtime_error("DslWeightLoader: load_expert unsupported transform '" + spec->fn
+                                 + "' for '" + name + "'");
+    }
+
+    const bool has_expert_placeholder =
+        spec->source.find("{expert}") != std::string::npos;
+    std::string hf_name = format_hf_name(
+        spec->source.empty() ? name : spec->source,
+        layer_idx,
+        has_expert_placeholder ? expert_idx : -1);
+
+    const SafeTensorEntry* entry_ptr = nullptr;
+    try {
+        entry_ptr = &mReader.find_entry(hf_name);
+    } catch (const std::out_of_range&) {
+        if (spec->optional) {
+            return false;
+        }
+        throw std::runtime_error("DslWeightLoader: load_expert missing '" + hf_name + "'");
+    }
+    const auto& entry = *entry_ptr;
+    const auto& shape = entry.shape();
+    if (shape.empty()) {
+        if (spec->optional) {
+            return false;
+        }
+        throw std::runtime_error("DslWeightLoader: load_expert missing '" + hf_name + "'");
+    }
+
+    // Per-expert tensors with {expert} in the name.
+    if (has_expert_placeholder) {
+        if (spec->kind == MappingSpec::Kind::Direct) {
+            entry.read_tensor(target, allow_cast);
+        } else {
+            if (shape.size() != 2 || target.Rank != 2) {
+                throw std::runtime_error("DslWeightLoader: load_expert transpose expects 2D tensor for '" + name + "'");
+            }
+            Tensor tmp = get_expert_scratch(target.DType, {shape.at(0), shape.at(1)});
+            entry.read_tensor(tmp, allow_cast);
+            transpose(target, tmp, static_cast<int>(shape.at(0)),
+                      static_cast<int>(shape.at(1)), stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return true;
+    }
+
+    // Batched expert tensors [E, ...] without {expert} placeholder.
+    if (shape.size() < 2) {
+        throw std::runtime_error("DslWeightLoader: load_expert expects expert-batched tensor for '" + name + "'");
+    }
+    if (expert_idx < 0 || expert_idx >= shape.at(0)) {
+        throw std::runtime_error("DslWeightLoader: load_expert index out of range for '" + name + "'");
+    }
+
+    long per_expert_elems = 1;
+    for (std::size_t i = 1; i < shape.size(); ++i) {
+        per_expert_elems *= shape[i];
+    }
+    if (static_cast<long>(target.nelem()) != per_expert_elems) {
+        throw std::runtime_error("DslWeightLoader: load_expert size mismatch for '" + name + "'");
+    }
+    const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(expert_idx) * per_expert_elems;
+
+    if (spec->kind == MappingSpec::Kind::Direct) {
+        entry.read_raw(target, offset, per_expert_elems, allow_cast);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return true;
+    }
+
+    // Transform transpose for batched [E, A, B] -> [B, A]
+    if (shape.size() != 3 || target.Rank != 2) {
+        throw std::runtime_error("DslWeightLoader: load_expert transpose expects 3D source for '" + name + "'");
+    }
+    const long A = shape[1];
+    const long B = shape[2];
+    if (target.Sizes[0] != B || target.Sizes[1] != A) {
+        throw std::runtime_error("DslWeightLoader: load_expert transpose shape mismatch for '" + name + "'");
+    }
+    Tensor tmp = get_expert_scratch(target.DType, {A, B});
+    entry.read_raw(tmp, offset, per_expert_elems, allow_cast);
+    transpose(target, tmp, static_cast<int>(A), static_cast<int>(B), stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
 }
 

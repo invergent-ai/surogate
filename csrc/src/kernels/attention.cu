@@ -48,7 +48,8 @@ template<int E, class scalar_t>
 __global__ void __launch_bounds__(512) attention_forward_gpu_kernel(
     scalar_t* out, float* stats, float scale,
     const scalar_t* qkv,
-    int B, int T, int Hq, int Hkv) {
+    int B, int T, int Hq, int Hkv,
+    int window_size) {
     constexpr const int SubWarpSize = 16;
 
     auto block = cg::this_thread_block();
@@ -90,7 +91,12 @@ __global__ void __launch_bounds__(512) attention_forward_gpu_kernel(
         }
     }
 
-    for (int l = sub_warp.meta_group_rank(); l <= t; l += sub_warp.meta_group_size()) {
+    int start = 0;
+    if (window_size > 0) {
+        start = t - window_size + 1;
+        if (start < 0) start = 0;
+    }
+    for (int l = start + sub_warp.meta_group_rank(); l <= t; l += sub_warp.meta_group_size()) {
         ptrdiff_t kv_offset = l * TH * E;
         float qk = 0;
         for (int ee = 0; ee < E / (SubWarpSize * vec_t::size); ++ee) {
@@ -203,7 +209,8 @@ template<int E, class scalar_t>
 __global__ void __launch_bounds__(512) attention_backward_gpu_kernel(
         scalar_t* dqkv, const float* stats, float scale,
         const scalar_t* out, const scalar_t* dout, const scalar_t* qkv,
-        int B, int T, int Hq, int Hkv) {
+        int B, int T, int Hq, int Hkv,
+        int window_size) {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
     const int t = blockIdx.z;
@@ -231,7 +238,12 @@ __global__ void __launch_bounds__(512) attention_backward_gpu_kernel(
     }
 
     ptrdiff_t q_offset = t * TH * E;
-    for (int l = threadIdx.x; l <= t; l += blockDim.x) {
+    int start = 0;
+    if (window_size > 0) {
+        start = t - window_size + 1;
+        if (start < 0) start = 0;
+    }
+    for (int l = start + threadIdx.x; l <= t; l += blockDim.x) {
         ptrdiff_t kv_offset = l * TH * E;
         float qk = 0;
         for (int i = 0; i < E; ++i) {
@@ -280,17 +292,19 @@ __global__ void __launch_bounds__(512) attention_backward_gpu_kernel(
 template<class floatX>
 cudaError_t attention_gpu_forward(floatX* out, float* stats, float scale,
                           const floatX* qkv,
-                          int B, int T, int Hq, int Hkv, int Hs, cudaStream_t stream) {
+                          int B, int T, int Hq, int Hkv, int Hs,
+                          int window_size,
+                          cudaStream_t stream) {
     dim3 grid_dim{(unsigned)Hq, (unsigned)B, (unsigned)T};
     dim3 block_dim{512, 1, 1};
     size_t smem = Hs * sizeof(float) * block_dim.x / 16;
 
     if (Hs == 128) {
         attention_forward_gpu_kernel<128><<<grid_dim, block_dim, smem, stream>>>(
-            out, stats, scale, qkv, B, T, Hq, Hkv);
+            out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 64) {
         attention_forward_gpu_kernel<64><<<grid_dim, block_dim, smem, stream>>>(
-            out, stats, scale, qkv,  B, T, Hq, Hkv);
+            out, stats, scale, qkv,  B, T, Hq, Hkv, window_size);
     } else {
         printf("Unsupported head dimension");
         return cudaErrorInvalidValue;
@@ -322,7 +336,7 @@ void attention_forward_cudnn(float* out,  // output: (B, T, Nq, HS)
                              const float* inp,  // input: (B, T, Hq + 2Hkv, HS) QKV
                              std::byte* workspace, cudnnHandle_t handle,
                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
-    attention_gpu_forward(out, stats, 1.f / sqrtf(HS), inp, B, T, Hq, Hkv, HS, stream);
+    attention_gpu_forward(out, stats, 1.f / sqrtf(HS), inp, B, T, Hq, Hkv, HS, /*window_size=*/0, stream);
 }
 
 /**
@@ -349,7 +363,9 @@ void attention_forward_cudnn(float* out,  // output: (B, T, Nq, HS)
 template<class floatX>
 cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale,
                                    const floatX* out, const floatX* dout, const floatX* qkv,
-                                   int B, int T, int Hq, int Hkv, int Hs, cudaStream_t stream) {
+                                   int B, int T, int Hq, int Hkv, int Hs,
+                                   int window_size,
+                                   cudaStream_t stream) {
     dim3 grid_dim{(unsigned)Hq, (unsigned)B, (unsigned)T};
     dim3 block_dim{512, 1, 1};
     size_t smem = Hs * sizeof(float) * block_dim.x / 16;
@@ -359,10 +375,10 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
     cudaMemsetAsync(dqkv, 0, dqkv_bytes, stream);
     if (Hs == 128) {
         attention_backward_gpu_kernel<128><<<grid_dim, block_dim, smem, stream>>>(
-            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv);
+            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 64) {
         attention_backward_gpu_kernel<64><<<grid_dim, block_dim, smem, stream>>>(
-            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv);
+            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
     } else {
         printf("Unsupported head dimension");
         return cudaErrorInvalidValue;
@@ -393,7 +409,7 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
 void attention_backward_cudnn(float* dqkv, const float* stats,
                               const float* out, const float* dout, const float* qkv, std::byte* workspace,
                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
-    attention_gpu_backward(dqkv, stats, 1.f / sqrtf(HS), out, dout, qkv, B, T, Hq, Hkv, HS, stream);
+    attention_gpu_backward(dqkv, stats, 1.f / sqrtf(HS), out, dout, qkv, B, T, Hq, Hkv, HS, /*window_size=*/0, stream);
 }
 
 /**
@@ -433,13 +449,15 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Hq, HS)
 void attention_forward_custom(Tensor& out,  // output: (B, T, Hq, HS)
                               Tensor& stats, // output for backward pass: (B, Hq, T)
                               const Tensor& inp,  // input: (B, T, Hq + Hk + Hv, HS) QKV
-                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+                              int B, int T, int Hq, int Hkv, int HS,
+                              int window_size,
+                              cudaStream_t stream) {
     if (out.DType == ETensorDType::FP32) {
         attention_gpu_forward(out.get<float>(), stats.get<float>(), 1.f / sqrtf(HS),
-                              inp.get<float>(), B, T, Hq, Hkv, HS, stream);
+                              inp.get<float>(), B, T, Hq, Hkv, HS, window_size, stream);
     } else if (out.DType == ETensorDType::BF16) {
         attention_gpu_forward(out.get<nv_bfloat16>(), stats.get<float>(), 1.f / sqrtf(HS),
-                              inp.get<nv_bfloat16>(), B, T, Hq, Hkv, HS, stream);
+                              inp.get<nv_bfloat16>(), B, T, Hq, Hkv, HS, window_size, stream);
     } else {
         throw std::logic_error("attention_forward_custom: unsupported dtype");
     }
@@ -447,11 +465,13 @@ void attention_forward_custom(Tensor& out,  // output: (B, T, Hq, HS)
 
 void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
                                const Tensor& out, const Tensor& dout, const Tensor& qkv,
-                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+                               int B, int T, int Hq, int Hkv, int HS,
+                               int window_size,
+                               cudaStream_t stream) {
     if (out.DType == ETensorDType::FP32) {
         attention_gpu_backward(dqkv.get<float>(), stats.get<float>(), 1.f / sqrtf(HS),
                                out.get<float>(), dout.get<float>(), qkv.get<float>(),
-                               B, T, Hq, Hkv, HS, stream);
+                               B, T, Hq, Hkv, HS, window_size, stream);
     } else {
         throw std::logic_error("attention_backward_custom: unsupported dtype");
     }
@@ -491,4 +511,108 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
     } else {
         throw std::logic_error("attention_backward: unsupported dtype");
     }
+}
+
+// ============================================================================
+// Attention sinks (GPT-OSS): adjust output + LSE after forward, and compute sink grads.
+// ============================================================================
+template<typename T>
+__global__ void attention_apply_sinks_kernel(
+    T* __restrict__ out,
+    float* __restrict__ lse,
+    const T* __restrict__ sinks,
+    int B, int Tseq, int Hq, int Hs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * Tseq * Hq;
+    if (idx >= total) return;
+    int b = idx / (Hq * Tseq);
+    int rem = idx % (Hq * Tseq);
+    int h = rem / Tseq;
+    int t = rem % Tseq;
+
+    float l = lse[(b * Hq + h) * Tseq + t];
+    float s = static_cast<float>(sinks[h]);
+    float maxv = fmaxf(l, s);
+    float lse_new = maxv + logf(expf(l - maxv) + expf(s - maxv));
+    float scale = expf(l - lse_new);
+
+    lse[(b * Hq + h) * Tseq + t] = lse_new;
+
+    T* out_ptr = out + ((b * Tseq + t) * Hq + h) * Hs;
+    for (int i = 0; i < Hs; ++i) {
+        float v = static_cast<float>(out_ptr[i]) * scale;
+        out_ptr[i] = static_cast<T>(v);
+    }
+}
+
+template<typename T>
+__global__ void attention_sinks_backward_kernel(
+    float* __restrict__ d_sinks,
+    const T* __restrict__ out,
+    const T* __restrict__ dout,
+    const float* __restrict__ lse,
+    const T* __restrict__ sinks,
+    int B, int Tseq, int Hq, int Hs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * Tseq * Hq;
+    if (idx >= total) return;
+    int b = idx / (Hq * Tseq);
+    int rem = idx % (Hq * Tseq);
+    int h = rem / Tseq;
+    int t = rem % Tseq;
+
+    const T* out_ptr = out + ((b * Tseq + t) * Hq + h) * Hs;
+    const T* dout_ptr = dout + ((b * Tseq + t) * Hq + h) * Hs;
+    float D = 0.0f;
+    for (int i = 0; i < Hs; ++i) {
+        D += static_cast<float>(out_ptr[i]) * static_cast<float>(dout_ptr[i]);
+    }
+
+    float l = lse[(b * Hq + h) * Tseq + t];
+    float s = static_cast<float>(sinks[h]);
+    float p_sink = expf(s - l);
+    float grad = -p_sink * D;
+    atomicAdd(&d_sinks[h], grad);
+}
+
+void attention_apply_sinks(nv_bfloat16* out, float* lse, const nv_bfloat16* sinks,
+                           int B, int T, int Hq, int Hs, cudaStream_t stream) {
+    int total = B * T * Hq;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    attention_apply_sinks_kernel<<<grid_size, block_size, 0, stream>>>(
+        out, lse, sinks, B, T, Hq, Hs
+    );
+}
+
+void attention_apply_sinks(float* out, float* lse, const float* sinks,
+                           int B, int T, int Hq, int Hs, cudaStream_t stream) {
+    int total = B * T * Hq;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    attention_apply_sinks_kernel<<<grid_size, block_size, 0, stream>>>(
+        out, lse, sinks, B, T, Hq, Hs
+    );
+}
+
+void attention_sinks_backward(float* d_sinks, const nv_bfloat16* out, const nv_bfloat16* dout, const float* lse,
+                              const nv_bfloat16* sinks, int B, int T, int Hq, int Hs, cudaStream_t stream) {
+    int total = B * T * Hq;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    attention_sinks_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_sinks, out, dout, lse, sinks, B, T, Hq, Hs
+    );
+}
+
+void attention_sinks_backward(float* d_sinks, const float* out, const float* dout, const float* lse,
+                              const float* sinks, int B, int T, int Hq, int Hs, cudaStream_t stream) {
+    int total = B * T * Hq;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    attention_sinks_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_sinks, out, dout, lse, sinks, B, T, Hq, Hs
+    );
 }

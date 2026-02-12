@@ -734,6 +734,53 @@ void global_amax(float* out, const Tensor& values, size_t count, const cudaDevic
     }
 }
 
+void sanitize_non_finite(Tensor& data, cudaStream_t stream) {
+    if (data.DType == ETensorDType::FP32) {
+        sanitize_non_finite(data.get<float>(), static_cast<int>(data.nelem()), stream);
+    } else if (data.DType == ETensorDType::BF16) {
+        sanitize_non_finite(data.get<nv_bfloat16>(), static_cast<int>(data.nelem()), stream);
+    } else {
+        throw std::logic_error("sanitize_non_finite: unsupported dtype");
+    }
+}
+
+void clamp_abs(Tensor& data, float max_abs, cudaStream_t stream) {
+    if (max_abs <= 0.0f) {
+        return;
+    }
+    if (data.DType == ETensorDType::FP32) {
+        clamp_abs(data.get<float>(), static_cast<int>(data.nelem()), max_abs, stream);
+    } else if (data.DType == ETensorDType::BF16) {
+        clamp_abs(data.get<nv_bfloat16>(), static_cast<int>(data.nelem()), max_abs, stream);
+    } else {
+        throw std::logic_error("clamp_abs: unsupported dtype");
+    }
+}
+
+void count_non_finite(Tensor& out_count, const Tensor& data, cudaStream_t stream) {
+    if (out_count.DType != ETensorDType::INT32 || out_count.nelem() < 1) {
+        throw std::logic_error("count_non_finite: out_count must be INT32 scalar");
+    }
+    if (data.DType == ETensorDType::FP32) {
+        count_non_finite(out_count.get<int>(), data.get<float>(), static_cast<int>(data.nelem()), stream);
+    } else if (data.DType == ETensorDType::BF16) {
+        count_non_finite(out_count.get<int>(), data.get<nv_bfloat16>(), static_cast<int>(data.nelem()), stream);
+    } else {
+        throw std::logic_error("count_non_finite: unsupported dtype");
+    }
+}
+
+void count_invalid_indices(Tensor& out_count, const Tensor& indices, int num_experts, cudaStream_t stream) {
+    if (out_count.DType != ETensorDType::INT32 || out_count.nelem() < 1) {
+        throw std::logic_error("count_invalid_indices: out_count must be INT32 scalar");
+    }
+    if (indices.DType != ETensorDType::INT32) {
+        throw std::logic_error("count_invalid_indices: indices must be INT32");
+    }
+    count_invalid_indices(out_count.get<int>(), indices.get<int>(),
+                          static_cast<int>(indices.nelem()), num_experts, stream);
+}
+
 void global_norm_squared_prescaled(float* out, const Tensor& values, size_t count, const float* prescale_device,
                                     const cudaDeviceProp& dp, cudaStream_t stream) {
     if (values.DType == ETensorDType::FP32) {

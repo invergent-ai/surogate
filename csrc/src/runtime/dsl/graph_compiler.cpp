@@ -173,6 +173,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"matmul_bias", CompiledOpType::MatmulBias},
         {"bias_add", CompiledOpType::BiasAdd},
         {"swiglu", CompiledOpType::SwiGLU},
+        {"gpt_oss_moe_act", CompiledOpType::GptOssMoeAct},
         {"silu", CompiledOpType::Silu},
         {"gelu", CompiledOpType::Gelu},
         {"relu2", CompiledOpType::Relu2},
@@ -199,12 +200,14 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"moe_grouped_gemm_gate_up", CompiledOpType::MoEGroupedGemmGateUp},
         {"moe_grouped_gemm_down", CompiledOpType::MoEGroupedGemmDown},
         {"moe_unpermute", CompiledOpType::MoEUnpermute},
+        {"moe_expert_bias_add", CompiledOpType::MoEExpertBiasAdd},
         // Backward operations
         {"view_backward", CompiledOpType::ViewBackward},
         {"add_backward", CompiledOpType::AddBackward},
         {"matmul_backward", CompiledOpType::MatmulBackward},
         {"bias_add_backward", CompiledOpType::BiasAddBackward},
         {"swiglu_backward", CompiledOpType::SwiGLUBackward},
+        {"gpt_oss_moe_act_backward", CompiledOpType::GptOssMoeActBackward},
         {"silu_backward", CompiledOpType::SiluBackward},
         {"gelu_backward", CompiledOpType::GeluBackward},
         {"relu2_backward", CompiledOpType::Relu2Backward},
@@ -232,6 +235,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"moe_grouped_gemm_gate_up_backward", CompiledOpType::MoEGroupedGemmGateUpBackward},
         {"moe_grouped_gemm_down_backward", CompiledOpType::MoEGroupedGemmDownBackward},
         {"moe_unpermute_backward", CompiledOpType::MoEUnpermuteBackward},
+        {"moe_expert_bias_add_backward", CompiledOpType::MoEExpertBiasAddBackward},
         // Mamba/SSM forward operations
         {"mamba_split_proj", CompiledOpType::MambaSplitProj},
         {"mamba_conv1d", CompiledOpType::MambaConv1d},
@@ -556,6 +560,12 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    if (auto* window_attr = find_attr(op.attrs, "window_size")) {
+        if (auto v = attr_int(*window_attr)) {
+            attrs.window_size = static_cast<int>(*v);
+        }
+    }
+
     if (auto* mrope_attr = find_attr(op.attrs, "mrope_section")) {
         if (auto list = attr_list_int(*mrope_attr)) {
             if (list->size() >= 3) {
@@ -681,11 +691,54 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 attrs.normalize_weights = *v;
             }
         }
+        if (auto* soft_attr = find_attr(op.attrs, "softmax")) {
+            if (auto v = attr_bool(*soft_attr)) {
+                attrs.topk_softmax = *v;
+            }
+        }
 
         // scaling_factor attribute (e.g. routed_scaling_factor for Nemotron-H)
         if (auto* sf_attr = find_attr(op.attrs, "scaling_factor")) {
             if (auto v = attr_double(*sf_attr)) {
                 attrs.scaling_factor = static_cast<float>(*v);
+            }
+        }
+        if (auto* round_attr = find_attr(op.attrs, "topk_rounding_scale")) {
+            if (auto v = attr_double(*round_attr)) {
+                attrs.topk_rounding_scale = static_cast<float>(*v);
+            } else if (auto v_int = attr_int(*round_attr)) {
+                attrs.topk_rounding_scale = static_cast<float>(*v_int);
+            }
+        }
+        if (auto* sort_attr = find_attr(op.attrs, "topk_sort_by_index")) {
+            if (auto v = attr_bool(*sort_attr)) {
+                attrs.topk_sort_by_index = *v;
+            } else if (auto v_int = attr_int(*sort_attr)) {
+                attrs.topk_sort_by_index = (*v_int != 0);
+            }
+        }
+    }
+
+    if (type == CompiledOpType::MoEGroupedGemmGateUp ||
+        type == CompiledOpType::MoEGroupedGemmGateUpBackward) {
+        if (auto* interleaved_attr = find_attr(op.attrs, "gate_up_interleaved")) {
+            if (auto v = attr_bool(*interleaved_attr)) {
+                attrs.gate_up_interleaved = *v;
+            } else if (auto v_int = attr_int(*interleaved_attr)) {
+                attrs.gate_up_interleaved = (*v_int != 0);
+            }
+        }
+    }
+
+    if (type == CompiledOpType::GptOssMoeAct || type == CompiledOpType::GptOssMoeActBackward) {
+        if (auto* alpha_attr = find_attr(op.attrs, "alpha")) {
+            if (auto v = attr_double(*alpha_attr)) {
+                attrs.gpt_oss_alpha = static_cast<float>(*v);
+            }
+        }
+        if (auto* limit_attr = find_attr(op.attrs, "limit")) {
+            if (auto v = attr_double(*limit_attr)) {
+                attrs.gpt_oss_limit = static_cast<float>(*v);
             }
         }
     }

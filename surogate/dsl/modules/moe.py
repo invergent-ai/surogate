@@ -21,7 +21,7 @@ from ..tensor_type import Tensor
 from ..decorators import module, forward, Param
 from ..graph_builder import graph
 from ..dim import Dim, B, T
-from ..hf import stack_experts
+from ..hf import stack_experts, transform
 
 
 @module
@@ -136,6 +136,64 @@ class MoEExpertsSimple:
     # Expert weights (batched format)
     experts_gate_up = Param(Tensor["E", "M", "C"], offload_group="moe_experts")
     experts_down = Param(Tensor["E", "C", "M"], offload_group="moe_experts")
+
+    @forward
+    def forward(self, x: Tensor["B * T", "C"]) -> Tensor["B * T", "C"]:
+        """Placeholder forward - actual MoE computation is in block definitions."""
+        with graph() as g:
+            return x
+
+
+@module
+class GptOssMoE:
+    """GPT-OSS MoE router + experts with per-expert biases.
+
+    HF weight layout:
+        {prefix}.router.weight          -> router_weight
+        {prefix}.router.bias            -> router_bias
+        {prefix}.experts.gate_up_proj   -> experts_gate_up (transpose)
+        {prefix}.experts.gate_up_proj_bias -> experts_gate_up_bias
+        {prefix}.experts.down_proj      -> experts_down (transpose)
+        {prefix}.experts.down_proj_bias -> experts_down_bias
+    """
+
+    _hf_mapping_defaults_ = {
+        "router_weight": "{prefix}.router.weight",
+        "router_bias": "{prefix}.router.bias",
+        "experts_gate_up": transform("{prefix}.experts.gate_up_proj", fn="transpose"),
+        "experts_gate_up_bias": "{prefix}.experts.gate_up_proj_bias",
+        "experts_down": transform("{prefix}.experts.down_proj", fn="transpose"),
+        "experts_down_bias": "{prefix}.experts.down_proj_bias",
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_experts: int,
+        num_experts_per_tok: int = 4,
+    ):
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+
+        # Typed dimensions
+        self.C = Dim("C")
+        self.M = Dim("M")
+        self.E = Dim("E")
+        self.K = Dim("K")
+        self.MUp = 2 * self.M  # interleaved gate + up
+
+    # Router weight + bias
+    router_weight = Param(Tensor["E", "C"])
+    router_bias = Param(Tensor["E"])
+
+    # Expert weights/biases (batched format)
+    experts_gate_up = Param(Tensor["E", "MUp", "C"], offload_group="moe_experts")
+    experts_gate_up_bias = Param(Tensor["E", "MUp"], offload_group="moe_experts")
+    experts_down = Param(Tensor["E", "C", "M"], offload_group="moe_experts")
+    experts_down_bias = Param(Tensor["E", "C"], offload_group="moe_experts")
 
     @forward
     def forward(self, x: Tensor["B * T", "C"]) -> Tensor["B * T", "C"]:

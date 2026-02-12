@@ -85,7 +85,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     }
 
     auto& state = *mAdamW8BitState;
-    constexpr size_t BLOCK_SIZE = 2048;  // Must match ADAMW8BIT_BLOCK_SIZE in adamw8bit.cu
+    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;  // Must match optimizer block size
     size_t state_offset = 0;
 
     // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
@@ -236,7 +236,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
     }
 
     auto& state = *mAdamW8BitState;
-    constexpr size_t BLOCK_SIZE = 2048;  // Must match ADAMW8BIT_BLOCK_SIZE in adamw8bit.cu
+    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;  // Must match optimizer block size
     size_t state_offset = 0;
 
     // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
@@ -465,7 +465,7 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpy(state.quantiles2.Data, h_q2.data(), h_q2.size() * sizeof(float), cudaMemcpyHostToDevice));
     }
 
-    constexpr size_t BLOCK_SIZE = 2048;
+    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
     size_t total_params = 0;
     size_t state_elems = 0;
     const bool use_weight_manager = (mWeightManager != nullptr);

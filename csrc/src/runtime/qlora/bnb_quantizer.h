@@ -29,6 +29,7 @@ namespace qlora {
 class BnBQuantizer final : public IQuantizer {
 public:
     explicit BnBQuantizer(const QuantizerConfig& config);
+    ~BnBQuantizer() override;
 
     void quantize(
         const Tensor& input,
@@ -52,10 +53,14 @@ public:
     [[nodiscard]] size_t estimate_storage_bytes(int M, int K) const override;
 
 private:
+    void ensure_absmax_buffer(long num_blocks);
+
     int mBlockSize;
     bool mDoubleQuant;
     int mDoubleQuantGroupSize;
     cudaDeviceProp mDeviceProps;
+    float* mAbsmaxBuffer = nullptr;
+    long mAbsmaxCapacity = 0;
 };
 
 }  // namespace qlora

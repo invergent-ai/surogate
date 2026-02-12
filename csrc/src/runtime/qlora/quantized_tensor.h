@@ -4,8 +4,8 @@
 // QuantizedTensor: Architecture-agnostic quantized tensor storage.
 //
 // This struct stores a quantized tensor regardless of which quantization
-// format (NF4, FP8, FP4) is used. The IQuantizer interface produces and
-// consumes these, while GenericWeightManager stores them.
+// format (NF4, FP8, FP4, MXFP4) is used. The IQuantizer interface produces
+// and consumes these, while GenericWeightManager stores them.
 
 #ifndef SUROGATE_SRC_RUNTIME_QLORA_QUANTIZED_TENSOR_H
 #define SUROGATE_SRC_RUNTIME_QLORA_QUANTIZED_TENSOR_H
@@ -24,6 +24,7 @@ enum class QuantFormat : int {
     BNB_NF4,      // bitsandbytes NF4 with optional double quantization
     FP8_PER_BLOCK,// Per-block FP8 E4M3 with block scales
     FP4_BLOCK_2D, // Two-level block scaling FP4 E2M1 (Blackwell)
+    HF_MXFP4,    // HF pre-quantized MXFP4: packed FP4 + E8M0 shared exponents per 32 elements
 };
 
 /// Storage for a single quantized tensor.
@@ -51,18 +52,21 @@ struct QuantizedTensor {
     /// - BNB_NF4: packed 4-bit data (2 values per byte), BYTE dtype
     /// - FP8_PER_BLOCK: FP8 E4M3 data, FP8_E4M3 dtype
     /// - FP4_BLOCK_2D: packed FP4 data, BYTE dtype
+    /// - HF_MXFP4: packed FP4 data (2 values per byte), BYTE dtype
     Tensor data;
 
     /// Per-block scale factors.
     /// - BNB_NF4: absmax per block (FP32 or BYTE for double-quant)
     /// - FP8_PER_BLOCK: per-block FP32 scales
     /// - FP4_BLOCK_2D: per-block FP8 E4M3 scales (row-wise)
+    /// - HF_MXFP4: E8M0 shared exponents per 32-element block, BYTE dtype
     Tensor scales;
 
     /// Additional metadata (format-specific).
     /// - BNB_NF4 with double quantization: absmax_scale (FP32) and absmax_offset (FP32)
     /// - FP4_BLOCK_2D: column-wise FP8 scales
     /// - FP8_PER_BLOCK: unused
+    /// - HF_MXFP4: unused
     Tensor meta;
     Tensor meta2;
 

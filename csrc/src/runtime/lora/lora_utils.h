@@ -34,6 +34,7 @@ inline std::vector<std::string> targets_to_peft_names(const ModularLoRAConfig& c
     if (cfg.applies_to_v()) out.emplace_back("v_proj");
     if (cfg.applies_to_o()) out.emplace_back("o_proj");
     if (cfg.applies_to_gate()) out.emplace_back("gate_proj");
+    if (cfg.applies_to_gate_up()) out.emplace_back("gate_up_proj");
     if (cfg.applies_to_up()) out.emplace_back("up_proj");
     if (cfg.applies_to_down()) out.emplace_back("down_proj");
     // MoE router gate (when train_router is enabled)

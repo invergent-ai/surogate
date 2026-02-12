@@ -53,11 +53,13 @@ struct LoRAAttentionWeights {
 template<typename TTensor>
 struct LoRAMLPWeights {
     std::optional<LoRALayerWeights<TTensor>> gate;  ///< Gate projection
+    std::optional<LoRALayerWeights<TTensor>> gate_up;  ///< Fused gate+up projection
     std::optional<LoRALayerWeights<TTensor>> up;    ///< Up projection
     std::optional<LoRALayerWeights<TTensor>> down;  ///< Down projection
 
     [[nodiscard]] bool has_any() const {
         return (gate.has_value() && gate->has_value()) ||
+               (gate_up.has_value() && gate_up->has_value()) ||
                (up.has_value() && up->has_value()) ||
                (down.has_value() && down->has_value());
     }
@@ -72,11 +74,13 @@ struct LoRAMLPWeights {
 template<typename TTensor>
 struct LoRAExpertWeights {
     std::optional<LoRALayerWeights<TTensor>> gate;  ///< Gate projection LoRA
+    std::optional<LoRALayerWeights<TTensor>> gate_up;  ///< Fused gate+up projection LoRA
     std::optional<LoRALayerWeights<TTensor>> up;    ///< Up projection LoRA
     std::optional<LoRALayerWeights<TTensor>> down;  ///< Down projection LoRA
 
     [[nodiscard]] bool has_any() const {
         return (gate.has_value() && gate->has_value()) ||
+               (gate_up.has_value() && gate_up->has_value()) ||
                (up.has_value() && up->has_value()) ||
                (down.has_value() && down->has_value());
     }
@@ -104,11 +108,13 @@ struct LoRAGroupedLayerWeights {
 template<typename TTensor>
 struct LoRAGroupedExpertWeights {
     std::optional<LoRAGroupedLayerWeights<TTensor>> gate;  ///< Gate projection LoRA
+    std::optional<LoRAGroupedLayerWeights<TTensor>> gate_up;  ///< Fused gate+up projection LoRA
     std::optional<LoRAGroupedLayerWeights<TTensor>> up;    ///< Up projection LoRA
     std::optional<LoRAGroupedLayerWeights<TTensor>> down;  ///< Down projection LoRA
 
     [[nodiscard]] bool has_any() const {
         return (gate.has_value() && gate->has_value()) ||
+               (gate_up.has_value() && gate_up->has_value()) ||
                (up.has_value() && up->has_value()) ||
                (down.has_value() && down->has_value());
     }

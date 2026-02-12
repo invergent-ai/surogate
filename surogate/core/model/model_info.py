@@ -19,13 +19,14 @@ class ModelInfo:
     model_dir: str
     torch_dtype: torch.dtype
     max_model_len: int
-    quant_method: Literal['gptq', 'awq', 'bnb', None]
+    quant_method: Literal['gptq', 'awq', 'bnb', 'prequant_fp8', 'prequant_nvfp4', 'prequant_mxfp4', None]
     quant_bits: int
 
     # extra
     rope_scaling: Optional[Dict[str, Any]] = None
     is_moe_model: bool = False
     config: Optional[PretrainedConfig] = None
+    quant_info: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         self.model_name = ModelInfo.get_model_name(self.model_dir)
@@ -55,6 +56,9 @@ class ModelInfo:
             HfConfigFactory.set_config_attr(config, 'quantization_config', quantization_config)
 
         quant_info = HfConfigFactory.get_quant_info(config) or {}
+        # Fallback: some ModelOpt models store quant info in hf_quant_config.json
+        if not quant_info:
+            quant_info = HfConfigFactory.get_quant_info_from_hf_quant_config(model_dir) or {}
         torch_dtype = HfConfigFactory.get_torch_dtype(config, quant_info)
         max_model_len = HfConfigFactory.get_max_model_len(config)
         rope_scaling = HfConfigFactory.get_config_attr(config, 'rope_scaling')
@@ -86,6 +90,7 @@ class ModelInfo:
             quant_info.get('quant_bits'),
             rope_scaling=rope_scaling,
             is_moe_model=is_moe_model,
+            quant_info=quant_info or None,
         )
 
 def get_matched_model_types(architectures: Optional[List[str]]) -> List[str]:

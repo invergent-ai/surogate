@@ -7,6 +7,7 @@ class LLMArchitecture:
     qwen = 'qwen'
     llama = 'llama'
     nemotron_nano = 'nemotron_nano'
+    gpt_oss = 'gpt_oss'
 
 class MLLMArchitecture:
     qwen2_vl = 'qwen2_vl'

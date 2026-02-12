@@ -113,8 +113,13 @@ void convert_tensor_dispatch(std::byte* target, const std::byte* source, std::si
         convert_dtype(reinterpret_cast<nv_bfloat16*>(target), reinterpret_cast<const float*>(source), size);
     } else if(t_type == ETensorDType::BF16 && s_type == ETensorDType::FP16) {
         convert_dtype(reinterpret_cast<nv_bfloat16*>(target), reinterpret_cast<const half*>(source), size);
+    } else if ((t_type == ETensorDType::BYTE || s_type == ETensorDType::BYTE) &&
+               get_dtype_size(t_type) == get_dtype_size(s_type)) {
+        // BYTE is a raw storage type — identity copy when partner has same byte width.
+        // Handles FP4_E2M1 <-> BYTE, FP8_E4M3 <-> BYTE, INT8 <-> BYTE, etc.
+        CUDA_CHECK(cudaMemcpyAsync(target, source, size * get_dtype_size(t_type), cudaMemcpyDefault));
     } else {
-        throw std::runtime_error("Unsupported conversion");
+        throw std::runtime_error(fmt::format("Unsupported conversion: {} -> {}", dtype_to_str(s_type), dtype_to_str(t_type)));
     }
 }
 

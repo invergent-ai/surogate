@@ -37,6 +37,7 @@ public:
                 int B, int T,
                 const std::shared_ptr<TensorAllocator>& allocator,
                 bool lora_only_mode = false,
+                bool prequantized = false,
                 std::size_t stack_bytes = kDefaultStackBytes,
                 bool allocate_stack = true,
                 const ActivationLayoutIR* activation_layout = nullptr);
@@ -75,6 +76,7 @@ public:
     bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
     bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Enabled; }
     bool is_lora_only_mode() const { return mLoraOnlyMode; }
+    bool is_prequantized() const { return mPrequantized; }
 
     /// @brief Get the recompute level
     RecomputeLevel recompute_level() const { return mRecomputeLevel; }
@@ -169,6 +171,7 @@ private:
     bool mStackSimulate = false;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
+    bool mPrequantized = false;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;

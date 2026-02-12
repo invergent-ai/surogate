@@ -301,7 +301,7 @@ inline void backward_lora_router(
 /**
  * @brief Apply LoRA contributions for a single MoE expert
  *
- * This function applies LoRA to an expert's gate_up and down projections.
+ * This function applies LoRA to an expert's gate_up (fused) or gate/up and down projections.
  * It's called during the MoE expert forward pass for each expert that has
  * tokens routed to it.
  *
@@ -350,23 +350,32 @@ inline void apply_expert_lora(
         return dropout_base_seed + expert_idx * 10000 + proj_type * 1000;
     };
 
-    // Apply LoRA to gate projection (first half of gate_up)
-    if (expert_lora.gate.has_value() && expert_lora.gate->has_value()) {
-        apply_lora_contribution(gate_up, D, expert_input, *expert_lora.gate,
+    // Apply LoRA to fused gate_up (preferred if present)
+    if (expert_lora.gate_up.has_value() && expert_lora.gate_up->has_value()) {
+        apply_lora_contribution(gate_up, 0, expert_input, *expert_lora.gate_up,
                                 intermediate, slice_buffer,
-                                scaling, dropout_prob, get_dropout_seed(0), is_training,
-                                N, C, D, rank,
+                                scaling, dropout_prob, get_dropout_seed(3), is_training,
+                                N, C, 2 * D, rank,
                                 handle, workspace, stream);
-    }
+    } else {
+        // Apply LoRA to gate projection (first half of gate_up)
+        if (expert_lora.gate.has_value() && expert_lora.gate->has_value()) {
+            apply_lora_contribution(gate_up, D, expert_input, *expert_lora.gate,
+                                    intermediate, slice_buffer,
+                                    scaling, dropout_prob, get_dropout_seed(0), is_training,
+                                    N, C, D, rank,
+                                    handle, workspace, stream);
+        }
 
-    // Apply LoRA to up projection (second half of gate_up)
-    // Note: In the fused gate_up layout, up is at offset 0 and gate is at offset D
-    if (expert_lora.up.has_value() && expert_lora.up->has_value()) {
-        apply_lora_contribution(gate_up, 0, expert_input, *expert_lora.up,
-                                intermediate, slice_buffer,
-                                scaling, dropout_prob, get_dropout_seed(1), is_training,
-                                N, C, D, rank,
-                                handle, workspace, stream);
+        // Apply LoRA to up projection (second half of gate_up)
+        // Note: In the fused gate_up layout, up is at offset 0 and gate is at offset D
+        if (expert_lora.up.has_value() && expert_lora.up->has_value()) {
+            apply_lora_contribution(gate_up, 0, expert_input, *expert_lora.up,
+                                    intermediate, slice_buffer,
+                                    scaling, dropout_prob, get_dropout_seed(1), is_training,
+                                    N, C, D, rank,
+                                    handle, workspace, stream);
+        }
     }
 
     // Apply LoRA to down projection
@@ -558,41 +567,59 @@ inline void backward_lora_expert(
             handle, workspace, stream);
     }
 
-    // Backward through gate projection LoRA (second half of gate_up at offset D)
-    // gate is at offset D in the fused gate_up tensor
-    if (expert_lora_weights.gate.has_value() && expert_lora_weights.gate->has_value() &&
-        expert_lora_grads.gate.has_value()) {
+    // Backward through fused gate_up LoRA (preferred if present)
+    if (expert_lora_weights.gate_up.has_value() && expert_lora_weights.gate_up->has_value() &&
+        expert_lora_grads.gate_up.has_value()) {
         backward_lora_layer(
-            expert_lora_grads.gate->A,
-            expert_lora_grads.gate->B,
+            expert_lora_grads.gate_up->A,
+            expert_lora_grads.gate_up->B,
             d_expert_input,
-            d_gate_up, D,  // gate is at offset D
+            d_gate_up, 0,  // fused gate_up uses full output
             expert_input,
-            expert_lora_weights.gate->A,
-            expert_lora_weights.gate->B,
+            expert_lora_weights.gate_up->A,
+            expert_lora_weights.gate_up->B,
             scaling,
-            dropout_prob, get_dropout_seed(0), is_training,  // proj_type=0 for gate
+            dropout_prob, get_dropout_seed(3), is_training,  // proj_type=3 for gate_up
             intermediate, slice_buffer,
-            N, C, D, rank, accumulate,
+            N, C, 2 * D, rank, accumulate,
             handle, workspace, stream);
-    }
+    } else {
+        // Backward through gate projection LoRA (second half of gate_up at offset D)
+        // gate is at offset D in the fused gate_up tensor
+        if (expert_lora_weights.gate.has_value() && expert_lora_weights.gate->has_value() &&
+            expert_lora_grads.gate.has_value()) {
+            backward_lora_layer(
+                expert_lora_grads.gate->A,
+                expert_lora_grads.gate->B,
+                d_expert_input,
+                d_gate_up, D,  // gate is at offset D
+                expert_input,
+                expert_lora_weights.gate->A,
+                expert_lora_weights.gate->B,
+                scaling,
+                dropout_prob, get_dropout_seed(0), is_training,  // proj_type=0 for gate
+                intermediate, slice_buffer,
+                N, C, D, rank, accumulate,
+                handle, workspace, stream);
+        }
 
-    // Backward through up projection LoRA (first half of gate_up at offset 0)
-    if (expert_lora_weights.up.has_value() && expert_lora_weights.up->has_value() &&
-        expert_lora_grads.up.has_value()) {
-        backward_lora_layer(
-            expert_lora_grads.up->A,
-            expert_lora_grads.up->B,
-            d_expert_input,
-            d_gate_up, 0,  // up is at offset 0
-            expert_input,
-            expert_lora_weights.up->A,
-            expert_lora_weights.up->B,
-            scaling,
-            dropout_prob, get_dropout_seed(1), is_training,  // proj_type=1 for up
-            intermediate, slice_buffer,
-            N, C, D, rank, accumulate,
-            handle, workspace, stream);
+        // Backward through up projection LoRA (first half of gate_up at offset 0)
+        if (expert_lora_weights.up.has_value() && expert_lora_weights.up->has_value() &&
+            expert_lora_grads.up.has_value()) {
+            backward_lora_layer(
+                expert_lora_grads.up->A,
+                expert_lora_grads.up->B,
+                d_expert_input,
+                d_gate_up, 0,  // up is at offset 0
+                expert_input,
+                expert_lora_weights.up->A,
+                expert_lora_weights.up->B,
+                scaling,
+                dropout_prob, get_dropout_seed(1), is_training,  // proj_type=1 for up
+                intermediate, slice_buffer,
+                N, C, D, rank, accumulate,
+                handle, workspace, stream);
+        }
     }
 }
 

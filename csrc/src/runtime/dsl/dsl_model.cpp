@@ -73,15 +73,17 @@ bool graph_has_kernel(const Module& module, std::string_view kernel) {
 
 bool is_qlora_param_name(std::string_view name, bool train_router) {
     const std::string_view clean = trim_optional(name);
+    // Always keep router weights full precision (do not quantize in QLoRA).
+    if (clean.find("router") != std::string_view::npos) {
+        return false;
+    }
     int layer_idx = -1;
     std::string field;
     if (internal::parse_block_param(clean, layer_idx, field)) {
         if (!field.empty() && field.back() == '?') {
             field.pop_back();
         }
-        if (train_router && field.find("router") != std::string::npos) {
-            return false;
-        }
+        (void)train_router;
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" ||
             field == "mlp_up_weight" || field == "mlp_down_weight" ||
             field == "up_weight" || field == "down_weight" ||
@@ -128,6 +130,8 @@ struct DslConfigView {
     std::optional<double> eps;
     std::optional<bool> use_qkv_bias;
     std::optional<bool> use_qk_norm;
+    std::optional<long> sliding_window;
+    std::optional<std::vector<int>> layer_types;
     std::optional<long> num_experts;
     std::optional<long> num_experts_per_tok;
     std::optional<long> moe_intermediate_size;
@@ -178,6 +182,30 @@ std::optional<std::string> get_string_attr(const AttrMap& map, const char* key) 
     return std::nullopt;
 }
 
+std::optional<std::vector<int>> get_layer_types_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (const auto* list = internal::as_list(*value)) {
+            std::vector<int> out;
+            out.reserve(list->size());
+            for (const auto& item : *list) {
+                if (auto v = internal::as_int(item)) {
+                    out.push_back((*v != 0) ? 1 : 0);
+                    continue;
+                }
+                auto s = internal::as_string(item);
+                if (!s) {
+                    out.push_back(0);
+                    continue;
+                }
+                const bool sliding = (s->find("sliding") != std::string::npos);
+                out.push_back(sliding ? 1 : 0);
+            }
+            return out;
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<modules::ActivationType> parse_activation_type(std::string_view name) {
     std::string clean;
     clean.reserve(name.size());
@@ -210,6 +238,8 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.eps = get_double_attr(cfg, "eps");
     view.use_qkv_bias = get_bool_attr(cfg, "use_qkv_bias");
     view.use_qk_norm = get_bool_attr(cfg, "use_qk_norm");
+    view.sliding_window = get_long_attr(cfg, "sliding_window");
+    view.layer_types = get_layer_types_attr(cfg, "layer_types");
     view.num_experts = get_long_attr(cfg, "num_experts");
     view.num_experts_per_tok = get_long_attr(cfg, "num_experts_per_tok");
     view.moe_intermediate_size = get_long_attr(cfg, "moe_intermediate_size");
@@ -269,6 +299,9 @@ std::optional<PretrainedConfig::ArchitectureId> arch_from_string(std::string_vie
     }
     if (lower.find("nemotron") != std::string::npos) {
         return PretrainedConfig::NEMOTRON_H;
+    }
+    if (lower.find("gpt_oss") != std::string::npos || lower.find("gpt-oss") != std::string::npos) {
+        return PretrainedConfig::GPT_OSS;
     }
     if (lower.find("llama") != std::string::npos) {
         return PretrainedConfig::LLAMA;
@@ -340,9 +373,15 @@ modules::ModelConfig build_model_config(const Module& module,
     cfg.TiedWordEmbeddings = base.TiedWordEmbeddings;
     cfg.UseQKVBias = base.UseQKVBias;
     cfg.UseQKNorm = base.UseQKNorm;
+    cfg.SlidingWindow = base.SlidingWindow;
+    cfg.LayerTypes = base.LayerTypes;
     cfg.UseVisualInputs = base.UseVisualInputs;
     cfg.DeepstackVisualLayers = base.DeepstackVisualLayers;
     cfg.DType = base.DType;
+    cfg.use_sliding_window = (base.SlidingWindow > 0);
+    if (base.SlidingWindow > 0) {
+        cfg.sliding_window_size = base.SlidingWindow;
+    }
 
     // Override with DSL-provided values when available
     if (view.d_model) cfg.HiddenSize = static_cast<int>(*view.d_model);
@@ -355,6 +394,13 @@ modules::ModelConfig build_model_config(const Module& module,
     if (view.vocab_size) cfg.VocabSize = static_cast<int>(*view.vocab_size);
     if (view.eps) cfg.RmsNormEps = static_cast<float>(*view.eps);
     if (view.use_qkv_bias) cfg.UseQKVBias = *view.use_qkv_bias;
+    if (view.sliding_window) {
+        cfg.use_sliding_window = (*view.sliding_window > 0);
+        cfg.sliding_window_size = static_cast<int>(*view.sliding_window);
+    }
+    if (view.layer_types) {
+        cfg.LayerTypes = *view.layer_types;
+    }
 
     cfg.UseQKNorm = runtime.use_qk_norm;
     cfg.use_qk_norm = runtime.use_qk_norm;
@@ -489,6 +535,15 @@ qlora::QuantizerConfig build_quantizer_config(
     } else if (qlora_cfg.is_fp4()) {
         qcfg.format = qlora::QuantFormat::FP4_BLOCK_2D;
         qcfg.block_size = qlora_cfg.block_size() > 0 ? qlora_cfg.block_size() : 16;
+    } else if (qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantFP8) {
+        qcfg.format = qlora::QuantFormat::FP8_PER_BLOCK;
+        qcfg.block_size = 128;
+    } else if (qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantNVFP4) {
+        qcfg.format = qlora::QuantFormat::FP4_BLOCK_2D;
+        qcfg.block_size = 16;
+    } else if (qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantMXFP4) {
+        qcfg.format = qlora::QuantFormat::HF_MXFP4;
+        qcfg.block_size = 32;
     } else {
         qcfg.format = qlora::QuantFormat::NONE;
     }
@@ -570,6 +625,38 @@ std::vector<qlora::WeightLoadSpec> build_weight_specs(
     return specs;
 }
 
+int count_router_fp_weights(const Module& module) {
+    if (!module.forward.has_value()) {
+        return 0;
+    }
+    ShapeEnv env = make_shape_env(module, /*B=*/1, /*T=*/1);
+    augment_shape_env(env, module.config);
+
+    int count = 0;
+    for (const auto& kv : module.forward->params) {
+        const std::string& name = kv.first;
+        const TensorInfo& info = kv.second;
+        if (name.find("router") == std::string::npos) {
+            continue;
+        }
+        if (!info.quantizable) {
+            continue;
+        }
+        if (info.shape.empty()) {
+            continue;
+        }
+        auto resolved = resolve_shape(info.shape, env);
+        if (resolved.size() < 2) {
+            continue;
+        }
+        if (resolved[1] <= 0) {
+            continue;
+        }
+        ++count;
+    }
+    return count;
+}
+
 }  // namespace
 
 namespace internal {
@@ -595,6 +682,28 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     config.num_shards = num_shards;
     config.num_experts = qlora_cfg.num_experts;
     config.moe_intermediate_size = qlora_cfg.moe_intermediate_size;
+
+    // Configure pre-quantized loading if applicable
+    if (qlora_cfg.is_prequantized()) {
+        config.prequantized = true;
+        config.modules_to_not_convert = qlora_cfg.modules_to_not_convert;
+
+        switch (qlora_cfg.strategy) {
+            case modules::QLoRAQuantStrategy::PrequantFP8:
+                config.scale_suffix = "_scale_inv";
+                break;
+            case modules::QLoRAQuantStrategy::PrequantNVFP4:
+                config.scale_suffix = "_scale";
+                config.scale2_suffix = "_scale_2";
+                break;
+            case modules::QLoRAQuantStrategy::PrequantMXFP4:
+                config.data_suffix = "_blocks";
+                config.scale_suffix = "_scales";
+                break;
+            default:
+                break;
+        }
+    }
 
     // Configure weight manager
     config.weight_manager_config.device_id = config.quantizer_config.device_id;
@@ -635,14 +744,26 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
         config.weight_manager_config.max_dequant_cache_size = 4;
     }
 
+    const char* format_label =
+        qlora_cfg.is_bnb() ? "BnB-NF4" :
+        qlora_cfg.is_fp8() ? "FP8" :
+        qlora_cfg.is_fp4() ? "FP4" :
+        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantFP8 ? "Prequant-FP8" :
+        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantNVFP4 ? "Prequant-NVFP4" :
+        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantMXFP4 ? "Prequant-MXFP4" :
+        "none";
+
     fprintf(stderr, "[QLoRA] Generic provider: %d weight specs (%d quantizable), "
-                    "format=%s, shard=%d/%d\n",
+                    "format=%s, shard=%d/%d%s\n",
             static_cast<int>(config.weight_specs.size()),
             num_quantizable,
-            qlora_cfg.is_bnb() ? "BnB-NF4" :
-            qlora_cfg.is_fp8() ? "FP8" :
-            qlora_cfg.is_fp4() ? "FP4" : "none",
-            shard_idx, num_shards);
+            format_label,
+            shard_idx, num_shards,
+            config.prequantized ? " [pre-quantized]" : "");
+    const int router_fp = count_router_fp_weights(module);
+    if (router_fp > 0) {
+        fprintf(stderr, "[QLoRA] Router weights kept full-precision (excluded from QLoRA): %d\n", router_fp);
+    }
 
     return std::make_unique<qlora::GenericQLoRAProvider>(
         std::move(config), pt_config, allocator);
@@ -823,6 +944,22 @@ std::size_t DslModel::qlora_quantized_weights_bytes() const {
 
 float DslModel::qlora_memory_savings_ratio() const {
     return mQLoRAProvider ? mQLoRAProvider->memory_savings_ratio() : 1.0f;
+}
+
+std::size_t DslModel::saved_buffers_total_bytes() const {
+    return mExecutor ? mExecutor->saved_buffers_total_bytes() : 0;
+}
+
+int DslModel::saved_buffers_count() const {
+    return mExecutor ? mExecutor->saved_buffers_count() : 0;
+}
+
+const std::unordered_map<std::string, size_t>& DslModel::saved_buffers_sizes() const {
+    if (mExecutor) {
+        return mExecutor->saved_buffers_sizes();
+    }
+    static const std::unordered_map<std::string, size_t> empty;
+    return empty;
 }
 
 void DslModel::validate_ir() {

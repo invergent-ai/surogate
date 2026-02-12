@@ -407,12 +407,12 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         Tensor position_ids = ctx.Model->get_position_ids_buffer();
         Tensor targets = ctx.Model->get_target_buffer();
         ctx.Model->forward(inputs, position_ids, *ctx.Communicator, micro_idx);
-        try {
-            ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
-        } catch (const std::exception& e) {
-            std::cerr << "backward threw: " << e.what() << std::endl;
-            throw;
-        }
+                    try {
+                ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
+            } catch (const std::exception& e) {
+                std::cerr << "backward threw: " << e.what() << std::endl;
+                throw;
+                    }
     });
     ++mTrainMicroStep;
 }
@@ -749,6 +749,34 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
     });
 
+    // Post-step memory breakdown (step 1 only, after optimizer states are allocated)
+    if (step == 1 && mOptions.DebugMemoryBreakdown) {
+        auto& ctx0 = mContexts.at(0);
+        auto& rs0 = ctx0.Model->get_run_state();
+        if (rs0.Allocator) {
+            auto stats = rs0.Allocator->get_allocation_segments();
+            auto stack_stats = rs0.Stack.get_allocation_stats();
+            MemoryBreakdownContext breakdown_ctx;
+            breakdown_ctx.enabled = true;
+            breakdown_ctx.allocator = rs0.Allocator.get();
+            breakdown_ctx.hidden_size = mConfig->HiddenSize;
+            breakdown_ctx.intermediate_size = mConfig->IntermediateSize;
+            breakdown_ctx.num_layers = mConfig->NumLayers;
+            breakdown_ctx.batch_size = B;
+            breakdown_ctx.seq_length = T;
+
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx0.Model.get());
+            if (dsl_model && dsl_model->qlora_enabled()) {
+                breakdown_ctx.qlora_quantized_bytes = dsl_model->qlora_quantized_weights_bytes();
+                breakdown_ctx.qlora_savings_ratio = dsl_model->qlora_memory_savings_ratio();
+            }
+
+            fprintf(stderr, "\n[Post-Step-0 Memory Breakdown]\n");
+            TrainingRunLogger logger("", 0, TrainingRunLogger::VERBOSE);
+            logger.log_allocator(stats, stack_stats, breakdown_ctx);
+        }
+    }
+
     auto& ctx = mContexts.at(0);
     float step_loss = ctx.Model->get_loss();
     float step_norm = ctx.Model->get_norm();
@@ -897,6 +925,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
                 else if (name == "v_proj") mod_lora.targets.insert(modules::LoRATarget::V_PROJ);
                 else if (name == "o_proj") mod_lora.targets.insert(modules::LoRATarget::O_PROJ);
                 else if (name == "gate_proj") mod_lora.targets.insert(modules::LoRATarget::GATE_PROJ);
+                else if (name == "gate_up_proj") mod_lora.targets.insert(modules::LoRATarget::GATE_UP_PROJ);
                 else if (name == "up_proj") mod_lora.targets.insert(modules::LoRATarget::UP_PROJ);
                 else if (name == "down_proj") mod_lora.targets.insert(modules::LoRATarget::DOWN_PROJ);
             }
@@ -1126,6 +1155,7 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                         expert_prefix = fmt::format("{}.mlp.experts", prefix);
                     }
                     add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                    add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
                     add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
                     add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
                 } else {
@@ -1138,6 +1168,7 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                         expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
                     }
                     add_layer(expert_prefix + ".gate_proj", expert.gate);
+                    add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
                     add_layer(expert_prefix + ".up_proj", expert.up);
                     add_layer(expert_prefix + ".down_proj", expert.down);
                 }
@@ -1156,6 +1187,21 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
+    }, gpu_id);
+    return result;
+}
+
+int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {
+    int result = 0;
+    run_work([&result](sThreadContext& ctx) {
+        auto& rs = ctx.Model->get_run_state();
+        if (!rs.ValidTokenCount.Data) {
+            result = 0;
+            return;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(&result, rs.ValidTokenCount.Data, sizeof(int),
+                                   cudaMemcpyDeviceToHost, rs.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
     }, gpu_id);
     return result;
 }

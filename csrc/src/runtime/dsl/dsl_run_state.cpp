@@ -38,6 +38,13 @@ int resolve_mlp_up_factor(const PretrainedConfig& cfg) {
     return 2;
 }
 
+bool is_hybrid_architecture(const PretrainedConfig& cfg) {
+    if (auto* model_cfg = dynamic_cast<const modules::ModelConfig*>(&cfg)) {
+        return model_cfg->architecture == modules::ArchitectureType::Hybrid;
+    }
+    return false;
+}
+
 constexpr double kPi = 3.14159265358979323846;
 
 struct RopeInvFreq {
@@ -278,6 +285,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          int B, int T,
                          const std::shared_ptr<TensorAllocator>& allocator,
                          bool lora_only_mode,
+                         bool prequantized,
                          std::size_t stack_bytes,
                          bool allocate_stack,
                          const ActivationLayoutIR* activation_layout)
@@ -286,6 +294,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
       mRuntimeConfig(runtime_config),
       mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
+      mPrequantized(prequantized),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
     if (!mAllocator) {
@@ -681,11 +690,17 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
         }
         mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
-        mSharedDAttOut = mAllocator->allocate(dtype, "d_att_out_shared", kind, {B, T, C});
+        if (is_hybrid_architecture(cfg)) {
+            mSharedDAttOut = mAllocator->allocate(dtype, "d_att_out_shared", kind, {B, T, C});
+        } else {
+            mSharedDAttOut = mSharedDResAtt;
+        }
         mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
         mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
         mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
     }
+
+    const bool hybrid = is_hybrid_architecture(cfg);
 
     mSimplifiedGradients.resize(cfg.NumLayers);
     for (int i = 0; i < cfg.NumLayers; ++i) {
@@ -695,7 +710,10 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         g.d_res_ffn = share_res_ffn ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
                                     : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
         g.d_res_att = share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_att_out = share_grads ? mSharedDAttOut : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C});
+        // In standard transformers res_att = x + att_out, so the gradients are equal.
+        // Only hybrid architectures (Nemotron-H) need separate storage.
+        g.d_att_out = hybrid ? (share_grads ? mSharedDAttOut : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
+                             : g.d_res_att;
         g.d_ln2 = share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
         if (large_bwd_temps_on_stack) {

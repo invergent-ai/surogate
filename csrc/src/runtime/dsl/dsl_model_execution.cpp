@@ -560,7 +560,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const ActivationLayoutIR* layout = mModule->activation_layout.has_value()
                                            ? &*mModule->activation_layout
                                            : nullptr;
-    mRunState = std::make_unique<DslRunState>(mModelConfig, mRuntimeConfig, mOptions, B, T, mAllocator, lora_enabled(),
+    mRunState = std::make_unique<DslRunState>(mModelConfig, mRuntimeConfig, mOptions, B, T, mAllocator,
+                                              lora_enabled(), mQLoRAConfig.is_prequantized(),
                                               dummy_stack_bytes, /*allocate_stack=*/false, layout);
     mRunState->WorldSize = comm.world_size();
     if (mParams) {

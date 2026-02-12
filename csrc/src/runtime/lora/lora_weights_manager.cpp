@@ -120,6 +120,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         master.moe.use_grouped = true;
         work.moe.use_grouped = true;
         const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
+                                   mConfig.lora_config.applies_to_gate_up() ||
                                    mConfig.lora_config.applies_to_up() ||
                                    mConfig.lora_config.applies_to_down();
         if (has_mlp_lora) {
@@ -181,6 +182,7 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(
 
     const int C = mConfig.hidden_size;
     const int D = mConfig.effective_moe_intermediate();
+    const int gate_up_out = 2 * D;
     const int num_experts = mConfig.num_experts;
     const int r = mConfig.lora_config.rank;
     const ETensorDType master_dtype = mConfig.lora_config.dtype;
@@ -201,6 +203,9 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(
     if (mConfig.lora_config.applies_to_gate()) {
         allocate_grouped(master_moe.gate, work_moe.gate, C, D, prefix + "_gate");
     }
+    if (mConfig.lora_config.applies_to_gate_up()) {
+        allocate_grouped(master_moe.gate_up, work_moe.gate_up, C, gate_up_out, prefix + "_gate_up");
+    }
     if (mConfig.lora_config.applies_to_up()) {
         allocate_grouped(master_moe.up, work_moe.up, C, D, prefix + "_up");
     }
@@ -216,12 +221,18 @@ void ModularLoRAWeightsManager::allocate_expert_weights(
 
     const int C = mConfig.hidden_size;
     const int D = mConfig.effective_moe_intermediate();
+    const int gate_up_out = 2 * D;
     const std::string prefix = fmt::format("lora_layer_{}_expert_{}", layer_idx, expert_idx);
 
     if (mConfig.lora_config.applies_to_gate()) {
         master_expert.gate.emplace();
         work_expert.gate.emplace();
         allocate_layer_weights(*master_expert.gate, *work_expert.gate, /*in=*/C, /*out=*/D, prefix + "_gate");
+    }
+    if (mConfig.lora_config.applies_to_gate_up()) {
+        master_expert.gate_up.emplace();
+        work_expert.gate_up.emplace();
+        allocate_layer_weights(*master_expert.gate_up, *work_expert.gate_up, /*in=*/C, /*out=*/gate_up_out, prefix + "_gate_up");
     }
     if (mConfig.lora_config.applies_to_up()) {
         master_expert.up.emplace();
@@ -279,22 +290,25 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
 
         // Dense MLP LoRA
         init_layer(b.mlp.gate, C, base + 4);
-        init_layer(b.mlp.up, C, base + 5);
-        init_layer(b.mlp.down, D, base + 6);
+        init_layer(b.mlp.gate_up, C, base + 5);
+        init_layer(b.mlp.up, C, base + 6);
+        init_layer(b.mlp.down, D, base + 7);
 
         // MoE expert LoRA
         if (b.moe.use_grouped) {
             init_grouped(b.moe.grouped.gate, C, base + 8);
-            init_grouped(b.moe.grouped.up, C, base + 9);
-            init_grouped(b.moe.grouped.down, D_moe, base + 10);
+            init_grouped(b.moe.grouped.gate_up, C, base + 9);
+            init_grouped(b.moe.grouped.up, C, base + 10);
+            init_grouped(b.moe.grouped.down, D_moe, base + 11);
         } else {
             for (int e = 0; e < (int)b.moe.experts.size(); ++e) {
                 auto& expert = b.moe.experts[e];
                 // Use separate subsequence space for each expert to avoid correlation
-                unsigned long long expert_base = base + 8ULL + static_cast<unsigned long long>(e) * 4ULL;
+                unsigned long long expert_base = base + 8ULL + static_cast<unsigned long long>(e) * 5ULL;
                 init_layer(expert.gate, C, expert_base + 0);
-                init_layer(expert.up, C, expert_base + 1);
-                init_layer(expert.down, D_moe, expert_base + 2);
+                init_layer(expert.gate_up, C, expert_base + 1);
+                init_layer(expert.up, C, expert_base + 2);
+                init_layer(expert.down, D_moe, expert_base + 3);
             }
         }
 
@@ -379,11 +393,13 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
     // MLP LoRA
     if (work.moe.use_grouped) {
         sync_grouped(work.moe.grouped.gate, master.moe.grouped.gate, "moe_gate_grouped");
+        sync_grouped(work.moe.grouped.gate_up, master.moe.grouped.gate_up, "moe_gate_up_grouped");
         sync_grouped(work.moe.grouped.up, master.moe.grouped.up, "moe_up_grouped");
         sync_grouped(work.moe.grouped.down, master.moe.grouped.down, "moe_down_grouped");
     } else {
         // Dense MLP LoRA
         sync_layer(work.mlp.gate, master.mlp.gate, "gate_proj");
+        sync_layer(work.mlp.gate_up, master.mlp.gate_up, "gate_up_proj");
         sync_layer(work.mlp.up, master.mlp.up, "up_proj");
         sync_layer(work.mlp.down, master.mlp.down, "down_proj");
 
@@ -393,6 +409,7 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
             auto& work_expert = work.moe.experts[e];
             std::string expert_prefix = fmt::format("expert_{}", e);
             sync_layer(work_expert.gate, master_expert.gate, (expert_prefix + "_gate").c_str());
+            sync_layer(work_expert.gate_up, master_expert.gate_up, (expert_prefix + "_gate_up").c_str());
             sync_layer(work_expert.up, master_expert.up, (expert_prefix + "_up").c_str());
             sync_layer(work_expert.down, master_expert.down, (expert_prefix + "_down").c_str());
         }
@@ -447,6 +464,7 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
         // Per-expert LoRA for MoE models
         std::size_t per_expert = 0;
         if (mConfig.lora_config.applies_to_gate()) per_expert += r * C + D_moe * r;
+        if (mConfig.lora_config.applies_to_gate_up()) per_expert += r * C + (2 * D_moe) * r;
         if (mConfig.lora_config.applies_to_up()) per_expert += r * C + D_moe * r;
         if (mConfig.lora_config.applies_to_down()) per_expert += r * D_moe + C * r;
         per_layer += per_expert * E;
@@ -464,6 +482,7 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
     } else {
         // Dense MLP LoRA
         if (mConfig.lora_config.applies_to_gate()) per_layer += r * C + D * r;
+        if (mConfig.lora_config.applies_to_gate_up()) per_layer += r * C + (2 * D) * r;
         if (mConfig.lora_config.applies_to_up()) per_layer += r * C + D * r;
         if (mConfig.lora_config.applies_to_down()) per_layer += r * D + C * r;
     }
@@ -500,6 +519,10 @@ void ModularLoRAWeightsManager::iterate_tensors(
         if (block.mlp.gate.has_value()) {
             callback(prefix + ".mlp.gate_proj.lora_A.weight", block.mlp.gate->A);
             callback(prefix + ".mlp.gate_proj.lora_B.weight", block.mlp.gate->B);
+        }
+        if (block.mlp.gate_up.has_value()) {
+            callback(prefix + ".mlp.gate_up_proj.lora_A.weight", block.mlp.gate_up->A);
+            callback(prefix + ".mlp.gate_up_proj.lora_B.weight", block.mlp.gate_up->B);
         }
         if (block.mlp.up.has_value()) {
             callback(prefix + ".mlp.up_proj.lora_A.weight", block.mlp.up->A);
@@ -540,6 +563,7 @@ void ModularLoRAWeightsManager::iterate_tensors(
             };
 
             export_grouped_layer(g.gate, "gate_proj");
+            export_grouped_layer(g.gate_up, "gate_up_proj");
             export_grouped_layer(g.up, "up_proj");
             export_grouped_layer(g.down, "down_proj");
         } else {
@@ -551,6 +575,10 @@ void ModularLoRAWeightsManager::iterate_tensors(
                 if (expert.gate.has_value()) {
                     callback(expert_prefix + ".gate_proj.lora_A.weight", expert.gate->A);
                     callback(expert_prefix + ".gate_proj.lora_B.weight", expert.gate->B);
+                }
+                if (expert.gate_up.has_value()) {
+                    callback(expert_prefix + ".gate_up_proj.lora_A.weight", expert.gate_up->A);
+                    callback(expert_prefix + ".gate_up_proj.lora_B.weight", expert.gate_up->B);
                 }
                 if (expert.up.has_value()) {
                     callback(expert_prefix + ".up_proj.lora_A.weight", expert.up->A);

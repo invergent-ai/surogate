@@ -222,6 +222,8 @@ private:
 
     /// Deferred TiedTo pairs: (destination_name, source_name).
     std::vector<std::pair<std::string, std::string>> mTiedParams;
+    Tensor mExpertScratch{};
+    std::size_t mExpertScratchBytes = 0;
 };
 
 }  // namespace dsl

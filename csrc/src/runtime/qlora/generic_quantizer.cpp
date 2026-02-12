@@ -10,6 +10,7 @@
 #include "runtime/qlora/bnb_quantizer.h"
 #include "runtime/qlora/fp8_quantizer.h"
 #include "runtime/qlora/fp4_quantizer.h"
+#include "runtime/qlora/mxfp4_quantizer.h"
 #include "kernels/kernels.h"
 
 namespace qlora {
@@ -45,6 +46,11 @@ std::unique_ptr<IQuantizer> create_quantizer(const QuantizerConfig& config) {
             }
             return std::make_unique<FP4Quantizer>(config);
         }
+
+        case QuantFormat::HF_MXFP4:
+            // MXFP4 is dequant-only (pre-quantized HF models). No SM requirement
+            // since dequant is a simple LUT + multiply, runs on any CUDA GPU.
+            return std::make_unique<MXFP4Quantizer>(config);
 
         case QuantFormat::NONE:
             return nullptr;

@@ -1,6 +1,8 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <vector>
+#include <cstdlib>
+#include <cmath>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
@@ -11,6 +13,16 @@ namespace dsl {
 
 void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     Tensor& probs = resolve_tensor(op.inputs[0]);
+
+    int layer_idx_any = op.attrs.layer_idx;
+    if (layer_idx_any < 0 && !op.inputs.empty()) {
+        std::string_view name = op.inputs[0].name;
+        if (name.rfind("saved.", 0) == 0) {
+            name.remove_prefix(6);
+        }
+        std::string field;
+        parse_block_param(name, layer_idx_any, field);
+    }
 
     // Optional correction bias (e.g., e_score_correction_bias from DeepSeek V3 / Nemotron-H routing)
     const float* correction_bias = nullptr;
@@ -23,7 +35,10 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     const int num_experts = static_cast<int>(probs.Sizes[1]);
     const int top_k = op.attrs.top_k;
     const bool normalize = op.attrs.normalize_weights;
+    const bool softmax = op.attrs.topk_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
+    const float rounding_scale = op.attrs.topk_rounding_scale;
+    const bool sort_by_index = op.attrs.topk_sort_by_index;
 
     // MoE topk outputs have dynamic shapes depending on num_tokens and top_k.
     // The compiled graph may have empty shapes for these intermediates, so we
@@ -40,13 +55,15 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                          weights.get<nv_bfloat16>(),
                          probs.get<nv_bfloat16>(),
                          correction_bias,
-                         num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+                         num_tokens, num_experts, top_k, normalize, softmax,
+                         sort_by_index, rounding_scale, mRunState.MainStream);
     } else {
         moe_topk_forward(indices.get<int>(),
                          weights.get<float>(),
                          probs.get<float>(),
                          correction_bias,
-                         num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+                         num_tokens, num_experts, top_k, normalize, softmax,
+                         sort_by_index, rounding_scale, mRunState.MainStream);
     }
 
     // Apply routed_scaling_factor to weights after top-k selection + normalization
@@ -75,6 +92,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
     const int num_experts = static_cast<int>(probs.Sizes[1]);
     const int top_k = op.attrs.top_k;
     const bool normalize = op.attrs.normalize_weights;
+    const bool softmax = op.attrs.topk_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
 
     // If scaling_factor != 1.0, scale d_routing_weights by the factor before backward.
@@ -127,7 +145,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           d_weights_f32.get<float>(),
                           probs_f32.get<float>(),
                           expert_indices.get<int>(),
-                          num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+                          num_tokens, num_experts, top_k, normalize, softmax, mRunState.MainStream);
 
         // Cast output back to BF16
         convert_dtype(d_probs.get<nv_bfloat16>(), d_probs_f32.get<float>(),
@@ -139,7 +157,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           d_weights_ptr->get<float>(),
                           probs.get<float>(),
                           expert_indices.get<int>(),
-                          num_tokens, num_experts, top_k, normalize, mRunState.MainStream);
+                          num_tokens, num_experts, top_k, normalize, softmax, mRunState.MainStream);
     }
 
     mTensorMap[op.outputs[0].name] = d_probs;

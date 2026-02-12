@@ -115,6 +115,7 @@ void ModularLoRAGradsManager::allocate_gradients() {
 
         if (layer_is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
+                                       mConfig.lora_config.applies_to_gate_up() ||
                                        mConfig.lora_config.applies_to_up() ||
                                        mConfig.lora_config.applies_to_down();
             if (has_mlp_lora) {
@@ -125,6 +126,10 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 if (mConfig.lora_config.applies_to_gate()) {
                     full.moe.grouped.gate = alloc_grouped_full(C, D_moe, exp_prefix + "_gate");
                     shard.moe.grouped.gate = alloc_grouped_shard(C, D_moe, exp_prefix + "_gate_shard");
+                }
+                if (mConfig.lora_config.applies_to_gate_up()) {
+                    full.moe.grouped.gate_up = alloc_grouped_full(C, 2 * D_moe, exp_prefix + "_gate_up");
+                    shard.moe.grouped.gate_up = alloc_grouped_shard(C, 2 * D_moe, exp_prefix + "_gate_up_shard");
                 }
                 if (mConfig.lora_config.applies_to_up()) {
                     full.moe.grouped.up = alloc_grouped_full(C, D_moe, exp_prefix + "_up");
@@ -193,17 +198,20 @@ void ModularLoRAGradsManager::start_micro_step(cudaStream_t stream, int micro_st
             zero_layer(block.attention.v);
             zero_layer(block.attention.o);
             zero_layer(block.mlp.gate);
+            zero_layer(block.mlp.gate_up);
             zero_layer(block.mlp.up);
             zero_layer(block.mlp.down);
 
             if (block.moe.use_grouped) {
                 zero_layer(block.moe.grouped.gate);
+                zero_layer(block.moe.grouped.gate_up);
                 zero_layer(block.moe.grouped.up);
                 zero_layer(block.moe.grouped.down);
             } else {
                 // MoE expert LoRA gradients
                 for (auto& expert : block.moe.experts) {
                     zero_layer(expert.gate);
+                    zero_layer(expert.gate_up);
                     zero_layer(expert.up);
                     zero_layer(expert.down);
                 }
@@ -268,17 +276,20 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         all_reduce_layer(block.attention.v);
         all_reduce_layer(block.attention.o);
         all_reduce_layer(block.mlp.gate);
+        all_reduce_layer(block.mlp.gate_up);
         all_reduce_layer(block.mlp.up);
         all_reduce_layer(block.mlp.down);
 
         if (block.moe.use_grouped) {
             all_reduce_grouped_layer(block.moe.grouped.gate);
+            all_reduce_grouped_layer(block.moe.grouped.gate_up);
             all_reduce_grouped_layer(block.moe.grouped.up);
             all_reduce_grouped_layer(block.moe.grouped.down);
         } else {
             // MoE expert LoRA gradients
             for (auto& expert : block.moe.experts) {
                 all_reduce_layer(expert.gate);
+                all_reduce_layer(expert.gate_up);
                 all_reduce_layer(expert.up);
                 all_reduce_layer(expert.down);
             }

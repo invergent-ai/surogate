@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include <cuda_bf16.h>
 
+#include "kernels/kernels.h"
 #include "utilities/utils.h"
 
 namespace qlora {
@@ -111,6 +112,12 @@ GenericWeightManager::~GenericWeightManager() {
                 entry.has_pool_buffer = false;
             }
         }
+    }
+
+    // Free the transpose temp buffer (allocated with raw cudaMalloc)
+    if (!mTransposeTemp.is_null()) {
+        cudaFree(mTransposeTemp.Data);
+        mTransposeTemp = Tensor{};
     }
 }
 
@@ -221,6 +228,66 @@ void GenericWeightManager::register_full_precision(
     entry.full_precision = tensor;
 
     mWeights.emplace(name, std::move(entry));
+}
+
+void GenericWeightManager::store_prequantized(
+    const std::string& name,
+    QuantizedTensor&& qt,
+    int offload_group,
+    const std::vector<long>& shape,
+    const std::string& transform_fn) {
+    if (mWeights.count(name)) {
+        throw std::runtime_error(
+            fmt::format("GenericWeightManager: weight '{}' already registered", name));
+    }
+
+    ManagedWeight entry;
+    entry.is_quantized_weight = true;
+    entry.offload_group = offload_group;
+    entry.M = qt.M;
+    entry.K = qt.K;
+    entry.dequant_shape = shape;
+
+    // Handle Transform("transpose"): the packed data is in HF (untransposed) order.
+    // After dequantization, we need a per-expert 2D transpose to match the DSL layout.
+    if (transform_fn == "transpose" && shape.size() >= 3) {
+        entry.needs_transpose = true;
+        entry.num_experts_for_transpose = static_cast<int>(shape[0]);
+        // DSL shape is [E, dim1, dim2]. HF stores [E, dim2, dim1] (inner dims swapped).
+        // hf_inner_rows = dim2, hf_inner_cols = dim1 (HF order before transpose).
+        entry.hf_inner_rows = static_cast<int>(shape[2]);
+        entry.hf_inner_cols = static_cast<int>(shape[1]);
+    } else if (transform_fn == "transpose" && shape.size() == 2) {
+        entry.needs_transpose = true;
+        entry.num_experts_for_transpose = 1;
+        entry.hf_inner_rows = static_cast<int>(shape[1]);
+        entry.hf_inner_cols = static_cast<int>(shape[0]);
+    }
+
+    // Move the pre-populated QuantizedTensor in
+    entry.quantized = std::move(qt);
+
+    // Allocate dequant buffer: pre-allocate in unlimited mode, defer in pooled mode.
+    if (!is_pooled()) {
+        std::vector<long> dequant_shape;
+        if (!shape.empty()) {
+            dequant_shape = shape;
+        } else {
+            dequant_shape = {static_cast<long>(entry.M), static_cast<long>(entry.K)};
+        }
+        entry.dequant_buffer = mAllocator->allocate(
+            ETensorDType::BF16,
+            fmt::format("{}.dequant", name).c_str(),
+            EAllocationType::ON_DEVICE,
+            dequant_shape);
+    }
+
+    // Insert into the map FIRST, then register with offload manager.
+    auto [it, inserted] = mWeights.emplace(name, std::move(entry));
+
+    if (offload_group >= 0 && mOffloadManager) {
+        mOffloadManager->register_tensor(&it->second.quantized, offload_group, name);
+    }
 }
 
 void GenericWeightManager::quantize_and_store(
@@ -532,8 +599,46 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry,
         mOffloadManager->load_group(entry.offload_group, stream);
     }
 
-    // Dequantize into the buffer
-    mQuantizer->dequantize(entry.quantized, entry.dequant_buffer, stream);
+    if (entry.needs_transpose) {
+        // The packed data is in HF (untransposed) order. Dequantize into a temp
+        // buffer, then transpose per-expert into the actual dequant_buffer.
+        const long total_elems = (long)entry.M * entry.K;
+        const long needed_bytes = total_elems * sizeof(nv_bfloat16);
+
+        // Lazily allocate (or grow) the shared transpose temp buffer
+        if (mTransposeTemp.is_null() || mTransposeTemp.bytes() < (size_t)needed_bytes) {
+            // Free previous allocation if growing
+            if (!mTransposeTemp.is_null()) {
+                CUDA_CHECK(cudaFree(mTransposeTemp.Data));
+            }
+            // Use raw CUDA allocation for the temporary buffer since
+            // TensorAllocator has no deallocation and we may need to grow.
+            void* ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&ptr, needed_bytes));
+            mTransposeTemp = Tensor::from_pointer(
+                static_cast<std::byte*>(ptr),
+                mConfig.device_id,
+                ETensorDType::BF16,
+                std::vector<long>{total_elems});
+        }
+
+        // Dequantize into temp buffer (data is in HF order)
+        mQuantizer->dequantize(entry.quantized, mTransposeTemp, stream);
+
+        // Batched transpose: [E, hf_rows, hf_cols] → [E, hf_cols, hf_rows]
+        // where hf_rows × hf_cols is the per-expert HF shape.
+        batched_transpose_2d_bf16(
+            entry.dequant_buffer.get<nv_bfloat16>(),
+            mTransposeTemp.get<nv_bfloat16>(),
+            entry.num_experts_for_transpose,
+            entry.hf_inner_rows,
+            entry.hf_inner_cols,
+            mDeviceProps,
+            stream);
+    } else {
+        // Standard path: dequantize directly into the buffer
+        mQuantizer->dequantize(entry.quantized, entry.dequant_buffer, stream);
+    }
 
     entry.dequant_valid = true;
     entry.dequant_step = mCurrentStep;

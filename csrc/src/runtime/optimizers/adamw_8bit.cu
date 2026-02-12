@@ -22,11 +22,12 @@ namespace optimizers {
 // Constants and configuration
 
 // Block size for 8-bit optimizer (number of elements processed per block)
-// This determines the granularity of quantization - each block has its own absmax
-constexpr int ADAMW8BIT_BLOCK_SIZE_INTERNAL = 2048;
+// This determines the granularity of quantization - each block has its own absmax.
+constexpr int ADAMW8BIT_BLOCK_SIZE_INTERNAL = ADAMW8BIT_BLOCK_SIZE;
+static_assert(ADAMW8BIT_BLOCK_SIZE_INTERNAL % 256 == 0, "ADAMW8BIT block size must be a multiple of 256");
 
-// Number of elements processed per thread
-constexpr int ADAMW8BIT_NUM_PER_THREAD = 8;
+// Number of elements processed per thread. Keep 256 threads per block.
+constexpr int ADAMW8BIT_NUM_PER_THREAD = ADAMW8BIT_BLOCK_SIZE_INTERNAL / 256;
 
 // Number of lanes for quantile caching in shared memory
 constexpr int ADAMW8BIT_LANES = 2;

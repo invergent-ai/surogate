@@ -100,6 +100,9 @@ public:
     void set_recompute_enabled(bool enabled);
     void set_recompute_use_graphs(bool enabled) { mRecomputeUseGraphs = enabled; }
     void set_capturing(bool capturing) { mCapturing = capturing; }
+    void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
+        mDebugDumpFn = std::move(fn);
+    }
 
     // Cache management
     void set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache);
@@ -127,9 +130,11 @@ public:
 
     // Expose mapped tensors for test/debug (returns nullptr if not found).
     const Tensor* try_get_tensor(const std::string& name) const;
+    // Debug-only: resolve by SSA-stripped name or fallback to simplified activations.
+    const Tensor* try_get_tensor_fuzzy(const std::string& name);
 
     // Save specified tensors to the saved map (for backward use)
-    void save_tensors(const std::vector<std::string>& save_list);
+    void save_tensors(const std::vector<std::string>& save_list, bool force_persist = false);
     // Preallocate persistent buffers for saved tensors before CUDA graph capture.
     // This avoids cudaMalloc during capture when recompute requires persistent saves.
     void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list);
@@ -148,6 +153,7 @@ private:
     void dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook);
     void dispatch_bias_add(const CompiledOp& op);
     void dispatch_swiglu(const CompiledOp& op);
+    void dispatch_gpt_oss_moe_act(const CompiledOp& op);
     void dispatch_silu(const CompiledOp& op);
     void dispatch_gelu(const CompiledOp& op);
     void dispatch_relu2(const CompiledOp& op);
@@ -171,6 +177,7 @@ private:
     void dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op);
     void dispatch_moe_grouped_gemm_down(const CompiledOp& op);
     void dispatch_moe_unpermute(const CompiledOp& op);
+    void dispatch_moe_expert_bias_add(const CompiledOp& op);
 
     // Backward dispatch functions
     void dispatch_view_backward(const CompiledOp& op);
@@ -178,6 +185,7 @@ private:
     void dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_bias_add_backward(const CompiledOp& op);
     void dispatch_swiglu_backward(const CompiledOp& op);
+    void dispatch_gpt_oss_moe_act_backward(const CompiledOp& op);
     void dispatch_silu_backward(const CompiledOp& op);
     void dispatch_gelu_backward(const CompiledOp& op);
     void dispatch_relu2_backward(const CompiledOp& op);
@@ -205,6 +213,7 @@ private:
     void dispatch_moe_grouped_gemm_gate_up_backward(const CompiledOp& op);
     void dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op);
     void dispatch_moe_unpermute_backward(const CompiledOp& op);
+    void dispatch_moe_expert_bias_add_backward(const CompiledOp& op);
 
     // Mamba/SSM forward dispatch
     void dispatch_mamba_split_proj(const CompiledOp& op);
@@ -226,6 +235,7 @@ private:
     Tensor& resolve_tensor(const TensorRef& ref);
     Tensor& ensure_output_tensor(const TensorRef& ref);
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
+    Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 
     // Layer boundary handling
     void handle_layer_start(int layer_idx);
@@ -262,6 +272,7 @@ private:
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
     std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
     std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
+    std::function<void(const std::vector<std::string>&, int)> mDebugDumpFn;
 
     // For embedding backward
     const Tensor* mLastInputsCpu = nullptr;
@@ -291,8 +302,20 @@ private:
 
     // Persistent storage for MoE saved tensors (per-layer copies to prevent buffer reuse corruption)
     // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)
-    std::unordered_map<std::string, void*> mMoESavedBuffers;
-    std::unordered_map<std::string, size_t> mMoESavedSizes;
+    std::unordered_map<std::string, void*> mMoeSavedBuffers;
+    std::unordered_map<std::string, size_t> mMoeSavedSizes;
+
+public:
+    /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
+    size_t saved_buffers_total_bytes() const {
+        size_t total = 0;
+        for (const auto& [name, sz] : mMoeSavedSizes) total += sz;
+        return total;
+    }
+    /// Number of persistent saved buffers.
+    int saved_buffers_count() const { return static_cast<int>(mMoeSavedSizes.size()); }
+    /// Per-buffer sizes for diagnostics.
+    const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const { return mMoeSavedSizes; }
 };
 
 // ============================================================================

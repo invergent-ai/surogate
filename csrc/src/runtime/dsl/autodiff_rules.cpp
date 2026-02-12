@@ -621,12 +621,24 @@ std::vector<Operation> flash_attention_backward(const BackwardRuleContext& ctx) 
 
     AttrMap attrs = copy_attrs(fwd.attrs, {"causal", "softmax_scale", "window_size"});
 
+    std::vector<std::string> inputs = {ctx.d_output, saved_ref(out), saved_ref(lse), saved_ref(qkv)};
+    bool has_sinks = (fwd.inputs.size() > 1 && !fwd.inputs[1].empty());
+    if (has_sinks) {
+        inputs.push_back(saved_ref(fwd.inputs[1]));
+    }
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    if (has_sinks) {
+        outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    }
+
     ops.push_back(make_operation(
         "flash_attention_backward_" + std::to_string(ctx.op_counter++),
         "flash_attention_backward",
         "flash_attention_backward",
-        {ctx.d_output, saved_ref(out), saved_ref(lse), saved_ref(qkv)},
-        {ctx.needs_grad(0) ? ctx.d_inputs[0] : ""},
+        inputs,
+        outputs,
         attrs));
 
     return ops;
@@ -977,7 +989,7 @@ std::vector<Operation> moe_topk_backward(const BackwardRuleContext& ctx) {
         std::string probs = fwd.inputs[0];
         std::string indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "indices";
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor", "softmax"});
 
         ops.push_back(make_operation(
             "moe_topk_backward_" + std::to_string(ctx.op_counter++),
@@ -988,6 +1000,64 @@ std::vector<Operation> moe_topk_backward(const BackwardRuleContext& ctx) {
             attrs));
     }
 
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// GPT-OSS MoE activation backward rule
+// Forward: out = gpt_oss_moe_act(inp, alpha, limit)
+// Backward: d_inp = gpt_oss_moe_act_backward(d_out, inp)
+// -----------------------------------------------------------------------------
+std::vector<Operation> gpt_oss_moe_act_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    if (!ctx.needs_grad(0)) {
+        return ops;
+    }
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.empty()) {
+        return ops;
+    }
+    std::string inp = fwd.inputs[0];
+    AttrMap attrs = copy_attrs(fwd.attrs, {"alpha", "limit"});
+    ops.push_back(make_operation(
+        "gpt_oss_moe_act_backward_" + std::to_string(ctx.op_counter++),
+        "gpt_oss_moe_act_backward",
+        "gpt_oss_moe_act_backward",
+        {ctx.d_output, saved_ref(inp)},
+        {ctx.d_inputs[0]},
+        attrs));
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// MoE expert bias add backward rule
+// Forward: out = moe_expert_bias_add(x, bias)
+// Backward: d_x, d_bias = moe_expert_bias_add_backward(d_out, bias)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_expert_bias_add_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.empty()) {
+        return ops;
+    }
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    if (fwd.inputs.size() > 1) {
+        outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    }
+
+    std::vector<std::string> inputs = {ctx.d_output};
+    if (fwd.inputs.size() > 1) {
+        inputs.push_back(fwd.inputs[1]);
+    }
+
+    ops.push_back(make_operation(
+        "moe_expert_bias_add_backward_" + std::to_string(ctx.op_counter++),
+        "moe_expert_bias_add_backward",
+        "moe_expert_bias_add_backward",
+        inputs,
+        outputs));
     return ops;
 }
 
@@ -1036,13 +1106,15 @@ std::vector<Operation> moe_grouped_gemm_gate_up_backward(const BackwardRuleConte
         std::string inp_ref = ctx.is_param(inp) ? inp : saved_ref(inp);
         std::string weights_ref = ctx.is_param(weights) ? weights : saved_ref(weights);
         std::string scatter_ref = saved_ref(scatter_indices);
+        AttrMap attrs = copy_attrs(fwd.attrs, {"gate_up_interleaved"});
 
         ops.push_back(make_operation(
             "moe_grouped_gemm_gate_up_backward_" + std::to_string(ctx.op_counter++),
             "moe_grouped_gemm_gate_up_backward",
             "moe_grouped_gemm_gate_up_backward",
             {ctx.d_output, inp_ref, weights_ref, scatter_ref},
-            {ctx.d_inputs[0]}));
+            {ctx.d_inputs[0]},
+            attrs));
     }
 
     return ops;
@@ -1405,6 +1477,8 @@ void register_builtin_backward_rules() {
     reg.register_rule("moe_grouped_gemm_down", moe_grouped_gemm_down_backward);
     reg.register_rule("moe_grouped_gemm", moe_grouped_gemm_backward);
     reg.register_rule("moe_unpermute", moe_unpermute_backward);
+    reg.register_rule("gpt_oss_moe_act", gpt_oss_moe_act_backward);
+    reg.register_rule("moe_expert_bias_add", moe_expert_bias_add_backward);
 
     // Compound ops (handled as units)
     reg.register_rule("StackedBlocks", stacked_blocks_backward);

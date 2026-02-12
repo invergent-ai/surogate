@@ -1465,6 +1465,52 @@ void dequantize_fp4_block(
 }
 
 /**
+ * @brief Kernel: scatter row-major FP8 scales into F8_128x4 swizzled layout.
+ */
+__global__ void swizzle_fp8_scales_kernel(
+    __nv_fp8_e4m3* __restrict__ out_swizzled,
+    const __nv_fp8_e4m3* __restrict__ in_rowmajor,
+    int scale_rows, int scale_cols)
+{
+    const long total = (long)scale_rows * scale_cols;
+    for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long)gridDim.x * blockDim.x) {
+        const int row = idx / scale_cols;
+        const int col = idx % scale_cols;
+        const size_t swizzled = scale_swizzled_offset(row, col, scale_cols);
+        out_swizzled[swizzled] = in_rowmajor[idx];
+    }
+}
+
+/**
+ * @brief Swizzle FP8 block scales from row-major to F8_128x4 layout (in-place).
+ */
+void swizzle_fp8_scales_rowmajor_to_f8_128x4(
+    __nv_fp8_e4m3* scales,
+    int scale_rows,
+    int scale_cols,
+    cudaStream_t stream)
+{
+    const long total = (long)scale_rows * scale_cols;
+    if (total == 0) return;
+
+    // Allocate temp buffer for the row-major source
+    const size_t bytes = total * sizeof(__nv_fp8_e4m3);
+    __nv_fp8_e4m3* temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&temp, bytes));
+    CUDA_CHECK(cudaMemcpyAsync(temp, scales, bytes, cudaMemcpyDeviceToDevice, stream));
+
+    const int threads = 256;
+    const int blocks = std::min((int)((total + threads - 1) / threads), 1024);
+    swizzle_fp8_scales_kernel<<<blocks, threads, 0, stream>>>(scales, temp, scale_rows, scale_cols);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Synchronize before freeing temp
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(temp));
+}
+
+/**
  * @brief Host launcher for FP4 block quantization with stochastic rounding.
  */
 void quantize_fp4_block_stochastic(

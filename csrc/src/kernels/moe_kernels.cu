@@ -22,6 +22,7 @@
 #include <cub/cub.cuh>
 #include <cublas_v2.h>
 #include <cfloat>
+#include <climits>
 
 #include "kernels/kernels.h"
 #include "kernel_utils.cuh"
@@ -176,7 +177,8 @@ __device__ __forceinline__ void topk_insert(float* vals, int* idxs, float val, i
     idxs[K - 1] = idx;
     #pragma unroll
     for (int j = K - 2; j >= 0; j--) {
-        if (vals[j + 1] > vals[j]) {
+        if ((vals[j + 1] > vals[j]) ||
+            (vals[j + 1] == vals[j] && idxs[j + 1] < idxs[j])) {
             float tv = vals[j]; vals[j] = vals[j + 1]; vals[j + 1] = tv;
             int ti = idxs[j]; idxs[j] = idxs[j + 1]; idxs[j + 1] = ti;
         }
@@ -195,7 +197,8 @@ __device__ __forceinline__ void warp_topk(
     int num_experts,
     float* out_vals,
     int* out_idxs,
-    const float* __restrict__ correction_bias = nullptr
+    const float* __restrict__ correction_bias = nullptr,
+    float rounding_scale = 0.0f
 ) {
     const int lane = threadIdx.x & (MOE_WARP_SIZE - 1);
 
@@ -214,7 +217,11 @@ __device__ __forceinline__ void warp_topk(
         float val = static_cast<float>(token_scores[e]);
         // Use biased score for selection if correction_bias is provided
         float selection_val = correction_bias ? (val + correction_bias[e]) : val;
-        if (selection_val > my_vals[K - 1]) {
+        if (rounding_scale > 0.0f) {
+            selection_val = nearbyintf(selection_val * rounding_scale) / rounding_scale;
+        }
+        if (selection_val > my_vals[K - 1] ||
+            (selection_val == my_vals[K - 1] && (my_idxs[K - 1] < 0 || e < my_idxs[K - 1]))) {
             topk_insert<K>(my_vals, my_idxs, selection_val, e);
         }
     }
@@ -282,7 +289,10 @@ __global__ void moe_topk_forward_kernel(
     int num_tokens,
     int num_experts,
     int top_k,
-    bool normalize_weights
+    bool normalize_weights,
+    bool softmax_weights,
+    bool sort_by_index,
+    float rounding_scale
 ) {
     const int warps_per_block = blockDim.x / MOE_WARP_SIZE;
     const int warp_id = threadIdx.x / MOE_WARP_SIZE;
@@ -295,11 +305,11 @@ __global__ void moe_topk_forward_kernel(
     // Warp-cooperative top-K selection (uses biased scores if bias present)
     float topk_vals[MOE_TOPK_MAX_K];
     int topk_idxs[MOE_TOPK_MAX_K];
-    warp_topk<K>(token_scores, num_experts, topk_vals, topk_idxs, correction_bias);
+    warp_topk<K>(token_scores, num_experts, topk_vals, topk_idxs, correction_bias, rounding_scale);
 
     // If correction_bias was used, topk_vals contain biased scores.
     // Re-read original unbiased scores for the selected experts (used for weights).
-    if (correction_bias) {
+    if (correction_bias || rounding_scale > 0.0f) {
         for (int k = 0; k < top_k; k++) {
             int idx = topk_idxs[k];
             if (idx >= 0 && idx < num_experts) {
@@ -311,7 +321,21 @@ __global__ void moe_topk_forward_kernel(
     // Optionally normalize weights (sum of selected scores → 1).
     // Must sum over top_k (runtime), not K (template), since K may be larger
     // when top_k doesn't match a specialized template (e.g. top_k=3, K=8).
-    if (normalize_weights) {
+    if (softmax_weights) {
+        float maxv = topk_vals[0];
+        for (int k = 1; k < top_k; ++k) {
+            maxv = fmaxf(maxv, topk_vals[k]);
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            topk_vals[k] = expf(topk_vals[k] - maxv);
+            sum += topk_vals[k];
+        }
+        sum = fmaxf(sum, 1e-9f);
+        for (int k = 0; k < top_k; ++k) {
+            topk_vals[k] /= sum;
+        }
+    } else if (normalize_weights) {
         float sum = 0.0f;
         for (int k = 0; k < top_k; k++) {
             sum += topk_vals[k];
@@ -322,10 +346,43 @@ __global__ void moe_topk_forward_kernel(
         }
     }
 
+    if (sort_by_index && top_k > 1) {
+        for (int i = 0; i < top_k - 1; ++i) {
+            int min_idx = i;
+            int min_val = topk_idxs[i];
+            if (min_val < 0) {
+                min_val = INT_MAX;
+            }
+            for (int j = i + 1; j < top_k; ++j) {
+                int idx = topk_idxs[j];
+                int idx_val = idx < 0 ? INT_MAX : idx;
+                if (idx_val < min_val) {
+                    min_val = idx_val;
+                    min_idx = j;
+                }
+            }
+            if (min_idx != i) {
+                int tmp_idx = topk_idxs[i];
+                float tmp_val = topk_vals[i];
+                topk_idxs[i] = topk_idxs[min_idx];
+                topk_vals[i] = topk_vals[min_idx];
+                topk_idxs[min_idx] = tmp_idx;
+                topk_vals[min_idx] = tmp_val;
+            }
+        }
+    }
+
     // Parallel write: lanes < top_k each write one result
     if (lane < top_k) {
-        expert_indices[token_idx * top_k + lane] = topk_idxs[lane];
-        routing_weights[token_idx * top_k + lane] = static_cast<T>(topk_vals[lane]);
+        int idx = topk_idxs[lane];
+        float val = topk_vals[lane];
+        // Sanitize invalid selections (can happen if logits are non-finite).
+        if (idx < 0 || idx >= num_experts || !isfinite(val)) {
+            idx = 0;
+            val = 0.0f;
+        }
+        expert_indices[token_idx * top_k + lane] = idx;
+        routing_weights[token_idx * top_k + lane] = static_cast<T>(val);
     }
 }
 
@@ -353,7 +410,8 @@ __global__ void moe_topk_backward_kernel(
     int num_tokens,
     int num_experts,
     int top_k,
-    bool normalize_weights
+    bool normalize_weights,
+    bool softmax_weights
 ) {
     constexpr int MAX_K = 8;
     int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -364,6 +422,48 @@ __global__ void moe_topk_backward_kernel(
     const float* p_row = probs + token_idx * num_experts;
     const float* d_w_row = d_routing_w + token_idx * top_k;
     const int* idx_row = expert_indices + token_idx * top_k;
+
+    if (softmax_weights) {
+        float maxv = -INFINITY;
+        float z_vals[MAX_K];
+        #pragma unroll
+        for (int k = 0; k < MAX_K; ++k) {
+            if (k >= top_k) break;
+            int e = idx_row[k];
+            float z = (e >= 0 && e < num_experts) ? p_row[e] : -INFINITY;
+            z_vals[k] = z;
+            maxv = fmaxf(maxv, z);
+        }
+
+        float sum = 0.0f;
+        float w_vals[MAX_K];
+        #pragma unroll
+        for (int k = 0; k < MAX_K; ++k) {
+            if (k >= top_k) break;
+            float w = expf(z_vals[k] - maxv);
+            w_vals[k] = w;
+            sum += w;
+        }
+        sum = fmaxf(sum, 1e-20f);
+        float dot = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < MAX_K; ++k) {
+            if (k >= top_k) break;
+            w_vals[k] /= sum;
+            dot += d_w_row[k] * w_vals[k];
+        }
+
+        #pragma unroll
+        for (int k = 0; k < MAX_K; ++k) {
+            if (k >= top_k) break;
+            int e = idx_row[k];
+            if (e >= 0 && e < num_experts) {
+                float d_z = w_vals[k] * (d_w_row[k] - dot);
+                d_row[e] = d_z;
+            }
+        }
+        return;
+    }
 
     if (!normalize_weights) {
         #pragma unroll
@@ -402,6 +502,386 @@ __global__ void moe_topk_backward_kernel(
             d_row[e] = d_p;
         }
     }
+}
+
+// ============================================================================
+// GPT-OSS MoE Activation (interleaved gate/up)
+// ============================================================================
+template<typename T>
+__global__ void gpt_oss_moe_act_forward_kernel(
+    T* __restrict__ out,           // (N, D)
+    const T* __restrict__ inp,     // (N, 2*D) interleaved [gate, up]
+    int total_elements,            // N * D
+    int D,
+    float alpha,
+    float limit
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    int d = idx % D;
+    int n = idx / D;
+    int base = n * (2 * D) + 2 * d;
+    float gate = static_cast<float>(inp[base]);
+    float up = static_cast<float>(inp[base + 1]);
+    if (gate > limit) gate = limit;
+    if (up > limit) up = limit;
+    if (up < -limit) up = -limit;
+    float sig = 1.0f / (1.0f + expf(-alpha * gate));
+    float glu = gate * sig;
+    float out_val = (up + 1.0f) * glu;
+    out[idx] = static_cast<T>(out_val);
+}
+
+template<typename T>
+__global__ void gpt_oss_moe_act_backward_kernel(
+    T* __restrict__ d_inp,          // (N, 2*D) interleaved [gate, up]
+    const T* __restrict__ d_out,    // (N, D)
+    const T* __restrict__ inp,      // (N, 2*D) interleaved [gate, up]
+    int total_elements,             // N * D
+    int D,
+    float alpha,
+    float limit
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    int d = idx % D;
+    int n = idx / D;
+    int base = n * (2 * D) + 2 * d;
+
+    float gate_in = static_cast<float>(inp[base]);
+    float up_in = static_cast<float>(inp[base + 1]);
+    float gate = gate_in;
+    if (gate > limit) gate = limit;
+    float up = up_in;
+    if (up > limit) up = limit;
+    if (up < -limit) up = -limit;
+
+    float sig = 1.0f / (1.0f + expf(-alpha * gate));
+    float glu = gate * sig;
+
+    float d_out_val = static_cast<float>(d_out[idx]);
+
+    float d_up = d_out_val * glu;
+    if (up_in > limit || up_in < -limit) {
+        d_up = 0.0f;
+    }
+
+    float sig_deriv = sig * (1.0f - sig);
+    float fprime = sig + alpha * gate * sig_deriv;
+    float d_gate = d_out_val * (up + 1.0f) * fprime;
+    if (gate_in > limit) {
+        d_gate = 0.0f;
+    }
+
+    d_inp[base] = static_cast<T>(d_gate);
+    d_inp[base + 1] = static_cast<T>(d_up);
+}
+
+void gpt_oss_moe_act_forward(
+    nv_bfloat16* out,
+    const nv_bfloat16* inp,
+    int N,
+    int D,
+    float alpha,
+    float limit,
+    cudaStream_t stream
+) {
+    const int total = N * D;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    gpt_oss_moe_act_forward_kernel<<<grid_size, block_size, 0, stream>>>(
+        out, inp, total, D, alpha, limit
+    );
+}
+
+void gpt_oss_moe_act_forward(
+    float* out,
+    const float* inp,
+    int N,
+    int D,
+    float alpha,
+    float limit,
+    cudaStream_t stream
+) {
+    const int total = N * D;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    gpt_oss_moe_act_forward_kernel<<<grid_size, block_size, 0, stream>>>(
+        out, inp, total, D, alpha, limit
+    );
+}
+
+void gpt_oss_moe_act_backward(
+    nv_bfloat16* d_inp,
+    const nv_bfloat16* d_out,
+    const nv_bfloat16* inp,
+    int N,
+    int D,
+    float alpha,
+    float limit,
+    cudaStream_t stream
+) {
+    const int total = N * D;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    gpt_oss_moe_act_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_inp, d_out, inp, total, D, alpha, limit
+    );
+}
+
+void gpt_oss_moe_act_backward(
+    float* d_inp,
+    const float* d_out,
+    const float* inp,
+    int N,
+    int D,
+    float alpha,
+    float limit,
+    cudaStream_t stream
+) {
+    const int total = N * D;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    gpt_oss_moe_act_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_inp, d_out, inp, total, D, alpha, limit
+    );
+}
+
+// ============================================================================
+// Utility: sanitize non-finite values (NaN/Inf) in-place
+// ============================================================================
+template<typename T>
+__global__ void sanitize_non_finite_kernel(T* data, int n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const float v = static_cast<float>(data[idx]);
+    if (!isfinite(v)) {
+        data[idx] = static_cast<T>(0.0f);
+    }
+}
+
+template<typename T>
+static void sanitize_non_finite_impl(T* data, int n, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    sanitize_non_finite_kernel<<<grid, block, 0, stream>>>(data, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sanitize_non_finite(nv_bfloat16* data, int n, cudaStream_t stream) {
+    sanitize_non_finite_impl(data, n, stream);
+}
+
+void sanitize_non_finite(float* data, int n, cudaStream_t stream) {
+    sanitize_non_finite_impl(data, n, stream);
+}
+
+// ============================================================================
+// Utility: clamp absolute values in-place
+// ============================================================================
+template<typename T>
+__global__ void clamp_abs_kernel(T* data, int n, float max_abs) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = static_cast<float>(data[idx]);
+    if (v > max_abs) v = max_abs;
+    else if (v < -max_abs) v = -max_abs;
+    data[idx] = static_cast<T>(v);
+}
+
+template<typename T>
+static void clamp_abs_impl(T* data, int n, float max_abs, cudaStream_t stream) {
+    if (n <= 0 || max_abs <= 0.0f) return;
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    clamp_abs_kernel<<<grid, block, 0, stream>>>(data, n, max_abs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void clamp_abs(nv_bfloat16* data, int n, float max_abs, cudaStream_t stream) {
+    clamp_abs_impl(data, n, max_abs, stream);
+}
+
+void clamp_abs(float* data, int n, float max_abs, cudaStream_t stream) {
+    clamp_abs_impl(data, n, max_abs, stream);
+}
+
+// ============================================================================
+// Utility: count non-finite values (NaN/Inf)
+// ============================================================================
+template<typename T>
+__global__ void count_non_finite_kernel(int* out_count, const T* data, int n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const float v = static_cast<float>(data[idx]);
+    if (!isfinite(v)) {
+        atomicAdd(out_count, 1);
+    }
+}
+
+template<typename T>
+static void count_non_finite_impl(int* out_count, const T* data, int n, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    count_non_finite_kernel<<<grid, block, 0, stream>>>(out_count, data, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void count_non_finite(int* out_count, const nv_bfloat16* data, int n, cudaStream_t stream) {
+    count_non_finite_impl(out_count, data, n, stream);
+}
+
+void count_non_finite(int* out_count, const float* data, int n, cudaStream_t stream) {
+    count_non_finite_impl(out_count, data, n, stream);
+}
+
+// ============================================================================
+// Utility: count invalid indices
+// ============================================================================
+__global__ void count_invalid_indices_kernel(int* out_count, const int* indices, int n, int num_experts) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int v = indices[idx];
+    if (v < 0 || v >= num_experts) {
+        atomicAdd(out_count, 1);
+    }
+}
+
+void count_invalid_indices(int* out_count, const int* indices, int n, int num_experts, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    count_invalid_indices_kernel<<<grid, block, 0, stream>>>(out_count, indices, n, num_experts);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// MoE per-expert bias add
+// ============================================================================
+template<typename T>
+__global__ void moe_expert_bias_add_forward_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ inp,
+    const T* __restrict__ bias,
+    const int* __restrict__ expert_offsets,
+    int num_experts,
+    int hidden_size
+) {
+    int e = blockIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_experts || d >= hidden_size) return;
+    int start = expert_offsets[e];
+    int end = expert_offsets[e + 1];
+    float b = static_cast<float>(bias[e * hidden_size + d]);
+    for (int t = start; t < end; ++t) {
+        int idx = t * hidden_size + d;
+        float v = static_cast<float>(inp[idx]) + b;
+        out[idx] = static_cast<T>(v);
+    }
+}
+
+template<typename T>
+__global__ void moe_expert_bias_add_backward_kernel(
+    T* __restrict__ d_inp,
+    float* __restrict__ d_bias,
+    const T* __restrict__ d_out,
+    const int* __restrict__ expert_offsets,
+    int num_experts,
+    int hidden_size
+) {
+    int e = blockIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_experts || d >= hidden_size) return;
+    int start = expert_offsets[e];
+    int end = expert_offsets[e + 1];
+    float sum = 0.0f;
+    for (int t = start; t < end; ++t) {
+        int idx = t * hidden_size + d;
+        float v = static_cast<float>(d_out[idx]);
+        if (d_inp) {
+            d_inp[idx] = static_cast<T>(v);
+        }
+        sum += v;
+    }
+    d_bias[e * hidden_size + d] = sum;
+}
+
+void moe_expert_bias_add_forward(
+    float* out,
+    const float* inp,
+    const float* bias,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int total_tokens,
+    cudaStream_t stream
+) {
+    (void)total_tokens;
+    if (num_experts <= 0 || hidden_size <= 0) return;
+    dim3 block(256, 1, 1);
+    dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
+    moe_expert_bias_add_forward_kernel<<<grid, block, 0, stream>>>(
+        out, inp, bias, expert_offsets, num_experts, hidden_size
+    );
+}
+
+void moe_expert_bias_add_forward(
+    nv_bfloat16* out,
+    const nv_bfloat16* inp,
+    const nv_bfloat16* bias,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int total_tokens,
+    cudaStream_t stream
+) {
+    (void)total_tokens;
+    if (num_experts <= 0 || hidden_size <= 0) return;
+    dim3 block(256, 1, 1);
+    dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
+    moe_expert_bias_add_forward_kernel<<<grid, block, 0, stream>>>(
+        out, inp, bias, expert_offsets, num_experts, hidden_size
+    );
+}
+
+void moe_expert_bias_add_backward(
+    float* d_inp,
+    float* d_bias,
+    const float* d_out,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int total_tokens,
+    cudaStream_t stream
+) {
+    (void)total_tokens;
+    if (num_experts <= 0 || hidden_size <= 0) return;
+    dim3 block(256, 1, 1);
+    dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
+    moe_expert_bias_add_backward_kernel<<<grid, block, 0, stream>>>(
+        d_inp, d_bias, d_out, expert_offsets, num_experts, hidden_size
+    );
+}
+
+void moe_expert_bias_add_backward(
+    nv_bfloat16* d_inp,
+    float* d_bias,
+    const nv_bfloat16* d_out,
+    const int* expert_offsets,
+    int num_experts,
+    int hidden_size,
+    int total_tokens,
+    cudaStream_t stream
+) {
+    (void)total_tokens;
+    if (num_experts <= 0 || hidden_size <= 0) return;
+    dim3 block(256, 1, 1);
+    dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
+    moe_expert_bias_add_backward_kernel<<<grid, block, 0, stream>>>(
+        d_inp, d_bias, d_out, expert_offsets, num_experts, hidden_size
+    );
 }
 
 // ============================================================================
@@ -1024,6 +1504,9 @@ static void moe_topk_forward_dispatch(
     int num_experts,
     int top_k,
     bool normalize_weights,
+    bool softmax_weights,
+    bool sort_by_index,
+    float rounding_scale,
     cudaStream_t stream
 ) {
     // 8 warps per block = 256 threads, each warp handles one token
@@ -1035,21 +1518,25 @@ static void moe_topk_forward_dispatch(
     switch (top_k) {
     case 1:
         moe_topk_forward_kernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
+            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
         break;
     case 2:
         moe_topk_forward_kernel<T, 2><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
+            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
         break;
     case 4:
         moe_topk_forward_kernel<T, 4><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
+            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
         break;
     default:
         // K=8 covers top_k 3,5,6,7,8 — the merge always produces K entries,
         // but we only write top_k of them via the lane < top_k guard.
         moe_topk_forward_kernel<T, 8><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k, normalize_weights);
+            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
+            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
         break;
     }
 }
@@ -1063,10 +1550,14 @@ void moe_topk_forward(
     int num_experts,
     int top_k,
     bool normalize_weights,
+    bool softmax_weights,
+    bool sort_by_index,
+    float rounding_scale,
     cudaStream_t stream
 ) {
     moe_topk_forward_dispatch(expert_indices, routing_weights, scores, correction_bias,
-                              num_tokens, num_experts, top_k, normalize_weights, stream);
+                              num_tokens, num_experts, top_k, normalize_weights,
+                              softmax_weights, sort_by_index, rounding_scale, stream);
 }
 
 void moe_topk_forward(
@@ -1078,10 +1569,14 @@ void moe_topk_forward(
     int num_experts,
     int top_k,
     bool normalize_weights,
+    bool softmax_weights,
+    bool sort_by_index,
+    float rounding_scale,
     cudaStream_t stream
 ) {
     moe_topk_forward_dispatch(expert_indices, routing_weights, scores, correction_bias,
-                              num_tokens, num_experts, top_k, normalize_weights, stream);
+                              num_tokens, num_experts, top_k, normalize_weights,
+                              softmax_weights, sort_by_index, rounding_scale, stream);
 }
 
 void moe_topk_backward(
@@ -1093,13 +1588,14 @@ void moe_topk_backward(
     int num_experts,
     int top_k,
     bool normalize_weights,
+    bool softmax_weights,
     cudaStream_t stream
 ) {
     int block_size = 256;
     int grid_size = (num_tokens + block_size - 1) / block_size;
     moe_topk_backward_kernel<<<grid_size, block_size, 0, stream>>>(
         d_probs, d_routing_weights, probs, expert_indices,
-        num_tokens, num_experts, top_k, normalize_weights
+        num_tokens, num_experts, top_k, normalize_weights, softmax_weights
     );
 }
 
@@ -2866,6 +3362,12 @@ __global__ void moe_combine_backward_kernel(
     for (int k = 0; k < top_k; k++) {
         int assignment_idx = token_idx * top_k + k;
         int expert_pos = scatter_indices[assignment_idx];
+        if (expert_pos < 0 || expert_pos >= total_tokens) {
+            if (d_routing_weights != nullptr && threadIdx.x == 0) {
+                d_routing_weights[assignment_idx] = static_cast<T>(0);
+            }
+            continue;
+        }
 
         T* d_exp_out = d_expert_out + expert_pos * hidden_size;
         float weight = static_cast<float>(weights[k]);
@@ -2949,6 +3451,12 @@ __global__ void moe_combine_backward_kernel_mixed(
     for (int k = 0; k < top_k; k++) {
         int assignment_idx = token_idx * top_k + k;
         int expert_pos = scatter_indices[assignment_idx];
+        if (expert_pos < 0 || expert_pos >= total_tokens) {
+            if (d_routing_weights != nullptr && threadIdx.x == 0) {
+                d_routing_weights[assignment_idx] = 0.0f;
+            }
+            continue;
+        }
 
         T* d_exp_out = d_expert_out + expert_pos * hidden_size;
         float weight = weights[k];

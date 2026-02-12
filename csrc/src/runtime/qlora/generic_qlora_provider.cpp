@@ -110,12 +110,21 @@ void GenericQLoRAProvider::import_and_quantize(
             "pre-built weight manager?)");
     }
 
-    mWeightMgr = import_and_quantize_weights(
-        file_name,
-        *mDeferredConfig,
-        *mPtConfig,
-        mAllocator,
-        stream);
+    if (mDeferredConfig->prequantized) {
+        mWeightMgr = import_prequantized_weights(
+            file_name,
+            *mDeferredConfig,
+            *mPtConfig,
+            mAllocator,
+            stream);
+    } else {
+        mWeightMgr = import_and_quantize_weights(
+            file_name,
+            *mDeferredConfig,
+            *mPtConfig,
+            mAllocator,
+            stream);
+    }
 
     // Compute total BF16 bytes for memory savings
     mTotalBF16Bytes = 0;

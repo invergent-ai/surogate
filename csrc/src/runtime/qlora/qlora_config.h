@@ -5,7 +5,9 @@
 #ifndef SUROGATE_SRC_MODULES_QLORA_QLORA_CONFIG_H
 #define SUROGATE_SRC_MODULES_QLORA_QLORA_CONFIG_H
 
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "recipes/nvfp4/nvfp4_recipe.h"
 #include "utilities/dtype.h"
@@ -21,9 +23,14 @@ namespace modules {
  */
 enum class QLoRAQuantStrategy {
     None,           ///< No quantization (regular LoRA with BF16 base model)
-    FP8,            ///< FP8 E4M3 with per-block scales
-    NVFP4,          ///< FP4 E2M1 with two-level block scales for SM 100+ (Blackwell)
-    BitsAndBytes    ///< BitsAndBytes-style NF4 with per-block absmax and double quantization
+    FP8,            ///< FP8 E4M3 with per-block scales (online quantization)
+    NVFP4,          ///< FP4 E2M1 with two-level block scales for SM 100+ (online quantization)
+    BitsAndBytes,   ///< BitsAndBytes-style NF4 with per-block absmax and double quantization
+
+    // Pre-quantized HF model loading (no online quantization, weights already quantized)
+    PrequantFP8,    ///< HF fine-grained FP8: per-block (128x128) FP8 E4M3 + FP32 inverse scales
+    PrequantNVFP4,  ///< HF NVFP4 (ModelOpt): packed FP4 + FP8 block scales + FP32 global scale
+    PrequantMXFP4,  ///< HF MXFP4: packed FP4 + E8M0 shared exponents per 32-element block
 };
 
 /**
@@ -144,6 +151,15 @@ struct QLoRAConfig {
     /// Shared expert intermediate size (0 = use moe_intermediate_size or intermediate_size)
     int moe_shared_expert_intermediate_size = 0;
 
+    // =========================================================================
+    // Pre-quantized model configuration
+    // =========================================================================
+
+    /// HF module paths that should NOT be quantized (loaded as full-precision).
+    /// Populated from HF quantization_config "ignore" or "modules_to_not_convert".
+    /// Examples: "lm_head", "model.layers.0.mlp.gate" (router gates in MoE).
+    std::vector<std::string> modules_to_not_convert;
+
     /**
      * @brief Check if this is an MoE model
      */
@@ -187,6 +203,15 @@ struct QLoRAConfig {
      */
     [[nodiscard]] bool is_bnb() const {
         return strategy == QLoRAQuantStrategy::BitsAndBytes;
+    }
+
+    /**
+     * @brief Check if loading a pre-quantized HF model (no online quantization)
+     */
+    [[nodiscard]] bool is_prequantized() const {
+        return strategy == QLoRAQuantStrategy::PrequantFP8 ||
+               strategy == QLoRAQuantStrategy::PrequantNVFP4 ||
+               strategy == QLoRAQuantStrategy::PrequantMXFP4;
     }
 
     /**
@@ -248,6 +273,58 @@ struct QLoRAConfig {
     }
 
     /**
+     * @brief Create config for loading HF pre-quantized fine-grained FP8 models
+     *
+     * For models like DeepSeek-V3/R1 with quantization_config.quant_method = "fp8".
+     * Weights are stored as FP8 E4M3 with per-block (128x128) FP32 inverse scales.
+     * Reuses the existing FP8_PER_BLOCK dequant path (formats are identical).
+     */
+    static QLoRAConfig prequant_fp8() {
+        QLoRAConfig cfg;
+        cfg.enabled = true;
+        cfg.strategy = QLoRAQuantStrategy::PrequantFP8;
+        cfg.scale_config.block_size = 128;
+        cfg.base_dtype = ETensorDType::FP8_E4M3;
+        cfg.adapter_dtype = ETensorDType::BF16;
+        return cfg;
+    }
+
+    /**
+     * @brief Create config for loading HF pre-quantized NVFP4 models
+     *
+     * For models quantized with NVIDIA ModelOpt (quant_method = "modelopt",
+     * quant_algo = "NVFP4"). Weights are packed FP4 with two-level scaling:
+     * per-16-element FP8 E4M3 block scales + per-tensor FP32 global scale.
+     * Requires Blackwell GPU (SM100+).
+     */
+    static QLoRAConfig prequant_nvfp4() {
+        QLoRAConfig cfg;
+        cfg.enabled = true;
+        cfg.strategy = QLoRAQuantStrategy::PrequantNVFP4;
+        cfg.scale_config.block_size = 16;
+        cfg.base_dtype = ETensorDType::FP4_E2M1;
+        cfg.adapter_dtype = ETensorDType::BF16;
+        return cfg;
+    }
+
+    /**
+     * @brief Create config for loading HF pre-quantized MXFP4 models
+     *
+     * For models like OpenAI GPT-OSS with quantization_config.quant_method = "mxfp4".
+     * Weights are packed FP4 with E8M0 shared exponents per 32-element block
+     * (microscaling format).
+     */
+    static QLoRAConfig prequant_mxfp4() {
+        QLoRAConfig cfg;
+        cfg.enabled = true;
+        cfg.strategy = QLoRAQuantStrategy::PrequantMXFP4;
+        cfg.scale_config.block_size = 32;
+        cfg.base_dtype = ETensorDType::BYTE;  // Packed FP4 stored as uint8
+        cfg.adapter_dtype = ETensorDType::BF16;
+        return cfg;
+    }
+
+    /**
      * @brief Create disabled QLoRA configuration (regular LoRA)
      */
     static QLoRAConfig none() {
@@ -264,6 +341,9 @@ inline const char* to_string(QLoRAQuantStrategy strategy) {
         case QLoRAQuantStrategy::FP8: return "fp8";
         case QLoRAQuantStrategy::NVFP4: return "nvfp4";
         case QLoRAQuantStrategy::BitsAndBytes: return "bitsandbytes";
+        case QLoRAQuantStrategy::PrequantFP8: return "prequant_fp8";
+        case QLoRAQuantStrategy::PrequantNVFP4: return "prequant_nvfp4";
+        case QLoRAQuantStrategy::PrequantMXFP4: return "prequant_mxfp4";
         default: return "unknown";
     }
 }

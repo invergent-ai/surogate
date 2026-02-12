@@ -23,6 +23,7 @@ enum class LoRATarget {
     V_PROJ,      ///< Value projection
     O_PROJ,      ///< Output projection
     GATE_PROJ,   ///< MLP gate projection
+    GATE_UP_PROJ,///< Fused MLP gate+up projection (GPT-OSS style)
     UP_PROJ,     ///< MLP up projection
     DOWN_PROJ    ///< MLP down projection
 };
@@ -91,6 +92,7 @@ struct ModularLoRAConfig {
     [[nodiscard]] bool applies_to_v() const { return applies_to(LoRATarget::V_PROJ); }
     [[nodiscard]] bool applies_to_o() const { return applies_to(LoRATarget::O_PROJ); }
     [[nodiscard]] bool applies_to_gate() const { return applies_to(LoRATarget::GATE_PROJ); }
+    [[nodiscard]] bool applies_to_gate_up() const { return applies_to(LoRATarget::GATE_UP_PROJ); }
     [[nodiscard]] bool applies_to_up() const { return applies_to(LoRATarget::UP_PROJ); }
     [[nodiscard]] bool applies_to_down() const { return applies_to(LoRATarget::DOWN_PROJ); }
 
@@ -99,7 +101,7 @@ struct ModularLoRAConfig {
     }
 
     [[nodiscard]] bool applies_to_mlp() const {
-        return applies_to_gate() || applies_to_up() || applies_to_down();
+        return applies_to_gate() || applies_to_gate_up() || applies_to_up() || applies_to_down();
     }
 
     /**

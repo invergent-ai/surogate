@@ -583,7 +583,7 @@ class SurogateTrainerWrapper():
         if use_full_step_graphs and self.config.optimizer not in ("adamw_8bit", "normuon"):
             raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
         if use_full_step_graphs and not self.config.use_cuda_graphs:
-            logger.info("CUDA graphs disabled; DSL full-step execution will use eager fallback.")
+            logger.info("CUDA graphs disabled")
 
         # Allocate token buffers
         micro_steps = self.config.gradient_accumulation_steps if use_full_step_graphs else 1

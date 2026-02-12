@@ -1,5 +1,7 @@
 #include "runtime/dsl/compiled_ops.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
@@ -52,6 +54,9 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     fill_zero(expert_counts, mRunState.MainStream);
     fill_zero(expert_positions, mRunState.MainStream);
     fill_zero(gather_indices, mRunState.MainStream);
+
+    // Initialize scatter_indices to -1 so invalid expert IDs are explicitly marked.
+    CUDA_CHECK(cudaMemsetAsync(scatter_indices.Data, 0xFF, scatter_indices.bytes(), mRunState.MainStream));
 
     // Compute expert counts
     moe_compute_expert_counts(expert_counts.get<int>(),
@@ -116,17 +121,17 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                 if (bytes == 0) {
                     return;
                 }
-                auto buf_it = mMoESavedBuffers.find(key);
-                if (buf_it == mMoESavedBuffers.end() || mMoESavedSizes[key] < bytes) {
-                    if (buf_it != mMoESavedBuffers.end() && buf_it->second != nullptr) {
+                auto buf_it = mMoeSavedBuffers.find(key);
+                if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[key] < bytes) {
+                    if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                         CUDA_CHECK(cudaFree(buf_it->second));
                     }
                     void* new_buffer = nullptr;
                     CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                    mMoESavedBuffers[key] = new_buffer;
-                    mMoESavedSizes[key] = bytes;
+                    mMoeSavedBuffers[key] = new_buffer;
+                    mMoeSavedSizes[key] = bytes;
                 }
-                void* dst_buffer = mMoESavedBuffers[key];
+                void* dst_buffer = mMoeSavedBuffers[key];
                 CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
                                            cudaMemcpyDeviceToDevice, mRunState.MainStream));
             };
@@ -175,8 +180,8 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
     }
     if (layer_idx >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx) + "].moe_gather_indices";
-        auto it = mMoESavedBuffers.find(key);
-        if (it != mMoESavedBuffers.end() && it->second != nullptr) {
+        auto it = mMoeSavedBuffers.find(key);
+        if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             const int top_k = op.attrs.top_k > 0 ? op.attrs.top_k : 1;
             const int num_tokens = static_cast<int>(d_input.Sizes[0]);
             const int total_tokens = num_tokens * top_k;

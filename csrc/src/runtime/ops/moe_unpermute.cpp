@@ -70,13 +70,20 @@ void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
     Tensor& routing_weights = resolve_tensor(op.inputs[2]);
     Tensor& scatter_indices = resolve_tensor(op.inputs[3]);
 
-    Tensor& d_expert_out = ensure_output_tensor(op.outputs[0]);
-    Tensor& d_routing_weights = ensure_output_tensor(op.outputs[1]);
-
     const int top_k = op.attrs.top_k;
     const int num_tokens = static_cast<int>(routing_weights.Sizes[0]);
     const int total_tokens = num_tokens * top_k;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+
+    // Allocate dynamic outputs explicitly to avoid relying on static shapes.
+    // d_expert_out shape: [total_tokens, hidden_size]
+    // d_routing_weights shape: [num_tokens, top_k]
+    Tensor d_expert_out = mRunState.temp_alloc(d_output.DType,
+        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)});
+    Tensor d_routing_weights = mRunState.temp_alloc(routing_weights.DType,
+        {static_cast<long>(num_tokens), static_cast<long>(top_k)});
+    mTemps.push_back(d_expert_out);
+    mTemps.push_back(d_routing_weights);
 
     // Validate expert_out shape: must be [total_tokens, hidden_size].
     // A shape mismatch (e.g., [1, hidden_size] from a stale/incorrectly saved tensor)

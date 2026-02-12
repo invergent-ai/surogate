@@ -43,6 +43,7 @@ struct LoRAAdapterConfig {
     [[nodiscard]] bool applies_to_v() const { return applies_to("v_proj"); }
     [[nodiscard]] bool applies_to_o() const { return applies_to("o_proj"); }
     [[nodiscard]] bool applies_to_gate() const { return applies_to("gate_proj"); }
+    [[nodiscard]] bool applies_to_gate_up() const { return applies_to("gate_up_proj"); }
     [[nodiscard]] bool applies_to_up() const { return applies_to("up_proj"); }
     [[nodiscard]] bool applies_to_down() const { return applies_to("down_proj"); }
 
@@ -51,7 +52,7 @@ struct LoRAAdapterConfig {
     }
 
     [[nodiscard]] bool applies_to_mlp() const {
-        return applies_to_gate() || applies_to_up() || applies_to_down();
+        return applies_to_gate() || applies_to_gate_up() || applies_to_up() || applies_to_down();
     }
 };
 
@@ -59,4 +60,3 @@ struct LoRAAdapterConfig {
 using LoRAConfig = LoRAAdapterConfig;
 
 #endif // SUROGATE_SRC_CONFIG_LORA_ADAPTER_CONFIG_H
-

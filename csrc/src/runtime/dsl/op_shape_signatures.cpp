@@ -541,6 +541,99 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // GPT-OSS MoE Activation (interleaved gate/up)
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "gpt_oss_moe_act";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            if (inputs.empty() || outputs.empty()) {
+                return std::make_optional(ShapeValidationError{"gpt_oss_moe_act requires 1 input and 1 output"});
+            }
+            const auto& in_shape = inputs[0];
+            const auto& out_shape = outputs[0];
+            if (in_shape.empty() || out_shape.empty()) {
+                return std::optional<ShapeValidationError>();
+            }
+            if (in_shape.size() != out_shape.size()) {
+                ShapeValidationError err;
+                err.message = "gpt_oss_moe_act: input and output rank must match";
+                return std::make_optional(err);
+            }
+            if (in_shape.back() != 2 * out_shape.back()) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "gpt_oss_moe_act: input last dim (" << in_shape.back()
+                    << ") must be 2x output last dim (" << out_shape.back() << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+            for (size_t i = 0; i + 1 < in_shape.size(); ++i) {
+                if (in_shape[i] != out_shape[i]) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "gpt_oss_moe_act: dimension [" << i << "] mismatch: "
+                        << in_shape[i] << " vs " << out_shape[i];
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Expert Bias Add
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_expert_bias_add";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            if (inputs.size() < 2 || outputs.empty()) {
+                return std::make_optional(ShapeValidationError{"moe_expert_bias_add requires 2 inputs and 1 output"});
+            }
+            const auto& x = inputs[0];
+            const auto& bias = inputs[1];
+            const auto& out = outputs[0];
+            if (!x.empty() && x.size() != 2) {
+                return std::make_optional(ShapeValidationError{"moe_expert_bias_add: input must be 2D [tokens, hidden]"});
+            }
+            if (!bias.empty() && bias.size() != 2) {
+                return std::make_optional(ShapeValidationError{"moe_expert_bias_add: bias must be 2D [experts, hidden]"});
+            }
+            if (!out.empty() && !x.empty()) {
+                if (out.size() != 2 || out[0] != x[0] || out[1] != x[1]) {
+                    ShapeValidationError err;
+                    err.message = "moe_expert_bias_add: output shape must match input shape";
+                    return std::make_optional(err);
+                }
+            }
+            if (!x.empty() && !bias.empty() && bias[1] != x[1]) {
+                ShapeValidationError err;
+                err.message = "moe_expert_bias_add: bias hidden dim must match input hidden dim";
+                return std::make_optional(err);
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
     // Embedding
     // ------------------------------------------------------------------------
     {
@@ -1026,7 +1119,7 @@ void register_builtin_shape_signatures() {
         OpShapeSignature sig;
         sig.op_name = "flash_attention";
         sig.min_inputs = 1;
-        sig.max_inputs = 1;
+        sig.max_inputs = 2;
         sig.min_outputs = 2;
         sig.max_outputs = 2;
         sig.validator = [](const std::vector<std::vector<long>>& inputs,
@@ -1044,6 +1137,15 @@ void register_builtin_shape_signatures() {
                 oss << "flash_attention: qkv has rank " << qkv.size() << " but expected 3 or 4";
                 err.message = oss.str();
                 return std::make_optional(err);
+            }
+
+            if (inputs.size() > 1) {
+                const auto& sinks = inputs[1];
+                if (!sinks.empty() && sinks.size() != 1) {
+                    ShapeValidationError err;
+                    err.message = "flash_attention: sinks must be 1D [Hq]";
+                    return std::make_optional(err);
+                }
             }
 
             // Skip output shape checks if output shapes are unknown (empty)
@@ -1258,6 +1360,84 @@ void register_builtin_shape_signatures() {
             // d_inp matches mlp_up shape
             if (auto err = validators::check_same_numel(d_inp, mlp_up, "d_inp", "mlp_up", "swiglu_backward")) {
                 return err;
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // GPT-OSS MoE Activation Backward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "gpt_oss_moe_act_backward";
+        sig.min_inputs = 2;
+        sig.max_inputs = 2;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            const auto& d_out = inputs[0];
+            const auto& inp = inputs[1];
+            const auto& d_inp = outputs[0];
+
+            if (!inp.empty() && !d_out.empty()) {
+                if (inp.back() != 2 * d_out.back()) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "gpt_oss_moe_act_backward: inp last dim (" << inp.back()
+                        << ") must be 2x d_out last dim (" << d_out.back() << ")";
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+
+            if (auto err = validators::check_same_numel(d_inp, inp, "d_inp", "inp", "gpt_oss_moe_act_backward")) {
+                return err;
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // MoE Expert Bias Add Backward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "moe_expert_bias_add_backward";
+        sig.min_inputs = 1;
+        sig.max_inputs = 2;
+        sig.min_outputs = 2;
+        sig.max_outputs = 2;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            const auto& d_out = inputs[0];
+            const auto& d_inp = outputs[0];
+            const auto& d_bias = outputs[1];
+
+            if (auto err = validators::check_same_numel(d_inp, d_out, "d_inp", "d_out", "moe_expert_bias_add_backward")) {
+                return err;
+            }
+
+            if (!d_bias.empty()) {
+                if (d_bias.size() != 2) {
+                    ShapeValidationError err;
+                    err.message = "moe_expert_bias_add_backward: d_bias must be 2D [experts, hidden]";
+                    return std::make_optional(err);
+                }
+                if (!d_out.empty() && d_bias[1] != d_out.back()) {
+                    ShapeValidationError err;
+                    err.message = "moe_expert_bias_add_backward: d_bias hidden dim must match d_out last dim";
+                    return std::make_optional(err);
+                }
             }
 
             return std::optional<ShapeValidationError>();
@@ -1491,9 +1671,9 @@ void register_builtin_shape_signatures() {
         OpShapeSignature sig;
         sig.op_name = "flash_attention_backward";
         sig.min_inputs = 4;
-        sig.max_inputs = 4;
+        sig.max_inputs = 5;
         sig.min_outputs = 1;
-        sig.max_outputs = 1;
+        sig.max_outputs = 2;
         sig.validator = [](const std::vector<std::vector<long>>& inputs,
                           const std::vector<std::vector<long>>& outputs,
                           const AttrMap& attrs,
@@ -1505,13 +1685,29 @@ void register_builtin_shape_signatures() {
             const auto& d_qkv = outputs[0];
 
             // d_qkv should match qkv shape
-            if (auto err = validators::check_same_numel(d_qkv, qkv, "d_qkv", "qkv", "flash_attention_backward")) {
-                return err;
+            if (!d_qkv.empty()) {
+                if (auto err = validators::check_same_numel(d_qkv, qkv, "d_qkv", "qkv", "flash_attention_backward")) {
+                    return err;
+                }
             }
 
-            // qkv should be rank 3
-            if (auto err = validators::check_rank(qkv, 3, "qkv", "flash_attention_backward")) {
-                return err;
+            // qkv should be rank 3 or 4
+            if (!qkv.empty() && (qkv.size() < 3 || qkv.size() > 4)) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "flash_attention_backward: qkv has rank " << qkv.size()
+                    << " but expected 3 or 4";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+
+            if (inputs.size() > 4 && outputs.size() > 1) {
+                const auto& d_sinks = outputs[1];
+                if (!d_sinks.empty() && d_sinks.size() != 1) {
+                    ShapeValidationError err;
+                    err.message = "flash_attention_backward: d_sinks must be 1D [Hq]";
+                    return std::make_optional(err);
+                }
             }
 
             return std::optional<ShapeValidationError>();

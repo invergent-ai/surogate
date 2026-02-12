@@ -529,6 +529,9 @@ NB_MODULE(_surogate, m) {
         .value("FP8", modules::QLoRAQuantStrategy::FP8, "FP8 E4M3 with per-block scales")
         .value("NVFP4", modules::QLoRAQuantStrategy::NVFP4, "FP4 E2M1 with two-level block scales (Blackwell SM100+)")
         .value("BNB", modules::QLoRAQuantStrategy::BitsAndBytes, "BitsAndBytes NF4 with per-block absmax (any GPU)")
+        .value("PREQUANT_FP8", modules::QLoRAQuantStrategy::PrequantFP8, "Pre-quantized HF FP8 (DeepSeek-V3/R1)")
+        .value("PREQUANT_NVFP4", modules::QLoRAQuantStrategy::PrequantNVFP4, "Pre-quantized HF NVFP4 (ModelOpt)")
+        .value("PREQUANT_MXFP4", modules::QLoRAQuantStrategy::PrequantMXFP4, "Pre-quantized HF MXFP4")
         ;
 
     nb::class_<modules::QLoRAConfig>(m, "QLoRAConfig",
@@ -545,8 +548,14 @@ NB_MODULE(_surogate, m) {
                 strat = modules::QLoRAQuantStrategy::NVFP4;
             } else if (strategy == "bnb" || strategy == "BNB" || strategy == "bitsandbytes" || strategy == "nf4") {
                 strat = modules::QLoRAQuantStrategy::BitsAndBytes;
+            } else if (strategy == "prequant_fp8") {
+                strat = modules::QLoRAQuantStrategy::PrequantFP8;
+            } else if (strategy == "prequant_nvfp4") {
+                strat = modules::QLoRAQuantStrategy::PrequantNVFP4;
+            } else if (strategy == "prequant_mxfp4") {
+                strat = modules::QLoRAQuantStrategy::PrequantMXFP4;
             } else if (!strategy.empty() && strategy != "none") {
-                throw std::runtime_error("Unknown QLoRA strategy: " + strategy + " (valid: none, fp8, nvfp4, bnb)");
+                throw std::runtime_error("Unknown QLoRA strategy: " + strategy + " (valid: none, fp8, nvfp4, bnb, prequant_fp8, prequant_nvfp4, prequant_mxfp4)");
             }
 
             new (t) modules::QLoRAConfig{
@@ -579,6 +588,12 @@ NB_MODULE(_surogate, m) {
                              cfg->strategy = modules::QLoRAQuantStrategy::NVFP4;
                          } else if (strat == "bnb" || strat == "BNB" || strat == "bitsandbytes" || strat == "nf4") {
                              cfg->strategy = modules::QLoRAQuantStrategy::BitsAndBytes;
+                         } else if (strat == "prequant_fp8") {
+                             cfg->strategy = modules::QLoRAQuantStrategy::PrequantFP8;
+                         } else if (strat == "prequant_nvfp4") {
+                             cfg->strategy = modules::QLoRAQuantStrategy::PrequantNVFP4;
+                         } else if (strat == "prequant_mxfp4") {
+                             cfg->strategy = modules::QLoRAQuantStrategy::PrequantMXFP4;
                          } else {
                              cfg->strategy = modules::QLoRAQuantStrategy::None;
                          }
@@ -634,6 +649,27 @@ NB_MODULE(_surogate, m) {
            "- block_size: Number of consecutive elements per quantization block (64, 128, 256, 512).\n"
            "- double_quant: Enable double quantization (quantize absmax to INT8) for extra memory savings.\n\n"
            "Returns: QLoRAConfig with NF4 base weights.")
+        .def_static("prequant_fp8", []() {
+            return modules::QLoRAConfig::prequant_fp8();
+        },
+           "Create pre-quantized FP8 QLoRA configuration.\n\n"
+           "For loading HF models with fine-grained FP8 quantization (e.g., DeepSeek-V3/R1).\n"
+           "No online quantization — weights are loaded as-is from safetensors.\n\n"
+           "Returns: QLoRAConfig for pre-quantized FP8 loading.")
+        .def_static("prequant_nvfp4", []() {
+            return modules::QLoRAConfig::prequant_nvfp4();
+        },
+           "Create pre-quantized NVFP4 QLoRA configuration.\n\n"
+           "For loading HF models quantized with NVIDIA ModelOpt NVFP4.\n"
+           "Uses two-level scaling: FP8 E4M3 block scales + FP32 global scale.\n\n"
+           "Returns: QLoRAConfig for pre-quantized NVFP4 loading.")
+        .def_static("prequant_mxfp4", []() {
+            return modules::QLoRAConfig::prequant_mxfp4();
+        },
+           "Create pre-quantized MXFP4 QLoRA configuration.\n\n"
+           "For loading HF models with microscaling FP4 quantization.\n"
+           "Uses E8M0 shared exponents per 32-element block.\n\n"
+           "Returns: QLoRAConfig for pre-quantized MXFP4 loading.")
         .def_rw("bnb_double_quant", &modules::QLoRAConfig::bnb_double_quant,
                 "Enable double quantization for BnB (quantize absmax values to INT8).")
         .def_rw("bnb_double_quant_group_size", &modules::QLoRAConfig::bnb_double_quant_group_size,
@@ -646,6 +682,23 @@ NB_MODULE(_surogate, m) {
                 "Per-expert MLP intermediate size (0 = use regular intermediate_size).")
         .def_prop_ro("is_moe", &modules::QLoRAConfig::is_moe,
                      "Whether this is an MoE model (num_experts > 0).")
+        .def_prop_ro("is_prequantized", &modules::QLoRAConfig::is_prequantized,
+                     "Whether loading a pre-quantized HF model (no online quantization).")
+        .def_prop_rw("modules_to_not_convert",
+                     [](const modules::QLoRAConfig* cfg) {
+                         nb::list result;
+                         for (const auto& m : cfg->modules_to_not_convert) {
+                             result.append(nb::cast(m));
+                         }
+                         return result;
+                     },
+                     [](modules::QLoRAConfig* cfg, const nb::list& modules) {
+                         cfg->modules_to_not_convert.clear();
+                         for (auto item : modules) {
+                             cfg->modules_to_not_convert.push_back(nb::cast<std::string>(item));
+                         }
+                     },
+                     "HF module paths that should NOT be quantized (loaded as full-precision).")
         .def("__repr__", [](const modules::QLoRAConfig& cfg) {
             if (cfg.is_bnb()) {
                 return fmt::format("QLoRAConfig(enabled={}, strategy='{}', block_size={}, bnb_double_quant={}, adapter_dtype='{}')",
@@ -1032,6 +1085,10 @@ NB_MODULE(_surogate, m) {
            "Parameters:\n- gpu_id: Which GPU's gradients to return.\n\n"
            "Returns: dict[str, ndarray] mapping adapter parameter name -> gradient view.\n"
            "Note: blocking; intended for debugging only.")
+        .def("get_valid_token_count", &MultiGPUPyTrainer::get_valid_token_count, nb::arg("gpu_id"),
+             "Return the accumulated valid-token count for the last training step.\n\n"
+             "Parameters:\n- gpu_id: Which GPU's count to return.\n\n"
+             "Returns: int (valid tokens accumulated across micro-steps, after all-reduce).")
         .def("get_gpu_info", &MultiGPUPyTrainer::get_gpu_info,
              "Return current GPU utilization info for all GPUs (implementation-defined structure).")
         .def("get_moe_stats", [](MultiGPUPyTrainer* trainer) {

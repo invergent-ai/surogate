@@ -187,3 +187,79 @@ class Qwen3Attention:
             out = g.view(out_flat, shape=[B, T, self.C])
 
             return out
+
+
+@module
+class GptOssAttention:
+    """GPT-OSS attention with sinks and RoPE."""
+
+    _hf_mapping_defaults_ = {
+        **GQAAttention._hf_mapping_defaults_,
+        "sinks": "{prefix}.sinks",
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        max_seq: int,
+        use_qkv_bias: bool = True,
+    ):
+        self.d_model = d_model
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.max_seq = max_seq
+        self.use_qkv_bias = use_qkv_bias
+
+        # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.MaxSeq = Dim("MaxSeq")
+
+        # Derived dimensions (DimExpr)
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
+        self.AttnDim = self.Hq * self.D
+
+    # Attention weights
+    qkv_weight = Param(Tensor["QKV", "C"])
+    qkv_bias = Param(Tensor["QKV"], when="use_qkv_bias")
+    out_weight = Param(Tensor["C", "AttnDim"])
+    out_bias = Param(Tensor["C"], when="use_qkv_bias")
+    rope_freqs = Param(Tensor["MaxSeq", "D // 2", 2, "fp32"], frozen=True)
+    sinks = Param(Tensor["Hq"])
+
+    @forward
+    def forward(
+        self,
+        x: Tensor["B", "T", "C"],
+        position_ids: Tensor["T", "int32"],
+    ) -> Tensor["B", "T", "C"]:
+        with graph() as g:
+            # QKV projection
+            x_flat = g.view(x, shape=[B * T, self.C])
+            if self.use_qkv_bias:
+                qkv_flat = g.matmul_bias(x_flat, "qkv_weight", "qkv_bias", transpose="NT")
+            else:
+                qkv_flat = g.matmul(x_flat, "qkv_weight", transpose="NT")
+            qkv_packed = g.view(qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D])
+
+            # Apply RoPE
+            qkv_rope = g.rope(qkv_packed, "rope_freqs", position_ids, rotary_dim="D")
+
+            # FlashAttention + sinks
+            attn_out, _ = g.flash_attention(qkv_rope, causal=True, sinks="sinks")
+
+            # Output projection
+            attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim])
+            if self.use_qkv_bias:
+                out_flat = g.matmul_bias(attn_flat, "out_weight", "out_bias", transpose="NT")
+            else:
+                out_flat = g.matmul(attn_flat, "out_weight", transpose="NT")
+            out = g.view(out_flat, shape=[B, T, self.C])
+
+            return out

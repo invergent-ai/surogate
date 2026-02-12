@@ -384,7 +384,7 @@ TEST_CASE("moe_topk_forward fp32 matches CPU", "[moe][topk]") {
         thrust::raw_pointer_cast(d_weights.data()),
         thrust::raw_pointer_cast(d_scores.data()),
         nullptr,  // no correction bias
-        num_tokens, num_experts, top_k, normalize, 0
+        num_tokens, num_experts, top_k, normalize, false, false, 0.0f, 0
     );
 
     std::vector<int> h_indices = from_device(d_indices);
@@ -739,7 +739,7 @@ TEST_CASE("moe full forward pass integration", "[moe][integration]") {
         thrust::raw_pointer_cast(d_routing_weights.data()),
         thrust::raw_pointer_cast(d_probs.data()),
         nullptr,  // no correction bias
-        num_tokens, num_experts, top_k, true, 0
+        num_tokens, num_experts, top_k, true, false, false, 0.0f, 0
     );
 
     // GPU permute

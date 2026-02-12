@@ -37,8 +37,6 @@ namespace nvfp4_4o6_impl {
 
 // Constants
 constexpr int kBlockSize = 16;
-constexpr float kFP4Max = 6.0f;
-constexpr float kFP8E4M3Max = 448.0f;
 
 // For 4/6 adaptive quantization, we use tensor scale = 1536 (= 384 * 4).
 // This is different from standard NVFP4 which uses 2688 (= 448 * 6).

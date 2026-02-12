@@ -1,11 +1,15 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
+#include "runtime/dsl/dsl_param_store.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -45,8 +49,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-        auto it_saved = mMoESavedBuffers.find(key);
-        if (it_saved != mMoESavedBuffers.end() && it_saved->second != nullptr) {
+        auto it_saved = mMoeSavedBuffers.find(key);
+        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
@@ -90,6 +94,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
         ? static_cast<int>(mConfig.MoeIntermediateSize)
         : static_cast<int>(mConfig.IntermediateSize);
+    const bool gate_up_interleaved = op.attrs.gate_up_interleaved;
     const int weight_experts = (weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts;
     const bool offsets_owned = mRunState.Stack.owns(expert_offsets.Data);
     if (offsets_owned && !mRunState.Stack.is_live(expert_offsets.Data)) {
@@ -122,7 +127,15 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             }
         }
         if (bad > 0 || oob > 0 || last != total_tokens) {
-            throw std::runtime_error("moe_grouped_gemm_gate_up: expert_offsets invalid");
+            std::string msg = "moe_grouped_gemm_gate_up: expert_offsets invalid (layer=";
+            msg += std::to_string(layer_idx_any);
+            msg += ", bad=" + std::to_string(bad);
+            msg += ", oob=" + std::to_string(oob);
+            msg += ", last=" + std::to_string(last);
+            msg += ", total_tokens=" + std::to_string(total_tokens);
+            msg += ", num_experts=" + std::to_string(num_experts);
+            msg += ")";
+            throw std::runtime_error(msg);
         }
     }
 
@@ -244,6 +257,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             const bool training = mLoRARunState->is_training;
             const long total_tokens_l = total_tokens;
             const int total_tokens_i = static_cast<int>(total_tokens_l);
+            const int micro_step = mLoRARunState->micro_step;
+            bool lora_applied = false;
 
             auto get_dropout_seed = [&](int proj_type) -> unsigned int {
                 return mLoRARunState->dropout_base_seed
@@ -301,32 +316,68 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
 
             if (total_tokens_i > 0 && rank > 0) {
                 Tensor lora_intermediate = view_or_temp(mLoRARunState->moe_lora_intermediate1, total_tokens_l, rank);
-                Tensor lora_gate = view_or_temp(mLoRARunState->moe_lora_gate, total_tokens_l, intermediate_size);
-                Tensor lora_up = view_or_temp(mLoRARunState->moe_lora_up, total_tokens_l, intermediate_size);
+                const bool has_gate_up = grouped.gate_up.has_value() && grouped.gate_up->has_value();
 
-                if (grouped.gate.has_value() && grouped.gate->has_value()) {
-                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate->A,
+                if (has_gate_up) {
+                    Tensor lora_gate_up = view_or_temp(mLoRARunState->moe_lora_gate_up, total_tokens_l, gate_up_dim);
+                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate_up->A,
                                           rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
-                    scale_and_dropout(lora_intermediate, get_dropout_seed(5));
-                    dispatch_grouped_gemm(lora_gate, lora_intermediate, grouped.gate->B,
-                                          intermediate_size, rank, 1.0f, 0.0f, EMMTranspose::TN);
-                    add_2d_slice(out, lora_gate, total_tokens_l, gate_up_dim, intermediate_size,
-                                 /*dst_col_offset=*/intermediate_size, mRunState.MainStream);
-                }
+                    scale_and_dropout(lora_intermediate, get_dropout_seed(7));
+                    dispatch_grouped_gemm(lora_gate_up, lora_intermediate, grouped.gate_up->B,
+                                          gate_up_dim, rank, 1.0f, 0.0f, EMMTranspose::TN);
+                    vector_add_sr(out, out, lora_gate_up, 1.0f, out.nelem(), /*seed=*/0, mRunState.MainStream);
+                    lora_applied = true;
+                } else {
+                    Tensor lora_gate = view_or_temp(mLoRARunState->moe_lora_gate, total_tokens_l, intermediate_size);
+                    Tensor lora_up = view_or_temp(mLoRARunState->moe_lora_up, total_tokens_l, intermediate_size);
 
-                if (grouped.up.has_value() && grouped.up->has_value()) {
-                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.up->A,
-                                          rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
-                    scale_and_dropout(lora_intermediate, get_dropout_seed(4));
-                    dispatch_grouped_gemm(lora_up, lora_intermediate, grouped.up->B,
-                                          intermediate_size, rank, 1.0f, 0.0f, EMMTranspose::TN);
-                    add_2d_slice(out, lora_up, total_tokens_l, gate_up_dim, intermediate_size,
-                                 /*dst_col_offset=*/0, mRunState.MainStream);
+                    bool has_gate = false;
+                    bool has_up = false;
+
+                    if (grouped.gate.has_value() && grouped.gate->has_value()) {
+                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate->A,
+                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        scale_and_dropout(lora_intermediate, get_dropout_seed(5));
+                        dispatch_grouped_gemm(lora_gate, lora_intermediate, grouped.gate->B,
+                                              intermediate_size, rank, 1.0f, 0.0f, EMMTranspose::TN);
+                        has_gate = true;
+                        if (!gate_up_interleaved) {
+                            add_2d_slice(out, lora_gate, total_tokens_l, gate_up_dim, intermediate_size,
+                                         /*dst_col_offset=*/intermediate_size, mRunState.MainStream);
+                        }
+                    }
+
+                    if (grouped.up.has_value() && grouped.up->has_value()) {
+                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.up->A,
+                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        scale_and_dropout(lora_intermediate, get_dropout_seed(4));
+                        dispatch_grouped_gemm(lora_up, lora_intermediate, grouped.up->B,
+                                              intermediate_size, rank, 1.0f, 0.0f, EMMTranspose::TN);
+                        has_up = true;
+                        if (!gate_up_interleaved) {
+                            add_2d_slice(out, lora_up, total_tokens_l, gate_up_dim, intermediate_size,
+                                         /*dst_col_offset=*/0, mRunState.MainStream);
+                        }
+                    }
+
+                    if (gate_up_interleaved) {
+                        if (has_gate && has_up) {
+                            add_gate_up_interleaved(out, lora_up, lora_gate,
+                                                    total_tokens_i, intermediate_size, mRunState.MainStream);
+                        } else if (has_gate) {
+                            add_gate_up_interleaved_gate(out, lora_gate,
+                                                         total_tokens_i, intermediate_size, mRunState.MainStream);
+                        } else if (has_up) {
+                            add_gate_up_interleaved_up(out, lora_up,
+                                                       total_tokens_i, intermediate_size, mRunState.MainStream);
+                        }
+                    }
+                    lora_applied = has_gate || has_up;
                 }
             }
         }
     }
-
+    
     mTensorMap[op.outputs[0].name] = out;
 }
 
@@ -335,6 +386,18 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     Tensor& inp = resolve_tensor(op.inputs[1]);
     Tensor& weights = resolve_tensor(op.inputs[2]);
     Tensor& d_input = ensure_output_tensor(op.outputs[0]);
+    Tensor* d_input_ptr = &d_input;
+    const long expected_nelem = static_cast<long>(inp.nelem());
+    if (d_input_ptr->nelem() != expected_nelem) {
+        std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
+        Tensor tmp = mRunState.temp_alloc(inp.DType, shape);
+        mTemps.push_back(tmp);
+        auto [it, _] = mTensorMap.insert_or_assign(op.outputs[0].name, tmp);
+        d_input_ptr = &it->second;
+    }
+    if (d_input_ptr->Device == -1 && mRunState.Stack.owns(d_input_ptr->Data)) {
+        d_input_ptr->Device = mRunState.Stack.device_id();
+    }
 
     // Get expert offsets from stored state (per-layer when available).
     Tensor* expert_offsets_ptr = nullptr;
@@ -354,8 +417,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
 
     if (layer_idx >= 0) {
         const std::string key = "blocks[" + std::to_string(layer_idx) + "].moe_expert_offsets";
-        auto it = mMoESavedBuffers.find(key);
-        if (it != mMoESavedBuffers.end() && it->second != nullptr) {
+        auto it = mMoeSavedBuffers.find(key);
+        if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
@@ -391,36 +454,91 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                                                     "moe_grouped_gemm_gate_up_backward");
     const bool weight_is_compact = compact.weight_is_compact;
     const int* host_offsets_ptr = compact.host_offsets.empty() ? nullptr : compact.host_offsets.data();
+    if (!host_offsets_ptr &&
+        layer_idx == static_cast<int>(mConfig.NumLayers) - 1 &&
+        mMoEExpertOffsetsData.size() == static_cast<std::size_t>(num_experts + 1)) {
+        host_offsets_ptr = mMoEExpertOffsetsData.data();
+    }
+    std::vector<int> host_offsets_sanitized;
+    if (host_offsets_ptr && num_experts > 0) {
+        const long total_tokens = d_gate_up.Sizes[0];
+        bool valid = (host_offsets_ptr[0] == 0);
+        int last = host_offsets_ptr[0];
+        for (int e = 1; e <= num_experts && valid; ++e) {
+            int v = host_offsets_ptr[e];
+            if (v < last || v < 0 || v > total_tokens) {
+                valid = false;
+                break;
+            }
+            last = v;
+        }
+        if (valid && last != total_tokens) {
+            valid = false;
+        }
+        if (!valid) {
+            host_offsets_sanitized.assign(static_cast<std::size_t>(num_experts + 1), 0);
+            const int clamped_total = static_cast<int>(total_tokens);
+            host_offsets_sanitized[1] = clamped_total;
+            for (int e = 2; e <= num_experts; ++e) {
+                host_offsets_sanitized[e] = clamped_total;
+            }
+            host_offsets_ptr = host_offsets_sanitized.data();
+        }
+    }
     const int* active_ptr = compact.active_experts.empty() ? nullptr : compact.active_experts.data();
     const int num_active = compact.num_active;
 
     // Refresh MoE experts for this layer (selective dequant) before using weights in backward.
-    if (!compact.host_offsets.empty()) {
-        (void)refresh_moe_experts_if_needed(layer_idx,
-                                            compact.host_offsets.data(),
-                                            num_experts,
-                                            mWeights,
-                                            mRunState.MainStream);
-    } else {
-        // Fallback: copy offsets to host for selection.
-        std::vector<int> host_offsets_fallback(static_cast<std::size_t>(num_experts + 1), 0);
-        CUDA_CHECK(cudaMemcpyAsync(host_offsets_fallback.data(),
-                                   expert_offsets_ptr->get<int>(),
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        (void)refresh_moe_experts_if_needed(layer_idx,
-                                            host_offsets_fallback.data(),
-                                            num_experts,
-                                            mWeights,
-                                            mRunState.MainStream);
+    if (mWeights.qlora_provider()) {
+        if (!compact.host_offsets.empty()) {
+            (void)refresh_moe_experts_if_needed(layer_idx,
+                                                compact.host_offsets.data(),
+                                                num_experts,
+                                                mWeights,
+                                                mRunState.MainStream);
+        } else {
+            // Fallback: copy offsets to host for selection.
+            std::vector<int> host_offsets_fallback(static_cast<std::size_t>(num_experts + 1), 0);
+            CUDA_CHECK(cudaMemcpyAsync(host_offsets_fallback.data(),
+                                       expert_offsets_ptr->get<int>(),
+                                       static_cast<std::size_t>(num_experts + 1) * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            (void)refresh_moe_experts_if_needed(layer_idx,
+                                                host_offsets_fallback.data(),
+                                                num_experts,
+                                                mWeights,
+                                                mRunState.MainStream);
+        }
     }
 
-    if (weight_is_compact && compact.active_experts.empty()) {
-        fill_zero(d_input, mRunState.MainStream);
+    const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState &&
+                              mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
+                              layer_idx >= 0;
+    bool skip_base_backward = false;
+    if (lora_enabled &&
+        mRunState.is_lora_only_mode() &&
+        mRunState.is_prequantized() &&
+        mConfig.Architecture == PretrainedConfig::GPT_OSS) {
+        const char* env = std::getenv("SUROGATE_PREQUANT_BASE_GRAD");
+        const bool allow_base_grad = (env && *env && std::string(env) != "0");
+        skip_base_backward = !allow_base_grad;
+    }
+
+    auto zero_d_input = [&]() {
+        if (!d_input_ptr->Data || d_input_ptr->bytes() == 0) return;
+        if (d_input_ptr->Device == -1 && mRunState.Stack.owns(d_input_ptr->Data)) {
+            CUDA_CHECK(cudaMemsetAsync(d_input_ptr->Data, 0, d_input_ptr->bytes(), mRunState.MainStream));
+        } else {
+            fill_zero(*d_input_ptr, mRunState.MainStream);
+        }
+    };
+
+    if (skip_base_backward || (weight_is_compact && compact.active_experts.empty())) {
+        zero_d_input();
     } else if (d_gate_up.DType == ETensorDType::BF16) {
-        moe_grouped_gemm_gate_up_backward(d_input.get<nv_bfloat16>(),
+        moe_grouped_gemm_gate_up_backward(d_input_ptr->get<nv_bfloat16>(),
                                           d_gate_up.get<nv_bfloat16>(),
                                           weights.get<nv_bfloat16>(),
                                           expert_offsets_ptr->get<int>(),
@@ -431,7 +549,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                                           weight_is_compact,
                                           num_active);
     } else {
-        moe_grouped_gemm_gate_up_backward(d_input.get<float>(),
+        moe_grouped_gemm_gate_up_backward(d_input_ptr->get<float>(),
                                           d_gate_up.get<float>(),
                                           weights.get<float>(),
                                           expert_offsets_ptr->get<int>(),
@@ -444,9 +562,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     }
 
     // Apply grouped MoE LoRA backward (gate/up) when enabled.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState &&
-        mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
-        layer_idx >= 0) {
+    if (lora_enabled) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx, mRunState.MainStream);
         if (lora_block.moe.use_grouped) {
             const auto& grouped = lora_block.moe.grouped;
@@ -550,61 +666,88 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             const float grad_beta = lora_accum ? 1.0f : 0.0f;
 
             if (total_tokens_i > 0 && rank > 0) {
-                Tensor d_up = view_or_temp(mLoRARunState->moe_lora_up, total_tokens_l, intermediate_size);
-                Tensor d_gate = view_or_temp(mLoRARunState->moe_lora_gate, total_tokens_l, intermediate_size);
                 Tensor lora_intermediate = view_or_temp(mLoRARunState->moe_lora_intermediate1, total_tokens_l, rank);
+                const int gate_up_dim = 2 * intermediate_size;
+                const bool has_gate_up = grouped.gate_up.has_value() && grouped.gate_up->has_value();
 
-                split_gate_up(d_gate_up, d_up, d_gate, total_tokens_i, intermediate_size, mRunState.MainStream);
-
-                // Gate projection
-                if (grouped.gate.has_value() && grouped.gate->has_value()) {
-                    const unsigned int seed_gate = get_dropout_seed(5);
-                    // intermediate = x @ A^T
-                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate->A,
+                if (has_gate_up) {
+                    const unsigned int seed_gate_up = get_dropout_seed(7);
+                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate_up->A,
                                           rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
-                    scale_and_dropout(lora_intermediate, seed_gate);
-                    if (lora_grads && lora_grads->moe.grouped.gate.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.gate->B, d_gate, lora_intermediate,
-                                             intermediate_size, rank, grad_beta);
+                    scale_and_dropout(lora_intermediate, seed_gate_up);
+                    if (lora_grads && lora_grads->moe.grouped.gate_up.has_value()) {
+                        dispatch_weight_grad(lora_grads->moe.grouped.gate_up->B, d_gate_up, lora_intermediate,
+                                             gate_up_dim, rank, grad_beta);
                     }
-                    // intermediate = d_gate @ B
-                    dispatch_grouped_gemm(lora_intermediate, d_gate, grouped.gate->B,
-                                          rank, intermediate_size, 1.0f, 0.0f, EMMTranspose::NN);
-                    scale_and_dropout(lora_intermediate, seed_gate);
-                    if (lora_grads && lora_grads->moe.grouped.gate.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.gate->A, lora_intermediate, inp,
+                    dispatch_grouped_gemm(lora_intermediate, d_gate_up, grouped.gate_up->B,
+                                          rank, gate_up_dim, 1.0f, 0.0f, EMMTranspose::NN);
+                    scale_and_dropout(lora_intermediate, seed_gate_up);
+                    if (lora_grads && lora_grads->moe.grouped.gate_up.has_value()) {
+                        dispatch_weight_grad(lora_grads->moe.grouped.gate_up->A, lora_intermediate, inp,
                                              rank, hidden_size, grad_beta);
                     }
-                    // dx += intermediate @ A
-                    dispatch_grouped_gemm(d_input, lora_intermediate, grouped.gate->A,
+                    dispatch_grouped_gemm(*d_input_ptr, lora_intermediate, grouped.gate_up->A,
                                           hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
-                }
+                } else {
+                    Tensor d_up = view_or_temp(mLoRARunState->moe_lora_up, total_tokens_l, intermediate_size);
+                    Tensor d_gate = view_or_temp(mLoRARunState->moe_lora_gate, total_tokens_l, intermediate_size);
 
-                // Up projection
-                if (grouped.up.has_value() && grouped.up->has_value()) {
-                    const unsigned int seed_up = get_dropout_seed(4);
-                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.up->A,
-                                          rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
-                    scale_and_dropout(lora_intermediate, seed_up);
-                    if (lora_grads && lora_grads->moe.grouped.up.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.up->B, d_up, lora_intermediate,
-                                             intermediate_size, rank, grad_beta);
+                    if (op.attrs.gate_up_interleaved) {
+                        split_gate_up_interleaved(d_gate_up, d_up, d_gate, total_tokens_i, intermediate_size, mRunState.MainStream);
+                    } else {
+                        split_gate_up(d_gate_up, d_up, d_gate, total_tokens_i, intermediate_size, mRunState.MainStream);
                     }
-                    dispatch_grouped_gemm(lora_intermediate, d_up, grouped.up->B,
-                                          rank, intermediate_size, 1.0f, 0.0f, EMMTranspose::NN);
-                    scale_and_dropout(lora_intermediate, seed_up);
-                    if (lora_grads && lora_grads->moe.grouped.up.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.up->A, lora_intermediate, inp,
-                                             rank, hidden_size, grad_beta);
+
+                    // Gate projection
+                    if (grouped.gate.has_value() && grouped.gate->has_value()) {
+                        const unsigned int seed_gate = get_dropout_seed(5);
+                        // intermediate = x @ A^T
+                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate->A,
+                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        scale_and_dropout(lora_intermediate, seed_gate);
+                        if (lora_grads && lora_grads->moe.grouped.gate.has_value()) {
+                            dispatch_weight_grad(lora_grads->moe.grouped.gate->B, d_gate, lora_intermediate,
+                                                 intermediate_size, rank, grad_beta);
+                        }
+                        // intermediate = d_gate @ B
+                        dispatch_grouped_gemm(lora_intermediate, d_gate, grouped.gate->B,
+                                              rank, intermediate_size, 1.0f, 0.0f, EMMTranspose::NN);
+                        scale_and_dropout(lora_intermediate, seed_gate);
+                        if (lora_grads && lora_grads->moe.grouped.gate.has_value()) {
+                            dispatch_weight_grad(lora_grads->moe.grouped.gate->A, lora_intermediate, inp,
+                                                 rank, hidden_size, grad_beta);
+                        }
+                        // dx += intermediate @ A
+                        dispatch_grouped_gemm(*d_input_ptr, lora_intermediate, grouped.gate->A,
+                                              hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
                     }
-                    dispatch_grouped_gemm(d_input, lora_intermediate, grouped.up->A,
-                                          hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
+
+                    // Up projection
+                    if (grouped.up.has_value() && grouped.up->has_value()) {
+                        const unsigned int seed_up = get_dropout_seed(4);
+                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.up->A,
+                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        scale_and_dropout(lora_intermediate, seed_up);
+                        if (lora_grads && lora_grads->moe.grouped.up.has_value()) {
+                            dispatch_weight_grad(lora_grads->moe.grouped.up->B, d_up, lora_intermediate,
+                                                 intermediate_size, rank, grad_beta);
+                        }
+                        dispatch_grouped_gemm(lora_intermediate, d_up, grouped.up->B,
+                                              rank, intermediate_size, 1.0f, 0.0f, EMMTranspose::NN);
+                        scale_and_dropout(lora_intermediate, seed_up);
+                        if (lora_grads && lora_grads->moe.grouped.up.has_value()) {
+                            dispatch_weight_grad(lora_grads->moe.grouped.up->A, lora_intermediate, inp,
+                                                 rank, hidden_size, grad_beta);
+                        }
+                        dispatch_grouped_gemm(*d_input_ptr, lora_intermediate, grouped.up->A,
+                                              hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
+                    }
                 }
             }
         }
     }
 
-    mTensorMap[op.outputs[0].name] = d_input;
+    mTensorMap[op.outputs[0].name] = *d_input_ptr;
 
     // Weight gradient computation would go here if needed (for fine-tuning experts)
 }
