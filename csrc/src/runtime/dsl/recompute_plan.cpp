@@ -2533,31 +2533,21 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             continue;
         }
         if (op.policy == RecomputePolicy::FftOnly && lora_only_mode) {
-            // Avoid recomputing attention outputs in LoRA mode only when we have a single
-            // micro-step. With gradient accumulation, we must recompute per micro-step
-            // to avoid stale attention activations from micro-step 0.
-            if (op.op_type == "flash_attention" && ctx.rs.GradAccumSteps <= 1) {
+            // Avoid recomputing attention outputs in LoRA mode.
+            // LoRA O-proj backward expects the original forward attention activations.
+            if (op.op_type == "flash_attention") {
                 continue;
             }
         }
-        // In FFT mode, we MUST recompute all activations for each micro-step.
-        // The saved tensors contain micro-step 0's activations, which are WRONG for subsequent
-        // micro-steps during gradient accumulation. Skipping recompute causes flash attention
-        // backward to receive stale activations (from micro-step 0) with correct d_out (from
-        // current micro-step), resulting in gradient explosion.
-        //
-        // The original logic skipped lora_only ops in FFT mode to "use saved tensors instead",
-        // but this only works with gradient_accumulation_steps=1.
-        //
-        // if (op.policy == RecomputePolicy::LoraOnly && !lora_only_mode) {
-        //     continue;  // WRONG: causes gradient explosion with grad accum > 1
-        // }
+        // NOTE: Each micro-step performs its own forward+backward pair, so saved
+        // activations are always fresh for the current micro-step's backward pass.
+        // There is no cross-micro-step staleness — persist_saved_layer_tensors()
+        // copies stack-backed tensors to persistent storage at layer boundaries
+        // before they can be overwritten by subsequent layers.
         // In LoRA mode, only skip recompute for non-deterministic ops that must reuse
         // the original forward activations (e.g., flash_attention outputs for O-proj).
         if (lora_only_mode && !op.lora_targets.empty() && op.op_type == "flash_attention") {
-            if (ctx.rs.GradAccumSteps <= 1) {
-                continue;
-            }
+            continue;
         }
 
         // In hybrid models, the recompute plan contains ops for all block types
