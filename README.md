@@ -132,6 +132,10 @@ surogate sft config.yaml
 
 ---
 
+Harness the full power of **Surogate** with **[Surogate Studio](https://github.com/invergent-ai/surogate-studio)** — a fully visual, easy-to-use platform for fine-tuning, deployment, evaluation, and production LLMOps.
+
+---
+
 ## Contributing
 
 PRs and issues are welcome.
