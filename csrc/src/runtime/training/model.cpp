@@ -154,10 +154,11 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
     CUDA_CHECK(cudaEventRecord(OptimizerDone, MainStream));
     CUDA_CHECK(cudaStreamSynchronize(MainStream));
 
-    Tensor host_buffer = Allocator->allocate(ETensorDType::FP32, "host_buffer", EAllocationType::PINNED, {3});
+    Tensor host_buffer = Allocator->allocate(ETensorDType::FP32, "host_buffer", EAllocationType::PINNED, {4});
     NormHost = host_buffer.get<float>();
-    LossHost = host_buffer.get<float>() + 1;
-    AccuracyHost = host_buffer.get<float>() + 2;
+    GradScaleHost = host_buffer.get<float>() + 1;
+    LossHost = host_buffer.get<float>() + 2;
+    AccuracyHost = host_buffer.get<float>() + 3;
 }
 
 void destroy_cudnn_handle(cudnnHandle_t handle) noexcept;
@@ -228,6 +229,7 @@ IRunState::IRunState(IRunState&& other) noexcept
       ValidTokenCount(std::move(other.ValidTokenCount)),
       CorrectCount(std::move(other.CorrectCount)),
       NormHost(other.NormHost),
+      GradScaleHost(other.GradScaleHost),
       LossHost(other.LossHost),
       AccuracyHost(other.AccuracyHost),
       DeviceProp(other.DeviceProp),
@@ -268,6 +270,7 @@ IRunState::IRunState(IRunState&& other) noexcept
     other.TimingOptimizerStart = nullptr;
     other.TimingOptimizerEnd = nullptr;
     other.NormHost = nullptr;
+    other.GradScaleHost = nullptr;
     other.LossHost = nullptr;
     other.DeviceId = -1;
     other.GradAccumSteps = 1;

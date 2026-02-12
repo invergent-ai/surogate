@@ -222,6 +222,7 @@ public:
     Tensor CorrectCount;                // (1,) Int32 - count of correct predictions
 
     float* NormHost = nullptr;          // single value
+    float* GradScaleHost = nullptr;     // grad_scale for deferred NaN check
     float* LossHost = nullptr;          // single value
     float* AccuracyHost = nullptr;      // single value for accuracy
 

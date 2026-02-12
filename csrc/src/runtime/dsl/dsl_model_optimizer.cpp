@@ -67,15 +67,6 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
-    if (!stream_is_capturing(stream)) {
-        float grad_scale_host = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (!std::isfinite(grad_scale_host)) {
-            throw std::runtime_error("DslModel::update: grad_scale is NaN/Inf");
-        }
-    }
 
     if (!mAdamW8BitState->initialized) {
         if (stream_is_capturing(stream)) {
@@ -186,6 +177,13 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         mWeightManager->invalidate();
     }
 
+    // Deferred NaN check: norm kernel completed long ago, event sync is ~free
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
+        if (!std::isfinite(*rs.GradScaleHost)) {
+            throw std::runtime_error("DslModel::update: grad_scale is NaN/Inf");
+        }
+    }
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
@@ -221,15 +219,6 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
-    if (!stream_is_capturing(stream)) {
-        float grad_scale_host = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (!std::isfinite(grad_scale_host)) {
-            throw std::runtime_error("DslModel::update_adamw_8bit_graph: grad_scale is NaN/Inf");
-        }
-    }
 
     if (!mAdamW8BitState->initialized) {
         init_optimizer_state(stream);
@@ -334,6 +323,13 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
         mWeightManager->invalidate();
     }
 
+    // Deferred NaN check: norm kernel completed long ago, event sync is ~free
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
+        if (!std::isfinite(*rs.GradScaleHost)) {
+            throw std::runtime_error("DslModel::update_adamw_8bit_graph: grad_scale is NaN/Inf");
+        }
+    }
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
@@ -550,6 +546,12 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, 
     global_norm_sqrt(rs.scratch().norm_buffer.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
+    // Async copy grad_scale to pinned host memory for deferred NaN check (avoids cudaStreamSynchronize)
+    if (!capturing) {
+        CUDA_CHECK(cudaMemcpyAsync(rs.GradScaleHost,
+                                   rs.scratch().norm_buffer.template get<float>() + 1,
+                                   sizeof(float), cudaMemcpyDeviceToHost, stream));
+    }
     record_event_if_not_capturing(rs.NormDone, stream);
 }
 
@@ -757,15 +759,6 @@ void DslModel::update_normuon(NCCLCommunicator& comm, const optimizers::Optimize
 
     calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
-    if (!stream_is_capturing(stream)) {
-        float grad_scale_host = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (!std::isfinite(grad_scale_host)) {
-            throw std::runtime_error("DslModel::update_normuon: grad_scale is NaN/Inf");
-        }
-    }
 
     // Initialize state if needed
     if (!mFFTNorMuonState || !mFFTNorMuonState->initialized) {
@@ -925,6 +918,13 @@ void DslModel::update_normuon(NCCLCommunicator& comm, const optimizers::Optimize
         mWeightManager->invalidate();
     }
 
+    // Deferred NaN check: norm kernel completed long ago, event sync is ~free
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
+        if (!std::isfinite(*rs.GradScaleHost)) {
+            throw std::runtime_error("DslModel::update_normuon: grad_scale is NaN/Inf");
+        }
+    }
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
@@ -960,15 +960,6 @@ void DslModel::update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
 
     calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
-    if (!stream_is_capturing(stream)) {
-        float grad_scale_host = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&grad_scale_host, grad_scale, sizeof(float),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (!std::isfinite(grad_scale_host)) {
-            throw std::runtime_error("DslModel::update_normuon_graph: grad_scale is NaN/Inf");
-        }
-    }
 
     if (!mFFTNorMuonState->initialized) {
         init_normuon_state(stream);
@@ -1110,6 +1101,13 @@ void DslModel::update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
         mWeightManager->invalidate();
     }
 
+    // Deferred NaN check: norm kernel completed long ago, event sync is ~free
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
+        if (!std::isfinite(*rs.GradScaleHost)) {
+            throw std::runtime_error("DslModel::update_normuon_graph: grad_scale is NaN/Inf");
+        }
+    }
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
