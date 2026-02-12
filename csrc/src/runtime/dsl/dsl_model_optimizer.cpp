@@ -421,6 +421,10 @@ void DslModel::prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const o
             if (!mLoRAAdamW8BitState) {
                 throw std::logic_error("DslModel::prepare_optimizer_state_for_graph: LoRA optimizer state not allocated");
             }
+            if (!mLoRARunState->norm_ptrs_initialized) {
+                populate_lora_norm_pointers(comm, stream);
+                did_work = true;
+            }
             if (!mLoRAAdamW8BitState->initialized) {
                 initialize_lora_multi_tensor_state(comm, stream);
                 did_work = true;

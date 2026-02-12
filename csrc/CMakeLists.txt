@@ -506,6 +506,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/kernels/test-qk-norm-rope.cu
             src/testing/kernels/test-classifier.cu
             src/testing/kernels/test-grad-clip.cu
+            src/testing/kernels/test-multi-tensor-norm.cu
 
             # Quantization
             src/testing/quantization/test-qlora.cu

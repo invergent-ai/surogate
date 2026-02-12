@@ -33,6 +33,14 @@ struct LoRARunState {
     // These are set by the MoE block before calling expert hooks and read by the hook callback.
     // This avoids the need to pass activation pointers through the hook signature.
 
+    // Multi-tensor norm state (pre-allocated for CUDA graph compatibility).
+    // Populated once by populate_lora_norm_pointers(), reused every step.
+    Tensor norm_data_ptrs;      // device: void*[N] tensor data pointers
+    Tensor norm_sizes;           // device: size_t[N] element counts
+    Tensor norm_dtype_flags;     // device: int[N] dtype flags (0=FP32, 1=BF16)
+    int norm_num_tensors = 0;
+    bool norm_ptrs_initialized = false;
+
     // Dropout state: used to maintain consistent dropout masks between forward and backward passes
     bool is_training = true;              ///< Training mode (dropout applied) vs eval mode (no dropout)
     int micro_step = 0;                   ///< Current micro-step for seed computation

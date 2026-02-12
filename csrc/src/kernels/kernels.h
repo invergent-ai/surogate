@@ -596,6 +596,18 @@ void global_norm_sqrt_prescaled(float* out, float* out_cpu, float grad_clip,
                                  const float* amax_device,
                                  const cudaDeviceProp& dp, cudaStream_t stream);
 
+// Multi-tensor fused norm (reduces kernel launches from O(N) to O(1)).
+// dtype_flags: 0=FP32, 1=BF16 per tensor.
+void global_amax_multi_tensor(float* amax_out, const void* const* data_ptrs,
+                               const size_t* sizes, const int* dtype_flags,
+                               int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream);
+void global_norm_squared_prescaled_multi_tensor(float* out, const void* const* data_ptrs,
+                                                 const size_t* sizes, const int* dtype_flags,
+                                                 int num_tensors, const float* prescale_device,
+                                                 const cudaDeviceProp& dp, cudaStream_t stream);
+void global_norm_squared_multi_tensor(float* out, const void* const* data_ptrs,
+                                       const size_t* sizes, const int* dtype_flags,
+                                       int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream);
 
 // 8-bit AdamW optimizer - functions moved to runtime/adamw_8bit.h
 // Bring them into global namespace for backward compatibility

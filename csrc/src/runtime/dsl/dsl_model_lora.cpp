@@ -274,16 +274,101 @@ void DslModel::ensure_lora_run_state(NCCLCommunicator& comm, int B, int T) {
 
 // LoRA gradient norm calculation
 
+void DslModel::populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t stream) {
+    auto& lrs = *mLoRARunState;
+
+    std::vector<void*> h_data_ptrs;
+    std::vector<size_t> h_sizes;
+    std::vector<int> h_dtype_flags;
+
+    auto collect_tensor = [&](const Tensor& t) {
+        if (!t.Data) return;
+        h_data_ptrs.push_back(t.Data);
+        h_sizes.push_back(t.nelem());
+        h_dtype_flags.push_back(t.DType == ETensorDType::BF16 ? 1 : 0);
+    };
+
+    auto collect_layer = [&](const auto& layer) {
+        if (!layer.has_value()) return;
+        collect_tensor(layer->A);
+        collect_tensor(layer->B);
+    };
+
+    auto collect_grouped_layer = [&](const auto& layer) {
+        if (!layer.has_value()) return;
+        collect_tensor(layer->A);
+        collect_tensor(layer->B);
+    };
+
+    for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+        bool unused_acc = false;
+        auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
+
+        collect_layer(g.attention.q);
+        collect_layer(g.attention.k);
+        collect_layer(g.attention.v);
+        collect_layer(g.attention.o);
+        collect_layer(g.mlp.gate);
+        collect_layer(g.mlp.gate_up);
+        collect_layer(g.mlp.up);
+        collect_layer(g.mlp.down);
+
+        if (g.moe.use_grouped) {
+            collect_grouped_layer(g.moe.grouped.gate);
+            collect_grouped_layer(g.moe.grouped.gate_up);
+            collect_grouped_layer(g.moe.grouped.up);
+            collect_grouped_layer(g.moe.grouped.down);
+        } else {
+            for (auto& expert : g.moe.experts) {
+                collect_layer(expert.gate);
+                collect_layer(expert.gate_up);
+                collect_layer(expert.up);
+                collect_layer(expert.down);
+            }
+        }
+
+        if (g.moe.shared.has_value()) {
+            collect_layer(g.moe.shared->up);
+            collect_layer(g.moe.shared->down);
+        }
+
+        collect_layer(g.router);
+    }
+
+    lrs.norm_num_tensors = static_cast<int>(h_data_ptrs.size());
+    if (lrs.norm_num_tensors == 0) {
+        lrs.norm_ptrs_initialized = true;
+        return;
+    }
+
+    lrs.norm_data_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_norm_data_ptrs",
+        EAllocationType::ON_DEVICE, {(long)(lrs.norm_num_tensors * sizeof(void*))});
+    lrs.norm_sizes = mAllocator->allocate(ETensorDType::BYTE, "lora_norm_sizes",
+        EAllocationType::ON_DEVICE, {(long)(lrs.norm_num_tensors * sizeof(size_t))});
+    lrs.norm_dtype_flags = mAllocator->allocate(ETensorDType::INT32, "lora_norm_dtype_flags",
+        EAllocationType::ON_DEVICE, {(long)lrs.norm_num_tensors});
+
+    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_data_ptrs.Data, h_data_ptrs.data(),
+        h_data_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_sizes.Data, h_sizes.data(),
+        h_sizes.size() * sizeof(size_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_dtype_flags.Data, h_dtype_flags.data(),
+        h_dtype_flags.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+
+    lrs.norm_ptrs_initialized = true;
+}
+
 void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip) {
     if (!mLoRARunState || !mLoRAGrads) {
         throw std::logic_error("DslModel::calculate_lora_gradient_norm: LoRA state not initialized");
     }
     auto& rs = *mRunState;
+    auto& lrs = *mLoRARunState;
     cudaStream_t stream = rs.MainStream;
 
     internal::wait_event_if_not_capturing(stream, rs.BackwardDone);
 
-    Tensor& buf = mLoRARunState->norm_buffer;
+    Tensor& buf = lrs.norm_buffer;
     fill_zero(buf, stream);
 
     // Buffer layout: [0..N-1] block sums, [N] norm, [N+1] scale, [N+2] amax, [N+3] prescale
@@ -291,96 +376,20 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     float* amax_ptr = buf.template get<float>() + num_block_sums + 2;
     float* prescale_ptr = buf.template get<float>() + num_block_sums + 3;
 
-    // Collect all LoRA gradient tensors for the two-pass approach
-    auto collect_grad = [&](const Tensor& grad) {
-        if (!grad.Data) return;
-        // Pass 1: accumulate amax across all LoRA gradients
-        global_amax(amax_ptr, grad, grad.nelem(), rs.DeviceProp, stream);
-    };
+    const auto* data_ptrs = reinterpret_cast<const void* const*>(lrs.norm_data_ptrs.Data);
+    const auto* sizes = reinterpret_cast<const size_t*>(lrs.norm_sizes.Data);
+    const auto* dtype_flags = lrs.norm_dtype_flags.template get<int>();
 
-    for (int l = 0; l < mModelConfig.NumLayers; ++l) {
-        bool unused_acc = false;
-        auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-
-        if (g.attention.q.has_value()) { collect_grad(g.attention.q->A); collect_grad(g.attention.q->B); }
-        if (g.attention.k.has_value()) { collect_grad(g.attention.k->A); collect_grad(g.attention.k->B); }
-        if (g.attention.v.has_value()) { collect_grad(g.attention.v->A); collect_grad(g.attention.v->B); }
-        if (g.attention.o.has_value()) { collect_grad(g.attention.o->A); collect_grad(g.attention.o->B); }
-        if (g.mlp.gate.has_value()) { collect_grad(g.mlp.gate->A); collect_grad(g.mlp.gate->B); }
-        if (g.mlp.gate_up.has_value()) { collect_grad(g.mlp.gate_up->A); collect_grad(g.mlp.gate_up->B); }
-        if (g.mlp.up.has_value()) { collect_grad(g.mlp.up->A); collect_grad(g.mlp.up->B); }
-        if (g.mlp.down.has_value()) { collect_grad(g.mlp.down->A); collect_grad(g.mlp.down->B); }
-        if (g.moe.use_grouped) {
-            if (g.moe.grouped.gate.has_value()) {
-                collect_grad(g.moe.grouped.gate->A); collect_grad(g.moe.grouped.gate->B);
-            }
-            if (g.moe.grouped.gate_up.has_value()) {
-                collect_grad(g.moe.grouped.gate_up->A); collect_grad(g.moe.grouped.gate_up->B);
-            }
-            if (g.moe.grouped.up.has_value()) {
-                collect_grad(g.moe.grouped.up->A); collect_grad(g.moe.grouped.up->B);
-            }
-            if (g.moe.grouped.down.has_value()) {
-                collect_grad(g.moe.grouped.down->A); collect_grad(g.moe.grouped.down->B);
-            }
-        } else {
-            for (std::size_t ei = 0; ei < g.moe.experts.size(); ++ei) {
-                auto& expert = g.moe.experts[ei];
-                if (expert.gate.has_value()) {
-                    collect_grad(expert.gate->A); collect_grad(expert.gate->B);
-                }
-                if (expert.gate_up.has_value()) {
-                    collect_grad(expert.gate_up->A); collect_grad(expert.gate_up->B);
-                }
-                if (expert.up.has_value()) {
-                    collect_grad(expert.up->A); collect_grad(expert.up->B);
-                }
-                if (expert.down.has_value()) {
-                    collect_grad(expert.down->A); collect_grad(expert.down->B);
-                }
-            }
-        }
-        if (g.router.has_value()) {
-            collect_grad(g.router->A); collect_grad(g.router->B);
-        }
-    }
+    // Pass 1: fused amax across all LoRA gradients (1 kernel)
+    global_amax_multi_tensor(amax_ptr, data_ptrs, sizes, dtype_flags,
+                              lrs.norm_num_tensors, rs.DeviceProp, stream);
 
     // Compute prescale = 1/amax on device (no host sync needed)
     compute_prescale(prescale_ptr, amax_ptr, stream);
 
-    // Pass 2: compute prescaled squared norm sum((g / amax)^2)
-    auto norm_squared_prescaled = [&](const Tensor& grad) {
-        if (!grad.Data) return;
-        global_norm_squared_prescaled(buf.template get<float>(), grad, grad.nelem(), prescale_ptr, rs.DeviceProp, stream);
-    };
-
-    for (int l = 0; l < mModelConfig.NumLayers; ++l) {
-        bool unused_acc = false;
-        auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-
-        if (g.attention.q.has_value()) { norm_squared_prescaled(g.attention.q->A); norm_squared_prescaled(g.attention.q->B); }
-        if (g.attention.k.has_value()) { norm_squared_prescaled(g.attention.k->A); norm_squared_prescaled(g.attention.k->B); }
-        if (g.attention.v.has_value()) { norm_squared_prescaled(g.attention.v->A); norm_squared_prescaled(g.attention.v->B); }
-        if (g.attention.o.has_value()) { norm_squared_prescaled(g.attention.o->A); norm_squared_prescaled(g.attention.o->B); }
-        if (g.mlp.gate.has_value()) { norm_squared_prescaled(g.mlp.gate->A); norm_squared_prescaled(g.mlp.gate->B); }
-        if (g.mlp.gate_up.has_value()) { norm_squared_prescaled(g.mlp.gate_up->A); norm_squared_prescaled(g.mlp.gate_up->B); }
-        if (g.mlp.up.has_value()) { norm_squared_prescaled(g.mlp.up->A); norm_squared_prescaled(g.mlp.up->B); }
-        if (g.mlp.down.has_value()) { norm_squared_prescaled(g.mlp.down->A); norm_squared_prescaled(g.mlp.down->B); }
-        if (g.moe.use_grouped) {
-            if (g.moe.grouped.gate.has_value()) { norm_squared_prescaled(g.moe.grouped.gate->A); norm_squared_prescaled(g.moe.grouped.gate->B); }
-            if (g.moe.grouped.gate_up.has_value()) { norm_squared_prescaled(g.moe.grouped.gate_up->A); norm_squared_prescaled(g.moe.grouped.gate_up->B); }
-            if (g.moe.grouped.up.has_value()) { norm_squared_prescaled(g.moe.grouped.up->A); norm_squared_prescaled(g.moe.grouped.up->B); }
-            if (g.moe.grouped.down.has_value()) { norm_squared_prescaled(g.moe.grouped.down->A); norm_squared_prescaled(g.moe.grouped.down->B); }
-        } else {
-            for (const auto& expert : g.moe.experts) {
-                if (expert.gate.has_value()) { norm_squared_prescaled(expert.gate->A); norm_squared_prescaled(expert.gate->B); }
-                if (expert.gate_up.has_value()) { norm_squared_prescaled(expert.gate_up->A); norm_squared_prescaled(expert.gate_up->B); }
-                if (expert.up.has_value()) { norm_squared_prescaled(expert.up->A); norm_squared_prescaled(expert.up->B); }
-                if (expert.down.has_value()) { norm_squared_prescaled(expert.down->A); norm_squared_prescaled(expert.down->B); }
-            }
-        }
-        if (g.router.has_value()) { norm_squared_prescaled(g.router->A); norm_squared_prescaled(g.router->B); }
-    }
+    // Pass 2: fused prescaled norm² across all LoRA gradients (1 kernel)
+    global_norm_squared_prescaled_multi_tensor(buf.template get<float>(), data_ptrs, sizes, dtype_flags,
+                                               lrs.norm_num_tensors, prescale_ptr, rs.DeviceProp, stream);
 
     // Reduce partial block sums
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), num_block_sums, stream);
@@ -553,7 +562,10 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
     }
     auto& rs = *mRunState;
     cudaStream_t stream = rs.MainStream;
-   
+
+    if (!mLoRARunState->norm_ptrs_initialized) {
+        populate_lora_norm_pointers(comm, stream);
+    }
     calculate_lora_gradient_norm(comm, grad_clip);
     const float* grad_scale = mLoRARunState->norm_buffer.template get<float>() + 1;
 
@@ -630,7 +642,13 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
     }
     auto& rs = *mRunState;
     cudaStream_t stream = rs.MainStream;
-    
+
+    if (!mLoRARunState->norm_ptrs_initialized) {
+        if (internal::stream_is_capturing(stream)) {
+            throw std::runtime_error("DslModel::update_lora_adamw_8bit_graph: norm pointers must be initialized before capture");
+        }
+        populate_lora_norm_pointers(comm, stream);
+    }
     calculate_lora_gradient_norm(comm, grad_clip);
     const float* grad_scale = mLoRARunState->norm_buffer.template get<float>() + 1;
 
@@ -715,6 +733,9 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
     }
     auto& state = *mLoRANorMuonState;
 
+    if (!mLoRARunState->norm_ptrs_initialized) {
+        populate_lora_norm_pointers(comm, main_stream);
+    }
     calculate_lora_gradient_norm(comm, config.grad_clip);
 
     const float lr = config.normuon_lr > 0 ? config.normuon_lr : config.learning_rate;

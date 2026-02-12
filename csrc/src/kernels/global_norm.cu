@@ -520,3 +520,201 @@ void global_norm_sqrt_prescaled(float* out, float* out_cpu, float grad_clip,
     global_norm_sqrt_prescaled_kernel<<<1, 1, 0, stream>>>(out, out_cpu, grad_clip, valid_token_count, total_tokens, amax_device);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ----------------------------------------------------------------------------
+// Multi-tensor fused kernels
+//
+// Iterate an array of tensor pointers inside a single kernel, reducing kernel
+// launch overhead from O(N_tensors) to O(1). Each tensor has a dtype flag
+// (0=FP32, 1=BF16) to handle mixed-precision gradient tensors.
+
+/**
+ * @brief Fused amax across multiple tensors.
+ *
+ * Iterates all tensors in a single kernel. Each block processes elements
+ * across all tensors via grid-stride loop, then atomicMax to a single output.
+ */
+template<int BLOCK_SIZE>
+__global__ void global_amax_multi_tensor_kernel(
+    float* __restrict__ amax_out,
+    const void* const* __restrict__ data_ptrs,
+    const size_t* __restrict__ sizes,
+    const int* __restrict__ dtype_flags,
+    int num_tensors)
+{
+    const size_t grid_width = static_cast<size_t>(blockDim.x) * gridDim.x;
+    float local_max = 0.f;
+
+    for (int t = 0; t < num_tensors; ++t) {
+        const size_t count = sizes[t];
+        if (dtype_flags[t] == 1) {
+            const auto* data = static_cast<const nv_bfloat16*>(data_ptrs[t]);
+            for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
+                float val = fabsf((float)data[i]);
+                if (val > local_max) local_max = val;
+            }
+        } else {
+            const auto* data = static_cast<const float*>(data_ptrs[t]);
+            for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
+                float val = fabsf(data[i]);
+                if (val > local_max) local_max = val;
+            }
+        }
+    }
+
+    // Warp reduction (max)
+    cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+    auto warp = cooperative_groups::tiled_partition<32>(block);
+    for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+        float other = warp.shfl_xor(local_max, offset);
+        if (other > local_max) local_max = other;
+    }
+
+    __shared__ float shared_max[32];
+    if (warp.thread_rank() == 0) {
+        shared_max[warp.meta_group_rank()] = local_max;
+    }
+    __syncthreads();
+
+    if (warp.meta_group_rank() == 0) {
+        float val = warp.thread_rank() < warp.meta_group_size() ? shared_max[warp.thread_rank()] : 0.f;
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            float other = warp.shfl_xor(val, offset);
+            if (other > val) val = other;
+        }
+        if (threadIdx.x == 0) {
+            atomicMaxFloat(amax_out, val);
+        }
+    }
+}
+
+/**
+ * @brief Fused prescaled squared norm across multiple tensors.
+ *
+ * Computes sum((x * prescale)^2) across ALL tensors, writing per-block partial
+ * sums to out[blockIdx.x]. Downstream deterministic_sum + global_norm_sqrt_prescaled
+ * are unchanged.
+ */
+template<int BLOCK_SIZE>
+__global__ void global_norm_squared_prescaled_multi_tensor_kernel(
+    float* __restrict__ out,
+    const void* const* __restrict__ data_ptrs,
+    const size_t* __restrict__ sizes,
+    const int* __restrict__ dtype_flags,
+    int num_tensors,
+    const float* __restrict__ prescale_device)
+{
+    const float prescale = *prescale_device;
+    const size_t grid_width = static_cast<size_t>(blockDim.x) * gridDim.x;
+    float accumulator = 0.f;
+
+    for (int t = 0; t < num_tensors; ++t) {
+        const size_t count = sizes[t];
+        if (dtype_flags[t] == 1) {
+            const auto* data = static_cast<const nv_bfloat16*>(data_ptrs[t]);
+            for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
+                float val = (float)data[i] * prescale;
+                accumulator += val * val;
+            }
+        } else {
+            const auto* data = static_cast<const float*>(data_ptrs[t]);
+            for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
+                float val = data[i] * prescale;
+                accumulator += val * val;
+            }
+        }
+    }
+
+    cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+    auto warp = cooperative_groups::tiled_partition<32>(block);
+    accumulator = reduce_group_add(warp, accumulator);
+    __shared__ float shared_accumulator[32];
+    if (warp.thread_rank() == 0) {
+        shared_accumulator[warp.meta_group_rank()] = accumulator;
+    }
+    __syncthreads();
+    float total = warp.thread_rank() < warp.meta_group_size() ? shared_accumulator[warp.thread_rank()] : 0.f;
+    total = reduce_group_add(warp, total);
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = out[blockIdx.x] + total;
+    }
+}
+
+/**
+ * @brief Fused squared norm across multiple tensors (no prescale).
+ *
+ * For dense gradient norm computation. Accumulates sum(x^2) across all tensors.
+ */
+template<int BLOCK_SIZE>
+__global__ void global_norm_squared_multi_tensor_kernel(
+    float* __restrict__ out,
+    const void* const* __restrict__ data_ptrs,
+    const size_t* __restrict__ sizes,
+    const int* __restrict__ dtype_flags,
+    int num_tensors)
+{
+    const size_t grid_width = static_cast<size_t>(blockDim.x) * gridDim.x;
+    float accumulator = 0.f;
+
+    for (int t = 0; t < num_tensors; ++t) {
+        const size_t count = sizes[t];
+        if (dtype_flags[t] == 1) {
+            const auto* data = static_cast<const nv_bfloat16*>(data_ptrs[t]);
+            for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
+                accumulator += (float)data[i] * (float)data[i];
+            }
+        } else {
+            const auto* data = static_cast<const float*>(data_ptrs[t]);
+            for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
+                accumulator += data[i] * data[i];
+            }
+        }
+    }
+
+    cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+    auto warp = cooperative_groups::tiled_partition<32>(block);
+    accumulator = reduce_group_add(warp, accumulator);
+    __shared__ float shared_accumulator[32];
+    if (warp.thread_rank() == 0) {
+        shared_accumulator[warp.meta_group_rank()] = accumulator;
+    }
+    __syncthreads();
+    float total = warp.thread_rank() < warp.meta_group_size() ? shared_accumulator[warp.thread_rank()] : 0.f;
+    total = reduce_group_add(warp, total);
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = out[blockIdx.x] + total;
+    }
+}
+
+// --- Multi-tensor launchers ---
+
+void global_amax_multi_tensor(float* amax_out, const void* const* data_ptrs,
+                               const size_t* sizes, const int* dtype_flags,
+                               int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (num_tensors == 0) return;
+    const int grid_size = get_max_num_block_sums(dp);
+    global_amax_multi_tensor_kernel<512><<<grid_size, 512, 0, stream>>>(
+        amax_out, data_ptrs, sizes, dtype_flags, num_tensors);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void global_norm_squared_prescaled_multi_tensor(float* out, const void* const* data_ptrs,
+                                                 const size_t* sizes, const int* dtype_flags,
+                                                 int num_tensors, const float* prescale_device,
+                                                 const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (num_tensors == 0) return;
+    const int grid_size = get_max_num_block_sums(dp);
+    global_norm_squared_prescaled_multi_tensor_kernel<512><<<grid_size, 512, 0, stream>>>(
+        out, data_ptrs, sizes, dtype_flags, num_tensors, prescale_device);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void global_norm_squared_multi_tensor(float* out, const void* const* data_ptrs,
+                                       const size_t* sizes, const int* dtype_flags,
+                                       int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (num_tensors == 0) return;
+    const int grid_size = get_max_num_block_sums(dp);
+    global_norm_squared_multi_tensor_kernel<512><<<grid_size, 512, 0, stream>>>(
+        out, data_ptrs, sizes, dtype_flags, num_tensors);
+    CUDA_CHECK(cudaGetLastError());
+}

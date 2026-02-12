@@ -208,6 +208,7 @@ private:
                                       const float* opt_params, const int* opt_step);
     void update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
+    void populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t stream);
     void initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);
     void update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
 
