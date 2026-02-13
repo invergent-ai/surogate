@@ -144,6 +144,7 @@ private:
     std::function<void(sThreadContext& ctx)> fetch_work(sThreadContext& ctx);
     void run_work(std::function<void(sThreadContext& ctx)> work, int idx=-1);
     void main_loop(NCCLCommunicator& comm);
+    void print_timing_breakdown(int step, int micro_steps);
 };
 
 

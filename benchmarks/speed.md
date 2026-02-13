@@ -10,12 +10,15 @@
 | **Qwen3 8B**   | 3,4k        | 3,5k         | 4,2k          | 6,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           |
  
  ## GPU: 1x NVIDIA RTX 5090 32GB (tok/sec) (CUDA 12.9)
-| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate NF4 |
-| -------------- | ----------- | ------------ | ------------- | ------------ | ------------- | ------------ | ------------- | ------------ |
-| **Qwen3 0.6B** | 19,1k       | 22,1k        | 32,0k         | 38,2k        | 33,5k         | 41,5k        | 34,5k         | 29,7k        |
-| **Qwen3 1.7B** | 12k         | 12,6k        | 16k           | 22,4k        | 20,0k         | 25,1k        | 20,3k         | 15,2k        | x |
-| **Qwen3 4B**   | 6k          | 6.1k         | 7,1k          | 10,3k        | 9,1k          | 12,5k        | 9,4k          | 6.8k         | x |
-| **Qwen3 8B**   | 3,4k        | 3,5k         | 4,2k          | 6,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           | x |
+| Model                  | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate NF4 |
+| ---------------------- | ----------- | ------------ | ------------- | ------------ | ------------- | ------------ | ------------- | ------------ |
+| **Qwen3 0.6B**         | 19,1k       | 22,1k        | 32,0k         | 38,2k        | 33,5k         | 41,5k        | 34,5k         | 29,7k        |
+| **Qwen3 1.7B**         | 12k         | 12,6k        | 16k           | 22,4k        | 20,0k         | 25,1k        | 20,3k         | 15,2k        | x |
+| **Qwen3 4B**           | 6k          | 6.1k         | 7,1k          | 10,3k        | 9,1k          | 12,5k        | 9,4k          | 6.8k         | x |
+| **Qwen3 8B**           | 3,4k        | 3,5k         | 3,8k          | 5,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           | x |
+| **Qwen/Qwen3-30B-A3B** |             | 0.016k       | 0.3k          |              |               |              |               |              |   |
+
+
 
 * Across all model sizes, Surogate beats Unsloth by a large margin for every listed precision format.
 * Surogate FP4 is the best throughput option, delivering about +107% to +128% vs Unsloth NF4 across all model sizes
@@ -101,14 +104,15 @@ compute_cap
 
 
 ## GPU Memory Usage (Gb)
-| Model          | Unsloth NF4 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4          | Surogate NF4
-| -------------- | ----------- | ------------ | ------------- | ------------ | ---------------------- |
-| **Qwen3 0.6B** | 4.0         | 5.4          | 5.0           | 5.5          | 4.8                    |
-| **Qwen3 1.7B** | 5.0         | 8.8          | 7.4           | 9            | 6.9                    | 6.2
-| **Qwen3 4B**   | 7.6         | 16           | 12.0          | 16           | 10.7                   | 11
-| **Qwen3 8B**   | 11.8        | 27.0         | 32.0          | 27.3         | 17.5                   | 15
-| **Qwen3 14B**  | 11.8        | 43.0         | 59.0          | 42,6         | hang on 100% gpu usage |
-| **Qwen3 32B**  |             | 84,6         |               | 84.0         | 105                    |
+
+| Model          | Unsloth NF4 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4          | Surogate NF4 |
+| -------------- | ----------- | ------------ | ------------- | ------------ | ---------------------- | ------------ |
+| **Qwen3 0.6B** | 4.0         | 5.4          | 5.0           | 5.5          | 4.8                    |              |
+| **Qwen3 1.7B** | 5.0         | 8.8          | 7.4           | 9            | 6.9                    | 6.2          |
+| **Qwen3 4B**   | 7.6         | 16           | 12.0          | 16           | 10.7                   | 11           |
+| **Qwen3 8B**   | 11.8        | 27.0         | 32.0          | 27.3         | 17.5                   | 15           |
+| **Qwen3 14B**  | 11.8        | 43.0         | 59.0          | 42,6         | hang on 100% gpu usage |              |
+| **Qwen3 32B**  |             | 84,6         |               | 84.0         | 105                    |              |
 
 --
 

@@ -29,9 +29,55 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     Tensor& input = resolve_tensor(op.inputs[1]);
     Tensor& weight = resolve_tensor(op.inputs[2]);
 
-    Tensor& residual_out = ensure_output_tensor(op.outputs[0]);
+    // Detect norm type from weight name BEFORE resolving outputs.
+    // This allows binding output tensors directly to canonical buffers,
+    // eliminating post-kernel D2D copies.
+    int fwd_layer_idx = -1;
+    std::string fwd_field;
+    parse_block_param(op.inputs[2].name, fwd_layer_idx, fwd_field);
+
+    const bool is_ln2_fwd = (fwd_layer_idx >= 0 && fwd_field.find("ln2") != std::string::npos);
+    const bool is_hybrid_norm = (fwd_layer_idx >= 0 &&
+        fwd_layer_idx < static_cast<int>(mConfig.NumLayers) &&
+        mConfig.architecture == modules::ArchitectureType::Hybrid &&
+        fwd_field == "norm_weight");
+
+    // Bind residual_out directly to canonical buffer when possible, so the kernel
+    // writes there without a post-kernel D2D copy.
+    Tensor* residual_out_ptr = nullptr;
+    if (is_ln2_fwd) {
+        auto& buf = mRunState.simplified_acts(fwd_layer_idx).residual_att;
+        if (buf.Data) {
+            residual_out_ptr = &buf;
+            store_tensor(op.outputs[0], buf);
+        }
+    } else if (is_hybrid_norm) {
+        Tensor& buf = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
+        if (buf.Data) {
+            residual_out_ptr = &buf;
+            store_tensor(op.outputs[0], buf);
+        }
+    }
+    if (!residual_out_ptr) {
+        residual_out_ptr = &ensure_output_tensor(op.outputs[0]);
+    }
+    Tensor& residual_out = *residual_out_ptr;
+
     Tensor& y = ensure_output_tensor(op.outputs[1]);
-    Tensor& rstd = ensure_output_tensor(op.outputs[2]);
+
+    // Bind rstd to canonical buffer for Hybrid norm.
+    Tensor* rstd_ptr = nullptr;
+    if (is_hybrid_norm) {
+        Tensor& buf = mRunState.simplified_acts(fwd_layer_idx).ln1_rstd;
+        if (buf.Data) {
+            rstd_ptr = &buf;
+            store_tensor(op.outputs[2], buf);
+        }
+    }
+    if (!rstd_ptr) {
+        rstd_ptr = &ensure_output_tensor(op.outputs[2]);
+    }
+    Tensor& rstd = *rstd_ptr;
 
     // Validate dtypes before calling kernel
     if (rstd.DType != ETensorDType::FP32) {
@@ -45,48 +91,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
                                    op.attrs.eps, static_cast<int>(mB * mT),
                                    mConfig.HiddenSize, mRunState.MainStream);
-
-    // Hybrid/Nemotron blocks use a single norm ("norm_weight") and rely on the per-layer
-    // residual buffer (res_in) for backward/recompute. The graph output for res_in is
-    // often a temporary (e.g., layerN.res_in), so explicitly persist it here.
-    // Also persist rstd to the per-layer ln1_rstd slot for the same reason.
-    // Only applies to Hybrid architecture — skip parse_block_param for Dense/MoE models.
-    int norm_layer_idx = -1;
-    std::string norm_field;
-    if (mConfig.architecture == modules::ArchitectureType::Hybrid &&
-        parse_block_param(op.inputs[2].name, norm_layer_idx, norm_field) && norm_field == "norm_weight") {
-        if (norm_layer_idx >= 0 && norm_layer_idx < static_cast<int>(mConfig.NumLayers)) {
-            Tensor& res_buf = mRunState.get_residual(norm_layer_idx, mRunState.MainStream);
-            if (residual_out.Data && res_buf.Data && residual_out.Data != res_buf.Data) {
-                CUDA_CHECK(cudaMemcpyAsync(res_buf.Data, residual_out.Data, residual_out.bytes(),
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
-            }
-            // Persist rstd to the per-layer activation slot
-            Tensor& rstd_buf = mRunState.simplified_acts(norm_layer_idx).ln1_rstd;
-            if (rstd.Data && rstd_buf.Data && rstd.Data != rstd_buf.Data) {
-                CUDA_CHECK(cudaMemcpyAsync(rstd_buf.Data, rstd.Data, rstd.bytes(),
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
-            }
-        }
-    }
-
-    // For LN2 output (res_att), copy to simplified_acts.residual_att when the
-    // graph compiler assigned the wrong slot. This happens for the last layer where
-    // the output is named "StackedBlocks_N" instead of "blocks[N].res_att".
-    if (op.outputs[1].name.find("ln2") != std::string::npos) {
-        int layer_idx = -1;
-        std::string field;
-        parse_block_param(op.outputs[1].name, layer_idx, field);
-        if (layer_idx >= 0) {
-            auto& acts = mRunState.simplified_acts(layer_idx);
-            // If the output wasn't written to acts.residual_att, copy it there
-            if (residual_out.Data != acts.residual_att.Data && acts.residual_att.Data) {
-                CUDA_CHECK(cudaMemcpyAsync(acts.residual_att.Data, residual_out.Data,
-                                           residual_out.bytes(), cudaMemcpyDeviceToDevice,
-                                           mRunState.MainStream));
-            }
-        }
-    }
 }
 
 void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp& op) {
@@ -110,28 +114,18 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         parse_block_param(op.inputs[3].name, ln_layer_idx, ln_field);
     }
     if (ln_layer_idx >= 0 && ln_field == "ln1_weight") {
-        // LN1 backward expects residual_out from the forward fused residual op.
-        // In the DSL graph, residual_out is res_ffn for the SAME layer index.
-        // Ensure the correct per-layer residual buffer is used (especially with offloading).
         if (mRunState.has_residual_offloading()) {
             mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
         }
         residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
         rstd_ptr = &mRunState.simplified_acts(ln_layer_idx).ln1_rstd;
     } else if (ln_layer_idx >= 0 && ln_field == "norm_weight") {
-        // Hybrid/Nemotron single-norm blocks store res_in in the per-layer residual buffer.
-        // Use it instead of the ephemeral saved tensor.
         if (mRunState.has_residual_offloading()) {
             mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
         }
         residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
         rstd_ptr = &mRunState.simplified_acts(ln_layer_idx).ln1_rstd;
     }
-    // LN2 backward needs the saved/recomputed residual_att from simplified_acts.
-    // The backward graph may have wrong tensor names for the last layer (e.g., "StackedBlocks_N"
-    // instead of "blocks[N].res_att"), causing it to resolve to stale/wrong data.
-    // Always use the simplified_acts residual_att which is either saved (no recompute) or
-    // recomputed (with recompute) to ensure correct gradient computation.
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
         auto& acts = mRunState.simplified_acts(ln_layer_idx);
         residual_out_ptr = &acts.residual_att;
@@ -145,7 +139,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     if (!op.inputs[1].name.empty()) {
         d_residual_next = &resolve_tensor(op.inputs[1]);
     } else {
-        // Allocate and zero a temporary for d_residual if none provided
         d_residual_zero = mRunState.temp_alloc(d_y.DType, {mB, mT, static_cast<long>(mConfig.HiddenSize)});
         fill_zero(d_residual_zero, mRunState.MainStream);
         mTemps.push_back(d_residual_zero);
@@ -153,7 +146,34 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
     Tensor* d_residual_input = d_residual_next;
     Tensor* d_residual_stream = d_residual_next;
-    Tensor& d_input = ensure_output_tensor(op.outputs[1]);
+
+    // Resolve d_input to canonical gradient buffer BEFORE the kernel, so the kernel
+    // writes directly to the correct simplified_grads buffer. This eliminates
+    // post-kernel D2D copies that were mirroring data between graph slots and
+    // pre-allocated gradient buffers.
+    Tensor* d_input_ptr = nullptr;
+    if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
+        // LN2: canonical target is d_mlp_down (MLP backward reads this as d_out)
+        auto& grads = mRunState.simplified_grads(ln_layer_idx);
+        if (grads.d_mlp_down.Data) {
+            d_input_ptr = &grads.d_mlp_down;
+        }
+    } else if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight")) {
+        // LN1/norm: canonical target is prev layer's d_mlp_down
+        if (op.outputs.size() > 1 && op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
+            const int prev_layer = op.outputs[1].layer_idx;
+            if (prev_layer >= 0) {
+                auto& prev_grads = mRunState.simplified_grads(prev_layer);
+                if (prev_grads.d_mlp_down.Data) {
+                    d_input_ptr = &prev_grads.d_mlp_down;
+                }
+            }
+        }
+    }
+    if (!d_input_ptr) {
+        d_input_ptr = &ensure_output_tensor(op.outputs[1]);
+    }
+    Tensor& d_input = *d_input_ptr;
 
     // d_weight may be nullptr if weight is frozen
     Tensor dummy_weight{};
@@ -174,8 +194,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     const int C = mConfig.HiddenSize;
 
     // Determine abs_max pointer for FP8 gradient quantization.
-    // LN1 backward produces d_res_ffn (gradient for previous layer's residual).
-    // LN2 backward produces d_res_att (gradient for attention path).
     float* abs_max_ptr = nullptr;
     if (mRunState.has_grad_quants()) {
         const bool is_ln2 = (ln_field == "ln2_weight");
@@ -184,47 +202,42 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             : mRunState.simplified_quant_grads().d_res_ffn.abs_max();
     }
 
-
     rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
                      *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
                      abs_max_ptr,
                      static_cast<int>(mB), static_cast<int>(mT), C,
                      mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
 
-    // Copy d_input to d_residual if they're different outputs
+    // Register d_input in mTensors for both graph outputs. Both outputs carry the same
+    // gradient (add backward is identity for both inputs). Using store_tensor ensures
+    // downstream ops find the result via resolve_tensor (which checks mTensors first).
+    store_tensor(op.outputs[1], d_input);
     if (!op.outputs[0].name.empty() && op.outputs[0].name != op.outputs[1].name) {
-        Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
-        CUDA_CHECK(cudaMemcpyAsync(d_residual.Data, d_input.Data, d_input.bytes(),
-                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        store_tensor(op.outputs[0], d_input);
     }
 
-    // Update residual_out gradient buffer to include norm contribution.
+    // Safety net: update d_residual_stream if it points to a different buffer.
+    // With direct binding above, this is typically a no-op (pointers match).
     if (d_residual_stream && d_residual_stream->Data && d_residual_stream->Data != d_input.Data) {
         CUDA_CHECK(cudaMemcpyAsync(d_residual_stream->Data, d_input.Data, d_input.bytes(),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
 
-    // LN2 backward produces d_res_ffn (gradient for MLP down output). Mirror it into d_mlp_down
-    // so downstream matmul backward sees a valid d_out.
+    // Alias related gradient buffers so code reading simplified_grads directly
+    // (not via resolve_tensor/mTensors) sees the correct data.
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
-        Tensor& d_residual = ensure_output_tensor(op.outputs[0]);
-        Tensor& d_mlp_down = mRunState.simplified_grads(ln_layer_idx).d_mlp_down;
-
-        if (d_mlp_down.Data && d_mlp_down.Data != d_residual.Data) {
-            CUDA_CHECK(cudaMemcpyAsync(d_mlp_down.Data, d_residual.Data, d_residual.bytes(),
-                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        auto& grads = mRunState.simplified_grads(ln_layer_idx);
+        if (grads.d_res_ffn.Data && grads.d_res_ffn.Data != d_input.Data) {
+            grads.d_res_ffn.Data = d_input.Data;
         }
     }
-
-    // LN1 backward writes grad for previous layer's residual stream into d_mlp_down;
-    // mirror it into that layer's d_res_ffn so gradient propagation matches modular.
-    if (op.outputs.size() > 1 && op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
+    if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight") &&
+        op.outputs.size() > 1 && op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
         const int prev_layer = op.outputs[1].layer_idx;
         if (prev_layer >= 0) {
-            Tensor& d_res_ffn_prev = mRunState.simplified_grads(prev_layer).d_res_ffn;
-            if (d_res_ffn_prev.Data && d_res_ffn_prev.Data != d_input.Data) {
-                CUDA_CHECK(cudaMemcpyAsync(d_res_ffn_prev.Data, d_input.Data, d_input.bytes(),
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            auto& prev_grads = mRunState.simplified_grads(prev_layer);
+            if (prev_grads.d_res_ffn.Data && prev_grads.d_res_ffn.Data != d_input.Data) {
+                prev_grads.d_res_ffn.Data = d_input.Data;
             }
         }
     }

@@ -1426,6 +1426,26 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     const int tid = ref.tensor_id;
 
+    // Fast path: pre-allocated block slots with existing data bypass string parsing.
+    // This covers most activation and gradient outputs during forward/backward.
+    // Only Mapped/Temporary/Parameter/Saved slots need the string-heavy resolution below.
+    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Temporary &&
+        ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Saved) {
+        Tensor& t = resolve_tensor(ref);
+        if (t.Data) {
+            if (!ref.shape.empty()) {
+                Tensor view = view_tensor(t, ref.shape);
+                if (tid >= 0) {
+                    mTensors[static_cast<std::size_t>(tid)] = view;
+                    return mTensors[static_cast<std::size_t>(tid)];
+                }
+                return t;
+            }
+            return t;
+        }
+        // No data — fall through to slow path for alias resolution or temp allocation
+    }
+
     if (!ref.name.empty()) {
         if (auto base = base_param_from_grad(ref.name)) {
             bool accum = false;
@@ -2043,22 +2063,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     auto initial_checkpoint = mRunState.Stack.checkpoint();
     int last_layer_restored = -1;
     auto clear_shared_grads = [&](int layer_idx) {
-        if (!mRunState.large_bwd_temps_on_stack()) {
-            return;
-        }
-        if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
-            return;
-        }
-        auto& grads = mRunState.simplified_grads(layer_idx);
-        if (grads.d_ln2.Data) {
-            fill_zero(grads.d_ln2, mRunState.MainStream);
-        }
-        if (grads.d_att.Data) {
-            fill_zero(grads.d_att, mRunState.MainStream);
-        }
-        if (grads.d_ln1.Data) {
-            fill_zero(grads.d_ln1, mRunState.MainStream);
-        }
+        // No-op: d_ln2, d_att, d_ln1 are fully overwritten by their respective
+        // backward ops before being read. Gradient data flows through mTensors[],
+        // not through the pre-allocated simplified_grads buffers. The matmul backward
+        // only temporarily remaps these pointers during LoRA hooks, then restores them.
+        (void)layer_idx;
     };
     auto prune_stack_tensors = [&](int current_layer) {
         // Prune flat tensor vector using pre-computed metadata (no string parsing)

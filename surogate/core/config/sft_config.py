@@ -625,6 +625,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
             logger.info("[LoRA]: disabling CUDA graphs because recompute with offloaded residuals is not compatible with CUDA graphs.")
 
+        if self.debug_time_breakdown and self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            logger.info("[debug_time_breakdown]: disabling CUDA graphs for accurate per-phase timing.")
+
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,

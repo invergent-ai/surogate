@@ -402,17 +402,26 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         throw std::runtime_error(fmt::format("step: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
     }
 
-    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation](sThreadContext& ctx) {
+    const bool do_timing = mOptions.TriggerTimingEvents;
+    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation, do_timing](sThreadContext& ctx) {
+        auto& rs = ctx.Model->get_run_state();
+        if (do_timing && rs.TimingForwardStart.empty()) {
+            rs.setup_timing_events(micro_batches);
+        }
         Tensor inputs = ctx.Model->get_input_buffer();
         Tensor position_ids = ctx.Model->get_position_ids_buffer();
         Tensor targets = ctx.Model->get_target_buffer();
+        if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingForwardStart[micro_idx], rs.MainStream));
         ctx.Model->forward(inputs, position_ids, *ctx.Communicator, micro_idx);
-                    try {
-                ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
-            } catch (const std::exception& e) {
-                std::cerr << "backward threw: " << e.what() << std::endl;
-                throw;
-                    }
+        if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingForwardEnd[micro_idx], rs.MainStream));
+        if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardStart[micro_idx], rs.MainStream));
+        try {
+            ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
+        } catch (const std::exception& e) {
+            std::cerr << "backward threw: " << e.what() << std::endl;
+            throw;
+        }
+        if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardEnd[micro_idx], rs.MainStream));
     });
     ++mTrainMicroStep;
 }
@@ -525,10 +534,22 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t
  * @return Pair of (loss, grad_norm).
  */
 std::pair<float, float> MultiGPUPyTrainer::update_with_config(const optimizers::OptimizerConfig& config, int step) {
-    run_work([&](sThreadContext& ctx) {
+    const bool do_timing = mOptions.TriggerTimingEvents;
+    run_work([&, do_timing](sThreadContext& ctx) {
+        auto& rs = ctx.Model->get_run_state();
+        if (do_timing && rs.TimingOptimizerStart) {
+            CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerStart, rs.MainStream));
+        }
         ctx.Model->update_with_config(*ctx.Communicator, config, step + 1);
+        if (do_timing && rs.TimingOptimizerEnd) {
+            CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerEnd, rs.MainStream));
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
     });
+
+    if (do_timing) {
+        print_timing_breakdown(step, mGradAccumulation);
+    }
 
     float step_loss, step_norm;
     auto& ctx = mContexts.at(0);
@@ -666,12 +687,22 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         // If graphs are disabled or unsupported, fall back to eager execution.
         if (!mOptions.UseCudaGraphs) {
+            const bool do_timing = mOptions.TriggerTimingEvents;
+            if (do_timing && rs.TimingForwardStart.empty()) {
+                rs.setup_timing_events(micro_steps);
+            }
             for (int j = 0; j < micro_steps; ++j) {
                 rs.Targets_CPU = gs.targets[j];
+                if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingForwardStart[j], rs.MainStream));
                 ctx.Model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingForwardEnd[j], rs.MainStream));
+                if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardStart[j], rs.MainStream));
                 ctx.Model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+                if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardEnd[j], rs.MainStream));
             }
+            if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerStart, rs.MainStream));
             ctx.Model->update_with_config(*ctx.Communicator, config, opt_step_host);
+            if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerEnd, rs.MainStream));
             CUDA_CHECK(cudaDeviceSynchronize());
             return;
         }
@@ -775,6 +806,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
     }
 
+    if (mOptions.TriggerTimingEvents) {
+        print_timing_breakdown(step, micro_steps);
+    }
+
     auto& ctx = mContexts.at(0);
     float step_loss = ctx.Model->get_loss();
     float step_norm = ctx.Model->get_norm();
@@ -785,6 +820,50 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
     return {step_loss, step_norm};
 }
 
+
+/**
+ * @brief Print a per-phase timing breakdown for the last training step.
+ *
+ * Uses CUDA timing events recorded around forward, backward, and optimizer phases
+ * to compute and print elapsed time for each phase. Only reads events from rank 0.
+ *
+ * @param step Global step index (for display).
+ * @param micro_steps Number of gradient accumulation micro-steps.
+ */
+void MultiGPUPyTrainer::print_timing_breakdown(int step, int micro_steps) {
+    auto& rs = mContexts.at(0).Model->get_run_state();
+    const int n = std::min(micro_steps, static_cast<int>(rs.TimingForwardStart.size()));
+    if (n == 0) return;
+
+    float total_fwd_ms = 0, total_bwd_ms = 0, opt_ms = 0;
+    std::vector<float> fwd_ms(n), bwd_ms(n);
+
+    for (int j = 0; j < n; ++j) {
+        if (!rs.TimingForwardStart[j] || !rs.TimingForwardEnd[j]) break;
+        CUDA_CHECK(cudaEventElapsedTime(&fwd_ms[j], rs.TimingForwardStart[j], rs.TimingForwardEnd[j]));
+        total_fwd_ms += fwd_ms[j];
+        if (rs.TimingBackwardStart[j] && rs.TimingBackwardEnd[j]) {
+            CUDA_CHECK(cudaEventElapsedTime(&bwd_ms[j], rs.TimingBackwardStart[j], rs.TimingBackwardEnd[j]));
+            total_bwd_ms += bwd_ms[j];
+        }
+    }
+    if (rs.TimingOptimizerStart && rs.TimingOptimizerEnd) {
+        CUDA_CHECK(cudaEventElapsedTime(&opt_ms, rs.TimingOptimizerStart, rs.TimingOptimizerEnd));
+    }
+
+    float total_ms = total_fwd_ms + total_bwd_ms + opt_ms;
+    fprintf(stderr, "[Time Breakdown] step=%d  fwd: %.1fms  bwd: %.1fms  opt: %.1fms  total: %.1fms",
+            step, total_fwd_ms, total_bwd_ms, opt_ms, total_ms);
+
+    if (n > 1) {
+        fprintf(stderr, "\n");
+        for (int j = 0; j < n; ++j) {
+            fprintf(stderr, "  micro[%d] fwd: %.1fms  bwd: %.1fms\n", j, fwd_ms[j], bwd_ms[j]);
+        }
+    } else {
+        fprintf(stderr, "\n");
+    }
+}
 
 /**
  * @brief Query per-GPU utilization information for all ranks.
