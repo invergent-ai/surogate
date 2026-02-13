@@ -1,33 +1,33 @@
-<div align="center">
+<div align="center" style='background-color: #ffaf10; padding: 2rem; color: black;'>
 <a href="https://surogate.ai/">
-<img width="120" alt="Surogate logo" src="./assets/logo.jpg" />
+<img width="40%" alt="Surogate logo" src="./assets/logo-black.svg" />
 </a>
-<h1>Surogate</h1>
-<h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
+<h1>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h1>
 <br/>
-<a href="https://surogate.ai">Home</a> ·
-<a href="https://docs.surogate.ai">Docs</a> ·
-<a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
-<a href="./benchmarks/speed.md">Benchmarks</a>
+<div style="font-size: 16px; font-weight: bold;">
+<a style="color: black" href="https://surogate.ai">Home</a> ·
+<a style="color: black" href="https://docs.surogate.ai">Docs</a> ·
+<a style="color: black" href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
+<a style="color: black" href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a>
+</div>
 <br/><br/>
 
 [![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
 [![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
 [![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
-[![Twitter Follow](https://img.shields.io/twitter/follow/invergentai?style=social)](https://twitter.com/invergentai)
+[![Twitter Follow](https://img.shields.io/twitter/follow/surogate_ai?style=social)](https://x.com/surogate_ai)
 
-<b>If Surogate saves you time or GPUs, consider ⭐ starring ⭐ the repo.</b>
 </div>
 
 ---
 
 ## What is Surogate?
 
-Surogate is a **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and predictable multi-GPU/multi-Node scaling at scale.
+Surogate is a **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and multi-GPU/multi-Node training scaling at scale.
 
 By combining a native **C++/CUDA execution engine**, a low-overhead Python frontend, and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**. 
 
-See reproducible comparisons in [`./benchmarks`](./benchmarks/speed.md).
+See reproducible comparisons in [Benchmarks](https://docs.surogate.ai/reference/benchmarks).
 
 ---
 
@@ -44,7 +44,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
   - [**💎 BF16**](https://docs.surogate.ai/guides/precision-and-recipes#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
   - [**🔥 FP8**](https://docs.surogate.ai/guides/precision-and-recipes#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
   - [**🔥 NVFP4**](https://docs.surogate.ai/guides/precision-and-recipes#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- [**⚡ BnB/FP8/NVFP4 QLoRA**](https://docs.surogate.ai/guides/qlora) to maximize SOL on Hopper/Blackwell GPUs
+- [**⚡ BnB/FP8/NVFP4 QLoRA**](https://docs.surogate.ai/guides/qlora) Support for a variety of QLoRA configurations, including online quantization (FP8, NVFP4, BnB) or loading pre-quantized weights (FP8, NVFP4)
 - [**👌 Optimizers**](https://docs.surogate.ai/guides/optimizers): AdamW 8bit, !! NorMuon !!
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - [**🧪 Mixed-precision training**](https://docs.surogate.ai/guides/precision-and-recipes#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.

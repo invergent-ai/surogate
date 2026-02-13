@@ -11,7 +11,7 @@ max_steps: 50
 
 learning_rate: 2e-4
 
-recipe: bf16
+recipe: fp8-hybrid
 lmhead_chunks: 8
 warmup_ratio: 0.1
 

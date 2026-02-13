@@ -85,6 +85,11 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                                    cudaMemcpyDeviceToHost,
                                    mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+
+        // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
+        if (layer_idx_any >= 0) {
+            mMoEHostOffsetsCache[layer_idx_any] = mMoEExpertOffsetsData;
+        }
     }
 
     // Permute tokens

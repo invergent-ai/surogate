@@ -75,6 +75,7 @@ module.exports = {
       label: 'Technical Reference',
       collapsed: true,
       items: [
+        'reference/benchmarks',
         'reference/python-api',
         'reference/cli',
         'reference/config'

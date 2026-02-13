@@ -489,14 +489,19 @@ void GenericWeightManager::prefetch_group(int group_id, cudaStream_t stream) {
 // =============================================================================
 
 void GenericWeightManager::new_step() {
-    mCurrentStep++;
-
-    // Invalidate all dequant caches
-    for (auto& [name, entry] : mWeights) {
-        entry.dequant_valid = false;
+    // When weights are frozen (QLoRA base weights), skip cache invalidation.
+    // Dequantized BF16 buffers remain valid since the quantized data never
+    // changes. This avoids redundant FP4/FP8→BF16 dequantization every step,
+    // which is the dominant overhead on multi-GPU QLoRA setups.
+    // Note: pool eviction still sets dequant_valid=false on evicted entries.
+    if (!mFrozenWeights) {
+        mCurrentStep++;
+        for (auto& [name, entry] : mWeights) {
+            entry.dequant_valid = false;
+        }
     }
 
-    // Advance offload manager step
+    // Always advance offload manager (for LRU / prefetch tracking)
     if (mOffloadManager) {
         mOffloadManager->new_step();
     }

@@ -749,6 +749,16 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // without allocating during cudaStreamBeginCapture.
         prime_fp8_weight_cache({});
         prime_fp4_weight_cache({});
+    } else if (!mWeightCachesPrimed) {
+        // Prime FP4 weight caches on first eager execution (e.g., QLoRA where CUDA
+        // graphs are disabled). FP4 on-the-fly quantization (two-level block scaling,
+        // F8_128x4 swizzle, FP4 packing) is expensive and dominates step time without
+        // caching. FP8 caches are NOT primed here: FP8 on-the-fly quantization is
+        // cheap (single abs_max + per-element scale), and priming FP8 caches adds
+        // ~2x model size in persistent GPU memory (FP8 + FP8 transposed), causing
+        // OOM on memory-constrained GPUs with QLoRA.
+        prime_fp4_weight_cache({});
+        mWeightCachesPrimed = true;
     }
 
     auto run_ops = [&]() {

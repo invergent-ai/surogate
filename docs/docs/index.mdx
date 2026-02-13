@@ -5,17 +5,15 @@ title: "Surogate Documentation"
 import Figure from '@site/src/components/Figure';
 
 # 
-<div align="center">
+<div align="center" style={{backgroundColor: '#ffaf10', padding: '2rem', color: 'black'}}>
 <a href="https://surogate.ai/">
-<Figure width="75"
-    src="/img/logo-black.svg" darkSrc="/img/logo-white.svg"
+<Figure width="40%"
+    src="/img/logo-black.svg"
     alt="Surogate logo"
 />
 </a>
-<h1>Surogate</h1>
-<h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
-<b>If Surogate saves you time or GPUs, consider ⭐ starring ⭐ the repo.</b>
-<br/><br/>
+<h2>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h2>
+<br/>
 <iframe src="https://ghbtns.com/github-btn.html?user=invergent-ai&repo=surogate&type=star&count=true&size=large" frameborder="0" scrolling="0" width="170" height="30" title="GitHub"></iframe>
 </div>
 
@@ -39,7 +37,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
   - [**💎 BF16**](./guides/precision-and-recipes.md#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
   - [**🔥 FP8**](./guides/precision-and-recipes.md#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
   - [**🔥 NVFP4**](./guides/precision-and-recipes.md#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- [**⚡ BnB/FP8/NVFP4 QLoRA**](./guides/qlora.md) to maximize SOL on Hopper/Blackwell GPUs
+- [**⚡ BnB/FP8/NVFP4 QLoRA**](./guides/qlora.md) Support for a variety of QLoRA configurations, including online quantization (FP8, NVFP4, BnB) or loading pre-quantized weights (FP8, NVFP4)
 - [**👌 Optimizers**](./guides/optimizers.md): AdamW 8bit, !! NorMuon !!
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - [**🧪 Mixed-precision training**](./guides/precision-and-recipes.md#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.

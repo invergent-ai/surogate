@@ -244,6 +244,11 @@ private:
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 
+    // Get host-side MoE expert offsets for a layer, using cache or syncing from device.
+    const int* get_or_sync_moe_host_offsets(int layer_idx,
+                                             const int* device_offsets,
+                                             int num_experts);
+
     // Layer boundary handling
     void handle_layer_start(int layer_idx);
     void handle_layer_end(int layer_idx);
@@ -332,6 +337,11 @@ private:
     Tensor mMoEExpertOffsets;  // Views into mMoEExpertOffsetsData
     void* mMoEExpertOffsetsGPU = nullptr;  // Persistent GPU buffer (not stack-allocated)
     size_t mMoEExpertOffsetsGPUSize = 0;   // Size in bytes
+
+    // Per-layer host-side MoE expert offsets cache.
+    // Populated once per layer (forward: in dispatch_moe_permute; backward: on first access).
+    // Avoids redundant D2H synchronization in grouped GEMM ops within the same layer.
+    std::unordered_map<int, std::vector<int>> mMoEHostOffsetsCache;
 
     // Persistent storage for MoE saved tensors (per-layer copies to prevent buffer reuse corruption)
     // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)

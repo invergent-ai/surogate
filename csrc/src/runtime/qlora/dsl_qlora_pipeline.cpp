@@ -190,21 +190,37 @@ int count_quantizable(const std::vector<WeightLoadSpec>& specs) {
 }
 
 /// Show a simple progress bar on stderr.
-void show_progress(int current, int total, const char* label) {
+void show_progress(int current, int total, const char* label,
+                    int rank = 0, int world_size = 1) {
     if (total <= 0) return;
-    const int bar_width = 40;
-    const float progress = static_cast<float>(current + 1) / static_cast<float>(total);
-    const int filled = static_cast<int>(progress * bar_width);
 
-    fprintf(stderr, "\r[%s] [", label);
-    for (int i = 0; i < bar_width; ++i) {
-        fprintf(stderr, "%c", i < filled ? '#' : '.');
+    const float progress = static_cast<float>(current + 1) / static_cast<float>(total);
+
+    if (world_size > 1) {
+        // Multi-GPU: print a line every 10% (and at 100%)
+        const int pct = static_cast<int>(progress * 100.0f);
+        const int prev_pct = static_cast<int>(
+            static_cast<float>(current) / static_cast<float>(total) * 100.0f);
+        if (pct / 10 != prev_pct / 10 || current + 1 == total) {
+            fprintf(stderr, "[Rank %d] [%s] %d%% (%d/%d)\n",
+                    rank, label, pct, current + 1, total);
+            fflush(stderr);
+        }
+    } else {
+        // Single GPU: interactive progress bar
+        const int bar_width = 40;
+        const int filled = static_cast<int>(progress * bar_width);
+
+        fprintf(stderr, "\r[%s] [", label);
+        for (int i = 0; i < bar_width; ++i) {
+            fprintf(stderr, "%c", i < filled ? '#' : '.');
+        }
+        fprintf(stderr, "] %d/%d", current + 1, total);
+        if (current + 1 == total) {
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
     }
-    fprintf(stderr, "] %d/%d", current + 1, total);
-    if (current + 1 == total) {
-        fprintf(stderr, "\n");
-    }
-    fflush(stderr);
 }
 
 /// Create a shaped view of a flat load buffer.
@@ -725,7 +741,7 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             continue;  // Deferred to pass 2
         }
 
-        show_progress(loaded, total, "QLoRA Import");
+        show_progress(loaded, total, "QLoRA Import", config.shard_idx, config.num_shards);
 
         if (spec.quantize && weight_mgr->quantizer()) {
             // 2D quantizable weight: double-buffered load → quantize pipeline
@@ -830,7 +846,7 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             continue;
         }
 
-        show_progress(loaded, total, "QLoRA Import");
+        show_progress(loaded, total, "QLoRA Import", config.shard_idx, config.num_shards);
 
         // Per-expert dimensions from the 3D shape [E, per_M, K]
         const int E = static_cast<int>(spec.shape[0]);
@@ -1027,7 +1043,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
             continue;  // Deferred to pass 2
         }
 
-        show_progress(loaded, total, "Prequant Import");
+        show_progress(loaded, total, "Prequant Import", config.shard_idx, config.num_shards);
 
         if (spec.quantize && quantizer) {
             // Resolve HF name from mapping table
@@ -1501,7 +1517,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
             continue;
         }
 
-        show_progress(loaded, total, "Prequant Import");
+        show_progress(loaded, total, "Prequant Import", config.shard_idx, config.num_shards);
 
         // Resolve mapping spec
         int layer_idx = -1;

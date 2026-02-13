@@ -60,6 +60,9 @@ GenericQLoRAProvider::GenericQLoRAProvider(
     }
 
     build_layer_offload_map();
+
+    // QLoRA base weights are frozen
+    mWeightMgr->set_frozen(true);
 }
 
 GenericQLoRAProvider::GenericQLoRAProvider(
@@ -137,6 +140,11 @@ void GenericQLoRAProvider::import_and_quantize(
 
     // Build layer → offload group mapping
     build_layer_offload_map();
+
+    // QLoRA base weights are frozen — mark them so that new_step() skips
+    // dequant cache invalidation. This avoids redundant FP4/FP8→BF16
+    // dequantization every step (the dominant overhead on multi-GPU FP4).
+    mWeightMgr->set_frozen(true);
 
     // Release deferred config (no longer needed)
     mDeferredConfig.reset();

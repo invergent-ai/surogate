@@ -263,6 +263,7 @@ private:
     cudaEvent_t mPrefetchEvent = nullptr;
     bool mPrefetchEnabled = false;
     bool mHasLossOp = false;
+    bool mWeightCachesPrimed = false;  // True after first eager FP8/FP4 cache priming
 
     // Pre-computed layer boundaries for predictable prefetch
     struct LayerBoundary {

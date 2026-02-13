@@ -758,7 +758,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
             static_cast<int>(config.weight_specs.size()),
             num_quantizable,
             format_label,
-            shard_idx, num_shards,
+            shard_idx+1, num_shards,
             config.prequantized ? " [pre-quantized]" : "");
     const int router_fp = count_router_fp_weights(module);
     if (router_fp > 0) {

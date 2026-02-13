@@ -78,29 +78,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         expert_offsets_ptr = moe_offsets_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
-    std::vector<int> host_offsets_local;
     const int* host_offsets_ptr = nullptr;
     if (num_experts > 0 && expert_offsets.Data) {
-        host_offsets_local.resize(static_cast<std::size_t>(num_experts + 1), 0);
-        CUDA_CHECK(cudaMemcpyAsync(host_offsets_local.data(),
-                                   expert_offsets.get<int>(),
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        host_offsets_ptr = host_offsets_local.data();
-    }
-
-    if (host_offsets_ptr) {
-        int bad = 0;
-        int last = host_offsets_ptr[num_experts];
-        for (int e = 1; e <= num_experts; ++e) {
-            if (host_offsets_ptr[e] < host_offsets_ptr[e - 1]) {
-                bad++;
-            }
-        }
-        (void)bad;
-        (void)last;
+        // Use cached host offsets (populated by dispatch_moe_permute for this layer).
+        host_offsets_ptr = get_or_sync_moe_host_offsets(
+            layer_idx_any, expert_offsets.get<int>(), num_experts);
     }
 
     MoeCompactInfo compact = host_offsets_ptr
@@ -312,18 +294,27 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         : static_cast<int>(mConfig.IntermediateSize);
 
     const int weight_experts = static_cast<int>(weights.Sizes[0]);
-    MoeCompactInfo compact = build_moe_compact_info(expert_offsets_ptr,
-                                                    num_experts,
-                                                    weight_experts,
-                                                    mRunState.MainStream,
-                                                    layer_idx,
-                                                    "moe_grouped_gemm_down_backward");
+
+    // Get host offsets from cache (populates on first backward access for this layer).
+    const int* cached_host_offsets = get_or_sync_moe_host_offsets(
+        layer_idx, expert_offsets_ptr, num_experts);
+
+    MoeCompactInfo compact = cached_host_offsets
+        ? build_moe_compact_info_from_host(cached_host_offsets,
+                                           num_experts,
+                                           weight_experts,
+                                           layer_idx,
+                                           "moe_grouped_gemm_down_backward")
+        : build_moe_compact_info(expert_offsets_ptr,
+                                 num_experts,
+                                 weight_experts,
+                                 mRunState.MainStream,
+                                 layer_idx,
+                                 "moe_grouped_gemm_down_backward");
     const bool weight_is_compact = compact.weight_is_compact;
-    const int* host_offsets_ptr = compact.host_offsets.empty() ? nullptr : compact.host_offsets.data();
-    if (!host_offsets_ptr &&
-        layer_idx == static_cast<int>(mConfig.NumLayers) - 1 &&
-        mMoEExpertOffsetsData.size() == static_cast<std::size_t>(num_experts + 1)) {
-        host_offsets_ptr = mMoEExpertOffsetsData.data();
+    const int* host_offsets_ptr = cached_host_offsets;
+    if (!host_offsets_ptr && !compact.host_offsets.empty()) {
+        host_offsets_ptr = compact.host_offsets.data();
     }
     std::vector<int> host_offsets_sanitized;
     if (host_offsets_ptr && num_experts > 0) {
@@ -357,22 +348,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     // Refresh MoE experts for this layer (selective dequant) before using weights in backward.
     auto* qlora_provider = mWeights.qlora_provider();
     if (qlora_provider && qlora_provider->supports_selective_moe()) {
-        if (!compact.host_offsets.empty()) {
+        const int* refresh_offsets = host_offsets_ptr;
+        if (refresh_offsets) {
             (void)refresh_moe_experts_if_needed(layer_idx,
-                                                compact.host_offsets.data(),
-                                                num_experts,
-                                                mWeights,
-                                                mRunState.MainStream);
-        } else {
-            std::vector<int> host_offsets_fallback(static_cast<std::size_t>(num_experts + 1), 0);
-            CUDA_CHECK(cudaMemcpyAsync(host_offsets_fallback.data(),
-                                       expert_offsets_ptr,
-                                       static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            (void)refresh_moe_experts_if_needed(layer_idx,
-                                                host_offsets_fallback.data(),
+                                                refresh_offsets,
                                                 num_experts,
                                                 mWeights,
                                                 mRunState.MainStream);

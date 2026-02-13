@@ -82,17 +82,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     Tensor& expert_offsets = *expert_offsets_ptr;
     const int* expert_offsets_data = expert_offsets.get<int>();
 
-    std::vector<int> host_offsets_local;
     const int* host_offsets_ptr = nullptr;
     if (num_experts > 0 && expert_offsets.Data) {
-        host_offsets_local.resize(static_cast<std::size_t>(num_experts + 1), 0);
-        CUDA_CHECK(cudaMemcpyAsync(host_offsets_local.data(),
-                                   expert_offsets.get<int>(),
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        host_offsets_ptr = host_offsets_local.data();
+        // Use cached host offsets (populated by dispatch_moe_permute for this layer).
+        host_offsets_ptr = get_or_sync_moe_host_offsets(
+            layer_idx_any, expert_offsets.get<int>(), num_experts);
     }
 
     MoeCompactInfo compact = host_offsets_ptr
@@ -273,17 +267,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     Tensor& expert_offsets = *expert_offsets_ptr;
     const int* expert_offsets_data = expert_offsets.get<int>();
 
-    std::vector<int> host_offsets_local;
     const int* host_offsets_ptr = nullptr;
     if (num_experts > 0 && expert_offsets.Data) {
-        host_offsets_local.resize(static_cast<std::size_t>(num_experts + 1), 0);
-        CUDA_CHECK(cudaMemcpyAsync(host_offsets_local.data(),
-                                   expert_offsets.get<int>(),
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        host_offsets_ptr = host_offsets_local.data();
+        // Use cached host offsets (populates on first backward access for this layer).
+        host_offsets_ptr = get_or_sync_moe_host_offsets(
+            layer_idx_any, expert_offsets.get<int>(), num_experts);
     }
 
     MoeCompactInfo compact = host_offsets_ptr

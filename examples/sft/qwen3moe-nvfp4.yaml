@@ -1,22 +1,29 @@
-model: Qwen/Qwen3-0.6B
-output_dir: ./output
+model: nvidia/Qwen3-30B-A3B-NVFP4
+model_type: qwen3_moe
+output_dir: ./output_moe
 
-per_device_train_batch_size: 2
+per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
 sample_packing: true
-sequence_len: 2048
+sequence_len: 512
 
-num_epochs: 2
-eval_steps: 25
+max_steps: 50
+eval_steps: 15
 
 learning_rate: 2e-4
 
 recipe: fp8-hybrid
+lmhead_chunks: 8
+warmup_ratio: 0.1
 
 lora: true
 lora_rank: 16
 lora_alpha: 32
+lora_dtype: bf16
+
+qlora_offload_experts: true
+
 lora_target_modules:
   - q_proj
   - k_proj

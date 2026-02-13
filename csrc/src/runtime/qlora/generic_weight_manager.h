@@ -351,6 +351,20 @@ public:
     /// Whether pooled mode is active (max_dequant_cache_size > 0).
     [[nodiscard]] bool is_pooled() const { return mConfig.max_dequant_cache_size > 0; }
 
+    /// Mark all weights as frozen (immutable).
+    ///
+    /// When frozen, new_step() skips cache invalidation — dequantized BF16
+    /// buffers remain valid across steps since the underlying quantized data
+    /// never changes. This eliminates redundant dequantization for QLoRA
+    /// base weights, which is the dominant cost on multi-GPU FP4 setups.
+    ///
+    /// Pool-evicted buffers still get re-dequantized on next access (the
+    /// eviction path sets dequant_valid = false regardless of frozen state).
+    void set_frozen(bool frozen) { mFrozenWeights = frozen; }
+
+    /// Whether weights are frozen.
+    [[nodiscard]] bool is_frozen() const { return mFrozenWeights; }
+
 private:
     // =========================================================================
     // Internal helpers
@@ -382,6 +396,9 @@ private:
 
     /// Current step counter (incremented by new_step()).
     int64_t mCurrentStep = 0;
+
+    /// When true, new_step() skips cache invalidation (frozen QLoRA weights).
+    bool mFrozenWeights = false;
 
     /// CUDA device properties.
     cudaDeviceProp mDeviceProps;

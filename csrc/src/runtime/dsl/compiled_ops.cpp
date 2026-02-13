@@ -159,6 +159,28 @@ bool refresh_moe_experts_if_needed(int layer_idx,
     return refreshed;
 }
 
+const int* CompiledExecutor::get_or_sync_moe_host_offsets(int layer_idx,
+                                                           const int* device_offsets,
+                                                           int num_experts) {
+    if (layer_idx < 0 || num_experts <= 0 || !device_offsets) {
+        return nullptr;
+    }
+    auto it = mMoEHostOffsetsCache.find(layer_idx);
+    if (it != mMoEHostOffsetsCache.end()) {
+        return it->second.data();
+    }
+    // Cache miss: sync from device (at most once per layer per pass)
+    auto& cached = mMoEHostOffsetsCache[layer_idx];
+    cached.resize(static_cast<std::size_t>(num_experts + 1));
+    CUDA_CHECK(cudaMemcpyAsync(cached.data(),
+                               device_offsets,
+                               static_cast<std::size_t>(num_experts + 1) * sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               mRunState.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+    return cached.data();
+}
+
 // Global state for QKV gradient tracking (shared across split op files)
 std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
 std::vector<int> g_qkv_dA_micro_by_layer;
@@ -1590,6 +1612,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mComm = &comm;
     mCurrentGraph = &graph;
     mTemps.clear();
+    mMoEHostOffsetsCache.clear();
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mCurrentLayer = -1;
@@ -2031,6 +2054,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
+    mMoEHostOffsetsCache.clear();
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mAccumulateTensors.clear();
     mCurrentLayer = -1;
