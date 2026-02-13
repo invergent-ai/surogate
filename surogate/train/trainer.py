@@ -221,7 +221,8 @@ class SurogateTrainerWrapper():
             warmup_steps=self.warmup_steps,
             cooldown_steps=config.cooldown_steps,
             final_lr=config.learning_rate * config.final_lr_fraction,
-            schedule_type=config.lr_scheduler_type
+            schedule_type=config.lr_scheduler_type,
+            wsd_decay_steps_fraction=config.wsd_decay_steps_fraction
         )
 
     def _load_block_types(self) -> Optional[list]:

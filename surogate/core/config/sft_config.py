@@ -148,6 +148,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
            Learning rate schedule function: Cosine or Linear
         cooldown_steps (Optional[int], defaults to 0):
             Number of steps used for a linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`.
+        wsd_decay_steps_fraction (Optional[float], defaults to 0.1):
+            Fraction of total training steps used for the decay phase in WSD schedule.
+            Only used when lr_scheduler_type='wsd'.
         final_lr_fraction (Optional[float], defaults to 0.0):
             Final learning rate as a fraction of the initial learning rate.
         gradient_accumulation_steps (Optional[int], defaults to 4):
@@ -297,6 +300,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     learning_rate: Optional[float] = 2e-4
     lr_scheduler_type: Optional[Literal['linear', 'cosine', 'wsd']] = 'linear'
     cooldown_steps: Optional[int] = 0
+    wsd_decay_steps_fraction: Optional[float] = 0.1
     final_lr_fraction: Optional[float] = 0.0
     gradient_accumulation_steps: Optional[int] = 4
     max_grad_norm: Optional[float] = 1.0
@@ -411,6 +415,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.learning_rate = float(cfg.get('learning_rate', self.learning_rate))
         self.lr_scheduler_type = cfg.get('lr_scheduler_type', self.lr_scheduler_type)
         self.cooldown_steps = cfg['cooldown_steps'] if 'cooldown_steps' in cfg else self.cooldown_steps
+        self.wsd_decay_steps_fraction = float(cfg['wsd_decay_steps_fraction']) if 'wsd_decay_steps_fraction' in cfg else self.wsd_decay_steps_fraction
         self.final_lr_fraction = float(cfg['final_lr_fraction']) if 'final_lr_fraction' in cfg else self.final_lr_fraction
         self.gradient_accumulation_steps = cfg.get('gradient_accumulation_steps', self.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg['max_grad_norm']) if 'max_grad_norm' in cfg else self.max_grad_norm

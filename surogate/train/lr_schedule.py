@@ -9,13 +9,17 @@ class LRSchedule:
     """
 
     def __init__(self, base_lr: float, max_steps: int, warmup_steps: int,
-                 cooldown_steps: int, final_lr: float, schedule_type: str):
+                 cooldown_steps: int, final_lr: float, schedule_type: str,
+                 wsd_decay_steps_fraction: float = 0.1):
         self.base_lr = base_lr
         self.max_steps = max_steps
         self.warmup_steps = max(0, warmup_steps)
         self.cooldown_steps = max(0, cooldown_steps)
         self.final_lr = final_lr
         self.schedule_type = schedule_type.lower()
+
+        # WSD decay phase: fraction of total steps
+        self.wsd_decay_steps = max(0, int(max_steps * wsd_decay_steps_fraction))
 
         # Main schedule covers steps between warmup and cooldown
         self.main_steps = max_steps - self.warmup_steps - self.cooldown_steps
@@ -68,7 +72,11 @@ class LRSchedule:
         elif self.schedule_type == "linear":
             return self.base_lr + (self.final_lr - self.base_lr) * progress
         elif self.schedule_type == "wsd":
-            # Warmup-Stable-Decay: stable LR in main phase
+            # Warmup-Stable-Decay: stable LR then 1-sqrt decay to final_lr
+            decay_start = self.max_steps - self.wsd_decay_steps
+            if self.wsd_decay_steps > 0 and step >= decay_start:
+                progress = (step - decay_start) / self.wsd_decay_steps
+                return self.final_lr + (self.base_lr - self.final_lr) * (1.0 - math.sqrt(progress))
             return self.base_lr
         else:
             # Default to cosine

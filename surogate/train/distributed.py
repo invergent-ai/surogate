@@ -1019,7 +1019,8 @@ class RayDistributedTrainer:
             warmup_steps=warmup_steps,
             cooldown_steps=config.cooldown_steps,
             final_lr=config.learning_rate * config.final_lr_fraction,
-            schedule_type=config.lr_scheduler_type
+            schedule_type=config.lr_scheduler_type,
+            wsd_decay_steps_fraction=config.wsd_decay_steps_fraction
         )
 
         # Auto LR reduction guard
