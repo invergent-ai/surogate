@@ -1,25 +1,22 @@
-<div align="center" style='background-color: #ffaf10; padding: 2rem; color: black;'>
+<div align="center" style="padding: 2rem">
 <a href="https://surogate.ai/">
-<img width="40%" alt="Surogate logo" src="./assets/logo-black.svg" />
+  <img width="40%" alt="Surogate logo" src="./assets/logo-white.svg" />
 </a>
-<h1>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h1>
-<br/>
-<div style="font-size: 16px; font-weight: bold;">
+<h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
+<div>
 <a style="color: black" href="https://surogate.ai">Home</a> ·
 <a style="color: black" href="https://docs.surogate.ai">Docs</a> ·
 <a style="color: black" href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
 <a style="color: black" href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a>
 </div>
-<br/><br/>
-
+<br/>
+  
 [![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
 [![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
 [![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
 [![Twitter Follow](https://img.shields.io/twitter/follow/surogate_ai?style=social)](https://x.com/surogate_ai)
 
 </div>
-
----
 
 ## What is Surogate?
 
