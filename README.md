@@ -4,10 +4,11 @@
 </a>
 <h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
 <div>
-<a style="color: black" href="https://surogate.ai">Home</a> ·
-<a style="color: black" href="https://docs.surogate.ai">Docs</a> ·
-<a style="color: black" href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
-<a style="color: black" href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a>
+<a href="https://surogate.ai">Home</a> ·
+<a href="https://docs.surogate.ai">Docs</a> ·
+<a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
+<a href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a> ·
+<a href="https://github.com/invergent-ai/surogate-studio">Studio</a>
 </div>
 <br/>
   
@@ -20,11 +21,16 @@
 
 ## What is Surogate?
 
-Surogate is a **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and multi-GPU/multi-Node training scaling at scale.
+Surogate is a **production-grade LLM training framework** and **LLMOps platform** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and multi-GPU/multi-Node training scaling at scale.
 
 By combining a native **C++/CUDA execution engine**, a low-overhead Python frontend, and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**. 
 
 See reproducible comparisons in [Benchmarks](https://docs.surogate.ai/reference/benchmarks).
+
+
+[Surogate Studio](https://github.com/invergent-ai/surogate-studio) is the no-code companion of Suroagate for enterprise-grade LLMOps.
+
+![alt text](assets/studio.png)
 
 ---
 
@@ -48,7 +54,8 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
 - [**🧬 Adaptive Training**](https://docs.surogate.ai/about/adaptive-training): built-in automated training monitoring with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR management, MoE imbalance detection, Chinchilla token budgeting and dynamic epoch adjustment
 - **🧠 Supported models**: Qwen2.5, Qwen3, Qwen3 MoE, Llama 3+, Nemotron Nano. Models can be added easily, please create a PR if you need a specific model.
-
+- **[Surogate Studio](https://github.com/invergent-ai/surogate-studio)**: Unified no-code platform for managing your AI infrastructure and operations: Training, Fine-Tuning, Inference and Quantization
+  
 ---
 
 ## Hardware / Requirements
