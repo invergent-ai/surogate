@@ -1511,6 +1511,40 @@ void swizzle_fp8_scales_rowmajor_to_f8_128x4(
 }
 
 /**
+ * @brief Kernel: rescale FP8 E4M3 values by a float factor.
+ *
+ * Converts each FP8 value to float, multiplies by factor, converts back.
+ * Used to normalize block scales when merging components with different
+ * global scales into a single stacked tensor.
+ */
+__global__ void rescale_fp8_kernel(
+    __nv_fp8_e4m3* __restrict__ scales, long count, float factor)
+{
+    for (long idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < count; idx += (long)gridDim.x * blockDim.x) {
+        float val = __half2float(
+            __nv_cvt_fp8_to_halfraw(scales[idx].__x, __nv_fp8_interpretation_t::__NV_E4M3));
+        val *= factor;
+        scales[idx].__x = __nv_cvt_float_to_fp8(
+            val, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+    }
+}
+
+/**
+ * @brief Rescale FP8 E4M3 block scales in-place by a float factor.
+ */
+void rescale_fp8_scales(
+    __nv_fp8_e4m3* scales, long count, float factor, cudaStream_t stream)
+{
+    if (count == 0 || std::abs(factor - 1.0f) < 1e-7f) return;
+
+    const int threads = 256;
+    const int blocks = std::min((int)((count + threads - 1) / threads), 1024);
+    rescale_fp8_kernel<<<blocks, threads, 0, stream>>>(scales, count, factor);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
  * @brief Host launcher for FP4 block quantization with stochastic rounding.
  */
 void quantize_fp4_block_stochastic(

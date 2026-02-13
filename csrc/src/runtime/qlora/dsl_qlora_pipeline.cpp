@@ -407,7 +407,15 @@ bool is_module_not_converted(const std::string& hf_name,
 /// Reads per-expert quantized data and scales from safetensors, placing them at the
 /// correct byte offset within the full stacked tensor. For fuse_gate_up specs,
 /// loads up_proj and gate_proj into the first and second halves of each expert's rows.
-void load_prequant_experts_stacked(
+///
+/// For NVFP4 pre-quantized models, also reads per-component global scale values
+/// (weight_scale_2) and normalizes all block scales to a unified global_scale.
+/// This is critical because each component (expert × projection) was quantized
+/// independently with its own global_amax, and using max() across all components
+/// would produce incorrect dequantization for components with smaller global_scale.
+///
+/// Returns true if scale2 was handled (caller should skip outer-loop scale2 handling).
+bool load_prequant_experts_stacked(
     SafeTensorsReader& reader,
     const dsl::MappingSpec& mspec,
     const DslQLoRAPipelineConfig& config,
@@ -422,6 +430,29 @@ void load_prequant_experts_stacked(
     const size_t per_expert_scale_bytes = total_scale_bytes / E;
     const size_t data_elem_size = get_dtype_size(qt.data.DType);
     const size_t scale_elem_size = get_dtype_size(qt.scales.DType);
+
+    // Track per-component scale2 values for NVFP4 rescaling.
+    // Each entry: {scale2_value, byte_offset_in_scales_buffer, num_fp8_elements}
+    struct CompScale2 {
+        float scale2;
+        size_t scale_byte_offset;
+        long scale_count;
+    };
+    std::vector<CompScale2> comp_scales;
+    const bool has_scale2 = !config.scale2_suffix.empty() && qt.meta.Data != nullptr;
+
+    // Helper: read a single-element float scale2 from safetensors via the device meta buffer
+    auto read_scale2 = [&](const std::string& hf_name) -> float {
+        std::string scale2_hf = hf_name + config.scale2_suffix;
+        const auto* entry = try_find_entry(reader, scale2_hf);
+        if (!entry) return 0.0f;
+        entry->read_raw(qt.meta, 0, 1, true);
+        float val = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&val, qt.meta.Data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return val;
+    };
 
     if (mspec.fuse_gate_up) {
         // Fused gate_up: source pattern points to gate_proj; derive up_proj pattern.
@@ -446,7 +477,7 @@ void load_prequant_experts_stacked(
             std::string up_hf = resolve_hf_name(up_pattern, layer_idx, e);
             std::string up_data_hf = config.data_suffix.empty()
                 ? up_hf : (up_hf + config.data_suffix);
-                
+
             Tensor up_data = Tensor::from_pointer(
                 static_cast<std::byte*>(qt.data.Data) + expert_data_off,
                 qt.data.Device, qt.data.DType,
@@ -459,6 +490,12 @@ void load_prequant_experts_stacked(
                 qt.scales.Device, qt.scales.DType,
                 std::vector<long>{half_scale_elems});
             read_raw_padded(reader.find_entry(up_scale_hf), up_scales, stream);
+
+            // Read up_proj scale2
+            if (has_scale2) {
+                comp_scales.push_back({read_scale2(up_hf),
+                                       expert_scale_off, half_scale_elems});
+            }
 
             // Load gate_proj into second half of expert's data
             std::string gate_hf = resolve_hf_name(gate_pattern, layer_idx, e);
@@ -476,6 +513,12 @@ void load_prequant_experts_stacked(
                 qt.scales.Device, qt.scales.DType,
                 std::vector<long>{half_scale_elems});
             read_raw_padded(reader.find_entry(gate_scale_hf), gate_scales, stream);
+
+            // Read gate_proj scale2
+            if (has_scale2) {
+                comp_scales.push_back({read_scale2(gate_hf),
+                                       expert_scale_off + half_scale_bytes, half_scale_elems});
+            }
         }
     } else {
         const long per_expert_data_elems = static_cast<long>(per_expert_data_bytes / data_elem_size);
@@ -500,6 +543,45 @@ void load_prequant_experts_stacked(
                 qt.scales.Device, qt.scales.DType,
                 std::vector<long>{per_expert_scale_elems});
             read_raw_padded(reader.find_entry(scale_hf), scale_view, stream);
+
+            // Read this expert's scale2
+            if (has_scale2) {
+                comp_scales.push_back({read_scale2(hf_name),
+                                       e * per_expert_scale_bytes, per_expert_scale_elems});
+            }
+        }
+    }
+
+    // Rescale block scales so all components share a unified global_scale.
+    // Each component was quantized with its own global_scale (= amax / (FP8_MAX * FP4_MAX)).
+    // We find the max across all components, then for each component with a smaller
+    // global_scale, multiply its FP8 block scales by (component_scale2 / max_scale2).
+    // This compensates for the difference so that dequant with max_scale2 produces
+    // correct values for all components.
+    bool scale2_handled = false;
+    if (has_scale2 && !comp_scales.empty()) {
+        float max_scale2 = 0.0f;
+        for (const auto& cs : comp_scales) {
+            max_scale2 = std::max(max_scale2, cs.scale2);
+        }
+
+        if (max_scale2 > 0.0f) {
+            for (const auto& cs : comp_scales) {
+                float ratio = cs.scale2 / max_scale2;
+                if (std::abs(ratio - 1.0f) > 1e-6f) {
+                    auto* scale_ptr = reinterpret_cast<__nv_fp8_e4m3*>(
+                        static_cast<std::byte*>(qt.scales.Data) + cs.scale_byte_offset);
+                    rescale_fp8_scales(scale_ptr, cs.scale_count, ratio, stream);
+                }
+            }
+
+            qt.global_scale = max_scale2;
+
+            // Write to device meta for consistency
+            CUDA_CHECK(cudaMemcpyAsync(qt.meta.Data, &qt.global_scale,
+                                       sizeof(float), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            scale2_handled = true;
         }
     }
 
@@ -516,6 +598,7 @@ void load_prequant_experts_stacked(
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    return scale2_handled;
 }
 
 }  // anonymous namespace
@@ -1451,9 +1534,10 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                 EAllocationType::ON_DEVICE, spec.name);
         }
 
+        bool scale2_handled = false;
         try {
             if (mspec->kind == dsl::MappingSpec::Kind::StackExperts) {
-                load_prequant_experts_stacked(
+                scale2_handled = load_prequant_experts_stacked(
                     reader, *mspec, config, qt, layer_idx, E, per_M, K, stream);
             } else if (mspec->kind == dsl::MappingSpec::Kind::Direct ||
                        mspec->kind == dsl::MappingSpec::Kind::Transform) {
@@ -1482,13 +1566,17 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
         }
 
         // Read weight_scale_2 (NVFP4 global scale) for expert weights.
-        // Each expert has its own scale2 in HF; our QuantizedTensor has a single
-        // global_scale. We use the max across all experts (values are typically
-        // very close for experts in the same layer).
+        // For StackExperts: load_prequant_experts_stacked handles per-component
+        // scale2 with FP8 scale rescaling (scale2_handled=true). The old path
+        // just used max() across experts which is incorrect when scale2 values
+        // differ significantly or when fuse_gate_up combines two components.
         if (!config.scale2_suffix.empty() && qt.meta.Data != nullptr) {
-            if (mspec->kind == dsl::MappingSpec::Kind::StackExperts) {
+            if (mspec->kind == dsl::MappingSpec::Kind::StackExperts && scale2_handled) {
+                // Already handled inside load_prequant_experts_stacked —
+                // qt.global_scale and meta are set, FP8 scales rescaled.
+            } else if (mspec->kind == dsl::MappingSpec::Kind::StackExperts) {
+                // Fallback (shouldn't happen for NVFP4, but keep for safety)
                 float max_scale2 = 0.0f;
-                float min_scale2 = std::numeric_limits<float>::max();
                 for (int e = 0; e < E; ++e) {
                     std::string hf_name = resolve_hf_name(mspec->source, layer_idx, e);
                     std::string scale2_hf = hf_name + config.scale2_suffix;
@@ -1501,7 +1589,6 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                                                cudaMemcpyDeviceToHost, stream));
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     max_scale2 = std::max(max_scale2, val);
-                    min_scale2 = std::min(min_scale2, val);
                 }
                 qt.global_scale = max_scale2;
             } else {

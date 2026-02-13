@@ -794,6 +794,19 @@ void dequantize_fp4_block(nv_bfloat16* out, const uint8_t* in_fp4,
 void swizzle_fp8_scales_rowmajor_to_f8_128x4(
     __nv_fp8_e4m3* scales, int scale_rows, int scale_cols, cudaStream_t stream);
 
+/// @brief Rescale FP8 E4M3 block scales in-place by a float factor.
+///
+/// Used when merging pre-quantized components with different global scales
+/// into a single stacked tensor. Each component's block scales are rescaled
+/// by (component_global_scale / unified_global_scale) so that all components
+/// share the same effective global decode scale.
+///
+/// @param scales  FP8 E4M3 scale values to rescale (modified in-place).
+/// @param count   Number of FP8 elements to rescale.
+/// @param factor  Multiplicative factor (typically component_scale2 / max_scale2).
+/// @param stream  CUDA stream.
+void rescale_fp8_scales(__nv_fp8_e4m3* scales, long count, float factor, cudaStream_t stream);
+
 /// @brief FP4 block quantization with stochastic rounding (for gradients in backward pass).
 void quantize_fp4_block_stochastic(uint8_t* out_fp4, __nv_fp8_e4m3* block_scales, float* global_amax,
                                     const nv_bfloat16* in, int M, int K,
