@@ -55,35 +55,16 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
     }
 
     // 3. out = GroupRMSNorm(gated, weight)
-    const long expected = static_cast<long>(B) * T * D;
-    auto shape_matches = [](const TensorRef& ref, long expected_nelem) -> bool {
-        if (ref.shape.empty()) return false;
-        long prod = 1;
-        for (auto d : ref.shape) {
-            if (d <= 0) return false;
-            prod *= d;
-        }
-        return prod == expected_nelem;
-    };
-
-    Tensor* out_ptr = nullptr;
-    if (shape_matches(op.outputs[0], expected)) {
-        Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
-        if (out_ref.nelem() == expected) {
-            out_ptr = &out_ref;
-        }
-    }
-    if (!out_ptr) {
-        Tensor out = mRunState.temp_alloc(x.DType, {B, T, D});
-        mTemps.push_back(out);
-        out_ptr = &mTemps.back();
-    }
+    // Allocate both output tensors upfront to avoid dangling pointers
+    // from vector reallocation when pushing to mTemps.
+    Tensor out_t = mRunState.temp_alloc(x.DType, {B, T, D});
     Tensor rstd = mRunState.temp_alloc(ETensorDType::FP32, {B * T, groups});
+    mTemps.push_back(out_t);
     mTemps.push_back(rstd);
 
-    mamba_group_rmsnorm_forward(*out_ptr, rstd, gated, weight, eps, B, T, D, groups, mRunState.MainStream);
+    mamba_group_rmsnorm_forward(out_t, rstd, gated, weight, eps, B, T, D, groups, mRunState.MainStream);
 
-    store_tensor(op.outputs[0], *out_ptr);
+    store_tensor(op.outputs[0], out_t);
 
     // Save rstd and gated for backward.
     // Must persist via cudaMalloc because temp_alloc'd stack memory is freed at

@@ -31,69 +31,24 @@ void CompiledExecutor::dispatch_mamba_split_proj(const CompiledOp& op) {
     const int head_dim = op.attrs.mamba_head_dim;
 
 
-    auto shape_matches = [](const TensorRef& ref, long expected) -> bool {
-        if (ref.shape.empty()) return false;
-        long prod = 1;
-        for (auto d : ref.shape) {
-            if (d <= 0) return false;
-            prod *= d;
-        }
-        return prod == expected;
-    };
-
-    const long gate_expected = static_cast<long>(B) * T * intermediate_size;
-    const long conv_expected = static_cast<long>(B) * conv_dim * T;
-    const long delta_expected = static_cast<long>(B) * intermediate_size * T;
-
-    Tensor* gate_ptr = nullptr;
-    Tensor* conv_ptr = nullptr;
-    Tensor* delta_ptr = nullptr;
-
-    if (shape_matches(op.outputs[0], gate_expected)) {
-        Tensor& gate_ref = ensure_output_tensor(op.outputs[0]);
-        if (gate_ref.nelem() == gate_expected) {
-            gate_ptr = &gate_ref;
-        }
-    }
-    if (!gate_ptr) {
-        Tensor gate = mRunState.temp_alloc(proj.DType, {B, T, intermediate_size});
-        mTemps.push_back(gate);
-        gate_ptr = &mTemps.back();
-    }
-
-    if (shape_matches(op.outputs[1], conv_expected)) {
-        Tensor& conv_ref = ensure_output_tensor(op.outputs[1]);
-        if (conv_ref.nelem() == conv_expected) {
-            conv_ptr = &conv_ref;
-        }
-    }
-    if (!conv_ptr) {
-        Tensor conv_in = mRunState.temp_alloc(proj.DType, {B, conv_dim, T});
-        mTemps.push_back(conv_in);
-        conv_ptr = &mTemps.back();
-    }
-
-    if (shape_matches(op.outputs[2], delta_expected)) {
-        Tensor& delta_ref = ensure_output_tensor(op.outputs[2]);
-        if (delta_ref.nelem() == delta_expected) {
-            delta_ptr = &delta_ref;
-        }
-    }
-    if (!delta_ptr) {
-        Tensor delta = mRunState.temp_alloc(proj.DType, {B, intermediate_size, T});
-        mTemps.push_back(delta);
-        delta_ptr = &mTemps.back();
-    }
+    // Allocate all output tensors upfront (before any mTemps.push_back)
+    // to avoid dangling pointers from vector reallocation.
+    Tensor gate_t = mRunState.temp_alloc(proj.DType, {B, T, intermediate_size});
+    Tensor conv_t = mRunState.temp_alloc(proj.DType, {B, conv_dim, T});
+    Tensor delta_t = mRunState.temp_alloc(proj.DType, {B, intermediate_size, T});
+    mTemps.push_back(gate_t);
+    mTemps.push_back(conv_t);
+    mTemps.push_back(delta_t);
 
     // Call kernel
-    mamba_split_proj(*gate_ptr, *conv_ptr, *delta_ptr, proj,
+    mamba_split_proj(gate_t, conv_t, delta_t, proj,
                      B, T, intermediate_size, conv_dim, num_heads, head_dim,
                      mRunState.MainStream);
 
-    // Store outputs (ensure_output_tensor may already insert into map)
-    store_tensor(op.outputs[0], *gate_ptr);
-    store_tensor(op.outputs[1], *conv_ptr);
-    store_tensor(op.outputs[2], *delta_ptr);
+    // Store outputs
+    store_tensor(op.outputs[0], gate_t);
+    store_tensor(op.outputs[1], conv_t);
+    store_tensor(op.outputs[2], delta_t);
 }
 
 void CompiledExecutor::dispatch_mamba_split_proj_backward(const CompiledOp& op) {
