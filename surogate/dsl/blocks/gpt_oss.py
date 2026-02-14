@@ -268,13 +268,13 @@ class GptOssBlock:
     # Expert computations
     expert_gate_up = Activation(
         Tensor["B * T * K", "MUp"],
-        save=True,
+        save=False,
         recompute=True,
         recompute_from=["permuted_input", "@param:experts_gate_up", "scatter_indices"],
         recompute_op="moe_grouped_gemm_gate_up",
         recompute_policy="fft_only",
         share_policy="fft_share",
-        description="Expert gate+up projection output",
+        description="Expert gate+up projection output (not saved: backward uses expert_gate_up_bias instead)",
     )
     expert_gate_up_bias = Activation(
         Tensor["B * T * K", "MUp"],
@@ -299,13 +299,13 @@ class GptOssBlock:
     )
     expert_down = Activation(
         Tensor["B * T * K", "C"],
-        save=True,
+        save=False,
         recompute=True,
         recompute_from=["expert_act", "@param:experts_down", "scatter_indices"],
         recompute_op="moe_grouped_gemm_down",
         recompute_policy="fft_only",
         share_policy="fft_share",
-        description="Expert down projection output",
+        description="Expert down projection output (not saved: backward uses expert_down_bias instead)",
     )
     expert_down_bias = Activation(
         Tensor["B * T * K", "C"],
