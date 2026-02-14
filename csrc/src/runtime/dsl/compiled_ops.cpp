@@ -1853,6 +1853,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (mWeightManager && mWeightManager->needs_block_gather()) {
             mWeightManager->gather_block(0, comm, mRunState.side_stream());
         }
+        // QLoRA offload: prefetch first layer's quantized weights
+        if (auto* provider = mWeights.qlora_provider()) {
+            if (provider->has_offloading()) {
+                provider->prefetch_for_layer(0, mRunState.side_stream());
+            }
+        }
     }
 
     // Main dispatch loop - no string comparisons, direct function pointer dispatch
@@ -2094,6 +2100,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         if (mWeightManager && mWeightManager->needs_block_gather()) {
             const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
             mWeightManager->gather_block(last_layer, comm, mRunState.side_stream());
+        }
+        // QLoRA offload: prefetch last layer's quantized weights for backward
+        if (auto* provider = mWeights.qlora_provider()) {
+            if (provider->has_offloading()) {
+                const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
+                provider->prefetch_for_layer(last_layer, mRunState.side_stream());
+            }
         }
     }
 
