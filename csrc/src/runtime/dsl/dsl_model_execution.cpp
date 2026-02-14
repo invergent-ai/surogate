@@ -605,7 +605,11 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         const long expert_gate_up_tp = num_experts * up_factor * moe_intermediate * hidden * dtype_bytes;
         const long expert_down_tp = num_experts * moe_intermediate * hidden * dtype_bytes;
         const long permuted_tokens = 2L * B * T * top_k * hidden * dtype_bytes;
-        moe_extra = expert_gate_up_tp + expert_down_tp + permuted_tokens;
+        // MoE activation backward (gpt_oss_moe_act_backward) allocates d_inp buffers
+        // in intermediate dimension ({N, up_factor * intermediate}), not hidden dimension.
+        // Account for this larger BT-proportional backward buffer.
+        const long moe_bwd_act = 2L * B * T * top_k * up_factor * moe_intermediate * dtype_bytes;
+        moe_extra = expert_gate_up_tp + expert_down_tp + permuted_tokens + moe_bwd_act;
     }
     ETensorDType act_dtype = mOptions.ModelType.value_or(mConfig->DType);
     if (is_fp8_dtype(act_dtype)) {

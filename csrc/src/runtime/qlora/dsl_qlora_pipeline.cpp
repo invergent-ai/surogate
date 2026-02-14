@@ -131,6 +131,42 @@ GpuTempAlloc allocate_qt_gpu_temp(
         qt.meta = Tensor::from_pointer(
             static_cast<std::byte*>(alloc.meta), 0, ETensorDType::FP32,
             std::vector<long>{1L});
+    } else if (qconfig.format == QuantFormat::HF_MXFP4) {
+        qt.format = QuantFormat::HF_MXFP4;
+        qt.block_size = 32;
+
+        // Packed FP4 E2M1 data: 2 values per byte
+        const size_t data_bytes = static_cast<size_t>(M) * K / 2;
+        CUDA_CHECK(cudaMalloc(&alloc.data, data_bytes));
+        qt.data = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.data), 0, ETensorDType::BYTE,
+            std::vector<long>{static_cast<long>(data_bytes)});
+
+        // E8M0 shared exponents: one uint8 per 32-element block
+        const size_t scales_bytes = static_cast<size_t>(M) * K / 32;
+        CUDA_CHECK(cudaMalloc(&alloc.scales, scales_bytes));
+        qt.scales = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.scales), 0, ETensorDType::BYTE,
+            std::vector<long>{static_cast<long>(scales_bytes)});
+    } else if (qconfig.format == QuantFormat::FP8_PER_BLOCK) {
+        qt.format = QuantFormat::FP8_PER_BLOCK;
+        qt.block_size = qconfig.block_size;
+
+        // FP8 E4M3 data: 1 byte per value
+        const size_t data_bytes = static_cast<size_t>(M) * K;
+        CUDA_CHECK(cudaMalloc(&alloc.data, data_bytes));
+        qt.data = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.data), 0, ETensorDType::FP8_E4M3,
+            std::vector<long>{static_cast<long>(M), static_cast<long>(K)});
+
+        // Per-block FP32 scales (2D tile layout)
+        const long scale_rows = (static_cast<long>(M) + qt.block_size - 1) / qt.block_size;
+        const long scale_cols = (static_cast<long>(K) + qt.block_size - 1) / qt.block_size;
+        const size_t scales_bytes = static_cast<size_t>(scale_rows) * scale_cols * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&alloc.scales, scales_bytes));
+        qt.scales = Tensor::from_pointer(
+            static_cast<std::byte*>(alloc.scales), 0, ETensorDType::FP32,
+            std::vector<long>{scale_rows * scale_cols});
     } else {
         throw std::runtime_error(
             "allocate_qt_gpu_temp: unsupported format "

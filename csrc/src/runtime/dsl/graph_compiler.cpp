@@ -65,6 +65,21 @@ bool infer_known_tensor_shape(std::string_view name,
     int layer_idx = -1;
     std::string field;
     if (parse_block_param(name, layer_idx, field)) {
+        // Strip autodiff accumulation suffixes (_from_NNN, _accum_NNN) so that
+        // gradient-accumulation tensors like "ln2_flat_from_497" match "ln2_flat".
+        // strip_ssa_suffix only handles trailing _NNN, but autodiff generates
+        // "_from_<opid>" and "_accum_<counter>" which need two-part stripping.
+        for (const char* pat : {"_from_", "_accum_"}) {
+            auto pos = field.find(pat);
+            if (pos == std::string::npos) continue;
+            size_t after_pos = pos + std::strlen(pat);
+            bool all_digits = after_pos < field.size();
+            for (size_t i = after_pos; i < field.size(); ++i) {
+                if (!std::isdigit(static_cast<unsigned char>(field[i]))) { all_digits = false; break; }
+            }
+            if (all_digits) { field = field.substr(0, pos); break; }
+        }
+
         const long C = config.HiddenSize;
         const long D = config.IntermediateSize;
         const long MUp = config.mlp_up_rows();
@@ -365,6 +380,17 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             }
             if (slot_entry->dtype.has_value()) {
                 ref.dtype = *slot_entry->dtype;
+            }
+        }
+        // Override with infer_known_tensor_shape when available.
+        // The slot registry may return a parent slot's shape for aliases
+        // (e.g., "ln2_flat" is an alias of "ln2" with shape (B,T,C)),
+        // but _flat tensors need 2D shape (B*T,C). infer_known_tensor_shape
+        // correctly distinguishes _flat vs non-flat shapes.
+        {
+            std::vector<long> known_shape;
+            if (infer_known_tensor_shape(stripped, mConfig, mB, mT, known_shape)) {
+                ref.shape = known_shape;
             }
         }
         if (ref.shape.empty()) {
