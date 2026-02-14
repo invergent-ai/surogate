@@ -1572,28 +1572,32 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
-    if (mWeightManager && mWeightManager->is_streaming_enabled() && !mCapturing) {
-        // Wait for current layer's weights
+    if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
         mWeightManager->wait_for_gather(layer_idx, mRunState.MainStream);
     }
 
-    // Prefetch next layer
-    const int next_layer = layer_idx + 1;
-    if (next_layer < static_cast<int>(mConfig.NumLayers) && !mCapturing) {
-        if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+    // Prefetch next layer in the current traversal direction
+    const int next_layer = layer_idx + mPrefetchDirection;
+    if (next_layer >= 0 && next_layer < static_cast<int>(mConfig.NumLayers) && !mCapturing) {
+        if (mWeightManager && mWeightManager->needs_block_gather()) {
             if (mComm) {
                 mWeightManager->gather_block(next_layer, *mComm, mRunState.side_stream());
+            }
+        }
+        // QLoRA offload: prefetch quantized weights for the next layer
+        if (auto* provider = mWeights.qlora_provider()) {
+            if (provider->has_offloading()) {
+                provider->prefetch_for_layer(next_layer, mRunState.side_stream());
             }
         }
     }
 
     mCurrentLayer = layer_idx;
-
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
     // Release previous layer's weights
-    if (mWeightManager && mWeightManager->is_streaming_enabled() && !mCapturing) {
+    if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
         mWeightManager->release_block(layer_idx, mRunState.MainStream);
     }
 
@@ -1844,8 +1848,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     }
 
     // Prefetch layer 0 before loop
+    mPrefetchDirection = 1;  // Forward traversal
     if (mConfig.NumLayers > 0 && !mCapturing) {
-        if (mWeightManager && mWeightManager->is_streaming_enabled()) {
+        if (mWeightManager && mWeightManager->needs_block_gather()) {
             mWeightManager->gather_block(0, comm, mRunState.side_stream());
         }
     }
@@ -2080,6 +2085,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mWeightManager->gather_final_norm(comm, mRunState.MainStream);
         if (mOptions.LMHeadChunks <= 1) {
             mWeightManager->gather_lm_head(comm, mRunState.MainStream);
+        }
+    }
+
+    // Prefetch last layer before backward loop (layers processed in reverse)
+    mPrefetchDirection = -1;  // Backward traversal
+    if (mConfig.NumLayers > 0 && !mCapturing) {
+        if (mWeightManager && mWeightManager->needs_block_gather()) {
+            const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
+            mWeightManager->gather_block(last_layer, comm, mRunState.side_stream());
         }
     }
 
@@ -2710,6 +2724,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (op.layer_end >= 0 &&
                 op.layer_end != last_layer_restored &&
                 can_restore_stack(idx)) {
+                // Release this layer's offloaded weights (if applicable)
+                handle_layer_end(op.layer_end);
+
                 // Trigger async gradient reduction for this layer on side_stream.
                 // This overlaps communication with the next layer's backward compute on MainStream.
                 if (mComm && mComm->world_size() > 1) {

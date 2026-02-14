@@ -31,7 +31,8 @@ namespace dsl {
  */
 struct WeightGatherStatus {
     int layer_idx = -1;                ///< Which layer is stored in this buffer
-    cudaEvent_t done_event = nullptr;  ///< Event to synchronize on
+    cudaEvent_t done_event = nullptr;  ///< Event signaling gather/copy is complete (side_stream)
+    cudaEvent_t release_event = nullptr; ///< Event signaling MainStream is done reading this buffer
     bool fetch_pending = false;        ///< Whether a gather is in progress
     bool is_ready = true;              ///< Whether buffer is available for reuse
     int version = -1;                  ///< Cache version for invalidation
@@ -131,6 +132,8 @@ public:
     int num_layers() const { return mConfig.num_layers; }
     bool is_streaming_enabled() const { return mStreamWeights; }
     bool is_offload_enabled() const { return mConfig.offload_master || mConfig.offload_quants; }
+    /// True when block weights need per-layer gather (sharding OR offloading).
+    bool needs_block_gather() const { return mStreamWeights || mConfig.offload_master; }
     bool is_sharded(const std::string& name) const;
 
     // ITensorContainer interface (for checkpointing)
@@ -184,6 +187,7 @@ private:
 
     // CUDA resources
     cudaEvent_t mGatherEvents[kNumPrefetchBuffers] = {nullptr, nullptr};
+    cudaEvent_t mReleaseEvents[kNumPrefetchBuffers] = {nullptr, nullptr};
     cudaEvent_t mNonBlockEvents[3] = {nullptr, nullptr, nullptr};  // emb, final_norm, lm_head
 };
 

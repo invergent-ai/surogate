@@ -11,7 +11,7 @@ All numbers represent **total TPS (Tokens per Second)**
 | **Qwen3 1.7B**         | 12k         | 12,6k        | 14,0k         | 18,8k        | 17,4k          | 20,7k        | 17k            | 17,6k          |
 | **Qwen3 4B**           | 6k          | 6.1k         | 6,8k          | 8,8k         | 8,3k           | 10,8k        | 8,1k           | 8,6k           |
 | **Qwen3 8B**           | 3,4k        | 3,5k         | 3,8k          | 5,4k         | 5,0k           | 6,9k         | 4,9k           | 5,0k           |
-| **Qwen/Qwen3-30B-A3B** | 0.016k      | OOM          | OOM           | OOM          | 0,2k           | OOM          | 0.2k           | 0.3k           |
+| **Qwen/Qwen3-30B-A3B** | 0.016k      | OOM          | OOM           | OOM          | 0,3k           | OOM          | 0.2k           | 0.3k           |
 
 #### Relative Speedup vs Unsloth NF4
 | Model                  | BF16  | FP8   | QoFP8  | FP4   | QoFP4  | QoNF4  |
@@ -23,43 +23,45 @@ All numbers represent **total TPS (Tokens per Second)**
 | **Qwen/Qwen3-30B-A3B** | -     | -     | 12.50x | -     | 12.50x | 18.75x |
 
 
-### NVIDIA H100 SXM
-| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QoFP8 | Surogate FP4 | Surogate QoFP4 | Surogate QoNF4 |
-| -------------- | ----------- | ------------ | ------------- | ------------ | -------------- | ------------ | -------------- | -------------- |
-| **Qwen3 0.6B** | 21k         | 24,5k        | 62k           | 58k          | 45,6k          | -            | -              |                |
-| **Qwen3 1.7B** | 20k         | 23k          | 37,5k         | 37,5k        | 30.6k          | -            | -              |                |
-| **Qwen3 4B**   | 12,6k       | 13,1k        | 17,5k         | 18.7k        | 15,5k          | -            | -              |                |
-| **Qwen3 8B**   | 8,6k        | 9,1k         | 11,6k         | 12,9k        | 10,2k          | -            | -              |                |
-| **Qwen3 14B**  | 5,2k        | 5,6k         | 6,8k          | 8k           | 6,2k           | -            | -              |                |
+### NVIDIA H100 80GB HBM3
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QoFP8 | Surogate QoNF4 |
+| -------------- | ----------- | ------------ | ------------- | ------------ | -------------- | -------------- |
+| **Qwen3 0.6B** | 18k         | 21,3k        | 53,9k         | 51,2k        | 16,5k          | 16.6k          |
+| **Qwen3 1.7B** | 18k         | 20,8k        | 32,8k         | 33,0k        | 15,8k          | 16,1k          |
+| **Qwen3 4B**   | 11,5k       | 12,4k        | 15,9k         | 17,0k        | 11,2k          | 11,0k          |
+| **Qwen3 8B**   | 8,2k        | 8,9k         | 10,2k         | 11,6k        | 9,6k           | 9,4k           |
+| **Qwen3 14B**  | 5,2k        | 5,6k         | 6,0k          | 7,2k         | 6,5k           | 6,1k           |
+| **Qwen3 32B**  | 2,4k        | 2,6k         |               |              |                | 2,8k           |
 
 
 ### NVIDIA H200
-| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate QoNF4 |
-| -------------- | ----------- | ------------ | ------------- | ------------ | ------------- | ------------ | ------------- | -------------- |
-| **Qwen3 0.6B** | 18,3k       | 21,7k        | 65,2k         | 62k          | 48k           | -            | -             |                |
-| **Qwen3 1.7B** | 18,3k       | 21,4k        | 39k           | 40,8k        | 32,8k         | -            | -             |                |
-| **Qwen3 4B**   | 12,1k       | 12,8k        | 18,3k         | 20,5k        | 16,5k         | -            | -             |                |
-| **Qwen3 8B**   | 8,4k        | 9,1k         | 11,7k         | 14k          | 10,9k         | -            | -             |                |
-
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate QoNF4 |
+| -------------- | ----------- | ------------ | ------------- | ------------ | ------------- | -------------- |
+| **Qwen3 0.6B** | 18,3k       | 21,7k        |               |              |               |                |
+| **Qwen3 1.7B** | 18,3k       | 21,4k        |               |              |               |                |
+| **Qwen3 4B**   | 12,1k       | 12,8k        |               |              |               |                |
+| **Qwen3 8B**   | 8,4k        | 9,1k         |               |              |               |                |
+| **Qwen3 14B**  |             |              |               |              |               |                |
+| **Qwen3 32B**  |             |              |               |              |               |                |
 
 ### NVIDIA B200
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate QoNF4 |
 | -------------- | ----------- | ------------ | ------------- | ------------ | ------------- | ------------ | ------------- | -------------- |
-| **Qwen3 0.6B** | 17k         | 19,1k        | 95k           | 86k          | 51,8k         | 67k          |               |                |
-| **Qwen3 1.7B** | 16,7k       | 20,3K        | 65k           | 62k          | 43k           | 46,9k        |               |                |
-| **Qwen3 4B**   | 13,1k       | 14,8K        | 32k           | 33,5k        | 21,4k         | 24,5k        |               |                |
-| **Qwen3 8B**   | 11,3k       | 12,4K        | 21,3k         | 24,2k        | 13,8k         | 18k          |               |                |
-| **Qwen3 14B**  |             | 8,6k         | 12,9k         | 15k          | 8,1k          | 11,5k        |               |                |
-| **Qwen3 32B**  |             | 4,2k         | 5,8k          | 6,8k         |               | 5,3k         | 4,8k          |                |
+| **Qwen3 0.6B** | 17k         | 19,1k        |               |              |               |              |               |                |
+| **Qwen3 1.7B** | 16,7k       | 20,3K        |               |              |               |              |               |                |
+| **Qwen3 4B**   | 13,1k       | 14,8K        |               |              |               |              |               |                |
+| **Qwen3 8B**   | 11,3k       | 12,4K        |               |              |               |              |               |                |
+| **Qwen3 14B**  |             | 8,6k         |               |              |               |              |               |                |
+| **Qwen3 32B**  |             | 4,2k         |               |              |               |              |               |                |
 
 
 ### NVIDIA B300 SXM6 AC
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate QoNF4 |
 | -------------- | ----------- | ------------ | ------------- | ------------ | ------------- | ------------ | ------------- | -------------- |
-| **Qwen3 0.6B** |             |              | 82,5k         | 75,5k        |               |              |               |                |
-| **Qwen3 1.7B** |             |              | 59,3k         | 57k          |               |              |               |                |
-| **Qwen3 4B**   |             |              | 29,9k         | 30k          |               |              |               |                |
-| **Qwen3 8B**   |             |              | 21k           | 22,7k        |               |              |               |                |
+| **Qwen3 0.6B** |             |              |               |              |               |              |               |                |
+| **Qwen3 1.7B** |             |              |               |              |               |              |               |                |
+| **Qwen3 4B**   |             |              |               |              |               |              |               |                |
+| **Qwen3 8B**   |             |              |               |              |               |              |               |                |
 
 
 

@@ -733,6 +733,27 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
         }
     }
 
+    // offload_master: offload ALL quantized block weights to CPU pinned memory,
+    // stream them layer-by-layer. Reuses the same OffloadManager infrastructure.
+    if (options.OffloadMaster) {
+        config.weight_manager_config.enable_offloading = true;
+        config.weight_manager_config.offload_config.max_resident_groups = 2;
+        config.weight_manager_config.offload_config.device_id = config.quantizer_config.device_id;
+
+        // Assign per-layer offload groups to all quantizable block weights
+        for (auto& spec : config.weight_specs) {
+            if (!spec.quantize) continue;
+            auto bracket = spec.name.find("blocks[");
+            if (bracket == std::string::npos) continue;
+            auto close = spec.name.find(']', bracket);
+            if (close == std::string::npos) continue;
+            auto idx_start = bracket + 7;  // length of "blocks["
+            try {
+                spec.offload_group = std::stoi(spec.name.substr(idx_start, close - idx_start));
+            } catch (...) {}
+        }
+    }
+
     // Use pooled dequant buffers to limit peak GPU memory.
     // Only one layer's weights are needed at a time (forward or backward),
     // so cache_size=4 (one per weight type: QKV, Out, GateUp, Down) matches
@@ -830,6 +851,22 @@ DslModel::DslModel(const PretrainedConfig& config,
     }
 
     const bool use_weight_manager = (options.ShardWeights || options.OffloadMaster) && !mQLoRAConfig.is_quantized();
+
+    // DEBUG: Log weight manager decision
+    if (options.DebugMemoryBreakdown) {
+        std::cerr << "[DEBUG-MODEL] use_weight_manager=" << use_weight_manager
+                  << " (ShardWeights=" << options.ShardWeights
+                  << ", OffloadMaster=" << options.OffloadMaster
+                  << ", is_quantized=" << mQLoRAConfig.is_quantized()
+                  << ", lora=" << lora_config.has_value()
+                  << ")" << std::endl;
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[DEBUG-MODEL] Before param alloc: GPU used="
+                  << (total_mem - free_mem)/(1024*1024) << " MiB, free="
+                  << free_mem/(1024*1024) << " MiB" << std::endl;
+    }
+
     mParams = std::make_unique<DslParamStore>(*mModule, mModule->forward.value(),
                                               options, *mConfig, mAllocator,
                                               lora_config ? &*lora_config : nullptr,
@@ -847,6 +884,15 @@ DslModel::DslModel(const PretrainedConfig& config,
             *mModule, mModule->forward.value(), options, *mConfig, mAllocator,
             lora_config ? &*lora_config : nullptr, mShardIdx, mNumShards);
         mParams->set_weight_manager(mWeightManager.get());
+    }
+
+    // DEBUG: After weight manager + grad store allocation
+    if (options.DebugMemoryBreakdown) {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[DEBUG-MODEL] After param+grad+wm alloc: GPU used="
+                  << (total_mem - free_mem)/(1024*1024) << " MiB, free="
+                  << free_mem/(1024*1024) << " MiB" << std::endl;
     }
 
     if (lora_config.has_value() && lora_config->enabled()) {

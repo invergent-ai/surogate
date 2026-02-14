@@ -298,6 +298,7 @@ private:
     long mT = 0;
     int mMicroStep = 0;
     int mCurrentLayer = -1;
+    int mPrefetchDirection = 1;  // +1 for forward, -1 for backward
     bool mCapturing = false;
 
     // Temporary tensor storage (for stack-allocated tensors)

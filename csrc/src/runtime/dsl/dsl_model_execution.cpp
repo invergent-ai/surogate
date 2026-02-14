@@ -23,6 +23,8 @@
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 
+#include <iostream>
+
 namespace dsl {
 
 void DslModel::build_lora_name_tables() {
@@ -640,6 +642,15 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const long min_stack_bytes = min_stack_base + attn_fallback_bytes + moe_stack_slack;
     required_size = std::max(required_size, min_stack_bytes);  // Full fine-tune keeps 3GB+fallback; LoRA can use tighter floor.
     const auto high_mark = mRunState->Stack.get_high_mark();
+    // DEBUG: Stack allocation size
+    if (options.DebugMemoryBreakdown && comm.rank() == 0) {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[DEBUG-STACK] base_size=" << base_size/(1024*1024) << " MiB"
+                  << ", required_size=" << required_size/(1024*1024) << " MiB"
+                  << ", GPU used=" << (total_mem - free_mem)/(1024*1024) << " MiB"
+                  << ", free=" << free_mem/(1024*1024) << " MiB" << std::endl;
+    }
     Tensor stack_buffer = mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {required_size});
     mRunState->set_stack_buffer(std::move(stack_buffer), high_mark);
     comm.barrier();

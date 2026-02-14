@@ -224,7 +224,7 @@ Tensor TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAll
             std::string message = fmt::format(
                 "Cuda OOM when allocating tensor {} of shape {} with dtype {} in context {}. "
                 "Try reducing batch/seq length or offloading optimizer state "
-                "with --offload-optimizer (and optionally --offload-gradients).",
+                "with 'offload_optimizer' (and optionally 'offload_grads').",
                 name, shape_str, dtype_to_str(dtype), m_Stats->Context);
             throw std::runtime_error(message);
         }
@@ -322,7 +322,7 @@ struct MemoryCategory {
 /**
  * @brief Categorize a tensor name into a memory category for grouped reporting.
  *
- * Categories help users understand which --offload-* flags to use.
+ * Categories help users understand which offload_-* flags to use.
  *
  * @param name Tensor name.
  * @return Category with name and optimization hints.
@@ -330,16 +330,16 @@ struct MemoryCategory {
 static MemoryCategory categorize_tensor(const std::string& name) {
     // Optimizer state (momentum/variance)
     if (name.find("opt_m_") == 0 || name.find("opt_v_") == 0) {
-        return {"optimizer", "enable 'offload-optimizer'"};
+        return {"optimizer", "enable 'offload_optimizer'"};
     }
     // Gradients (d_ prefix)
     if (name.find("d_") == 0) {
-        return {"gradients", "enable 'shard-gradients' and 'offload-gradients'"};
+        return {"gradients", "enable 'shard_gradients' and 'offload_grads'"};
     }
     // FP8/quantization buffers
     if (name.find("fp8_") == 0 || name.find("fp4_") == 0 || name.find("quant") != std::string::npos ||
         name.find("_q") == name.size() - 2 || name.find("_scales") != std::string::npos) {
-        return {"quants", "enable 'offload-quants' and 'persistent-quants'"};
+        return {"quants", "enable 'offload_quants' and 'persistent_quants'"};
     }
     // Workspace buffers
     if (name.find("_ws") != std::string::npos || name.find("workspace") != std::string::npos) {
@@ -351,14 +351,14 @@ static MemoryCategory categorize_tensor(const std::string& name) {
         return {"activations", "enable 'recompute'"};
     }
     // Model weights
-    return {"weights", "enable 'offload-master'"};
+    return {"weights", "enable 'offload_master'"};
 }
 
 /**
  * @brief Print a summary of large device allocations tracked per tensor name.
  *
  * Groups allocations by category (weights, gradients, optimizer, quants, workspace)
- * to help users understand which --offload-* flags can reduce memory usage.
+ * to help users understand which offload_* flags can reduce memory usage.
  */
 void TensorAllocator::print_stats() const {
     // Group allocations by category

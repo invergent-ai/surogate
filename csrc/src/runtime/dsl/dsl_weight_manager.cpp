@@ -18,6 +18,8 @@
 #include "utilities/dtype.h"
 #include "utilities/tensor.h"
 
+#include <cuda_runtime.h>
+
 namespace dsl {
 namespace {
 
@@ -330,47 +332,55 @@ void DslWeightManager::allocate_prefetch_buffers() {
         return;
     }
 
-    // Find max buffer size needed per layer
-    std::size_t max_layer_bytes = 0;
-    for (int l = 0; l < mConfig.num_layers; ++l) {
-        std::size_t layer_bytes = 0;
-        for (const auto& name : mBlockParamNames[l]) {
-            auto it = mWeights.find(name);
-            if (it != mWeights.end()) {
-                const auto& entry = it->second;
-                if (!entry.global_shape.empty()) {
-                    Tensor tmp = Tensor::empty(entry.master.DType, entry.global_shape);
-                    layer_bytes += tmp.bytes();
-                } else {
-                    layer_bytes += entry.master.bytes();
-                }
-            }
+    // Helper: extract base param name by stripping the numeric layer index.
+    // e.g., "blocks[5].mlp_up_weight" -> "blocks[].mlp_up_weight"
+    //        "mamba_blocks[12].in_proj" -> "mamba_blocks[].in_proj"
+    auto base_name = [](const std::string& name) -> std::string {
+        auto open = name.find('[');
+        auto close = name.find(']');
+        if (open != std::string::npos && close != std::string::npos && close > open) {
+            return name.substr(0, open + 1) + name.substr(close);
         }
-        max_layer_bytes = std::max(max_layer_bytes, layer_bytes);
-    }
+        return name;
+    };
 
-    // Allocate double buffers for prefetching
+    // Allocate double buffers for prefetching.
+    // Only one layer occupies each prefetch slot at a time, so we allocate one set
+    // of GPU buffers per unique base param name per slot and share across all layers.
     for (int i = 0; i < kNumPrefetchBuffers; ++i) {
         mPrefetchStatus[i].layer_idx = -1;
         mPrefetchStatus[i].is_ready = true;
         mPrefetchStatus[i].fetch_pending = false;
         mPrefetchStatus[i].version = -1;
 
-        // Allocate individual tensors for each block weight
+        // Track allocated base buffers for this slot
+        std::unordered_map<std::string, Tensor> base_buffers;
+
         for (int l = 0; l < mConfig.num_layers; ++l) {
             for (const auto& name : mBlockParamNames[l]) {
                 auto it = mWeights.find(name);
                 if (it == mWeights.end()) continue;
-                const auto& entry = it->second;
-                std::vector<long> shape = entry.global_shape;
-                if (shape.empty()) {
-                    shape.assign(entry.master.Sizes.begin(),
-                                 entry.master.Sizes.begin() + entry.master.Rank);
+
+                std::string bname = base_name(name);
+                auto bit = base_buffers.find(bname);
+
+                if (bit == base_buffers.end()) {
+                    // First time seeing this base param — allocate GPU buffer
+                    const auto& entry = it->second;
+                    std::vector<long> shape = entry.global_shape;
+                    if (shape.empty()) {
+                        shape.assign(entry.master.Sizes.begin(),
+                                     entry.master.Sizes.begin() + entry.master.Rank);
+                    }
+                    std::string buf_name = "prefetch_" + std::to_string(i) + "_" + bname;
+                    Tensor buf = mAllocator->allocate(mConfig.work_dtype, buf_name.c_str(),
+                                                      EAllocationType::ON_DEVICE, shape);
+                    base_buffers.emplace(bname, buf);
+                    mPrefetchBuffers[i].emplace(name, buf);
+                } else {
+                    // Reuse existing buffer — alias same GPU memory
+                    mPrefetchBuffers[i].emplace(name, bit->second);
                 }
-                std::string buf_name = "prefetch_" + std::to_string(i) + "_" + name;
-                Tensor buf = mAllocator->allocate(mConfig.work_dtype, buf_name.c_str(),
-                                                  EAllocationType::ON_DEVICE, shape);
-                mPrefetchBuffers[i].emplace(name, std::move(buf));
             }
         }
     }
@@ -381,6 +391,10 @@ void DslWeightManager::create_cuda_resources() {
         CUDA_CHECK(cudaEventCreate(&mGatherEvents[i]));
         mPrefetchStatus[i].done_event = mGatherEvents[i];
         CUDA_CHECK(cudaEventRecord(mGatherEvents[i], 0));
+
+        CUDA_CHECK(cudaEventCreate(&mReleaseEvents[i]));
+        mPrefetchStatus[i].release_event = mReleaseEvents[i];
+        CUDA_CHECK(cudaEventRecord(mReleaseEvents[i], 0));
     }
     for (int i = 0; i < 3; ++i) {
         CUDA_CHECK(cudaEventCreate(&mNonBlockEvents[i]));
@@ -396,6 +410,10 @@ void DslWeightManager::release_cuda_resources() noexcept {
         if (mGatherEvents[i]) {
             cudaEventDestroy(mGatherEvents[i]);
             mGatherEvents[i] = nullptr;
+        }
+        if (mReleaseEvents[i]) {
+            cudaEventDestroy(mReleaseEvents[i]);
+            mReleaseEvents[i] = nullptr;
         }
     }
     for (int i = 0; i < 3; ++i) {
@@ -505,6 +523,8 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
     }
 
     auto& status = mPrefetchStatus[buf_idx];
+    // Wait for MainStream to finish reading this buffer before overwriting
+    CUDA_CHECK(cudaStreamWaitEvent(stream, status.release_event, 0));
     status.layer_idx = layer_idx;
     status.is_ready = false;
     status.fetch_pending = true;
@@ -525,7 +545,9 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
 
         auto& entry = it->second;
         auto buf_it = mPrefetchBuffers[buf_idx].find(name);
-        if (buf_it == mPrefetchBuffers[buf_idx].end()) continue;
+        if (buf_it == mPrefetchBuffers[buf_idx].end()) {
+            continue;
+        }
 
         Tensor& work = buf_it->second;
 
@@ -579,6 +601,8 @@ void DslWeightManager::release_block(int layer_idx, cudaStream_t stream) {
                 CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
                 status.fetch_pending = false;
             }
+            // Record event on MainStream so side_stream knows when it's safe to overwrite
+            CUDA_CHECK(cudaEventRecord(status.release_event, stream));
             status.is_ready = true;
             break;
         }
@@ -592,9 +616,13 @@ void DslWeightManager::wait_for_gather(int layer_idx, cudaStream_t stream) {
 
     for (int i = 0; i < kNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
-        if (status.layer_idx == layer_idx && status.fetch_pending) {
-            CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
-            status.fetch_pending = false;
+        if (status.layer_idx == layer_idx) {
+            if (status.fetch_pending) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
+                status.fetch_pending = false;
+            }
+            // Mark buffer as in-use so gather_block won't pick it for another layer
+            status.is_ready = false;
             break;
         }
     }

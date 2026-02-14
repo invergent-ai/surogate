@@ -1023,7 +1023,26 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             *mConfig, mOptions, comm.rank(), comm.world_size(), allocator);
     }
 
+    // DEBUG: GPU memory after model creation (before run state)
+    if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[DEBUG-MEM] After model creation: GPU used="
+                  << (total_mem - free_mem) / (1024*1024) << " MiB, free="
+                  << free_mem / (1024*1024) << " MiB, total="
+                  << total_mem / (1024*1024) << " MiB" << std::endl;
+    }
+
     ctx.Model->allocate_run_state(mOptions, comm, B, T, /*allocate_optimizer=*/true);
+
+    // DEBUG: GPU memory after run state allocation
+    if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[DEBUG-MEM] After run state alloc: GPU used="
+                  << (total_mem - free_mem) / (1024*1024) << " MiB, free="
+                  << free_mem / (1024*1024) << " MiB" << std::endl;
+    }
 
     // Default position IDs: [0..T-1] for each sequence in the batch.
     // This keeps Python-side training/tests deterministic even when callers do not provide
