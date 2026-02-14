@@ -970,4 +970,34 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
     }
 }
 
+void NVFP4Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
+    // FP4 WoQ path: when pre-quantized FP4 E2M1 expert weights are available,
+    // use cuDNN FE block_scale_dequantize fused with moe_grouped_matmul.
+    // This saves memory bandwidth by reading FP4 (0.5 bytes) instead of BF16 (2 bytes)
+    // for expert weights, with the dequantization fused into the matmul kernel.
+    //
+    // Falls back to BF16 cuDNN MoE GEMM when FP4 weights are not available
+    // (on-the-fly quantization is not worthwhile for MoE due to the large
+    // aggregate weight size E*N*K — the quantization cost exceeds bandwidth savings).
+
+    if (ctx.has_fp4_weights()) {
+        bool success = moe_cudnn_grouped_gemm_fp4(
+            ctx.out, ctx.inp,
+            ctx.weights_fp4, ctx.fp4_block_scales,
+            ctx.expert_offsets, ctx.num_experts,
+            ctx.N, ctx.K, ctx.total_tokens,
+            ctx.fp4_block_size,
+            ctx.cudnn_handle, ctx.workspace, ctx.workspace_size,
+            ctx.stream);
+
+        if (success) {
+            return;
+        }
+        // FP4 WoQ not supported on this GPU/cuDNN — fall back to BF16
+    }
+
+    // Fall back to BF16 cuDNN MoE GEMM (base class implementation)
+    Recipe::forward_moe_matmul(ctx);
+}
+
 }  // namespace recipes

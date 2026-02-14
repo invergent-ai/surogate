@@ -120,6 +120,26 @@ public:
      */
     void backward_matmul(modules::MatmulContext& ctx) const override;
 
+    /**
+     * @brief FP8 MoE grouped matmul (forward)
+     *
+     * Implements full FP8 training support for MoE:
+     * 1. Pre-quantized FP8 weights (WoQ via cuDNN FE) - most efficient
+     * 2. Full FP8 training (quantize activations to E4M3)
+     * 3. BF16 fallback
+     */
+    void forward_moe_matmul(modules::MoeMatmulContext& ctx) const override;
+
+    /**
+     * @brief FP8 MoE grouped matmul (backward)
+     *
+     * Quantizes upstream gradients to E5M2 and computes:
+     * - dinp = weights^T @ dout (E4M3 weights × E5M2 gradients)
+     *
+     * Weight gradients computed separately by DSL op dispatchers.
+     */
+    void backward_moe_matmul(modules::MoeMatmulContext& ctx) const override;
+
 private:
     Config mConfig;
 };

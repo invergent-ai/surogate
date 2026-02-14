@@ -13,6 +13,7 @@
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "recipes/recipe.h"
 #include "utilities/dtype.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/lora/lora_grads_manager.h"
@@ -109,6 +110,43 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
+    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact) {
+        // Recipe-driven MoE GEMM via cuDNN FE or FP8
+        modules::MoeMatmulContext ctx;
+        ctx.out = out.get<nv_bfloat16>();
+        ctx.inp = inp.get<nv_bfloat16>();
+        ctx.weights = weights.get<nv_bfloat16>();
+        ctx.expert_offsets = expert_offsets_data;
+        ctx.num_experts = num_experts;
+        ctx.N = out_features;
+        ctx.K = in_features;
+        ctx.total_tokens = static_cast<int>(total_tokens);
+        ctx.layer_idx = layer_idx_any;
+        ctx.run_state = &mRunState;
+        ctx.cudnn_handle = mRunState.CudnnHandle;
+        ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
+        ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
+        ctx.stream = mRunState.MainStream;
+        ctx.host_offsets = host_offsets_ptr;
+        ctx.active_experts = active_ptr;
+        ctx.num_active = num_active;
+        ctx.weight_is_compact = weight_is_compact;
+        ctx.allow_fp8 = op.attrs.allow_quant;
+
+        // Allocate FP8 buffers if using FP8 hybrid recipe
+        Tensor inp_quant_buf, inp_stats_buf;
+        if (mRecipe->is_fp8_hybrid() && ctx.allow_fp8) {
+            const long num_elements = total_tokens * in_features;
+            inp_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E4M3, {total_tokens, static_cast<long>(in_features)});
+            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2});  // abs_max, scale
+            inp_quant_buf.Stats = inp_stats_buf.get<float>();
+            ctx.inp_quant = &inp_quant_buf;
+            mTemps.push_back(inp_quant_buf);
+            mTemps.push_back(inp_stats_buf);
+        }
+
+        mRecipe->forward_moe_matmul(ctx);
     } else if (inp.DType == ETensorDType::BF16) {
         moe_grouped_gemm(out.get<nv_bfloat16>(),
                          inp.get<nv_bfloat16>(),
@@ -294,11 +332,43 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(d_inp, mRunState.MainStream);
+    } else if (mRecipe && d_out.DType == ETensorDType::BF16) {
+        // Recipe-driven backward MoE GEMM
+        modules::MoeMatmulContext ctx;
+        ctx.dinp = d_inp.get<nv_bfloat16>();
+        ctx.dout = d_out.get<nv_bfloat16>();
+        ctx.weights = weights.get<nv_bfloat16>();
+        ctx.expert_offsets = expert_offsets_data;
+        ctx.num_experts = num_experts;
+        ctx.N = out_features;
+        ctx.K = in_features;
+        ctx.total_tokens = static_cast<int>(total_tokens);
+        ctx.layer_idx = layer_idx_any;
+        ctx.run_state = &mRunState;
+        ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.stream = mRunState.MainStream;
+        ctx.host_offsets = host_offsets_ptr;
+        ctx.active_experts = active_ptr;
+        ctx.num_active = num_active;
+        ctx.weight_is_compact = weight_is_compact;
+        ctx.skip_weight_grad = false;
+        ctx.allow_fp8 = op.attrs.allow_quant;
+
+        // Allocate FP8 buffers if using FP8 hybrid recipe
+        Tensor dout_quant_buf, dout_stats_buf;
+        if (mRecipe->is_fp8_hybrid() && ctx.allow_fp8) {
+            const long num_elements = total_tokens * out_features;
+            dout_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E5M2, {total_tokens, static_cast<long>(out_features)});
+            dout_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2});  // abs_max, scale
+            dout_quant_buf.Stats = dout_stats_buf.get<float>();
+            ctx.dout_quant = &dout_quant_buf;
+            mTemps.push_back(dout_quant_buf);
+            mTemps.push_back(dout_stats_buf);
+        }
+
+        mRecipe->backward_moe_matmul(ctx);
     } else if (d_out.DType == ETensorDType::BF16) {
-        // Backward: d_inp = d_out @ weights (using NN mode for transposed operation)
-        // Use moe_grouped_gemm_up_backward which computes: d_input = d_up @ weights^T
-        // For generic case: d_inp[tokens, in_features] = d_out[tokens, out_features] @ W[E, out, in]
-        // moe_grouped_gemm_up_backward expects: hidden_size=in_features, intermediate_size=out_features
+        // Direct kernel call fallback
         moe_grouped_gemm_up_backward(d_inp.get<nv_bfloat16>(),
                                      d_out.get<nv_bfloat16>(),
                                      weights.get<nv_bfloat16>(),

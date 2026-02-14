@@ -1784,6 +1784,37 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
                       bool weight_is_compact = true,
                       int num_active_experts = -1);
 
+/// @brief FP8 MoE grouped GEMM: E4M3 input × E4M3 weights → BF16 output
+/// @param output Output tensor (total_tokens, M) BF16
+/// @param input Input tensor (total_tokens, K) FP8 E4M3
+/// @param weights Expert weights (num_experts, M, K) FP8 E4M3
+/// @param scale_input Per-tensor scale for input (device pointer)
+/// @param scale_weights Per-tensor scale for weights (device pointer)
+/// @param expert_offsets Token offsets per expert (num_experts + 1)
+/// @param num_experts Number of experts
+/// @param M Output dimension per expert
+/// @param K Input dimension per expert
+/// @param cublas_handle cuBLAS handle
+/// @param stream CUDA stream
+/// @param host_offsets Optional pre-cached host offsets
+/// @param alpha Scaling factor (default 1.0)
+/// @param beta Accumulation factor (default 0.0)
+/// @param mode Transpose mode (default TN)
+/// @param active_expert_indices Optional active expert indices
+/// @param weight_is_compact Whether weights use compact indexing
+/// @param num_active_experts Number of active experts
+void moe_grouped_gemm(nv_bfloat16* output, const __nv_fp8_e4m3* input, const __nv_fp8_e4m3* weights,
+                      const float* scale_input, const float* scale_weights,
+                      const int* expert_offsets, int num_experts,
+                      int M, int K,
+                      cublasLtHandle_t cublas_handle, cudaStream_t stream,
+                      const int* host_offsets = nullptr,
+                      float alpha = 1.0f, float beta = 0.0f,
+                      EMMTranspose mode = EMMTranspose::TN,
+                      const int* active_expert_indices = nullptr,
+                      bool weight_is_compact = true,
+                      int num_active_experts = -1);
+
 /// @brief Computes weight gradients across all experts: dW = grad_output^T @ input
 /// @param d_weight Output gradient tensor (num_experts, M, N).
 /// @param grad_output Input gradient from downstream (total_tokens, M).
@@ -1955,6 +1986,82 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_up,
                                   const int* active_expert_indices = nullptr,
                                   bool weight_is_compact = true,
                                   int num_active_experts = -1);
+
+// ============================================================================
+// FP8 MoE Grouped GEMM - Backward Pass
+// ============================================================================
+
+/// @brief FP8 MoE grouped GEMM backward: E4M3 weights × E5M2 gradients → BF16 dinp
+/// Computes: d_input = weights^T @ d_output (for generic MoE backward pass)
+/// @param d_input Output gradient w.r.t. input (total_tokens, K) BF16
+/// @param d_output Input gradient from downstream (total_tokens, M) FP8 E5M2
+/// @param weights Expert weights (num_experts, M, K) FP8 E4M3
+/// @param scale_dout Per-tensor scale for d_output (device pointer)
+/// @param scale_weights Per-tensor scale for weights (device pointer)
+/// @param expert_offsets Token offsets per expert (num_experts + 1)
+/// @param num_experts Number of experts
+/// @param K Input dimension (hidden_size)
+/// @param M Output dimension (intermediate_size or other)
+/// @param cublas_handle cuBLASLt handle
+/// @param stream CUDA stream
+/// @param host_offsets Optional pre-cached host offsets
+/// @param active_expert_indices Optional active expert indices
+/// @param weight_is_compact Whether weights use compact indexing
+/// @param num_active_experts Number of active experts
+void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
+                                  const __nv_fp8_e5m2* d_output,
+                                  const __nv_fp8_e4m3* weights,
+                                  const float* scale_dout,
+                                  const float* scale_weights,
+                                  const int* expert_offsets, int num_experts,
+                                  int hidden_size, int intermediate_size,
+                                  cublasLtHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
+
+// ----------------------------------------------------------------------------
+// cuDNN FE MoE grouped matmul
+// ----------------------------------------------------------------------------
+
+/// BF16 MoE grouped GEMM via cuDNN Frontend moe_grouped_matmul.
+/// Replaces cublasGemmGroupedBatchedEx for MoE forward passes.
+void moe_cudnn_grouped_gemm(
+    nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
+    const int* expert_offsets, int num_experts,
+    int N, int K, int total_tokens,
+    cudnnHandle_t cudnn_handle, std::byte* workspace, std::size_t workspace_size,
+    cudaStream_t stream);
+
+/// Get workspace size for BF16 MoE grouped GEMM.
+std::size_t moe_cudnn_grouped_gemm_workspace_size(
+    int num_experts, int total_tokens, int N, int K,
+    cudnnHandle_t cudnn_handle);
+
+/// FP8 Weight-Only Quantization MoE grouped GEMM via cuDNN Frontend.
+/// Uses block_scale_dequantize(FP8_weight) fused with moe_grouped_matmul.
+/// Token stays BF16; only the weight is FP8 E4M3 with per-block FP32 scales.
+/// Returns true on success, false if FP8 WoQ is not supported on this GPU/cuDNN.
+bool moe_cudnn_grouped_gemm_fp8(
+    nv_bfloat16* output, const nv_bfloat16* input,
+    const void* weights_fp8, const float* block_scales,
+    const int* expert_offsets, int num_experts,
+    int N, int K, int total_tokens, int block_size,
+    cudnnHandle_t cudnn_handle, std::byte* workspace, std::size_t workspace_size,
+    cudaStream_t stream);
+
+/// FP4 Weight-Only Quantization MoE grouped GEMM via cuDNN Frontend.
+/// Uses block_scale_dequantize(FP4_E2M1_weight) fused with moe_grouped_matmul.
+/// Token stays BF16; only the weight is FP4 E2M1 with pre-combined FP32 block scales.
+/// Returns true on success, false if FP4 WoQ is not supported on this GPU/cuDNN.
+bool moe_cudnn_grouped_gemm_fp4(
+    nv_bfloat16* output, const nv_bfloat16* input,
+    const void* weights_fp4, const float* block_scales,
+    const int* expert_offsets, int num_experts,
+    int N, int K, int total_tokens, int block_size,
+    cudnnHandle_t cudnn_handle, std::byte* workspace, std::size_t workspace_size,
+    cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // Mamba / SSM kernels

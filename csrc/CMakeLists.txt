@@ -358,6 +358,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
     src/kernels/cudnn_att.cpp
+    src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu
     src/kernels/mxfp4_dequant.cu
     src/kernels/bnb_quant.cu

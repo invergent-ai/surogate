@@ -5,13 +5,16 @@
 #ifndef SUROGATE_SRC_MODULES_MATMUL_CONTEXT_H
 #define SUROGATE_SRC_MODULES_MATMUL_CONTEXT_H
 
+#include <cstddef>
 #include <optional>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include "utilities/tensor.h"
 
 // Forward declaration of the global IRunState (defined in runtime/training/model.h)
 class IRunState;
+typedef struct cudnnContext* cudnnHandle_t;
 
 namespace modules {
 
@@ -210,6 +213,116 @@ struct SwiGLUContext {
     [[nodiscard]] bool is_forward() const { return dout == nullptr; }
     [[nodiscard]] bool is_backward() const { return dout != nullptr; }
     [[nodiscard]] bool has_scale() const { return scale_out != nullptr || scale != nullptr; }
+};
+
+/**
+ * @brief Context for MoE grouped matmul (recipe-driven dispatch)
+ *
+ * Carries all information needed to execute forward and backward MoE grouped GEMM
+ * through the recipe system, with full FP8 training support.
+ */
+struct MoeMatmulContext {
+    // =========================================================================
+    // Forward pass tensors
+    // =========================================================================
+
+    // BF16 tensors (always set for forward)
+    nv_bfloat16* out = nullptr;          ///< Output (total_tokens, N)
+    const nv_bfloat16* inp = nullptr;    ///< Input tokens (total_tokens, K), pre-permuted
+    const nv_bfloat16* weights = nullptr;///< Expert weights (E, N, K) row-major, BF16
+    const int* expert_offsets = nullptr; ///< Cumulative token offsets (num_experts+1) INT32
+
+    // Optional FP8 weight-only quantization (WoQ) data.
+    // When set, the recipe may use cuDNN FE block_scale_dequantize + moe_grouped_matmul
+    // for fused FP8 WoQ execution. If nullptr, recipe falls back to BF16.
+    const void* weights_fp8 = nullptr;   ///< FP8 E4M3 expert weights (E, N, K) row-major
+    const float* fp8_block_scales = nullptr; ///< Per-block FP32 scales for FP8
+    int fp8_block_size = 128;            ///< Block size for FP8 per-block quantization
+
+    // Optional FP4 weight-only quantization (WoQ) data.
+    // When set, the recipe may use cuDNN FE block_scale_dequantize + moe_grouped_matmul
+    // for fused FP4 WoQ execution. Caller must pre-combine NVFP4's two-level scales
+    // (FP8 block × FP32 global) into a single FP32 scale per block.
+    const void* weights_fp4 = nullptr;   ///< FP4 E2M1 expert weights (E, N, K) packed
+    const float* fp4_block_scales = nullptr; ///< Per-block FP32 combined scales for FP4
+    int fp4_block_size = 16;             ///< Block size for FP4 per-block quantization
+
+    // =========================================================================
+    // Backward pass tensors (only set for backward_moe_matmul)
+    // =========================================================================
+
+    nv_bfloat16* dinp = nullptr;         ///< Gradient w.r.t. input (total_tokens, K)
+    const nv_bfloat16* dout = nullptr;   ///< Upstream gradient (total_tokens, N)
+    nv_bfloat16* dweight = nullptr;      ///< Gradient w.r.t. weights (E, N, K) - optional
+
+    // =========================================================================
+    // FP8 quantization buffers (for full FP8 training, not just WoQ)
+    // =========================================================================
+
+    Tensor* inp_quant = nullptr;         ///< E4M3 quantized input buffer (forward)
+    Tensor* dout_quant = nullptr;        ///< E5M2 quantized gradient buffer (backward)
+    int delayed_quantizer_idx = -1;      ///< Quantizer index for delayed scaling (-1 = JIT)
+
+    // =========================================================================
+    // Dimensions
+    // =========================================================================
+
+    int num_experts = 0;                 ///< Number of experts
+    int N = 0;                           ///< Output dimension per expert
+    int K = 0;                           ///< Input dimension per expert
+    int total_tokens = 0;                ///< Total tokens across all experts
+    int layer_idx = 0;                   ///< Current layer index (for delayed scaling)
+
+    // =========================================================================
+    // Runtime
+    // =========================================================================
+
+    IRunState* run_state = nullptr;      ///< Run state for temp buffer allocation
+    cudnnHandle_t cudnn_handle = nullptr;
+    void* cublas_handle = nullptr;       ///< cublasLtHandle_t for FP8×FP8 matmul
+    std::byte* workspace = nullptr;      ///< cuDNN/cuBLAS workspace
+    std::size_t workspace_size = 0;
+    cudaStream_t stream = nullptr;
+
+    // =========================================================================
+    // Backward-specific flags
+    // =========================================================================
+
+    bool skip_weight_grad = false;       ///< Skip weight gradient computation (LoRA-only)
+    bool allow_fp8 = true;               ///< Allow FP8 quantization (false for skip_quant)
+
+    // =========================================================================
+    // Host-side MoE metadata (cached for performance)
+    // =========================================================================
+
+    const int* host_offsets = nullptr;   ///< Host copy of expert_offsets (E+1)
+    const int* active_experts = nullptr; ///< Active expert indices (compact mode)
+    int num_active = -1;                 ///< Number of active experts (-1 = all)
+    bool weight_is_compact = false;      ///< Weights use compact indexing
+
+    // =========================================================================
+    // Convenience methods
+    // =========================================================================
+
+    /// Check if this is a forward pass context
+    [[nodiscard]] bool is_forward() const {
+        return dout == nullptr;
+    }
+
+    /// Check if this is a backward pass context
+    [[nodiscard]] bool is_backward() const {
+        return dout != nullptr;
+    }
+
+    /// Check if FP8 WoQ data is available
+    [[nodiscard]] bool has_fp8_weights() const {
+        return weights_fp8 != nullptr && fp8_block_scales != nullptr;
+    }
+
+    /// Check if FP4 WoQ data is available
+    [[nodiscard]] bool has_fp4_weights() const {
+        return weights_fp4 != nullptr && fp4_block_scales != nullptr;
+    }
 };
 
 } // namespace modules

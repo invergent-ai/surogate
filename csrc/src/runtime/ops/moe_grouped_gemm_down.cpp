@@ -12,6 +12,7 @@
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "recipes/recipe.h"
 #include "utilities/dtype.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/lora/lora_grads_manager.h"
@@ -113,6 +114,24 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
+    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact) {
+        // Recipe-driven MoE GEMM via cuDNN FE
+        // down weight is (E, C, D) → N=C, K=D
+        modules::MoeMatmulContext ctx;
+        ctx.out = out.get<nv_bfloat16>();
+        ctx.inp = inp.get<nv_bfloat16>();
+        ctx.weights = weights.get<nv_bfloat16>();
+        ctx.expert_offsets = expert_offsets.get<int>();
+        ctx.num_experts = num_experts;
+        ctx.N = hidden_size;
+        ctx.K = intermediate_size;
+        ctx.total_tokens = static_cast<int>(total_tokens);
+        ctx.run_state = &mRunState;
+        ctx.cudnn_handle = mRunState.CudnnHandle;
+        ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
+        ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
+        ctx.stream = mRunState.MainStream;
+        mRecipe->forward_moe_matmul(ctx);
     } else if (inp.DType == ETensorDType::BF16) {
         moe_grouped_gemm_down(out.get<nv_bfloat16>(),
                               inp.get<nv_bfloat16>(),

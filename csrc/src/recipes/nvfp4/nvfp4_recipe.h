@@ -159,6 +159,15 @@ public:
      */
     void backward_matmul(modules::MatmulContext& ctx) const override;
 
+    /**
+     * @brief FP4 WoQ MoE grouped matmul
+     *
+     * When FP4 pre-quantized expert weights are available, uses cuDNN FE
+     * block_scale_dequantize fused with moe_grouped_matmul for bandwidth savings.
+     * Falls back to BF16 cuDNN MoE GEMM otherwise.
+     */
+    void forward_moe_matmul(modules::MoeMatmulContext& ctx) const override;
+
 private:
     Config mConfig;
 

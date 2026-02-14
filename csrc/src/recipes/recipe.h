@@ -233,6 +233,30 @@ public:
     virtual void swiglu_backward(modules::SwiGLUContext& ctx) const;
 
     // =========================================================================
+    // MoE grouped matmul dispatch
+    // =========================================================================
+
+    /**
+     * @brief Execute forward MoE grouped matmul
+     *
+     * Dispatches the MoE grouped GEMM based on the recipe's precision.
+     * BF16 recipe uses BF16 cuDNN FE, FP8 recipe uses FP8 dequant + MoE GEMM, etc.
+     *
+     * @param ctx MoE matmul context with all tensors and dimensions
+     */
+    virtual void forward_moe_matmul(modules::MoeMatmulContext& ctx) const;
+
+    /**
+     * @brief Execute backward MoE grouped matmul
+     *
+     * Computes gradients w.r.t. input (dinp) and optionally weights (dweight).
+     * FP8 hybrid recipe quantizes gradients to E5M2 and uses E4M3 weights × E5M2 grads.
+     *
+     * @param ctx MoE matmul context with gradient tensors (dout, dinp, dweight)
+     */
+    virtual void backward_moe_matmul(modules::MoeMatmulContext& ctx) const;
+
+    // =========================================================================
     // Run state configuration
     // =========================================================================
 

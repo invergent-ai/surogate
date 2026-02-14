@@ -92,6 +92,46 @@ void Recipe::backward_matmul(modules::MatmulContext& ctx) const {
 }
 
 // =============================================================================
+// Default MoE grouped matmul implementation
+// =============================================================================
+
+void Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
+    // Default implementation: BF16 MoE grouped GEMM via cuDNN Frontend.
+    // Derived recipes (FP8, FP4) override to add weight dequantization.
+    moe_cudnn_grouped_gemm(
+        ctx.out, ctx.inp, ctx.weights,
+        ctx.expert_offsets, ctx.num_experts,
+        ctx.N, ctx.K, ctx.total_tokens,
+        ctx.cudnn_handle, ctx.workspace, ctx.workspace_size,
+        ctx.stream);
+}
+
+void Recipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const {
+    // Default implementation: BF16 MoE grouped GEMM backward.
+    // Computes dinp = weights^T @ dout using grouped GEMM kernels.
+    //
+    // Weight gradients are computed separately in the DSL op dispatchers.
+    // Derived recipes (FP8, FP4) override to add gradient quantization.
+
+    if (!ctx.run_state) {
+        throw std::runtime_error("Recipe::backward_moe_matmul: run_state is null");
+    }
+    if (!ctx.dinp || !ctx.dout || !ctx.weights || !ctx.expert_offsets) {
+        throw std::runtime_error("Recipe::backward_moe_matmul: required tensors are null");
+    }
+
+    // dinp = weights^T @ dout
+    // Use the generic moe_grouped_gemm_up_backward kernel which computes d_input = d_output @ weights^T
+    moe_grouped_gemm_up_backward(
+        ctx.dinp, ctx.dout, ctx.weights,
+        ctx.expert_offsets, ctx.num_experts,
+        ctx.K, ctx.N,  // hidden_size=K, intermediate_size=N (swapped for backward)
+        reinterpret_cast<cublasHandle_t>(ctx.cublas_handle), ctx.stream,
+        ctx.host_offsets,
+        ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
+}
+
+// =============================================================================
 // Default SwiGLU implementation
 // =============================================================================
 

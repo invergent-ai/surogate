@@ -338,4 +338,208 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     }
 }
 
+void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
+    // Full FP8 training support for MoE:
+    // 1. Pre-quantized FP8 weights (WoQ path via cuDNN FE) - most efficient
+    // 2. Full FP8 training (quantize activations + call BF16 kernels for now)
+    // 3. BF16 fallback (when FP8 not allowed or not supported)
+
+    // =========================================================================
+    // Path 1: Pre-quantized FP8 weights (Weight-Only Quantization via cuDNN FE)
+    // =========================================================================
+    if (ctx.has_fp8_weights()) {
+        bool success = moe_cudnn_grouped_gemm_fp8(
+            ctx.out, ctx.inp,
+            ctx.weights_fp8, ctx.fp8_block_scales,
+            ctx.expert_offsets, ctx.num_experts,
+            ctx.N, ctx.K, ctx.total_tokens,
+            ctx.fp8_block_size,
+            ctx.cudnn_handle, ctx.workspace, ctx.workspace_size,
+            ctx.stream);
+
+        if (success) {
+            return;
+        }
+        // FP8 WoQ not supported on this GPU/cuDNN — fall back to path 2 or 3
+    }
+
+    // =========================================================================
+    // Path 2: Full FP8 Training (quantize activations + use FP8 kernels)
+    // =========================================================================
+
+    if (ctx.allow_fp8 && ctx.inp_quant && ctx.inp_quant->Data && ctx.run_state &&
+        ctx.cublas_handle && ctx.host_offsets) {
+        IRunState& rs = *ctx.run_state;
+        const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.K;
+
+        if (ctx.inp_quant->DType != ETensorDType::FP8_E4M3) {
+            throw std::runtime_error(
+                "FP8HybridRecipe::forward_moe_matmul: inp_quant should be E4M3");
+        }
+        if (!ctx.inp_quant->abs_max() || !ctx.inp_quant->scale()) {
+            throw std::runtime_error(
+                "FP8HybridRecipe::forward_moe_matmul: inp_quant missing abs_max/scale Stats");
+        }
+
+        Tensor& inp_fp8 = *ctx.inp_quant;
+
+        // Step 1: Quantize input to FP8 E4M3
+        if (ctx.delayed_quantizer_idx >= 0 && rs.has_fp8_delayed_scaling()) {
+            auto* scaling_state = rs.get_fp8_scaling_state();
+            if (scaling_state) {
+                auto qidx = static_cast<modules::QuantizerIndex>(ctx.delayed_quantizer_idx);
+                Tensor inp_bf16{};
+                inp_bf16.Data = reinterpret_cast<std::byte*>(const_cast<nv_bfloat16*>(ctx.inp));
+                inp_bf16.DType = ETensorDType::BF16;
+                inp_bf16.Rank = 2;
+                inp_bf16.Sizes[0] = ctx.total_tokens;
+                inp_bf16.Sizes[1] = ctx.K;
+
+                quantize_with_delayed_scale(
+                    inp_fp8.get<__nv_fp8_e4m3>(),
+                    scaling_state->get_recorded_amax_ptr(qidx),
+                    inp_fp8.scale(),
+                    inp_bf16.get<nv_bfloat16>(),
+                    scaling_state->get_scale(qidx),
+                    num_elements, rs.DeviceProp, ctx.stream);
+            }
+        } else {
+            // JIT scaling
+            Tensor inp_bf16{};
+            inp_bf16.Data = reinterpret_cast<std::byte*>(const_cast<nv_bfloat16*>(ctx.inp));
+            inp_bf16.DType = ETensorDType::BF16;
+            inp_bf16.Rank = 2;
+            inp_bf16.Sizes[0] = ctx.total_tokens;
+            inp_bf16.Sizes[1] = ctx.K;
+
+            quantize_with_abs_max(inp_fp8, inp_fp8.scale(), inp_bf16, inp_fp8.abs_max(),
+                                  num_elements, rs.DeviceProp, ctx.stream);
+        }
+
+        // Step 2: Quantize expert weights to FP8 E4M3 (per-expert quantization)
+        Tensor weights_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K});
+        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2});
+        weights_fp8.Stats = weight_stats.get<float>();
+
+        for (int e = 0; e < ctx.num_experts; ++e) {
+            const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
+            __nv_fp8_e4m3* weight_fp8_e = weights_fp8.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
+            float* abs_max_e = weight_stats.get<float>() + e * 2;
+            float* scale_e = abs_max_e + 1;
+
+            abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+            quantize_with_abs_max(weight_fp8_e, scale_e, weight_e, abs_max_e,
+                                  static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+        }
+
+        // Step 3: FP8×FP8 MoE grouped GEMM
+        moe_grouped_gemm(
+            ctx.out,
+            inp_fp8.get<__nv_fp8_e4m3>(),
+            weights_fp8.get<__nv_fp8_e4m3>(),
+            inp_fp8.scale(),
+            weight_stats.get<float>() + 1,  // First scale
+            ctx.expert_offsets, ctx.num_experts,
+            ctx.N, ctx.K,
+            reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle), ctx.stream,
+            ctx.host_offsets,
+            1.0f, 0.0f, EMMTranspose::TN,
+            ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
+
+        rs.temp_free(weight_stats);
+        rs.temp_free(weights_fp8);
+        return;  // Success - FP8 path completed
+    }
+
+    // =========================================================================
+    // Path 3: BF16 Fallback
+    // =========================================================================
+    Recipe::forward_moe_matmul(ctx);
+}
+
+void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const {
+    // Full FP8 backward pass for MoE:
+    // 1. Quantize upstream gradient to E5M2
+    // 2. Compute dinp = weights^T @ dout
+    //
+    // Note: Similar to forward, we quantize gradients but use BF16 kernels for now.
+    // Adding native FP8 MoE backward kernels would improve performance.
+
+    if (!ctx.run_state || !ctx.dinp || !ctx.dout || !ctx.weights || !ctx.expert_offsets) {
+        if (!ctx.run_state) {
+            throw std::runtime_error("FP8HybridRecipe::backward_moe_matmul: run_state is null");
+        }
+        throw std::runtime_error("FP8HybridRecipe::backward_moe_matmul: required tensors are null");
+    }
+
+    // Fall back to BF16 if FP8 is not allowed for this layer
+    if (!ctx.allow_fp8) {
+        Recipe::backward_moe_matmul(ctx);
+        return;
+    }
+
+    // Use FP8 backward if buffers are available
+    if (ctx.dout_quant && ctx.dout_quant->Data && ctx.cublas_handle && ctx.host_offsets) {
+        if (ctx.dout_quant->DType != ETensorDType::FP8_E5M2) {
+            throw std::runtime_error(
+                "FP8HybridRecipe::backward_moe_matmul: dout_quant should be E5M2");
+        }
+        if (!ctx.dout_quant->abs_max() || !ctx.dout_quant->scale()) {
+            throw std::runtime_error(
+                "FP8HybridRecipe::backward_moe_matmul: dout_quant missing abs_max/scale Stats");
+        }
+
+        IRunState& rs = *ctx.run_state;
+        Tensor& dout_e5m2 = *ctx.dout_quant;
+        const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.N;
+
+        // Step 1: Quantize upstream gradient to E5M2
+        Tensor dout_bf16{};
+        dout_bf16.Data = reinterpret_cast<std::byte*>(const_cast<nv_bfloat16*>(ctx.dout));
+        dout_bf16.DType = ETensorDType::BF16;
+        dout_bf16.Rank = 2;
+        dout_bf16.Sizes[0] = ctx.total_tokens;
+        dout_bf16.Sizes[1] = ctx.N;
+
+        quantize_with_abs_max(dout_e5m2, dout_e5m2.scale(), dout_bf16, dout_e5m2.abs_max(),
+                              num_elements, rs.DeviceProp, ctx.stream);
+
+        // Step 2: Quantize expert weights to E4M3
+        Tensor weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K});
+        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2});
+        weights_e4m3.Stats = weight_stats.get<float>();
+
+        for (int e = 0; e < ctx.num_experts; ++e) {
+            const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
+            __nv_fp8_e4m3* weight_fp8_e = weights_e4m3.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
+            float* abs_max_e = weight_stats.get<float>() + e * 2;
+            float* scale_e = abs_max_e + 1;
+
+            abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+            quantize_with_abs_max(weight_fp8_e, scale_e, weight_e, abs_max_e,
+                                  static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+        }
+
+        // Step 3: FP8 backward GEMM (E4M3 weights × E5M2 gradients → BF16 dinp)
+        moe_grouped_gemm_up_backward(
+            ctx.dinp,
+            dout_e5m2.get<__nv_fp8_e5m2>(),
+            weights_e4m3.get<__nv_fp8_e4m3>(),
+            dout_e5m2.scale(),
+            weight_stats.get<float>() + 1,  // First scale
+            ctx.expert_offsets, ctx.num_experts,
+            ctx.K, ctx.N,
+            reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle), ctx.stream,
+            ctx.host_offsets,
+            ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
+
+        rs.temp_free(weight_stats);
+        rs.temp_free(weights_e4m3);
+        return;  // Success - FP8 backward completed
+    }
+
+    // Fall back to BF16
+    Recipe::backward_moe_matmul(ctx);
+}
+
 }  // namespace recipes
