@@ -46,7 +46,7 @@ jobs:
     steps:
       - name: Install System Dependencies
         run: |
-          apt-get update && apt-get install -y --no-install-recommends \
+          apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
           git wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev libdw-dev libelf-dev libnccl2 libnccl-dev \
           g++-13
 
