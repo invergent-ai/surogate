@@ -398,7 +398,7 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
         }
 
         // MoE metrics string
-        std::string moe_str = fmt::format(" | aux {:.4f} | imbal {:.2f}", moe_aux_loss, moe_load_imbalance);
+        std::string moe_str = fmt::format(" | aux {:.4f} | imbal {:.2f} | util {:.2f}", moe_aux_loss, moe_load_imbalance, moe_expert_utilization);
 
         std::string phase_str = mPhase.empty() ? "" : fmt::format(" | {}", mPhase);
 
