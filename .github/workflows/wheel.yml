@@ -47,7 +47,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           apt-get update && apt-get install -y --no-install-recommends \
-          git wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev \
+          git wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev libdw-dev libelf-dev libnccl-dev \
           g++-13
 
       - name: Checkout code
