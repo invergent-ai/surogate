@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -354,6 +355,14 @@ DslRunState::DslRunState(const PretrainedConfig& config,
 DslRunState::~DslRunState() {
     destroy_cuda_graphs();
     release_cuda_resources();
+    if (mMoEStatsDevice) {
+        (void)cudaFree(mMoEStatsDevice);
+        mMoEStatsDevice = nullptr;
+    }
+    if (mMoEStatsHost) {
+        (void)cudaFreeHost(mMoEStatsHost);
+        mMoEStatsHost = nullptr;
+    }
 }
 
 void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark) {
@@ -1172,6 +1181,48 @@ void DslRunState::configure_backward_graphs(bool hooked) {
         }
     }
     mBackwardGraphsHooked = hooked;
+}
+
+void DslRunState::set_moe_config(int num_experts, float aux_loss_coef) {
+    if (num_experts <= 0) return;
+    mNumMoEExperts = num_experts;
+    mMoEAuxLossCoef = aux_loss_coef;
+    if (!mMoEStatsDevice) {
+        CUDA_CHECK(cudaMalloc(&mMoEStatsDevice, kMoEStatsSize * sizeof(float)));
+        CUDA_CHECK(cudaMemset(mMoEStatsDevice, 0, kMoEStatsSize * sizeof(float)));
+    }
+    if (!mMoEStatsHost) {
+        CUDA_CHECK(cudaMallocHost(&mMoEStatsHost, kMoEStatsSize * sizeof(float)));
+        std::memset(mMoEStatsHost, 0, kMoEStatsSize * sizeof(float));
+    }
+}
+
+IRunState::MoEStats DslRunState::get_moe_stats() const {
+    MoEStats stats;
+    if (!mMoEStatsDevice || mNumMoEExperts <= 0) {
+        return stats;
+    }
+    // Copy accumulated stats from device to host (sync — called after forward is complete)
+    CUDA_CHECK(cudaMemcpy(mMoEStatsHost, mMoEStatsDevice,
+                          kMoEStatsSize * sizeof(float), cudaMemcpyDeviceToHost));
+    const int num_layers = static_cast<int>(mMoEStatsHost[4]);
+    if (num_layers <= 0) {
+        return stats;
+    }
+    stats.aux_loss = mMoEStatsHost[0];                       // summed across layers
+    stats.z_loss = mMoEStatsHost[1];                          // summed across layers
+    stats.expert_utilization = mMoEStatsHost[2] / num_layers; // average
+    stats.load_imbalance = mMoEStatsHost[3] / num_layers;    // average
+    stats.num_layers = num_layers;
+    stats.valid = true;
+    return stats;
+}
+
+void DslRunState::reset_moe_stats() {
+    if (mMoEStatsDevice) {
+        CUDA_CHECK(cudaMemsetAsync(mMoEStatsDevice, 0,
+                                   kMoEStatsSize * sizeof(float), MainStream));
+    }
 }
 
 } // namespace dsl

@@ -154,6 +154,20 @@ public:
     [[nodiscard]] Tensor* get_gradient_quant_buffer(int op) override;
     [[nodiscard]] modules::FP8ScalingState* get_fp8_scaling_state() override { return mFP8ScalingState.get(); }
 
+    // MoE stats overrides
+    [[nodiscard]] MoEStats get_moe_stats() const override;
+    void reset_moe_stats() override;
+    [[nodiscard]] bool is_moe_model() const override { return mNumMoEExperts > 0; }
+
+    /// @brief Get device pointer to MoE stats buffer for kernel accumulation.
+    /// Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
+    float* moe_stats_device() { return mMoEStatsDevice; }
+
+    /// @brief Set MoE config and allocate stats buffers (call once after construction)
+    void set_moe_config(int num_experts, float aux_loss_coef);
+    [[nodiscard]] int moe_num_experts() const { return mNumMoEExperts; }
+    [[nodiscard]] float moe_aux_loss_coef() const { return mMoEAuxLossCoef; }
+
 private:
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_activations(const PretrainedConfig& cfg);
@@ -244,6 +258,14 @@ private:
     // Helper to destroy graph arrays
     void destroy_cuda_graphs() noexcept;
     void allocate_graph_arrays(int num_layers);
+
+    // MoE routing stats accumulation buffer (GPU)
+    // Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
+    static constexpr int kMoEStatsSize = 5;
+    float* mMoEStatsDevice = nullptr;   ///< Device buffer for kernel accumulation
+    float* mMoEStatsHost = nullptr;     ///< Pinned host buffer for readback
+    int mNumMoEExperts = 0;             ///< 0 = not MoE
+    float mMoEAuxLossCoef = 0.01f;     ///< Auxiliary loss coefficient
 };
 
 } // namespace dsl

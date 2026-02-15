@@ -1839,6 +1839,115 @@ void moe_compute_aux_loss(
     );
 }
 
+// ============================================================================
+// Routing Statistics Kernel (for monitoring — not on gradient path)
+// ============================================================================
+// Computes aux_loss, expert_utilization, and load_imbalance in a single pass
+// and accumulates into a persistent stats buffer via atomicAdd.
+// stats layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
+
+template<typename T>
+__global__ void moe_routing_stats_kernel(
+    float* __restrict__ stats,              // [5] accumulated stats
+    const T* __restrict__ routing_probs,    // (num_tokens, num_experts) post-softmax/sigmoid
+    const int* __restrict__ expert_indices, // (num_tokens, top_k)
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    float aux_loss_coef
+) {
+    extern __shared__ float smem[];
+    float* expert_counts = smem;                   // num_experts
+    float* expert_probs  = smem + num_experts;     // num_experts
+
+    // Initialize shared memory
+    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        expert_counts[e] = 0.0f;
+        expert_probs[e] = 0.0f;
+    }
+    __syncthreads();
+
+    // Count tokens per expert
+    int total_assignments = num_tokens * top_k;
+    for (int i = threadIdx.x; i < total_assignments; i += blockDim.x) {
+        int expert_id = expert_indices[i];
+        if (expert_id >= 0 && expert_id < num_experts) {
+            atomicAdd(&expert_counts[expert_id], 1.0f);
+        }
+    }
+
+    // Compute average routing probability per expert
+    for (int t = threadIdx.x; t < num_tokens; t += blockDim.x) {
+        for (int e = 0; e < num_experts; e++) {
+            float prob = static_cast<float>(routing_probs[t * num_experts + e]);
+            atomicAdd(&expert_probs[e], prob / num_tokens);
+        }
+    }
+    __syncthreads();
+
+    // Single thread computes final stats
+    if (threadIdx.x == 0) {
+        // Aux loss: coef * num_experts * sum(f_e * P_e)
+        float aux_loss = 0.0f;
+        float max_count = 0.0f;
+        float mean_count = static_cast<float>(total_assignments) / num_experts;
+        int active_experts = 0;
+
+        for (int e = 0; e < num_experts; e++) {
+            float fraction = expert_counts[e] / total_assignments;
+            aux_loss += fraction * expert_probs[e];
+            if (expert_counts[e] > max_count) max_count = expert_counts[e];
+            if (expert_counts[e] > 0.0f) active_experts++;
+        }
+        aux_loss *= num_experts * aux_loss_coef;
+
+        float utilization = static_cast<float>(active_experts) / num_experts;
+        float load_imbalance = (mean_count > 0.0f) ? (max_count / mean_count) : 0.0f;
+
+        atomicAdd(&stats[0], aux_loss);
+        // stats[1] (z_loss) not computed here — needs pre-softmax logits
+        atomicAdd(&stats[2], utilization);
+        atomicAdd(&stats[3], load_imbalance);
+        atomicAdd(&stats[4], 1.0f);  // layer count
+    }
+}
+
+void moe_compute_routing_stats(
+    float* stats,
+    const nv_bfloat16* routing_probs,
+    const int* expert_indices,
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    float aux_loss_coef,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int shared_mem = 2 * num_experts * sizeof(float);
+    moe_routing_stats_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(
+        stats, routing_probs, expert_indices,
+        num_tokens, num_experts, top_k, aux_loss_coef
+    );
+}
+
+void moe_compute_routing_stats(
+    float* stats,
+    const float* routing_probs,
+    const int* expert_indices,
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    float aux_loss_coef,
+    cudaStream_t stream
+) {
+    int block_size = 256;
+    int shared_mem = 2 * num_experts * sizeof(float);
+    moe_routing_stats_kernel<float><<<1, block_size, shared_mem, stream>>>(
+        stats, routing_probs, expert_indices,
+        num_tokens, num_experts, top_k, aux_loss_coef
+    );
+}
+
 void moe_router_z_loss_forward(
     float* z_loss,
     const nv_bfloat16* router_logits,

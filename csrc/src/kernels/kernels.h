@@ -1666,6 +1666,21 @@ void moe_compute_aux_loss(float* aux_loss, const float* routing_probs, const int
 void moe_compute_aux_loss(float* aux_loss, const nv_bfloat16* routing_probs, const int* expert_indices,
                           int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
 
+/// @brief Compute MoE routing statistics for monitoring (aux_loss, utilization, load_imbalance).
+/// Accumulates into a persistent buffer using atomicAdd (call once per MoE layer per step).
+/// @param stats Output buffer [5]: {aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count}.
+/// @param routing_probs Routing probabilities post-softmax/sigmoid (num_tokens, num_experts).
+/// @param expert_indices Expert indices from topk (num_tokens, top_k).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param top_k Number of experts per token.
+/// @param aux_loss_coef Auxiliary loss coefficient.
+/// @param stream CUDA stream.
+void moe_compute_routing_stats(float* stats, const float* routing_probs, const int* expert_indices,
+                               int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
+void moe_compute_routing_stats(float* stats, const nv_bfloat16* routing_probs, const int* expert_indices,
+                               int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
+
 // MoE Backward Kernels
 
 /// @brief Backward pass for softmax routing.

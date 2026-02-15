@@ -678,6 +678,14 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mExecutor->set_rng_state(mRngState);
     }
 
+    // Enable MoE routing stats tracking
+    if (mModelConfig.NumExperts > 0) {
+        float aux_coef = mModelConfig.moe_config.has_value()
+                         ? mModelConfig.moe_config->router_aux_loss_coef
+                         : 0.01f;
+        mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef);
+    }
+
     // Wire weight manager for streaming/sharding
     if (mWeightManager) {
         if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {

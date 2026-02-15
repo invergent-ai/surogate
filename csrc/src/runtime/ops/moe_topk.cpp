@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
+#include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -81,6 +82,18 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     store_tensor(op.outputs[0], weights);
     store_tensor(op.outputs[1], indices);
 
+    // Accumulate MoE routing stats for monitoring (non-gradient path)
+    if (float* stats = mRunState.moe_stats_device()) {
+        if (probs.DType == ETensorDType::BF16) {
+            moe_compute_routing_stats(stats, probs.get<nv_bfloat16>(), indices.get<int>(),
+                                      num_tokens, num_experts, top_k,
+                                      mRunState.moe_aux_loss_coef(), mRunState.MainStream);
+        } else {
+            moe_compute_routing_stats(stats, probs.get<float>(), indices.get<int>(),
+                                      num_tokens, num_experts, top_k,
+                                      mRunState.moe_aux_loss_coef(), mRunState.MainStream);
+        }
+    }
 }
 
 void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
