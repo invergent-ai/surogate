@@ -68,7 +68,79 @@ if python -c "import surogate" 2>/dev/null; then
     echo "Currently installed surogate version: $INSTALLED_VERSION"
 fi
 
-# Detect CUDA version
+# --- CUDA version-specific install functions ---
+# Each function installs the appropriate packages for its CUDA version.
+# Uses CPU torch wheels to avoid pulling in nvidia-* pip packages;
+# CUDA kernels in surogate link against the system CUDA toolkit.
+
+install_cu128() {
+    local version="$1"
+    echo "Installing packages for CUDA 12.8..."
+    uv pip install "nvidia-cudnn-cu12==9.19.0.56"
+    install_surogate_wheel "$version" "cu128"
+}
+
+install_cu129() {
+    local version="$1"
+    echo "Installing packages for CUDA 12.9..."
+    uv pip install "nvidia-cudnn-cu12==9.19.0.56"
+    install_surogate_wheel "$version" "cu129"
+}
+
+install_cu13() {
+    local version="$1"
+    echo "Installing packages for CUDA 13+..."
+    uv pip install "nvidia-cudnn-cu13==9.19.0.56"
+    install_surogate_wheel "$version" "cu129"
+}
+
+# --- Helper: download and install the surogate wheel ---
+
+install_surogate_wheel() {
+    local version="$1"
+    local cuda_suffix="$2"
+
+    local wheel_name="surogate-${version}+${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
+    local wheel_pattern="surogate-${version}%2B${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
+
+    local download_url
+    download_url=$(echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "$wheel_pattern" || true)
+
+    if [ -z "$download_url" ]; then
+        echo "Error: Could not find wheel for CUDA $cuda_suffix (looking for $wheel_name)"
+        echo "Available wheels:"
+        echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep '\.whl$' || echo "  (none found)"
+        exit 1
+    fi
+
+    echo "Downloading: $wheel_name"
+    echo "URL: $download_url"
+
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    local wheel_path="${temp_dir}/${wheel_name}"
+
+    curl -L -o "$wheel_path" "$download_url"
+
+    if [ ! -f "$wheel_path" ]; then
+        echo "Error: Failed to download wheel."
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+
+    if [ -n "$INSTALLED_VERSION" ]; then
+        echo "Upgrading surogate from $INSTALLED_VERSION to $version..."
+        uv pip install --reinstall "$wheel_path"
+    else
+        echo "Installing surogate..."
+        uv pip install "$wheel_path"
+    fi
+
+    rm -rf "$temp_dir"
+}
+
+# --- Detect CUDA version ---
+
 CUDA_VERSION=""
 if command -v nvcc &> /dev/null; then
     CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
@@ -88,21 +160,8 @@ CUDA_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
 
 echo "Detected CUDA version: $CUDA_VERSION"
 
-# Map to supported CUDA version suffix
-if [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    CUDA_SUFFIX="cu129"
-elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 9 ]]; then
-    CUDA_SUFFIX="cu129"
-elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
-    CUDA_SUFFIX="cu128"
-else
-    echo "Warning: CUDA $CUDA_VERSION may not be fully compatible. Using cu129."
-    CUDA_SUFFIX="cu129"
-fi
+# --- Fetch latest release ---
 
-echo "Using CUDA suffix: $CUDA_SUFFIX"
-
-# Fetch the latest release info from GitHub API
 echo "Fetching latest release from GitHub..."
 RELEASE_JSON=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest")
 
@@ -111,59 +170,28 @@ if [ -z "$RELEASE_JSON" ] || echo "$RELEASE_JSON" | grep -q '"message": "Not Fou
     exit 1
 fi
 
-# Extract the version tag (e.g., "v0.0.1" or "0.0.1")
 TAG_NAME=$(echo "$RELEASE_JSON" | grep -oP '"tag_name":\s*"\K[^"]+')
-# Remove leading 'v' if present
 VERSION="${TAG_NAME#v}"
-
 echo "Latest version: $VERSION"
 
-# Construct the wheel filename pattern (URLs have %2B instead of +)
-WHEEL_NAME="surogate-${VERSION}+${CUDA_SUFFIX}-cp312-abi3-manylinux_2_39_x86_64.whl"
-WHEEL_PATTERN="surogate-${VERSION}%2B${CUDA_SUFFIX}-cp312-abi3-manylinux_2_39_x86_64.whl"
+# --- Dispatch to the right install function ---
 
-# Find the download URL for the matching wheel (GitHub URLs use %2B for +)
-DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "$WHEEL_PATTERN" || true)
-
-if [ -z "$DOWNLOAD_URL" ]; then
-    echo "Error: Could not find wheel for CUDA $CUDA_SUFFIX (looking for $WHEEL_NAME)"
-    echo "Available wheels:"
-    echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep '\.whl$' || echo "  (none found)"
-    exit 1
-fi
-
-echo "Downloading: $WHEEL_NAME"
-echo "URL: $DOWNLOAD_URL"
-
-# Download and install the wheel
-TEMP_DIR=$(mktemp -d)
-WHEEL_PATH="${TEMP_DIR}/${WHEEL_NAME}"
-
-curl -L -o "$WHEEL_PATH" "$DOWNLOAD_URL"
-
-if [ ! -f "$WHEEL_PATH" ]; then
-    echo "Error: Failed to download wheel."
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-# Install or upgrade surogate
-if [ -n "$INSTALLED_VERSION" ]; then
-    echo "Upgrading surogate from $INSTALLED_VERSION to $VERSION..."
-    uv pip install --reinstall "$WHEEL_PATH"
+if [[ "$CUDA_MAJOR" -ge 13 ]]; then
+    install_cu13 "$VERSION"
+elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 9 ]]; then
+    install_cu129 "$VERSION"
+elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
+    install_cu128 "$VERSION"
 else
-    echo "Installing surogate..."
-    uv pip install "$WHEEL_PATH"
+    echo "Error: CUDA $CUDA_VERSION is not compatible with Surogate. Aborting."
+    exit 1
 fi
-
-# Cleanup
-rm -rf "$TEMP_DIR"
 
 echo ""
 if [ -n "$INSTALLED_VERSION" ]; then
-    echo "Successfully upgraded surogate from $INSTALLED_VERSION to $VERSION for CUDA $CUDA_SUFFIX"
+    echo "Successfully upgraded surogate from $INSTALLED_VERSION to $VERSION"
 else
-    echo "Successfully installed surogate $VERSION for CUDA $CUDA_SUFFIX"
+    echo "Successfully installed surogate $VERSION"
 fi
 
 # Clone examples
