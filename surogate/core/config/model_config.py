@@ -49,7 +49,7 @@ class ModelConfig(ABC):
     def _init_model_info(self) -> torch.dtype:
         logger = get_logger()
         logger.debug("init model info and template...")
-        self.model_info, self.model_template, self._model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs(), load_model=False)
+        self.model_info, self.model_template, self._model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs(), load_model=False, download_model=True)
         self.model_dir = self.model_info.model_dir
         self.model_type = self.model_info.model_type
 
