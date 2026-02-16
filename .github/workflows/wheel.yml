@@ -11,21 +11,21 @@ jobs:
     name: Build wheel (CUDA ${{ matrix.cuda_version }})
     runs-on: self-hosted
     container:
-      image: ${{ matrix.cuda_image }}
+      image: ${{ matrix.cuda_build_image }}
 
     strategy:
       matrix:
         include:
           - cuda_version: "12.8"
-            cuda_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
+            cuda_build_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"
             archs: "80;86;89;90;100a;120a"
           - cuda_version: "12.9"
-            cuda_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
+            cuda_build_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu129"
             archs: "80;86;89;90;100a;103a;120a"
           - cuda_version: "13.1"
-            cuda_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
+            cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu13"
             archs: "80;86;89;90;100a;103a;120a"
     env:
@@ -69,8 +69,8 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Add CUDA runtime dependencies
-        run: uv run --no-project --with tomlkit python3 .github/scripts/add_cuda_deps.py "${{ matrix.wheel_tag }}" "${{ matrix.torch_index_url }}"
+      - name: Add CUDA version tag
+        run: uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py "${{ matrix.wheel_tag }}"
 
       - name: Build wheel
         run: uv build --wheel

@@ -1,0 +1,102 @@
+name: Build Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g., 0.1.1). Leave empty to use latest git tag.'
+        required: false
+        type: string
+      cuda_versions:
+        description: 'CUDA versions to build (comma-separated: cu128,cu129,cu13, or "all")'
+        required: true
+        default: 'all'
+        type: string
+
+jobs:
+  docker:
+    name: Build Docker image (CUDA ${{ matrix.wheel_tag }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        include:
+          - cuda_major: "12"
+            wheel_tag: "cu128"
+            cuda_runtime_image: "nvidia/cuda:12.8.1-runtime-ubuntu24.04"
+          - cuda_major: "12"
+            wheel_tag: "cu129"
+            cuda_runtime_image: "nvidia/cuda:12.9.1-runtime-ubuntu24.04"
+          - cuda_major: "13"
+            wheel_tag: "cu13"
+            cuda_runtime_image: "nvidia/cuda:13.1.1-runtime-ubuntu24.04"
+
+    steps:
+      - name: Check if this CUDA version should be built
+        id: should_build
+        run: |
+          REQUESTED="${{ inputs.cuda_versions }}"
+          CURRENT="${{ matrix.wheel_tag }}"
+
+          if [[ "$REQUESTED" == "all" ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+          elif [[ ",$REQUESTED," == *",$CURRENT,"* ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.should_build.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Docker Buildx
+        if: steps.should_build.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.should_build.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version
+        if: steps.should_build.outputs.build == 'true'
+        id: version
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          else
+            # Get latest tag
+            git fetch --tags
+            LATEST_TAG=$(git describe --tags --abbrev=0 --match='v*' 2>/dev/null || echo "v0.0.1")
+            VERSION="${LATEST_TAG#v}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "Using latest tag: ${VERSION}"
+          fi
+
+      - name: Build and push Docker image
+        if: steps.should_build.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            CUDA_RUNTIME_IMAGE=${{ matrix.cuda_runtime_image }}
+            CUDA_MAJOR=${{ matrix.cuda_major }}
+            PACKAGE_VERSION=${{ steps.version.outputs.version }}
+            WHEEL_TAG=${{ matrix.wheel_tag }}
+          tags: |
+            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
+            ghcr.io/invergent-ai/surogate:latest-${{ matrix.wheel_tag }}
+          cache-from: type=gha,scope=${{ matrix.wheel_tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.wheel_tag }}
