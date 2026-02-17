@@ -2280,8 +2280,9 @@ void moe_grouped_gemm(float* output, const float* input, const float* weights,
                       float alpha, float beta, EMMTranspose mode,
                       const int* active_expert_indices,
                       bool weight_is_compact,
-                      int num_active_experts) {
-    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts);
+                      int num_active_experts,
+                      const void* const* weight_ptrs) {
+    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
 }
 
 void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
@@ -2292,8 +2293,9 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
                       float alpha, float beta, EMMTranspose mode,
                       const int* active_expert_indices,
                       bool weight_is_compact,
-                      int num_active_experts) {
-    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts);
+                      int num_active_experts,
+                      const void* const* weight_ptrs) {
+    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
 }
 
 template<typename T>
@@ -3212,7 +3214,8 @@ void moe_grouped_gemm_up_backward_impl(
     const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
     const int* active_expert_indices,
     bool weight_is_compact,
-    int num_active_experts
+    int num_active_experts,
+    const void* const* weight_ptrs = nullptr  // Optional: per-expert weight pointers (LLEP)
 ) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
@@ -3263,7 +3266,10 @@ void moe_grouped_gemm_up_backward_impl(
         ldb_vec.push_back(up_dim);
         ldc_vec.push_back(hidden_size);
 
-        A_vec.push_back(weights + (weight_is_compact ? e : global_idx) * up_dim * hidden_size);
+        const int weight_idx = weight_is_compact ? e : global_idx;
+        A_vec.push_back(weight_ptrs
+            ? static_cast<const T*>(weight_ptrs[weight_idx])
+            : weights + weight_idx * up_dim * hidden_size);
         B_vec.push_back(d_up + h_offsets[global_idx] * up_dim);
         C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
     }
@@ -3407,11 +3413,12 @@ void moe_grouped_gemm_up_backward(
     const int* host_offsets,
     const int* active_expert_indices,
     bool weight_is_compact,
-    int num_active_experts
+    int num_active_experts,
+    const void* const* weight_ptrs
 ) {
     moe_grouped_gemm_up_backward_impl(d_input, d_up, weights, expert_offsets,
                                       num_experts, hidden_size, intermediate_size,
-                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
+                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
 }
 
 void moe_grouped_gemm_up_backward(
@@ -3427,11 +3434,12 @@ void moe_grouped_gemm_up_backward(
     const int* host_offsets,
     const int* active_expert_indices,
     bool weight_is_compact,
-    int num_active_experts
+    int num_active_experts,
+    const void* const* weight_ptrs
 ) {
     moe_grouped_gemm_up_backward_impl(d_input, d_up, weights, expert_offsets,
                                       num_experts, hidden_size, intermediate_size,
-                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
+                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
 }
 
 // ============================================================================

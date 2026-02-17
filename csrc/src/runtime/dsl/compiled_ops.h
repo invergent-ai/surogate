@@ -431,6 +431,17 @@ private:
     };
     std::unordered_map<int, LLEPLayerState> mLLEPStates;  // keyed by layer_idx
 
+    // Lightweight per-layer EP metadata — survives LLEP state clearing.
+    // Backward uses this to reconstruct native-only weight pointers when
+    // the full LLEP state has been freed to save GPU memory.
+    struct EPLayerMeta {
+        int num_merged = 0;                // total experts on this GPU (native + foreign)
+        int native_start = 0;              // first native expert's global ID
+        int num_local = 0;                 // number of native experts
+        std::vector<int> merged_to_global; // merged_idx → global expert ID
+    };
+    std::unordered_map<int, EPLayerMeta> mEPLayerMeta;  // keyed by layer_idx
+
     // Shared GPU buffers for EP combine / dispatch_backward output (off-stack).
     // Only one layer uses these at a time, so sharing saves ~1.2 GB vs per-layer.
     void* mSharedEpCombinedGpu = nullptr;      // ep_combine reverse A2A output [total_send, hidden]

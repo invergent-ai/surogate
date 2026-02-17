@@ -1813,7 +1813,8 @@ void moe_grouped_gemm(float* output, const float* input, const float* weights,
                       EMMTranspose mode = EMMTranspose::TN,
                       const int* active_expert_indices = nullptr,
                       bool weight_is_compact = true,
-                      int num_active_experts = -1);
+                      int num_active_experts = -1,
+                      const void* const* weight_ptrs = nullptr);
 void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                       const int* expert_offsets, int num_experts,
                       int M, int K,
@@ -1823,7 +1824,8 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
                       EMMTranspose mode = EMMTranspose::TN,
                       const int* active_expert_indices = nullptr,
                       bool weight_is_compact = true,
-                      int num_active_experts = -1);
+                      int num_active_experts = -1,
+                      const void* const* weight_ptrs = nullptr);
 
 /// @brief FP8 MoE grouped GEMM: E4M3 input × E4M3 weights → BF16 output
 /// @param output Output tensor (total_tokens, M) BF16
@@ -2026,7 +2028,8 @@ void moe_grouped_gemm_up_backward(float* d_input, const float* d_up, const float
                                   const int* host_offsets = nullptr,
                                   const int* active_expert_indices = nullptr,
                                   bool weight_is_compact = true,
-                                  int num_active_experts = -1);
+                                  int num_active_experts = -1,
+                                  const void* const* weight_ptrs = nullptr);
 void moe_grouped_gemm_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_up, const nv_bfloat16* weights,
                                   const int* expert_offsets, int num_experts,
                                   int hidden_size, int intermediate_size,
@@ -2034,7 +2037,8 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_up,
                                   const int* host_offsets = nullptr,
                                   const int* active_expert_indices = nullptr,
                                   bool weight_is_compact = true,
-                                  int num_active_experts = -1);
+                                  int num_active_experts = -1,
+                                  const void* const* weight_ptrs = nullptr);
 
 // ============================================================================
 // FP8 MoE Grouped GEMM - Backward Pass

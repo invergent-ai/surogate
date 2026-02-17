@@ -79,18 +79,23 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
 
     // LLEP per-expert weight pointer override: when LLEP is active, use per-expert
     // pointers instead of contiguous weight tensors.
+    bool is_llep_active = false;
     const void* const* llep_weight_ptrs = nullptr;
     {
         auto llep_it = mLLEPStates.find(layer_idx_any);
         if (llep_it != mLLEPStates.end() && llep_it->second.active) {
             auto& llep = llep_it->second;
+            is_llep_active = true;
             std::string_view wname = op.inputs[1].name;
             if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
+            } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+                // Separate up projection (Nemotron-H "experts_up") — reuses gate_up_weight_ptrs
+                // since ep_dispatch populates it from whichever up-projection weight exists.
+                llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             }
-            // Note: separate gate/up (GPT-OSS) not yet supported with per-expert pointers
             num_experts = llep.num_merged_experts;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
         }
@@ -130,8 +135,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
-    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact) {
-        // Recipe-driven MoE GEMM via cuDNN FE or FP8
+    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active) {
+        // Recipe-driven MoE GEMM via cuDNN FE or FP8 (skip when LLEP active — cuDNN
+        // crashes with variable merged expert counts; cuBLAS per-expert is safe)
         modules::MoeMatmulContext ctx;
         ctx.out = out.get<nv_bfloat16>();
         ctx.inp = inp.get<nv_bfloat16>();
@@ -176,7 +182,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                          mRunState.cublas_handle(), mRunState.MainStream,
                          host_offsets_ptr,
                          /*alpha=*/1.0f, /*beta=*/0.0f, EMMTranspose::TN,
-                         active_ptr, weight_is_compact, num_active);
+                         active_ptr, weight_is_compact, num_active,
+                         llep_weight_ptrs);
     } else {
         moe_grouped_gemm(out.get<float>(),
                          inp.get<float>(),
@@ -186,7 +193,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                          mRunState.cublas_handle(), mRunState.MainStream,
                          host_offsets_ptr,
                          /*alpha=*/1.0f, /*beta=*/0.0f, EMMTranspose::TN,
-                         active_ptr, weight_is_compact, num_active);
+                         active_ptr, weight_is_compact, num_active,
+                         llep_weight_ptrs);
     }
 
     // Apply grouped MoE LoRA (up projection) when enabled.
@@ -305,6 +313,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         parse_block_param(name, layer_idx_any, field);
     }
 
+    // For EP, derive num_experts from the forward-cached offsets.
+    // LLEP may change num_merged per layer (transferring experts between GPUs),
+    // so mConfig.NumLocalExperts may not match the actual merged expert count.
+    if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
+        auto ci = mMoEHostOffsetsCache.find(layer_idx_any);
+        if (ci != mMoEHostOffsetsCache.end() && ci->second.size() > 1) {
+            num_experts = static_cast<int>(ci->second.size()) - 1;
+        }
+    }
+
     // Get expert offsets
     Tensor expert_offsets_view;
     Tensor* expert_offsets_ptr = nullptr;
@@ -314,7 +332,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
             expert_offsets_ptr = &expert_offsets_view;
         }
@@ -333,20 +351,64 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
 
-    // LLEP per-expert weight pointer override for backward
+    // LLEP per-expert weight pointer override for backward.
+    // Case 1: Full LLEP state exists (last MoE layer) — use directly.
+    // Case 2: No LLEP state but EP metadata exists (earlier layers) — reconstruct
+    //         native-only weight pointers (foreign expert tokens get zero gradient).
     const void* const* llep_weight_ptrs = nullptr;
+    bool is_llep_active = false;
+    std::vector<const void*> reconstructed_weight_ptrs;  // local storage for case 2
     {
         auto llep_it = mLLEPStates.find(layer_idx_any);
         if (llep_it != mLLEPStates.end() && llep_it->second.active) {
+            // Case 1: full LLEP state with foreign weight pointers
+            is_llep_active = true;
             auto& llep = llep_it->second;
             std::string_view wname = op.inputs[2].name;
             if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
+            } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+                llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             }
             num_experts = llep.num_merged_experts;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+        } else if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
+            // Case 2: LLEP state cleared but metadata survives
+            auto meta_it = mEPLayerMeta.find(layer_idx_any);
+            if (meta_it != mEPLayerMeta.end() && meta_it->second.num_merged != meta_it->second.num_local) {
+                // num_merged > num_local means foreign experts were present in forward.
+                // Reconstruct weight pointers: native experts use dequantized weights,
+                // foreign experts use a zero buffer (their token gradients become zero).
+                const auto& meta = meta_it->second;
+                is_llep_active = true;
+                num_experts = meta.num_merged;
+                expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+
+                const size_t elem_sz = get_dtype_size(weights.DType);
+                const long w_rows = (weights.Rank >= 2) ? weights.Sizes[1] : 0;
+                const long w_cols = (weights.Rank >= 3) ? weights.Sizes[2] : 0;
+                const size_t expert_bytes = static_cast<size_t>(w_rows * w_cols) * elem_sz;
+                // Allocate zero buffer for foreign expert weight pointers
+                std::vector<long> zw_shape = {1L, w_rows, w_cols};
+                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape);
+                fill_zero(zero_weight, mRunState.MainStream);
+                mTemps.push_back(zero_weight);
+
+                reconstructed_weight_ptrs.resize(meta.num_merged);
+                for (int m = 0; m < meta.num_merged; ++m) {
+                    const int global_e = meta.merged_to_global[m];
+                    const int local_idx = global_e - meta.native_start;
+                    if (local_idx >= 0 && local_idx < meta.num_local) {
+                        reconstructed_weight_ptrs[m] = static_cast<const std::byte*>(weights.Data)
+                            + static_cast<size_t>(local_idx) * expert_bytes;
+                    } else {
+                        reconstructed_weight_ptrs[m] = zero_weight.Data;
+                    }
+                }
+                llep_weight_ptrs = reconstructed_weight_ptrs.data();
+            }
         }
     }
 
@@ -383,8 +445,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(d_inp, mRunState.MainStream);
-    } else if (mRecipe && d_out.DType == ETensorDType::BF16) {
-        // Recipe-driven backward MoE GEMM
+    } else if (mRecipe && d_out.DType == ETensorDType::BF16 && !is_llep_active && mOptions.EPSize <= 1) {
+        // Recipe-driven backward MoE GEMM (skip when EP active: gradient checkpointing
+        // may clear LLEP state during multi-layer recompute, leaving intermediate layers
+        // without state; direct kernel path handles this correctly)
         modules::MoeMatmulContext ctx;
         ctx.dinp = d_inp.get<nv_bfloat16>();
         ctx.dout = d_out.get<nv_bfloat16>();
@@ -419,7 +483,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
 
         mRecipe->backward_moe_matmul(ctx);
     } else if (d_out.DType == ETensorDType::BF16) {
-        // Direct kernel call fallback
+        // Direct kernel call (also used as LLEP fallback when recipe path is skipped)
         moe_grouped_gemm_up_backward(d_inp.get<nv_bfloat16>(),
                                      d_out.get<nv_bfloat16>(),
                                      weights.get<nv_bfloat16>(),
@@ -427,7 +491,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                                      num_experts, in_features, out_features,
                                      mRunState.cublas_handle(), mRunState.MainStream,
                                      host_offsets_ptr,
-                                     active_ptr, weight_is_compact, num_active);
+                                     active_ptr, weight_is_compact, num_active,
+                                     llep_weight_ptrs);
     } else {
         moe_grouped_gemm_up_backward(d_inp.get<float>(),
                                      d_out.get<float>(),
@@ -436,7 +501,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                                      num_experts, in_features, out_features,
                                      mRunState.cublas_handle(), mRunState.MainStream,
                                      host_offsets_ptr,
-                                     active_ptr, weight_is_compact, num_active);
+                                     active_ptr, weight_is_compact, num_active,
+                                     llep_weight_ptrs);
     }
 
     // Apply grouped MoE LoRA backward (up projection) when enabled.

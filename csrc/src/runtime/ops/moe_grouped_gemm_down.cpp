@@ -316,6 +316,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     }
 
 
+    // For EP, derive num_experts from the forward-cached offsets.
+    // LLEP may change num_merged per layer.
+    int num_experts_for_offsets = static_cast<int>(mConfig.NumLocalExperts);
+    if (mOptions.EPSize > 1 && layer_idx >= 0) {
+        auto ci = mMoEHostOffsetsCache.find(layer_idx);
+        if (ci != mMoEHostOffsetsCache.end() && ci->second.size() > 1) {
+            num_experts_for_offsets = static_cast<int>(ci->second.size()) - 1;
+        }
+    }
+
     // Use per-layer expert_offsets when available; fall back to global buffer.
     const int* expert_offsets_ptr = nullptr;
     Tensor expert_offsets_view;
@@ -325,7 +335,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts_for_offsets + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it->second);
             expert_offsets_ptr = expert_offsets_view.get<int>();
         }
@@ -337,22 +347,55 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         expert_offsets_ptr = static_cast<const int*>(mMoEExpertOffsetsGPU);
     }
 
-    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
+    int num_experts = num_experts_for_offsets;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
     // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
     const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
         ? static_cast<int>(mConfig.MoeIntermediateSize)
         : static_cast<int>(mConfig.IntermediateSize);
 
-    // LLEP per-expert weight pointer override for backward
+    // LLEP per-expert weight pointer override for backward.
+    // Case 1: Full LLEP state (last MoE layer) — use directly.
+    // Case 2: No LLEP state but EP metadata (earlier layers) — reconstruct.
     const void* const* llep_weight_ptrs = nullptr;
+    bool is_llep_active = false;
+    std::vector<const void*> reconstructed_weight_ptrs;
     {
         auto llep_it = mLLEPStates.find(layer_idx);
         if (llep_it != mLLEPStates.end() && llep_it->second.active) {
             auto& llep = llep_it->second;
+            is_llep_active = true;
             num_experts = llep.num_merged_experts;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
             llep_weight_ptrs = llep.down_weight_ptrs.data();
+        } else if (mOptions.EPSize > 1 && layer_idx >= 0) {
+            auto meta_it = mEPLayerMeta.find(layer_idx);
+            if (meta_it != mEPLayerMeta.end() && meta_it->second.num_merged != meta_it->second.num_local) {
+                const auto& meta = meta_it->second;
+                is_llep_active = true;
+                num_experts = meta.num_merged;
+                expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+
+                const size_t elem_sz = get_dtype_size(weights.DType);
+                const size_t expert_bytes = static_cast<size_t>(hidden_size) * intermediate_size * elem_sz;
+                std::vector<long> zw_shape = {1L, static_cast<long>(hidden_size), static_cast<long>(intermediate_size)};
+                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape);
+                fill_zero(zero_weight, mRunState.MainStream);
+                mTemps.push_back(zero_weight);
+
+                reconstructed_weight_ptrs.resize(meta.num_merged);
+                for (int m = 0; m < meta.num_merged; ++m) {
+                    const int global_e = meta.merged_to_global[m];
+                    const int local_idx = global_e - meta.native_start;
+                    if (local_idx >= 0 && local_idx < meta.num_local) {
+                        reconstructed_weight_ptrs[m] = static_cast<const std::byte*>(weights.Data)
+                            + static_cast<size_t>(local_idx) * expert_bytes;
+                    } else {
+                        reconstructed_weight_ptrs[m] = zero_weight.Data;
+                    }
+                }
+                llep_weight_ptrs = reconstructed_weight_ptrs.data();
+            }
         }
     }
 

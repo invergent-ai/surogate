@@ -2183,7 +2183,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
-    mMoEHostOffsetsCache.clear();
+    // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
+    // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
+    // communication op), so the GPU persistent buffers may be stale. The forward
+    // cache has the correct merged expert offsets for each layer.
+    if (mConfig.EPSize <= 1) {
+        mMoEHostOffsetsCache.clear();
+    }
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mAccumulateTensors.clear();
     mCurrentLayer = -1;

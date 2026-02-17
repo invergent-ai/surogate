@@ -183,10 +183,9 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     }
 
     // Clear ALL previous LLEP states (free per-layer LoRA + foreign weight GPU memory).
-    // During forward, each layer only needs its own LLEP state (created below).
-    // During backward with gradient checkpointing, the recompute re-runs ep_dispatch
-    // which recreates fresh LLEP state before any backward ops need it.
-    // Clearing all states limits peak LLEP memory to ~1 layer instead of all MoE layers.
+    // Foreign expert weight buffers are large (~20MB each) and accumulate across 23 MoE
+    // layers, causing OOM if kept alive. Only the last MoE layer's LLEP state survives.
+    // Earlier layers' backward uses mEPLayerMeta (lightweight) to reconstruct weight pointers.
     {
         for (auto& [_, state] : mLLEPStates) {
             state.free_lora_gpu();
@@ -222,6 +221,15 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     std::vector<int> global_to_merged(num_experts, -1);
     for (int m = 0; m < num_merged; ++m) {
         global_to_merged[merged_experts[m]] = m;
+    }
+
+    // ---- Save lightweight EP metadata for backward (survives LLEP state clearing) ----
+    {
+        auto& meta = mEPLayerMeta[layer_idx];
+        meta.num_merged = num_merged;
+        meta.native_start = ep_rank * num_local;
+        meta.num_local = num_local;
+        meta.merged_to_global = merged_experts;
     }
 
     // ---- Compute send splits ----
@@ -357,8 +365,12 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     Tensor* native_down_ptr = nullptr;
     bool wt_started = false;
     const std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+    // Detect up-projection weight name: fused "experts_gate_up" (Qwen3-MoE, GPT-OSS)
+    // or separate "experts_up" (Nemotron-H).
+    const std::string up_weight_name = mWeights.has(layer_prefix + "experts_gate_up")
+        ? "experts_gate_up" : "experts_up";
     if (use_llep && (!plan.weights_to_send.empty() || !plan.weights_to_receive.empty())) {
-        native_gate_up_ptr = &mWeights.get(layer_prefix + "experts_gate_up");
+        native_gate_up_ptr = &mWeights.get(layer_prefix + up_weight_name);
         native_down_ptr = &mWeights.get(layer_prefix + "experts_down");
 
         // Lazy create weight transfer stream
@@ -375,7 +387,7 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         // Prefer quantized transfer (2-8x less P2P bandwidth) when available
         auto* provider = mWeights.qlora_provider();
         const qlora::QuantizedTensor* qt_gu = provider
-            ? provider->try_get_quantized(layer_prefix + "experts_gate_up") : nullptr;
+            ? provider->try_get_quantized(layer_prefix + up_weight_name) : nullptr;
         const qlora::QuantizedTensor* qt_dn = provider
             ? provider->try_get_quantized(layer_prefix + "experts_down") : nullptr;
         qlora::IQuantizer* quantizer = provider ? provider->get_quantizer() : nullptr;
@@ -770,6 +782,48 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         // until the LLEP state is cleared (at start of next layer's ep_dispatch).
         llep.owned_foreign_ptrs = std::move(foreign_weights.owned_gpu_ptrs);
         foreign_weights.owned_gpu_ptrs.clear();  // Prevent double-free
+    } else if (ep_size > 1) {
+        // When EP is active but no foreign experts were transferred (balanced routing
+        // or imbalance below threshold), still create LLEP state with native-only
+        // weight pointers. This ensures backward always takes the direct kernel path
+        // instead of the recipe path, which can crash with EP-modified expert offsets
+        // (e.g., Nemotron-H generic MoE GEMM with FP8 hybrid recipe).
+        native_gate_up_ptr = &mWeights.get(layer_prefix + up_weight_name);
+        native_down_ptr = &mWeights.get(layer_prefix + "experts_down");
+
+        const Tensor& native_gate_up = *native_gate_up_ptr;
+        const Tensor& native_down = *native_down_ptr;
+
+        const long gu_rows = (native_gate_up.Rank >= 3) ? native_gate_up.Sizes[1] : native_gate_up.Sizes[0];
+        const long gu_cols = (native_gate_up.Rank >= 3) ? native_gate_up.Sizes[2] : native_gate_up.Sizes[1];
+        const long dn_rows = (native_down.Rank >= 3) ? native_down.Sizes[1] : native_down.Sizes[0];
+        const long dn_cols = (native_down.Rank >= 3) ? native_down.Sizes[2] : native_down.Sizes[1];
+        const size_t gu_expert_bytes = static_cast<size_t>(gu_rows * gu_cols) * elem_sz;
+        const size_t dn_expert_bytes = static_cast<size_t>(dn_rows * dn_cols) * elem_sz;
+
+        auto& llep = mLLEPStates[layer_idx];
+        llep.active = true;
+        llep.num_merged_experts = num_merged;
+        llep.merged_to_global = merged_experts;
+        llep.global_to_merged = global_to_merged;
+        llep.weight_dtype = native_gate_up.DType;
+
+        llep.gate_up_weight_ptrs.resize(num_merged);
+        llep.down_weight_ptrs.resize(num_merged);
+
+        const int native_start = ep_rank * num_local;
+        for (int m = 0; m < num_merged; ++m) {
+            const int global_e = merged_experts[m];
+            const int local_native = global_e - native_start;
+            llep.gate_up_weight_ptrs[m] = static_cast<const std::byte*>(native_gate_up.Data)
+                + static_cast<size_t>(local_native) * gu_expert_bytes;
+            llep.down_weight_ptrs[m] = static_cast<const std::byte*>(native_down.Data)
+                + static_cast<size_t>(local_native) * dn_expert_bytes;
+        }
+
+        llep.merged_offsets_host = mMoEHostOffsetsCache[layer_idx];
+        llep.merged_offsets_gpu = mMoeSavedBuffers[layer_prefix + "moe_expert_offsets"];
+        llep.merged_offsets_gpu_bytes = mMoeSavedSizes[layer_prefix + "moe_expert_offsets"];
     }
 
     // ---- Save remaining EP state for backward / combine ----
