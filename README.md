@@ -1,6 +1,7 @@
 <div align="center" style="padding: 2rem">
 <a href="https://surogate.ai/">
-  <img width="40%" alt="Surogate logo" src="./assets/logo-white.svg" />
+  <img width="40%" alt="Surogate logo" src="./assets/logo-white.svg#gh-dark-mode-only" />
+  <img width="40%" alt="Surogate logo" src="./assets/logo-black.svg#gh-light-mode-only" />
 </a>
 <h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
 <div>
