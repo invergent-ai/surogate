@@ -2,14 +2,14 @@
 # High-performance LLM pre-training/fine-tuning framework
 #
 # Build Args:
-#   CUDA_VERSION: CUDA version (e.g., 12.9.1, 13.1.1)
+#   CUDA_RUNTIME_IMAGE: CUDA runtime image (e.g., nvidia/cuda:12.9.1-runtime-ubuntu24.04)
 #   CUDA_MAJOR: CUDA major version for package dependencies (e.g., 12, 13)
 #   PACKAGE_VERSION: Surogate package version (e.g., 0.1.1)
 #   WHEEL_TAG: Wheel CUDA tag (e.g., cu129, cu13)
 #
 # Build:
 #   docker build \
-#     --build-arg CUDA_VERSION=13.1.1 \
+#     --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:13.1.1-runtime-ubuntu24.04 \
 #     --build-arg CUDA_MAJOR=13 \
 #     --build-arg PACKAGE_VERSION=0.1.1 \
 #     --build-arg WHEEL_TAG=cu13 \
@@ -34,7 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies
 # Note: libcudnn9-cuda-12 works for both CUDA 12.x and 13.x
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     ca-certificates \
     curl \
     libnccl2 \
