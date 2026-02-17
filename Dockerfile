@@ -1,30 +1,44 @@
 # Surogate Docker Image
 # High-performance LLM pre-training/fine-tuning framework
 #
+# Build Args:
+#   CUDA_VERSION: CUDA version (e.g., 12.9.1, 13.1.1)
+#   CUDA_MAJOR: CUDA major version for package dependencies (e.g., 12, 13)
+#   PACKAGE_VERSION: Surogate package version (e.g., 0.1.1)
+#   WHEEL_TAG: Wheel CUDA tag (e.g., cu129, cu13)
+#
 # Build:
-#   docker build -t invergent-ai/surogate:0.0.2 .
+#   docker build \
+#     --build-arg CUDA_VERSION=13.1.1 \
+#     --build-arg CUDA_MAJOR=13 \
+#     --build-arg PACKAGE_VERSION=0.1.1 \
+#     --build-arg WHEEL_TAG=cu13 \
+#     -t ghcr.io/invergent-ai/surogate:0.1.1-cu13 .
 #
 # Run:
-#   docker run --gpus all ghcr.io/invergent-ai/surogate:0.0.2 --help
-#   docker run --gpus all -v /path/to/config.yaml:/config.yaml -v path_to_output:/output ghcr.io/invergent-ai/surogate:0.0.2 sft /config.yaml
+#   docker run --gpus all ghcr.io/invergent-ai/surogate:0.1.1-cu13 --help
+#   docker run --gpus all \
+#     -v /path/to/config.yaml:/config.yaml \
+#     -v /path/to/output:/output \
+#     ghcr.io/invergent-ai/surogate:0.1.1-cu13 sft /config.yaml
 
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04
+FROM nvidia/cuda:${CUDA_RUNTIME_IMAGE}
 
-FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
-
-ARG WHL=https://github.com/invergent-ai/surogate/releases/download/v0.0.3/surogate-0.0.3+cu129-cp312-abi3-manylinux_2_39_x86_64.whl
+ARG CUDA_MAJOR=13
+ARG PACKAGE_VERSION=0.1.1
+ARG WHEEL_TAG=cu13
+ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${WHEEL_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies
+# Note: libcudnn9-cuda-12 works for both CUDA 12.x and 13.x
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    libopenmpi3t64 \
     ca-certificates \
-    wget \
-    curl
-
-RUN apt-get remove -y --allow-change-held-packages libcudnn9-dev-cuda-13 libcudnn9-headers-cuda-13 libcudnn9-cuda-13 \
-    && apt-get install -y cudnn9-cuda-13=9.17.1.4-1 \
+    curl \
+    libnccl2 \
+    libcudnn9-cuda-${CUDA_MAJOR} \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -41,13 +55,10 @@ RUN uv venv /home/surogate/.venv --python=3.12
 ENV PATH="/home/surogate/.venv/bin:$PATH" \
     VIRTUAL_ENV="/home/surogate/.venv"
 
-# Install surogate with CUDA 13 dependencies
-RUN --mount=type=cache,target=/root/.cache/uv uv pip install ${WHL} \
-    && rm -f ${WHL}
-
-# Set default working directory for user data
-WORKDIR /workspace
+# Install wheel from URL
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install ${WHEEL_URL}
 
 # Default entrypoint
-ENTRYPOINT ["surogate"]
+ENTRYPOINT [".venv/bin/surogate"]
 CMD ["--help"]
