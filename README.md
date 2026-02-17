@@ -1,8 +1,13 @@
 <div align="center" style="padding: 2rem">
-<a href="https://surogate.ai/">
-  <img width="40%" alt="Surogate logo" src="./assets/logo-white.svg#gh-dark-mode-only" />
-  <img width="40%" alt="Surogate logo" src="./assets/logo-black.svg#gh-light-mode-only" />
-</a>
+<p align="center">
+  <a href="https://surogate.ai/">
+    <img alt="Surogate" width="40%"
+      src="https://raw.githubusercontent.com/invergent-ai/surogate/main/assets/logo-white.svg#gh-dark-mode-only" />
+    <img alt="Surogate" width="40%"
+      src="https://raw.githubusercontent.com/invergent-ai/surogate/main/assets/logo-black.svg#gh-light-mode-only" />
+  </a>
+</p>
+
 <h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
 <div>
 <a href="https://surogate.ai">Home</a> ·
