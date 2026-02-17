@@ -28,6 +28,7 @@
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "kernels/kernels.h"
+#include "runtime/lora/lora_types.h"
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
@@ -185,6 +186,9 @@ private:
     void dispatch_moe_grouped_gemm_down(const CompiledOp& op);
     void dispatch_moe_unpermute(const CompiledOp& op);
     void dispatch_moe_expert_bias_add(const CompiledOp& op);
+    // Expert Parallelism forward dispatch
+    void dispatch_ep_dispatch(const CompiledOp& op);
+    void dispatch_ep_combine(const CompiledOp& op);
 
     // Backward dispatch functions
     void dispatch_view_backward(const CompiledOp& op);
@@ -221,6 +225,9 @@ private:
     void dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op);
     void dispatch_moe_unpermute_backward(const CompiledOp& op);
     void dispatch_moe_expert_bias_add_backward(const CompiledOp& op);
+    // Expert Parallelism backward dispatch
+    void dispatch_ep_dispatch_backward(const CompiledOp& op);
+    void dispatch_ep_combine_backward(const CompiledOp& op);
 
     // Mamba/SSM forward dispatch
     void dispatch_mamba_split_proj(const CompiledOp& op);
@@ -348,6 +355,111 @@ private:
     // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)
     std::unordered_map<std::string, void*> mMoeSavedBuffers;
     std::unordered_map<std::string, size_t> mMoeSavedSizes;
+
+    // Expert Parallelism (EP) per-layer state: send/recv splits, token reorder mapping
+    struct EpLayerState {
+        std::vector<int> send_splits;      // tokens sent to each EP peer
+        std::vector<int> recv_splits;      // tokens received from each EP peer
+        int total_send = 0;                // sum of send_splits
+        int total_recv = 0;                // sum of recv_splits
+        void* send_order_gpu = nullptr;    // GPU buffer: reorder indices for recv re-sort gather
+        void* recv_reorder_gpu = nullptr;  // GPU buffer: reorder indices for recv → local expert order
+        size_t send_order_bytes = 0;
+        size_t recv_reorder_bytes = 0;
+        // LLEP send reorder: when LLEP is active, tokens are reordered before A2A.
+        // llep_send_reorder_gpu[new_pos] = old_pos in expert-sorted input.
+        // Null when standard EP (no reorder needed).
+        void* llep_send_reorder_gpu = nullptr;
+        size_t llep_send_reorder_bytes = 0;
+        void* local_scatter_gpu = nullptr; // local_scatter [total_recv] indices output
+        size_t local_scatter_bytes = 0;
+    };
+    std::unordered_map<int, EpLayerState> mEpStates;  // keyed by layer_idx
+
+    // LLEP (Least-Loaded EP) per-layer state for dynamic load balancing.
+    // When active, merged weight tensors contain native + foreign expert weights,
+    // and the GEMM ops use these instead of the QLoRA-resolved weights.
+    struct LLEPLayerState {
+        bool active = false;               // Whether LLEP rebalancing is active this step
+        int num_merged_experts = 0;        // Total experts on this GPU (native + foreign)
+
+        // Per-expert weight pointers (indexed by merged expert index 0..num_merged-1).
+        // Each pointer points to one expert's weight slice in either:
+        //  - native dequant buffer (for native experts), or
+        //  - foreign weight receive buffer (for received foreign experts).
+        // No contiguous merged buffer needed — saves ~465 MB GPU memory.
+        std::vector<const void*> gate_up_weight_ptrs;  // [num_merged]: ptr to gate_up [2*D, C]
+        std::vector<const void*> down_weight_ptrs;     // [num_merged]: ptr to down [C, D]
+        ETensorDType weight_dtype = ETensorDType::BF16;
+
+        std::vector<int> merged_offsets_host;  // Host expert offsets for merged set
+        void* merged_offsets_gpu = nullptr;    // GPU expert offsets
+        size_t merged_offsets_gpu_bytes = 0;
+        // Map from merged expert index → global expert ID
+        std::vector<int> merged_to_global;
+        // Map from global expert ID → merged expert index (-1 if not on this GPU)
+        std::vector<int> global_to_merged;
+
+        // Merged LoRA weights [num_merged, ...] for use in GEMM dispatch.
+        // Built from native expert LoRA + transferred foreign expert LoRA.
+        // Null/inactive when LoRA is not enabled.
+        // Per-layer owned GPU memory (NOT shared across layers).
+        modules::LoRAGroupedExpertWeights<Tensor> merged_lora;
+        bool has_merged_lora = false;
+        // Per-layer owned GPU pointers for merged LoRA (freed on layer state clear)
+        std::vector<void*> owned_lora_ptrs;
+
+        // Foreign weight P2P receive buffers — owned by this state.
+        // Must stay alive as long as weight pointers reference them.
+        std::vector<void*> owned_foreign_ptrs;
+
+        void free_lora_gpu() {
+            for (void* p : owned_lora_ptrs) {
+                if (p) cudaFree(p);
+            }
+            owned_lora_ptrs.clear();
+            has_merged_lora = false;
+        }
+        void free_foreign_gpu() {
+            for (void* p : owned_foreign_ptrs) {
+                if (p) cudaFree(p);
+            }
+            owned_foreign_ptrs.clear();
+            gate_up_weight_ptrs.clear();
+            down_weight_ptrs.clear();
+        }
+    };
+    std::unordered_map<int, LLEPLayerState> mLLEPStates;  // keyed by layer_idx
+
+    // Shared GPU buffers for EP combine / dispatch_backward output (off-stack).
+    // Only one layer uses these at a time, so sharing saves ~1.2 GB vs per-layer.
+    void* mSharedEpCombinedGpu = nullptr;      // ep_combine reverse A2A output [total_send, hidden]
+    size_t mSharedEpCombinedBytes = 0;
+    void* mSharedEpSortedRecvGpu = nullptr;    // ep_dispatch_backward output [total_send, hidden]
+    size_t mSharedEpSortedRecvBytes = 0;
+    void* mSharedEpLlepCombineGpu = nullptr;   // ep_combine LLEP reorder output [total_send, hidden]
+    size_t mSharedEpLlepCombineBytes = 0;
+
+    // CUDA stream for LLEP weight transfer (overlaps with token A2A on MainStream).
+    // Lazily created on first LLEP activation. Uses separate NCCL weight_transfer_comm.
+    cudaStream_t mWeightTransferStream = nullptr;
+
+    // GPU buffer pool for EP intermediates — eliminates cudaStreamSynchronize + cudaFree
+    // barriers in the hot path. All EP ops run on MainStream, so CUDA stream ordering
+    // guarantees safe buffer reuse without explicit synchronization.
+    // Pattern: acquire() finds a recycled buffer >= requested size (or cudaMalloc's a new one);
+    //          release() returns the buffer to the pool for reuse by subsequent layers.
+    struct EpPoolEntry { void* ptr; size_t bytes; };
+    std::vector<EpPoolEntry> mEpBufPool;
+    void* ep_buf_acquire(size_t need);
+    void ep_buf_release(void* ptr, size_t bytes);
+
+    // Retired shared EP buffers — old allocations kept alive until end-of-step because
+    // save_moe_layer_tensors copies tensor data at layer boundaries, and the copy source
+    // may reference the old buffer via stored mTensors entries. Cannot go into mEpBufPool
+    // because the pool recycles buffers for temporary EP intermediates, which would overwrite
+    // data still referenced by saved tensors. Freed at destructor time.
+    std::vector<EpPoolEntry> mEpRetiredBufs;
 
     // Reusable per-forward layer tracking vectors (avoid heap allocation every forward call).
     std::vector<DeviceMemoryStack::Checkpoint> mLayerCheckpoints;

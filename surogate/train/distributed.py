@@ -340,7 +340,10 @@ class NodeTrainer:
 
         # Create model config
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
-        ir_json = build_dsl_ir_for_model(self._config.model_dir)
+        dsl_extra = {}
+        if getattr(self._config, "ep_size", 1) > 1:
+            dsl_extra["ep_size"] = self._config.ep_size
+        ir_json = build_dsl_ir_for_model(self._config.model_dir, extra_config=dsl_extra or None)
         self._config.runtime_config.dsl_ir_json = ir_json
         pretrained_config = _surogate.PretrainedConfig.from_pretrained(
             self._config.model_dir, to_surogate_dtype(self._config.torch_dtype)
@@ -1028,7 +1031,11 @@ class RayDistributedTrainer:
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
-        moe_monitor = MoEMonitor(logger)
+        moe_monitor = MoEMonitor(
+            logger,
+            num_experts=config.moe_num_experts,
+            num_experts_per_tok=config.moe_num_experts_per_tok,
+        )
         advisor = TrainingAdvisor(
             logger, phase_detector, gradient_tracker, plateau_detector,
             loss_guard, moe_monitor, lr_schedule, max_steps,

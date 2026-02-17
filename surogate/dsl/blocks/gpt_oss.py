@@ -31,6 +31,7 @@ class GptOssBlock:
         num_experts_per_tok: int,
         eps: float = 1e-5,
         use_qkv_bias: bool = True,
+        ep_size: int = 1,
     ):
         self.d_model = d_model
         self.num_query_heads = num_query_heads
@@ -42,6 +43,8 @@ class GptOssBlock:
         self.num_experts_per_tok = num_experts_per_tok
         self.eps = eps
         self.use_qkv_bias = use_qkv_bias
+        self.ep_size = ep_size
+        self.num_local_experts = num_experts // ep_size if ep_size > 1 else num_experts
 
         # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
         self.C = Dim("C")
@@ -265,6 +268,23 @@ class GptOssBlock:
         description="Indices for scattering back to original order",
     )
 
+    # EP dispatch outputs (only present when ep_size > 1)
+    ep_recv_input = Activation(
+        Tensor["B * T * K", "C"],
+        save=True,
+        when=lambda self: self.ep_size > 1,
+        share_policy="per_layer",
+        description="EP-dispatched input tokens (post-A2A, local experts only)",
+    )
+    ep_recv_scatter = Activation(
+        Tensor["B * T * K"],
+        dtype="int32",
+        save=True,
+        when=lambda self: self.ep_size > 1,
+        share_policy="per_layer",
+        description="EP-dispatched scatter indices (post-A2A)",
+    )
+
     # Expert computations
     expert_gate_up = Activation(
         Tensor["B * T * K", "MUp"],
@@ -318,6 +338,15 @@ class GptOssBlock:
         description="Expert down projection after bias",
     )
 
+    # EP combine output (only present when ep_size > 1)
+    ep_combined = Activation(
+        Tensor["B * T * K", "C"],
+        save=True,
+        when=lambda self: self.ep_size > 1,
+        share_policy="per_layer",
+        description="EP-combined expert output (post reverse-A2A, pre-EP order)",
+    )
+
     # MoE output
     moe_out = Activation(
         Tensor["B * T", "C"],
@@ -351,6 +380,8 @@ class GptOssBlock:
     d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
     d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
     d_router_logits = Gradient(Tensor["B * T", "E"], gradient_of="router_logits")
+    d_ep_recv_input = Gradient(Tensor["B * T * K", "C"], gradient_of="ep_recv_input",
+                               when=lambda self: self.ep_size > 1)
     d_permuted_input = Gradient(Tensor["B * T * K", "C"], gradient_of="permuted_input",
                                 alias_of="permuted_input")
     d_expert_gate_up = Gradient(Tensor["B * T * K", "MUp"], gradient_of="expert_gate_up")
@@ -445,11 +476,25 @@ class GptOssBlock:
                 out_name="permuted_input", scatter_name="scatter_indices",
             )
 
+            # EP dispatch: route tokens to expert-owning GPUs (no-op when ep_size=1)
+            if self.ep_size > 1:
+                ep_recv_input, ep_recv_scatter = g.ep_dispatch(
+                    permuted_input, routing_indices, scatter_indices,
+                    num_experts=self.num_experts, ep_size=self.ep_size,
+                    top_k=self.num_experts_per_tok,
+                    out_name="ep_recv_input", recv_scatter_name="ep_recv_scatter",
+                )
+                gemm_input = ep_recv_input
+                gemm_scatter = ep_recv_scatter
+            else:
+                gemm_input = permuted_input
+                gemm_scatter = scatter_indices
+
             # Grouped GEMM for gate+up projection
             expert_gate_up = g.moe_grouped_gemm_gate_up(
-                permuted_input,
+                gemm_input,
                 "experts_gate_up",
-                scatter_indices,
+                gemm_scatter,
                 gate_up_interleaved=True,
                 out_name="expert_gate_up",
             )
@@ -465,11 +510,20 @@ class GptOssBlock:
 
             # Grouped GEMM for down projection
             expert_down = g.moe_grouped_gemm_down(
-                expert_act, "experts_down", scatter_indices, out_name="expert_down",
+                expert_act, "experts_down", gemm_scatter, out_name="expert_down",
             )
             expert_down_bias = g.moe_expert_bias_add(
                 expert_down, "experts_down_bias", out_name="expert_down_bias",
             )
+
+            # EP combine: route expert outputs back (no-op when ep_size=1)
+            if self.ep_size > 1:
+                expert_down_bias = g.ep_combine(
+                    expert_down_bias,
+                    num_experts=self.num_experts, ep_size=self.ep_size,
+                    top_k=self.num_experts_per_tok,
+                    out_name="ep_combined",
+                )
 
             # Unpermute and combine with routing weights
             moe_out = g.moe_unpermute(

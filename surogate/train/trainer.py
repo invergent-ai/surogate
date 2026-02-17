@@ -45,7 +45,11 @@ class SurogateTrainerWrapper():
         model_weights_path = get_model_weights_path(config.model_dir)
 
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
-        ir_json = build_dsl_ir_for_model(config.model_dir)
+        # Pass training-time config overrides that affect graph compilation
+        dsl_extra = {}
+        if getattr(config, "ep_size", 1) > 1:
+            dsl_extra["ep_size"] = config.ep_size
+        ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
         config.runtime_config.dsl_ir_json = ir_json
         
         # Setup data loaders / on-the-fly batcher
@@ -401,7 +405,11 @@ class SurogateTrainerWrapper():
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
-        moe_monitor = MoEMonitor(logger)
+        moe_monitor = MoEMonitor(
+            logger,
+            num_experts=self.config.moe_num_experts,
+            num_experts_per_tok=self.config.moe_num_experts_per_tok,
+        )
         advisor = TrainingAdvisor(
             logger, phase_detector, gradient_tracker, plateau_detector,
             loss_guard, moe_monitor, self.lr_schedule, self.max_steps,
@@ -602,7 +610,11 @@ class SurogateTrainerWrapper():
         plateau_detector = PlateauDetector(logger)
         phase_detector = PhaseDetector(logger)
         gradient_tracker = GradientTracker(logger)
-        moe_monitor = MoEMonitor(logger)
+        moe_monitor = MoEMonitor(
+            logger,
+            num_experts=self.config.moe_num_experts,
+            num_experts_per_tok=self.config.moe_num_experts_per_tok,
+        )
         advisor = TrainingAdvisor(
             logger, phase_detector, gradient_tracker, plateau_detector,
             loss_guard, moe_monitor, self.lr_schedule, self.max_steps,

@@ -432,6 +432,9 @@ NB_MODULE(_surogate, m) {
         .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
         .def_rw("router_z_loss_coef", &RuntimeOptions::RouterZLossCoef, "MoE z-loss coefficient (-1 = use model config).")
+        .def_rw("ep_size", &RuntimeOptions::EPSize, "Expert parallelism size (1 = no EP, all experts replicated).")
+        .def_rw("ep_load_balance_threshold", &RuntimeOptions::EPLoadBalanceThreshold,
+                 "LLEP adaptive threshold: LPT activates when max/mean GPU load exceeds this (default 1.3).")
         .def_prop_rw("matmul_type", [](const RuntimeOptions* opt){ return opt->matmul_dtype(); },
                      [](RuntimeOptions* opt, const std::string& dtype_str){ opt->MatmulType = opt_dtype_from_str(dtype_str); },
                      "Optional override dtype for matmul kernels (empty/None means default).")

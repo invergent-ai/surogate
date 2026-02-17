@@ -34,9 +34,41 @@ enum MoeUIDs {
     MOE_OUTPUT_UID,
 };
 
-// Cache key: (num_experts, total_tokens, K, N)
+// Cache key: (num_experts, total_tokens, K, N) — total_tokens is bucketed to reduce cache misses
 using moe_gemm_cache_key = std::tuple<int64_t, int64_t, int64_t, int64_t>;
 using moe_gemm_cache_type = std::map<moe_gemm_cache_key, std::shared_ptr<fe::graph::Graph>>;
+
+/// Round total_tokens up to the next multiple of 256.
+/// This prevents excessive cuDNN FE plan compilations when total_tokens varies
+/// (e.g., with Expert Parallelism where A2A redistribution changes token counts).
+static int64_t pad_moe_tokens(int64_t total_tokens) {
+    constexpr int64_t BUCKET = 256;
+    return ((total_tokens + BUCKET - 1) / BUCKET) * BUCKET;
+}
+
+/// Thread-local padded buffers for cuDNN MoE GEMM when total_tokens is bucketed.
+/// These grow as needed and are never freed (reused across calls).
+struct MoePadBuffers {
+    void* input = nullptr;
+    void* output = nullptr;
+    int64_t input_elems = 0;   // capacity in elements
+    int64_t output_elems = 0;  // capacity in elements
+
+    void ensure_input(int64_t needed) {
+        if (needed > input_elems) {
+            if (input) cudaFree(input);
+            CUDA_CHECK(cudaMalloc(&input, needed * sizeof(nv_bfloat16)));
+            input_elems = needed;
+        }
+    }
+    void ensure_output(int64_t needed) {
+        if (needed > output_elems) {
+            if (output) cudaFree(output);
+            CUDA_CHECK(cudaMalloc(&output, needed * sizeof(nv_bfloat16)));
+            output_elems = needed;
+        }
+    }
+};
 
 // Minimum cuDNN runtime version for moe_grouped_matmul support
 static constexpr size_t CUDNN_MOE_MIN_VERSION = 91500;
@@ -294,25 +326,47 @@ bool moe_cudnn_grouped_gemm_fp8(
 {
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
+    const int64_t padded = pad_moe_tokens(total_tokens);
     auto [graph, supported] = lookup_cache_or_build_moe_fp8_graph(
-        num_experts, total_tokens, K, N, block_size, cudnn_handle);
+        num_experts, padded, K, N, block_size, cudnn_handle);
 
     if (!supported || !graph) {
         return false;
     }
 
+    const void* input_ptr = input;
+    void* output_ptr = output;
+    thread_local MoePadBuffers pad_bufs;
+
+    if (padded > total_tokens) {
+        pad_bufs.ensure_input(padded * K);
+        pad_bufs.ensure_output(padded * N);
+        const size_t real_bytes = static_cast<size_t>(total_tokens) * K * sizeof(nv_bfloat16);
+        const size_t pad_bytes = static_cast<size_t>(padded - total_tokens) * K * sizeof(nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(pad_bufs.input, input, real_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(pad_bufs.input) + real_bytes, 0, pad_bytes, stream));
+        input_ptr = pad_bufs.input;
+        output_ptr = pad_bufs.output;
+    }
+
     std::unordered_map<int64_t, void*> variant_pack = {
-        {MOE_FP8_TOKEN_UID, (void*)input},
+        {MOE_FP8_TOKEN_UID, const_cast<void*>(input_ptr)},
         {MOE_FP8_WEIGHT_UID, (void*)weights_fp8},
         {MOE_FP8_BLOCK_SCALE_UID, (void*)block_scales},
         {MOE_FP8_FIRST_TOKEN_OFFSET_UID, (void*)expert_offsets},
-        {MOE_FP8_OUTPUT_UID, (void*)output},
+        {MOE_FP8_OUTPUT_UID, output_ptr},
     };
 
     auto status = graph->execute(cudnn_handle, variant_pack, workspace);
     if (!status.is_good()) {
         return false;
     }
+
+    if (padded > total_tokens) {
+        const size_t out_bytes = static_cast<size_t>(total_tokens) * N * sizeof(nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(output, pad_bufs.output, out_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -472,25 +526,47 @@ bool moe_cudnn_grouped_gemm_fp4(
 {
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
+    const int64_t padded = pad_moe_tokens(total_tokens);
     auto [graph, supported] = lookup_cache_or_build_moe_fp4_graph(
-        num_experts, total_tokens, K, N, block_size, cudnn_handle);
+        num_experts, padded, K, N, block_size, cudnn_handle);
 
     if (!supported || !graph) {
         return false;
     }
 
+    const void* input_ptr = input;
+    void* output_ptr = output;
+    thread_local MoePadBuffers pad_bufs;
+
+    if (padded > total_tokens) {
+        pad_bufs.ensure_input(padded * K);
+        pad_bufs.ensure_output(padded * N);
+        const size_t real_bytes = static_cast<size_t>(total_tokens) * K * sizeof(nv_bfloat16);
+        const size_t pad_bytes = static_cast<size_t>(padded - total_tokens) * K * sizeof(nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(pad_bufs.input, input, real_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(pad_bufs.input) + real_bytes, 0, pad_bytes, stream));
+        input_ptr = pad_bufs.input;
+        output_ptr = pad_bufs.output;
+    }
+
     std::unordered_map<int64_t, void*> variant_pack = {
-        {MOE_FP4_TOKEN_UID, (void*)input},
+        {MOE_FP4_TOKEN_UID, const_cast<void*>(input_ptr)},
         {MOE_FP4_WEIGHT_UID, (void*)weights_fp4},
         {MOE_FP4_BLOCK_SCALE_UID, (void*)block_scales},
         {MOE_FP4_FIRST_TOKEN_OFFSET_UID, (void*)expert_offsets},
-        {MOE_FP4_OUTPUT_UID, (void*)output},
+        {MOE_FP4_OUTPUT_UID, output_ptr},
     };
 
     auto status = graph->execute(cudnn_handle, variant_pack, workspace);
     if (!status.is_good()) {
         return false;
     }
+
+    if (padded > total_tokens) {
+        const size_t out_bytes = static_cast<size_t>(total_tokens) * N * sizeof(nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(output, pad_bufs.output, out_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -524,12 +600,17 @@ std::size_t moe_cudnn_grouped_gemm_workspace_size(
     int num_experts, int total_tokens, int N, int K,
     cudnnHandle_t cudnn_handle)
 {
+    int64_t padded = pad_moe_tokens(total_tokens);
     auto graph = lookup_cache_or_build_moe_gemm_graph(
-        num_experts, total_tokens, K, N, cudnn_handle);
+        num_experts, padded, K, N, cudnn_handle);
     return graph->get_workspace_size();
 }
 
 /// Execute BF16 MoE grouped GEMM via cuDNN FE.
+///
+/// When total_tokens doesn't align to a bucket boundary, padded temporary
+/// buffers are used so the cuDNN FE plan cache stays hot. The padding region
+/// is zero-filled (zero input → zero output) and the result is copied back.
 void moe_cudnn_grouped_gemm(
     nv_bfloat16* output,
     const nv_bfloat16* input,
@@ -545,16 +626,48 @@ void moe_cudnn_grouped_gemm(
 {
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
+    const int64_t padded = pad_moe_tokens(total_tokens);
     auto graph = lookup_cache_or_build_moe_gemm_graph(
-        num_experts, total_tokens, K, N, cudnn_handle);
+        num_experts, padded, K, N, cudnn_handle);
+
+    const void* input_ptr = input;
+    void* output_ptr = output;
+
+    thread_local MoePadBuffers pad_bufs;
+
+    if (padded > total_tokens) {
+        const int64_t in_elems = padded * K;
+        const int64_t out_elems = padded * N;
+        pad_bufs.ensure_input(in_elems);
+        pad_bufs.ensure_output(out_elems);
+
+        // Copy real input + zero-fill the padding region
+        const size_t real_bytes = static_cast<size_t>(total_tokens) * K * sizeof(nv_bfloat16);
+        const size_t pad_bytes = static_cast<size_t>(padded - total_tokens) * K * sizeof(nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(pad_bufs.input, input, real_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(pad_bufs.input) + real_bytes,
+                                   0, pad_bytes, stream));
+
+        input_ptr = pad_bufs.input;
+        output_ptr = pad_bufs.output;
+    }
 
     std::unordered_map<int64_t, void*> variant_pack = {
-        {MOE_TOKEN_UID, (void*)input},
+        {MOE_TOKEN_UID, const_cast<void*>(input_ptr)},
         {MOE_WEIGHT_UID, (void*)weights},
         {MOE_FIRST_TOKEN_OFFSET_UID, (void*)expert_offsets},
-        {MOE_OUTPUT_UID, (void*)output},
+        {MOE_OUTPUT_UID, output_ptr},
     };
 
     checkCudnnFE(graph->execute(cudnn_handle, variant_pack, workspace));
+
+    if (padded > total_tokens) {
+        // Copy only the real output tokens back
+        const size_t out_bytes = static_cast<size_t>(total_tokens) * N * sizeof(nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(output, pad_bufs.output, out_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+
     CUDA_CHECK(cudaGetLastError());
 }

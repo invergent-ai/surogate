@@ -167,6 +167,11 @@ public:
     void allocate_run_state(const RuntimeOptions& options, NCCLCommunicator& comm,
                             int B, int T, bool allocate_optimizer) override;
 
+    /// Schedule deferred QLoRA offloading auto-tune.  The actual tuning
+    /// happens at the start of step 1 (inside invalidate_cache) after all
+    /// lazy runtime allocations from step 0 are settled.
+    void auto_tune_offloading();
+
     float get_loss() const override;
     float get_accuracy() const override;
 

@@ -142,7 +142,8 @@ bool is_non_differentiable(const Graph& forward, const std::string& name) {
     if (name.find("scatter_indices") != std::string::npos ||
         name.find("routing_indices") != std::string::npos ||
         name.find("gather_indices") != std::string::npos ||
-        name.find("expert_offsets") != std::string::npos) {
+        name.find("expert_offsets") != std::string::npos ||
+        name.find("ep_recv_scatter") != std::string::npos) {
         return true;
     }
     return false;

@@ -634,6 +634,73 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // EP Dispatch: (recv_sorted, recv_scatter) = ep_dispatch(permuted, routing, scatter)
+    // Dynamic output shapes depend on EP routing
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "ep_dispatch";
+        sig.min_inputs = 3;
+        sig.max_inputs = 3;
+        sig.min_outputs = 2;
+        sig.max_outputs = 2;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            // Shapes are dynamic (depend on runtime routing); skip validation
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // EP Combine: combined = ep_combine(expert_output)
+    // Dynamic output shape depends on EP routing
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "ep_combine";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // EP Dispatch Backward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "ep_dispatch_backward";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // EP Combine Backward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "ep_combine_backward";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
     // Embedding
     // ------------------------------------------------------------------------
     {

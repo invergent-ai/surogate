@@ -216,6 +216,9 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"moe_grouped_gemm_down", CompiledOpType::MoEGroupedGemmDown},
         {"moe_unpermute", CompiledOpType::MoEUnpermute},
         {"moe_expert_bias_add", CompiledOpType::MoEExpertBiasAdd},
+        // Expert Parallelism forward operations
+        {"ep_dispatch", CompiledOpType::EpDispatch},
+        {"ep_combine", CompiledOpType::EpCombine},
         // Backward operations
         {"view_backward", CompiledOpType::ViewBackward},
         {"add_backward", CompiledOpType::AddBackward},
@@ -251,6 +254,9 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"moe_grouped_gemm_down_backward", CompiledOpType::MoEGroupedGemmDownBackward},
         {"moe_unpermute_backward", CompiledOpType::MoEUnpermuteBackward},
         {"moe_expert_bias_add_backward", CompiledOpType::MoEExpertBiasAddBackward},
+        // Expert Parallelism backward operations
+        {"ep_dispatch_backward", CompiledOpType::EpDispatchBackward},
+        {"ep_combine_backward", CompiledOpType::EpCombineBackward},
         // Mamba/SSM forward operations
         {"mamba_split_proj", CompiledOpType::MambaSplitProj},
         {"mamba_conv1d", CompiledOpType::MambaConv1d},
@@ -774,6 +780,30 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
             if (auto v = attr_double(*limit_attr)) {
                 attrs.gpt_oss_limit = static_cast<float>(*v);
             }
+        }
+    }
+
+    // Expert Parallelism attributes
+    if (type == CompiledOpType::EpDispatch || type == CompiledOpType::EpCombine ||
+        type == CompiledOpType::EpDispatchBackward || type == CompiledOpType::EpCombineBackward) {
+        if (auto* ep_attr = find_attr(op.attrs, "ep_size")) {
+            if (auto v = attr_int(*ep_attr)) {
+                attrs.ep_size = static_cast<int>(*v);
+            }
+        }
+        if (auto* ne_attr = find_attr(op.attrs, "num_experts")) {
+            if (auto v = attr_int(*ne_attr)) {
+                attrs.num_experts = static_cast<int>(*v);
+            }
+        } else {
+            attrs.num_experts = static_cast<int>(mConfig.NumExperts);
+        }
+        if (auto* tk_attr = find_attr(op.attrs, "top_k")) {
+            if (auto v = attr_int(*tk_attr)) {
+                attrs.top_k = static_cast<int>(*v);
+            }
+        } else {
+            attrs.top_k = static_cast<int>(mConfig.NumExpertsPerTok);
         }
     }
 
@@ -1378,6 +1408,16 @@ void GraphCompiler::infer_output_shapes(
 
         case CompiledOpType::MoEUnpermute: {
             // Output shape [B*T, C] - based on routing structure
+            break;
+        }
+
+        // Expert Parallelism operations (dynamic shapes)
+        case CompiledOpType::EpDispatch: {
+            // Output shape is variable (worst case: all tokens to this GPU)
+            break;
+        }
+        case CompiledOpType::EpCombine: {
+            // Output shape matches original permuted token count
             break;
         }
 

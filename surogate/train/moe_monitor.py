@@ -36,14 +36,20 @@ class MoEMonitor:
     ----------
     logger
         Standard Python logger (``logging.Logger`` or compatible).
+    num_experts : int
+        Total number of experts in the model (0 = unknown, use conservative defaults).
+    num_experts_per_tok : int
+        Number of experts activated per token (top-k). Only used when *num_experts* > 0.
     window : int
         Number of recent steps to keep for rolling statistics.
     warmup : int
         Minimum steps before diagnostics become active.
     imbalance_warn : float
         ``load_imbalance`` above this triggers a warning (1.0 = perfect).
+        When 0, auto-computed from *num_experts* and *num_experts_per_tok*.
     imbalance_severe : float
         ``load_imbalance`` above this triggers a severe warning.
+        When 0, auto-computed from *num_experts* and *num_experts_per_tok*.
     utilization_warn : float
         ``expert_utilization`` below this triggers a warning (1.0 = all used).
     utilization_critical : float
@@ -54,13 +60,32 @@ class MoEMonitor:
         Minimum steps between repeated warnings of the same kind.
     """
 
+    @staticmethod
+    def _auto_thresholds(num_experts: int, top_k: int) -> tuple[float, float]:
+        """Compute imbalance warn/severe thresholds from architecture.
+
+        The ``load_imbalance`` metric is ``max_expert_tokens / mean_expert_tokens``.
+        With more experts the most popular expert naturally receives many more
+        tokens than the average, even with a well-trained router.  The sparsity
+        ratio ``num_experts / top_k`` is the main driver.
+
+        Returns (warn, severe) thresholds.
+        """
+        sparsity = num_experts / max(top_k, 1)
+        # Empirical: warn ≈ 1.5*sparsity, severe ≈ 3*sparsity, with floors
+        warn = max(3.0, 1.5 * sparsity)
+        severe = max(10.0, 3.0 * sparsity)
+        return warn, severe
+
     def __init__(
         self,
         logger,
+        num_experts: int = 0,
+        num_experts_per_tok: int = 1,
         window: int = 50,
         warmup: int = 10,
-        imbalance_warn: float = 3.0,
-        imbalance_severe: float = 10.0,
+        imbalance_warn: float = 0,
+        imbalance_severe: float = 0,
         utilization_warn: float = 0.8,
         utilization_critical: float = 0.5,
         aux_loss_spike_sigma: float = 3.0,
@@ -69,12 +94,23 @@ class MoEMonitor:
         self.logger = logger
         self.window = window
         self.warmup = warmup
-        self.imbalance_warn = imbalance_warn
-        self.imbalance_severe = imbalance_severe
         self.utilization_warn = utilization_warn
         self.utilization_critical = utilization_critical
         self.aux_loss_spike_sigma = aux_loss_spike_sigma
         self.cooldown = cooldown
+
+        # Auto-compute imbalance thresholds from architecture when not explicit
+        if imbalance_warn > 0 and imbalance_severe > 0:
+            self.imbalance_warn = imbalance_warn
+            self.imbalance_severe = imbalance_severe
+        elif num_experts > 0:
+            self.imbalance_warn, self.imbalance_severe = self._auto_thresholds(
+                num_experts, num_experts_per_tok
+            )
+        else:
+            # Conservative defaults when architecture is unknown
+            self.imbalance_warn = 3.0
+            self.imbalance_severe = 10.0
 
         # Rolling history
         self._aux_losses: deque[float] = deque(maxlen=window)

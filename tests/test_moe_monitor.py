@@ -24,6 +24,65 @@ def _make_moe(
     )
 
 
+class TestAutoThresholds:
+    def test_small_moe_thresholds(self, logger):
+        """8 experts, top-2: sparsity=4, warn=6, severe=12."""
+        mon = MoEMonitor(logger, num_experts=8, num_experts_per_tok=2)
+        assert mon.imbalance_warn == pytest.approx(6.0)
+        assert mon.imbalance_severe == pytest.approx(12.0)
+
+    def test_qwen3_moe_thresholds(self, logger):
+        """128 experts, top-8: sparsity=16, warn=24, severe=48."""
+        mon = MoEMonitor(logger, num_experts=128, num_experts_per_tok=8)
+        assert mon.imbalance_warn == pytest.approx(24.0)
+        assert mon.imbalance_severe == pytest.approx(48.0)
+
+    def test_gptoss_thresholds(self, logger):
+        """128 experts, top-4: sparsity=32, warn=48, severe=96."""
+        mon = MoEMonitor(logger, num_experts=128, num_experts_per_tok=4)
+        assert mon.imbalance_warn == pytest.approx(48.0)
+        assert mon.imbalance_severe == pytest.approx(96.0)
+
+    def test_explicit_thresholds_override_auto(self, logger):
+        """Explicit warn/severe should override auto-computation."""
+        mon = MoEMonitor(
+            logger, num_experts=128, num_experts_per_tok=8,
+            imbalance_warn=5.0, imbalance_severe=15.0,
+        )
+        assert mon.imbalance_warn == 5.0
+        assert mon.imbalance_severe == 15.0
+
+    def test_unknown_architecture_conservative_defaults(self, logger):
+        """When num_experts=0 (unknown), use conservative defaults."""
+        mon = MoEMonitor(logger)
+        assert mon.imbalance_warn == 3.0
+        assert mon.imbalance_severe == 10.0
+
+    def test_auto_thresholds_no_false_warnings_qwen3(self, logger, caplog):
+        """Qwen3-MoE imbalance of 10 should NOT trigger warnings."""
+        mon = MoEMonitor(
+            logger, num_experts=128, num_experts_per_tok=8,
+            warmup=3, cooldown=0,
+        )
+        for i in range(3):
+            mon.step(_make_moe(), step=i)
+        with caplog.at_level(logging.WARNING):
+            mon.step(_make_moe(load_imbalance=10.0), step=3)
+        assert "imbalance" not in caplog.text.lower()
+
+    def test_auto_thresholds_no_false_warnings_gptoss(self, logger, caplog):
+        """GPT-OSS imbalance of 5.5 should NOT trigger warnings."""
+        mon = MoEMonitor(
+            logger, num_experts=128, num_experts_per_tok=4,
+            warmup=3, cooldown=0,
+        )
+        for i in range(3):
+            mon.step(_make_moe(), step=i)
+        with caplog.at_level(logging.WARNING):
+            mon.step(_make_moe(load_imbalance=5.5), step=3)
+        assert "imbalance" not in caplog.text.lower()
+
+
 class TestMoEMonitorStep:
     def test_none_is_noop(self, logger):
         mon = MoEMonitor(logger, warmup=3)

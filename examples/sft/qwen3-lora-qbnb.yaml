@@ -1,4 +1,4 @@
-model: Qwen/Qwen3-0.6B
+model: Qwen/Qwen3-8B
 output_dir: ./output
 
 per_device_train_batch_size: 2
@@ -7,7 +7,7 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-num_epochs: 2
+max_steps: 5
 eval_steps: 25
 
 learning_rate: 2e-4

@@ -1072,6 +1072,59 @@ class GraphBuilder:
         return self._make_output(out)
 
     # =========================================================================
+    # Expert Parallelism (EP) Operations
+    # =========================================================================
+
+    def ep_dispatch(
+        self,
+        permuted_input: str | GraphRef,
+        routing_indices: str | GraphRef,
+        scatter_indices: str | GraphRef,
+        *,
+        num_experts: int,
+        ep_size: int,
+        top_k: int,
+        out_name: str | None = None,
+        recv_scatter_name: str | None = None,
+    ) -> tuple[GraphRef, GraphRef]:
+        """EP dispatch: route permuted tokens to expert-owning GPUs via all-to-all.
+
+        Returns (recv_tokens, recv_scatter_indices) for local expert computation.
+        """
+        recv = out_name or self._fresh_name("ep_recv")
+        recv_scatter = recv_scatter_name or self._fresh_name("ep_recv_scatter")
+        self._add_node(GraphNode(
+            op="ep_dispatch",
+            inputs=[
+                self._resolve_input(permuted_input),
+                self._resolve_input(routing_indices),
+                self._resolve_input(scatter_indices),
+            ],
+            outputs=[recv, recv_scatter],
+            attrs={"num_experts": num_experts, "ep_size": ep_size, "top_k": top_k},
+        ))
+        return self._make_outputs([recv, recv_scatter])
+
+    def ep_combine(
+        self,
+        expert_output: str | GraphRef,
+        *,
+        num_experts: int,
+        ep_size: int,
+        top_k: int,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """EP combine: reverse all-to-all to collect expert outputs."""
+        out = out_name or self._fresh_name("ep_combined")
+        self._add_node(GraphNode(
+            op="ep_combine",
+            inputs=[self._resolve_input(expert_output)],
+            outputs=[out],
+            attrs={"num_experts": num_experts, "ep_size": ep_size, "top_k": top_k},
+        ))
+        return self._make_output(out)
+
+    # =========================================================================
     # Mamba2 / SSM Operations
     # =========================================================================
 

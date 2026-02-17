@@ -6,16 +6,19 @@ gradient_accumulation_steps: 4
 
 sample_packing: true
 sequence_len: 512
+gpus: 4
+ep_size: 4
+ep_load_balance_threshold: 1.0
 
 max_steps: 50
 
 learning_rate: 2e-4
 
-recipe: bf16
+recipe: fp8-hybrid
 lmhead_chunks: 8
 warmup_ratio: 0.1
 
-qlora_offload_experts: true
+# qlora_offload_experts: true
 
 lora: true
 lora_rank: 16

@@ -239,6 +239,22 @@ public:
         return total;
     }
 
+    void set_max_resident_groups(int max_groups) override {
+        mConfig.max_resident_groups = max_groups;
+    }
+
+    [[nodiscard]] int max_resident_groups() const override {
+        return mConfig.max_resident_groups;
+    }
+
+    [[nodiscard]] size_t max_group_bytes() const override {
+        size_t max_bytes = 0;
+        for (const auto& [gid, group] : mGroups) {
+            max_bytes = std::max(max_bytes, group.total_bytes);
+        }
+        return max_bytes;
+    }
+
 private:
     // =========================================================================
     // Internal data structures

@@ -10,6 +10,8 @@ sequence_len: 512
 
 max_steps: 50
 eval_steps: 15
+gpus: 4
+ep_size: 4
 
 learning_rate: 2e-4
 
@@ -22,7 +24,7 @@ lora_rank: 16
 lora_alpha: 32
 lora_dtype: bf16
 
-qlora_offload_experts: true
+# qlora_offload_experts: true
 
 lora_target_modules:
   - q_proj

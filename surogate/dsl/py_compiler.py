@@ -1957,6 +1957,7 @@ def compile_model_for_hf(
     architecture: str,
     hf_config: Dict[str, Any],
     *,
+    extra_config: Dict[str, Any] | None = None,
     raise_on_error: bool = False,
     warnings: WarningCollector | None = None,
 ) -> str:
@@ -1966,6 +1967,9 @@ def compile_model_for_hf(
     Args:
         architecture: HuggingFace architecture name (e.g., "Qwen3ForCausalLM")
         hf_config: The HuggingFace config.json contents
+        extra_config: Additional config overrides from training config (e.g., ep_size).
+                      These are merged into the config dict after HF config extraction,
+                      allowing training-time parameters to influence graph compilation.
 
     Returns:
         JSON string in the format expected by the C++ runtime
@@ -2023,6 +2027,11 @@ def compile_model_for_hf(
             value = _get_hf_value(hf_config, hf_key)
             if value is not None:
                 config[dsl_param] = value
+
+    # Merge training-time overrides (e.g., ep_size) into the config.
+    # These are not part of the HF model config but affect graph compilation.
+    if extra_config:
+        config.update(extra_config)
 
     try:
         # Compile

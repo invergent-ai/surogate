@@ -6,60 +6,13 @@ Surogate provides full support for pre-training and fine-tuning Mixture-of-Exper
 
 Surogate natively supports:
 
-| Model                 | Architecture | Experts      | Active (top-k) |
-| --------------------- | ------------ | ------------ | -------------- |
-| Qwen3-MoE-30B-A3B     | qwen3_moe    | 128          | 8              |
-| Upcycled dense models | qwen3_moe    | Configurable | Configurable   |
+| Model                   | Architecture | Experts | Active (top-k) |
+| ----------------------- | ------------ | ------- | -------------- |
+| Qwen3-MoE-30B-A3B       | qwen3_moe    | 128     | 8              |
+| GPT-OSS-20B             | gpt_oss      | 128     | 4              |
+| Nemotron-H (MoE layers) | nemotron_h   | 64      | 4              |
 
-## Creating a MoE Model
-
-There are two paths to creating an MoE model:
-
-1. **Upcycle a dense model** - Convert an existing dense model to MoE architecture
-2. **Use a pre-trained MoE** - Start from an existing MoE model like Qwen3-MoE-30B-A3B
-
-### Upcycling from a Dense Model
-
-The `scripts/upcycle_moe.py` script converts a dense HuggingFace transformer into a Sparse MoE model. This is useful when you want to increase model capacity without training from scratch.
-
-**Basic usage:**
-
-```bash
-python scripts/upcycle_moe.py \
-    --model_id "Qwen/Qwen3-0.6B" \
-    --num_experts 8 \
-    --top_k 2 \
-    --save_path ./my-moe-model
-```
-
-**Parameters:**
-
-| Parameter          | Default  | Description                               |
-| ------------------ | -------- | ----------------------------------------- |
-| `--model_id`       | required | HuggingFace model ID or local path        |
-| `--num_experts`    | 8        | Total number of experts per layer         |
-| `--top_k`          | 2        | Number of experts activated per token     |
-| `--dus_pct`        | 20       | Depth Upscaling percentage (0 to disable) |
-| `--save_path`      | required | Output directory for the MoE model        |
-| `--max_shard_size` | 5GB      | Maximum checkpoint shard size             |
-
-**Recommended configurations for Qwen3-0.6B:**
-
-- **8-2 configuration** (8 experts, top-k=2): Highly recommended. Provides good balance of capacity and efficiency.
-- **Depth Upscaling 20%**: Optional but can provide small accuracy improvements.
-- **Avoid high top-k**: Do not use top-k > 2 for small models. Higher values increase compute without consistent accuracy gains.
-
-**What the script does:**
-
-1. Loads the dense model
-2. Optionally applies Depth Upscaling (DUS) to add more layers
-3. Replaces each FFN block with an MoE layer containing `num_experts` copies of the original FFN
-4. Initializes the router with small random weights
-5. Saves the model in HuggingFace format
-
-**Important:** Upcycled models have an untrained router. The router is initialized randomly, so the model requires fine-tuning before it can effectively route tokens to different experts.
-
-### Pre-training from Scratch
+## Pre-training from Scratch
 
 To pre-train an MoE model from scratch, use the `surogate pt` command with an MoE model preset:
 
@@ -142,54 +95,6 @@ max_grad_norm: 0.5
 use_cuda_graphs: false
 ```
 
-### 3. LoRA + Router Training (Recommended for Upcycled Models)
-
-Train both LoRA adapters and the router gate. This is **essential for upcycled models** where the router is randomly initialized:
-
-```yaml
-# moe-lora-router.yaml
-model: ./my-moe-model
-model_type: qwen3_moe
-output_dir: ./output-moe-lora-router
-merge_adapter: true
-
-lora: true
-lora_rank: 16
-lora_alpha: 32
-lora_dtype: bf16
-
-# Enable router training (critical for upcycled models)
-train_router: true
-
-# Optional: Tune MoE loss coefficients (defaults from model config)
-# router_aux_loss_coef: 0.01   # Higher = more load balancing
-# router_z_loss_coef: 0.001    # Regularize router logits
-
-lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
-
-# Slightly higher learning rate works well with router training
-learning_rate: 3e-5
-warmup_ratio: 0.15
-max_grad_norm: 1.0
-weight_decay: 0.1
-use_cuda_graphs: false
-```
-
-**What `train_router: true` does:**
-
-1. Unfreezes the router gate weights (normally frozen in LoRA mode)
-2. Computes gradients for the router during backward pass
-3. Updates router weights alongside LoRA adapters
-4. Exports trained router weights in the adapter checkpoint
-5. Merges router weights when using `merge_adapter: true`
-
 ## QLoRA for MoE Models
 
 MoE models can be fine-tuned with QLoRA to reduce memory usage. All QLoRA variants (BnB, FP8, FP4) are supported:
@@ -230,14 +135,13 @@ router_z_loss_coef: 0.001    # Logit regularization (default: from model config,
 
 **When to adjust these values:**
 
-| Scenario | Aux Loss Coef | Z-Loss Coef | Reasoning |
-| -------- | ------------- | ----------- | --------- |
-| Default/pre-trained models | Use model default | Use model default | Well-tuned for the architecture |
-| Upcycled models | 0.01 - 0.05 | 0.001 - 0.01 | Higher aux loss helps untrained router learn balanced routing |
-| Router collapse detected | Increase 2-5x | Increase 2-5x | Stronger regularization to stabilize routing |
-| Over-uniform routing | Decrease 2-5x | Keep default | Allow more routing specialization |
-| Large batch training | Keep default | Keep default | Usually stable |
-| Small batch training | Increase 2x | Increase 2x | More regularization helps with noisy gradients |
+| Scenario                   | Aux Loss Coef     | Z-Loss Coef       | Reasoning                                                     |
+| -------------------------- | ----------------- | ----------------- | ------------------------------------------------------------- |
+| Default/pre-trained models | Use model default | Use model default | Well-tuned for the architecture                               |
+| Router collapse detected   | Increase 2-5x     | Increase 2-5x     | Stronger regularization to stabilize routing                  |
+| Over-uniform routing       | Decrease 2-5x     | Keep default      | Allow more routing specialization                             |
+| Large batch training       | Keep default      | Keep default      | Usually stable                                                |
+| Small batch training       | Increase 2x       | Increase 2x       | More regularization helps with noisy gradients                |
 
 **Note:** Setting these values in the config overrides the model's default coefficients. Omit them to use the model's pre-configured values.
 
@@ -247,15 +151,15 @@ router_z_loss_coef: 0.001    # Logit regularization (default: from model config,
 
 Upcycled models need careful tuning because the router starts untrained:
 
-| Parameter               | Recommended Value | Notes                                    |
-| ----------------------- | ----------------- | ---------------------------------------- |
-| `learning_rate`         | 1e-5 to 3e-5      | Much lower than dense models (10x lower) |
-| `warmup_ratio`          | 0.15-0.20         | Longer warmup helps router stability     |
-| `max_grad_norm`         | 0.5-1.0           | Gradient clipping prevents instability   |
-| `weight_decay`          | 0.01-0.1          | Standard values work                     |
-| `train_router`          | true              | Essential for upcycled models            |
-| `router_aux_loss_coef`  | 0.01-0.05         | Higher than default for faster router convergence |
-| `router_z_loss_coef`    | 0.001-0.01        | Standard values work                     |
+| Parameter              | Recommended Value | Notes                                             |
+| ---------------------- | ----------------- | ------------------------------------------------- |
+| `learning_rate`        | 1e-5 to 3e-5      | Much lower than dense models (10x lower)          |
+| `warmup_ratio`         | 0.15-0.20         | Longer warmup helps router stability              |
+| `max_grad_norm`        | 0.5-1.0           | Gradient clipping prevents instability            |
+| `weight_decay`         | 0.01-0.1          | Standard values work                              |
+| `train_router`         | true              | Essential for upcycled models                     |
+| `router_aux_loss_coef` | 0.01-0.05         | Higher than default for faster router convergence |
+| `router_z_loss_coef`   | 0.001-0.01        | Standard values work                              |
 
 ### For Pre-trained MoE Models (e.g., Qwen3-MoE-30B-A3B)
 
@@ -283,12 +187,14 @@ Surogate provides dedicated MoE metrics to monitor router health and expert util
 
 ### MoE-Specific Metrics
 
-| Metric               | Description                                       | Healthy Range |
-| -------------------- | ------------------------------------------------- | ------------- |
-| `aux_loss`           | Load balancing auxiliary loss (sum across layers) | 0.001 - 0.1   |
-| `z_loss`             | Router z-loss for logit regularization            | 0.0001 - 0.01 |
-| `expert_utilization` | Fraction of experts receiving tokens (0-1)        | 0.7 - 1.0     |
-| `load_imbalance`     | Ratio of max to mean token counts (1.0 = perfect) | 1.0 - 2.5     |
+| Metric               | Description                                       | Healthy Range              |
+| -------------------- | ------------------------------------------------- | -------------------------- |
+| `aux_loss`           | Load balancing auxiliary loss (sum across layers) | 0.001 - 0.1                |
+| `z_loss`             | Router z-loss for logit regularization            | 0.0001 - 0.01              |
+| `expert_utilization` | Fraction of experts receiving tokens (0-1)        | 0.7 - 1.0                  |
+| `load_imbalance`     | Ratio of max to mean expert token counts (1.0 = perfect) | Depends on architecture* |
+
+*Load imbalance healthy range depends on the number of experts — see [Load Imbalance](#load-imbalance) for per-architecture guidance.
 
 ### Enabling MoE Metrics
 
@@ -321,17 +227,28 @@ Measures what fraction of experts are receiving tokens each step. Monitor via:
 
 #### Load Imbalance
 
-Measures how evenly tokens are distributed across active experts. Monitor via:
+Measures how evenly tokens are distributed across active experts, computed as `max_expert_tokens / mean_expert_tokens`. Monitor via:
 - **Console**: `imbal` field shown inline for MoE models
 - **JSON logs**: `moe_load_imbalance` field in step logs
 - **wandb/Aim**: `train/moe_load_imbalance`
 
-| Value     | Interpretation                    |
-| --------- | --------------------------------- |
-| 1.0 - 1.5 | Excellent - near-perfect balance  |
-| 1.5 - 2.5 | Good - acceptable imbalance       |
-| 2.5 - 4.0 | Warning - some experts overloaded |
-| > 4.0     | Critical - severe load imbalance  |
+**Important:** The expected load imbalance depends heavily on the number of experts and top-k. With more experts, the most popular expert will naturally receive many more tokens than the average, even with a well-trained router. A single threshold does not apply across architectures.
+
+**Per-architecture expected ranges (pre-trained models with trained router):**
+
+| Architecture                          | Experts | Top-k | Expected Imbalance | Warning Threshold |
+| ------------------------------------- | ------- | ----- | ------------------ | ----------------- |
+| Small MoE (e.g., 8x2 upcycled)       | 8       | 2     | 1.5 - 3.0         | > 5.0             |
+| Nemotron-H MoE layers                 | 64      | 4     | 3.0 - 6.0         | > 10.0            |
+| GPT-OSS (128 experts, top-4)          | 128     | 4     | 4.0 - 6.0         | > 10.0            |
+| Qwen3-MoE-30B-A3B (128 experts, top-8) | 128   | 8     | 8.0 - 12.0        | > 20.0            |
+
+**Why large expert counts have high imbalance:** The metric reports the ratio of the *single busiest expert* to the *average across all experts*. With 128 experts and top-8 routing, each expert receives on average `tokens * 8 / 128 = 6.25%` of tokens. A trained router will specialize — popular experts may receive 50-75% of tokens while many experts receive very few. This is normal and expected behavior, not a sign of router collapse.
+
+**What to watch for:** Rather than absolute values, monitor for:
+- **Sudden spikes** in imbalance (2x+ increase within a few steps)
+- **Monotonically increasing** imbalance (router concentrating on fewer experts over time)
+- **Imbalance combined with low utilization** (< 0.5) — this indicates actual router collapse
 
 #### Auxiliary Loss
 
@@ -370,19 +287,19 @@ Monitor these indicators for healthy MoE training:
 - **Loss**: Decreases steadily without sudden spikes
 - **Gradient norm**: Stays below 0.4 (or 1.0 with `max_grad_norm: 1.0`)
 - **Expert utilization**: Above 0.7 and stable or increasing
-- **Load imbalance**: Below 2.5 and stable
+- **Load imbalance**: Stable and within expected range for the architecture (see [Load Imbalance](#load-imbalance))
 - **Aux loss**: Decreasing or stable in the 0.01-0.1 range
 
 ### Signs of Router Collapse
 
 Router collapse occurs when the router stops distributing tokens effectively:
 
-| Symptom                  | Metric Indicator           |
-| ------------------------ | -------------------------- |
-| All tokens to one expert | `expert_utilization` < 0.2 |
-| Severe load imbalance    | `load_imbalance` > 5.0     |
-| Router instability       | `z_loss` > 0.1 or spiking  |
-| Training divergence      | `aux_loss` > 2.0           |
+| Symptom                     | Metric Indicator                                           |
+| --------------------------- | ---------------------------------------------------------- |
+| All tokens to few experts   | `expert_utilization` < 0.2                                 |
+| Severe load imbalance       | `load_imbalance` > 2x the expected range for architecture  |
+| Router instability          | `z_loss` > 0.1 or spiking                                 |
+| Training divergence         | `aux_loss` > 2.0                                           |
 
 **Recovery steps:**
 
@@ -393,9 +310,9 @@ Router collapse occurs when the router stops distributing tokens effectively:
 5. **Increase loss coefficients** - set `router_aux_loss_coef: 0.05` and `router_z_loss_coef: 0.01` for stronger regularization
 6. **Check batch size** - very small batches can cause routing instability
 
-### Example: Monitoring an Upcycled Model
+### Example: Monitoring an Upcycled Model (8 experts, top-2)
 
-When fine-tuning an upcycled model, you should see this progression:
+When fine-tuning a small upcycled model (e.g., 8 experts, top-2), you should see this progression:
 
 **Early training (steps 0-100):**
 ```
@@ -418,22 +335,7 @@ load_imbalance: 1.6       # Well balanced
 aux_loss: 0.05            # Stable
 ```
 
-### Programmatic Access to MoE Metrics
-
-You can access MoE metrics programmatically:
-
-```python
-# Get MoE stats from trainer
-moe_stats = trainer.get_moe_stats()
-
-if moe_stats['valid']:
-    print(f"Aux loss: {moe_stats['aux_loss']:.4f}")
-    print(f"Z loss: {moe_stats['z_loss']:.4f}")
-    print(f"Expert utilization: {moe_stats['expert_utilization']:.2%}")
-    print(f"Load imbalance: {moe_stats['load_imbalance']:.2f}")
-```
-
-For more details on all available metrics, see [Training Metrics & Monitoring](metrics.md)
+For large pre-trained MoE models (128 experts), load imbalance will be significantly higher throughout training — see [Load Imbalance](#load-imbalance) for expected ranges.
 
 ## Memory Considerations
 
@@ -446,15 +348,110 @@ MoE models have more parameters than dense models but similar active compute:
 | Qwen3-MoE-30B-A3B  | 30B          | 3B            | ~60GB       | ~12GB            |
 
 Tips for reducing memory:
-- Use QLoRA (`qlora_bnb: true`) for large models
+- Use QLoRA (`qlora_bnb: true` or `qlora_fp8: true`) for large models
+- Use Expert Parallelism (`ep_size: N`) to shard experts across GPUs — each GPU holds `1/N` of the experts
+- Enable `qlora_offload_experts: true` to offload inactive expert weights to CPU
 - Reduce `per_device_train_batch_size` and increase `gradient_accumulation_steps`
 - Enable `recompute` (default)
+
+## Expert Parallelism (EP)
+
+By default, every GPU holds a full copy of all expert weights (data-parallel only). For large MoE models with many experts, this means each GPU must fit all expert weights in memory — even though only a few experts are active per token.
+
+**Expert Parallelism** distributes experts across GPUs so that each GPU holds only `num_experts / ep_size` local experts. Tokens are routed to the correct GPU via all-to-all communication, experts run in parallel, and results are sent back. This reduces per-GPU memory and enables parallel expert compute across GPUs.
+
+### Configuration
+
+```yaml
+gpus: 4
+ep_size: 2                       # 2-way expert parallelism
+ep_load_balance_threshold: 1.3   # LLEP activation threshold (default)
+```
+
+| Parameter                   | Type  | Default | Description                                                                                                                                          |
+| --------------------------- | ----- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ep_size`                   | int   | 1       | Number of GPUs in each expert-parallel group. Must divide `gpus`. Each GPU holds `num_experts / ep_size` local experts.                              |
+| `ep_load_balance_threshold` | float | 1.3     | Imbalance ratio (`max_gpu_load / mean_gpu_load`) above which dynamic load balancing (LLEP) activates. Set to `1.0` for always-active load balancing. |
+
+**Constraints:**
+
+- `ep_size` must evenly divide `gpus`
+- `num_experts` must be evenly divisible by `ep_size`
+- `ep_size = 1` (default) disables EP and uses pure data parallelism
+
+### How EP Works
+
+With `gpus: 4` and `ep_size: 2`:
+
+- **EP groups**: Ranks {0, 1} and {2, 3} each form an expert-parallel group
+- **DP groups**: Ranks {0, 2} and {1, 3} each form a data-parallel group
+- Each GPU holds `num_experts / 2` local experts
+- Dense layer gradients are all-reduced across all 4 GPUs (global)
+- Expert weight gradients are all-reduced across the DP group only (2 GPUs)
+
+### LLEP Load Balancing
+
+MoE routing is inherently imbalanced — some experts receive more tokens than others. Without load balancing, the GPU with the most-loaded experts becomes a bottleneck.
+
+**Least-Loaded EP (LLEP)** dynamically redistributes work when imbalance is detected:
+
+1. At each layer, expert token counts are measured across the EP group
+2. If `max_gpu_load / mean_gpu_load` exceeds `ep_load_balance_threshold`, the LPT (Longest Processing Time) scheduler activates
+3. Overloaded experts are temporarily transferred to underloaded GPUs along with their weights
+4. After computation, results and gradients are routed back to the native GPU
+
+LLEP is automatic when `ep_size > 1`. The `ep_load_balance_threshold` controls sensitivity:
+
+| Value  | Behavior                                                        |
+| ------ | --------------------------------------------------------------- |
+| `1.0`  | Always active — LPT scheduling runs every layer                 |
+| `1.3`  | Default — activates only when significant imbalance is detected |
+| `2.0+` | Rarely activates — only under extreme imbalance                 |
+
+### EP with QLoRA
+
+EP works with all QLoRA variants. When combined with expert offloading (`qlora_offload_experts: true`), each GPU offloads only its local expert shard, reducing both GPU and CPU memory:
+
+```yaml
+model: Qwen/Qwen3-30B-A3B
+model_type: qwen3_moe
+gpus: 4
+ep_size: 2
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+
+qlora_fp8: true
+qlora_offload_experts: true
+ep_load_balance_threshold: 1.0
+
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+```
+
+### When to Use EP
+
+| Scenario                                             | Recommendation                               |
+| ---------------------------------------------------- | -------------------------------------------- |
+| Model fits on one GPU with QLoRA                     | EP not needed (`ep_size: 1`)                 |
+| Many GPUs, want faster throughput                    | Use EP to parallelize expert compute         |
+| Expert weights too large for one GPU even with QLoRA | Use EP to shard experts across GPUs          |
+| High routing imbalance                               | Use EP with `ep_load_balance_threshold: 1.0` |
 
 ## Limitations
 
 1. **CUDA Graphs:** MoE models cannot use CUDA graphs due to dynamic expert routing. Always set `use_cuda_graphs: false`.
 
 2. **ZeRO-3:** MoE expert weights can be sharded with ZeRO-3, but routing overhead increases with world size.
+
+3. **EP checkpoint compatibility:** Checkpoints saved with EP require the same `ep_size` when resuming training.
 
 ## Example Configurations
 

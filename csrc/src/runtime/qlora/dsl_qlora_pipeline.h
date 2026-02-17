@@ -85,6 +85,10 @@ struct DslQLoRAPipelineConfig {
     int num_experts = 0;
     int moe_intermediate_size = 0;
 
+    /// Expert Parallelism: each GPU loads only local experts.
+    int ep_rank = 0;   ///< This GPU's rank within the EP group
+    int ep_size = 1;   ///< Number of GPUs in the EP group (1 = no EP)
+
     /// List of weight parameters to load and their properties.
     std::vector<WeightLoadSpec> weight_specs;
 

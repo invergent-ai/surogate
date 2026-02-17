@@ -26,8 +26,17 @@ def resolve_architecture(config_json: Dict[str, Any]) -> str:
     raise ValueError("Could not resolve architecture from config.json")
 
 
-def build_dsl_ir_from_python(architecture: str, config_json: Dict[str, Any]) -> str:
+def build_dsl_ir_from_python(
+    architecture: str,
+    config_json: Dict[str, Any],
+    extra_config: Dict[str, Any] | None = None,
+) -> str:
     """Build IR JSON using Python DSL models.
+
+    Args:
+        architecture: HuggingFace architecture name.
+        config_json: The HuggingFace config.json contents.
+        extra_config: Additional config overrides (e.g., ep_size from training config).
 
     Raises:
         RuntimeError: If DSL compilation fails, with detailed error message.
@@ -36,7 +45,7 @@ def build_dsl_ir_from_python(architecture: str, config_json: Dict[str, Any]) -> 
     from surogate.dsl import models  # noqa: F401 - registers models
     from surogate.dsl.py_compiler import compile_model_for_hf
 
-    ir_json = compile_model_for_hf(architecture, config_json)
+    ir_json = compile_model_for_hf(architecture, config_json, extra_config=extra_config)
 
     # Check if compilation succeeded
     result = json.loads(ir_json)
@@ -60,16 +69,20 @@ def build_dsl_ir_from_python(architecture: str, config_json: Dict[str, Any]) -> 
     return ir_json
 
 
-def build_dsl_ir_for_model(model_dir: str) -> str:
+def build_dsl_ir_for_model(
+    model_dir: str,
+    extra_config: Dict[str, Any] | None = None,
+) -> str:
     """
     Build DSL IR JSON for a model.
 
     Args:
         model_dir: Path to the HuggingFace model directory
+        extra_config: Additional config overrides (e.g., ep_size from training config)
 
     Returns:
         JSON string with the compiled IR
     """
     config_json = load_hf_config(model_dir)
     architecture = resolve_architecture(config_json)
-    return build_dsl_ir_from_python(architecture, config_json)
+    return build_dsl_ir_from_python(architecture, config_json, extra_config=extra_config)

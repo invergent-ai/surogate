@@ -718,6 +718,7 @@ class NemotronHMoEBlock:
         activation: str = "relu2",
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 1.0,
+        ep_size: int = 1,
     ):
         self.d_model = d_model
         self.moe_intermediate_size = moe_intermediate_size
@@ -730,6 +731,8 @@ class NemotronHMoEBlock:
         self.activation = activation
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
+        self.ep_size = ep_size
+        self.num_local_experts = num_experts // ep_size if ep_size > 1 else num_experts
 
         # Dimension aliases for Param shape annotations
         # Set to actual integer values for DSL shape resolution
@@ -771,9 +774,26 @@ class NemotronHMoEBlock:
     permuted_input = Activation(Tensor["B * T * K", "C"], save=True)
     scatter_indices = Activation(Tensor["B * T * K"], dtype="int32", save=True)
 
+    # EP dispatch outputs (only present when ep_size > 1)
+    ep_recv_input = Activation(
+        Tensor["B * T * K", "C"], save=True,
+        when=lambda self: self.ep_size > 1,
+        description="EP-dispatched input tokens (post-A2A)",
+    )
+    ep_recv_scatter = Activation(
+        Tensor["B * T * K"], dtype="int32", save=True,
+        when=lambda self: self.ep_size > 1,
+        description="EP-dispatched scatter indices (post-A2A)",
+    )
+
     expert_up = Activation(Tensor["B * T * K", "M"], save=True)
     expert_act = Activation(Tensor["B * T * K", "M"], save=True)
     expert_down = Activation(Tensor["B * T * K", "C"], save=True)
+    ep_combined = Activation(
+        Tensor["B * T * K", "C"], save=True,
+        when=lambda self: self.ep_size > 1,
+        description="EP-combined expert output (post reverse-A2A)",
+    )
     moe_out = Activation(Tensor["B * T", "C"], save=True)
 
     # Shared expert activations
@@ -791,6 +811,8 @@ class NemotronHMoEBlock:
     d_ln = Gradient(Tensor["B", "T", "C"], gradient_of="ln")
     d_router_logits = Gradient(Tensor["B * T", "E"], dtype="fp32", gradient_of="router_logits")
     d_routing_weights = Gradient(Tensor["B * T", "K"], dtype="fp32", gradient_of="routing_weights")
+    d_ep_recv_input = Gradient(Tensor["B * T * K", "C"], gradient_of="ep_recv_input",
+                               when=lambda self: self.ep_size > 1)
     d_permuted_input = Gradient(Tensor["B * T * K", "C"], gradient_of="permuted_input")
     d_expert_up = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_up")
     d_expert_act = Gradient(Tensor["B * T * K", "M"], gradient_of="expert_act")
@@ -836,9 +858,23 @@ class NemotronHMoEBlock:
                 out_name="permuted_input", scatter_name="scatter_indices",
             )
 
+            # EP dispatch: route tokens to expert-owning GPUs (no-op when ep_size=1)
+            if self.ep_size > 1:
+                ep_recv_input, ep_recv_scatter = g.ep_dispatch(
+                    permuted_input, routing_indices, scatter_indices,
+                    num_experts=self.num_experts, ep_size=self.ep_size,
+                    top_k=self.num_experts_per_tok,
+                    out_name="ep_recv_input", recv_scatter_name="ep_recv_scatter",
+                )
+                gemm_input = ep_recv_input
+                gemm_scatter = ep_recv_scatter
+            else:
+                gemm_input = permuted_input
+                gemm_scatter = scatter_indices
+
             # Expert computation (simple up + activation + down)
             expert_up = g.moe_grouped_gemm(
-                permuted_input, "experts_up", scatter_indices,
+                gemm_input, "experts_up", gemm_scatter,
             )
 
             # Activation
@@ -848,8 +884,17 @@ class NemotronHMoEBlock:
                 expert_act = g.silu(expert_up)
 
             expert_down = g.moe_grouped_gemm_down(
-                expert_act, "experts_down", scatter_indices,
+                expert_act, "experts_down", gemm_scatter,
             )
+
+            # EP combine: route expert outputs back (no-op when ep_size=1)
+            if self.ep_size > 1:
+                expert_down = g.ep_combine(
+                    expert_down,
+                    num_experts=self.num_experts, ep_size=self.ep_size,
+                    top_k=self.num_experts_per_tok,
+                    out_name="ep_combined",
+                )
 
             # Unpermute and combine
             moe_out = g.moe_unpermute(

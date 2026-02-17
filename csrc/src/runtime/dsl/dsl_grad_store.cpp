@@ -228,13 +228,31 @@ void DslGradStore::zero_all(cudaStream_t stream) {
 }
 
 void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
+    const bool ep_active = comm.ep_enabled();
     for (auto& kv : mGrads) {
-        comm.all_reduce_avg(kv.second, stream);
+        // EP: expert weight gradients average across DP group only (same experts),
+        // everything else (dense, router, norms) averages across all GPUs.
+        if (ep_active && kv.first.find("experts_") != std::string::npos) {
+            comm.all_reduce_avg_dp(kv.second, stream);
+        } else {
+            comm.all_reduce_avg(kv.second, stream);
+        }
     }
     mReducePending = false;
 }
 
 void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream, cudaEvent_t done_event) {
+    const bool ep_active = comm.ep_enabled();
+
+    // Helper: reduce a single gradient using the appropriate communicator
+    auto reduce_one = [&](const std::string& name, Tensor& grad) {
+        if (ep_active && name.find("experts_") != std::string::npos) {
+            comm.all_reduce_avg_dp(grad, stream);
+        } else {
+            comm.all_reduce_avg(grad, stream);
+        }
+    };
+
     // If overlapped reduction is enabled and we have layer gradients that were already reduced,
     // only reduce non-layer gradients (embeddings, lm_head, final_norm)
     if (is_overlapped_enabled() && mHasLayerGrads) {
@@ -249,13 +267,13 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
         // Reduce non-layer gradients
         for (auto& kv : mGrads) {
             if (layer_grads.find(kv.first) == layer_grads.end()) {
-                comm.all_reduce_avg(kv.second, stream);
+                reduce_one(kv.first, kv.second);
             }
         }
     } else {
         // Fallback: reduce all gradients (original behavior)
         for (auto& kv : mGrads) {
-            comm.all_reduce_avg(kv.second, stream);
+            reduce_one(kv.first, kv.second);
         }
     }
 
@@ -331,21 +349,58 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
                          ? mLayerReduceEvents[layer_idx]
                          : nullptr;
 
-    // Both ZeRO-2 and ZeRO-1/DDP use batched transactions for NCCL efficiency
-    comm.begin_transaction(stream);
-    for (const auto& name : grad_names) {
-        auto it = mGrads.find(name);
-        if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
-            if (mConfig.shard_gradients) {
-                // ZeRO-2: Use reduce-scatter
-                comm.schedule_reduce_scatter(it->second);
-            } else {
-                // DDP/ZeRO-1: Use all-reduce with batching
-                comm.schedule_all_reduce_avg(it->second);
+    const bool ep_active = comm.ep_enabled();
+
+    // EP: expert gradients use DP-only all-reduce (separate from global transaction).
+    // Dense/router gradients use the standard global comm transaction.
+    if (ep_active) {
+        // First pass: reduce dense/router grads via global comm transaction
+        bool has_dense = false;
+        for (const auto& name : grad_names) {
+            if (name.find("experts_") == std::string::npos) {
+                has_dense = true;
+                break;
             }
         }
+        if (has_dense) {
+            comm.begin_transaction(stream);
+            for (const auto& name : grad_names) {
+                if (name.find("experts_") != std::string::npos) continue;
+                auto it = mGrads.find(name);
+                if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
+                    if (mConfig.shard_gradients) {
+                        comm.schedule_reduce_scatter(it->second);
+                    } else {
+                        comm.schedule_all_reduce_avg(it->second);
+                    }
+                }
+            }
+            comm.execute_transaction(ev);
+        }
+
+        // Second pass: reduce expert grads via DP comm (individual calls)
+        for (const auto& name : grad_names) {
+            if (name.find("experts_") == std::string::npos) continue;
+            auto it = mGrads.find(name);
+            if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
+                comm.all_reduce_avg_dp(it->second, stream);
+            }
+        }
+    } else {
+        // No EP: original path — all grads use global comm
+        comm.begin_transaction(stream);
+        for (const auto& name : grad_names) {
+            auto it = mGrads.find(name);
+            if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
+                if (mConfig.shard_gradients) {
+                    comm.schedule_reduce_scatter(it->second);
+                } else {
+                    comm.schedule_all_reduce_avg(it->second);
+                }
+            }
+        }
+        comm.execute_transaction(ev);
     }
-    comm.execute_transaction(ev);
 
     // ZeRO-2 with offloading: accumulate reduced shards into host storage
     if (mConfig.shard_gradients && !mShardedGrads.empty()) {

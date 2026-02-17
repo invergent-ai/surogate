@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -258,6 +259,9 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmDown: return "moe_grouped_gemm_down";
         case CompiledOpType::MoEUnpermute: return "moe_unpermute";
         case CompiledOpType::MoEExpertBiasAdd: return "moe_expert_bias_add";
+        // Expert Parallelism forward
+        case CompiledOpType::EpDispatch: return "ep_dispatch";
+        case CompiledOpType::EpCombine: return "ep_combine";
         // Backward
         case CompiledOpType::ViewBackward: return "view_backward";
         case CompiledOpType::AddBackward: return "add_backward";
@@ -293,6 +297,9 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmDownBackward: return "moe_grouped_gemm_down_backward";
         case CompiledOpType::MoEUnpermuteBackward: return "moe_unpermute_backward";
         case CompiledOpType::MoEExpertBiasAddBackward: return "moe_expert_bias_add_backward";
+        // Expert Parallelism backward
+        case CompiledOpType::EpDispatchBackward: return "ep_dispatch_backward";
+        case CompiledOpType::EpCombineBackward: return "ep_combine_backward";
         // Mamba/SSM forward
         case CompiledOpType::MambaSplitProj: return "mamba_split_proj";
         case CompiledOpType::MambaConv1d: return "mamba_conv1d";
@@ -345,6 +352,65 @@ CompiledExecutor::~CompiledExecutor() {
     }
     mMoeSavedBuffers.clear();
     mMoeSavedSizes.clear();
+
+    // Free EP per-layer persistent buffers
+    for (auto& [layer, state] : mEpStates) {
+        if (state.send_order_gpu) cudaFree(state.send_order_gpu);
+        if (state.recv_reorder_gpu) cudaFree(state.recv_reorder_gpu);
+        if (state.llep_send_reorder_gpu) cudaFree(state.llep_send_reorder_gpu);
+        if (state.local_scatter_gpu) cudaFree(state.local_scatter_gpu);
+    }
+    mEpStates.clear();
+
+    // Free shared EP buffers (shared across layers)
+    if (mSharedEpCombinedGpu) cudaFree(mSharedEpCombinedGpu);
+    if (mSharedEpSortedRecvGpu) cudaFree(mSharedEpSortedRecvGpu);
+    if (mSharedEpLlepCombineGpu) cudaFree(mSharedEpLlepCombineGpu);
+
+    // Free retired shared EP buffers (old allocations kept alive during forward/backward)
+    for (auto& e : mEpRetiredBufs) {
+        if (e.ptr) cudaFree(e.ptr);
+    }
+    mEpRetiredBufs.clear();
+
+    // Free EP buffer pool
+    for (auto& e : mEpBufPool) {
+        if (e.ptr) cudaFree(e.ptr);
+    }
+    mEpBufPool.clear();
+
+    // Destroy weight transfer stream
+    if (mWeightTransferStream) {
+        cudaStreamDestroy(mWeightTransferStream);
+        mWeightTransferStream = nullptr;
+    }
+}
+
+void* CompiledExecutor::ep_buf_acquire(size_t need) {
+    if (need == 0) return nullptr;
+    // Find smallest buffer that fits (best-fit to reduce waste)
+    size_t best_size = SIZE_MAX;
+    int best_idx = -1;
+    for (int i = 0; i < static_cast<int>(mEpBufPool.size()); ++i) {
+        if (mEpBufPool[i].bytes >= need && mEpBufPool[i].bytes < best_size) {
+            best_size = mEpBufPool[i].bytes;
+            best_idx = i;
+        }
+    }
+    if (best_idx >= 0) {
+        void* ptr = mEpBufPool[best_idx].ptr;
+        mEpBufPool.erase(mEpBufPool.begin() + best_idx);
+        return ptr;
+    }
+    void* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, need));
+    return ptr;
+}
+
+void CompiledExecutor::ep_buf_release(void* ptr, size_t bytes) {
+    if (ptr && bytes > 0) {
+        mEpBufPool.push_back({ptr, bytes});
+    }
 }
 
 void CompiledExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
@@ -504,6 +570,7 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
 
         // Check if this is an MoE-related tensor that needs persistent storage
         bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
+                              name.find("ep_") != std::string::npos ||
                               name.find("scatter_indices") != std::string::npos ||
                               name.find("routing_weights") != std::string::npos ||
                               name.find("routing_indices") != std::string::npos ||
@@ -1031,6 +1098,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         }
         if (found_tensor) {
             const bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
+                                        name.find("ep_") != std::string::npos ||
                                         name.find("scatter_indices") != std::string::npos ||
                                         name.find("routing_weights") != std::string::npos ||
                                         name.find("routing_indices") != std::string::npos ||
@@ -1617,6 +1685,31 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mTemps.clear();
     mMoEHostOffsetsCache.clear();
+    // Free retired shared EP buffers from previous steps (accumulated during reallocation).
+    // Previous step is fully complete, so these are no longer referenced.
+    for (auto& e : mEpRetiredBufs) {
+        if (e.ptr) cudaFree(e.ptr);
+    }
+    mEpRetiredBufs.clear();
+    // Free EP buffer pool — temporary buffers with short lifetimes (acquired/released
+    // within a single dispatch call). As routing imbalance changes during training,
+    // buffer sizes drift and stale entries become unreusable zombies. Clearing per-step
+    // prevents this accumulation; cudaMalloc overhead is negligible vs A2A/GEMM costs.
+    for (auto& e : mEpBufPool) {
+        if (e.ptr) cudaFree(e.ptr);
+    }
+    mEpBufPool.clear();
+    // Trim CUDA stream-ordered memory pool to release cached allocations.
+    // cuBLAS cublasGemmGroupedBatchedEx internally uses cudaMallocAsync;
+    // trimming reclaims unused cached blocks from previous steps.
+    {
+        int device;
+        cudaGetDevice(&device);
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+            cudaMemPoolTrimTo(pool, 0);
+        }
+    }
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mCurrentLayer = -1;
@@ -1862,12 +1955,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     }
 
     // Main dispatch loop - no string comparisons, direct function pointer dispatch
+    const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
+    const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
             continue;
         }
 
         const auto& op = graph.ops[idx];
+
+        if (op_trace) {
+            std::cerr << "[OP " << idx << "] " << op_type_to_string(op.type)
+                      << " id=" << op.op_id << std::endl;
+        }
 
         // Handle layer boundaries
         if (op.layer_start >= 0) {
@@ -1984,6 +2084,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::MoEExpertBiasAdd:
                     dispatch_moe_expert_bias_add(op);
                     break;
+                // Expert Parallelism forward operations
+                case CompiledOpType::EpDispatch:
+                    dispatch_ep_dispatch(op);
+                    break;
+                case CompiledOpType::EpCombine:
+                    dispatch_ep_combine(op);
+                    break;
                 // Mamba/SSM forward operations
                 case CompiledOpType::MambaSplitProj:
                     dispatch_mamba_split_proj(op);
@@ -2005,6 +2112,17 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
+            }
+            // After each op, check for sticky CUDA errors (debug mode)
+            if (op_trace) {
+                auto post_err = cudaGetLastError();
+                if (post_err != cudaSuccess) {
+                    std::ostringstream oss2;
+                    oss2 << "CompiledExecutor forward op " << idx
+                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
+                         << "): left sticky CUDA error: " << cudaGetErrorString(post_err);
+                    throw std::runtime_error(oss2.str());
+                }
             }
         } catch (const std::exception& e) {
             std::ostringstream oss;
@@ -2496,6 +2614,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     };
 
     const int num_layers = static_cast<int>(mConfig.NumLayers);
+    const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
+    const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
 
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
     std::vector<bool> layer_seen_any(num_layers, false);
@@ -2678,6 +2798,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     dispatch_moe_expert_bias_add_backward(op);
                     break;
 
+                // Expert Parallelism backward operations
+                case CompiledOpType::EpDispatchBackward:
+                    dispatch_ep_dispatch_backward(op);
+                    break;
+                case CompiledOpType::EpCombineBackward:
+                    dispatch_ep_combine_backward(op);
+                    break;
+
                 // MoE forward ops that may appear in backward graph
                 case CompiledOpType::MoESoftmax:
                 case CompiledOpType::MoESigmoid:
@@ -2687,11 +2815,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MoEGroupedGemmGateUp:
                 case CompiledOpType::MoEGroupedGemmDown:
                 case CompiledOpType::MoEUnpermute:
+                case CompiledOpType::EpDispatch:
+                case CompiledOpType::EpCombine:
                 case CompiledOpType::Silu:
                 case CompiledOpType::Relu2:
                 case CompiledOpType::Mul:
-                    // These forward MoE ops may appear in backward graph due to autodiff
-                    throw std::runtime_error("CompiledExecutor: MoE forward op in backward graph not yet supported");
+                    // These forward MoE/EP ops may appear in backward graph due to autodiff
+                    throw std::runtime_error("CompiledExecutor: MoE/EP forward op in backward graph not yet supported");
 
                 // Mamba/SSM backward operations
                 case CompiledOpType::MambaSplitProjBackward:
@@ -2727,6 +2857,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     std::ostringstream oss;
                     oss << "CompiledExecutor: unsupported backward op type at idx " << idx
                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
+                    throw std::runtime_error(oss.str());
+                }
+            }
+
+            // Per-op CUDA error check in trace mode: detects illegal memory accesses from launched kernels
+            if (op_trace) {
+                auto op_err = cudaDeviceSynchronize();
+                if (op_err != cudaSuccess) {
+                    std::ostringstream oss;
+                    oss << "CompiledExecutor backward op " << idx
+                        << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
+                        << "): CUDA error after execution: " << cudaGetErrorString(op_err);
                     throw std::runtime_error(oss.str());
                 }
             }
@@ -2777,6 +2919,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // would remove these tensors from mTensors, causing "tensor not found" errors.
             // For now, skip periodic cleanup when recompute is disabled to preserve correctness.
             // Memory usage will be higher but the backward pass will complete successfully.
+
+            // After each backward op, check for CUDA errors (lightweight, non-blocking)
+            {
+                auto err = cudaGetLastError();
+                if (err != cudaSuccess) {
+                    std::ostringstream oss2;
+                    oss2 << "CompiledExecutor backward op " << idx
+                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
+                         << "): CUDA error: " << cudaGetErrorString(err);
+                    throw std::runtime_error(oss2.str());
+                }
+            }
         } catch (const std::exception& e) {
             std::ostringstream oss;
             oss << "CompiledExecutor backward op " << idx << " (type=" << op_type_to_string(op.type)

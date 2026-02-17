@@ -231,6 +231,15 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             to O(top_k) for dequantization buffers. Significant memory savings for models with
             many experts (e.g., 128 experts with top_k=8 saves ~93% of dequant buffer memory).
 
+        ep_size (Optional[int], defaults to 1):
+            Expert Parallelism size. Distributes MoE experts across ep_size GPUs.
+            Must divide gpus and num_experts. 1 = no EP (all experts replicated).
+            When ep_size > 1, LLEP load balancing is automatically active.
+        ep_load_balance_threshold (Optional[float], defaults to 1.3):
+            LLEP adaptive threshold. When max_gpu_load / mean_gpu_load exceeds this,
+            LPT load balancing activates to rebalance tokens across GPUs.
+            Only relevant when ep_size > 1.
+
         use_chat_template (Optional[bool], defaults to True):
             Whether to use chat template for training.
         merge_adapter: (Optional[bool], defaults to False):
@@ -340,6 +349,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     qlora_four_over_six: Optional[bool] = True
     qlora_selective_expert_dequant: Optional[bool] = False
     qlora_offload_experts: Optional[bool] = False
+
+    # Expert Parallelism (EP): distribute MoE experts across GPUs
+    ep_size: Optional[int] = 1  # 1 = no EP (all experts replicated on every GPU)
+    ep_load_balance_threshold: Optional[float] = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
 
     merge_adapter: Optional[bool] = False
     use_chat_template: Optional[bool] = True
@@ -453,6 +466,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.qlora_selective_expert_dequant = cfg.get('qlora_selective_expert_dequant', self.qlora_selective_expert_dequant)
         self.qlora_offload_experts = cfg.get('qlora_offload_experts', self.qlora_offload_experts)
 
+        self.ep_size = cfg.get('ep_size', self.ep_size)
+        self.ep_load_balance_threshold = float(cfg.get('ep_load_balance_threshold', self.ep_load_balance_threshold))
+
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
@@ -534,9 +550,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                     "Gradient offloading is only supported with ZeRO-2 (gradient sharding) enabled."
                 )
 
+        self._validate_ep_config()
         self.create_runtime_config()
         self.create_lora_config()
         self.create_qlora_config()
+        self._extract_moe_info()
 
         self.ensure_directories()
 
@@ -568,6 +586,40 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
             )
 
+
+    def _validate_ep_config(self):
+        """Validate Expert Parallelism configuration."""
+        if self.ep_size is None or self.ep_size <= 1:
+            self.ep_size = 1
+            return
+
+        logger = get_logger()
+
+        if self.gpus % self.ep_size != 0:
+            raise ValueError(
+                f"ep_size ({self.ep_size}) must divide gpus ({self.gpus}). "
+                f"EP creates ep_size groups of dp_size = gpus / ep_size GPUs each."
+            )
+
+        if not self.model_info.is_moe_model:
+            raise ValueError(
+                f"ep_size ({self.ep_size}) > 1 requires a MoE model. "
+                f"Expert Parallelism distributes MoE experts across GPUs."
+            )
+
+        # Get num_experts from model config
+        from surogate.core.model.hf_config import HfConfigFactory
+        config = self.model_info.config
+        num_experts = HfConfigFactory.get_config_attr(config, 'num_experts') or 0
+        if num_experts > 0 and num_experts % self.ep_size != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by ep_size ({self.ep_size}). "
+                f"Each GPU owns num_experts / ep_size = {num_experts} / {self.ep_size} experts."
+            )
+
+        dp_size = self.gpus // self.ep_size
+        logger.info(f"[EP] Expert Parallelism: ep_size={self.ep_size}, dp_size={dp_size}, "
+                     f"num_local_experts={num_experts // self.ep_size if num_experts > 0 else '?'}")
 
     def ensure_directories(self):
         # Skip directory creation if running inside a Ray worker
@@ -669,6 +721,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.runtime_config.use_write_combined = self.use_write_combined
         self.runtime_config.selective_expert_dequant = self.qlora_selective_expert_dequant
         self.runtime_config.offload_experts = self.qlora_offload_experts
+        # Expert Parallelism
+        self.runtime_config.ep_size = self.ep_size
+        self.runtime_config.ep_load_balance_threshold = self.ep_load_balance_threshold
         # MoE loss coefficients (None means use model config default)
         if self.router_aux_loss_coef is not None:
             self.runtime_config.router_aux_loss_coef = float(self.router_aux_loss_coef)
@@ -764,6 +819,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                 self.qlora_config.num_experts = num_experts
                 self.qlora_config.num_experts_per_tok = num_experts_per_tok
                 self.qlora_config.moe_intermediate_size = moe_intermediate_size
+
+    def _extract_moe_info(self):
+        """Extract MoE expert counts from model config for monitoring."""
+        if self.model_info.is_moe_model:
+            from surogate.core.model.hf_config import HfConfigFactory
+            config = self.model_info.config
+            self.moe_num_experts = HfConfigFactory.get_config_attr(config, 'num_experts') or 0
+            self.moe_num_experts_per_tok = HfConfigFactory.get_config_attr(config, 'num_experts_per_tok') or 1
+        else:
+            self.moe_num_experts = 0
+            self.moe_num_experts_per_tok = 1
 
     def generate_run_name(self):
         return generate_unique_name(category='science')

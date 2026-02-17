@@ -18,6 +18,11 @@
 
 class NCCLCommunicator;
 
+namespace qlora {
+struct QuantizedTensor;
+class IQuantizer;
+}  // namespace qlora
+
 namespace dsl {
 
 /**
@@ -79,6 +84,21 @@ public:
 
     /// Memory savings ratio vs BF16 base weights (for stats).
     virtual float memory_savings_ratio() const = 0;
+
+    /// Get quantized tensor for a parameter (no dequantization).
+    /// Returns nullptr if the parameter is not quantized or not found.
+    virtual const qlora::QuantizedTensor* try_get_quantized(std::string_view name) const {
+        (void)name;
+        return nullptr;
+    }
+
+    /// Get the quantizer used by this provider (for remote dequantization).
+    /// Returns nullptr if no quantizer is available.
+    virtual qlora::IQuantizer* get_quantizer() const { return nullptr; }
+
+    /// Auto-tune offloading parameters based on current GPU memory state.
+    /// Called after import_and_quantize() to maximize resident groups.
+    virtual void auto_tune_offloading() {}
 };
 
 } // namespace dsl

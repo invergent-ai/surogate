@@ -197,6 +197,10 @@ struct ModelConfig : public PretrainedConfig {
     int NumExpertsPerTok = 0;        ///< Top-K experts per token
     int MoeIntermediateSize = 0;     ///< Per-expert intermediate size
 
+    // Expert Parallelism (EP) configuration
+    int EPSize = 1;                  ///< Number of GPUs per expert group (1 = no EP)
+    int NumLocalExperts = 0;         ///< Experts on this GPU (NumExperts / EPSize)
+
     // Extended RoPE configuration
     float rope_scaling_factor = 1.0f;    ///< RoPE scaling for longer contexts
     std::string rope_type = "default";   ///< RoPE type: "default", "linear", "dynamic", "yarn"

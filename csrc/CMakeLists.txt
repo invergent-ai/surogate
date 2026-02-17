@@ -304,6 +304,10 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/moe_expert_bias_add.cpp
     src/runtime/ops/gpt_oss_moe_act.cpp
     src/runtime/ops/moe_unpermute.cpp
+    src/runtime/ops/ep_dispatch.cpp
+    src/runtime/ops/ep_combine.cpp
+    src/runtime/ep/lpt_planner.cpp
+    src/runtime/ep/weight_transfer.cpp
 
     src/runtime/ops/mamba_split_proj.cpp
     src/runtime/ops/mamba_conv1d.cpp
@@ -351,6 +355,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/activation.cu
     src/kernels/fast_lora_silu.cu
     src/kernels/moe_kernels.cu
+    src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu

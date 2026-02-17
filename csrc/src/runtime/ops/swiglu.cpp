@@ -67,24 +67,20 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
         // 2D case for MoE: d_out is [N, D], inp is [N, 2*D]
         const long N = d_out.Sizes[0];
         const long D = d_out.Sizes[1];
-        const long expected_inp = N * D * 2;
-        const long inp_nelem = static_cast<long>(inp.nelem());
-        const long d_inp_nelem = static_cast<long>(d_inp.nelem());
-        if (inp_nelem != expected_inp || d_inp_nelem != expected_inp) {
-            std::ostringstream oss;
-            oss << "swiglu_backward: shape mismatch for 2D tensors: "
-                << "d_out=[" << N << "," << D << "]"
-                << " inp_nelem=" << inp_nelem
-                << " d_inp_nelem=" << d_inp_nelem
-                << " expected_inp_nelem=" << expected_inp
-                << " inp_shape=" << tensor_shape_str(inp)
-                << " d_inp_shape=" << tensor_shape_str(d_inp)
-                << " d_out_name=" << op.inputs[0].name
-                << " inp_name=" << op.inputs[1].name
-                << " out_name=" << op.outputs[0].name;
-            throw std::runtime_error(oss.str());
+
+        // EP changes token count dynamically — pre-allocated buffer may be wrong size.
+        // Re-allocate if needed (same pattern as moe_grouped_gemm_gate_up_backward).
+        Tensor* d_inp_ptr = &d_inp;
+        const long expected_nelem = static_cast<long>(inp.nelem());
+        if (d_inp_ptr->nelem() != expected_nelem) {
+            std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
+            Tensor tmp = mRunState.temp_alloc(inp.DType, shape);
+            mTemps.push_back(tmp);
+            store_tensor(op.outputs[0], tmp);
+            d_inp_ptr = &mTensors[op.outputs[0].tensor_id];
         }
-        swiglu_backward(d_inp, d_out, inp, abs_max_ptr,
+
+        swiglu_backward(*d_inp_ptr, d_out, inp, abs_max_ptr,
                         1, static_cast<int>(N), static_cast<int>(D), mRunState.MainStream);
     } else {
         // 3D case: d_out is [B, T, D]

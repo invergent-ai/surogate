@@ -72,6 +72,7 @@ GenericQLoRAProvider::GenericQLoRAProvider(
     : mDeferredConfig(std::make_unique<DslQLoRAPipelineConfig>(std::move(config)))
     , mPtConfig(&pt_config)
     , mAllocator(std::move(allocator))
+    , mEPSize(mDeferredConfig->ep_size)
 {
 }
 
@@ -155,6 +156,16 @@ void GenericQLoRAProvider::invalidate_cache() {
     if (mWeightMgr) {
         mWeightMgr->new_step();
     }
+
+    // Deferred auto-tune: after the first training step completes, all lazy
+    // runtime allocations (dequant pool, NCCL buffers, cuDNN workspace, EP
+    // persistent state, MoE saved buffers) are settled.  At the start of
+    // step 1, measure actual free GPU memory and maximize resident groups.
+    if (mAutoTunePending && mStepCount > 0) {
+        auto_tune_offloading();
+        mAutoTunePending = false;
+    }
+    mStepCount++;
 }
 
 bool GenericQLoRAProvider::refresh_moe_experts(
@@ -197,6 +208,62 @@ float GenericQLoRAProvider::memory_savings_ratio() const {
     }
     return static_cast<float>(mWeightMgr->quantized_bytes()) /
            static_cast<float>(mTotalBF16Bytes);
+}
+
+// =============================================================================
+// Quantized data access (for EP quantized weight transfer)
+// =============================================================================
+
+const qlora::QuantizedTensor* GenericQLoRAProvider::try_get_quantized(std::string_view name) const {
+    if (!mWeightMgr) return nullptr;
+    return mWeightMgr->get_quantized(std::string(name));
+}
+
+qlora::IQuantizer* GenericQLoRAProvider::get_quantizer() const {
+    if (!mWeightMgr) return nullptr;
+    return mWeightMgr->quantizer();
+}
+
+void GenericQLoRAProvider::auto_tune_offloading() {
+    if (!mWeightMgr) return;
+    auto* om = mWeightMgr->offload_manager();
+    if (!om || om->num_groups() == 0 || om->max_resident_groups() == 0) return;
+
+    // If called before the first training step, defer to after step 0
+    // when all lazy runtime allocations are settled.
+    if (mStepCount == 0) {
+        mAutoTunePending = true;
+        return;
+    }
+
+    size_t gpu_free = 0, gpu_total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&gpu_free, &gpu_total));
+
+    const size_t max_grp = om->max_group_bytes();
+    const int num_grp = om->num_groups();
+    // Called after step 0: all runtime buffers are allocated (dequant pool,
+    // NCCL, cuDNN, EP persistent state, MoE saved buffers). Free memory
+    // reflects actual steady-state availability.  Reserve a small margin
+    // (1 GB or 5% of total) for runtime variance and fragmentation.
+    // When EP is active, LLEP transfers foreign expert weights as BF16 (up to
+    // 2× the quantized group size), so reserve extra to avoid OOM during forward.
+    size_t reserve = std::max(static_cast<size_t>(1ULL * 1024 * 1024 * 1024), gpu_total / 20);
+    if (mEPSize > 1 && max_grp > 0) {
+        reserve += max_grp * 6;  // LLEP foreign BF16 weights + NCCL wt-transfer buffers + dequant pool growth + fragmentation
+    }
+    const size_t available = (gpu_free > reserve) ? (gpu_free - reserve) : 0;
+    int new_max = (max_grp > 0)
+        ? static_cast<int>(available / max_grp) : om->max_resident_groups();
+    new_max = std::max(2, std::min(new_max, num_grp));
+
+    fprintf(stderr, "[QLoRA] Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
+            "max_group=%.1f MB, %d groups -> max_resident: %d -> %d%s\n",
+            static_cast<double>(gpu_free) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(reserve) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(max_grp) / (1024.0 * 1024.0),
+            num_grp, om->max_resident_groups(), new_max,
+            (new_max >= num_grp) ? " (all fit)" : "");
+    om->set_max_resident_groups(new_max);
 }
 
 // =============================================================================

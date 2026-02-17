@@ -38,23 +38,25 @@ void CompiledExecutor::dispatch_relu2_backward(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[1]);
 
     // Element-wise backward: output shape matches input shape.
-    // Compiled shape may be empty when backward compiler can't track saved tensor shapes.
-    Tensor& d_inp = (op.outputs[0].shape.empty() && inp.Rank > 0)
-        ? [&]() -> Tensor& {
-            std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-            Tensor t = mRunState.temp_alloc(inp.DType, shape);
-            fill_zero(t, mRunState.MainStream);
-            mTemps.push_back(t);
-            store_tensor(op.outputs[0], t);
-            return mTensors[op.outputs[0].tensor_id];
-        }()
-        : ensure_output_tensor(op.outputs[0]);
+    // EP changes token count dynamically — pre-allocated buffer may be wrong size.
+    // Re-allocate if shape is empty OR if element count doesn't match input.
+    Tensor& d_inp_ref = ensure_output_tensor(op.outputs[0]);
+    Tensor* d_inp_ptr = &d_inp_ref;
+    const long expected_nelem = static_cast<long>(inp.nelem());
+    if (d_inp_ptr->nelem() != expected_nelem) {
+        std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
+        Tensor t = mRunState.temp_alloc(inp.DType, shape);
+        fill_zero(t, mRunState.MainStream);
+        mTemps.push_back(t);
+        store_tensor(op.outputs[0], t);
+        d_inp_ptr = &mTensors[op.outputs[0].tensor_id];
+    }
 
-    const long N = static_cast<long>(inp.nelem());
+    const long N = expected_nelem;
     // Kernel signature: relu2_backward(dinp, inp, dout, n, stream)
-    relu2_backward(d_inp, inp, d_out, N, mRunState.MainStream);
+    relu2_backward(*d_inp_ptr, inp, d_out, N, mRunState.MainStream);
 
-    store_tensor(op.outputs[0], d_inp);
+    store_tensor(op.outputs[0], *d_inp_ptr);
 }
 
 

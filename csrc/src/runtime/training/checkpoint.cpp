@@ -130,6 +130,7 @@ std::string save_checkpoint(std::string target, int step, IModel& model, const D
 
         meta_data["distributed"] = nlohmann::json::object({
             {"world", comm.world_size()},
+            {"ep_size", comm.ep_size()},
         });
 
         std::ofstream file(target + "/checkpoint.json");
@@ -174,6 +175,15 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
         throw std::runtime_error(
             fmt::format("Loading checkpoints with different world size is not supported: Current world size: {}, checkpoint world size: {}",
                         comm.world_size(), ws));
+    }
+
+    // Validate EP size matches (expert weights are distributed, so ep_size must be the same)
+    const int checkpoint_ep_size = meta_data["distributed"].value("ep_size", 1);
+    if (checkpoint_ep_size != comm.ep_size()) {
+        throw std::runtime_error(
+            fmt::format("Loading checkpoints with different EP size is not supported: "
+                        "current ep_size={}, checkpoint ep_size={}",
+                        comm.ep_size(), checkpoint_ep_size));
     }
 
     model.set_rng_state(meta_data["run"]["rng"].get<std::vector<std::byte>>());

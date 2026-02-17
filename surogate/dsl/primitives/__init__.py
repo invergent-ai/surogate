@@ -27,6 +27,10 @@ from .mamba import (
     mamba_split_conv_out,
     mamba_combine_scan,
 )
+from .ep import (
+    ep_dispatch,
+    ep_combine,
+)
 
 __all__ = [
     # Common
@@ -83,4 +87,7 @@ __all__ = [
     "mamba_split_proj",
     "mamba_split_conv_out",
     "mamba_combine_scan",
+    # Expert Parallelism
+    "ep_dispatch",
+    "ep_combine",
 ]

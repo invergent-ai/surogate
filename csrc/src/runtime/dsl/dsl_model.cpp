@@ -683,6 +683,26 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     config.num_experts = qlora_cfg.num_experts;
     config.moe_intermediate_size = qlora_cfg.moe_intermediate_size;
 
+    // Expert Parallelism: each GPU loads only its local experts
+    config.ep_rank = (options.EPSize > 1) ? (shard_idx % options.EPSize) : 0;
+    config.ep_size = options.EPSize;
+
+    // Adjust expert weight specs to local dimensions when EP is active
+    if (config.ep_size > 1) {
+        for (auto& spec : config.weight_specs) {
+            if (spec.shape.size() < 3) continue;  // Not an expert weight
+            const int E = static_cast<int>(spec.shape[0]);
+            const int local_E = E / config.ep_size;
+            spec.shape[0] = local_E;
+            // Recompute M from local shape (flatten non-last dims)
+            long rows = 1;
+            for (size_t d = 0; d + 1 < spec.shape.size(); ++d) {
+                rows *= spec.shape[d];
+            }
+            spec.M = static_cast<int>(rows);
+        }
+    }
+
     // Configure pre-quantized loading if applicable
     if (qlora_cfg.is_prequantized()) {
         config.prequantized = true;
@@ -709,14 +729,11 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     config.weight_manager_config.device_id = config.quantizer_config.device_id;
     if (options.OffloadExperts && qlora_cfg.is_moe()) {
         config.weight_manager_config.enable_offloading = true;
-        // Keep 2 groups resident: current layer + one prefetched layer ahead.
-        config.weight_manager_config.offload_config.max_resident_groups = 2;
         config.weight_manager_config.offload_config.device_id = config.quantizer_config.device_id;
 
         // The Python DSL assigns a single offload_group to ALL expert weights
         // across all layers. Remap to per-layer groups so each layer's experts
-        // can be loaded/unloaded independently (~300 MB per layer instead of
-        // the entire model's experts at once).
+        // can be loaded/unloaded independently.
         for (auto& spec : config.weight_specs) {
             if (spec.offload_group < 0) continue;
             // Parse block index from names like "moe_blocks[3].experts_gate_up"
@@ -731,6 +748,11 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
                 // Keep original group if parsing fails
             }
         }
+
+        // Initial max_resident_groups (conservative default).
+        // Post-import auto-tune in dsl_model_weights.cpp will increase this
+        // based on actual GPU free memory after all weights are loaded.
+        config.weight_manager_config.offload_config.max_resident_groups = 2;
     }
 
     // offload_master: offload ALL quantized block weights to CPU pinned memory,
@@ -826,6 +848,15 @@ DslModel::DslModel(const PretrainedConfig& config,
     apply_arch_from_hf_config(*mConfig, *mModule);
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
     mModelConfig = build_model_config(*mModule, *mConfig, mRuntimeConfig);
+
+    // Expert Parallelism: set EPSize and compute NumLocalExperts
+    mModelConfig.EPSize = mOptions.EPSize;
+    if (mModelConfig.NumExperts > 0) {
+        mModelConfig.NumLocalExperts = (mModelConfig.EPSize > 1)
+            ? mModelConfig.NumExperts / mModelConfig.EPSize
+            : mModelConfig.NumExperts;
+    }
+
     // Keep base PretrainedConfig in sync with DSL-resolved ModelConfig.
     // This ensures run-state allocations (which use PretrainedConfig) match
     // the compiled graph/kernel expectations derived from ModelConfig.
@@ -990,6 +1021,12 @@ std::size_t DslModel::qlora_quantized_weights_bytes() const {
 
 float DslModel::qlora_memory_savings_ratio() const {
     return mQLoRAProvider ? mQLoRAProvider->memory_savings_ratio() : 1.0f;
+}
+
+void DslModel::auto_tune_offloading() {
+    if (mQLoRAProvider) {
+        mQLoRAProvider->auto_tune_offloading();
+    }
 }
 
 std::size_t DslModel::saved_buffers_total_bytes() const {

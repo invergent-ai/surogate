@@ -155,6 +155,15 @@ public:
 
     /// Get the total CPU memory used by offloaded groups (bytes).
     [[nodiscard]] virtual size_t cpu_memory_used() const = 0;
+
+    /// Update max_resident_groups at runtime (e.g., after import when GPU state is known).
+    virtual void set_max_resident_groups(int max_groups) = 0;
+
+    /// Get the current max_resident_groups setting.
+    [[nodiscard]] virtual int max_resident_groups() const = 0;
+
+    /// Get max bytes among all groups (for auto-tune calculations).
+    [[nodiscard]] virtual size_t max_group_bytes() const = 0;
 };
 
 /// Create an OffloadManager with the given configuration.

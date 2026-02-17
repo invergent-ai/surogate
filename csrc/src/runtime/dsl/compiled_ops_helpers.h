@@ -44,6 +44,20 @@ MoeCompactInfo build_moe_compact_info_from_host(const int* host_offsets,
 int env_int(const char* name, int fallback);
 float env_float(const char* name, float fallback);
 
+// Build a Tensor wrapping a raw GPU pointer with proper Rank/Device set.
+// IMPORTANT: Manual `Tensor{}` leaves Rank=0, Device=-1 which makes .bytes()
+// and .nelem() return wrong values. Always use this helper instead.
+inline Tensor make_raw_tensor(void* ptr, ETensorDType dtype,
+                              const std::vector<long>& shape, int device) {
+    Tensor t{};
+    t.Data = static_cast<std::byte*>(ptr);
+    t.DType = dtype;
+    t.Rank = static_cast<int>(shape.size());
+    t.Device = device;
+    for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[i];
+    for (int i = t.Rank; i < MAX_TENSOR_DIM; ++i) t.Sizes[i] = 1;
+    return t;
+}
 
 bool refresh_moe_experts_if_needed(int layer_idx,
                                    const int* host_offsets,

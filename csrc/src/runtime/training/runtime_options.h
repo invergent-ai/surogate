@@ -70,6 +70,13 @@ struct RuntimeOptions {
     // MoE optimization: Offload expert NF4 weights to CPU, stream on-demand (saves ~12GB for 128-expert models)
     bool OffloadExperts = false;
 
+    // Expert Parallelism: distribute MoE experts across GPUs (1 = no EP, all experts replicated)
+    int EPSize = 1;
+
+    // LLEP adaptive threshold: when max_gpu_load / mean_gpu_load exceeds this, LPT load balancing activates.
+    // Only relevant when EPSize > 1. Values close to 1.0 = aggressive rebalancing, higher = less rebalancing.
+    float EPLoadBalanceThreshold = 1.3f;
+
     // MoE loss coefficients (override model config when >= 0)
     float RouterAuxLossCoef = -1.0f;  ///< Load balancing auxiliary loss coefficient (-1 = use model config)
     float RouterZLossCoef = -1.0f;    ///< Router z-loss (logit regularization) coefficient (-1 = use model config)

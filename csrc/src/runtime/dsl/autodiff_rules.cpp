@@ -1412,6 +1412,57 @@ std::vector<Operation> mamba_out_proj_backward(const BackwardRuleContext& ctx) {
     return matmul_backward(ctx);
 }
 
+// -----------------------------------------------------------------------------
+// EP Dispatch backward rule
+// Forward: recv_sorted, recv_scatter = ep_dispatch(permuted, routing, scatter, ...)
+// Backward: d_permuted = ep_dispatch_backward(d_recv_sorted)
+// Only the first input (permuted tokens) is differentiable
+// -----------------------------------------------------------------------------
+std::vector<Operation> ep_dispatch_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        AttrMap attrs = copy_attrs(fwd.attrs,
+            {"ep_size", "num_experts", "top_k"}, "ep_dispatch_backward");
+
+        ops.push_back(make_operation(
+            "ep_dispatch_backward_" + std::to_string(ctx.op_counter++),
+            "ep_dispatch_backward",
+            "ep_dispatch_backward",
+            {ctx.d_outputs[0]},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// EP Combine backward rule
+// Forward: combined = ep_combine(expert_output, ...)
+// Backward: d_expert_output = ep_combine_backward(d_combined)
+// -----------------------------------------------------------------------------
+std::vector<Operation> ep_combine_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        AttrMap attrs = copy_attrs(fwd.attrs,
+            {"ep_size", "num_experts", "top_k"}, "ep_combine_backward");
+
+        ops.push_back(make_operation(
+            "ep_combine_backward_" + std::to_string(ctx.op_counter++),
+            "ep_combine_backward",
+            "ep_combine_backward",
+            {ctx.d_output},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
 } // anonymous namespace
 
 // -----------------------------------------------------------------------------
@@ -1479,6 +1530,10 @@ void register_builtin_backward_rules() {
     reg.register_rule("moe_unpermute", moe_unpermute_backward);
     reg.register_rule("gpt_oss_moe_act", gpt_oss_moe_act_backward);
     reg.register_rule("moe_expert_bias_add", moe_expert_bias_add_backward);
+
+    // Expert Parallelism ops
+    reg.register_rule("ep_dispatch", ep_dispatch_backward_rule);
+    reg.register_rule("ep_combine", ep_combine_backward_rule);
 
     // Compound ops (handled as units)
     reg.register_rule("StackedBlocks", stacked_blocks_backward);

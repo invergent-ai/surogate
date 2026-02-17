@@ -4,8 +4,8 @@ from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="Qwen/Qwen3-30B-A3B",
-    max_seq_length=256,  # Context length - can be longer, but uses more memory
+    model_name="openai/gpt-oss-20b",
+    max_seq_length=512,  # Context length - can be longer, but uses more memory
     load_in_4bit=True,  # 4bit uses much less memory
     load_in_fp8=False,  # A bit more accurate, uses 2x memory
     full_finetuning=False,  # We have full finetuning now!
@@ -66,7 +66,7 @@ trainer = SFTTrainer(
         seed=3407,
         report_to="none",  # Use TrackIO/WandB etc
         packing=True,
-        max_length=256
+        max_length=512
     ),
 )
 trainer_stats = trainer.train()

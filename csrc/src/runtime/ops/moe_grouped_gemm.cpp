@@ -24,7 +24,7 @@ namespace dsl {
 
 void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
-    Tensor& weights = resolve_tensor(op.inputs[1]);
+    Tensor weights = resolve_tensor(op.inputs[1]);  // copy for LLEP override
     Tensor& scatter_indices = resolve_tensor(op.inputs[2]);
     (void)scatter_indices;
 
@@ -37,12 +37,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         top_k = 1;
     }
 
-    const int num_experts = static_cast<int>(mConfig.NumExperts);
-    // Weight dimensions: [num_experts, out_features, in_features]
-    // Output size: out_features (second dimension of weights)
-    const int out_features = (weights.Rank >= 2) ? static_cast<int>(weights.Sizes[1]) : 0;
-    const int in_features = (weights.Rank >= 3) ? static_cast<int>(weights.Sizes[2]) : 0;
-    const int weight_experts = (weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts;
+    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
 
     int layer_idx_any = op.attrs.layer_idx;
     if (layer_idx_any < 0 && !op.inputs.empty()) {
@@ -63,7 +58,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
             expert_offsets_ptr = &expert_offsets_view;
         }
@@ -81,11 +76,36 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         expert_offsets_ptr = moe_offsets_fwd_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
+
+    // LLEP per-expert weight pointer override: when LLEP is active, use per-expert
+    // pointers instead of contiguous weight tensors.
+    const void* const* llep_weight_ptrs = nullptr;
+    {
+        auto llep_it = mLLEPStates.find(layer_idx_any);
+        if (llep_it != mLLEPStates.end() && llep_it->second.active) {
+            auto& llep = llep_it->second;
+            std::string_view wname = op.inputs[1].name;
+            if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+                llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
+            } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
+                llep_weight_ptrs = llep.down_weight_ptrs.data();
+            }
+            // Note: separate gate/up (GPT-OSS) not yet supported with per-expert pointers
+            num_experts = llep.num_merged_experts;
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+        }
+    }
+
+    // Weight dimensions: [num_experts, out_features, in_features]
+    const int out_features = (weights.Rank >= 2) ? static_cast<int>(weights.Sizes[1]) : 0;
+    const int in_features = (weights.Rank >= 3) ? static_cast<int>(weights.Sizes[2]) : 0;
+    const int weight_experts = llep_weight_ptrs ? num_experts
+        : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
     const int* expert_offsets_data = expert_offsets.get<int>();
 
     const int* host_offsets_ptr = nullptr;
     if (num_experts > 0 && expert_offsets.Data) {
-        // Use cached host offsets (populated by dispatch_moe_permute for this layer).
+        // Use cached host offsets (populated by dispatch_moe_permute or ep_dispatch for this layer).
         host_offsets_ptr = get_or_sync_moe_host_offsets(
             layer_idx_any, expert_offsets.get<int>(), num_experts);
     }
@@ -174,9 +194,20 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
         layer_idx_any >= 0) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
-        if (lora_block.moe.use_grouped && lora_block.moe.grouped.up.has_value() &&
-            lora_block.moe.grouped.up->has_value()) {
-            const auto& lora_up = *lora_block.moe.grouped.up;
+        if (lora_block.moe.use_grouped) {
+            // When LLEP is active, use merged LoRA tensors
+            const auto* up_ptr = lora_block.moe.grouped.up.has_value()
+                ? &(*lora_block.moe.grouped.up) : nullptr;
+            {
+                auto llep_lora_it = mLLEPStates.find(layer_idx_any);
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
+                    && llep_lora_it->second.has_merged_lora
+                    && llep_lora_it->second.merged_lora.up.has_value()) {
+                    up_ptr = &(*llep_lora_it->second.merged_lora.up);
+                }
+            }
+            if (up_ptr && up_ptr->has_value()) {
+            const auto& lora_up = *up_ptr;
             const int rank = mLoRAConfig->rank;
             const float scaling = mLoRAConfig->scaling();
             const float dropout = mLoRAConfig->dropout;
@@ -246,7 +277,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                 dispatch_grouped_gemm(out, lora_intermediate, lora_up.B,
                                       out_features, rank, 1.0f, 1.0f, EMMTranspose::TN);
             }
-        }
+            }  // if (up_ptr && up_ptr->has_value())
+        }  // if (use_grouped)
     }
 
     store_tensor(op.outputs[0], out);
@@ -257,14 +289,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     // Inputs: d_out, inp, weights, scatter_indices
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& inp = resolve_tensor(op.inputs[1]);
-    Tensor& weights = resolve_tensor(op.inputs[2]);
+    Tensor weights = resolve_tensor(op.inputs[2]);  // copy for LLEP override
     Tensor& scatter_indices = resolve_tensor(op.inputs[3]);
     (void)scatter_indices;
 
-    const int num_experts = static_cast<int>(mConfig.NumExperts);
-    const int out_features = (weights.Rank >= 2) ? static_cast<int>(weights.Sizes[1]) : 0;
-    const int in_features = (weights.Rank >= 3) ? static_cast<int>(weights.Sizes[2]) : 0;
-    const int weight_experts = (weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts;
+    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
 
     int layer_idx_any = op.attrs.layer_idx;
     if (layer_idx_any < 0 && !op.inputs.empty()) {
@@ -285,7 +314,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
             expert_offsets_ptr = &expert_offsets_view;
         }
@@ -303,6 +332,28 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         expert_offsets_ptr = moe_offsets_bwd_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
+
+    // LLEP per-expert weight pointer override for backward
+    const void* const* llep_weight_ptrs = nullptr;
+    {
+        auto llep_it = mLLEPStates.find(layer_idx_any);
+        if (llep_it != mLLEPStates.end() && llep_it->second.active) {
+            auto& llep = llep_it->second;
+            std::string_view wname = op.inputs[2].name;
+            if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+                llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
+            } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
+                llep_weight_ptrs = llep.down_weight_ptrs.data();
+            }
+            num_experts = llep.num_merged_experts;
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+        }
+    }
+
+    const int out_features = (weights.Rank >= 2) ? static_cast<int>(weights.Sizes[1]) : 0;
+    const int in_features = (weights.Rank >= 3) ? static_cast<int>(weights.Sizes[2]) : 0;
+    const int weight_experts = llep_weight_ptrs ? num_experts
+        : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
     const int* expert_offsets_data = expert_offsets.get<int>();
 
     const int* host_offsets_ptr = nullptr;
@@ -393,9 +444,22 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
         layer_idx_any >= 0) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
-        if (lora_block.moe.use_grouped && lora_block.moe.grouped.up.has_value() &&
-            lora_block.moe.grouped.up->has_value()) {
-            const auto& lora_up = *lora_block.moe.grouped.up;
+        if (lora_block.moe.use_grouped) {
+            // When LLEP is active, use merged LoRA tensors
+            const auto* up_ptr = lora_block.moe.grouped.up.has_value()
+                ? &(*lora_block.moe.grouped.up) : nullptr;
+            bool llep_lora_active = false;
+            {
+                auto llep_lora_it = mLLEPStates.find(layer_idx_any);
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
+                    && llep_lora_it->second.has_merged_lora
+                    && llep_lora_it->second.merged_lora.up.has_value()) {
+                    up_ptr = &(*llep_lora_it->second.merged_lora.up);
+                    llep_lora_active = true;
+                }
+            }
+            if (up_ptr && up_ptr->has_value()) {
+            const auto& lora_up = *up_ptr;
             const int rank = mLoRAConfig->rank;
             const float scaling = mLoRAConfig->scaling();
             const float dropout = mLoRAConfig->dropout;
@@ -490,7 +554,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
 
             modules::LoRABlockWeights<Tensor>* lora_grads = nullptr;
             bool lora_accum = false;
-            if (mLoRAGrads && mComm) {
+            if (mLoRAGrads && mComm && !llep_lora_active) {
+                // Skip LoRA weight grads when LLEP is active — grad storage is
+                // [num_local, ...] which doesn't match num_merged.
                 lora_grads = &mLoRAGrads->get_block_full(layer_idx_any, mRunState.MainStream, *mComm, lora_accum);
             }
             const float grad_beta = lora_accum ? 1.0f : 0.0f;
@@ -521,7 +587,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                 dispatch_grouped_gemm(d_inp, lora_intermediate, lora_up.A,
                                       in_features, rank, 1.0f, 1.0f, EMMTranspose::NN);
             }
-        }
+            }  // if (up_ptr && up_ptr->has_value())
+        }  // if (use_grouped)
     }
 
     store_tensor(op.outputs[0], d_inp);

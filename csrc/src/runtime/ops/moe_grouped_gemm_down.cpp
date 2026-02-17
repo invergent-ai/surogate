@@ -24,7 +24,7 @@ namespace dsl {
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
-    Tensor& weights = resolve_tensor(op.inputs[1]);  // Parameter name resolved by graph compiler
+    Tensor weights = resolve_tensor(op.inputs[1]);  // Parameter name resolved by graph compiler (copy for LLEP override)
     Tensor& scatter_indices = resolve_tensor(op.inputs[2]);
     (void)scatter_indices;  // Used by kernel through expert_offsets
     const int num_tokens = static_cast<int>(mB * mT);
@@ -36,13 +36,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         top_k = 1;
     }
 
-    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
     // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
     const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
         ? static_cast<int>(mConfig.MoeIntermediateSize)
         : static_cast<int>(mConfig.IntermediateSize);
-    const int weight_experts = (weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts;
     int layer_idx_any = op.attrs.layer_idx;
     if (layer_idx_any < 0 && !op.inputs.empty()) {
         std::string_view name = op.inputs[0].name;
@@ -61,7 +60,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
             expert_offsets_ptr = &expert_offsets_view;
         }
@@ -79,9 +78,27 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         expert_offsets_ptr = moe_offsets_ptr;
     }
     Tensor& expert_offsets = *expert_offsets_ptr;
+
+    // LLEP per-expert weight pointer override: when LLEP is active, use per-expert
+    // pointers (native dequant buffer + foreign P2P receive) instead of contiguous weights.
+    bool is_llep_active = false;
+    const void* const* llep_weight_ptrs = nullptr;
+    {
+        auto llep_it = mLLEPStates.find(layer_idx_any);
+        if (llep_it != mLLEPStates.end() && llep_it->second.active) {
+            auto& llep = llep_it->second;
+            num_experts = llep.num_merged_experts;
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+            llep_weight_ptrs = llep.down_weight_ptrs.data();
+            is_llep_active = true;
+        }
+    }
+
+    const int weight_experts = llep_weight_ptrs ? num_experts
+        : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
     const int* host_offsets_ptr = nullptr;
     if (num_experts > 0 && expert_offsets.Data) {
-        // Use cached host offsets (populated by dispatch_moe_permute for this layer).
+        // Use cached host offsets (populated by dispatch_moe_permute or ep_dispatch for this layer).
         host_offsets_ptr = get_or_sync_moe_host_offsets(
             layer_idx_any, expert_offsets.get<int>(), num_experts);
     }
@@ -114,8 +131,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
-    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact) {
-        // Recipe-driven MoE GEMM via cuDNN FE
+    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active) {
+        // Recipe-driven MoE GEMM via cuDNN FE (skip when LLEP active — cuDNN
+        // crashes with variable merged expert counts; cuBLAS per-expert is safe)
         // down weight is (E, C, D) → N=C, K=D
         modules::MoeMatmulContext ctx;
         ctx.out = out.get<nv_bfloat16>();
@@ -142,7 +160,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                               host_offsets_ptr,
                               active_ptr,
                               weight_is_compact,
-                              num_active);
+                              num_active,
+                              llep_weight_ptrs);
     } else {
         moe_grouped_gemm_down(out.get<float>(),
                               inp.get<float>(),
@@ -153,7 +172,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                               host_offsets_ptr,
                               active_ptr,
                               weight_is_compact,
-                              num_active);
+                              num_active,
+                              llep_weight_ptrs);
     }
 
     // Apply grouped MoE LoRA (down projection) when enabled.
@@ -161,9 +181,20 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
         layer_idx_any >= 0) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
-        if (lora_block.moe.use_grouped && lora_block.moe.grouped.down.has_value() &&
-            lora_block.moe.grouped.down->has_value()) {
-            const auto& lora_down = *lora_block.moe.grouped.down;
+        if (lora_block.moe.use_grouped) {
+            // When LLEP is active, use merged LoRA tensors
+            const auto* down_ptr = lora_block.moe.grouped.down.has_value()
+                ? &(*lora_block.moe.grouped.down) : nullptr;
+            {
+                auto llep_lora_it = mLLEPStates.find(layer_idx_any);
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
+                    && llep_lora_it->second.has_merged_lora
+                    && llep_lora_it->second.merged_lora.down.has_value()) {
+                    down_ptr = &(*llep_lora_it->second.merged_lora.down);
+                }
+            }
+            if (down_ptr && down_ptr->has_value()) {
+            const auto& lora_down = *down_ptr;
             const int rank = mLoRAConfig->rank;
             const float scaling = mLoRAConfig->scaling();
             const float dropout = mLoRAConfig->dropout;
@@ -234,7 +265,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                 dispatch_grouped_gemm(out, lora_intermediate, lora_down.B,
                                       hidden_size, rank, 1.0f, 1.0f, EMMTranspose::TN);
             }
-        }
+            }  // if (down_ptr && down_ptr->has_value())
+        }  // if (use_grouped)
     }
 
     store_tensor(op.outputs[0], out);
@@ -243,7 +275,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp& op) {
     Tensor& d_output = resolve_tensor(op.inputs[0]);
     Tensor& inp = resolve_tensor(op.inputs[1]);
-    Tensor& weights = resolve_tensor(op.inputs[2]);
+    Tensor weights = resolve_tensor(op.inputs[2]);  // copy for LLEP override
     // Output shape for MoE backward can be dynamic (B*T*K, M). Use input shape when
     // compiled shape is missing or mismatched to avoid incorrect allocations.
     auto needs_dynamic = [&](const TensorRef& out_ref, const Tensor& in) -> bool {
@@ -293,7 +325,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it->second);
             expert_offsets_ptr = expert_offsets_view.get<int>();
         }
@@ -305,14 +337,27 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         expert_offsets_ptr = static_cast<const int*>(mMoEExpertOffsetsGPU);
     }
 
-    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
     // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
     const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
         ? static_cast<int>(mConfig.MoeIntermediateSize)
         : static_cast<int>(mConfig.IntermediateSize);
 
-    const int weight_experts = static_cast<int>(weights.Sizes[0]);
+    // LLEP per-expert weight pointer override for backward
+    const void* const* llep_weight_ptrs = nullptr;
+    {
+        auto llep_it = mLLEPStates.find(layer_idx);
+        if (llep_it != mLLEPStates.end() && llep_it->second.active) {
+            auto& llep = llep_it->second;
+            num_experts = llep.num_merged_experts;
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+            llep_weight_ptrs = llep.down_weight_ptrs.data();
+        }
+    }
+
+    const int weight_experts = llep_weight_ptrs ? num_experts
+        : static_cast<int>(weights.Sizes[0]);
 
     // Get host offsets from cache (populates on first backward access for this layer).
     const int* cached_host_offsets = get_or_sync_moe_host_offsets(
@@ -411,7 +456,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                        host_offsets_ptr,
                                        active_ptr,
                                        weight_is_compact,
-                                       num_active);
+                                       num_active,
+                                       llep_weight_ptrs);
     } else {
         moe_grouped_gemm_down_backward(d_input.get<float>(),
                                        d_output.get<float>(),
@@ -422,15 +468,29 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                        host_offsets_ptr,
                                        active_ptr,
                                        weight_is_compact,
-                                       num_active);
+                                       num_active,
+                                       llep_weight_ptrs);
     }
 
     // Apply grouped MoE LoRA backward (down projection) when enabled.
     if (lora_enabled) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx, mRunState.MainStream);
-        if (lora_block.moe.use_grouped && lora_block.moe.grouped.down.has_value() &&
-            lora_block.moe.grouped.down->has_value()) {
-            const auto& lora_down = *lora_block.moe.grouped.down;
+        if (lora_block.moe.use_grouped) {
+            // When LLEP is active, use merged LoRA tensors
+            const auto* down_ptr = lora_block.moe.grouped.down.has_value()
+                ? &(*lora_block.moe.grouped.down) : nullptr;
+            bool llep_lora_active = false;
+            {
+                auto llep_lora_it = mLLEPStates.find(layer_idx);
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
+                    && llep_lora_it->second.has_merged_lora
+                    && llep_lora_it->second.merged_lora.down.has_value()) {
+                    down_ptr = &(*llep_lora_it->second.merged_lora.down);
+                    llep_lora_active = true;
+                }
+            }
+            if (down_ptr && down_ptr->has_value()) {
+            const auto& lora_down = *down_ptr;
             const int rank = mLoRAConfig->rank;
             const float scaling = mLoRAConfig->scaling();
             const float dropout = mLoRAConfig->dropout;
@@ -525,7 +585,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
 
             modules::LoRABlockWeights<Tensor>* lora_grads = nullptr;
             bool lora_accum = false;
-            if (mLoRAGrads && mComm) {
+            if (mLoRAGrads && mComm && !llep_lora_active) {
+                // Skip LoRA weight grads when LLEP is active — grad storage is
+                // [num_local, ...] which doesn't match num_merged.
                 lora_grads = &mLoRAGrads->get_block_full(layer_idx, mRunState.MainStream, *mComm, lora_accum);
             }
             const float grad_beta = lora_accum ? 1.0f : 0.0f;
@@ -556,7 +618,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                 dispatch_grouped_gemm(d_input, lora_intermediate, lora_down.A,
                                       intermediate_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
             }
-        }
+            }  // if (down_ptr && down_ptr->has_value())
+        }  // if (use_grouped)
     }
 
     store_tensor(op.outputs[0], d_input);

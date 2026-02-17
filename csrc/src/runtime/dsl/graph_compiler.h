@@ -79,6 +79,9 @@ enum class CompiledOpType : std::uint8_t {
     MoEGroupedGemmDown,
     MoEUnpermute,
     MoEExpertBiasAdd,
+    // Expert Parallelism forward operations
+    EpDispatch,
+    EpCombine,
     // Backward operations
     ViewBackward,
     AddBackward,
@@ -114,6 +117,9 @@ enum class CompiledOpType : std::uint8_t {
     MoEGroupedGemmDownBackward,
     MoEUnpermuteBackward,
     MoEExpertBiasAddBackward,
+    // Expert Parallelism backward operations
+    EpDispatchBackward,
+    EpCombineBackward,
     // Mamba/SSM forward operations
     MambaSplitProj,
     MambaConv1d,
@@ -188,6 +194,10 @@ struct CompiledAttrs {
     float topk_rounding_scale = 0.0f;
     bool topk_sort_by_index = false;
     bool gate_up_interleaved = false;
+
+    // Expert Parallelism
+    int ep_size = 1;
+    int num_experts = 0;
 
     // GPT-OSS gated MoE activation
     float gpt_oss_alpha = 1.702f;

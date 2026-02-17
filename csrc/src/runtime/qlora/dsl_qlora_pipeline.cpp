@@ -237,7 +237,7 @@ void show_progress(int current, int total, const char* label,
         const int pct = static_cast<int>(progress * 100.0f);
         const int prev_pct = static_cast<int>(
             static_cast<float>(current) / static_cast<float>(total) * 100.0f);
-        if (pct / 10 != prev_pct / 10 || current + 1 == total) {
+        if (pct / 25 != prev_pct / 25 || current + 1 == total) {
             fprintf(stderr, "[Rank %d] [%s] %d%% (%d/%d)\n",
                     rank, label, pct, current + 1, total);
             fflush(stderr);
@@ -506,6 +506,11 @@ bool load_prequant_experts_stacked(
         return val;
     };
 
+    // EP: compute global expert start index for HF name resolution.
+    // E is already the local expert count (spec.shape adjusted by EP config).
+    // Local storage uses indices 0..E-1; HF files use global indices.
+    const int ep_expert_start = (config.ep_size > 1) ? config.ep_rank * E : 0;
+
     if (mspec.fuse_gate_up) {
         // Fused gate_up: source pattern points to gate_proj; derive up_proj pattern.
         std::string gate_pattern = mspec.source;
@@ -522,11 +527,12 @@ bool load_prequant_experts_stacked(
         const long half_scale_elems = static_cast<long>(half_scale_bytes / scale_elem_size);
 
         for (int e = 0; e < E; ++e) {
+            const int global_e = ep_expert_start + e;
             const size_t expert_data_off = e * per_expert_data_bytes;
             const size_t expert_scale_off = e * per_expert_scale_bytes;
 
             // Load up_proj into first half of expert's data
-            std::string up_hf = resolve_hf_name(up_pattern, layer_idx, e);
+            std::string up_hf = resolve_hf_name(up_pattern, layer_idx, global_e);
             std::string up_data_hf = config.data_suffix.empty()
                 ? up_hf : (up_hf + config.data_suffix);
 
@@ -550,7 +556,7 @@ bool load_prequant_experts_stacked(
             }
 
             // Load gate_proj into second half of expert's data
-            std::string gate_hf = resolve_hf_name(gate_pattern, layer_idx, e);
+            std::string gate_hf = resolve_hf_name(gate_pattern, layer_idx, global_e);
             std::string gate_data_hf = config.data_suffix.empty()
                 ? gate_hf : (gate_hf + config.data_suffix);
             Tensor gate_data = Tensor::from_pointer(
@@ -577,7 +583,8 @@ bool load_prequant_experts_stacked(
         const long per_expert_scale_elems = static_cast<long>(per_expert_scale_bytes / scale_elem_size);
 
         for (int e = 0; e < E; ++e) {
-            std::string hf_name = resolve_hf_name(mspec.source, layer_idx, e);
+            const int global_e = ep_expert_start + e;
+            std::string hf_name = resolve_hf_name(mspec.source, layer_idx, global_e);
             std::string data_hf = config.data_suffix.empty()
                 ? hf_name : (hf_name + config.data_suffix);
 
@@ -867,7 +874,15 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             continue;  // Already handled in pass 1
         }
         if (!spec.quantize || !weight_mgr->quantizer()) {
-            // Full-precision expert weight (unlikely but handle gracefully)
+            // Full-precision expert weight (unlikely but handle gracefully).
+            // EP with full-precision 3D experts requires per-expert loading which
+            // is only implemented for the quantized path. In practice EP always
+            // uses QLoRA, so this path should not be hit.
+            if (config.ep_size > 1) {
+                throw std::runtime_error(
+                    "Full-precision expert weights not supported with EP "
+                    "(use QLoRA quantization): " + spec.name);
+            }
             Tensor tensor = allocator->allocate(
                 spec.target_dtype,
                 spec.name.c_str(),
@@ -899,9 +914,13 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             ETensorDType::BF16,
             std::vector<long>{static_cast<long>(per_M), static_cast<long>(K)});
 
-        // Load and quantize each expert individually
+        // Load and quantize each expert individually.
+        // With EP, E is already the local expert count (shape adjusted in config).
+        // Load from global HF index, quantize to local storage index.
+        const int ep_expert_start = (config.ep_size > 1) ? config.ep_rank * E : 0;
         for (int e = 0; e < E; ++e) {
-            loader.load_expert(spec.name, e, expert_buf, true, stream);
+            const int global_e = ep_expert_start + e;
+            loader.load_expert(spec.name, global_e, expert_buf, true, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             try {
                 weight_mgr->quantize_expert_slice(spec.name, e, per_M, expert_buf, stream);
@@ -1538,6 +1557,11 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
 
         if (!spec.quantize || !quantizer) {
             // Full-precision expert weight
+            if (config.ep_size > 1) {
+                throw std::runtime_error(
+                    "Full-precision expert weights not supported with EP "
+                    "(use QLoRA quantization): " + spec.name);
+            }
             Tensor tensor = allocator->allocate(
                 spec.target_dtype,
                 spec.name.c_str(),
@@ -1600,10 +1624,44 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                     mspec->source.empty() ? spec.name : mspec->source, layer_idx);
                 std::string data_hf = config.data_suffix.empty()
                     ? hf_name : (hf_name + config.data_suffix);
-                read_raw_padded(reader.find_entry(data_hf), qt.data, stream);
-
                 std::string scale_hf = hf_name + config.scale_suffix;
-                read_raw_padded(reader.find_entry(scale_hf), qt.scales, stream);
+
+                if (config.ep_size > 1) {
+                    // EP: read only the local expert slice from the stacked HF tensor.
+                    // HF has [E_total, ...], we need [E_local, ...] starting at ep_expert_start.
+                    const int E_total = E * config.ep_size;
+                    const int ep_expert_start = config.ep_rank * E;
+
+                    // Data slice
+                    const auto& data_entry = reader.find_entry(data_hf);
+                    long hf_data_nelem = 1;
+                    for (auto d : data_entry.shape()) hf_data_nelem *= d;
+                    const long per_expert_data_elems = hf_data_nelem / E_total;
+                    const long data_offset = static_cast<long>(ep_expert_start) * per_expert_data_elems;
+                    const long data_count = static_cast<long>(E) * per_expert_data_elems;
+                    if (data_count < qt.data.nelem()) {
+                        // Zero-pad if quantizer allocated more (alignment)
+                        CUDA_CHECK(cudaMemsetAsync(qt.data.Data, 0, qt.data.bytes(), stream));
+                    }
+                    data_entry.read_raw(qt.data, data_offset,
+                                        std::min(data_count, static_cast<long>(qt.data.nelem())), true);
+
+                    // Scale slice
+                    const auto& scale_entry = reader.find_entry(scale_hf);
+                    long hf_scale_nelem = 1;
+                    for (auto d : scale_entry.shape()) hf_scale_nelem *= d;
+                    const long per_expert_scale_elems = hf_scale_nelem / E_total;
+                    const long scale_offset = static_cast<long>(ep_expert_start) * per_expert_scale_elems;
+                    const long scale_count = static_cast<long>(E) * per_expert_scale_elems;
+                    if (scale_count < qt.scales.nelem()) {
+                        CUDA_CHECK(cudaMemsetAsync(qt.scales.Data, 0, qt.scales.bytes(), stream));
+                    }
+                    scale_entry.read_raw(qt.scales, scale_offset,
+                                         std::min(scale_count, static_cast<long>(qt.scales.nelem())), true);
+                } else {
+                    read_raw_padded(reader.find_entry(data_hf), qt.data, stream);
+                    read_raw_padded(reader.find_entry(scale_hf), qt.scales, stream);
+                }
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             } else {
                 throw std::runtime_error(

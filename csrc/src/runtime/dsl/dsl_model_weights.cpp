@@ -143,6 +143,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);
         CUDA_CHECK(cudaStreamSynchronize(quant_stream));
         CUDA_CHECK(cudaStreamDestroy(quant_stream));
+
         mParams->set_qlora_provider(mQLoRAProvider.get());
         if (mRunState) {
             mParams->set_default_stream(mRunState->MainStream);

@@ -163,9 +163,30 @@ void NCCLCommunicator::terminate_nccl() {
     if (std::uncaught_exceptions() == 0 && result == ncclSuccess) {
         CUDA_CHECK(cudaStreamSynchronize(mCommsStream));
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Destroy EP sub-communicators before the global comm
+        if (mWeightTransferComm) {
+            ncclCheck(ncclCommFinalize(mWeightTransferComm));
+            ncclCheck(ncclCommDestroy(mWeightTransferComm));
+            mWeightTransferComm = nullptr;
+        }
+        if (mDPComm) {
+            ncclCheck(ncclCommFinalize(mDPComm));
+            ncclCheck(ncclCommDestroy(mDPComm));
+            mDPComm = nullptr;
+        }
+        if (mEPComm) {
+            ncclCheck(ncclCommFinalize(mEPComm));
+            ncclCheck(ncclCommDestroy(mEPComm));
+            mEPComm = nullptr;
+        }
+
         ncclCheck(ncclCommFinalize(mNcclComm));
         ncclCheck(ncclCommDestroy(mNcclComm));
     } else {
+        if (mWeightTransferComm) { ncclCommAbort(mWeightTransferComm); mWeightTransferComm = nullptr; }
+        if (mDPComm) { ncclCommAbort(mDPComm); mDPComm = nullptr; }
+        if (mEPComm) { ncclCommAbort(mEPComm); mEPComm = nullptr; }
         ncclCheck(ncclCommAbort(mNcclComm));
     }
 }
@@ -414,6 +435,198 @@ void NCCLCommunicator::reduce_norm(float* norm_squared, cudaStream_t stream) {
 void NCCLCommunicator::all_reduce_sum_int(int* values, int n, cudaStream_t stream) {
     if (mWorld == 1) return;
     ncclCheck(ncclAllReduce(values, values, n, ncclInt32, ncclSum, mNcclComm, stream));
+}
+
+// ============================================================================
+// Expert Parallelism (EP) process groups
+// ============================================================================
+
+/**
+ * @brief Initialize EP sub-communicators for 2D parallelism (DP x EP).
+ *
+ * Creates three NCCL sub-communicators:
+ * - EP comm: ranks sharing data but owning different experts (size = ep_size)
+ * - DP comm: ranks owning the same experts but processing different data (size = dp_size)
+ * - Weight transfer comm: same ranks as EP, separate comm for overlap with A2A
+ *
+ * Rank mapping: ep_rank = global_rank % ep_size, dp_rank = global_rank / ep_size
+ *
+ * @param ep_size Number of EP ranks (must divide world_size; 1 = no EP, skip creation)
+ *
+ * @throws std::runtime_error If ep_size doesn't divide world_size.
+ */
+void NCCLCommunicator::init_ep_groups(int ep_size) {
+    if (ep_size <= 1) {
+        mEPSize = 1;
+        mEPRank = 0;
+        mDPSize = mWorld;
+        mDPRank = mRank;
+        return;
+    }
+
+    if (mWorld % ep_size != 0) {
+        throw std::runtime_error(fmt::format(
+            "init_ep_groups: ep_size ({}) must divide world_size ({})", ep_size, mWorld));
+    }
+
+    mEPSize = ep_size;
+    mDPSize = mWorld / ep_size;
+    mEPRank = mRank % ep_size;
+    mDPRank = mRank / ep_size;
+
+    // Generate unique NCCL IDs for each group via host all-gather.
+    // Rank 0 of each group generates the ID, then broadcasts via all-gather.
+
+    // EP groups: ranks {dp_rank * ep_size .. dp_rank * ep_size + ep_size - 1}
+    // The "leader" of each EP group is the rank with ep_rank == 0, i.e. rank = dp_rank * ep_size
+    ncclUniqueId ep_id{};
+    if (mEPRank == 0) {
+        ncclCheck(ncclGetUniqueId(&ep_id));
+    }
+    // Broadcast EP ID within EP group: all ranks in same EP group need the same ID.
+    // Use host_all_gather to share, then pick the one from the group leader.
+    auto all_ep_ids = host_all_gather(ep_id);
+    int ep_leader = mDPRank * ep_size;  // global rank of EP group leader
+    ep_id = all_ep_ids[ep_leader];
+
+    ncclCheck(ncclCommInitRank(&mEPComm, mEPSize, ep_id, mEPRank));
+
+    // DP groups: ranks {ep_rank, ep_rank + ep_size, ep_rank + 2*ep_size, ...}
+    // The "leader" of each DP group is the rank with dp_rank == 0, i.e. rank = ep_rank
+    ncclUniqueId dp_id{};
+    if (mDPRank == 0) {
+        ncclCheck(ncclGetUniqueId(&dp_id));
+    }
+    auto all_dp_ids = host_all_gather(dp_id);
+    int dp_leader = mEPRank;  // global rank of DP group leader
+    dp_id = all_dp_ids[dp_leader];
+
+    ncclCheck(ncclCommInitRank(&mDPComm, mDPSize, dp_id, mDPRank));
+
+    // Weight transfer comm: same group as EP, separate NCCL comm for overlap
+    ncclUniqueId wt_id{};
+    if (mEPRank == 0) {
+        ncclCheck(ncclGetUniqueId(&wt_id));
+    }
+    auto all_wt_ids = host_all_gather(wt_id);
+    wt_id = all_wt_ids[ep_leader];
+
+    ncclCheck(ncclCommInitRank(&mWeightTransferComm, mEPSize, wt_id, mEPRank));
+
+    if (mRank == 0) {
+        fprintf(stderr, "[EP] Initialized EP groups: ep_size=%d, dp_size=%d, world_size=%d\n",
+                mEPSize, mDPSize, mWorld);
+    }
+}
+
+/**
+ * @brief Variable-split all-to-all using grouped ncclSend/ncclRecv on the EP comm.
+ *
+ * NCCL has no native variable-split all-to-all. This implements it via:
+ * ncclGroupStart(); for each peer: ncclSend + ncclRecv; ncclGroupEnd();
+ *
+ * @param send Source buffer, split contiguously per send_splits.
+ * @param recv Destination buffer, split contiguously per recv_splits.
+ * @param send_splits Array of ep_size() ints: elements to send to each EP peer.
+ * @param recv_splits Array of ep_size() ints: elements to receive from each EP peer.
+ * @param elem_size Size of each element in bytes.
+ * @param stream CUDA stream for the NCCL operations.
+ */
+void NCCLCommunicator::all_to_all_single(const std::byte* send, std::byte* recv,
+                                          const int* send_splits, const int* recv_splits,
+                                          int elem_size, cudaStream_t stream) {
+    if (!mEPComm) {
+        throw std::runtime_error("all_to_all_single: EP comm not initialized (call init_ep_groups first)");
+    }
+
+    ncclCheck(ncclGroupStart());
+    std::size_t send_offset = 0;
+    std::size_t recv_offset = 0;
+    for (int peer = 0; peer < mEPSize; ++peer) {
+        std::size_t send_bytes = static_cast<std::size_t>(send_splits[peer]) * elem_size;
+        std::size_t recv_bytes = static_cast<std::size_t>(recv_splits[peer]) * elem_size;
+        if (send_bytes > 0) {
+            ncclCheck(ncclSend(send + send_offset, send_bytes, ncclInt8, peer, mEPComm, stream));
+        }
+        if (recv_bytes > 0) {
+            ncclCheck(ncclRecv(recv + recv_offset, recv_bytes, ncclInt8, peer, mEPComm, stream));
+        }
+        send_offset += send_bytes;
+        recv_offset += recv_bytes;
+    }
+    ncclCheck(ncclGroupEnd());
+}
+
+/**
+ * @brief All-reduce INT32 values across EP group using sum.
+ *
+ * Used for aggregating expert token counts across EP ranks.
+ *
+ * @param values Device pointer to int32 values (input/output in-place).
+ * @param n Number of int32 elements.
+ * @param stream CUDA stream.
+ */
+void NCCLCommunicator::all_reduce_sum_int_ep(int* values, int n, cudaStream_t stream) {
+    if (!mEPComm || mEPSize <= 1) return;
+    ncclCheck(ncclAllReduce(values, values, n, ncclInt32, ncclSum, mEPComm, stream));
+}
+
+/**
+ * @brief All-reduce tensor in-place using average on the DP comm.
+ *
+ * Used for gradient averaging across data-parallel ranks (expert weight gradients
+ * only need to be synchronized within the DP group, not globally).
+ *
+ * @param tensor Tensor to all-reduce in-place.
+ * @param stream CUDA stream.
+ */
+void NCCLCommunicator::all_reduce_avg_dp(Tensor& tensor, cudaStream_t stream) {
+    if (!mDPComm || mDPSize <= 1) return;
+
+    ncclDataType_t nccl_dtype;
+    switch (tensor.DType) {
+        case ETensorDType::FP32:
+            nccl_dtype = ncclFloat;
+            break;
+        case ETensorDType::BF16:
+            nccl_dtype = ncclBfloat16;
+            break;
+        case ETensorDType::FP16:
+            nccl_dtype = ncclFloat16;
+            break;
+        default:
+            throw std::runtime_error(fmt::format(
+                "NCCLCommunicator::all_reduce_avg_dp: unsupported tensor dtype {}",
+                dtype_to_str(tensor.DType)));
+    }
+
+    ncclCheck(ncclAllReduce(tensor.Data, tensor.Data, tensor.nelem(), nccl_dtype, ncclAvg, mDPComm, stream));
+}
+
+void NCCLCommunicator::send_wt(const void* data, std::size_t bytes, int peer, cudaStream_t stream) {
+    if (!mWeightTransferComm) {
+        throw std::runtime_error("send_wt: weight_transfer_comm not initialized");
+    }
+    if (bytes > 0) {
+        ncclCheck(ncclSend(data, bytes, ncclInt8, peer, mWeightTransferComm, stream));
+    }
+}
+
+void NCCLCommunicator::recv_wt(void* data, std::size_t bytes, int peer, cudaStream_t stream) {
+    if (!mWeightTransferComm) {
+        throw std::runtime_error("recv_wt: weight_transfer_comm not initialized");
+    }
+    if (bytes > 0) {
+        ncclCheck(ncclRecv(data, bytes, ncclInt8, peer, mWeightTransferComm, stream));
+    }
+}
+
+void NCCLCommunicator::weight_transfer_group_start() {
+    ncclCheck(ncclGroupStart());
+}
+
+void NCCLCommunicator::weight_transfer_group_end() {
+    ncclCheck(ncclGroupEnd());
 }
 
 /**

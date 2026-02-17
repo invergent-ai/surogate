@@ -238,6 +238,13 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
     run_work([this, path](sThreadContext& ctx) {
         ctx.Model->import_weights(path, true, *ctx.Communicator);
 
+        // Schedule deferred QLoRA offloading auto-tune.  The actual tuning
+        // runs after step 0 completes (inside invalidate_cache) when all lazy
+        // runtime allocations are settled and gpu_free reflects steady-state.
+        if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+            dsl_model->auto_tune_offloading();
+        }
+
         // Print memory breakdown if enabled (rank 0 only)
         if (mOptions.DebugMemoryBreakdown && ctx.Communicator->rank() == 0) {
             auto& rs = ctx.Model->get_run_state();
@@ -979,6 +986,11 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
 
     ctx.Communicator = &comm;
     ctx.GPUUtil = IGPUUtilTracker::create();
+
+    // Initialize EP sub-communicators if EP is enabled
+    if (mOptions.EPSize > 1) {
+        comm.init_ep_groups(mOptions.EPSize);
+    }
 
     auto allocator = std::make_shared<TensorAllocator>();
 

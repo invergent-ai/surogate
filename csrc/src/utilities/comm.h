@@ -75,6 +75,62 @@ public:
 
     [[nodiscard]] cudaStream_t stream() const { return mCommsStream; }
 
+    // ========================================================================
+    // Expert Parallelism (EP) process groups
+    // ========================================================================
+    // 2D parallelism: world_size = dp_size * ep_size
+    // EP group: ranks that share data but own different experts (size = ep_size)
+    // DP group: ranks that own the same experts but process different data (size = dp_size)
+    // Weight transfer group: same ranks as EP, separate NCCL comm (for overlap with A2A)
+
+    /// Initialize EP sub-communicators. Must be called after construction, before any EP operations.
+    /// @param ep_size Number of EP ranks (must divide world_size; 1 = no EP)
+    void init_ep_groups(int ep_size);
+
+    [[nodiscard]] int ep_rank() const { return mEPRank; }
+    [[nodiscard]] int ep_size() const { return mEPSize; }
+    [[nodiscard]] int dp_rank() const { return mDPRank; }
+    [[nodiscard]] int dp_size() const { return mDPSize; }
+    [[nodiscard]] bool ep_enabled() const { return mEPSize > 1; }
+    [[nodiscard]] ncclComm_t ep_comm() const { return mEPComm; }
+    [[nodiscard]] ncclComm_t dp_comm() const { return mDPComm; }
+    [[nodiscard]] ncclComm_t weight_transfer_comm() const { return mWeightTransferComm; }
+
+    // ========================================================================
+    // Variable-split all-to-all (for EP token routing)
+    // ========================================================================
+
+    /// Variable-split all-to-all using grouped ncclSend/ncclRecv.
+    /// send_splits[i] = number of elements to send to EP rank i
+    /// recv_splits[i] = number of elements to receive from EP rank i
+    /// @param send Source buffer (contiguous, split according to send_splits)
+    /// @param recv Destination buffer (contiguous, split according to recv_splits)
+    /// @param send_splits Array of ep_size() ints: per-peer send counts (in elements)
+    /// @param recv_splits Array of ep_size() ints: per-peer recv counts (in elements)
+    /// @param elem_size Size of each element in bytes
+    /// @param stream CUDA stream for the NCCL operations
+    void all_to_all_single(const std::byte* send, std::byte* recv,
+                           const int* send_splits, const int* recv_splits,
+                           int elem_size, cudaStream_t stream);
+
+    /// All-reduce on the EP comm (for aggregating expert counts across EP group)
+    void all_reduce_sum_int_ep(int* values, int n, cudaStream_t stream);
+
+    /// All-reduce on the DP comm (for gradient averaging across data-parallel group)
+    void all_reduce_avg_dp(Tensor& tensor, cudaStream_t stream);
+
+    /// P2P send on weight_transfer_comm (for LLEP expert weight transfer).
+    /// Must be called inside ncclGroupStart/ncclGroupEnd.
+    void send_wt(const void* data, std::size_t bytes, int peer, cudaStream_t stream);
+
+    /// P2P recv on weight_transfer_comm (for LLEP expert weight transfer).
+    /// Must be called inside ncclGroupStart/ncclGroupEnd.
+    void recv_wt(void* data, std::size_t bytes, int peer, cudaStream_t stream);
+
+    /// Batched P2P weight transfer: wraps multiple send_wt/recv_wt in ncclGroupStart/End.
+    void weight_transfer_group_start();
+    void weight_transfer_group_end();
+
     //! On the root rank, returns a vector of (memcpyable) T objects that
     //! have been gathered from all ranks.
     template<typename T>
@@ -184,6 +240,15 @@ private:
     int mRank;
     int mWorld;
     int mLocalRank;  // Local device index (same as rank for single-node, device index for multi-node)
+
+    // EP process group state (initialized by init_ep_groups())
+    int mEPSize = 1;
+    int mEPRank = 0;
+    int mDPSize = 1;
+    int mDPRank = 0;
+    ncclComm_t mEPComm = nullptr;
+    ncclComm_t mDPComm = nullptr;
+    ncclComm_t mWeightTransferComm = nullptr;
 
     cudaEvent_t mCommsSync;
     cudaStream_t mCommsStream;

@@ -11,7 +11,7 @@ All numbers represent **total TPS (Tokens per Second)**
 | **Qwen3 1.7B**         | 12k         | 12,6k        | 14,0k         | 18,8k        | 17,4k          | 20,7k        | 17k            | 17,6k          |
 | **Qwen3 4B**           | 6k          | 6.1k         | 6,8k          | 8,8k         | 8,3k           | 10,8k        | 8,1k           | 8,6k           |
 | **Qwen3 8B**           | 3,4k        | 3,5k         | 3,8k          | 5,4k         | 5,0k           | 6,9k         | 4,9k           | 5,0k           |
-| **Qwen/Qwen3-30B-A3B** | 0.016k      | OOM          | OOM           | OOM          | 0,3k           | OOM          | 0.2k           | 0.3k           |
+| **Qwen/Qwen3-30B-A3B** | 0.016k      | OOM          | OOM           | OOM          | 0,3k           | OOM          | 0.5k           | 0.3k           |
 
 #### Relative Speedup vs Unsloth NF4
 | Model                  | BF16  | FP8   | QoFP8  | FP4   | QoFP4  | QoNF4  |

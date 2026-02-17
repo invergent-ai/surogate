@@ -1631,6 +1631,32 @@ void moe_permute_tokens(float* out, const float* inp, const int* gather_indices,
 void moe_permute_tokens(nv_bfloat16* out, const nv_bfloat16* inp, const int* gather_indices,
                         int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
 
+/// @brief Fused EP send buffer preparation: scatter expert-sorted tokens into
+/// destination-GPU order directly on GPU, eliminating CPU-side sort.
+/// @param send_buf Output send buffer in destination-peer order [total_tokens, hidden_size]
+/// @param input Input tokens in expert-sorted order [total_tokens, hidden_size]
+/// @param expert_offsets Expert token offsets [num_experts + 1] (GPU)
+/// @param expert_to_gpu Expert→GPU mapping [num_experts] (GPU)
+/// @param peer_write_offsets Temporary buffer [num_experts] for per-expert write offsets (GPU)
+/// @param send_order Output mapping [total_tokens]: send_order[write_pos]=token_idx (may be null)
+/// @param num_experts Total number of experts
+/// @param ep_size Number of EP peers
+/// @param hidden_size Hidden dimension
+/// @param total_tokens Total tokens to scatter
+/// @param stream CUDA stream
+void ep_fused_prepare_send_buffer_bf16(
+    nv_bfloat16* send_buf, const nv_bfloat16* input,
+    const int* expert_offsets, const int* expert_to_gpu,
+    int* peer_write_offsets, int* send_order,
+    int num_experts, int ep_size, int hidden_size, int total_tokens,
+    cudaStream_t stream);
+void ep_fused_prepare_send_buffer_fp32(
+    float* send_buf, const float* input,
+    const int* expert_offsets, const int* expert_to_gpu,
+    int* peer_write_offsets, int* send_order,
+    int num_experts, int ep_size, int hidden_size, int total_tokens,
+    cudaStream_t stream);
+
 /// @brief Unpermute and weight-combine expert outputs back to token order.
 /// @param out Output combined hidden states (num_tokens, hidden_size).
 /// @param expert_out Expert outputs in permuted order (total_tokens, hidden_size).
@@ -1886,7 +1912,8 @@ void moe_grouped_gemm_gate_up(float* output, const float* input, const float* we
                               const int* host_offsets = nullptr,
                               const int* active_expert_indices = nullptr,
                               bool weight_is_compact = true,
-                              int num_active_experts = -1);
+                              int num_active_experts = -1,
+                              const void* const* weight_ptrs = nullptr);
 void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                               const int* expert_offsets, int num_experts,
                               int hidden_size, int intermediate_size,
@@ -1894,7 +1921,8 @@ void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, con
                               const int* host_offsets = nullptr,
                               const int* active_expert_indices = nullptr,
                               bool weight_is_compact = true,
-                              int num_active_experts = -1);
+                              int num_active_experts = -1,
+                              const void* const* weight_ptrs = nullptr);
 
 /// @brief Grouped GEMM for MoE down projection across all experts.
 /// Runs all expert GEMMs in parallel instead of sequentially.
@@ -1917,7 +1945,8 @@ void moe_grouped_gemm_down(float* output, const float* input, const float* weigh
                            const int* host_offsets = nullptr,
                            const int* active_expert_indices = nullptr,
                            bool weight_is_compact = true,
-                           int num_active_experts = -1);
+                           int num_active_experts = -1,
+                           const void* const* weight_ptrs = nullptr);
 void moe_grouped_gemm_down(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                            const int* expert_offsets, int num_experts,
                            int hidden_size, int intermediate_size,
@@ -1925,7 +1954,8 @@ void moe_grouped_gemm_down(nv_bfloat16* output, const nv_bfloat16* input, const 
                            const int* host_offsets = nullptr,
                            const int* active_expert_indices = nullptr,
                            bool weight_is_compact = true,
-                           int num_active_experts = -1);
+                           int num_active_experts = -1,
+                           const void* const* weight_ptrs = nullptr);
 
 /// @brief Grouped GEMM backward through down projection for all MoE experts.
 /// Computes d_swiglu = d_output @ down_proj (no transpose on weight).
@@ -1945,7 +1975,8 @@ void moe_grouped_gemm_down_backward(float* d_input, const float* d_output, const
                                      const int* host_offsets = nullptr,
                                      const int* active_expert_indices = nullptr,
                                      bool weight_is_compact = true,
-                                     int num_active_experts = -1);
+                                     int num_active_experts = -1,
+                                     const void* const* weight_ptrs = nullptr);
 void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_output, const nv_bfloat16* weights,
                                      const int* expert_offsets, int num_experts,
                                      int hidden_size, int intermediate_size,
@@ -1953,7 +1984,8 @@ void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_o
                                      const int* host_offsets = nullptr,
                                      const int* active_expert_indices = nullptr,
                                      bool weight_is_compact = true,
-                                     int num_active_experts = -1);
+                                     int num_active_experts = -1,
+                                     const void* const* weight_ptrs = nullptr);
 
 /// @brief Grouped GEMM backward through gate+up projection for all MoE experts.
 /// Computes d_input = d_gate_up @ gate_up_proj (no transpose on weight).
@@ -1973,7 +2005,8 @@ void moe_grouped_gemm_gate_up_backward(float* d_input, const float* d_gate_up, c
                                        const int* host_offsets = nullptr,
                                        const int* active_expert_indices = nullptr,
                                        bool weight_is_compact = true,
-                                       int num_active_experts = -1);
+                                       int num_active_experts = -1,
+                                       const void* const* weight_ptrs = nullptr);
 void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_gate_up, const nv_bfloat16* weights,
                                        const int* expert_offsets, int num_experts,
                                        int hidden_size, int intermediate_size,
@@ -1981,7 +2014,8 @@ void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* 
                                        const int* host_offsets = nullptr,
                                        const int* active_expert_indices = nullptr,
                                        bool weight_is_compact = true,
-                                       int num_active_experts = -1);
+                                       int num_active_experts = -1,
+                                       const void* const* weight_ptrs = nullptr);
 
 /// @brief Grouped GEMM backward for non-gated up projection across all experts.
 /// Computes d_input = d_up @ W_up where W_up has shape (D, C).

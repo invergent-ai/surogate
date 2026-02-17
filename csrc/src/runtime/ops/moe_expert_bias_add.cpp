@@ -7,6 +7,7 @@
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "utilities/comm.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
@@ -55,7 +56,13 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
             if (err == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumExperts + 1);
+            // Use actual stored size (may be num_merged+1 when LLEP is active, not num_local+1)
+            auto size_it = mMoeSavedSizes.find(key);
+            if (size_it != mMoeSavedSizes.end()) {
+                expert_offsets_view.Sizes[0] = static_cast<long>(size_it->second / sizeof(int));
+            } else {
+                expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
+            }
             expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
             expert_offsets_ptr = &expert_offsets_view;
             } else {
@@ -99,22 +106,79 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
     Tensor expert_offsets_tensor = resolve_moe_expert_offsets(op);
     const int* expert_offsets = expert_offsets_tensor.get<int>();
 
-    const int num_experts = static_cast<int>(mConfig.NumExperts);
     const int hidden_size = static_cast<int>(inp.Sizes[1]);
     const int total_tokens = static_cast<int>(inp.Sizes[0]);
+
+    // Parse layer index for LLEP lookup
+    int layer_idx = op.attrs.layer_idx;
+    if (layer_idx < 0 && !op.inputs.empty()) {
+        std::string_view name = op.inputs[0].name;
+        if (name.rfind("saved.", 0) == 0) name.remove_prefix(6);
+        std::string field;
+        parse_block_param(name, layer_idx, field);
+    }
+
+    // Check if LLEP is active for this layer (merged experts != local experts)
+    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
+    const LLEPLayerState* llep = nullptr;
+    if (layer_idx >= 0) {
+        auto it = mLLEPStates.find(layer_idx);
+        if (it != mLLEPStates.end() && it->second.active) {
+            llep = &it->second;
+            num_experts = llep->num_merged_experts;
+        }
+    }
 
     std::vector<long> out_shape = {static_cast<long>(total_tokens), static_cast<long>(hidden_size)};
     Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
     mTemps.push_back(out);
 
-    if (inp.DType == ETensorDType::BF16) {
-        moe_expert_bias_add_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), bias.get<nv_bfloat16>(),
-                                    expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
-    } else if (inp.DType == ETensorDType::FP32) {
-        moe_expert_bias_add_forward(out.get<float>(), inp.get<float>(), bias.get<float>(),
-                                    expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+    if (llep) {
+        // LLEP mode: merged experts may be non-contiguous in the global expert space.
+        // Build a merged bias tensor by gathering rows from the full bias tensor using
+        // merged_to_global mapping. Every GPU has the full [E_total, hidden] bias via
+        // Direct HF mapping (2D tensors are not EP-sharded).
+        const size_t row_bytes = static_cast<size_t>(hidden_size) * get_dtype_size(bias.DType);
+        Tensor merged_bias = mRunState.temp_alloc(bias.DType,
+            {static_cast<long>(num_experts), static_cast<long>(hidden_size)});
+        mTemps.push_back(merged_bias);
+        for (int m = 0; m < num_experts; ++m) {
+            const int global_e = llep->merged_to_global[m];
+            const std::byte* src = static_cast<const std::byte*>(bias.Data)
+                + static_cast<size_t>(global_e) * row_bytes;
+            std::byte* dst = static_cast<std::byte*>(merged_bias.Data)
+                + static_cast<size_t>(m) * row_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, row_bytes,
+                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+
+        if (inp.DType == ETensorDType::BF16) {
+            moe_expert_bias_add_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(),
+                                        merged_bias.get<nv_bfloat16>(),
+                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+        } else if (inp.DType == ETensorDType::FP32) {
+            moe_expert_bias_add_forward(out.get<float>(), inp.get<float>(),
+                                        merged_bias.get<float>(),
+                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+        } else {
+            throw std::logic_error("moe_expert_bias_add: unsupported input dtype");
+        }
     } else {
-        throw std::logic_error("moe_expert_bias_add: unsupported input dtype");
+        // Basic EP (or no EP): bias tensor contains all experts, offset to local range.
+        const int ep_bias_offset = (mConfig.EPSize > 1 && mComm && mComm->ep_enabled())
+            ? mComm->ep_rank() * num_experts * hidden_size : 0;
+
+        if (inp.DType == ETensorDType::BF16) {
+            moe_expert_bias_add_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(),
+                                        bias.get<nv_bfloat16>() + ep_bias_offset,
+                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+        } else if (inp.DType == ETensorDType::FP32) {
+            moe_expert_bias_add_forward(out.get<float>(), inp.get<float>(),
+                                        bias.get<float>() + ep_bias_offset,
+                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+        } else {
+            throw std::logic_error("moe_expert_bias_add: unsupported input dtype");
+        }
     }
 
     store_tensor(op.outputs[0], out);
@@ -146,7 +210,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
         return;
     }
 
-    const int num_experts = static_cast<int>(mConfig.NumExperts);
+    const int num_experts = static_cast<int>(mConfig.NumLocalExperts);
     const int top_k = (mConfig.NumExpertsPerTok > 0) ? static_cast<int>(mConfig.NumExpertsPerTok) : 1;
     const int num_tokens = static_cast<int>(mB * mT);
     const int total_tokens = num_tokens * (top_k > 0 ? top_k : 1);

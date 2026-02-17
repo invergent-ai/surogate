@@ -73,6 +73,14 @@ public:
     float memory_savings_ratio() const override;
 
     // =========================================================================
+    // Quantized data access (for EP quantized weight transfer)
+    // =========================================================================
+
+    const qlora::QuantizedTensor* try_get_quantized(std::string_view name) const override;
+    qlora::IQuantizer* get_quantizer() const override;
+    void auto_tune_offloading() override;
+
+    // =========================================================================
     // Direct access to the underlying weight manager
     // =========================================================================
 
@@ -84,6 +92,10 @@ private:
     void build_layer_offload_map();
 
     std::unique_ptr<GenericWeightManager> mWeightMgr;
+
+    // Deferred auto-tune: run after first training step when all lazy allocs are settled.
+    int mStepCount = 0;
+    bool mAutoTunePending = false;
 
     // Deferred construction state
     std::unique_ptr<DslQLoRAPipelineConfig> mDeferredConfig;
@@ -99,6 +111,9 @@ private:
 
     /// Whether any weights use offloading.
     bool mHasOffloading = false;
+
+    /// EP size (> 1 means LLEP may use extra GPU memory for foreign weight transfers).
+    int mEPSize = 1;
 };
 
 }  // namespace qlora

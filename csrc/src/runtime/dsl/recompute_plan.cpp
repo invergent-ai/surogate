@@ -2550,6 +2550,23 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             continue;
         }
 
+        // When EP is active, skip MoE expert compute ops in the recompute chain.
+        // ep_dispatch (which involves NCCL A2A communication) cannot be recomputed,
+        // so the post-EP tensor shapes (fewer tokens, local experts only) cannot be
+        // reproduced from pre-EP inputs. The saved ep_recv_input/ep_recv_scatter
+        // Activation slots provide the tensors the backward autodiff rules need.
+        if (ctx.cfg.EPSize > 1) {
+            static const std::unordered_set<std::string> moe_expert_ops = {
+                "moe_grouped_gemm_gate_up", "moe_grouped_gemm_down",
+                "moe_grouped_gemm",
+                "swiglu", "gpt_oss_moe_act", "moe_expert_bias_add",
+                "moe_unpermute",
+            };
+            if (moe_expert_ops.count(op.op_type)) {
+                continue;
+            }
+        }
+
         // In hybrid models, the recompute plan contains ops for all block types
         // but each layer only corresponds to one type. If inputs can't be resolved
         // (e.g., attention param on a Mamba layer), skip the op.
