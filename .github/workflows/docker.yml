@@ -16,7 +16,7 @@ on:
 jobs:
   docker:
     name: Build Docker image (CUDA ${{ matrix.wheel_tag }})
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: read
       packages: write

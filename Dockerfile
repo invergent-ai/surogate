@@ -23,7 +23,7 @@
 #     ghcr.io/invergent-ai/surogate:0.1.1-cu13 sft /config.yaml
 
 ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04
-FROM nvidia/cuda:${CUDA_RUNTIME_IMAGE}
+FROM ${CUDA_RUNTIME_IMAGE}
 
 ARG CUDA_MAJOR=13
 ARG PACKAGE_VERSION=0.1.1
