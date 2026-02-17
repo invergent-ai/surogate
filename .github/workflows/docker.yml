@@ -12,11 +12,16 @@ on:
         required: true
         default: 'all'
         type: string
+  workflow_run:
+    workflows: ["Build Wheels"]
+    types:
+      - completed
 
 jobs:
   docker:
     name: Build Docker image (CUDA ${{ matrix.wheel_tag }})
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write
