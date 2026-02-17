@@ -1,10 +1,19 @@
 <div align="center" style="padding: 2rem">
 <p align="center">
-  <a href="https://surogate.ai/">
-    <img alt="Surogate" width="40%"
-      src="https://raw.githubusercontent.com/invergent-ai/surogate/main/assets/logo-white.svg#gh-dark-mode-only" />
-    <img alt="Surogate" width="40%"
-      src="https://raw.githubusercontent.com/invergent-ai/surogate/main/assets/logo-black.svg#gh-light-mode-only" />
+  <a href="https://surogate.ai/#gh-dark-mode-only">
+    <img
+      alt="Surogate"
+      width="40%"
+      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-white.svg#gh-dark-mode-only"
+    />
+  </a>
+
+  <a href="https://surogate.ai/#gh-light-mode-only">
+    <img
+      alt="Surogate"
+      width="40%"
+      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-black.svg#gh-light-mode-only"
+    />
   </a>
 </p>
 
