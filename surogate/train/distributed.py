@@ -353,14 +353,15 @@ class NodeTrainer:
         use_lora = self._config.lora and self._config.lora_rank and self._config.lora_alpha and self._config.lora_target_modules
 
         # Check for checkpoint resumption
-        self.start_step = 0
+        # find_latest_checkpoint returns -1 when no checkpoint exists;
+        # keep -1 so the loading gate (start_step >= 0) stays closed.
+        self.start_step = -1
         if self._config.resume_from_checkpoint:
             self.start_step = _surogate.find_latest_checkpoint(self._config.checkpoint_dir)
             if self.start_step >= 0:
                 logger.info(f"Node {self.node_rank}: Found checkpoint at step {self.start_step}")
             else:
                 logger.warning(f"Node {self.node_rank}: No checkpoint found to resume from. Starting training from beginning.")
-                self.start_step = 0
 
         # Create the trainer with NCCL multi-node support
         if self.num_nodes > 1:
@@ -883,7 +884,7 @@ class RayDistributedTrainer:
 
             def get_start_step(self) -> int:
                 """Get the starting step (0 for fresh training, >0 for resumed from checkpoint)."""
-                return self.trainer.start_step
+                return max(0, self.trainer.start_step)
 
             def train_step(self, step: int, lr: float) -> Tuple[float, float]:
                 return self.trainer.train_step(step, lr)
