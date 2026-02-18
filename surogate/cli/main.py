@@ -15,14 +15,27 @@ logger = get_logger()
 COMMAND_MAPPING: Dict[str, str] = {
     'sft': 'surogate.cli.sft',
     'pt': 'surogate.cli.pt',
+    'grpo': 'surogate.cli.grpo',
     'tokenize': 'surogate.cli.tokenize_cmd',
     'serve': 'surogate.cli.serve',
     'eval': 'surogate.cli.eval',
     'ptq': 'surogate.cli.ptq',
 }
 
+def _get_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("surogate")
+    except Exception:
+        try:
+            from surogate._version import __version__
+            return __version__
+        except Exception:
+            return "unknown"
+
+
 def parse_args():
-    logger.banner("Surogate LLMOps CLI")
+    logger.banner(f"Surogate LLMOps CLI  v{_get_version()}")
 
     parser = argparse.ArgumentParser(description="Surogate LLMOps Framework")
     parser.set_defaults(func=lambda _args, p=parser: p.print_help())
@@ -36,6 +49,10 @@ def parse_args():
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
     pt_prepare_command_parser(subparsers.add_parser('pt', help="Pretraining"))
 
+    # grpo command
+    from surogate.cli.grpo import prepare_command_parser as grpo_prepare_command_parser
+    grpo_prepare_command_parser(subparsers.add_parser('grpo', help="GRPO Reinforcement Learning from Rule-Based Rewards"))
+
     # tokenize command
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser
     tokenize_prepare_command_parser(subparsers.add_parser('tokenize', help="Tokenize datasets for training"))
@@ -45,7 +62,7 @@ def parse_args():
         parser.print_help()
         sys.exit(1)
     
-    commands_with_config = ['serve', 'pretrain', 'sft', 'pt','tokenize']
+    commands_with_config = ['serve', 'pretrain', 'sft', 'pt', 'grpo', 'tokenize']
     if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
         sys.exit(1)
