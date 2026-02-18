@@ -21,10 +21,11 @@ class ModelConfig(ABC):
         model (Optional[str]): model_id or model_path. Default is None.
         model_type (Optional[str]): Type of the model group. Default is None.
         max_model_len (Optional[int]): Maximum model length for rope scaling. Default is None.
-        rope_scaling (Literal): Type of RoPE scaling. You can pass a string such as 'linear', 'dynamic', 'yarn',
-            along with max_model_len and Surogate will automatically configure the corresponding rope_scaling,
-            overriding the value in config.json. Alternatively, pass a JSON string like '{"factor": 2.0, "type": "yarn"}',
-            which will directly replace the rope_scaling in config.json. Default is None.
+        rope_scaling (Literal): Type of RoPE scaling. Only relevant for vision-language models — it is applied
+            to the HuggingFace vision model loaded in Python for multi-modal preprocessing (on_the_fly_mm.py).
+            Has no effect for pure LLM fine-tuning: the C++ training engine reads rope config directly from
+            config.json on disk and ignores this value. You can pass a string such as 'linear', 'dynamic', 'yarn',
+            or a JSON string like '{"factor": 2.0, "type": "yarn"}'. Default is None.
     """
     model: Optional[str] = None
     model_type: Optional[str] = None
