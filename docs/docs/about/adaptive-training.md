@@ -245,6 +245,95 @@ The monitor provides a structured health report via `get_routing_diagnostics()`,
 
 For more details on MoE metrics and tuning, see [Mixture-of-Experts Models](../guides/moe.md).
 
+## Least-Loaded Expert Parallelism (LLEP)
+
+Well-trained MoE models naturally develop imbalanced expert routing — certain experts specialise in specific domains and receive far more tokens than others. This is desirable from a model-quality perspective, but standard Expert Parallelism (EP) is designed around the assumption of balanced load. When routing is skewed, the GPU hosting the busiest experts becomes a bottleneck: latency spikes, memory usage grows, and in extreme cases the overloaded GPU runs out of memory entirely.
+
+**Least-Loaded Expert Parallelism (LLEP)** is Surogate's dynamic load-balancing algorithm for EP training and inference. Instead of altering the model's routing logic (which would change its behaviour), LLEP reroutes *excess tokens* — along with their associated expert weights — from overloaded GPUs to underloaded ones at runtime. The mathematical result is identical to standard EP; only the execution schedule changes.
+
+LLEP activates automatically when `ep_size > 1` and routing imbalance crosses a configurable threshold.
+
+### How LLEP Works
+
+At each MoE layer, LLEP measures the per-GPU token load across the EP group:
+
+1. **Measure**: global expert token counts are collected across all EP ranks.
+2. **Check threshold**: if `max_gpu_load / mean_gpu_load` is below `ep_load_balance_threshold`, standard EP runs unchanged (no overhead).
+3. **Assign**: the Least-Loaded Assignment (LLA) algorithm redistributes excess tokens from overloaded GPUs to underloaded ones, subject to a per-GPU capacity limit (the `α` factor).
+4. **Transfer**: both the token batches and the corresponding expert weight slices are transferred peer-to-peer to the receiving GPU.
+5. **Compute**: each GPU runs grouped GEMMs for its native experts plus any spilled experts it received.
+6. **Combine**: outputs and gradients are routed back to the originating GPU and accumulated.
+
+LLEP computes the exact MoE forward pass — no approximations, no changes to routing probabilities. Gradient flow is fully supported, making it equally applicable to training and inference.
+
+### Configuration
+
+LLEP is enabled by setting `ep_size > 1`. The threshold controls how aggressively it activates:
+
+```yaml
+gpus: 8
+ep_size: 4                       # 4-way expert parallelism
+ep_load_balance_threshold: 1.3   # activate LLEP when max/mean > 1.3 (default)
+```
+
+| Parameter | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `ep_size` | int | 1 | Number of GPUs per EP group. Must divide `gpus` and `num_experts`. |
+| `ep_load_balance_threshold` | float | 1.3 | Imbalance ratio above which LLEP activates. Lower = more aggressive rebalancing. |
+
+**Threshold guidance:**
+
+| Value | Behaviour |
+| --- | --- |
+| `1.0` | Always active — LPT scheduling runs every layer regardless of balance |
+| `1.3` | Default — activates only when meaningful imbalance is present |
+| `2.0+` | Conservative — only triggers under severe imbalance |
+
+For post-training and fine-tuning on domain-specific data (where expert specialisation is strongest), `1.0` or `1.3` are recommended. For pre-training where routing is more uniform, `1.3` is a safe default.
+
+### Performance Characteristics
+
+LLEP is most effective when:
+
+- **Imbalance is high**: under 80–95% token concentration into a small number of experts, LLEP achieves 4–6× speedup over standard EP with stable memory usage.
+- **Batch size is large**: larger batches saturate per-GPU capacity, making even load distribution more valuable. With smaller batches the communication overhead may outweigh the benefit.
+- **Model hidden size is large**: larger GEMMs are more compute-efficient, so the cost of weight transfers is more easily amortised.
+
+Under perfectly balanced routing, LLEP adds minimal overhead and falls back to standard EP automatically when the threshold is not exceeded.
+
+### Relationship to MoEMonitor Warnings
+
+The MoEMonitor and LLEP are complementary: MoEMonitor detects *training-level* routing health issues (collapse, instability), while LLEP handles *system-level* load imbalance transparently.
+
+If you see MoEMonitor warnings while using EP, LLEP context matters:
+
+| Warning | With LLEP active | Recommended action |
+| --- | --- | --- |
+| `[MoE] Routing imbalance` | Normal — LLEP is redistributing work | No action needed; monitor if imbalance grows |
+| `[MoE] Severe routing imbalance` | LLEP may be saturated; very extreme skew | Lower `ep_load_balance_threshold` to `1.0`, check `router_aux_loss_coef` |
+| `[MoE] Expert collapse risk` | Routing collapse, not a load problem | Increase `router_aux_loss_coef`; LLEP cannot fix collapse |
+| `[Advisor] MoE routing collapse driving divergence` | Training instability | Fix `router_aux_loss_coef` first; LLEP is a throughput tool, not a stability fix |
+
+LLEP is designed to tolerate and exploit natural expert specialisation. It is not a substitute for fixing genuine router collapse — use `router_aux_loss_coef` and `router_z_loss_coef` for that.
+
+### LLEP with QLoRA and Expert Offloading
+
+LLEP is compatible with all QLoRA variants. When combined with `qlora_offload_experts: true`, each GPU offloads only its local expert shard to CPU. Spilled experts are fetched on demand during LLEP redistribution:
+
+```yaml
+model: Qwen/Qwen3-30B-A3B
+gpus: 4
+ep_size: 2
+ep_load_balance_threshold: 1.0
+
+lora: true
+lora_rank: 16
+qlora_fp8: true
+qlora_offload_experts: true
+```
+
+See [Expert Parallelism](../guides/moe.md#expert-parallelism-ep) for the full EP configuration reference.
+
 
 ## Early Stopping
 

@@ -18,7 +18,7 @@ To pre-train an MoE model from scratch, use the `surogate pt` command with an Mo
 
 ```yaml
 # pt-moe-config.yaml
-model: Qwen3-MoE-30B-A3B  # Or path to upcycled model
+model: Qwen3-MoE-30B-A3B  # Or path to model
 model_type: qwen3_moe
 
 # Pre-training specific settings
@@ -147,20 +147,6 @@ router_z_loss_coef: 0.001    # Logit regularization (default: from model config,
 
 ## Hyperparameter Recommendations
 
-### For Upcycled MoE Models
-
-Upcycled models need careful tuning because the router starts untrained:
-
-| Parameter              | Recommended Value | Notes                                             |
-| ---------------------- | ----------------- | ------------------------------------------------- |
-| `learning_rate`        | 1e-5 to 3e-5      | Much lower than dense models (10x lower)          |
-| `warmup_ratio`         | 0.15-0.20         | Longer warmup helps router stability              |
-| `max_grad_norm`        | 0.5-1.0           | Gradient clipping prevents instability            |
-| `weight_decay`         | 0.01-0.1          | Standard values work                              |
-| `train_router`         | true              | Essential for upcycled models                     |
-| `router_aux_loss_coef` | 0.01-0.05         | Higher than default for faster router convergence |
-| `router_z_loss_coef`   | 0.001-0.01        | Standard values work                              |
-
 ### For Pre-trained MoE Models (e.g., Qwen3-MoE-30B-A3B)
 
 Pre-trained MoE models have a well-trained router, so standard LoRA hyperparameters work:
@@ -174,12 +160,27 @@ Pre-trained MoE models have a well-trained router, so standard LoRA hyperparamet
 
 ### Dataset Size Guidelines
 
-For upcycled models, the lightweight fine-tuning stage requires:
+**Fine-tuning (SFT/LoRA):**
 
-- **Minimum:** ~50,000 samples
-- **Recommended:** ~150,000 samples
-- **Training duration:** 1 epoch is typically sufficient
-- **Hardware:** Single GPU (RTX 4090/A100) in 1.5-8 hours depending on model size
+| Scenario | Minimum | Recommended | Notes |
+| -------- | ------- | ----------- | ----- |
+| Task-specific (e.g., code, math) | 5,000 | 50,000–100,000 | 1–3 epochs; diminishing returns beyond ~100k for narrow tasks |
+| General instruction tuning | 50,000 | 200,000–500,000 | 1 epoch typically sufficient; mix diverse sources |
+| MoE with router training | 100,000 | 300,000+ | Router needs more signal to converge; extend warmup to 0.15 |
+
+**Pretraining / continual pretraining:**
+
+| Scenario | Minimum | Recommended | Notes |
+| -------- | ------- | ----------- | ----- |
+| Domain adaptation | 500M tokens | 5B–20B tokens | Less than this risks catastrophic forgetting |
+| Full pretraining from scratch | 1T tokens | 5T–20T tokens | Scale data with model size; follow Chinchilla ratios |
+| Vocabulary / architecture extension | 50B tokens | 200B–500B tokens | Enough to stabilize new parameters before mixing |
+
+**General rules of thumb:**
+
+- Prefer more shorter sequences over fewer long ones when memory-constrained — `truncation_strategy: split` keeps all tokens in pretraining
+- For MoE models, ensure your dataset covers enough variety to keep all experts active; a narrow corpus can cause router collapse even with sufficient token count
+- Monitor `expert_utilization` during early training; below 0.5 after warmup suggests the dataset is too narrow or `router_aux_loss_coef` needs to be increased
 
 ## Monitoring MoE Training
 
@@ -223,8 +224,6 @@ Measures what fraction of experts are receiving tokens each step. Monitor via:
 | 0.5 - 0.7 | Warning - some experts underutilized |
 | < 0.5     | Critical - possible router collapse  |
 
-**For upcycled models:** Expect low utilization (0.3-0.5) initially since the router is random. It should increase steadily during training when using `train_router: true`.
-
 #### Load Imbalance
 
 Measures how evenly tokens are distributed across active experts, computed as `max_expert_tokens / mean_expert_tokens`. Monitor via:
@@ -238,7 +237,7 @@ Measures how evenly tokens are distributed across active experts, computed as `m
 
 | Architecture                          | Experts | Top-k | Expected Imbalance | Warning Threshold |
 | ------------------------------------- | ------- | ----- | ------------------ | ----------------- |
-| Small MoE (e.g., 8x2 upcycled)       | 8       | 2     | 1.5 - 3.0         | > 5.0             |
+| Small MoE (e.g., 8x2)       | 8       | 2     | 1.5 - 3.0         | > 5.0             |
 | Nemotron-H MoE layers                 | 64      | 4     | 3.0 - 6.0         | > 10.0            |
 | GPT-OSS (128 experts, top-4)          | 128     | 4     | 4.0 - 6.0         | > 10.0            |
 | Qwen3-MoE-30B-A3B (128 experts, top-8) | 128   | 8     | 8.0 - 12.0        | > 20.0            |
@@ -310,32 +309,6 @@ Router collapse occurs when the router stops distributing tokens effectively:
 5. **Increase loss coefficients** - set `router_aux_loss_coef: 0.05` and `router_z_loss_coef: 0.01` for stronger regularization
 6. **Check batch size** - very small batches can cause routing instability
 
-### Example: Monitoring an Upcycled Model (8 experts, top-2)
-
-When fine-tuning a small upcycled model (e.g., 8 experts, top-2), you should see this progression:
-
-**Early training (steps 0-100):**
-```
-expert_utilization: 0.35  # Low - router is random
-load_imbalance: 4.2       # High - uneven distribution
-aux_loss: 0.8             # Elevated
-```
-
-**Mid training (steps 100-500):**
-```
-expert_utilization: 0.65  # Improving
-load_imbalance: 2.1       # Better balance
-aux_loss: 0.15            # Decreasing
-```
-
-**Late training (steps 500+):**
-```
-expert_utilization: 0.85  # Good utilization
-load_imbalance: 1.6       # Well balanced
-aux_loss: 0.05            # Stable
-```
-
-For large pre-trained MoE models (128 experts), load imbalance will be significantly higher throughout training — see [Load Imbalance](#load-imbalance) for expected ranges.
 
 ## Memory Considerations
 
@@ -455,60 +428,51 @@ lora_target_modules:
 
 ## Example Configurations
 
-### Upcycled Model with Router Training
+### MoE Pretraining
 
 ```yaml
-model: ./upcycled-qwen3-moe-8x2
+model: Qwen/Qwen3-30B-A3B
 model_type: qwen3_moe
-output_dir: ./output
+output_dir: ./output-pt
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 8
-gpus: 4
+gpus: 8
 use_cuda_graphs: false
 
 sample_packing: true
-sequence_len: 2048
-num_epochs: 1
+sequence_len: 4096
+truncation_strategy: split
+use_chat_template: false
+loss_scale: all
 
-# Critical hyperparameters for upcycled models
-learning_rate: 3e-5
-warmup_ratio: 0.15
+max_steps: 10000
+eval_steps: 500
+save_steps: 1000
+
+learning_rate: 3e-4
 lr_scheduler_type: cosine
+warmup_ratio: 0.05
 max_grad_norm: 1.0
 weight_decay: 0.1
 
-# LoRA + Router training
-lora: true
-lora_rank: 16
-lora_alpha: 32
-lora_dtype: bf16
-train_router: true
-merge_adapter: true
+recipe: fp8-hybrid
+optimizer: adamw_8bit
+lora: false
 
-# Tuned for upcycled models (higher aux_loss for faster router convergence)
-router_aux_loss_coef: 0.02
-router_z_loss_coef: 0.001
+# Expert parallelism across all 8 GPUs
+ep_size: 8
+ep_load_balance_threshold: 1.0
 
-lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
+router_aux_loss_coef: 0.001
+router_z_loss_coef: 0.0001
 
+dataloader_num_workers: 4
 datasets:
-  - path: "teknium/OpenHermes-2.5"
-    samples: 80000
-    type: auto
-  - path: "Open-Orca/SlimOrca"
-    type: auto
-    samples: 40000
-  - path: "meta-math/MetaMathQA"
-    type: auto
-    samples: 30000
+  - path: "HuggingFaceFW/fineweb-edu"
+    type: text
+    text_field: text
+    split: train
 ```
 
 ### Large MoE Model with QLoRA
