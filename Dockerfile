@@ -22,7 +22,7 @@
 #     ghcr.io/invergent-ai/surogate:0.1.1-cu13 sft /config.yaml
 
 FROM ubuntu:noble-20260210.1
-
+LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate
 ARG CUDA_MAJOR=13
 ARG PACKAGE_VERSION=0.1.1
 ARG WHEEL_TAG=cu13
