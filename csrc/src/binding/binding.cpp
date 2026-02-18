@@ -1156,6 +1156,90 @@ NB_MODULE(_surogate, m) {
         }, "Get MoE training statistics from the last forward pass.\n\n"
            "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, valid}.\n"
            "For non-MoE models, valid=False and other values are zero.")
+        .def("enter_inference_mode", &MultiGPUPyTrainer::enter_inference_mode,
+             nb::arg("max_seq_len"),
+             "Allocate KV-cache and switch model to inference mode.\n\n"
+             "Must be called before inference_prefill(). Frees any existing KV-cache.\n\n"
+             "Parameters:\n"
+             "- max_seq_len: Maximum total sequence length (prompt + generation tokens).")
+        .def("exit_inference_mode", &MultiGPUPyTrainer::exit_inference_mode,
+             "Free KV-cache and return model to training mode.")
+        .def("inference_prefill", [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<std::int32_t, nb::shape<-1>, nb::c_contig, nb::device::cpu> input_ids) {
+            auto logits = trainer->inference_prefill(input_ids.data(),
+                                                     static_cast<int>(input_ids.shape(0)));
+            const std::size_t n = logits.size();
+            float* data = new float[n];
+            std::copy(logits.begin(), logits.end(), data);
+            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {n}, owner);
+        }, nb::arg("input_ids"),
+           "Run prefill forward pass and populate the KV-cache.\n\n"
+           "Parameters:\n"
+           "- input_ids: int32 token IDs shaped [seq_len].\n\n"
+           "Returns: float32 logits shaped [vocab_size] for the last prompt token.")
+        .def("inference_decode", [](MultiGPUPyTrainer* trainer,
+                std::int32_t token_id, int position) {
+            auto logits = trainer->inference_decode(token_id, position);
+            const std::size_t n = logits.size();
+            float* data = new float[n];
+            std::copy(logits.begin(), logits.end(), data);
+            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {n}, owner);
+        }, nb::arg("token_id"), nb::arg("position"),
+           "Run single-token decode step using the KV-cache.\n\n"
+           "Parameters:\n"
+           "- token_id: int32 token ID to decode.\n"
+           "- position: Token position index (equals current KV-cache position).\n\n"
+           "Returns: float32 logits shaped [vocab_size].")
+        .def("set_kv_pos", &MultiGPUPyTrainer::set_kv_pos,
+             nb::arg("pos"),
+             "Reset KV-cache current position to pos (without clearing cached K/V).\n\n"
+             "Used to generate G completions from the same prompt without re-prefilling:\n"
+             "  1. inference_prefill(prompt)   — fills cache at [0, prompt_len)\n"
+             "  2. for each completion: set_kv_pos(prompt_len), then decode\n\n"
+             "Parameters:\n"
+             "- pos: Target position in [0, max_seq_len].")
+        .def("step_with_custom_loss", [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+                nb::ndarray<float, nb::ndim<2>, nb::c_contig> per_token_grads) {
+            trainer->step_with_custom_loss(input_ids.data(), targets.data(), per_token_grads.data());
+        },
+        nb::arg("input_ids"), nb::arg("targets"), nb::arg("per_token_grads"),
+        "Run one training micro-step with externally-computed per-token gradient multipliers.\n\n"
+        "Parameters:\n"
+        "- input_ids:       int32 token IDs shaped [B, T] (or [ngpu*B, T] for multi-GPU).\n"
+        "- targets:         int32 target IDs shaped [B, T]; -100 for masked positions.\n"
+        "- per_token_grads: float32 per-token gradient multipliers shaped [B, T].\n"
+        "                   per_token_grads[b, t] = dL_GRPO/d(log_prob_policy)[b, t].\n"
+        "                   Masked positions should be 0.\n\n"
+        "Equivalent to step() but uses provided per-token gradients instead of d_loss=1.0.\n"
+        "Call update_with_config() after grad_accum steps to apply gradients.")
+        .def("compute_logprobs", [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+                bool use_lora) {
+            const int B = static_cast<int>(input_ids.shape(0));
+            const int T = static_cast<int>(input_ids.shape(1));
+            auto logprobs = trainer->compute_logprobs(input_ids.data(), targets.data(),
+                                                      B, T, use_lora);
+            const std::size_t n = logprobs.size();
+            float* data = new float[n];
+            std::copy(logprobs.begin(), logprobs.end(), data);
+            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::ndim<2>>(
+                data, {static_cast<std::size_t>(B), static_cast<std::size_t>(T)}, owner);
+        },
+        nb::arg("input_ids"), nb::arg("targets"), nb::arg("use_lora") = true,
+        "Compute per-token log-probabilities for a batch.\n\n"
+        "Parameters:\n"
+        "- input_ids: int32 token IDs shaped [B, T].\n"
+        "- targets:   int32 target IDs shaped [B, T]; -100 for masked positions.\n"
+        "- use_lora:  If True (default), apply LoRA adapters (policy model).\n"
+        "             If False, skip LoRA (reference model).\n\n"
+        "Returns: float32 log-probabilities shaped [B, T].\n"
+        "         Masked positions (target==-100) receive 0.")
         .def_prop_ro("world_size", &MultiGPUPyTrainer::world_size, "Number of participating GPUs.")
         .def_prop_ro("batch_size", &MultiGPUPyTrainer::batch_size, "Per-GPU batch size configured for this trainer.")
         .def_prop_ro("seq_length", &MultiGPUPyTrainer::seq_length, "Sequence length configured for this trainer.")

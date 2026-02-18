@@ -37,6 +37,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
+    const int H  = Hq + 2 * Hkv;
 
     int layer_idx = op.attrs.layer_idx;
     if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
@@ -47,6 +48,72 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         parse_block_param(op.inputs[0].name, layer_idx, field);
     }
 
+    // -----------------------------------------------------------------------
+    // KV-cache inference path
+    // -----------------------------------------------------------------------
+    if (mKVCache && layer_idx >= 0 && layer_idx < mKVCache->num_layers) {
+        KVCache& cache = *mKVCache;
+        const int B    = static_cast<int>(mB);
+
+        if (!mRunState.scratch().cudnn_workspace.Data) {
+            mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
+            mTemps.push_back(mRunState.scratch().cudnn_workspace);
+        }
+        auto* ws = static_cast<std::byte*>(mRunState.scratch().cudnn_workspace.Data);
+
+        if (!cache.is_decode) {
+            // --- Prefill: run standard causal attention, then populate cache ---
+            const int T = static_cast<int>(mT);
+            attention_forward_cudnn(out, lse, qkv, mRunState.scratch().cudnn_workspace,
+                                    mRunState.CudnnHandle, B, T, Hq, Hkv, Hs,
+                                    mRunState.MainStream);
+
+            const auto* qkv_ptr = qkv.get<nv_bfloat16>();
+            extract_kv_to_cache(cache.k_layers[layer_idx], qkv_ptr,
+                                 B, T, H, Hkv, Hs, cache.max_seq_len,
+                                 /*cache_pos=*/0, /*head_start=*/Hq,
+                                 mRunState.MainStream);
+            extract_kv_to_cache(cache.v_layers[layer_idx], qkv_ptr,
+                                 B, T, H, Hkv, Hs, cache.max_seq_len,
+                                 /*cache_pos=*/0, /*head_start=*/Hq + Hkv,
+                                 mRunState.MainStream);
+        } else {
+            // --- Decode: append new K/V to cache, run decode attention ---
+            const int pos = cache.current_pos;   // position being decoded
+            const int T_kv = pos + 1;            // total valid tokens after appending
+            const auto* qkv_ptr = qkv.get<nv_bfloat16>();
+
+            // Write new K and V at position pos.
+            extract_kv_to_cache(cache.k_layers[layer_idx], qkv_ptr,
+                                 B, /*T=*/1, H, Hkv, Hs, cache.max_seq_len,
+                                 /*cache_pos=*/pos, /*head_start=*/Hq,
+                                 mRunState.MainStream);
+            extract_kv_to_cache(cache.v_layers[layer_idx], qkv_ptr,
+                                 B, /*T=*/1, H, Hkv, Hs, cache.max_seq_len,
+                                 /*cache_pos=*/pos, /*head_start=*/Hq + Hkv,
+                                 mRunState.MainStream);
+
+            // Q is at position [0] of the T=1 QKV tensor.
+            const auto* q_ptr = qkv_ptr;  // Q occupies first Hq*Hs per batch
+
+            // out for decode is (B, 1, Hq, Hs) — same underlying buffer, use directly.
+            attention_decode_cudnn(
+                out.get<nv_bfloat16>(),
+                q_ptr,
+                cache.k_layers[layer_idx],
+                cache.v_layers[layer_idx],
+                ws,
+                mRunState.CudnnHandle,
+                B, T_kv, Hq, Hkv, Hs, cache.max_seq_len,
+                mRunState.MainStream);
+        }
+        // Skip sinks and debug checks in inference mode — fall through to end.
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Training path (original)
+    // -----------------------------------------------------------------------
     int window_size = op.attrs.window_size;
     if (window_size <= 0 && mConfig.use_sliding_window && mConfig.is_sliding_layer(layer_idx)) {
         window_size = mConfig.sliding_window_size;

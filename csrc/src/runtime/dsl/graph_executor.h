@@ -18,6 +18,7 @@
 #include "runtime/dsl/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/dsl/kv_cache.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
 #include "utilities/stack.h"
@@ -167,6 +168,44 @@ public:
     size_t saved_buffers_total_bytes() const override;
     int saved_buffers_count() const override;
     const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const override;
+
+    /// Execute a forward pass in inference mode (no gradients, no activation saving).
+    /// Sets the KV-cache on the compiled executor and runs forward with the given (B, T).
+    /// After the call, logits_cpu contains vocab_size floats for the last token.
+    /// kv_cache.current_pos is updated to reflect the new cached position.
+    void execute_inference_forward(long B, long T, KVCache& kv_cache,
+                                   float* logits_cpu, int vocab_size,
+                                   NCCLCommunicator& comm);
+
+    /// Execute a forward pass to extract per-token log-probabilities.
+    ///
+    /// input_ids_cpu: CPU int32 token IDs, shape [B*T] (row-major).
+    /// targets_cpu:   CPU int32 target IDs, shape [B*T]; -100 = masked.
+    /// logprobs_cpu:  CPU output buffer, shape [B*T]; receives log P(target|context).
+    ///                Masked positions (target == -100) receive 0.
+    /// hook:          Optional LoRA forward hook (nullptr to skip LoRA, e.g. reference model).
+    void execute_logprobs_forward(long B, long T,
+                                   const std::int32_t* input_ids_cpu,
+                                   const std::int32_t* targets_cpu,
+                                   float* logprobs_cpu,
+                                   const modules::ForwardHook* hook,
+                                   NCCLCommunicator& comm);
+
+    /// Execute a backward pass with custom per-token d_loss values (for GRPO).
+    ///
+    /// Identical to backward_with_hook() except the d_loss tensor is seeded from
+    /// per_token_grads_cpu instead of being filled with 1.0. This allows Python
+    /// to feed externally-computed per-token GRPO gradients back through the model.
+    ///
+    /// per_token_grads_cpu: CPU float32 buffer of shape [B*T].
+    ///   Values represent dL_GRPO/d(log_prob_policy)[t] for each token.
+    ///   Masked positions should be 0.
+    /// hook: Optional backward hook (for LoRA gradient computation; may be nullptr).
+    void backward_with_custom_dloss(Tensor inputs, Tensor targets,
+                                     const float* per_token_grads_cpu,
+                                     NCCLCommunicator& comm,
+                                     int grad_accum_steps, int micro_step,
+                                     const modules::BackwardHook* hook);
 
 private:
     friend class RecomputePlan;

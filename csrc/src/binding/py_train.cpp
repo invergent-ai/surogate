@@ -1313,6 +1313,144 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
     return result;
 }
 
+// ============================================================================
+// Inference API (KV-cache, used by GRPO online generation)
+// ============================================================================
+
+void MultiGPUPyTrainer::enter_inference_mode(int max_seq_len) {
+    run_work([max_seq_len](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("enter_inference_mode: model is not a DslModel");
+        }
+        dsl_model->enter_inference_mode(max_seq_len);
+    });
+}
+
+void MultiGPUPyTrainer::exit_inference_mode() {
+    run_work([](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (dsl_model) {
+            dsl_model->exit_inference_mode();
+        }
+    });
+}
+
+std::vector<float> MultiGPUPyTrainer::inference_prefill(const std::int32_t* input_ids, int seq_len) {
+    std::vector<float> logits;
+    run_work([&logits, input_ids, seq_len](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("inference_prefill: model is not a DslModel");
+        }
+        auto result = dsl_model->inference_prefill(input_ids, seq_len, *ctx.Communicator);
+        if (ctx.Communicator->local_rank() == 0) {
+            logits = std::move(result);
+        }
+    });
+    return logits;
+}
+
+std::vector<float> MultiGPUPyTrainer::inference_decode(std::int32_t token_id, int position) {
+    std::vector<float> logits;
+    run_work([&logits, token_id, position](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("inference_decode: model is not a DslModel");
+        }
+        auto result = dsl_model->inference_decode(token_id, position, *ctx.Communicator);
+        if (ctx.Communicator->local_rank() == 0) {
+            logits = std::move(result);
+        }
+    });
+    return logits;
+}
+
+void MultiGPUPyTrainer::set_kv_pos(int pos) {
+    run_work([pos](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("set_kv_pos: model is not a DslModel");
+        }
+        dsl_model->set_kv_pos(pos);
+    });
+}
+
+std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
+                                                        const std::int32_t* targets,
+                                                        int B, int T, bool use_lora) {
+    std::vector<float> result;
+    run_work([&result, input_ids, targets, B, T, use_lora](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("compute_logprobs: model is not a DslModel");
+        }
+        auto logprobs = dsl_model->compute_logprobs(input_ids, targets, B, T, use_lora,
+                                                    *ctx.Communicator);
+        if (ctx.Communicator->local_rank() == 0) {
+            result = std::move(logprobs);
+        }
+    });
+    return result;
+}
+
+void MultiGPUPyTrainer::step_with_custom_loss(
+        const std::int32_t* inputs,
+        const std::int32_t* targets,
+        const float* per_token_grads,
+        const std::int32_t* position_ids) {
+    // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
+    for (int i = 0; i < (int)mContexts.size(); ++i) {
+        auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("step_with_custom_loss: ctx[{}].Model is null", i));
+        }
+        auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
+        auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) *
+                                       static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+
+        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            std::memcpy(pb, position_ids + i * pos_stride, pos_stride * sizeof(std::int32_t));
+        } else {
+            fill_sequential_position_ids(pb, pos_planes, B, T);
+        }
+    }
+
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(fmt::format("step_with_custom_loss: micro_step {} >= grad_accumulation {}",
+                                             mTrainMicroStep, mGradAccumulation));
+    }
+
+    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
+              per_token_grads, B = this->B, T = this->T](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("step_with_custom_loss: model is not a DslModel");
+        }
+
+        Tensor inputs_tensor = ctx.Model->get_input_buffer();
+        Tensor position_ids_tensor = ctx.Model->get_position_ids_buffer();
+        Tensor targets_tensor = ctx.Model->get_target_buffer();
+
+        // Each GPU receives its own slice of the per_token_grads buffer.
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const float* grads_for_this_gpu = per_token_grads +
+                                          static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+
+        dsl_model->step_with_custom_loss(inputs_tensor, position_ids_tensor, targets_tensor,
+                                          grads_for_this_gpu, micro_batches, micro_idx,
+                                          *ctx.Communicator);
+    });
+
+    ++mTrainMicroStep;
+}
+
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {
     int result = 0;
     run_work([&result](sThreadContext& ctx) {

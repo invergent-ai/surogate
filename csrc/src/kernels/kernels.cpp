@@ -618,6 +618,17 @@ void chunked_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const
     }
 }
 
+void extract_logprobs(const Tensor& logits, float* logprobs, const Tensor& targets,
+                      int BT, int V, int P, cudaStream_t stream) {
+    if (logits.DType == ETensorDType::FP32) {
+        extract_logprobs(logits.get<float>(), logprobs, targets.get<int>(), BT, V, P, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        extract_logprobs(logits.get<nv_bfloat16>(), logprobs, targets.get<int>(), BT, V, P, stream);
+    } else {
+        throw std::runtime_error("extract_logprobs: unsupported logits dtype");
+    }
+}
+
 /**
  * @brief Performs the forward pass of the encoder layer (embedding lookup + positional encoding).
  *

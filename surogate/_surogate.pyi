@@ -1245,10 +1245,93 @@ class SurogateTrainer:
         - path: Output directory path.
         - base_model_path: Optional path/name of base model for adapter_config.json.
         """
+    def enter_inference_mode(self, max_seq_len: int) -> None:
+        """
+        Allocate KV-cache and switch model to inference mode.
+
+        Must be called before inference_prefill(). Frees any existing KV-cache.
+
+        Parameters:
+        - max_seq_len: Maximum total sequence length (prompt + generation tokens).
+        """
+    def exit_inference_mode(self) -> None:
+        """
+        Free KV-cache and return model to training mode.
+        """
+    def inference_prefill(self, input_ids: npt.NDArray[np.int32]) -> npt.NDArray[np.float32]:
+        """
+        Run prefill forward pass and populate the KV-cache.
+
+        Parameters:
+        - input_ids: int32 token IDs shaped [seq_len].
+
+        Returns: float32 logits shaped [vocab_size] for the last prompt token.
+        """
+    def inference_decode(self, token_id: int, position: int) -> npt.NDArray[np.float32]:
+        """
+        Run single-token decode step using the KV-cache.
+
+        Parameters:
+        - token_id: int32 token ID to decode.
+        - position: Token position index (equals current KV-cache position).
+
+        Returns: float32 logits shaped [vocab_size].
+        """
+    def set_kv_pos(self, pos: int) -> None:
+        """
+        Reset KV-cache current position to pos without clearing cached K/V.
+
+        Used to generate G completions from the same prompt without re-prefilling:
+          1. inference_prefill(prompt)         — fills cache at [0, prompt_len)
+          2. for each completion:
+               set_kv_pos(prompt_len)          — reset decode start
+               inference_decode(token, prompt_len)  — first decode step
+               ...
+
+        Parameters:
+        - pos: Target position in [0, max_seq_len].
+        """
+    def compute_logprobs(
+        self,
+        input_ids: npt.NDArray[np.int32],
+        targets: npt.NDArray[np.int32],
+        use_lora: bool = True,
+    ) -> npt.NDArray[np.float32]:
+        """
+        Compute per-token log-probabilities for a batch.
+
+        Parameters:
+        - input_ids: int32 token IDs shaped [B, T].
+        - targets:   int32 target IDs shaped [B, T]; -100 for masked positions.
+        - use_lora:  If True (default), apply LoRA adapters (policy model).
+                     If False, skip LoRA (reference model).
+
+        Returns: float32 log-probabilities shaped [B, T].
+                 Masked positions (target == -100) receive 0.
+        """
+    def step_with_custom_loss(
+        self,
+        input_ids: npt.NDArray[np.int32],
+        targets: npt.NDArray[np.int32],
+        per_token_grads: npt.NDArray[np.float32],
+    ) -> None:
+        """
+        Run one training micro-step with externally-computed per-token gradient multipliers.
+
+        Parameters:
+        - input_ids:       int32 token IDs shaped [B, T] (or [ngpu*B, T] for multi-GPU).
+        - targets:         int32 target IDs shaped [B, T]; -100 for masked positions.
+        - per_token_grads: float32 per-token gradient multipliers shaped [B, T].
+                           per_token_grads[b, t] = dL_GRPO/d(log_prob_policy)[b, t].
+                           Masked positions should be 0.
+
+        Equivalent to step() but uses provided per-token gradients instead of d_loss=1.0.
+        Call update_with_config() after grad_accum steps to apply gradients.
+        """
     def export_model(self, path: str) -> None:
         """
         Export model weights and config to a directory.
-        
+
         Parameters:
         - path: Output directory path.
         """

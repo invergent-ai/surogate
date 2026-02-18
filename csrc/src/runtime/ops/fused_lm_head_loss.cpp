@@ -43,6 +43,66 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
         mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
     }
 
+    // -----------------------------------------------------------------------
+    // Inference mode: compute logits for last token, copy to CPU, skip loss.
+    // -----------------------------------------------------------------------
+    if (mKVCache && mInferenceLogitsCpu) {
+        // BT may be B*T (prefill) or B*1 (decode). We want logits for the
+        // very last token of the sequence (position BT-1).
+        const long last_token = BT - 1;
+        const std::size_t xf_stride_inf = get_dtype_size(xF_flat.DType);
+
+        Tensor xF_last = xF_flat;
+        xF_last.Data = static_cast<std::byte*>(xF_last.Data) +
+                       static_cast<std::size_t>(last_token) * xf_stride_inf * static_cast<std::size_t>(C);
+        xF_last.Sizes[0] = 1;
+        xF_last.Sizes[1] = C;
+        xF_last.Rank = 2;
+
+        Tensor logits_gpu = mRunState.temp_alloc(ETensorDType::FP32, {1, static_cast<long>(V)});
+        mTemps.push_back(logits_gpu);
+
+        matmul(logits_gpu, weight, xF_last,
+               std::nullopt, nullptr, nullptr,
+               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               V, 1, C,
+               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        CUDA_CHECK(cudaMemcpyAsync(mInferenceLogitsCpu, logits_gpu.Data,
+                                   static_cast<std::size_t>(V) * sizeof(float),
+                                   cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+
+        if (need_lm_head) {
+            mWeightManager->release_lm_head(mRunState.MainStream);
+        }
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Log-prob mode: compute log P(target | context) for all BT tokens, skip loss.
+    // -----------------------------------------------------------------------
+    if (mLogprobsGpu) {
+        Tensor logits = mRunState.non_block_activations().output;
+        logits.Sizes[0] = BT;
+        logits.Sizes[1] = V;
+        logits.Rank = 2;
+
+        matmul(logits, weight, xF_flat,
+               std::nullopt, nullptr, nullptr,
+               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               V, static_cast<int>(BT), C,
+               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        extract_logprobs(logits, mLogprobsGpu, targets,
+                         static_cast<int>(BT), V, P, mRunState.MainStream);
+
+        if (need_lm_head) {
+            mWeightManager->release_lm_head(mRunState.MainStream);
+        }
+        return;
+    }
+
     const std::size_t xf_stride = get_dtype_size(xF_flat.DType);
     const std::size_t tgt_stride = get_dtype_size(targets.DType);
     const std::size_t loss_stride = get_dtype_size(loss.DType);
@@ -164,7 +224,15 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     if (op.inputs[0].slot == TensorSlot::DLoss ||
         op.inputs[0].slot == TensorSlot::Losses ||
         d_loss_like) {
-        fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+        if (mCustomDLossGpu) {
+            // GRPO mode: seed d_loss from externally-computed per-token gradients.
+            // mCustomDLossGpu contains B*T float32 values = dL_GRPO/d(log_prob)[t].
+            CUDA_CHECK(cudaMemcpyAsync(d_loss.Data, mCustomDLossGpu,
+                                       static_cast<std::size_t>(d_loss.nelem()) * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        } else {
+            fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+        }
         d_loss_seeded = true;
     }
 

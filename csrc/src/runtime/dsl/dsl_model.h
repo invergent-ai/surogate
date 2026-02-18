@@ -28,6 +28,7 @@
 #include "utilities/tensor_container.h"
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/mapping_spec.h"
+#include "runtime/dsl/kv_cache.h"
 
 namespace modules {
 struct HfMapping;
@@ -163,6 +164,74 @@ public:
     /// Must be called before import_weights().
     void set_adapter_path(const std::string& path) { mAdapterPath = path; }
 
+    // -------------------------------------------------------------------------
+    // Inference API (used by GRPO online generation)
+    // -------------------------------------------------------------------------
+
+    /// Allocate KV-cache and switch model to inference mode.
+    /// Call before inference_prefill().  Frees any existing KV-cache.
+    /// max_seq_len: maximum total sequence length (prompt + generation).
+    void enter_inference_mode(int max_seq_len);
+
+    /// Free KV-cache and return model to training mode.
+    void exit_inference_mode();
+
+    /// Prefill: run the model on a prompt and populate the KV-cache.
+    /// Returns logits for the last prompt token (B=1 currently).
+    /// Must call enter_inference_mode() first.
+    std::vector<float> inference_prefill(const std::int32_t* input_ids, int seq_len,
+                                         NCCLCommunicator& comm);
+
+    /// Decode: run the model on a single new token and return logits [vocab_size].
+    /// Updates the KV-cache to include the new token.
+    /// position is the token index being decoded (= current_pos after prefill).
+    std::vector<float> inference_decode(std::int32_t token_id, int position,
+                                        NCCLCommunicator& comm);
+
+    /// Set the KV-cache current position without invalidating the cached K/V.
+    ///
+    /// Used to generate G completions from the same prompt:
+    ///   1. Call inference_prefill(prompt) — fills cache at [0, prompt_len).
+    ///   2. Note prompt_len = return value or saved elsewhere.
+    ///   3. For each of G completions:
+    ///        set_kv_pos(prompt_len);            // reset decode position
+    ///        inference_decode(last_prompt_token, prompt_len);  // first decode step
+    ///        ...
+    void set_kv_pos(int pos);
+
+    /// Compute per-token log-probabilities for a batch of sequences.
+    ///
+    /// input_ids: CPU int32 token IDs, shape [B, T] (row-major).
+    /// targets:   CPU int32 target IDs, shape [B, T]; -100 = masked positions.
+    /// B, T:      Batch size and sequence length.
+    /// use_lora:  If true and LoRA is enabled, apply LoRA adapters (policy model).
+    ///            If false, skip LoRA (reference model).
+    ///
+    /// Returns a vector of B*T float log-probabilities; masked positions receive 0.
+    std::vector<float> compute_logprobs(const std::int32_t* input_ids,
+                                        const std::int32_t* targets,
+                                        int B, int T, bool use_lora,
+                                        NCCLCommunicator& comm);
+
+    /// Run one training micro-step with externally-computed per-token gradient multipliers.
+    ///
+    /// Equivalent to forward() + backward() but replaces the standard d_loss=1.0 seeding
+    /// with the provided per-token gradient values.  Used by GRPO to feed
+    /// dL_GRPO/d(log_prob_policy)[t] directly through the LM-head backward.
+    ///
+    /// inputs:              Forward input tensor (from get_input_buffer()).
+    /// position_ids:        Position IDs tensor (from get_position_ids_buffer()).
+    /// targets:             Target token IDs tensor (from get_target_buffer()).
+    /// per_token_grads_cpu: CPU float32 per-token gradient multipliers, shape [B*T].
+    ///   per_token_grads_cpu[b*T + t] = dL_GRPO / d(log_prob_policy)[b, t].
+    ///   Masked positions (target==-100) should have 0 gradient.
+    /// grad_accum_steps:    Total gradient accumulation steps.
+    /// micro_step:          Current micro-step index within grad_accum_steps.
+    void step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor targets,
+                                const float* per_token_grads_cpu,
+                                int grad_accum_steps, int micro_step,
+                                NCCLCommunicator& comm);
+
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
     void on_restore_checkpoint(NCCLCommunicator& comm) override;
@@ -245,6 +314,10 @@ private:
 
     // Adapter merge state (optional — stacked LoRA)
     std::string mAdapterPath;
+
+    // KV-cache and inference state (null when in training mode)
+    std::unique_ptr<KVCache>       mKVCache;
+    std::vector<float>             mInferenceLogits;  // CPU-side logits scratch buffer
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <numeric>
 #include <stdexcept>
 
 #include "kernels/kernels.h"
@@ -744,6 +745,450 @@ void DslModel::set_internal_graphs_enabled(bool enabled) {
 
 bool DslModel::internal_graphs_enabled() const {
     return mExecutor ? mExecutor->internal_graphs_enabled() : false;
+}
+
+// ============================================================================
+// Inference API (KV-cache, no gradients)
+// ============================================================================
+
+void DslModel::enter_inference_mode(int max_seq_len) {
+    if (!mRunState || !mExecutor) {
+        throw std::logic_error("DslModel::enter_inference_mode: call allocate_run_state() first");
+    }
+    // Free any existing KV-cache before allocating a new one.
+    if (mKVCache) {
+        mKVCache->free_memory();
+        mKVCache.reset();
+    }
+
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    const int Hkv        = static_cast<int>(mModelConfig.NumKeyValHeads);
+    const int HS         = static_cast<int>(mModelConfig.head_size());
+
+    mKVCache = std::make_unique<KVCache>();
+    mKVCache->allocate(num_layers, /*B=*/1, max_seq_len, Hkv, HS);
+    mInferenceLogits.resize(static_cast<std::size_t>(mModelConfig.VocabSize));
+}
+
+void DslModel::exit_inference_mode() {
+    if (mKVCache) {
+        mKVCache->free_memory();
+        mKVCache.reset();
+    }
+    mInferenceLogits.clear();
+    mInferenceLogits.shrink_to_fit();
+}
+
+std::vector<float> DslModel::inference_prefill(const std::int32_t* input_ids, int seq_len,
+                                                NCCLCommunicator& comm) {
+    if (!mKVCache) {
+        throw std::logic_error("DslModel::inference_prefill: call enter_inference_mode() first");
+    }
+
+    auto& rs = *mRunState;
+
+    // The training buffer rs.Inputs is allocated for (B_train, T_train).
+    // Inference uses B=1 so we need seq_len <= B_train * T_train.
+    const std::size_t avail_elems =
+        static_cast<std::size_t>(rs.B) * static_cast<std::size_t>(rs.T);
+    if (static_cast<std::size_t>(seq_len) > avail_elems) {
+        throw std::runtime_error(
+            "DslModel::inference_prefill: seq_len exceeds training input buffer capacity");
+    }
+
+    // Copy token IDs to GPU.
+    const std::size_t input_bytes = static_cast<std::size_t>(seq_len) * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, input_ids,
+                               input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+
+    // Build position IDs [0, 1, ..., seq_len-1] and copy to GPU.
+    std::vector<std::int32_t> pos_ids(static_cast<std::size_t>(seq_len));
+    std::iota(pos_ids.begin(), pos_ids.end(), 0);
+    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, pos_ids.data(),
+                               input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+
+    // Reset KV-cache to prefill state (new generation).
+    mKVCache->reset();
+
+    auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!exec) {
+        throw std::logic_error("DslModel::inference_prefill: executor type not supported");
+    }
+    exec->execute_inference_forward(/*B=*/1, static_cast<long>(seq_len),
+                                    *mKVCache, mInferenceLogits.data(),
+                                    static_cast<int>(mModelConfig.VocabSize), comm);
+    return mInferenceLogits;
+}
+
+std::vector<float> DslModel::inference_decode(std::int32_t token_id, int position,
+                                              NCCLCommunicator& comm) {
+    if (!mKVCache) {
+        throw std::logic_error("DslModel::inference_decode: call enter_inference_mode() first");
+    }
+
+    auto& rs = *mRunState;
+
+    // Copy single token ID and its position to GPU.
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, &token_id,
+                               sizeof(std::int32_t), cudaMemcpyHostToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, &position,
+                               sizeof(std::int32_t), cudaMemcpyHostToDevice, rs.MainStream));
+
+    auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!exec) {
+        throw std::logic_error("DslModel::inference_decode: executor type not supported");
+    }
+    exec->execute_inference_forward(/*B=*/1, /*T=*/1,
+                                    *mKVCache, mInferenceLogits.data(),
+                                    static_cast<int>(mModelConfig.VocabSize), comm);
+    return mInferenceLogits;
+}
+
+void DslModel::set_kv_pos(int pos) {
+    if (!mKVCache) {
+        throw std::logic_error("DslModel::set_kv_pos: call enter_inference_mode() first");
+    }
+    if (pos < 0 || pos > mKVCache->max_seq_len) {
+        throw std::out_of_range("DslModel::set_kv_pos: pos out of range [0, max_seq_len]");
+    }
+    mKVCache->set_current_pos(pos);
+}
+
+std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
+                                               const std::int32_t* targets,
+                                               int B, int T, bool use_lora,
+                                               NCCLCommunicator& comm) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::compute_logprobs called before allocate_run_state()");
+    }
+
+    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!graph_exec) {
+        throw std::runtime_error("DslModel::compute_logprobs: executor is not a GraphExecutor");
+    }
+
+    const int BT = B * T;
+    std::vector<float> result(static_cast<std::size_t>(BT), 0.0f);
+
+    const modules::ForwardHook* hook_ptr = nullptr;
+    modules::ForwardHook hook;
+
+    if (use_lora && lora_enabled()) {
+        ensure_lora_run_state(comm, B, T);
+
+        hook = [this](int layer_idx, cudaStream_t stream, modules::ForwardHookPoint point, void* context) {
+            (void)context;
+            const auto& cfg = mModelConfig;
+            auto& rs = *mRunState;
+            const int B_ = (int)rs.B;
+            const int T_ = (int)rs.T;
+            const int C = (int)cfg.HiddenSize;
+            const int D = (int)cfg.IntermediateSize;
+            const int Hq = (int)cfg.NumQueryHeads;
+            const int Hkv = (int)cfg.NumKeyValHeads;
+            const int Hs = (int)cfg.head_size();
+            const int rank = mLoRAConfig->rank;
+            const float scaling = mLoRAConfig->scaling();
+            const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+
+            auto& acts = rs.simplified_acts(layer_idx);
+            auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
+            switch (point) {
+                case modules::ForwardHookPoint::AfterQKVProjection: {
+                    if (lora_block.attention.q.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, C, Hq * Hs, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                    if (lora_block.attention.k.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, C, Hkv * Hs, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                    if (lora_block.attention.v.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, C, Hkv * Hs, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                } break;
+                case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                    if (lora_block.attention.o.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, Hq * Hs, C, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                } break;
+                case modules::ForwardHookPoint::AfterMLPUpProjection: {
+                    Tensor& ln2_input = acts.ln2.Data ? acts.ln2 : acts.ln1;
+                    if (lora_block.mlp.up.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.mlp_up, 0, ln2_input, lora_block.mlp.up.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, C, D, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                    if (gated_mlp && lora_block.mlp.gate.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.mlp_up, D, ln2_input, lora_block.mlp.gate.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, C, D, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                } break;
+                case modules::ForwardHookPoint::AfterMLPDownProjection: {
+                    if (lora_block.mlp.down.has_value()) {
+                        modules::detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
+                                                        mLoRARunState->intermediate, mLoRARunState->slice,
+                                                        scaling, 0.0f, 0, false,
+                                                        B_ * T_, D, C, rank,
+                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                } break;
+                default:
+                    break;
+            }
+        };
+        hook_ptr = &hook;
+    }
+
+    graph_exec->execute_logprobs_forward((long)B, (long)T, input_ids, targets,
+                                          result.data(), hook_ptr, comm);
+    return result;
+}
+
+void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor targets,
+                                      const float* per_token_grads_cpu,
+                                      int grad_accum_steps, int micro_step,
+                                      NCCLCommunicator& comm) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_with_custom_loss called before allocate_run_state()");
+    }
+
+    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!graph_exec) {
+        throw std::runtime_error("DslModel::step_with_custom_loss: executor is not a GraphExecutor");
+    }
+
+    // Forward pass (with LoRA hooks if enabled) — saves activations for backward.
+    forward(inputs, position_ids, comm, micro_step);
+
+    if (!lora_enabled()) {
+        // No LoRA: plain backward with custom d_loss.
+        graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
+                                               comm, grad_accum_steps, micro_step, nullptr);
+        return;
+    }
+
+    // LoRA backward: mirror DslModel::backward() exactly, but use backward_with_custom_dloss.
+    ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+
+    if (mLoRALn1Names.empty()) {
+        build_lora_name_tables();
+    }
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+
+    modules::BackwardHook hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream,
+                               modules::BackwardHookPoint point, void* context) {
+        (void)context;
+        const auto& cfg = mModelConfig;
+        auto& rs = *mRunState;
+        const int B = (int)rs.B;
+        const int T = (int)rs.T;
+        const int C = (int)cfg.HiddenSize;
+        const int D = (int)cfg.IntermediateSize;
+        const int Hq = (int)cfg.NumQueryHeads;
+        const int Hkv = (int)cfg.NumKeyValHeads;
+        const int Hs = (int)cfg.head_size();
+        const int rank = mLoRAConfig->rank;
+        const float dropout = mLoRAConfig->dropout;
+        const bool is_training = mLoRARunState->is_training;
+        const int micro_step = mLoRARunState->micro_step;
+        const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+
+        auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+            return mLoRARunState->dropout_base_seed
+                   + static_cast<unsigned int>(layer_idx) * 1000000u
+                   + static_cast<unsigned int>(proj_type) * 100000u
+                   + static_cast<unsigned int>(micro_step) * 10000u;
+        };
+
+        auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
+        switch (point) {
+            case modules::BackwardHookPoint::AfterMLPDownBackward: {
+                if (!lora_block.mlp.down.has_value()) break;
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+                if (!lora_grads.mlp.down.has_value()) break;
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+                modules::detail::backward_lora_layer(
+                    lora_grads.mlp.down->A, lora_grads.mlp.down->B,
+                    da.d_swiglu, da.d_res_ffn, 0, a.swiglu,
+                    lora_block.mlp.down->A, lora_block.mlp.down->B,
+                    mLoRAConfig->scaling(), dropout, get_dropout_seed(6), is_training,
+                    mLoRARunState->intermediate, mLoRARunState->slice,
+                    B * T, D, C, rank, lora_accum,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+            } break;
+            case modules::BackwardHookPoint::AfterMLPUpBackward: {
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+                Tensor& d_ln2 = da.d_ln2.Data ? da.d_ln2 : da.d_ln1;
+                Tensor ln2_input;
+                if (mOptions.recompute_enabled()) {
+                    if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
+                        Tensor& ln2_weight = mParams->get(mLoRALn2Names[layer_idx]);
+                        Tensor ln2_residual;
+                        if (a.residual_att.Data) {
+                            ln2_residual = a.residual_att;
+                        } else if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
+                            if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx, rs.side_stream());
+                            ln2_residual = rs.get_residual(layer_idx, stream);
+                        } else if (layer_idx == 0) {
+                            ln2_residual = rs.non_block_activations().encoded;
+                        } else {
+                            if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx - 1, rs.side_stream());
+                            ln2_residual = rs.get_residual(layer_idx - 1, stream);
+                        }
+                        ln2_input = recompute_lora_rmsnorm(*mLoRARunState, ln2_residual, ln2_weight,
+                                                           mModelConfig.RmsNormEps, B, T, C, stream);
+                    } else {
+                        ln2_input = a.ln2.Data ? a.ln2 : a.ln1;
+                    }
+                } else {
+                    ln2_input = a.ln2.Data ? a.ln2 : a.ln1;
+                }
+                Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
+                modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
+                if (gated_mlp) {
+                    if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
+                        dA_up = lora_grads.mlp.up->A; dB_up = lora_grads.mlp.up->B;
+                        lora_up = *lora_block.mlp.up;
+                    }
+                    if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
+                        dA_gate = lora_grads.mlp.gate->A; dB_gate = lora_grads.mlp.gate->B;
+                        lora_gate = *lora_block.mlp.gate;
+                    }
+                    if (!dA_up.Data && !dA_gate.Data) break;
+                    modules::detail::backward_lora_mlp_up_gate_fused(
+                        dA_up, dB_up, dA_gate, dB_gate, d_ln2, da.d_mlp_up, ln2_input,
+                        lora_up, lora_gate, mLoRAConfig->scaling(),
+                        dropout, get_dropout_seed(4), get_dropout_seed(5), is_training,
+                        B * T, C, D, rank, lora_accum,
+                        mLoRARunState->intermediate, mLoRARunState->intermediate2,
+                        mLoRARunState->slice, rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                } else {
+                    if (!lora_block.mlp.up.has_value() || !lora_grads.mlp.up.has_value()) break;
+                    dA_up = lora_grads.mlp.up->A; dB_up = lora_grads.mlp.up->B;
+                    lora_up = *lora_block.mlp.up;
+                    modules::detail::backward_lora_layer(
+                        dA_up, dB_up, d_ln2, da.d_mlp_up, 0, ln2_input,
+                        lora_up.A, lora_up.B, mLoRAConfig->scaling(),
+                        dropout, get_dropout_seed(4), is_training,
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        B * T, C, D, rank, lora_accum,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                if (!lora_block.attention.o.has_value()) break;
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+                if (!lora_grads.attention.o.has_value()) break;
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+                modules::detail::backward_lora_layer(
+                    lora_grads.attention.o->A, lora_grads.attention.o->B,
+                    da.d_att, da.d_att_out, 0, a.att,
+                    lora_block.attention.o->A, lora_block.attention.o->B,
+                    mLoRAConfig->scaling(), dropout, get_dropout_seed(3), is_training,
+                    mLoRARunState->intermediate, mLoRARunState->slice,
+                    B * T, Hq * Hs, C, rank, lora_accum,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+            } break;
+            case modules::BackwardHookPoint::AfterQKVBackward: {
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                lora_accum = lora_accum || accumulate;
+                auto& a = rs.simplified_acts(layer_idx);
+                auto& da = rs.simplified_grads(layer_idx);
+                Tensor ln1_input;
+                if (mOptions.recompute_enabled()) {
+                    if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
+                        Tensor& ln1_weight = mParams->get(mLoRALn1Names[layer_idx]);
+                        Tensor ln1_residual;
+                        if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
+                            if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx, rs.side_stream());
+                            ln1_residual = rs.get_residual(layer_idx, stream);
+                        } else if (layer_idx == 0) {
+                            ln1_residual = rs.non_block_activations().encoded;
+                        } else {
+                            if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx - 1, rs.side_stream());
+                            ln1_residual = rs.get_residual(layer_idx - 1, stream);
+                        }
+                        ln1_input = recompute_lora_rmsnorm(*mLoRARunState, ln1_residual, ln1_weight,
+                                                           mModelConfig.RmsNormEps, B, T, C, stream);
+                    } else {
+                        ln1_input = a.ln1;
+                    }
+                } else {
+                    ln1_input = a.ln1;
+                }
+                Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
+                modules::LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
+                if (lora_block.attention.q.has_value() && lora_grads.attention.q.has_value()) {
+                    dA_q = lora_grads.attention.q->A; dB_q = lora_grads.attention.q->B;
+                    lora_q = *lora_block.attention.q;
+                }
+                if (lora_block.attention.k.has_value() && lora_grads.attention.k.has_value()) {
+                    dA_k = lora_grads.attention.k->A; dB_k = lora_grads.attention.k->B;
+                    lora_k = *lora_block.attention.k;
+                }
+                if (lora_block.attention.v.has_value() && lora_grads.attention.v.has_value()) {
+                    dA_v = lora_grads.attention.v->A; dB_v = lora_grads.attention.v->B;
+                    lora_v = *lora_block.attention.v;
+                }
+                if (!dA_q.Data && !dA_k.Data && !dA_v.Data) break;
+                modules::detail::backward_lora_qkv_fused(
+                    dA_q, dB_q, dA_k, dB_k, dA_v, dB_v,
+                    da.d_ln1, da.d_qkv, ln1_input, lora_q, lora_k, lora_v,
+                    mLoRAConfig->scaling(),
+                    dropout, get_dropout_seed(0), get_dropout_seed(1), get_dropout_seed(2), is_training,
+                    B * T, C, Hq * Hs, Hkv * Hs, rank, lora_accum,
+                    mLoRARunState->intermediate, mLoRARunState->intermediate2,
+                    mLoRARunState->slice, rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                mLoRAGrads->notify_block(layer_idx, stream, comm);
+            } break;
+            default:
+                break;
+        }
+    };
+
+    graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
+                                            comm, grad_accum_steps, micro_step, &hook);
+
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    // Extend the base-model BackwardDone event to include LoRA gradient reductions.
+    internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
 }
 
 }  // namespace dsl

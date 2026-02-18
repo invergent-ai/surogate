@@ -848,3 +848,58 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* log
         BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ----------------------------------------------------------------------------
+// Per-token log-probability extraction
+
+/**
+ * @brief Kernel: compute log P(target | context) for each token position.
+ *
+ * For each row idx in [0, BT):
+ *   if target == -100: logprobs[idx] = 0  (masked)
+ *   else: logprobs[idx] = logit[target] - logsumexp(logits[idx, :])
+ *
+ * Uses prepare_softmax_blockwide3 for a numerically stable logsumexp.
+ * Only thread 0 writes the output (no race).
+ *
+ * @tparam floatX  Data type (float or nv_bfloat16).
+ * @param logits   Logits tensor of shape (BT, P), read-only.
+ * @param logprobs Output per-token log-probabilities, shape (BT,), FP32.
+ * @param targets  Target token indices, shape (BT,); -100 = masked.
+ * @param BT       Batch * sequence length.
+ * @param V        Actual vocabulary size (logits dimension).
+ * @param P        Padded vocabulary size (stride).
+ */
+template <class floatX>
+__global__ void extract_logprobs_kernel(const floatX* logits, float* logprobs,
+                                         const int* targets, int BT, int V, int P) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x);
+    if (idx >= static_cast<int64_t>(BT)) { return; }
+
+    int ix = targets[idx];
+    if (ix == -100) {
+        if (threadIdx.x == 0) { logprobs[idx] = 0.0f; }
+        return;
+    }
+
+    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
+    float lse = sp.Offset + logf(1.0f / sp.Scale);
+
+    if (threadIdx.x == 0) {
+        logprobs[idx] = (float)logits[idx * static_cast<int64_t>(P) + ix] - lse;
+    }
+}
+
+void extract_logprobs(const float* logits, float* logprobs, const int* targets,
+                      int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    extract_logprobs_kernel<<<BT, block_size, 0, stream>>>(logits, logprobs, targets, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void extract_logprobs(const nv_bfloat16* logits, float* logprobs, const int* targets,
+                      int BT, int V, int P, cudaStream_t stream) {
+    const int block_size = 256;
+    extract_logprobs_kernel<<<BT, block_size, 0, stream>>>(logits, logprobs, targets, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}

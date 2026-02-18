@@ -32,6 +32,7 @@
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/kv_cache.h"
 
 namespace modules {
 struct ModelConfig;
@@ -101,6 +102,34 @@ public:
     void set_weight_manager(DslWeightManager* weight_manager);
     void set_recipe(const recipes::Recipe* recipe);
     void set_hook_context(void* context);
+    // Inference mode: set KV-cache and output logits buffer.
+    // kv_cache == nullptr means training mode (default).
+    // logits_cpu must point to at least vocab_size floats of CPU memory
+    // that will be filled by dispatch_fused_lm_head_loss.
+    void set_inference_context(KVCache* kv_cache, bool is_decode,
+                               float* logits_cpu, int vocab_size) {
+        mKVCache     = kv_cache;
+        mIsDecodeMode = is_decode;
+        mInferenceLogitsCpu   = logits_cpu;
+        mInferenceVocabSize   = vocab_size;
+    }
+
+    /// Set the GPU buffer that receives per-token log P(target|context) values.
+    /// When non-null, dispatch_fused_lm_head_loss writes log-probs and returns early
+    /// (no loss accumulation, no gradient state update).
+    void set_logprobs_context(float* logprobs_gpu) {
+        mLogprobsGpu = logprobs_gpu;
+    }
+
+    /// Set the GPU buffer containing per-token custom d_loss values for GRPO backward.
+    /// When non-null, dispatch_fused_lm_head_loss_backward copies these values into
+    /// d_loss instead of seeding with 1.0 (standard cross-entropy training).
+    /// Buffer must contain B*T float32 values (same layout as the loss tensor).
+    /// Lifetime must extend through the execute_backward call.
+    void set_custom_dloss_context(float* custom_dloss_gpu) {
+        mCustomDLossGpu = custom_dloss_gpu;
+    }
+
     void set_recompute_fn(std::function<void(int, long, long, bool)> fn);
     void set_recompute_enabled(bool enabled);
     void set_recompute_use_graphs(bool enabled) { mRecomputeUseGraphs = enabled; }
@@ -266,6 +295,18 @@ private:
     DslGradStore& mGrads;
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
+
+    // Inference context (null in training mode)
+    KVCache* mKVCache              = nullptr;
+    bool     mIsDecodeMode         = false;
+    float*   mInferenceLogitsCpu   = nullptr;
+    int      mInferenceVocabSize   = 0;
+
+    // Log-prob extraction context (null in training/inference mode)
+    float*   mLogprobsGpu          = nullptr;
+
+    // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)
+    float*   mCustomDLossGpu       = nullptr;
 
     // Optional components
     const modules::ModularLoRAConfig* mLoRAConfig = nullptr;

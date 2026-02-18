@@ -1442,5 +1442,163 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
 }
 
+// ============================================================================
+// Inference forward (KV-cache, no gradients)
+// ============================================================================
+
+void GraphExecutor::execute_inference_forward(long B, long T, KVCache& kv_cache,
+                                              float* logits_cpu, int vocab_size,
+                                              NCCLCommunicator& comm)
+{
+    if (!mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiled executor not initialized");
+    }
+
+    // Recompile for this (B, T) if needed (shares graph cache with training).
+    compile_graphs(B, T);
+    if (!mCompiledForward) {
+        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
+    }
+
+    DslRunState& rs = mRunState;
+
+    // Bind inputs: embeddings / position-ids are set by DslModel before calling here.
+    // The compiled executor resolves them from the run-state slots as usual.
+
+    // Configure inference context on the compiled executor.
+    mCompiledExecutor->set_inference_context(&kv_cache, kv_cache.is_decode, logits_cpu, vocab_size);
+    mCompiledExecutor->set_dimensions(B, T);
+
+    // Empty save list: no activations need to survive for backward.
+    static const std::vector<std::string> empty_save_list;
+    mCompiledExecutor->set_save_list(&empty_save_list);
+
+    // Run forward (no CUDA-graph capture — inference shape changes each step).
+    mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, nullptr);
+
+    // Advance cache position for decode steps.
+    if (kv_cache.is_decode) {
+        kv_cache.current_pos += 1;
+    } else {
+        kv_cache.current_pos = static_cast<int>(T);
+        kv_cache.is_decode   = true;
+    }
+
+    // Restore training save list so subsequent training steps behave normally.
+    mCompiledExecutor->set_save_list(&mSaveList);
+
+    // Clear inference context.
+    mCompiledExecutor->set_inference_context(nullptr, false, nullptr, 0);
+}
+
+// ============================================================================
+// Log-prob forward (no KV-cache, no gradients, log-probability extraction)
+// ============================================================================
+
+void GraphExecutor::execute_logprobs_forward(long B, long T,
+                                              const std::int32_t* input_ids_cpu,
+                                              const std::int32_t* targets_cpu,
+                                              float* logprobs_cpu,
+                                              const modules::ForwardHook* hook,
+                                              NCCLCommunicator& comm)
+{
+    if (!mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiled executor not initialized");
+    }
+
+    compile_graphs(B, T);
+    if (!mCompiledForward) {
+        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
+    }
+
+    DslRunState& rs = mRunState;
+    const int BT = static_cast<int>(B * T);
+    const std::size_t token_bytes = static_cast<std::size_t>(BT) * sizeof(std::int32_t);
+
+    // Copy input IDs and targets to device.
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, input_ids_cpu, token_bytes,
+                               cudaMemcpyHostToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_cpu, token_bytes,
+                               cudaMemcpyHostToDevice, rs.MainStream));
+
+    // Build position IDs: [0, 1, ..., T-1] repeated B times.
+    {
+        std::vector<std::int32_t> pos_cpu(static_cast<std::size_t>(BT));
+        for (long b = 0; b < B; ++b) {
+            for (long t = 0; t < T; ++t) {
+                pos_cpu[static_cast<std::size_t>(b * T + t)] = static_cast<std::int32_t>(t);
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, pos_cpu.data(), token_bytes,
+                                   cudaMemcpyHostToDevice, rs.MainStream));
+    }
+
+    // Allocate GPU buffer for per-token log-probs.
+    float* logprobs_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&logprobs_gpu, static_cast<std::size_t>(BT) * sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0,
+                               static_cast<std::size_t>(BT) * sizeof(float), rs.MainStream));
+
+    // Configure logprobs context (intercepted in dispatch_fused_lm_head_loss).
+    mCompiledExecutor->set_logprobs_context(logprobs_gpu);
+    mCompiledExecutor->set_dimensions(B, T);
+
+    // No activations need to survive for backward.
+    static const std::vector<std::string> empty_save_list;
+    mCompiledExecutor->set_save_list(&empty_save_list);
+
+    // Run forward with optional LoRA hook (nullptr = no LoRA = reference model).
+    mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, hook);
+
+    // Copy results back to CPU.
+    CUDA_CHECK(cudaMemcpyAsync(logprobs_cpu, logprobs_gpu,
+                               static_cast<std::size_t>(BT) * sizeof(float),
+                               cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+
+    // Cleanup.
+    CUDA_CHECK(cudaFree(logprobs_gpu));
+    mCompiledExecutor->set_logprobs_context(nullptr);
+    mCompiledExecutor->set_save_list(&mSaveList);
+}
+
+// ============================================================================
+// Custom d_loss backward (GRPO: external per-token gradient multipliers)
+// ============================================================================
+
+void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
+                                                const float* per_token_grads_cpu,
+                                                NCCLCommunicator& comm,
+                                                int grad_accum_steps, int micro_step,
+                                                const modules::BackwardHook* hook)
+{
+    auto& rs = mRunState;
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    const std::size_t BT = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+
+    // Allocate a temporary GPU buffer and upload the custom per-token gradients.
+    // These replace the standard d_loss=1.0 seeding in dispatch_fused_lm_head_loss_backward.
+    float* custom_dloss_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, BT * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu, per_token_grads_cpu,
+                               BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
+    mCompiledExecutor->set_custom_dloss_context(custom_dloss_gpu);
+
+    // Run standard backward (with or without LoRA backward hook).
+    if (hook) {
+        backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, *hook);
+    } else {
+        backward(inputs, targets, comm, grad_accum_steps, micro_step);
+    }
+
+    // Synchronize to ensure the D→D copy of custom_dloss_gpu→d_loss completed
+    // before freeing the temporary buffer.  The copy is launched early in the
+    // backward graph (dispatch_fused_lm_head_loss_backward), so this sync also
+    // waits for the full backward to complete on the GPU.
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+    mCompiledExecutor->set_custom_dloss_context(nullptr);
+    CUDA_CHECK(cudaFree(custom_dloss_gpu));
+}
 
 }  // namespace dsl
