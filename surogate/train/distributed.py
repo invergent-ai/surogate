@@ -25,10 +25,7 @@ def _get_ray():
             import ray
             _ray = ray
         except ImportError:
-            raise ImportError(
-                "Ray is required for distributed training. "
-                "Install with: pip install surogate[distributed]"
-            )
+            raise ImportError("Ray is required for distributed training.")
     return _ray
 
 
@@ -782,10 +779,14 @@ class RayDistributedTrainer:
                 shard of the dataset instead of using pre-tokenized files. This
                 reduces driver memory pressure and enables parallel tokenization.
         """
+        from surogate.utils.logger import get_logger
+        logger = get_logger()
+        
         ray = _get_ray()
 
         # Initialize Ray if not already done
         if not ray.is_initialized():
+            logger.info("Initializing Ray...")
             ray.init(address=ray_address if ray_address != "local" else None)
 
         self._config = config
