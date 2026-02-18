@@ -80,7 +80,8 @@ def add_cuda_version_tag(cuda_tag: str):
     data['project']['version'] = f"{current_version}+{cuda_tag}"
     print(f"Set version to {data['project']['version']}")
     
-    data['project']['dependencies'] = CUDA_DEPS[cuda_tag]
+    existing_deps = list(data['project'].get('dependencies', []))
+    data['project']['dependencies'] = existing_deps + CUDA_DEPS[cuda_tag]
     
     with open('pyproject.toml', 'w') as f:
         tomlkit.dump(data, f)
