@@ -1685,29 +1685,41 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mTemps.clear();
     mMoEHostOffsetsCache.clear();
-    // Free retired shared EP buffers from previous steps (accumulated during reallocation).
-    // Previous step is fully complete, so these are no longer referenced.
-    for (auto& e : mEpRetiredBufs) {
-        if (e.ptr) cudaFree(e.ptr);
-    }
-    mEpRetiredBufs.clear();
-    // Free EP buffer pool — temporary buffers with short lifetimes (acquired/released
-    // within a single dispatch call). As routing imbalance changes during training,
-    // buffer sizes drift and stale entries become unreusable zombies. Clearing per-step
-    // prevents this accumulation; cudaMalloc overhead is negligible vs A2A/GEMM costs.
-    for (auto& e : mEpBufPool) {
-        if (e.ptr) cudaFree(e.ptr);
-    }
-    mEpBufPool.clear();
-    // Trim CUDA stream-ordered memory pool to release cached allocations.
-    // cuBLAS cublasGemmGroupedBatchedEx internally uses cudaMallocAsync;
-    // trimming reclaims unused cached blocks from previous steps.
-    {
-        int device;
-        cudaGetDevice(&device);
-        cudaMemPool_t pool;
-        if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
-            cudaMemPoolTrimTo(pool, 0);
+    // cudaFree and cudaMemPoolTrimTo are prohibited during CUDA stream capture —
+    // they invalidate the capture. Skip all cleanup when capturing; it will run
+    // on the next eager (non-captured) step instead.
+    // Check both the inner capture flag and the actual stream status (for outer
+    // whole-step captures like train_step_graphed that don't set mCapturing).
+    cudaStreamCaptureStatus cleanup_capture_status = cudaStreamCaptureStatusNone;
+    const bool cleanup_capturing =
+        mCapturing ||
+        (cudaStreamIsCapturing(mRunState.MainStream, &cleanup_capture_status) == cudaSuccess &&
+         cleanup_capture_status != cudaStreamCaptureStatusNone);
+    if (!cleanup_capturing) {
+        // Free retired shared EP buffers from previous steps (accumulated during reallocation).
+        // Previous step is fully complete, so these are no longer referenced.
+        for (auto& e : mEpRetiredBufs) {
+            if (e.ptr) cudaFree(e.ptr);
+        }
+        mEpRetiredBufs.clear();
+        // Free EP buffer pool — temporary buffers with short lifetimes (acquired/released
+        // within a single dispatch call). As routing imbalance changes during training,
+        // buffer sizes drift and stale entries become unreusable zombies. Clearing per-step
+        // prevents this accumulation; cudaMalloc overhead is negligible vs A2A/GEMM costs.
+        for (auto& e : mEpBufPool) {
+            if (e.ptr) cudaFree(e.ptr);
+        }
+        mEpBufPool.clear();
+        // Trim CUDA stream-ordered memory pool to release cached allocations.
+        // cuBLAS cublasGemmGroupedBatchedEx internally uses cudaMallocAsync;
+        // trimming reclaims unused cached blocks from previous steps.
+        {
+            int device;
+            cudaGetDevice(&device);
+            cudaMemPool_t pool;
+            if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+                cudaMemPoolTrimTo(pool, 0);
+            }
         }
     }
     // Initialize flat tensor vector indexed by compile-time tensor IDs
