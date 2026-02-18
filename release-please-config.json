@@ -1,5 +1,5 @@
 {
-  "release-type": "node",
+  "release-type": "simple",
   "packages": { ".": {} },
   "include-v-in-tag": true,
   "changelog-path": "CHANGELOG.md",
