@@ -35,7 +35,7 @@ def _get_version() -> str:
 
 
 def parse_args():
-    logger.banner(f"Surogate LLMOps CLI  v{_get_version()}")
+    logger.banner(f"Surogate LLMOps CLI v{_get_version()}")
 
     parser = argparse.ArgumentParser(description="Surogate LLMOps Framework")
     parser.set_defaults(func=lambda _args, p=parser: p.print_help())
