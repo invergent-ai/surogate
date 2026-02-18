@@ -1,7 +1,6 @@
 name: Build Wheels
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -74,7 +73,7 @@ jobs:
         run: uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py "${{ matrix.wheel_tag }}"
 
       - name: Build wheel
-        run: uv build --wheel
+        run: uv build --wheel --out-dir wheelhouse
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -95,16 +94,27 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Extract changelog for this version
-        id: changelog
+      - name: Find previous tag
+        id: prev
+        shell: bash
         run: |
-          # Extract the section for this tag from CHANGELOG.md
-          version="${{ github.ref_name }}"
-          version="${version#v}"  # strip leading 'v'
-          body=$(awk "/^## \[?${version}\]?/{found=1; next} found && /^## /{exit} found{print}" CHANGELOG.md)
-          # Write to a file to avoid quoting issues
-          echo "$body" > release_notes.md
+          set -euo pipefail
+          current="${GITHUB_REF_NAME}"
 
+          # previous tag before the current one (works well for semver-like vX.Y.Z tags)
+          prev="$(git describe --tags --abbrev=0 "${current}^" 2>/dev/null || true)"
+
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+      - name: Generate release notes from Conventional Commits
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: >-
+            ${{ steps.prev.outputs.prev && format('{0}..HEAD', steps.prev.outputs.prev) || '' }}
+            --strip header
+        env:
+          OUTPUT: release-notes.md
+          GITHUB_REPO: ${{ github.repository }}
       - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
@@ -113,10 +123,10 @@ jobs:
           merge-multiple: true
 
       - name: Create release with changelog
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          body_path: release_notes.md
+          body_path: release-notes.md
           files: wheelhouse/*.whl
           draft: false
           fail_on_unmatched_files: true
