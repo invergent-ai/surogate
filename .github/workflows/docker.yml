@@ -44,6 +44,7 @@ jobs:
         id: should_build
         run: |
           REQUESTED="${{ inputs.cuda_versions }}"
+          REQUESTED="${REQUESTED:-all}"
           CURRENT="${{ matrix.wheel_tag }}"
 
           if [[ "$REQUESTED" == "all" ]]; then
