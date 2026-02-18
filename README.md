@@ -95,7 +95,7 @@ docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my
 curl -LsSf https://surogate.ai/install.sh | sh
 ```
 
-### Option B: Build from source (dev / contributors)
+### Option C: Build from source (dev / contributors)
 You need CUDA 12.8/12.9/13.x installed on your machine and NCCL development libraries libnccl-dev for your CUDA version
 
 ```bash
