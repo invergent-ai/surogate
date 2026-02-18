@@ -134,6 +134,9 @@ class SurogateTrainerWrapper():
                         if not Path(base_weights_path).exists():
                             base_weights_path = config.model_dir
                 logger.info(f"Importing base model weights from {base_weights_path}...")
+                if config.adapter_path:
+                    logger.info(f"Merging adapter from {config.adapter_path} into base weights...")
+                    self.trainer.set_adapter_path(config.adapter_path)
                 self.trainer.import_weights(base_weights_path)
                 logger.info(f"Loading checkpoint from step {self.start_step}...")
                 self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
@@ -155,6 +158,9 @@ class SurogateTrainerWrapper():
                     lora_config=config.lora_config,
                     qlora_config=config.qlora_config
                 )
+                if config.adapter_path:
+                    logger.info(f"Merging adapter from {config.adapter_path} into base weights...")
+                    self.trainer.set_adapter_path(config.adapter_path)
                 self.trainer.import_weights(model_weights_path)
 
             elif config.from_scratch:

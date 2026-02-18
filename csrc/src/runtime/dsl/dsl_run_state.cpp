@@ -438,10 +438,13 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     }
 
     mNonBlockGradients.d_ln_final = mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
-    // Skip d_embeddings allocation in LoRA-only mode - embedding backward is skipped entirely
-    if (!mLoraOnlyMode) {
-        mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
-    }
+    // Always allocate d_embeddings even in LoRA-only mode. While embedding backward
+    // is skipped in LoRA mode, the autodiff graph still produces d_embed_1 as an
+    // intermediate. Without a persistent buffer, ensure_output_tensor allocates it on
+    // the stack where it blocks can_restore_stack for the entire backward pass (its
+    // last_use is the final embedding_backward op), preventing per-layer stack restores
+    // and causing stack OOM on MoE models with many layers.
+    mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
 }
 
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {

@@ -17,6 +17,7 @@
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/graph_executor.h"
 #include "runtime/lora/lora_model_utils.h"
+#include "runtime/qlora/adapter_merger.h"
 #include "utilities/utils.h"
 #include "utilities/safetensors.h"
 #include "utilities/dtype.h"
@@ -137,7 +138,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         mQLoRAProvider = internal::create_dsl_qlora_provider(
             *mModule, mModelConfig, *mConfig, mOptions,
             *mLoRAConfig, mQLoRAConfig, mAllocator,
-            mHfMapping, mShardIdx, mNumShards);
+            mHfMapping, mShardIdx, mNumShards, mAdapterPath);
         cudaStream_t quant_stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&quant_stream));
         mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);
@@ -169,6 +170,18 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         }
         return stride;
     };
+
+    // Adapter merge (stacked LoRA): merge previously-trained adapter into base weights.
+    // This runs ONLY on the BF16 path; the QLoRA path handles merging in the pipeline.
+    std::unique_ptr<qlora::AdapterMerger> adapter_merger;
+    cudaStream_t adapter_stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+    if (!qlora_enabled() && !mAdapterPath.empty()) {
+        ShardConfig shard_config;
+        shard_config.shard_idx = mShardIdx;
+        shard_config.num_shards = mNumShards;
+        adapter_merger = std::make_unique<qlora::AdapterMerger>(
+            mAdapterPath, mHfMapping, reader, shard_config);
+    }
 
     for (const auto& name : mParams->param_names()) {
         if (mParams->is_external(name)) {
@@ -263,6 +276,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 (void)end;
                 entry.read_raw(param, static_cast<std::ptrdiff_t>(start) * stride, param.nelem(), allow_cast);
             }
+            if (adapter_merger) {
+                adapter_merger->apply(name, param, adapter_stream);
+                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
+            }
             continue;
         }
 
@@ -330,6 +347,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             if (offset != global_rows) {
                 throw std::runtime_error("DSL model: fuse mapping size mismatch for " + name);
             }
+            if (adapter_merger) {
+                adapter_merger->apply(name, param, adapter_stream);
+                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
+            }
             continue;
         }
 
@@ -365,6 +386,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 const long local_start = start + shard_rows * mShardIdx;
                 const long stride = row_stride(entry.shape());
                 entry.read_raw(param, static_cast<std::ptrdiff_t>(local_start) * stride, param.nelem(), allow_cast);
+            }
+            if (adapter_merger) {
+                adapter_merger->apply(name, param, adapter_stream);
+                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
             }
             continue;
         }
@@ -478,6 +503,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             } else {
                 throw std::runtime_error("DSL model: transpose expects 2D or 3D tensors for " + name);
             }
+            if (adapter_merger) {
+                adapter_merger->apply(name, param, adapter_stream);
+                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
+            }
             continue;
         }
 
@@ -561,6 +590,16 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     gate_slice.Sizes[1] = C;
                     gate_slice.Data = param.Data + base_offset + sub_expert_elems * elem_size;
                     gate_entry.read_tensor(gate_slice, allow_cast);
+
+                    // Merge adapter delta for this expert (stacked LoRA)
+                    if (adapter_merger) {
+                        Tensor expert_view = param;
+                        expert_view.Rank = 2;
+                        expert_view.Sizes[0] = fused_rows;
+                        expert_view.Sizes[1] = C;
+                        expert_view.Data = param.Data + base_offset;
+                        adapter_merger->apply_expert(name, e, expert_view, adapter_stream);
+                    }
                 }
             } else {
                 // Load single tensor (e.g., down_proj) for each expert
@@ -580,6 +619,11 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     }
                     slice.Data = param.Data + static_cast<std::size_t>(local_e) * expert_size * elem_size;
                     entry.read_tensor(slice, allow_cast);
+
+                    // Merge adapter delta for this expert (stacked LoRA)
+                    if (adapter_merger) {
+                        adapter_merger->apply_expert(name, e, slice, adapter_stream);
+                    }
                 }
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));

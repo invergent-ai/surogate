@@ -184,7 +184,7 @@ private:
                             Tensor& target, int layer_idx, bool allow_cast,
                             bool param_sharded, cudaStream_t stream);
 
-    // ---- Utilities ----
+    // ---- Private utilities ----
 
     /// Compute shard row range for a sharded parameter.
     [[nodiscard]] std::pair<long, long> shard_range(long global_rows, bool param_sharded) const;
@@ -198,15 +198,18 @@ private:
     /// Infer fuse slice sizes from config (QKV, gate_up, etc.).
     [[nodiscard]] std::vector<long> infer_fuse_slices(const std::string& name, int num_sources) const;
 
+    /// Find the mapping spec for an internal parameter name.
+    /// Sets layer_idx if the name is a block parameter. Returns nullptr if no mapping found.
+    [[nodiscard]] const MappingSpec* find_mapping_spec(const std::string& internal_name, int& layer_idx) const;
+
+public:
+    // ---- Public static utilities (used by AdapterMerger) ----
+
     /// Format an HF name template by substituting {layer} and {expert}.
     [[nodiscard]] static std::string format_hf_name(std::string templ, int layer_idx, int expert_idx = -1);
 
     /// Parse "blocks[N].param_name" -> (layer_idx, param_name). Returns false if not a block param.
     [[nodiscard]] static bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name);
-
-    /// Find the mapping spec for an internal parameter name.
-    /// Sets layer_idx if the name is a block parameter. Returns nullptr if no mapping found.
-    [[nodiscard]] const MappingSpec* find_mapping_spec(const std::string& internal_name, int& layer_idx) const;
 
     /// Resolve number of experts for StackExperts (from spec, config, or moe_config).
     [[nodiscard]] int resolve_num_experts(const MappingSpec& spec) const;

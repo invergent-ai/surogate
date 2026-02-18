@@ -827,6 +827,11 @@ NB_MODULE(_surogate, m) {
              "- memcpy_all_gather/memcpy_send_recv: Enable memcpy-based collectives where supported.\n"
              "- lora_config: Optional LoRA configuration for adapter training (freezes base model).\n"
              "- qlora_config: Optional QLoRA configuration for quantized base weights (FP8/FP4).")
+        .def("set_adapter_path", &MultiGPUPyTrainer::set_adapter_path, nb::arg("path"),
+             "Set path to a PEFT adapter to merge into base weights during import.\n\n"
+             "Must be called before import_weights(). The adapter's LoRA deltas\n"
+             "are applied to BF16 base weights before quantization or storage.\n\n"
+             "Parameters:\n- path: Path to PEFT adapter directory (with adapter_config.json).")
         .def("import_weights", &MultiGPUPyTrainer::import_weights, nb::arg("path"),
              "Import weights from a HuggingFace model file.\n\n"
              "Parameters:\n- path: Path to model.safetensors or model.safetensors.index.json.")

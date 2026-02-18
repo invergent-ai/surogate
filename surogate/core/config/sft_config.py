@@ -354,6 +354,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     ep_size: Optional[int] = 1  # 1 = no EP (all experts replicated on every GPU)
     ep_load_balance_threshold: Optional[float] = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
 
+    adapter_path: Optional[str] = None  # PEFT adapter dir to merge into base weights before training
     merge_adapter: Optional[bool] = False
     use_chat_template: Optional[bool] = True
     debug_time_breakdown: Optional[bool] = False
@@ -469,6 +470,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.ep_size = cfg.get('ep_size', self.ep_size)
         self.ep_load_balance_threshold = float(cfg.get('ep_load_balance_threshold', self.ep_load_balance_threshold))
 
+        self.adapter_path = cfg.get('adapter_path', self.adapter_path)
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
@@ -772,6 +774,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             raise ValueError(
                 f"Pre-quantized model ({prequant_method}) requires `lora: true`. "
                 "Base weights are frozen (read-only quantized data); only LoRA adapters are trained."
+            )
+
+        # Validate: adapter_path + pre-quantized = error
+        if self.adapter_path and is_prequantized:
+            raise ValueError(
+                f"Cannot merge adapter into a pre-quantized model ({prequant_method}). "
+                "Pre-quantized weights are loaded directly without BF16 intermediate stage, "
+                "so adapter merging is not supported. Merge the adapter offline first."
+            )
+
+        # Validate: adapter_path requires lora
+        if self.adapter_path and not self.lora:
+            raise ValueError(
+                "adapter_path requires `lora: true`. "
+                "The adapter is merged into base weights and a new LoRA adapter is trained on top."
             )
 
         # QLoRA is only supported together with LoRA adapters in Surogate:

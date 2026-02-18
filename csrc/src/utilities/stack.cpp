@@ -6,6 +6,11 @@
 #include "stack.h"
 #include "utilities/utils.h"
 
+#include <algorithm>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 /**
  * @brief Construct a stack allocator over a pre-allocated device memory region.
  *
@@ -41,10 +46,36 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
         fprintf(stderr, "[Stack OOM] Failed to allocate '%s': requested=%zu MB, used=%zu MB, capacity=%zu MB\n",
                 name, aligned_amount / (1024*1024), used / (1024*1024), mCapacity / (1024*1024));
         // Print recent allocations
-        fprintf(stderr, "[Stack OOM] Recent allocations:\n");
+        fprintf(stderr, "[Stack OOM] Recent allocations (last 10 of %zu total):\n", mAlloc.size());
         size_t start = mAlloc.size() > 10 ? mAlloc.size() - 10 : 0;
         for (size_t i = start; i < mAlloc.size(); ++i) {
             fprintf(stderr, "  - %s: %zu MB\n", mAlloc[i].Name, mAlloc[i].Amount / (1024*1024));
+        }
+        // Print top allocations by size for diagnosis
+        if (mAlloc.size() > 10) {
+            std::vector<size_t> sorted_indices(mAlloc.size());
+            for (size_t i = 0; i < mAlloc.size(); ++i) sorted_indices[i] = i;
+            std::sort(sorted_indices.begin(), sorted_indices.end(),
+                      [this](size_t a, size_t b) { return mAlloc[a].Amount > mAlloc[b].Amount; });
+            fprintf(stderr, "[Stack OOM] Top 10 allocations by size:\n");
+            for (size_t i = 0; i < std::min<size_t>(10, sorted_indices.size()); ++i) {
+                const auto& rec = mAlloc[sorted_indices[i]];
+                fprintf(stderr, "  - %s: %zu MB (idx=%zu)\n", rec.Name, rec.Amount / (1024*1024), sorted_indices[i]);
+            }
+        }
+        // Print aggregate stats by name
+        fprintf(stderr, "[Stack OOM] Allocation summary by name:\n");
+        std::unordered_map<std::string, std::pair<size_t, size_t>> name_stats;  // name -> (count, total_bytes)
+        for (const auto& rec : mAlloc) {
+            auto& stats = name_stats[rec.Name];
+            stats.first++;
+            stats.second += rec.Amount;
+        }
+        std::vector<std::pair<std::string, std::pair<size_t, size_t>>> sorted_stats(name_stats.begin(), name_stats.end());
+        std::sort(sorted_stats.begin(), sorted_stats.end(),
+                  [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        for (const auto& [n, s] : sorted_stats) {
+            fprintf(stderr, "  - %s: count=%zu total=%zu MB\n", n.c_str(), s.first, s.second / (1024*1024));
         }
         throw std::bad_alloc();
     }

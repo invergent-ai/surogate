@@ -272,6 +272,7 @@ datasets:
 | `lora_dtype`          | string | `"fp32"`  | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                         |
 | `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
 | `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
+| `adapter_path`        | string | `null`    | Path to a PEFT adapter directory to merge into base weights before training. Requires `lora: true`. Not supported with pre-quantized models. |
 | `merge_adapter`       | bool   | `false`   | Whether to merge LoRA adapters into the base model after training.         |
 
 ## MoE Settings

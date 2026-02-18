@@ -119,6 +119,14 @@ struct DslQLoRAPipelineConfig {
     /// HF module paths that should NOT be quantized (loaded full-precision).
     /// Populated from HF quantization_config "ignore" / "modules_to_not_convert".
     std::vector<std::string> modules_to_not_convert;
+
+    // =========================================================================
+    // Adapter merging (stacked LoRA)
+    // =========================================================================
+
+    /// Path to a PEFT adapter directory to merge into base weights before
+    /// quantization. Empty string means no adapter merge.
+    std::string adapter_path;
 };
 
 /// Import weights from HuggingFace SafeTensors and quantize into a GenericWeightManager.

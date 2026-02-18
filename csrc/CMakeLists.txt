@@ -327,6 +327,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/qlora/generic_weight_manager.cpp
     src/runtime/qlora/dsl_qlora_pipeline.cpp
     src/runtime/qlora/generic_qlora_provider.cpp
+    src/runtime/qlora/adapter_merger.cpp
 
     src/runtime/lora/lora_weights_manager.cpp
     src/runtime/lora/lora_grads_manager.cpp

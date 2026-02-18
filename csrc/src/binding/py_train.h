@@ -64,6 +64,7 @@ public:
 
     ~MultiGPUPyTrainer();
 
+    void set_adapter_path(std::string path);
     void import_weights(std::string path);
     void export_model(std::string path);
     void export_adapter(std::string path, std::string base_model_path = "");

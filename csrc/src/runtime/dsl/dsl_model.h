@@ -27,6 +27,7 @@
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
 #include "runtime/core/qlora_provider.h"
+#include "runtime/dsl/mapping_spec.h"
 
 namespace modules {
 struct HfMapping;
@@ -158,6 +159,10 @@ public:
     std::vector<std::byte> rng_state() const override;
     void set_rng_state(const std::vector<std::byte>& state) override;
 
+    /// Set the path to a PEFT adapter to merge into base weights during import.
+    /// Must be called before import_weights().
+    void set_adapter_path(const std::string& path) { mAdapterPath = path; }
+
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
     void on_restore_checkpoint(NCCLCommunicator& comm) override;
@@ -178,19 +183,8 @@ public:
     std::string_view model_type() const override;
     IRunState& get_run_state() const override;
 
-    struct MappingSpec {
-        enum class Kind { Direct, Fuse, Split, Transform, TiedTo, StackExperts, Unknown };
-        Kind kind = Kind::Unknown;
-        std::string source;
-        std::vector<std::string> sources;
-        std::vector<std::pair<long, long>> ranges;
-        std::string fn;
-        std::string target;
-        int dim = 0;
-        bool optional = false;
-        bool fuse_gate_up = false;  // For StackExperts: fuse gate+up into gate_up format
-        int num_experts = 0;        // For StackExperts: number of experts (0 = auto)
-    };
+    // Type alias for backward compatibility — canonical definition is dsl::MappingSpec.
+    using MappingSpec = ::dsl::MappingSpec;
 
 private:
     void validate_ir();
@@ -248,6 +242,9 @@ private:
     std::vector<std::string> mLoRALn1Names;  // ln1_weight or norm_weight per layer
     std::vector<std::string> mLoRALn2Names;  // ln2_weight or norm_weight per layer
     void build_lora_name_tables();
+
+    // Adapter merge state (optional — stacked LoRA)
+    std::string mAdapterPath;
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;

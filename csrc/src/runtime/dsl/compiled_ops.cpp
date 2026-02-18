@@ -2313,11 +2313,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             grad_of == "residual_final" || grad_of == "final_residual") {
             return &d_ln_final_buf;
         }
-        // Embedding output gradients (x0, encoded)
+        // Embedding output gradients (x0, encoded) — always bind to persistent buffer
         if (grad_of == "x0" || grad_of == "encoded" || grad_of == "embeddings") {
-            if (!mRunState.is_lora_only_mode()) {
-                return &d_embeddings_buf;
-            }
+            return &d_embeddings_buf;
         }
         // Note: d_xN, d_residualN don't map to persistent buffers - they're computed on-the-fly
         return nullptr;
@@ -2330,10 +2328,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     bind_tensor("d_ln_final", d_ln_final_buf);
     bind_tensor("d_ln_final_flat", d_ln_final_flat);
 
-    if (!mRunState.is_lora_only_mode()) {
-        bind_tensor("d_encoded", d_embeddings_buf);
-        bind_tensor("d_x0", d_embeddings_buf);
-    }
+    // Always bind embedding gradients to the persistent d_embeddings buffer, even in
+    // LoRA-only mode. This prevents ensure_output_tensor from stack-allocating them,
+    // which would block can_restore_stack for the entire backward pass.
+    bind_tensor("d_encoded", d_embeddings_buf);
+    bind_tensor("d_x0", d_embeddings_buf);
 
     // DSL-driven binding for any additional gradient slots declared in the Python model
     if (mSlotRegistry && mSlotRegistry->has_dsl_layout()) {
@@ -2406,13 +2405,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    // Bind autodiff-generated gradient names (d_embed_1, etc.) from forward embedding outputs
-    // These are dynamically generated and not in the DSL layout
-    if (!mRunState.is_lora_only_mode()) {
-        for (const auto& emb_out : mEmbeddingOutputs) {
-            std::string grad_name = "d_" + emb_out;
-            bind_tensor(grad_name, d_embeddings_buf);
-        }
+    // Bind autodiff-generated gradient names (d_embed_1, etc.) from forward embedding outputs.
+    // Always bind even in LoRA-only mode to prevent stack-allocation (see d_embeddings comment above).
+    for (const auto& emb_out : mEmbeddingOutputs) {
+        std::string grad_name = "d_" + emb_out;
+        bind_tensor(grad_name, d_embeddings_buf);
     }
 
     // Restore MoE expert_offsets from persistent CPU storage
@@ -2617,20 +2614,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
         }
     };
-    auto can_restore_stack = [&](std::size_t idx) -> bool {
-        // Check if any tensor still needed after idx lives on the stack
-        for (const auto& [name, use_idx] : last_use) {
-            if (use_idx <= idx) continue;  // Already past last use
-            int tid = graph.find_tensor_id(name);
-            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-            auto& tensor = mTensors[static_cast<std::size_t>(tid)];
-            if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
-                return false;
-            }
-        }
-        return true;
-    };
-
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
@@ -2891,12 +2874,32 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 }
             }
 
-            // Memory management - prune tensors after last use, then restore stack at layer boundaries
-            // when no live stack tensors remain. This is safe for MoE as well.
+            // Memory management - prune tensors after last use, then restore stack at layer boundaries.
+            // If live cross-layer tensors exist on the stack, persist them to allocated memory first.
             prune_by_last_use(idx);
             if (op.layer_end >= 0 &&
-                op.layer_end != last_layer_restored &&
-                can_restore_stack(idx)) {
+                op.layer_end != last_layer_restored) {
+                // Persist any cross-layer tensors that still live on the stack.
+                // These tensors (e.g., d_blocks[N].router_logits for MoE aux loss) have
+                // last_use beyond the current layer, so they must survive stack restore.
+                for (const auto& [name, use_idx] : last_use) {
+                    if (use_idx <= idx) continue;
+                    int tid = graph.find_tensor_id(name);
+                    if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+                    auto& tensor = mTensors[static_cast<std::size_t>(tid)];
+                    if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
+                        // Copy to persistent GPU memory
+                        const std::size_t nbytes = tensor.bytes();
+                        std::byte* persistent = nullptr;
+                        CUDA_CHECK(cudaMalloc(&persistent, nbytes));
+                        CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, nbytes,
+                                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                        tensor.Data = persistent;
+                        // Track for cleanup at end of backward
+                        mPersistedBackwardTensors.push_back(persistent);
+                    }
+                }
+
                 // Release this layer's offloaded weights (if applicable)
                 handle_layer_end(op.layer_end);
 
@@ -2975,6 +2978,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mRunState.Stack.restore(initial_checkpoint);
     prune_stack_tensors(-1);
     mTemps.clear();
+
+    // Free persisted cross-layer backward tensors
+    // Sync main stream first to ensure all consumers have completed
+    if (!mPersistedBackwardTensors.empty()) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        for (auto* ptr : mPersistedBackwardTensors) {
+            cudaFree(ptr);
+        }
+        mPersistedBackwardTensors.clear();
+    }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
         mWeightManager->release_final_norm(mRunState.MainStream);

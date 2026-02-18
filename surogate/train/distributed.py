@@ -426,12 +426,18 @@ class NodeTrainer:
                     # Fallback to base model if checkpoint doesn't have model.safetensors
                     weights_path = model_weights_path
             logger.info(f"Node {self.node_rank}: Importing base model weights from {weights_path}...")
+            if self._config.adapter_path:
+                logger.info(f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights...")
+                self._trainer.set_adapter_path(self._config.adapter_path)
             self._trainer.import_weights(weights_path)
             logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
             self._trainer.load_checkpoint(str(self._config.checkpoint_dir), self.start_step)
             logger.info(f"Node {self.node_rank}: Checkpoint loaded successfully")
         else:
             # Import weights from pretrained model
+            if self._config.adapter_path:
+                logger.info(f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights...")
+                self._trainer.set_adapter_path(self._config.adapter_path)
             self._trainer.import_weights(model_weights_path)
 
         if self._mm_on_the_fly:

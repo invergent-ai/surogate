@@ -228,6 +228,20 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
 }
 
 /**
+ * @brief Set the path to a PEFT adapter to merge into base weights during import.
+ *
+ * Must be called before import_weights(). The adapter's LoRA deltas will be
+ * applied to the BF16 base weights before quantization (QLoRA) or storage (BF16).
+ */
+void MultiGPUPyTrainer::set_adapter_path(std::string path) {
+    run_work([path](sThreadContext& ctx) {
+        if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+            dsl_model->set_adapter_path(path);
+        }
+    });
+}
+
+/**
  * @brief Import model weights from disk on all ranks.
  *
  * Runs a synchronized "work item" across all worker threads/ranks.

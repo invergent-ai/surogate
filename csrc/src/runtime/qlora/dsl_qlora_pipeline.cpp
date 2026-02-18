@@ -17,6 +17,7 @@
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
 #include "runtime/dsl/dsl_weight_loader.h"
+#include "runtime/qlora/adapter_merger.h"
 #include "runtime/qlora/fp4_block_quantized_tensor.h"
 #include "utilities/allocator.h"
 #include "utilities/safetensors.h"
@@ -716,6 +717,17 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
         shard_config,
         moe_config);
 
+    // ---- Step 3b: Create adapter merger (stacked LoRA) ----
+
+    std::unique_ptr<AdapterMerger> adapter_merger;
+    if (!config.adapter_path.empty()) {
+        adapter_merger = std::make_unique<AdapterMerger>(
+            config.adapter_path,
+            config.mapping,
+            reader,
+            shard_config);
+    }
+
     // ---- Step 4: Allocate double-buffered load buffers ----
     //
     // Double buffering allows overlapping:
@@ -801,8 +813,14 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             // Load BF16 weight from SafeTensors (CPU disk I/O + GPU copy on main stream)
             bool success = loader.load_param(spec.name, target, true, spec.sharded, nullptr, stream);
             if (success) {
-                // Ensure GPU copy is complete before quantizing
+                // Ensure GPU copy is complete before merging/quantizing
                 CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                // Merge adapter delta if an adapter is being loaded (stacked LoRA)
+                if (adapter_merger) {
+                    adapter_merger->apply(spec.name, target, stream);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
 
                 CUDA_CHECK(cudaGetLastError());
 
@@ -922,6 +940,13 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             const int global_e = ep_expert_start + e;
             loader.load_expert(spec.name, global_e, expert_buf, true, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Merge adapter delta for this expert (stacked LoRA)
+            if (adapter_merger) {
+                adapter_merger->apply_expert(spec.name, global_e, expert_buf, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
             try {
                 weight_mgr->quantize_expert_slice(spec.name, e, per_M, expert_buf, stream);
             } catch (...) {

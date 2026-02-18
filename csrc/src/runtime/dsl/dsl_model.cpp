@@ -671,7 +671,8 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     const std::shared_ptr<TensorAllocator>& allocator,
     const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
     int shard_idx,
-    int num_shards) {
+    int num_shards,
+    const std::string& adapter_path) {
 
     // Build the pipeline configuration
     qlora::DslQLoRAPipelineConfig config;
@@ -807,6 +808,9 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     if (router_fp > 0) {
         fprintf(stderr, "[QLoRA] Router weights kept full-precision (excluded from QLoRA): %d\n", router_fp);
     }
+
+    // Adapter merging (stacked LoRA)
+    config.adapter_path = adapter_path;
 
     return std::make_unique<qlora::GenericQLoRAProvider>(
         std::move(config), pt_config, allocator);

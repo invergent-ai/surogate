@@ -340,6 +340,10 @@ private:
     // Gradient accumulation tracking (set of gradient tensor names that need accumulation)
     std::unordered_set<std::string> mAccumulateTensors;
 
+    // Cross-layer backward tensors persisted from stack to cudaMalloc.
+    // Freed at end of backward pass.
+    std::vector<std::byte*> mPersistedBackwardTensors;
+
     // Persistent storage for MoE expert_offsets (needs to survive from forward to backward)
     std::vector<int> mMoEExpertOffsetsData;
     Tensor mMoEExpertOffsets;  // Views into mMoEExpertOffsetsData
