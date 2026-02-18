@@ -60,8 +60,7 @@ ENV PATH="/home/surogate/.venv/bin:$PATH" \
     VIRTUAL_ENV="/home/surogate/.venv"
 
 # Install wheel from URL
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install ${WHEEL_URL}
+RUN uv pip install ${WHEEL_URL}
 
 # Default entrypoint
 ENTRYPOINT [".venv/bin/surogate"]
