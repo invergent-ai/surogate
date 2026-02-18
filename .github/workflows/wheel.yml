@@ -75,6 +75,25 @@ jobs:
       - name: Build wheel
         run: uv build --wheel --out-dir wheelhouse
 
+      - name: Repair wheel
+        run: |
+          mkdir -p wheelhouse
+          uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
+            -w wheelhouse/ \
+            --exclude libcuda.so.1 \
+            --exclude libcudart.so.12 \
+            --exclude libcudart.so.13 \
+            --exclude libcudnn.so.9 \
+            --exclude libcufile.so.0 \
+            --exclude libnccl.so.2 \
+            --exclude libcublas.so.12 \
+            --exclude libcublas.so.13 \
+            --exclude libcublasLt.so.12 \
+            --exclude libcublasLt.so.13 \
+            --exclude libnvidia-ml.so.1
+
+            ls -lh wheelhouse/
+
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
