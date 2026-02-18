@@ -9,7 +9,6 @@
 #
 # Build:
 #   docker build \
-#     --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:13.1.1-runtime-ubuntu24.04 \
 #     --build-arg CUDA_MAJOR=13 \
 #     --build-arg PACKAGE_VERSION=0.1.1 \
 #     --build-arg WHEEL_TAG=cu13 \
@@ -22,8 +21,7 @@
 #     -v /path/to/output:/output \
 #     ghcr.io/invergent-ai/surogate:0.1.1-cu13 sft /config.yaml
 
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04
-FROM ${CUDA_RUNTIME_IMAGE}
+FROM ubuntu:noble-20260210.1
 
 ARG CUDA_MAJOR=13
 ARG PACKAGE_VERSION=0.1.1
@@ -31,15 +29,20 @@ ARG WHEEL_TAG=cu13
 ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${WHEEL_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_LIB_ROOT="/home/surogate/.venv/lib/python3.12/site-packages/nvidia"
 
-# Install runtime dependencies
-# Note: libcudnn9-cuda-12 works for both CUDA 12.x and 13.x
-RUN apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
-    ca-certificates \
-    curl \
-    libnccl2 \
-    libcudnn9-cuda-${CUDA_MAJOR} \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+RUN echo "${CUDA_LIB_ROOT}/cu13/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && echo "${CUDA_LIB_ROOT}/cudnn/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && echo "${CUDA_LIB_ROOT}/nccl/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && echo "${CUDA_LIB_ROOT}/cuda_runtime/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
+    && echo "${CUDA_LIB_ROOT}/cuda_nvrtc/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
+    && echo "${CUDA_LIB_ROOT}/cublas/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
+    && echo "${CUDA_LIB_ROOT}/cufile/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
+    && ldconfig
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
@@ -52,6 +55,7 @@ WORKDIR /home/surogate
 
 # Create virtual environment
 RUN uv venv /home/surogate/.venv --python=3.12
+
 ENV PATH="/home/surogate/.venv/bin:$PATH" \
     VIRTUAL_ENV="/home/surogate/.venv"
 

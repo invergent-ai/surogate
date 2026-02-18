@@ -8,6 +8,29 @@ import subprocess
 import sys
 import tomlkit
 
+CUDA_DEPS = {
+    'cu128': [
+        "nvidia-cuda-runtime-cu12==12.8.90",
+        "nvidia-cudnn-cu12==9.19.0.56",
+        "nvidia-nccl-cu12==2.29.3",
+        "nvidia-cufile-cu12==1.14.1.1",
+        "nvidia-cuda-nvrtc-cu12==12.8.93"
+    ],
+    'cu129': [
+        "nvidia-cuda-runtime-cu12==12.9.79",
+        "nvidia-cudnn-cu12==9.19.0.56",
+        "nvidia-nccl-cu12==2.29.3",
+        "nvidia-cufile-cu12==1.14.1.1",
+        "nvidia-cuda-nvrtc-cu12==12.9.86"
+    ],
+    'cu13': [
+        "nvidia-cuda-runtime==13.1.80",
+        "nvidia-cudnn-cu13==9.19.0.56",
+        "nvidia-nccl-cu13==2.29.3",
+        "nvidia-cufile==1.16.1.26",
+        "nvidia-cuda-nvrtc==13.1.115"
+    ],
+}
 
 def add_cuda_version_tag(cuda_tag: str):
     with open('pyproject.toml', 'r') as f:
@@ -56,7 +79,9 @@ def add_cuda_version_tag(cuda_tag: str):
     # Add CUDA tag to version
     data['project']['version'] = f"{current_version}+{cuda_tag}"
     print(f"Set version to {data['project']['version']}")
-
+    
+    data['project']['dependencies'] = CUDA_DEPS[cuda_tag]
+    
     with open('pyproject.toml', 'w') as f:
         tomlkit.dump(data, f)
 
