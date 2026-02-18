@@ -12,15 +12,7 @@ In multi-node training:
 
 ## Setup
 
-### 1. Install Ray
-
-First, install Surogate with Ray support:
-
-```bash
-pip install surogate[distributed]
-```
-
-### 2. Start the Ray Cluster
+### 1. Start the Ray Cluster
 
 On your **head node** (the main machine), start Ray:
 
@@ -38,7 +30,7 @@ ray start --address='<head-node-ip>:6379'
 
 Replace `<head-node-ip>` with the actual IP address from the head node output.
 
-### 3. Configure Your Training
+### 2. Configure Your Training
 
 Add a `distributed` section to your training configuration YAML:
 
@@ -65,7 +57,7 @@ distributed:
 - `gpus_per_node`: GPUs per node (leave at 0 to use `gpus` from main config)
 - `worker_output_dir`: Optional directory for worker-local data (defaults to `/tmp/surogate-{run_name}`)
 
-### 4. Run Training
+### 3. Run Training
 
 Start training from the head node:
 
