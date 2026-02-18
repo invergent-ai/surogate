@@ -23,7 +23,7 @@ class SurogateSFT(TokenizeDatasets):
     def run(self):
         # Check if distributed training is configured
         # In distributed mode, each worker node tokenizes its own shard of the data
-        if self.config.distributed and self.config.distributed.num_nodes > 1:
+        if self.config.distributed and self.config.distributed.num_nodes >= 1:
             logger.info("Distributed mode: each node will process its own data shard")
             logger.info(f"Starting training run '{self.config.run_name}'...")
             return self._train_distributed()
