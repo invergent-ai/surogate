@@ -217,6 +217,8 @@ def log_line_to_aim(run: "aim.Run", entry: dict):
         for k, v in entry.items():
             if k in {"log", "step", "time", "step_tokens"}:
                 continue
+            if not isinstance(v, (int, float)):
+                continue
             run.track(v, name=f"train/{k}", step=step)
         run.track(tps, name="train/tokens_per_second", step=step)
     elif kind == "eval":
@@ -225,6 +227,8 @@ def log_line_to_aim(run: "aim.Run", entry: dict):
         tps = eval_tokens / (duration_ms / 1000) if duration_ms else 0.0
         for k, v in entry.items():
             if k in {"log", "step", "time", "eval_tokens"}:
+                continue
+            if not isinstance(v, (int, float)):
                 continue
             run.track(v, name=f"eval/{k}", step=step)
         run.track(tps, name="eval/tokens_per_second", step=step)
