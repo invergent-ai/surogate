@@ -624,14 +624,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
                      f"num_local_experts={num_experts // self.ep_size if num_experts > 0 else '?'}")
 
     def ensure_directories(self):
+        # Always resolve paths (needed by all workers, including Ray)
+        self.output_dir = str(Path(self.output_dir).resolve())
+        self.checkpoint_dir = str(Path(self.checkpoint_dir or self.output_dir).resolve())
+
+        if self.log_file is None:
+            date_time = "{:%Y%m%d-%H%M%S}".format(datetime.now())
+            self.log_file = f"{self.output_dir}/log-{self.run_name}-{date_time}.json"
+            self.log_file = to_abspath(self.log_file)
+
         # Skip directory creation if running inside a Ray worker
         # Only the head node should create directories
         from surogate.utils.dist import is_ray_worker
         if is_ray_worker():
             return
 
-        # Convert output_dir to absolute path for consistent hash file location
-        self.output_dir = str(Path(self.output_dir).resolve())
         _output_dir = Path(self.output_dir)
         if _output_dir.exists():
             if not _output_dir.is_dir():
@@ -642,16 +649,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         else:
             _output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Set checkpoint_dir to output_dir if not specified, then convert to absolute path
-        self.checkpoint_dir = str(Path(self.checkpoint_dir or self.output_dir).resolve())
         _checkpoint_dir = Path(self.checkpoint_dir)
         if not _checkpoint_dir.exists():
             _checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        if self.log_file is None:
-            date_time = "{:%Y%m%d-%H%M%S}".format(datetime.now())
-            self.log_file = f"{self.output_dir}/log-{self.run_name}-{date_time}.json"
-            self.log_file = to_abspath(self.log_file)
 
         if self.log_file:
             log_path = to_abspath(self.log_file)
