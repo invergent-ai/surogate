@@ -17,7 +17,7 @@
   </a>
 </p>
 
-<h3>High-performance, mixed-precision LLM pre-training & fine-tuning <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
+<h3>LLM pre-training & fine-tuning at practical hardware limits<br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
 <div>
 <a href="https://surogate.ai">Home</a> ·
 <a href="https://docs.surogate.ai">Docs</a> ·
@@ -36,7 +36,7 @@
 
 ## What is Surogate?
 
-Surogate is a **production-grade LLM training framework** and **LLMOps platform** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and multi-GPU/multi-Node training scaling at scale.
+Surogate is an extremely fast **production-grade LLM training framework** and **LLMOps platform** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and multi-GPU/multi-Node training scaling at scale.
 
 By combining a native **C++/CUDA execution engine**, a low-overhead Python frontend, and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**. 
 
