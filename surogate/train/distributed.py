@@ -1135,16 +1135,17 @@ class RayDistributedTrainer:
                 break
 
             # Log progress
-            logger.info(
-                f"Step {step}/{max_steps} | Loss: {metrics.loss:.4f} | Norm: {metrics.grad_norm:.4f} | "
-                f"LR: {metrics.lr:.2e} | {step_time:.2f}s | {metrics.tokens_per_second:.0f} tok/s | {metrics.phase}"
-            )
-
-            if metrics.moe is not None:
+            if step % config.logging_steps == 0:
                 logger.info(
-                    f"  MoE: aux_loss={metrics.moe.aux_loss:.4f} z_loss={metrics.moe.z_loss:.4f} "
-                    f"util={metrics.moe.expert_utilization:.2%} imbalance={metrics.moe.load_imbalance:.2f}"
+                    f"Step {step}/{max_steps} | Loss: {metrics.loss:.4f} | Norm: {metrics.grad_norm:.4f} | "
+                    f"LR: {metrics.lr:.2e} | {step_time:.2f}s | {metrics.tokens_per_second:.0f} tok/s | {metrics.phase}"
                 )
+
+                if metrics.moe is not None:
+                    logger.info(
+                        f"  MoE: aux_loss={metrics.moe.aux_loss:.4f} z_loss={metrics.moe.z_loss:.4f} "
+                        f"util={metrics.moe.expert_utilization:.2%} imbalance={metrics.moe.load_imbalance:.2f}"
+                    )
 
             # Reset timer for next step
             step_start_time = time.time()

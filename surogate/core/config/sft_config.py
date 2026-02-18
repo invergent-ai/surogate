@@ -181,6 +181,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         eval_steps (Optional[int], defaults to 100):
              Run evaluation every N optimizer steps. Evaluation runs on the full eval dataset.
+        logging_steps (Optional[int], defaults to 1):
+            Log training metrics every N optimizer steps. Set to 1 to log every step (default).
         report_to (Optional[Literal['wandb', 'aim']], *optional*, defaults to None):
             Report the results and logs to. Supported platforms are `"wandb"`, `"aim"`.
         warmup_ratio (Optional[float], defaults to 0.0):
@@ -325,6 +327,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     normuon_beta2: Optional[float] = 0.95
     normuon_cautious_wd: Optional[bool] = True
     eval_steps: Optional[int] = 100
+    logging_steps: Optional[int] = 1
     per_device_train_batch_size: Optional[int] = 2
     report_to: Optional[List[Literal['wandb', 'aim']]] = None
     warmup_ratio: Optional[float] = 0
@@ -442,6 +445,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.normuon_beta2 = float(cfg.get('normuon_beta2', self.normuon_beta2))
         self.normuon_cautious_wd = cfg.get('normuon_cautious_wd', self.normuon_cautious_wd)
         self.eval_steps = cfg.get('eval_steps', self.eval_steps)
+        self.logging_steps = cfg.get('logging_steps', self.logging_steps)
         self.per_device_train_batch_size = cfg.get('per_device_train_batch_size', self.per_device_train_batch_size)
         self.report_to = cfg.get('report_to', self.report_to)
         self.warmup_ratio = float(cfg['warmup_ratio']) if 'warmup_ratio' in cfg else self.warmup_ratio

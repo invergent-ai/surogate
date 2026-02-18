@@ -531,16 +531,17 @@ class SurogateTrainerWrapper():
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
 
-            if metrics.moe is not None:
-                train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                          metrics.grad_norm, metrics.loss, metrics.lr,
-                                          metrics.moe.aux_loss,
-                                          metrics.moe.z_loss,
-                                          metrics.moe.load_imbalance,
-                                          metrics.moe.expert_utilization)
-            else:
-                train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                      metrics.grad_norm, metrics.loss, metrics.lr)
+            if step % self.config.logging_steps == 0:
+                if metrics.moe is not None:
+                    train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                              metrics.grad_norm, metrics.loss, metrics.lr,
+                                              metrics.moe.aux_loss,
+                                              metrics.moe.z_loss,
+                                              metrics.moe.load_imbalance,
+                                              metrics.moe.expert_utilization)
+                else:
+                    train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                          metrics.grad_norm, metrics.loss, metrics.lr)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
@@ -777,16 +778,17 @@ class SurogateTrainerWrapper():
                 break
 
             # Log training step
-            if metrics.moe is not None:
-                train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                          metrics.grad_norm, metrics.loss, metrics.lr,
-                                          metrics.moe.aux_loss,
-                                          metrics.moe.z_loss,
-                                          metrics.moe.load_imbalance,
-                                          metrics.moe.expert_utilization)
-            else:
-                train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                      metrics.grad_norm, metrics.loss, metrics.lr)
+            if step % self.config.logging_steps == 0:
+                if metrics.moe is not None:
+                    train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                              metrics.grad_norm, metrics.loss, metrics.lr,
+                                              metrics.moe.aux_loss,
+                                              metrics.moe.z_loss,
+                                              metrics.moe.load_imbalance,
+                                              metrics.moe.expert_utilization)
+                else:
+                    train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                                          metrics.grad_norm, metrics.loss, metrics.lr)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
