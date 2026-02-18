@@ -42,9 +42,38 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - [**🧪 Mixed-precision training**](./guides/precision-and-recipes.md#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - [**🧬 Adaptive Training**](./about/adaptive-training.md): built-in automated training monitoring with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR management, MoE imbalance detection, Chinchilla token budgeting and dynamic epoch adjustment
+- [**🎨 Dedicated MoE Features**](./guides/moe.md): Expert Parallelism, Least-Loaded EP load-balancing, MoE training metrics, Imbalance detection
+- **🥞 Stacked LoRA training**: Train a LoRA adapter on top of another LoRA adapter to skip offline merging into base model.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
 - **🧠 Supported models**: Qwen2.5, Qwen3, Qwen3 MoE, Llama 3+, Nemotron Nano. Models can be added easily, please create a PR if you need a specific model.
 
+
+## Quickstart
+
+### Option A: Run using Docker (recommended)
+Surogate provides 3 docker images for various CUDA versions. Currently only the `x86-64` architecture is supported.
+
+| CUDA   | Image                                        | Recommended NVIDIA Driver | Minimum NVIDIA Driver |
+| ------ | -------------------------------------------- | ------------------------- | --------------------- |
+| 12.8.1 | `ghcr.io/invergent-ai/surogate:latest-cu128` | `>= 570.124.06`           | `>= 525`              |
+| 12.9.1 | `ghcr.io/invergent-ai/surogate:latest-cu129` | `>= 575.57.08`            | `>= 525`              |
+| 13.1   | `ghcr.io/invergent-ai/surogate:latest-cu13`  | `>= 590.48.01`            | `>= 580`              |
+
+```bash
+docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my/local/output_dir:<OUTPUT_DIR_FROM_CONFIG_YAML> <IMAGE> sft config.yaml
+```
+
+### Option B: Install via script
+```bash
+curl -LsSf https://surogate.ai/install.sh | sh
+```
+
+Follow these guides to run your first training:
+
+- [Installation](getting-started/installation.md)
+- [Training modes: Pretraining vs Full Fine-Tuning vs LoRA](getting-started/training-modes.md)
+- [Quickstart: SFT](getting-started/quickstart-sft.md)
+- [Quickstart: Pre-training](getting-started/quickstart-pretraining.md)
 
 ## Hardware / Requirements
 
@@ -61,21 +90,6 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - `SM103`: B300, GB300
 - `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
 - `SM121`: DGX Spark
-  
-
-## Quickstart
-Install Surogate using the following command on a machine with CUDA 12 or 13:
-
-```bash
-curl -LsSf https://surogate.ai/install.sh | sh
-```
-
-Follow these guides to run your first training:
-
-- [Installation](getting-started/installation.md)
-- [Training modes: Pretraining vs Full Fine-Tuning vs LoRA](getting-started/training-modes.md)
-- [Quickstart: SFT](getting-started/quickstart-sft.md)
-- [Quickstart: Pre-training](getting-started/quickstart-pretraining.md)
 
 ## Learn More
 

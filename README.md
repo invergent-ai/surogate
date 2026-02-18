@@ -68,32 +68,29 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - [**🧪 Mixed-precision training**](https://docs.surogate.ai/guides/precision-and-recipes#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
 - [**🧬 Adaptive Training**](https://docs.surogate.ai/about/adaptive-training): built-in automated training monitoring with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR management, MoE imbalance detection, Chinchilla token budgeting and dynamic epoch adjustment
+- [**🎨 Dedicated MoE Features**](https://docs.surogate.ai/guides/moe): Expert Parallelism, Least-Loaded EP load-balancing, MoE training metrics, Imbalance detection
+- **🥞 Stacked LoRA training**: Train a LoRA adapter on top of another LoRA adapter to skip offline merging into base model.
 - **🧠 Supported models**: Qwen2.5, Qwen3, Qwen3 MoE, Llama 3+, Nemotron Nano. Models can be added easily, please create a PR if you need a specific model.
 - **[Surogate Studio](https://github.com/invergent-ai/surogate-studio)**: Unified no-code platform for managing your AI infrastructure and operations: Training, Fine-Tuning, Inference and Quantization
   
 ---
 
-## Hardware / Requirements
+## Quickstart
 
-- NVIDIA GPU + recent driver
-- CUDA **12.8, 12.9, 13**, NCCL, cuDNN
-- Linux x86_64
+### Option A: Run using Docker (recommended)
+Surogate provides 3 docker images for various CUDA versions. Currently only the `x86-64` architecture is supported.
 
-### Supported NVIDIA GPUs:
-- `SM80`: A100, A30
-- `SM86`: A2, A16, A10, A40, RTX3050, RTX3060, RTX 3070, RTX 3080, RTX 3090, A2000, A3000, A4000, A5000, A6000
-- `SM89`: L4, L40, L40S, RTX 4050, RTX 4060, RTX 4070, RTX 4080, RTX 4090, RTX 2000 Ada, RTX 4000 SFF Ada, RTX 4000 Ada, RTX 4500 Ada, RTX 5000 Ada, RTX 6000 Ada
-- `SM90`: H100, H200, GH200
-- `SM100`: B200, GB200
-- `SM103`: B300, GB300
-- `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
-- `SM121`: DGX Spark
-  
----
+| CUDA   | Image                                        | Recommended NVIDIA Driver | Minimum NVIDIA Driver |
+| ------ | -------------------------------------------- | ------------------------- | --------------------- |
+| 12.8.1 | `ghcr.io/invergent-ai/surogate:latest-cu128` | `>= 570.124.06`           | `>= 525`              |
+| 12.9.1 | `ghcr.io/invergent-ai/surogate:latest-cu129` | `>= 575.57.08`            | `>= 525`              |
+| 13.1   | `ghcr.io/invergent-ai/surogate:latest-cu13`  | `>= 590.48.01`            | `>= 580`              |
 
-## Install
+```bash
+docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my/local/output_dir:<OUTPUT_DIR_FROM_CONFIG_YAML> <IMAGE> sft config.yaml
+```
 
-### Option A: Install via script (recommended)
+### Option B: Install via script
 ```bash
 curl -LsSf https://surogate.ai/install.sh | sh
 ```
@@ -142,6 +139,24 @@ surogate sft config.yaml
 3) Outputs:
 - checkpoints, logs and artifacts are written under `output_dir`
 
+---
+
+## Hardware / Requirements
+
+- NVIDIA GPU + recent driver
+- CUDA **12.8, 12.9, 13**, NCCL, cuDNN
+- Linux x86_64
+
+### Supported NVIDIA GPUs:
+- `SM80`: A100, A30
+- `SM86`: A2, A16, A10, A40, RTX3050, RTX3060, RTX 3070, RTX 3080, RTX 3090, A2000, A3000, A4000, A5000, A6000
+- `SM89`: L4, L40, L40S, RTX 4050, RTX 4060, RTX 4070, RTX 4080, RTX 4090, RTX 2000 Ada, RTX 4000 SFF Ada, RTX 4000 Ada, RTX 4500 Ada, RTX 5000 Ada, RTX 6000 Ada
+- `SM90`: H100, H200, GH200
+- `SM100`: B200, GB200
+- `SM103`: B300, GB300
+- `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
+- `SM121`: DGX Spark
+  
 ---
 
 ## Documentation / Examples
