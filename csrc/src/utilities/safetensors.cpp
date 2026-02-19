@@ -308,8 +308,12 @@ const SafeTensorEntry& SafeTensorsReader::find_entry(std::string_view name) cons
  * @param allow_cast If true, allow dtype conversion into container tensors.
  */
 void load_safetensors(const std::string& file_name, ITensorContainer& tensors, bool allow_cast) {
-    SafeTensorsReader reader(file_name);
-    reader.load_tensors(tensors, allow_cast);
+    try {
+        SafeTensorsReader reader(file_name);
+        reader.load_tensors(tensors, allow_cast);
+    } catch (std::exception& e) {
+        throw std::runtime_error(fmt::format("Error loading safetensors file '{}': {}", file_name, e.what()));
+    }
 }
 
 /**
