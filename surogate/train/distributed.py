@@ -665,7 +665,12 @@ class NodeTrainer:
                 return -1
             return num_samples * self._config.sequence_len * max(self.num_nodes, 1)
         if self._train_loader is not None:
-            return self._train_loader.num_tokens
+            total = self._train_loader.num_tokens
+            if self.tokenize_on_node:
+                # Each node only has 1/num_nodes of the data; reconstruct global total
+                # so steps_per_epoch = total // total_tokens_per_step is correct
+                total *= self.num_nodes
+            return total
         return 0
 
     def get_moe_stats(self) -> Dict[str, Any]:
@@ -900,7 +905,7 @@ class RayDistributedTrainer:
 
         @ray.remote(
             num_gpus=gpus_per_node,
-            runtime_env={"env_vars": {"NCCL_DEBUG": "INFO"}}
+            runtime_env={"env_vars": {"NCCL_DEBUG": "WARN"}}
         )
         class NodeTrainerActor:
             def __init__(
@@ -1347,8 +1352,9 @@ class RayDistributedTrainer:
                 if config.save_steps > 0 and step % config.save_steps == 0 and step > start_step:
                     logger.info(f"Saving checkpoint at step {step}...")
                     try:
-                        # Only node 0 saves (others have identical weights in data parallel)
-                        ray.get(self.node_trainers[0].save_checkpoint.remote(config.checkpoint_dir, step))
+                        # ALL nodes must participate because C++ save_checkpoint may contain
+                        # NCCL barriers. Only node 0 actually writes the files.
+                        ray.get([t.save_checkpoint.remote(config.checkpoint_dir, step) for t in self.node_trainers])
                         logger.info(f"Checkpoint saved successfully at step {step}")
 
                         checkpoint_plot_path = Path(config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"

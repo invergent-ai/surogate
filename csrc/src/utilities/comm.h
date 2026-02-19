@@ -72,6 +72,9 @@ public:
     [[nodiscard]] int rank() const { return mRank; }
     [[nodiscard]] int world_size() const { return mWorld; }
     [[nodiscard]] int local_rank() const { return mLocalRank; }
+    [[nodiscard]] virtual int num_nodes() const { return 1; }
+    [[nodiscard]] virtual int node_rank() const { return 0; }
+    [[nodiscard]] virtual int num_local_gpus() const { return mWorld; }
 
     [[nodiscard]] cudaStream_t stream() const { return mCommsStream; }
 

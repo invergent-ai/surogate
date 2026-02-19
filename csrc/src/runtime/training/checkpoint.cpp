@@ -58,46 +58,63 @@ std::string save_checkpoint(std::string target, int step, IModel& model, const D
     nlohmann::json meta_data;
     const bool is_lora = model.lora_enabled();
 
+    // Multi-node: only the root node (node_rank 0) performs filesystem I/O.
+    // In data-parallel training, all nodes have identical weights, so saving from
+    // one node is sufficient. Non-root nodes only participate in NCCL barriers.
+    // Shards are indexed by local_rank (0..num_local_gpus-1) so the checkpoint
+    // is self-contained on a single node's filesystem.
+    const bool is_root_node = comm.node_rank() == 0;
+    const int shard_rank = comm.local_rank();
+    const int shard_count = comm.num_local_gpus();
+
     target = get_checkpoint_path(std::move(target), step);
-    std::filesystem::create_directories(target);
+    if (is_root_node) {
+        std::filesystem::create_directories(target);
+    }
 
     // For LoRA training, only save the adapter - base model weights are frozen
     if (!is_lora) {
-        // weights
-        // TODO don't duplicate weights if they are unsharded
-        write_safetensors(target + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.weights());
+        if (is_root_node) {
+            // weights
+            // TODO don't duplicate weights if they are unsharded
+            write_safetensors(target + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.weights());
 
-        // sharded optimizer state
-        write_safetensors(target + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum());
-        write_safetensors(target + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance());
+            // sharded optimizer state
+            write_safetensors(target + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_momentum());
+            write_safetensors(target + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_variance());
 
-        bool has_scales = false;
-        model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
-            if(tensor.Data != nullptr) {
-                has_scales = true;
+            bool has_scales = false;
+            model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
+                if(tensor.Data != nullptr) {
+                    has_scales = true;
+                }
+            });
+            if(has_scales) {
+                write_safetensors(target + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_momentum_scales());
             }
-        });
-        if(has_scales) {
-            write_safetensors(target + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum_scales());
-        }
 
-        bool has_v_scales = false;
-        model.opt_variance_scales().iterate_tensors([&has_v_scales](const std::string&, const TensorShard& tensor) {
-            if (tensor.Data != nullptr) {
-                has_v_scales = true;
+            bool has_v_scales = false;
+            model.opt_variance_scales().iterate_tensors([&has_v_scales](const std::string&, const TensorShard& tensor) {
+                if (tensor.Data != nullptr) {
+                    has_v_scales = true;
+                }
+            });
+            if (has_v_scales) {
+                write_safetensors(target + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_variance_scales());
             }
-        });
-        if (has_v_scales) {
-            write_safetensors(target + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance_scales());
         }
 
         // Export full model weights in HuggingFace-compatible format (config.json + model.safetensors)
         // This allows loading the checkpoint directly with HuggingFace transformers
-        save_pretrained_config(*model.get_run_state().Config, (target + "/config.json").c_str());
+        // All ranks participate in NCCL barriers inside export_weights; only rank 0 writes.
+        if (is_root_node) {
+            save_pretrained_config(*model.get_run_state().Config, (target + "/config.json").c_str());
+        }
         model.export_weights(target + "/model.safetensors", comm);
     }
 
     // Save LoRA adapter if this is a LoRA model (includes adapter weights and optimizer state)
+    // All ranks participate in NCCL barriers; only rank 0's node writes.
     model.save_lora_checkpoint(target, comm);
 
     comm.barrier();  // only write checkpoint.json once we know all the shard files are saved
@@ -129,7 +146,7 @@ std::string save_checkpoint(std::string target, int step, IModel& model, const D
         model.get_run_state().NormOutliers.re_evaluate();
 
         meta_data["distributed"] = nlohmann::json::object({
-            {"world", comm.world_size()},
+            {"world", shard_count},
             {"ep_size", comm.ep_size()},
         });
 
@@ -171,10 +188,15 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
     }
 
     nlohmann::json meta_data = nlohmann::json::parse(file);
-    if(int ws = meta_data["distributed"]["world"].get<int>(); ws != comm.world_size()) {
+
+    // Checkpoints are saved using local_rank / num_local_gpus shard indexing,
+    // so the recorded "world" matches num_local_gpus (not global world_size).
+    const int shard_rank = comm.local_rank();
+    const int shard_count = comm.num_local_gpus();
+    if(int ws = meta_data["distributed"]["world"].get<int>(); ws != shard_count) {
         throw std::runtime_error(
-            fmt::format("Loading checkpoints with different world size is not supported: Current world size: {}, checkpoint world size: {}",
-                        comm.world_size(), ws));
+            fmt::format("Loading checkpoints with different shard count is not supported: Current num_local_gpus: {}, checkpoint world: {}",
+                        shard_count, ws));
     }
 
     // Validate EP size matches (expert weights are distributed, so ep_size must be the same)
@@ -194,7 +216,7 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
     }
 
     // Check if this is a LoRA-only checkpoint (no base model weights saved)
-    const std::string weights_file = source + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size());
+    const std::string weights_file = source + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count);
     const bool has_base_weights = std::filesystem::exists(weights_file);
 
     if (has_base_weights) {
@@ -206,8 +228,8 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
         model.prepare_optimizer_for_checkpoint_load();
 
         // load optimizer shards
-        load_safetensors(source + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum(), false);
-        load_safetensors(source + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance(), false);
+        load_safetensors(source + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_momentum(), false);
+        load_safetensors(source + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_variance(), false);
 
         bool has_scales = false;
         model.opt_momentum_scales().iterate_tensors([&has_scales](const std::string& name, const TensorShard& tensor){
@@ -216,7 +238,7 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
             }
         });
         if(has_scales) {
-            load_safetensors(source + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum_scales(), false);
+            load_safetensors(source + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_momentum_scales(), false);
         }
 
         bool has_v_scales = false;
@@ -226,7 +248,7 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
             }
         });
         if (has_v_scales) {
-            load_safetensors(source + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance_scales(), false);
+            load_safetensors(source + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count), model.opt_variance_scales(), false);
         }
     }
 

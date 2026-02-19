@@ -886,6 +886,10 @@ public:
      */
     void barrier() override;
 
+    int num_nodes() const override { return mShare->NumNodes; }
+    int node_rank() const override { return mShare->NodeRank; }
+    int num_local_gpus() const override { return mShare->LocalGPUs; }
+
     /**
      * @brief Throttle launch queue by synchronizing local CPU threads.
      */

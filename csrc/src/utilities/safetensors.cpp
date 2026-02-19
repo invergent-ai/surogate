@@ -390,8 +390,21 @@ void SafeTensorWriter::prepare_metadata(NCCLCommunicator* comm) {
     mHeaderSize = header_size + sizeof(header_size);
 
     std::vector<SafeTensorWriter*> peers;
-    if (comm)
-        peers = comm->host_gather(this);
+    if (comm) {
+        if (comm->num_nodes() <= 1) {
+            // Single-node: host_gather shares the mmap pointer with all local threads.
+            // All pointers are in the same process — safe to dereference.
+            peers = comm->host_gather(this);
+        } else {
+            // Multi-node: host_gather gathers raw pointers across processes via NCCL.
+            // Cross-process pointers are invalid — only keep local peers.
+            auto all_peers = comm->host_gather(this);
+            if (comm->rank() == 0) {
+                int local_gpus = comm->num_local_gpus();
+                peers.assign(all_peers.begin(), all_peers.begin() + local_gpus);
+            }
+        }
+    }
 
     if (!comm || comm->rank() == 0) {
         std::string temp_name = mFileName + ".tmp";
@@ -418,6 +431,13 @@ void SafeTensorWriter::prepare_metadata(NCCLCommunicator* comm) {
         }
 
         mMappedFile = host_ptr;
+        mMetaFinalized = true;
+    }
+
+    // Multi-node: non-root-node ranks don't get the mmap pointer, but must
+    // be marked as finalized so write_tensor() can mark tensors as Done
+    // (skipping actual writes) without throwing.
+    if (comm && !mMetaFinalized) {
         mMetaFinalized = true;
     }
 
@@ -456,6 +476,13 @@ void SafeTensorWriter::write_tensor(const std::string& name, const TensorShard& 
     if (comm && tensor.ShardIndex != comm->rank()) {
         // When a tensor is replicated instead of sharded, all calls with have ShardIdx == 0,
         // so only the root rank writes the tensor.
+        found->second.Done = true;
+        return;
+    }
+
+    // Multi-node: non-root-node ranks don't have a mapped file.
+    // Mark as done without writing (rank 0's node writes the file).
+    if (!mMappedFile) {
         found->second.Done = true;
         return;
     }
@@ -548,13 +575,17 @@ void SafeTensorWriter::finalize(NCCLCommunicator* comm) {
         comm->barrier();
 
     if (!comm || comm->rank() == 0) {
-        if (munmap(mMappedFile, mTotalSize) != 0)
-            throw std::system_error(errno, std::system_category(), "Error unmapping file " + mFileName);
-        mMappedFile = nullptr;
-        close(mFileDescriptor);
-        mFileDescriptor = -1;
-        std::string temp_name = mFileName + ".tmp";
-        std::filesystem::rename(temp_name, mFileName);
+        if (mMappedFile) {
+            if (munmap(mMappedFile, mTotalSize) != 0)
+                throw std::system_error(errno, std::system_category(), "Error unmapping file " + mFileName);
+            mMappedFile = nullptr;
+        }
+        if (mFileDescriptor >= 0) {
+            close(mFileDescriptor);
+            mFileDescriptor = -1;
+            std::string temp_name = mFileName + ".tmp";
+            std::filesystem::rename(temp_name, mFileName);
+        }
     }
 }
 
