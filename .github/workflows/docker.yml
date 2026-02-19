@@ -89,6 +89,16 @@ jobs:
             echo "version=${VERSION}" >> $GITHUB_OUTPUT
             echo "Using latest tag: ${VERSION}"
           fi
+          
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/surogate
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest-${{ matrix.wheel_tag }}
+            type=sha
 
       - name: Build and push Docker image
         if: steps.should_build.outputs.build == 'true'
@@ -103,6 +113,8 @@ jobs:
             WHEEL_TAG=${{ matrix.wheel_tag }}
           tags: |
             ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
+            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}
             ghcr.io/invergent-ai/surogate:latest-${{ matrix.wheel_tag }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.wheel_tag }}
           cache-to: type=gha,mode=max,scope=${{ matrix.wheel_tag }}
