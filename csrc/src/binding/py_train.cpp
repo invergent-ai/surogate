@@ -1320,69 +1320,6 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
     return result;
 }
 
-// ============================================================================
-// Inference API (KV-cache, used by GRPO online generation)
-// ============================================================================
-
-void MultiGPUPyTrainer::enter_inference_mode(int max_seq_len) {
-    run_work([max_seq_len](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("enter_inference_mode: model is not a DslModel");
-        }
-        dsl_model->enter_inference_mode(max_seq_len);
-    });
-}
-
-void MultiGPUPyTrainer::exit_inference_mode() {
-    run_work([](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (dsl_model) {
-            dsl_model->exit_inference_mode();
-        }
-    });
-}
-
-std::vector<float> MultiGPUPyTrainer::inference_prefill(const std::int32_t* input_ids, int seq_len) {
-    std::vector<float> logits;
-    run_work([&logits, input_ids, seq_len](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("inference_prefill: model is not a DslModel");
-        }
-        auto result = dsl_model->inference_prefill(input_ids, seq_len, *ctx.Communicator);
-        if (ctx.Communicator->local_rank() == 0) {
-            logits = std::move(result);
-        }
-    });
-    return logits;
-}
-
-std::vector<float> MultiGPUPyTrainer::inference_decode(std::int32_t token_id, int position) {
-    std::vector<float> logits;
-    run_work([&logits, token_id, position](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("inference_decode: model is not a DslModel");
-        }
-        auto result = dsl_model->inference_decode(token_id, position, *ctx.Communicator);
-        if (ctx.Communicator->local_rank() == 0) {
-            logits = std::move(result);
-        }
-    });
-    return logits;
-}
-
-void MultiGPUPyTrainer::set_kv_pos(int pos) {
-    run_work([pos](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("set_kv_pos: model is not a DslModel");
-        }
-        dsl_model->set_kv_pos(pos);
-    });
-}
-
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
                                                         const std::int32_t* targets,
                                                         int B, int T, bool use_lora) {

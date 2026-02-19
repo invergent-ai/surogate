@@ -1157,50 +1157,6 @@ NB_MODULE(_surogate, m) {
         }, "Get MoE training statistics from the last forward pass.\n\n"
            "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, valid}.\n"
            "For non-MoE models, valid=False and other values are zero.")
-        .def("enter_inference_mode", &MultiGPUPyTrainer::enter_inference_mode,
-             nb::arg("max_seq_len"),
-             "Allocate KV-cache and switch model to inference mode.\n\n"
-             "Must be called before inference_prefill(). Frees any existing KV-cache.\n\n"
-             "Parameters:\n"
-             "- max_seq_len: Maximum total sequence length (prompt + generation tokens).")
-        .def("exit_inference_mode", &MultiGPUPyTrainer::exit_inference_mode,
-             "Free KV-cache and return model to training mode.")
-        .def("inference_prefill", [](MultiGPUPyTrainer* trainer,
-                nb::ndarray<std::int32_t, nb::shape<-1>, nb::c_contig, nb::device::cpu> input_ids) {
-            auto logits = trainer->inference_prefill(input_ids.data(),
-                                                     static_cast<int>(input_ids.shape(0)));
-            const std::size_t n = logits.size();
-            float* data = new float[n];
-            std::copy(logits.begin(), logits.end(), data);
-            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {n}, owner);
-        }, nb::arg("input_ids"),
-           "Run prefill forward pass and populate the KV-cache.\n\n"
-           "Parameters:\n"
-           "- input_ids: int32 token IDs shaped [seq_len].\n\n"
-           "Returns: float32 logits shaped [vocab_size] for the last prompt token.")
-        .def("inference_decode", [](MultiGPUPyTrainer* trainer,
-                std::int32_t token_id, int position) {
-            auto logits = trainer->inference_decode(token_id, position);
-            const std::size_t n = logits.size();
-            float* data = new float[n];
-            std::copy(logits.begin(), logits.end(), data);
-            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {n}, owner);
-        }, nb::arg("token_id"), nb::arg("position"),
-           "Run single-token decode step using the KV-cache.\n\n"
-           "Parameters:\n"
-           "- token_id: int32 token ID to decode.\n"
-           "- position: Token position index (equals current KV-cache position).\n\n"
-           "Returns: float32 logits shaped [vocab_size].")
-        .def("set_kv_pos", &MultiGPUPyTrainer::set_kv_pos,
-             nb::arg("pos"),
-             "Reset KV-cache current position to pos (without clearing cached K/V).\n\n"
-             "Used to generate G completions from the same prompt without re-prefilling:\n"
-             "  1. inference_prefill(prompt)   — fills cache at [0, prompt_len)\n"
-             "  2. for each completion: set_kv_pos(prompt_len), then decode\n\n"
-             "Parameters:\n"
-             "- pos: Target position in [0, max_seq_len].")
         .def("step_with_custom_loss", [](MultiGPUPyTrainer* trainer,
                 nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
                 nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,

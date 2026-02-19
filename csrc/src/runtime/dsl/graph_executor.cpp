@@ -1443,55 +1443,6 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
 }
 
 // ============================================================================
-// Inference forward (KV-cache, no gradients)
-// ============================================================================
-
-void GraphExecutor::execute_inference_forward(long B, long T, KVCache& kv_cache,
-                                              float* logits_cpu, int vocab_size,
-                                              NCCLCommunicator& comm)
-{
-    if (!mCompiledExecutor) {
-        throw std::runtime_error("GraphExecutor: compiled executor not initialized");
-    }
-
-    // Recompile for this (B, T) if needed (shares graph cache with training).
-    compile_graphs(B, T);
-    if (!mCompiledForward) {
-        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
-    }
-
-    DslRunState& rs = mRunState;
-
-    // Bind inputs: embeddings / position-ids are set by DslModel before calling here.
-    // The compiled executor resolves them from the run-state slots as usual.
-
-    // Configure inference context on the compiled executor.
-    mCompiledExecutor->set_inference_context(&kv_cache, kv_cache.is_decode, logits_cpu, vocab_size);
-    mCompiledExecutor->set_dimensions(B, T);
-
-    // Empty save list: no activations need to survive for backward.
-    static const std::vector<std::string> empty_save_list;
-    mCompiledExecutor->set_save_list(&empty_save_list);
-
-    // Run forward (no CUDA-graph capture — inference shape changes each step).
-    mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, nullptr);
-
-    // Advance cache position for decode steps.
-    if (kv_cache.is_decode) {
-        kv_cache.current_pos += 1;
-    } else {
-        kv_cache.current_pos = static_cast<int>(T);
-        kv_cache.is_decode   = true;
-    }
-
-    // Restore training save list so subsequent training steps behave normally.
-    mCompiledExecutor->set_save_list(&mSaveList);
-
-    // Clear inference context.
-    mCompiledExecutor->set_inference_context(nullptr, false, nullptr, 0);
-}
-
-// ============================================================================
 // Log-prob forward (no KV-cache, no gradients, log-probability extraction)
 // ============================================================================
 

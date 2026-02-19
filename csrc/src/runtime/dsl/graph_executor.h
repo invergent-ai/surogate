@@ -18,7 +18,6 @@
 #include "runtime/dsl/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
-#include "runtime/dsl/kv_cache.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
 #include "utilities/stack.h"
@@ -168,14 +167,6 @@ public:
     size_t saved_buffers_total_bytes() const override;
     int saved_buffers_count() const override;
     const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const override;
-
-    /// Execute a forward pass in inference mode (no gradients, no activation saving).
-    /// Sets the KV-cache on the compiled executor and runs forward with the given (B, T).
-    /// After the call, logits_cpu contains vocab_size floats for the last token.
-    /// kv_cache.current_pos is updated to reflect the new cached position.
-    void execute_inference_forward(long B, long T, KVCache& kv_cache,
-                                   float* logits_cpu, int vocab_size,
-                                   NCCLCommunicator& comm);
 
     /// Execute a forward pass to extract per-token log-probabilities.
     ///

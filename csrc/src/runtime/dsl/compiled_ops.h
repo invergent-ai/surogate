@@ -32,7 +32,6 @@
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
-#include "runtime/dsl/kv_cache.h"
 
 namespace modules {
 struct ModelConfig;
@@ -102,18 +101,6 @@ public:
     void set_weight_manager(DslWeightManager* weight_manager);
     void set_recipe(const recipes::Recipe* recipe);
     void set_hook_context(void* context);
-    // Inference mode: set KV-cache and output logits buffer.
-    // kv_cache == nullptr means training mode (default).
-    // logits_cpu must point to at least vocab_size floats of CPU memory
-    // that will be filled by dispatch_fused_lm_head_loss.
-    void set_inference_context(KVCache* kv_cache, bool is_decode,
-                               float* logits_cpu, int vocab_size) {
-        mKVCache     = kv_cache;
-        mIsDecodeMode = is_decode;
-        mInferenceLogitsCpu   = logits_cpu;
-        mInferenceVocabSize   = vocab_size;
-    }
-
     /// Set the GPU buffer that receives per-token log P(target|context) values.
     /// When non-null, dispatch_fused_lm_head_loss writes log-probs and returns early
     /// (no loss accumulation, no gradient state update).
@@ -296,13 +283,7 @@ private:
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
 
-    // Inference context (null in training mode)
-    KVCache* mKVCache              = nullptr;
-    bool     mIsDecodeMode         = false;
-    float*   mInferenceLogitsCpu   = nullptr;
-    int      mInferenceVocabSize   = 0;
-
-    // Log-prob extraction context (null in training/inference mode)
+    // Log-prob extraction context (null in training mode)
     float*   mLogprobsGpu          = nullptr;
 
     // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)

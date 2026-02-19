@@ -28,7 +28,6 @@
 #include "utilities/tensor_container.h"
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/mapping_spec.h"
-#include "runtime/dsl/kv_cache.h"
 
 namespace modules {
 struct HfMapping;
@@ -164,41 +163,6 @@ public:
     /// Must be called before import_weights().
     void set_adapter_path(const std::string& path) { mAdapterPath = path; }
 
-    // -------------------------------------------------------------------------
-    // Inference API (used by GRPO online generation)
-    // -------------------------------------------------------------------------
-
-    /// Allocate KV-cache and switch model to inference mode.
-    /// Call before inference_prefill().  Frees any existing KV-cache.
-    /// max_seq_len: maximum total sequence length (prompt + generation).
-    void enter_inference_mode(int max_seq_len);
-
-    /// Free KV-cache and return model to training mode.
-    void exit_inference_mode();
-
-    /// Prefill: run the model on a prompt and populate the KV-cache.
-    /// Returns logits for the last prompt token (B=1 currently).
-    /// Must call enter_inference_mode() first.
-    std::vector<float> inference_prefill(const std::int32_t* input_ids, int seq_len,
-                                         NCCLCommunicator& comm);
-
-    /// Decode: run the model on a single new token and return logits [vocab_size].
-    /// Updates the KV-cache to include the new token.
-    /// position is the token index being decoded (= current_pos after prefill).
-    std::vector<float> inference_decode(std::int32_t token_id, int position,
-                                        NCCLCommunicator& comm);
-
-    /// Set the KV-cache current position without invalidating the cached K/V.
-    ///
-    /// Used to generate G completions from the same prompt:
-    ///   1. Call inference_prefill(prompt) — fills cache at [0, prompt_len).
-    ///   2. Note prompt_len = return value or saved elsewhere.
-    ///   3. For each of G completions:
-    ///        set_kv_pos(prompt_len);            // reset decode position
-    ///        inference_decode(last_prompt_token, prompt_len);  // first decode step
-    ///        ...
-    void set_kv_pos(int pos);
-
     /// Compute per-token log-probabilities for a batch of sequences.
     ///
     /// input_ids: CPU int32 token IDs, shape [B, T] (row-major).
@@ -314,10 +278,6 @@ private:
 
     // Adapter merge state (optional — stacked LoRA)
     std::string mAdapterPath;
-
-    // KV-cache and inference state (null when in training mode)
-    std::unique_ptr<KVCache>       mKVCache;
-    std::vector<float>             mInferenceLogits;  // CPU-side logits scratch buffer
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;

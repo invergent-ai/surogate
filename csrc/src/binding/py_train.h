@@ -103,13 +103,6 @@ public:
                            const float* visual_embeds,
                            const std::vector<const float*>& deepstack_visual_embeds);
 
-    // Inference API (for online generation in GRPO)
-    void enter_inference_mode(int max_seq_len);
-    void exit_inference_mode();
-    std::vector<float> inference_prefill(const std::int32_t* input_ids, int seq_len);
-    std::vector<float> inference_decode(std::int32_t token_id, int position);
-    void set_kv_pos(int pos);  // reset KV-cache position (for G completions from same prefix)
-
     // Compute per-token log-probabilities for a batch [B, T].
     // use_lora=true applies LoRA (policy model); use_lora=false skips LoRA (reference model).
     // Returns B*T float log-probs; masked positions (target==-100) receive 0.

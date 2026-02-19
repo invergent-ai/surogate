@@ -44,42 +44,6 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     }
 
     // -----------------------------------------------------------------------
-    // Inference mode: compute logits for last token, copy to CPU, skip loss.
-    // -----------------------------------------------------------------------
-    if (mKVCache && mInferenceLogitsCpu) {
-        // BT may be B*T (prefill) or B*1 (decode). We want logits for the
-        // very last token of the sequence (position BT-1).
-        const long last_token = BT - 1;
-        const std::size_t xf_stride_inf = get_dtype_size(xF_flat.DType);
-
-        Tensor xF_last = xF_flat;
-        xF_last.Data = static_cast<std::byte*>(xF_last.Data) +
-                       static_cast<std::size_t>(last_token) * xf_stride_inf * static_cast<std::size_t>(C);
-        xF_last.Sizes[0] = 1;
-        xF_last.Sizes[1] = C;
-        xF_last.Rank = 2;
-
-        Tensor logits_gpu = mRunState.temp_alloc(ETensorDType::FP32, {1, static_cast<long>(V)});
-        mTemps.push_back(logits_gpu);
-
-        matmul(logits_gpu, weight, xF_last,
-               std::nullopt, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               V, 1, C,
-               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
-
-        CUDA_CHECK(cudaMemcpyAsync(mInferenceLogitsCpu, logits_gpu.Data,
-                                   static_cast<std::size_t>(V) * sizeof(float),
-                                   cudaMemcpyDeviceToHost, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-
-        if (need_lm_head) {
-            mWeightManager->release_lm_head(mRunState.MainStream);
-        }
-        return;
-    }
-
-    // -----------------------------------------------------------------------
     // Log-prob mode: compute log P(target | context) for all BT tokens, skip loss.
     // -----------------------------------------------------------------------
     if (mLogprobsGpu) {

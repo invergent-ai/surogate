@@ -435,29 +435,6 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Nq, HS)
                              Tensor& workspace, cudnnHandle_t handle,
                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
-// KV-cache decode attention: Q (B, Hq, HS), K/V cache (B, max_seq_len, Hkv, HS).
-// Builds a cuDNN SDPA graph with no causal mask (Q attends to all T_kv cached tokens).
-// The graph is cached by (B, Hq, Hkv, T_kv, HS, max_seq_len) — compiled once per unique T_kv.
-void attention_decode_cudnn(
-        nv_bfloat16* out,           // (B, Hq, HS)
-        const nv_bfloat16* q,       // (B, Hq, HS)
-        const nv_bfloat16* k_cache, // (B, max_seq_len, Hkv, HS) — only [0, T_kv) is valid
-        const nv_bfloat16* v_cache, // same layout
-        std::byte* workspace, cudnnHandle_t handle,
-        int B, int T_kv, int Hq, int Hkv, int HS, int max_seq_len,
-        cudaStream_t stream);
-
-// Extract K or V from interleaved QKV into the KV-cache.
-// qkv: (B, T, H, HS) where H = Hq + 2*Hkv.
-// cache: (B, max_seq_len, Hkv, HS).
-// head_start: Hq for K, Hq+Hkv for V.
-// cache_pos: first cache slot to write (supports both prefill and decode).
-void extract_kv_to_cache(
-        nv_bfloat16* cache,
-        const nv_bfloat16* qkv,
-        int B, int T, int H, int Hkv, int HS, int max_seq_len, int cache_pos, int head_start,
-        cudaStream_t stream);
-
 // Custom (non-cuDNN) attention forward using the in-tree kernel (supports FP32/BF16).
 void attention_forward_custom(Tensor& out,  // output: (B, T, Nq, HS)
                               Tensor& stats, // output for backward pass: (B, Hq, T)
