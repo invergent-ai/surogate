@@ -13,25 +13,25 @@
 #include <vector>
 
 struct GPUUtilInfo {
-    unsigned int clock;
-    unsigned int max_clock;
-    unsigned int power;
-    unsigned int power_limit;
-    unsigned int fan;
-    unsigned int temperature;
-    unsigned int temp_slowdown;
+    unsigned int clock = 0;
+    unsigned int max_clock = 0;
+    unsigned int power = 0;
+    unsigned int power_limit = 0;
+    unsigned int fan = 0;
+    unsigned int temperature = 0;
+    unsigned int temp_slowdown = 0;
 
-    std::size_t mem_free;
-    std::size_t mem_total;
-    std::size_t mem_reserved;
-    std::size_t mem_used;
+    std::size_t mem_free = 0;
+    std::size_t mem_total = 0;
+    std::size_t mem_reserved = 0;
+    std::size_t mem_used = 0;
 
-    float gpu_utilization;
-    float mem_utilization;
-    const char* throttle_reason;
+    float gpu_utilization = 0.0f;
+    float mem_utilization = 0.0f;
+    const char* throttle_reason = "";
 
-    std::size_t pcie_rx;    // in bytes/µs
-    std::size_t pcie_tx;
+    std::size_t pcie_rx = 0;    // in bytes/µs
+    std::size_t pcie_tx = 0;
 };
 
 std::size_t get_mem_reserved();

@@ -92,6 +92,7 @@ public:
     [[nodiscard]] int dp_rank() const { return mDPRank; }
     [[nodiscard]] int dp_size() const { return mDPSize; }
     [[nodiscard]] bool ep_enabled() const { return mEPSize > 1; }
+    [[nodiscard]] ncclComm_t comm() const { return mNcclComm; }
     [[nodiscard]] ncclComm_t ep_comm() const { return mEPComm; }
     [[nodiscard]] ncclComm_t dp_comm() const { return mDPComm; }
     [[nodiscard]] ncclComm_t weight_transfer_comm() const { return mWeightTransferComm; }
@@ -193,7 +194,7 @@ public:
      * @param node_rank This node's rank (0 to num_nodes-1).
      * @param num_nodes Total number of nodes.
      * @param nccl_id Shared NCCL unique ID for global communicator (128 bytes, same on all nodes).
-     * @param node_master_nccl_id Shared NCCL unique ID for node master communicator (128 bytes, same on all nodes).
+     *                 Node-master communicator is derived via ncclCommSplit internally.
      * @param memcpy_allgather Enable memcpy-based all-gather emulation.
      * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
      * @param work Callable invoked once per GPU with that GPU's communicator.
@@ -204,7 +205,6 @@ public:
         int node_rank,
         int num_nodes,
         const void* nccl_id,
-        const void* node_master_nccl_id,
         bool memcpy_allgather,
         bool memcpy_send_recv,
         std::function<void(NCCLCommunicator& comm)> work

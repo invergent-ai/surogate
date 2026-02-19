@@ -1328,7 +1328,7 @@ launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_rec
     threads.reserve(ngpus);
 
     for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
-        threads.emplace_back([=, &work]() {
+        threads.emplace_back([=]() {
             try {
                 if (!set_cpu_affinity()) {
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
@@ -1385,21 +1385,20 @@ std::array<std::byte, 128> NCCLCommunicator::generate_nccl_id() {
 }
 
 /**
- * @brief Launch communicator threads with externally-provided NCCL IDs (for Ray multi-node).
+ * @brief Launch communicator threads with externally-provided NCCL ID (for Ray multi-node).
  *
  * Similar to launch_communicators_impl but:
- * - Uses externally-provided nccl_id and node_master_nccl_id (coordinated via Ray)
+ * - Uses externally-provided nccl_id (coordinated via Ray)
  * - Uses provided node_rank, num_nodes
  * - Computes global_rank = node_rank * ngpus + local_rank
  * - Computes global_world = num_nodes * ngpus
- * - Initializes node master communicator and staging buffers for cross-node operations
+ * - Creates node master communicator via ncclCommSplit from the global communicator
  */
 std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_multinode(
     int ngpus,
     int node_rank,
     int num_nodes,
     const void* nccl_id,
-    const void* node_master_nccl_id,
     bool memcpy_allgather,
     bool memcpy_send_recv,
     std::function<void(NCCLCommunicator& comm)> work) {
@@ -1423,9 +1422,6 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     }
     if (nccl_id == nullptr) {
         throw std::runtime_error("nccl_id cannot be null");
-    }
-    if (node_master_nccl_id == nullptr) {
-        throw std::runtime_error("node_master_nccl_id cannot be null");
     }
 
     int global_world = num_nodes * ngpus;
@@ -1455,10 +1451,14 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     CUDA_CHECK(cudaMalloc(&shared_state->d_barrier_buf, sizeof(char)));
     CUDA_CHECK(cudaMemset(shared_state->d_barrier_buf, 0, sizeof(char)));
 
-    // NOTE: NodeMasterComm is initialized inside the worker threads by local_rank=0
-    // because ncclCommInitRank is a collective operation that must be called
-    // simultaneously by all participating ranks (one per node). Moving this to the
-    // main thread would cause a deadlock since nodes may reach this point at different times.
+    // NOTE: NodeMasterComm is created via ncclCommSplit inside the worker threads.
+    // ncclCommSplit is a collective on the global communicator, so all ranks must call it.
+
+    // Copy NCCL ID to owned storage so thread lambdas can capture it by value.
+    // The caller's buffers (e.g. stack-local arrays in py_train.cpp) may be destroyed
+    // before the spawned threads dereference the pointers in ncclCommInitRank.
+    ncclUniqueId owned_nccl_id{};
+    std::memcpy(&owned_nccl_id, nccl_id, sizeof(ncclUniqueId));
 
     // Launch worker threads
     std::vector<std::jthread> threads;
@@ -1467,7 +1467,7 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
         int global_rank = node_rank * ngpus + local_rank;
 
-        threads.emplace_back([=, &work, nccl_id_copy = nccl_id, node_master_nccl_id_copy = node_master_nccl_id]() {
+        threads.emplace_back([=]() {
             try {
                 if (!set_cpu_affinity()) {
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
@@ -1475,22 +1475,22 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
 
                 NCCLCommunicatorImpl comm(local_rank, global_rank, global_world,
                                           memcpy_allgather, memcpy_send_recv,
-                                          nccl_id_copy, shared_state);
+                                          &owned_nccl_id, shared_state);
 
-                // Initialize NodeMasterComm for cross-node operations IMMEDIATELY after the
-                // per-GPU communicator init. The ncclCommInitRank above is a collective operation
-                // that synchronizes all 8 GPUs across both nodes, so all local_rank=0 threads
-                // exit that call at approximately the same time. We leverage this synchronization
-                // to ensure the NodeMasterComm init (also a collective) is called simultaneously
-                // by both node masters without needing an explicit cross-node barrier.
-                //
-                // IMPORTANT: No local barrier before this! A local barrier would desynchronize
-                // the cross-node timing because nodes have different numbers of threads that
-                // might reach the barrier at different speeds.
-                if (local_rank == 0 && num_nodes > 1) {
-                    // Stay on device 0 (already set by NCCLCommunicatorImpl constructor for local_rank 0)
-                    ncclCheck(ncclCommInitRank(&shared_state->NodeMasterComm, num_nodes,
-                                               *reinterpret_cast<const ncclUniqueId*>(node_master_nccl_id_copy), node_rank));
+                // Create NodeMasterComm via ncclCommSplit from the global communicator.
+                // This is a collective — ALL ranks must call it. Ranks with local_rank=0
+                // join the node-master group (color=0); others pass NCCL_SPLIT_NOCOLOR.
+                // Using ncclCommSplit avoids a second ncclGetUniqueId() / bootstrap root,
+                // which causes interference in NCCL 2.29+ when two roots coexist in one process.
+                if (num_nodes > 1) {
+                    int split_color = (local_rank == 0) ? 0 : NCCL_SPLIT_NOCOLOR;
+                    int split_key   = (local_rank == 0) ? node_rank : 0;
+                    ncclComm_t node_master_comm = nullptr;
+                    ncclCheck(ncclCommSplit(comm.comm(), split_color, split_key,
+                                           &node_master_comm, nullptr));
+                    if (local_rank == 0) {
+                        shared_state->NodeMasterComm = node_master_comm;
+                    }
                 }
 
                 // Now sync all local threads before proceeding to work

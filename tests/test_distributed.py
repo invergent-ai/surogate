@@ -118,7 +118,6 @@ class TestNodeTrainer:
             node_rank=0,
             num_nodes=2,
             nccl_id=b"\x00" * 128,
-            node_master_nccl_id=b"\x01" * 128,
             gpus_per_node=4,
         )
 
@@ -126,7 +125,6 @@ class TestNodeTrainer:
         assert trainer.num_nodes == 2
         assert trainer.gpus_per_node == 4
         assert len(trainer.nccl_id) == 128
-        assert len(trainer.node_master_nccl_id) == 128
 
     def test_node_trainer_stores_config(self):
         """NodeTrainer should store config dict for later reconstruction."""
@@ -144,7 +142,6 @@ class TestNodeTrainer:
             node_rank=1,
             num_nodes=2,
             nccl_id=b"\x00" * 128,
-            node_master_nccl_id=b"\x01" * 128,
             gpus_per_node=2,
         )
 
@@ -156,8 +153,8 @@ class TestRayDistributedTrainerMocked:
     """Tests for RayDistributedTrainer with mocked Ray."""
 
     @patch("surogate.train.distributed._get_ray")
-    def test_trainer_generates_nccl_ids(self, mock_get_ray):
-        """RayDistributedTrainer should generate two NCCL IDs."""
+    def test_trainer_generates_nccl_id(self, mock_get_ray):
+        """RayDistributedTrainer should generate a single NCCL ID."""
         # Mock Ray
         mock_ray = MagicMock()
         mock_ray.is_initialized.return_value = True
@@ -179,10 +176,8 @@ class TestRayDistributedTrainerMocked:
             gpus_per_node=4,
         )
 
-        # Check NCCL IDs were generated
+        # Check NCCL ID was generated (single ID, node master derived via ncclCommSplit)
         assert len(trainer.nccl_id) == 128
-        assert len(trainer.node_master_nccl_id) == 128
-        assert trainer.nccl_id != trainer.node_master_nccl_id
 
     @patch("surogate.train.distributed._get_ray")
     def test_trainer_auto_detects_nodes(self, mock_get_ray):
@@ -280,7 +275,6 @@ class TestCreateMultinodeBinding:
                 node_rank=0,
                 num_nodes=1,
                 nccl_id=b"\x00" * 128,
-                node_master_nccl_id=b"\x00" * 128,
                 config=None,
                 options=None,
                 batch_size=1,
@@ -330,18 +324,12 @@ class TestIntegrationGPU:
         """NCCL ID should be usable in multi-node setup."""
         from surogate import _surogate
 
-        # Generate IDs
+        # Generate single ID (node master comm derived via ncclCommSplit)
         nccl_id = _surogate.generate_nccl_id()
-        node_master_id = _surogate.generate_nccl_id()
 
-        # Verify they're valid bytes
+        # Verify it's valid bytes
         assert isinstance(nccl_id, bytes)
-        assert isinstance(node_master_id, bytes)
         assert len(nccl_id) == 128
-        assert len(node_master_id) == 128
-
-        # Different IDs for different communicators
-        assert nccl_id != node_master_id
 
 
 if __name__ == "__main__":

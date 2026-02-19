@@ -109,6 +109,44 @@ def _create_barrier_actor(num_nodes: int):
     return BarrierActor.remote(num_nodes)
 
 
+def _detect_nccl_interface(node_rank: int = 0):
+    """Detect the network interface matching Ray's node IP and set NCCL_SOCKET_IFNAME.
+
+    Ray communicates on the correct network (typically the IB fabric), so NCCL must
+    use the same interface for its bootstrap sockets.  This MUST be called before
+    any ``ncclGetUniqueId()`` call, because the unique-ID embeds the caller's IP.
+
+    Returns (iface, ip) or (None, None) on failure.
+    """
+    import os
+    import subprocess
+    from surogate.utils.logger import get_logger
+    logger = get_logger()
+
+    try:
+        import ray
+        ray_ip = ray.util.get_node_ip_address()
+        result = subprocess.run(
+            ['ip', '-4', '-o', 'addr', 'show'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 4:
+                iface = parts[1]
+                ip = parts[3].split('/')[0]
+                if ip == ray_ip:
+                    if 'NCCL_SOCKET_IFNAME' not in os.environ:
+                        os.environ['NCCL_SOCKET_IFNAME'] = iface
+                        logger.info(f"Node {node_rank}: Auto-detected NCCL interface {iface} ({ip})")
+                    return iface, ip
+        logger.warning(f"Node {node_rank}: Could not find interface for Ray IP {ray_ip}")
+        return None, None
+    except Exception as e:
+        logger.warning(f"Node {node_rank}: Failed to detect network interface: {e}")
+        return None, None
+
+
 class NodeTrainer:
     """
     Training worker that runs on a single node.
@@ -124,8 +162,6 @@ class NodeTrainer:
         eval_files: Optional[List[str]],
         node_rank: int,
         num_nodes: int,
-        nccl_id: bytes,
-        node_master_nccl_id: bytes,
         gpus_per_node: int,
         tokenize_on_node: bool = False,
     ):
@@ -134,8 +170,7 @@ class NodeTrainer:
         self.eval_files = eval_files
         self.node_rank = node_rank
         self.num_nodes = num_nodes
-        self.nccl_id = nccl_id
-        self.node_master_nccl_id = node_master_nccl_id
+        self.nccl_id = None
         self.gpus_per_node = gpus_per_node
         self.tokenize_on_node = tokenize_on_node
 
@@ -195,6 +230,40 @@ class NodeTrainer:
         self._eval_files = eval_files
         self._config = config
 
+    def generate_nccl_id(self) -> bytes:
+        """Generate a single NCCL unique ID (must be called on node 0 only).
+
+        ncclGetUniqueId() starts a bootstrap root listener in the calling process.
+        The bootstrap root must live in the same process as rank 0 of the communicator.
+        The node-master communicator is derived via ncclCommSplit internally (no second ID needed).
+
+        IMPORTANT: NCCL env vars must be set BEFORE ncclGetUniqueId() because:
+        - NCCL_SOCKET_IFNAME: the unique-ID embeds the caller's IP for bootstrap
+        - NCCL_RAS_ENABLE: RAS subsystem can interfere with bootstrap listeners
+        """
+        import os
+        from surogate.utils.logger import get_logger
+        logger = get_logger()
+
+        # Set NCCL env vars BEFORE ncclGetUniqueId() — the bootstrap root listener
+        # starts inside that call and inherits the current environment.
+        os.environ['NCCL_RAS_ENABLE'] = '0'
+        os.environ['NCCL_IB_DISABLE'] = '0'
+
+        # Detect and set the correct network interface BEFORE generating IDs
+        _detect_nccl_interface(self.node_rank)
+
+        from surogate import _surogate
+        logger.info(f"Node {self.node_rank}: Generating NCCL ID with NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}")
+        nccl_id = _surogate.generate_nccl_id()
+        self.nccl_id = nccl_id
+        logger.info(f"Node {self.node_rank}: Generated NCCL ID: {nccl_id[:16].hex()}")
+        return nccl_id
+
+    def set_nccl_id(self, nccl_id: bytes) -> None:
+        """Set NCCL ID received from node 0."""
+        self.nccl_id = nccl_id
+
     def download_model(self) -> str:
         """
         Download the model (non-blocking phase that can take variable time per node).
@@ -205,7 +274,7 @@ class NodeTrainer:
         from surogate.utils.hf import get_model_weights_path
         from surogate.utils.logger import get_logger
         logger = get_logger()
-        
+
         logger.info(f"Node {self.node_rank}: Starting model download...")
         model_weights_path = get_model_weights_path(self._config.model_dir)
 
@@ -244,41 +313,11 @@ class NodeTrainer:
         os.environ['NCCL_RAS_ENABLE'] = '0'
 
         # Configure NCCL network settings for multi-node communication
-        # Auto-detect the correct network interface (not loopback)
         import socket
-        import subprocess
         hostname = socket.gethostname()
 
-        # Find network interface with a routable IP (not loopback)
-        def get_network_interface():
-            """Find the network interface and IP that can reach other nodes."""
-            try:
-                # Get all interfaces with their IPs
-                result = subprocess.run(
-                    ['ip', '-4', '-o', 'addr', 'show'],
-                    capture_output=True, text=True, timeout=5
-                )
-                for line in result.stdout.strip().split('\n'):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        iface = parts[1]
-                        ip_cidr = parts[3]
-                        ip = ip_cidr.split('/')[0]
-                        # Skip loopback and docker/veth interfaces
-                        if iface == 'lo' or iface.startswith('docker') or iface.startswith('veth') or iface.startswith('br-'):
-                            continue
-                        # Prefer interfaces in common private ranges
-                        if ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.'):
-                            return iface, ip
-                return None, None
-            except Exception as e:
-                logger.warning(f"Failed to detect network interface: {e}")
-                return None, None
-
-        detected_iface, detected_ip = get_network_interface()
-        if detected_iface and 'NCCL_SOCKET_IFNAME' not in os.environ:
-            os.environ['NCCL_SOCKET_IFNAME'] = detected_iface
-            logger.info(f"Node {self.node_rank}: Auto-detected network interface {detected_iface} with IP {detected_ip}")
+        # Ensure NCCL_SOCKET_IFNAME is set (may already be set by generate_nccl_ids on node 0)
+        detected_iface, detected_ip = _detect_nccl_interface(self.node_rank)
 
         local_ip = detected_ip or socket.gethostbyname(hostname)
         logger.info(f"Node {self.node_rank}: Local IP={local_ip}, hostname={hostname}, NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}")
@@ -366,17 +405,16 @@ class NodeTrainer:
             # Sleep for a small amount to ensure all nodes reach this point
             logger.info(f"Node {self.node_rank}: Ready for NCCL initialization, waiting for other nodes...")
             logger.info(f"Node {self.node_rank}: NCCL ID (first 16 bytes): {self.nccl_id[:16].hex()}")
-            logger.info(f"Node {self.node_rank}: Node Master NCCL ID (first 16 bytes): {self.node_master_nccl_id[:16].hex()}")
             time.sleep(2.0)  # Give all nodes time to reach this point
 
-            # Multi-node: use NCCL IDs for cross-node coordination
+            # Multi-node: use NCCL ID for cross-node coordination
+            # The node-master communicator is derived via ncclCommSplit internally.
             logger.info(f"Node {self.node_rank}: Starting NCCL initialization with {self.num_nodes} nodes, node_rank={self.node_rank}, local_gpus={local_gpus}")
             self._trainer = _surogate.SurogateTrainer.create_multinode(
                 ngpu=local_gpus,
                 node_rank=self.node_rank,
                 num_nodes=self.num_nodes,
                 nccl_id=self.nccl_id,
-                node_master_nccl_id=self.node_master_nccl_id,
                 config=pretrained_config,
                 options=self._config.runtime_config,
                 batch_size=self._config.per_device_train_batch_size,
@@ -636,11 +674,11 @@ class NodeTrainer:
             return self._trainer.get_moe_stats()
         return {'valid': False}
 
-    def validate(self, max_steps: int = 100) -> float:
-        """Run validation and return mean loss."""
+    def validate(self, max_steps: int = 100) -> Tuple[float, int]:
+        """Run validation and return (mean_loss, batches_processed)."""
         if self._mm_on_the_fly:
             if self._mm_eval_dataset is None:
-                return 0.0
+                return 0.0, 0
             pad_token_id = self._config.tokenizer.pad_token_id
             if pad_token_id is None:
                 pad_token_id = self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
@@ -673,10 +711,10 @@ class NodeTrainer:
                 loss = self._trainer.validate(batch["inputs"], batch["targets"], batch["position_ids"])
                 total_loss += loss
                 batches += 1
-            return total_loss / batches if batches > 0 else 0.0
+            return (total_loss / batches if batches > 0 else 0.0), batches
 
         if not self._eval_loader:
-            return 0.0
+            return 0.0, 0
 
         config = self._config
         B = config.per_device_train_batch_size
@@ -697,11 +735,37 @@ class NodeTrainer:
             total_loss += loss
             batches += 1
 
-        return total_loss / batches if batches > 0 else 0.0
+        return (total_loss / batches if batches > 0 else 0.0), batches
 
     def save_checkpoint(self, path: str, step: int) -> None:
         """Save checkpoint (only node 0 saves the full model)."""
         self._trainer.save_checkpoint(path, step)
+
+    def get_dataset_info(self) -> Dict[str, Any]:
+        """Get dataset info for logging (train/eval token counts)."""
+        info: Dict[str, Any] = {}
+        if self._train_loader is not None:
+            info["train_tokens"] = self._train_loader.num_tokens
+        if self._eval_loader is not None:
+            info["eval_tokens"] = self._eval_loader.num_tokens
+        return info
+
+    def get_allocator_info(self, gpu_idx: int) -> Any:
+        """Get allocator info for a specific GPU."""
+        if self._trainer is not None:
+            return self._trainer.get_allocator_info(gpu_idx)
+        return None
+
+    def get_gpu_info(self) -> List[Any]:
+        """Get GPU info for all local GPUs."""
+        if self._trainer is not None:
+            return self._trainer.get_gpu_info()
+        return []
+
+    def cleanup_old_checkpoints(self, checkpoint_dir: str, save_total_limit: int) -> int:
+        """Clean up old checkpoints, keeping the most recent ones."""
+        from surogate import _surogate
+        return _surogate.clean_old_checkpoints(checkpoint_dir, save_total_limit, -1)
 
     def cleanup_trainer(self) -> None:
         """Cleanup trainer resources before export."""
@@ -817,11 +881,12 @@ class RayDistributedTrainer:
                 config_dict[key] = serialized
         self.config_dict = config_dict
 
-        # Generate NCCL IDs on the driver (will be shared with all workers)
-        # Import here to avoid loading CUDA on the driver before Ray actors are created
-        from surogate import _surogate
-        self.nccl_id = _surogate.generate_nccl_id()
-        self.node_master_nccl_id = _surogate.generate_nccl_id()
+        # NCCL ID will be generated on node 0's actor (not the driver).
+        # ncclGetUniqueId() starts a bootstrap root listener in the calling process.
+        # The bootstrap root must be in the same process as rank 0 of the communicator,
+        # otherwise NCCL's bootstrap protocol can fail with corrupted data exchanges.
+        # Only ONE ID is needed — the node-master comm is derived via ncclCommSplit.
+        self.nccl_id = None
 
     def _setup_workers(self) -> None:
         from surogate.utils.logger import get_logger
@@ -845,25 +910,27 @@ class RayDistributedTrainer:
                 eval_files: Optional[List[str]],
                 node_rank: int,
                 num_nodes: int,
-                nccl_id: bytes,
-                node_master_nccl_id: bytes,
                 gpus_per_node: int,
                 tokenize_on_node: bool = False,
-            ):  
+            ):
                 self.trainer = NodeTrainer(
                     config_dict=config_dict,
                     train_files=train_files,
                     eval_files=eval_files,
                     node_rank=node_rank,
                     num_nodes=num_nodes,
-                    nccl_id=nccl_id,
-                    node_master_nccl_id=node_master_nccl_id,
                     gpus_per_node=gpus_per_node,
                     tokenize_on_node=tokenize_on_node,
                 )
 
             def setup(self) -> None:
                 self.trainer.setup()
+
+            def generate_nccl_id(self):
+                return self.trainer.generate_nccl_id()
+
+            def set_nccl_id(self, nccl_id):
+                self.trainer.set_nccl_id(nccl_id)
 
             def download_model(self) -> str:
                 return self.trainer.download_model()
@@ -890,7 +957,7 @@ class RayDistributedTrainer:
             def train_step(self, step: int, lr: float) -> Tuple[float, float]:
                 return self.trainer.train_step(step, lr)
 
-            def validate(self, max_steps: int = 100) -> float:
+            def validate(self, max_steps: int = 100) -> Tuple[float, int]:
                 return self.trainer.validate(max_steps)
 
             def save_checkpoint(self, path: str, step: int) -> None:
@@ -910,16 +977,61 @@ class RayDistributedTrainer:
                 """Get MoE training statistics from the last forward pass."""
                 return self.trainer.get_moe_stats()
 
-        # Spawn actors with shared NCCL IDs
+            def get_dataset_info(self) -> Dict[str, Any]:
+                """Get dataset info for logging."""
+                return self.trainer.get_dataset_info()
+
+            def get_allocator_info(self, gpu_idx: int):
+                """Get allocator info for a specific GPU."""
+                return self.trainer.get_allocator_info(gpu_idx)
+
+            def get_gpu_info(self):
+                """Get GPU info for all local GPUs (as dicts for Ray serialization)."""
+                infos = self.trainer.get_gpu_info()
+                return [
+                    {
+                        "clock": g.clock, "max_clock": g.max_clock,
+                        "power": g.power, "power_limit": g.power_limit,
+                        "fan": g.fan, "temperature": g.temperature,
+                        "temp_slowdown": g.temp_slowdown,
+                        "mem_free": g.mem_free, "mem_total": g.mem_total,
+                        "mem_reserved": g.mem_reserved,
+                        "gpu_utilization": g.gpu_utilization,
+                        "mem_utilization": g.mem_utilization,
+                        "throttle_reason": g.throttle_reason,
+                        "pcie_rx": g.pcie_rx, "pcie_tx": g.pcie_tx,
+                    }
+                    for g in infos
+                ]
+
+            def cleanup_old_checkpoints(self, checkpoint_dir: str, save_total_limit: int) -> int:
+                """Clean up old checkpoints."""
+                return self.trainer.cleanup_old_checkpoints(checkpoint_dir, save_total_limit)
+
+        # Use a STRICT_SPREAD placement group so Ray places exactly one actor per
+        # physical node.  Each bundle requests the GPUs that one actor needs; the
+        # STRICT_SPREAD strategy guarantees that every bundle lands on a different node.
+        from ray.util.placement_group import placement_group, placement_group_table
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        bundles = [{"GPU": gpus_per_node, "CPU": 1} for _ in range(self.num_nodes)]
+        pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        ray.get(pg.ready())
+        logger.info(f"Placement group ready: {self.num_nodes} bundles, STRICT_SPREAD")
+
+        # Spawn actors, pinning each to its own bundle inside the placement group
         self.node_trainers = [
-            NodeTrainerActor.remote(
+            NodeTrainerActor.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                )
+            ).remote(
                 config_dict=self.config_dict,
                 train_files=self.train_files,
                 eval_files=self.eval_files,
                 node_rank=i,
                 num_nodes=self.num_nodes,
-                nccl_id=self.nccl_id,
-                node_master_nccl_id=self.node_master_nccl_id,
                 gpus_per_node=gpus_per_node,
                 tokenize_on_node=self.tokenize_on_node,
             )
@@ -935,17 +1047,26 @@ class RayDistributedTrainer:
         ray.get([t.download_model.remote() for t in self.node_trainers])
         logger.info("All nodes finished downloading models")
 
-        # Phase 3: Barrier - ensure all nodes are ready to enter NCCL init together
-        # NCCL's ncclCommInitRank is a collective operation that requires all participants
-        # to call it at nearly the same time. Without this barrier, Ray scheduling delays
-        # could cause one node to start NCCL init while another is still finishing download.
+        # Phase 3: Generate NCCL ID on node 0's actor and distribute to all nodes.
+        # ncclGetUniqueId() starts a bootstrap root listener in the calling process.
+        # This MUST be the same process that will run rank 0 of ncclCommInitRank,
+        # otherwise the bootstrap protocol fails with corrupted data exchanges.
+        # Only ONE ID is needed — the node-master comm is derived via ncclCommSplit.
+        if self.num_nodes > 1:
+            logger.info("Generating NCCL ID on node 0...")
+            nccl_id = ray.get(self.node_trainers[0].generate_nccl_id.remote())
+            # Distribute to all other nodes
+            ray.get([t.set_nccl_id.remote(nccl_id) for t in self.node_trainers[1:]])
+            logger.info("NCCL ID distributed to all nodes")
+
+        # Phase 4: Barrier - ensure all nodes are ready to enter NCCL init together
         if self.num_nodes > 1:
             logger.info("Synchronizing nodes before NCCL initialization...")
             barrier = _create_barrier_actor(self.num_nodes)
             ray.get([t.wait_at_barrier.remote(barrier) for t in self.node_trainers])
             logger.info("All nodes synchronized, proceeding to NCCL init")
 
-        # Phase 4: Initialize trainers with NCCL (collective operation - must be synchronous)
+        # Phase 5: Initialize trainers with NCCL (collective operation - must be synchronous)
         # All nodes must enter this phase together since it contains NCCL collective operations
         logger.info("Initializing NCCL trainers on all nodes...")
         ray.get([t.init_trainer.remote() for t in self.node_trainers])
@@ -957,7 +1078,11 @@ class RayDistributedTrainer:
 
     def train(self) -> None:
         """Run the distributed training loop."""
+        import time
+        import traceback as _traceback
+
         ray = _get_ray()
+        from surogate import _surogate
         from surogate.train.gradient_tracker import GradientTracker
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
@@ -965,7 +1090,9 @@ class RayDistributedTrainer:
         from surogate.train.moe_monitor import MoEMonitor
         from surogate.train.phase_detector import PhaseDetector
         from surogate.train.plateau_detector import PlateauDetector
+        from surogate.train.reporter import training_logger_context
         from surogate.train.training_advisor import TrainingAdvisor
+        from surogate.train.training_plot import generate_training_plot
         from surogate.utils.logger import get_logger
 
         logger = get_logger()
@@ -984,7 +1111,9 @@ class RayDistributedTrainer:
             config.gradient_accumulation_steps
         )
         total_tokens_per_step = tokens_per_step_per_node * self.num_nodes
-        
+
+        num_params = None
+        chinchilla_tokens = None
         if config.from_scratch:
             # Chinchilla token budget (optimal tokens ≈ 20 × params)
             from surogate.utils.model import estimate_model_parameters
@@ -1057,195 +1186,269 @@ class RayDistributedTrainer:
         else:
             early_stopping = None
 
-        logger.info(f"Starting distributed training...")
-        logger.info(f"  Nodes: {self.num_nodes}")
-        logger.info(f"  GPUs per node: {local_gpus}")
-        logger.info(f"  Total GPUs: {self.num_nodes * local_gpus}")
-        logger.info(f"  Tokens per step: {total_tokens_per_step}")
-        logger.info(f"  Starting from step: {start_step}")
-        logger.info(f"  Max steps: {max_steps}")
-
         has_eval = False
         if self.eval_files:
             has_eval = True
         elif config.multimodal_on_the_fly:
             has_eval = bool(config.validation_datasets) or (config.validation_split_ratio and config.validation_split_ratio > 0)
-        
-        if config.from_scratch:
-            # Chinchilla token budget
-            planned_tokens = max_steps * total_tokens_per_step
-            ratio = planned_tokens / max(chinchilla_tokens, 1)
-            def _fmt(n):
-                if n >= 1e12: return f"{n/1e12:.1f}T"
-                if n >= 1e9: return f"{n/1e9:.1f}B"
-                if n >= 1e6: return f"{n/1e6:.1f}M"
-                return f"{n/1e3:.1f}K"
-            logger.info(
-                f"  Chinchilla budget: {_fmt(chinchilla_tokens)} tokens (20 × {_fmt(num_params)} params) | "
-                f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
-            )
 
-        # Training loop
-        import time
-        step_start_time = time.time()
+        with training_logger_context(config) as train_logger:
+            # log_cmd and log_options are already called by training_logger_context.
+            # Log dataset info (log_dataset requires C++ DataLoader objects on the driver,
+            # so we log token counts manually from node 0)
+            if not config.multimodal_on_the_fly:
+                dataset_info = ray.get(self.node_trainers[0].get_dataset_info.remote())
+                if dataset_info.get("train_tokens"):
+                    logger.info(f"Train dataset: {dataset_info['train_tokens']} tokens")
+                if dataset_info.get("eval_tokens"):
+                    logger.info(f"Eval dataset: {dataset_info['eval_tokens']} tokens")
 
-        for step in range(start_step, max_steps):
-            lr = lr_schedule.get_lr(step)
+            # Log allocator info from node 0
+            for idx in range(local_gpus):
+                alloc_info = ray.get(self.node_trainers[0].get_allocator_info.remote(idx))
+                if alloc_info is not None:
+                    train_logger.log_allocator(alloc_info)
 
-            # Run training step on all nodes in parallel
-            futures = [t.train_step.remote(step, lr) for t in self.node_trainers]
-            results = ray.get(futures)
+            logger.info(f"Starting distributed training...")
+            logger.info(f"  Nodes: {self.num_nodes}")
+            logger.info(f"  GPUs per node: {local_gpus}")
+            logger.info(f"  Total GPUs: {self.num_nodes * local_gpus}")
+            logger.info(f"  Tokens per step: {total_tokens_per_step}")
+            logger.info(f"  Starting from step: {start_step}")
+            logger.info(f"  Max steps: {max_steps}")
+            logger.info(f"  Recipe: {config.recipe}")
+            logger.info(f"  Optimizer: {config.optimizer}")
+            logger.info(f"  LR schedule: {config.lr_scheduler_type} (warmup={warmup_steps}, cooldown={config.cooldown_steps})")
 
-            # Aggregate results (average loss and norm across nodes)
-            losses = [r[0] for r in results]
-            norms = [r[1] for r in results]
-            avg_loss = sum(losses) / len(losses)
-            avg_norm = sum(norms) / len(norms)
-
-            # Calculate timing
-            step_end_time = time.time()
-            step_time = step_end_time - step_start_time
-
-            # Check for loss spikes / gradient explosions
-            if loss_guard is not None:
-                loss_guard.step(avg_loss, avg_norm, step)
-            plateau_detector.step(avg_loss, step)
-            phase = phase_detector.step(avg_loss, step)
-            gradient_tracker.step(avg_norm, step)
-
-            # Build structured metrics
-            metrics = StepMetrics(
-                step=step,
-                epoch=step / steps_per_epoch if steps_per_epoch > 0 else 0.0,
-                loss=avg_loss,
-                grad_norm=avg_norm,
-                grad_norm_mean=gradient_tracker.mean,
-                grad_norm_max=gradient_tracker.max,
-                grad_norm_trend=gradient_tracker.trend,
-                lr=lr,
-                tokens=total_tokens_per_step,
-                elapsed_ms=int(step_time * 1000),
-                phase=phase.value,
-                lr_overridden=lr_schedule.has_override,
-                moe=MoEMetrics.from_dict(ray.get(self.node_trainers[0].get_moe_stats.remote())),
-            )
-            moe_monitor.step(metrics.moe, step)
-            advisor.step(metrics, step)
-
-            if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
-                break
-
-            # Log progress
-            if step % config.logging_steps == 0:
+            if config.from_scratch:
+                planned_tokens = max_steps * total_tokens_per_step
+                ratio = planned_tokens / max(chinchilla_tokens, 1)
+                def _fmt(n):
+                    if n >= 1e12: return f"{n/1e12:.1f}T"
+                    if n >= 1e9: return f"{n/1e9:.1f}B"
+                    if n >= 1e6: return f"{n/1e6:.1f}M"
+                    return f"{n/1e3:.1f}K"
                 logger.info(
-                    f"Step {step}/{max_steps} | Loss: {metrics.loss:.4f} | Norm: {metrics.grad_norm:.4f} | "
-                    f"LR: {metrics.lr:.2e} | {step_time:.2f}s | {metrics.tokens_per_second:.0f} tok/s | {metrics.phase}"
+                    f"  Chinchilla budget: {_fmt(chinchilla_tokens)} tokens (20 × {_fmt(num_params)} params) | "
+                    f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
                 )
 
-                if metrics.moe is not None:
-                    logger.info(
-                        f"  MoE: aux_loss={metrics.moe.aux_loss:.4f} z_loss={metrics.moe.z_loss:.4f} "
-                        f"util={metrics.moe.expert_utilization:.2%} imbalance={metrics.moe.load_imbalance:.2f}"
-                    )
+            if config.lora and config.lora_config:
+                logger.info(f"LoRA enabled:")
+                logger.info(f"  Rank: {config.lora_config.rank}")
+                logger.info(f"  Alpha: {config.lora_config.alpha}")
+                logger.info(f"  Scaling: {config.lora_config.scaling:.4f}")
+                logger.info(f"  DType: {config.lora_dtype}")
+                logger.info(f"  Target modules: {config.lora_config.target_modules}")
+                if config.qlora_fp8:
+                    logger.info(f"  QLoRA-FP8 enabled: block_size={config.qlora_block_size}")
+                elif config.qlora_fp4:
+                    logger.info("  QLoRA-FP4 enabled: NVFP4 (E2M1)")
+                logger.info("Note: Base model weights are frozen, only LoRA adapters will be trained")
 
-            # Reset timer for next step
+            # Training loop
             step_start_time = time.time()
 
-            # Periodic evaluation
-            if has_eval and config.eval_steps > 0 and step % config.eval_steps == 0 and step > start_step:
-                eval_futures = [t.validate.remote(100) for t in self.node_trainers]
-                eval_losses = ray.get(eval_futures)
-                avg_eval_loss = sum(eval_losses) / len(eval_losses)
-                logger.info(f"  Eval loss: {avg_eval_loss:.4f}")
-                if early_stopping is not None and early_stopping.check_eval(avg_eval_loss, step):
+            for step in range(start_step, max_steps):
+                lr = lr_schedule.get_lr(step)
+
+                # Run training step on all nodes in parallel
+                futures = [t.train_step.remote(step, lr) for t in self.node_trainers]
+                results = ray.get(futures)
+
+                # Aggregate results (average loss and norm across nodes)
+                losses = [r[0] for r in results]
+                norms = [r[1] for r in results]
+                avg_loss = sum(losses) / len(losses)
+                avg_norm = sum(norms) / len(norms)
+
+                # Calculate timing
+                step_end_time = time.time()
+                step_time = step_end_time - step_start_time
+
+                # Check for loss spikes / gradient explosions
+                if loss_guard is not None:
+                    loss_guard.step(avg_loss, avg_norm, step)
+                plateau_detector.step(avg_loss, step)
+                phase = phase_detector.step(avg_loss, step)
+                gradient_tracker.step(avg_norm, step)
+                train_logger.set_phase(phase.value)
+
+                # Build structured metrics
+                moe_metrics = None
+                if config.moe_num_experts and config.moe_num_experts > 1:
+                    moe_metrics = MoEMetrics.from_dict(ray.get(self.node_trainers[0].get_moe_stats.remote()))
+                metrics = StepMetrics(
+                    step=step,
+                    epoch=step / steps_per_epoch if steps_per_epoch > 0 else 0.0,
+                    loss=avg_loss,
+                    grad_norm=avg_norm,
+                    grad_norm_mean=gradient_tracker.mean,
+                    grad_norm_max=gradient_tracker.max,
+                    grad_norm_trend=gradient_tracker.trend,
+                    lr=lr,
+                    tokens=total_tokens_per_step,
+                    elapsed_ms=int(step_time * 1000),
+                    phase=phase.value,
+                    lr_overridden=lr_schedule.has_override,
+                    moe=moe_metrics,
+                )
+                moe_monitor.step(metrics.moe, step)
+                advisor.step(metrics, step)
+
+                if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                     break
 
-            # Periodic checkpointing
-            if config.save_steps > 0 and step % config.save_steps == 0 and step > start_step:
-                logger.info(f"Saving checkpoint at step {step}...")
-                try:
-                    # Only node 0 saves (others have identical weights in data parallel)
-                    ray.get(self.node_trainers[0].save_checkpoint.remote(config.checkpoint_dir, step))
-                    logger.info(f"Checkpoint saved successfully at step {step}")
-                except Exception as e:
-                    logger.error(f"Failed to save checkpoint at step {step}: {e}")
-                    logger.error(f"Exception type: {type(e).__name__}")
-                    logger.warning("Training will continue without saving this checkpoint")
-                    import traceback
-                    logger.error(f"Traceback:\n{traceback.format_exc()}")
-
-        # Save final model
-        # IMPORTANT: export_adapter/export_model contain NCCL barriers, so ALL nodes must participate
-        logger.info("Training complete. Saving final model...")
-        try:
-            if config.lora:
-                adapter_dir = str(Path(config.output_dir))
-                logger.info(f"Exporting LoRA adapter to {adapter_dir}...")
-                # Call export on ALL nodes - they all participate in NCCL barriers
-                # Only node 0 actually writes the file
-                export_refs = [t.export_adapter.remote(adapter_dir) for t in self.node_trainers]
-                ready, not_ready = ray.wait(export_refs, num_returns=len(export_refs), timeout=120)
-                if len(ready) == len(export_refs):
-                    results = ray.get(ready)
-                    if any(results):
-                        logger.info(f"LoRA adapter saved to {adapter_dir}")
-                    else:
-                        logger.warning("Adapter export: all nodes returned False")
-                else:
-                    # Check if file was saved despite timeout
-                    adapter_file = Path(adapter_dir) / "adapter_model.safetensors"
-                    if adapter_file.exists():
-                        logger.info(f"LoRA adapter saved to {adapter_dir} (export timed out but file exists)")
-                    else:
-                        logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
-
-                # Merge adapter into base model if requested (only on head node)
-                if config.merge_adapter:
-                    from surogate.utils.adapter_merge import merge_adapter
-                    merged_dir = Path(config.output_dir)
-                    try:
-                        merge_adapter(
-                            base_model_path=config.model_dir,
-                            adapter_path=adapter_dir,
-                            output_path=str(merged_dir),
-                            max_shard_size="5GB",
-                            cpu_offload=True
+                # Log progress
+                if step % config.logging_steps == 0:
+                    if metrics.moe is not None:
+                        train_logger.log_step_moe(
+                            metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                            metrics.grad_norm, metrics.loss, metrics.lr,
+                            metrics.moe.aux_loss,
+                            metrics.moe.z_loss,
+                            metrics.moe.load_imbalance,
+                            metrics.moe.expert_utilization,
                         )
+                    else:
+                        train_logger.log_step(
+                            metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
+                            metrics.grad_norm, metrics.loss, metrics.lr,
+                        )
+
+                # Log GPU utilization from node 0
+                if config.log_gpu_util > 0 and step % config.log_gpu_util == 0:
+                    gpu_dicts = ray.get(self.node_trainers[0].get_gpu_info.remote())
+                    for i, d in enumerate(gpu_dicts):
+                        info = _surogate.GPUUtilInfo()
+                        for k, v in d.items():
+                            setattr(info, k, v)
+                        train_logger.log_gpu_state(step, i, info)
+
+                # Reset timer for next step
+                step_start_time = time.time()
+
+                # Periodic evaluation
+                if has_eval and config.eval_steps > 0 and step % config.eval_steps == 0 and step > start_step:
+                    eval_start = time.time()
+                    eval_futures = [t.validate.remote(100) for t in self.node_trainers]
+                    eval_results = ray.get(eval_futures)
+                    avg_eval_loss = sum(r[0] for r in eval_results) / len(eval_results)
+                    batches_processed = eval_results[0][1]  # All nodes process same number of batches
+                    eval_elapsed_ms = int((time.time() - eval_start) * 1000)
+                    epoch = step / steps_per_epoch if steps_per_epoch > 0 else 0.0
+                    eval_tokens = batches_processed * config.per_device_train_batch_size * config.sequence_len * local_gpus
+                    train_logger.log_eval(step, epoch, eval_tokens, eval_elapsed_ms, avg_eval_loss)
+                    logger.info(f"  Eval loss: {avg_eval_loss:.4f}")
+                    if early_stopping is not None and early_stopping.check_eval(avg_eval_loss, step):
+                        break
+
+                # Periodic checkpointing
+                if config.save_steps > 0 and step % config.save_steps == 0 and step > start_step:
+                    logger.info(f"Saving checkpoint at step {step}...")
+                    try:
+                        # Only node 0 saves (others have identical weights in data parallel)
+                        ray.get(self.node_trainers[0].save_checkpoint.remote(config.checkpoint_dir, step))
+                        logger.info(f"Checkpoint saved successfully at step {step}")
+
+                        checkpoint_plot_path = Path(config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"
+                        generate_training_plot(config.log_file, checkpoint_plot_path)
+
+                        if config.save_total_limit > 0:
+                            removed = ray.get(
+                                self.node_trainers[0].cleanup_old_checkpoints.remote(
+                                    config.checkpoint_dir, config.save_total_limit
+                                )
+                            )
+                            if removed:
+                                logger.info(
+                                    f"Removed {removed} old checkpoints, keeping the most recent {config.save_total_limit}"
+                                )
                     except Exception as e:
-                        logger.error(f"Failed to merge adapter: {e}")
-                        import traceback
-                        logger.error(f"Traceback:\n{traceback.format_exc()}")
-                        logger.warning("Adapter merge failed, but adapter was saved successfully")
-            else:
-                logger.info(f"Exporting model to {config.output_dir}...")
-                # Call export on ALL nodes - they all participate in NCCL barriers
-                # Only node 0 actually writes the file
-                export_refs = [t.export_model.remote(config.output_dir) for t in self.node_trainers]
-                ready, not_ready = ray.wait(export_refs, num_returns=len(export_refs), timeout=120)
-                if len(ready) == len(export_refs):
-                    results = ray.get(ready)
-                    if any(results):
-                        logger.info(f"Model saved to {config.output_dir}")
-                        # Copy tokenizer files from source model
-                        self._copy_tokenizer_files(config.model_dir, config.output_dir)
+                        logger.error(f"Failed to save checkpoint at step {step}: {e}")
+                        logger.error(f"Exception type: {type(e).__name__}")
+                        logger.warning("Training will continue without saving this checkpoint")
+                        logger.error(f"Traceback:\n{_traceback.format_exc()}")
+
+            # Save final model
+            # IMPORTANT: export_adapter/export_model contain NCCL barriers, so ALL nodes must participate
+            logger.info("Training complete. Saving final model...")
+            try:
+                if config.lora:
+                    adapter_dir = str(Path(config.output_dir))
+                    logger.info(f"Exporting LoRA adapter to {adapter_dir}...")
+                    # Call export on ALL nodes - they all participate in NCCL barriers
+                    # Only node 0 actually writes the file
+                    export_refs = [t.export_adapter.remote(adapter_dir) for t in self.node_trainers]
+                    ready, not_ready = ray.wait(export_refs, num_returns=len(export_refs), timeout=120)
+                    if len(ready) == len(export_refs):
+                        results = ray.get(ready)
+                        if any(results):
+                            logger.info(f"LoRA adapter saved to {adapter_dir}")
+                        else:
+                            logger.warning("Adapter export: all nodes returned False")
                     else:
-                        logger.warning("Model export: all nodes returned False")
+                        # Check if file was saved despite timeout
+                        adapter_file = Path(adapter_dir) / "adapter_model.safetensors"
+                        if adapter_file.exists():
+                            logger.info(f"LoRA adapter saved to {adapter_dir} (export timed out but file exists)")
+                        else:
+                            logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
+
+                    # Merge adapter into base model if requested (only on head node)
+                    if config.merge_adapter:
+                        from surogate.utils.adapter_merge import merge_adapter
+                        merged_dir = Path(config.output_dir)
+                        try:
+                            merge_adapter(
+                                base_model_path=config.model_dir,
+                                adapter_path=adapter_dir,
+                                output_path=str(merged_dir),
+                                max_shard_size="5GB",
+                                cpu_offload=True
+                            )
+                            generate_training_plot(config.log_file, merged_dir / "training_plot.png")
+                        except Exception as e:
+                            logger.error(f"Failed to merge adapter: {e}")
+                            logger.error(f"Traceback:\n{_traceback.format_exc()}")
+                            logger.warning("Adapter merge failed, but adapter was saved successfully")
+
+                    # Generate training plot in adapter directory
+                    generate_training_plot(config.log_file, Path(adapter_dir) / "training_plot.png")
                 else:
-                    # Check if file was saved despite timeout
-                    model_file = Path(config.output_dir) / "model.safetensors"
-                    if model_file.exists():
-                        logger.info(f"Model saved to {config.output_dir} (export timed out but file exists)")
-                        # Copy tokenizer files from source model
-                        self._copy_tokenizer_files(config.model_dir, config.output_dir)
+                    logger.info(f"Exporting model to {config.output_dir}...")
+                    # Call export on ALL nodes - they all participate in NCCL barriers
+                    # Only node 0 actually writes the file
+                    export_refs = [t.export_model.remote(config.output_dir) for t in self.node_trainers]
+                    ready, not_ready = ray.wait(export_refs, num_returns=len(export_refs), timeout=120)
+                    if len(ready) == len(export_refs):
+                        results = ray.get(ready)
+                        if any(results):
+                            logger.info(f"Model saved to {config.output_dir}")
+                            # Copy tokenizer files from source model
+                            self._copy_tokenizer_files(config.model_dir, config.output_dir)
+                            generate_training_plot(config.log_file, Path(config.output_dir) / "training_plot.png")
+                        else:
+                            logger.warning("Model export: all nodes returned False")
                     else:
-                        logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
-        except Exception as e:
-            logger.error(f"Error saving model: {e}")
-        finally:
-            # Cleanup Ray actors
-            logger.info("Shutting down Ray actors...")
-            self.shutdown()
-            logger.info("Ray actors shut down. Training complete.")
+                        # Check if file was saved despite timeout
+                        model_file = Path(config.output_dir) / "model.safetensors"
+                        if model_file.exists():
+                            logger.info(f"Model saved to {config.output_dir} (export timed out but file exists)")
+                            # Copy tokenizer files from source model
+                            self._copy_tokenizer_files(config.model_dir, config.output_dir)
+                            generate_training_plot(config.log_file, Path(config.output_dir) / "training_plot.png")
+                        else:
+                            logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
+
+                logger.info(f"\nTraining complete! Logs saved to {config.log_file}")
+            except Exception as e:
+                logger.error(f"Error saving model: {e}")
+            finally:
+                # Cleanup Ray actors
+                logger.info("Shutting down Ray actors...")
+                self.shutdown()
+                logger.info("Ray actors shut down. Training complete.")
 
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer and vocab files from source model to output directory."""

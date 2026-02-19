@@ -114,6 +114,7 @@ NB_MODULE(_surogate, m) {
         "All fields are read/write and represent the most recently sampled values.\n"
         "Units are implementation-defined; typically MHz for clocks, W for power, C for temperatures, "
         "and bytes for memory counters.")
+        .def(nb::init<>(), "Default constructor (all fields zero-initialized).")
         .def_rw("clock", &GPUUtilInfo::clock, "Current GPU clock (typically MHz).")
         .def_rw("max_clock", &GPUUtilInfo::max_clock, "Maximum GPU clock (typically MHz).")
         .def_rw("power", &GPUUtilInfo::power, "Current GPU power draw (typically W).")
@@ -1267,7 +1268,7 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n- gpu_id: Which GPU to query.\n\n"
             "Returns: dict[str, dict] with per-segment counters; stack entries include {'stack': bytes}.")
         .def_static("create_multinode", [](int ngpu, int node_rank, int num_nodes,
-                nb::bytes nccl_id, nb::bytes node_master_nccl_id,
+                nb::bytes nccl_id,
                 PretrainedConfig config, RuntimeOptions options,
                 int batch_size, int seq_len, int grad_accum,
                 bool memcpy_all_gather, bool memcpy_send_recv,
@@ -1276,30 +1277,27 @@ NB_MODULE(_surogate, m) {
             if (nccl_id.size() != 128) {
                 throw std::runtime_error(fmt::format("nccl_id must be exactly 128 bytes, got {}", nccl_id.size()));
             }
-            if (node_master_nccl_id.size() != 128) {
-                throw std::runtime_error(fmt::format("node_master_nccl_id must be exactly 128 bytes, got {}", node_master_nccl_id.size()));
-            }
             options.ModelType = config.DType;
             return new MultiGPUPyTrainer(ngpu, node_rank, num_nodes,
-                nccl_id.c_str(), node_master_nccl_id.c_str(),
+                nccl_id.c_str(),
                 config, options, batch_size, seq_len, grad_accum,
                 memcpy_all_gather, memcpy_send_recv, lora_config, qlora_config);
         }, nb::arg("ngpu"), nb::arg("node_rank"), nb::arg("num_nodes"),
-           nb::arg("nccl_id"), nb::arg("node_master_nccl_id"),
+           nb::arg("nccl_id"),
            nb::arg("config"), nb::arg("options"),
            nb::arg("batch_size"), nb::arg("seq_len"), nb::arg("grad_accum"),
            nb::arg("memcpy_all_gather") = true, nb::arg("memcpy_send_recv") = true,
            nb::arg("lora_config") = std::nullopt, nb::arg("qlora_config") = std::nullopt,
            "Create a trainer instance for multi-node distributed training.\n\n"
            "Used with Ray for coordinating training across multiple machines.\n"
-           "NCCL IDs must be generated on the master node using generate_nccl_id()\n"
-           "and shared with all worker nodes before calling this method.\n\n"
+           "The NCCL ID must be generated on the master node using generate_nccl_id()\n"
+           "and shared with all worker nodes before calling this method.\n"
+           "The node-master communicator is derived via ncclCommSplit internally.\n\n"
            "Parameters:\n"
            "- ngpu: Number of local GPUs on this node.\n"
            "- node_rank: This node's rank (0 to num_nodes-1).\n"
            "- num_nodes: Total number of nodes in the cluster.\n"
-           "- nccl_id: 128-byte NCCL unique ID for global communicator.\n"
-           "- node_master_nccl_id: 128-byte NCCL unique ID for node master communicator.\n"
+           "- nccl_id: 128-byte NCCL unique ID for the global communicator.\n"
            "- config: Model configuration.\n"
            "- options: Runtime/training options.\n"
            "- batch_size: Per-GPU batch size.\n"

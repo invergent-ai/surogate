@@ -5,6 +5,7 @@
 
 #include "py_train.h"
 
+#include <array>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
@@ -155,7 +156,7 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, 
  * @param node_rank This node's rank (0 to num_nodes-1).
  * @param num_nodes Total number of nodes in the cluster.
  * @param nccl_id 128-byte NCCL unique ID for global communicator (shared across all nodes).
- * @param node_master_nccl_id 128-byte NCCL unique ID for node master communicator.
+ *                Node master communicator is derived internally via ncclCommSplit.
  * @param config Model architecture configuration.
  * @param options Runtime/training options.
  * @param batch_size Per-GPU micro-batch size.
@@ -167,7 +168,7 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, 
  * @param qlora_config Optional QLoRA configuration.
  */
 MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
-                                     const void* nccl_id, const void* node_master_nccl_id,
+                                     const void* nccl_id,
                                      const PretrainedConfig& config, RuntimeOptions options,
                                      int batch_size, int seq_len, int grad_accum,
                                      bool memcpy_all_gather, bool memcpy_send_recv,
@@ -184,9 +185,15 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
     if (ngpus > gpus_available) {
         throw std::runtime_error(fmt::format("Requested {} GPUs, only {} available", ngpus, gpus_available));
     }
+
+    // Copy NCCL ID to owned storage. The caller's buffer (nanobind nb::bytes) may be
+    // destroyed before the worker threads read the ID in ncclCommInitRank.
+    std::array<std::byte, 128> nccl_id_owned{};
+    std::memcpy(nccl_id_owned.data(), nccl_id, 128);
+
     mContexts.resize(ngpus);
     mThreads = NCCLCommunicator::launch_communicators_multinode(
-       ngpus, node_rank, num_nodes, nccl_id, node_master_nccl_id,
+       ngpus, node_rank, num_nodes, nccl_id_owned.data(),
        memcpy_all_gather, memcpy_send_recv,
        [&](NCCLCommunicator& comm) {
            try {

@@ -55,7 +55,7 @@ public:
 
     //! Multi-node constructor (for Ray distributed training)
     MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
-                      const void* nccl_id, const void* node_master_nccl_id,
+                      const void* nccl_id,
                       const PretrainedConfig& config, RuntimeOptions options,
                       int batch_size, int seq_len, int grad_accum,
                       bool memcpy_all_gather, bool memcpy_send_recv,

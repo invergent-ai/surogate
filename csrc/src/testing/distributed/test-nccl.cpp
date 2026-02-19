@@ -405,7 +405,6 @@ TEST_CASE("launch_communicators_multinode with single node", "[distributed][nccl
     }
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     bool executed = false;
 
@@ -414,7 +413,6 @@ TEST_CASE("launch_communicators_multinode with single node", "[distributed][nccl
         0,              // node_rank
         1,              // num_nodes
         nccl_id.data(),
-        node_master_id.data(),
         false,          // memcpy_allgather
         false,          // memcpy_send_recv
         [&](NCCLCommunicator& comm) {
@@ -441,7 +439,6 @@ TEST_CASE("launch_communicators_multinode with multiple local GPUs", "[distribut
     int test_gpus = std::min(num_gpus, 2);
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     std::vector<int> ranks_seen(test_gpus, 0);
 
@@ -450,7 +447,6 @@ TEST_CASE("launch_communicators_multinode with multiple local GPUs", "[distribut
         0,              // node_rank
         1,              // num_nodes
         nccl_id.data(),
-        node_master_id.data(),
         false,          // memcpy_allgather
         false,          // memcpy_send_recv
         [&](NCCLCommunicator& comm) {
@@ -485,11 +481,10 @@ TEST_CASE("launch_communicators_multinode barrier works", "[distributed][nccl][m
     int test_gpus = std::min(num_gpus, 2);
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     auto pack = NCCLCommunicator::launch_communicators_multinode(
         test_gpus, 0, 1,
-        nccl_id.data(), node_master_id.data(),
+        nccl_id.data(),
         false, false,
         [](NCCLCommunicator& comm) {
             // Test barrier multiple times
@@ -515,11 +510,10 @@ TEST_CASE("launch_communicators_multinode host_gather works", "[distributed][ncc
     int test_gpus = std::min(num_gpus, 2);
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     auto pack = NCCLCommunicator::launch_communicators_multinode(
         test_gpus, 0, 1,
-        nccl_id.data(), node_master_id.data(),
+        nccl_id.data(),
         false, false,
         [&](NCCLCommunicator& comm) {
             int value = comm.rank() * 10 + 5;
@@ -550,11 +544,10 @@ TEST_CASE("launch_communicators_multinode host_all_gather works", "[distributed]
     int test_gpus = std::min(num_gpus, 2);
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     auto pack = NCCLCommunicator::launch_communicators_multinode(
         test_gpus, 0, 1,
-        nccl_id.data(), node_master_id.data(),
+        nccl_id.data(),
         false, false,
         [&](NCCLCommunicator& comm) {
             int value = comm.rank() + 200;
@@ -581,13 +574,12 @@ TEST_CASE("launch_communicators_multinode validates node_rank", "[distributed][n
     }
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     // Invalid node_rank (>= num_nodes)
     REQUIRE_THROWS_AS(
         NCCLCommunicator::launch_communicators_multinode(
             1, 5, 2,  // node_rank=5 but num_nodes=2
-            nccl_id.data(), node_master_id.data(),
+            nccl_id.data(),
             false, false,
             [](NCCLCommunicator&) {}
         ),
@@ -601,13 +593,12 @@ TEST_CASE("launch_communicators_multinode validates num_nodes", "[distributed][n
     }
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
 
     // Invalid num_nodes (< 1)
     REQUIRE_THROWS_AS(
         NCCLCommunicator::launch_communicators_multinode(
             1, 0, 0,  // num_nodes=0
-            nccl_id.data(), node_master_id.data(),
+            nccl_id.data(),
             false, false,
             [](NCCLCommunicator&) {}
         ),
@@ -620,32 +611,10 @@ TEST_CASE("launch_communicators_multinode validates nccl_id not null", "[distrib
         SKIP("CUDA not available");
     }
 
-    auto node_master_id = NCCLCommunicator::generate_nccl_id();
-
     REQUIRE_THROWS_AS(
         NCCLCommunicator::launch_communicators_multinode(
             1, 0, 1,
             nullptr,  // null nccl_id
-            node_master_id.data(),
-            false, false,
-            [](NCCLCommunicator&) {}
-        ),
-        std::runtime_error
-    );
-}
-
-TEST_CASE("launch_communicators_multinode validates node_master_nccl_id not null", "[distributed][nccl][multinode][error][.]") {
-    if (!cuda_available()) {
-        SKIP("CUDA not available");
-    }
-
-    auto nccl_id = NCCLCommunicator::generate_nccl_id();
-
-    REQUIRE_THROWS_AS(
-        NCCLCommunicator::launch_communicators_multinode(
-            1, 0, 1,
-            nccl_id.data(),
-            nullptr,  // null node_master_nccl_id
             false, false,
             [](NCCLCommunicator&) {}
         ),
