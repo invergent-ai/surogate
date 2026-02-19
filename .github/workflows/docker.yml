@@ -96,7 +96,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/surogate
           tags: |
-            type=raw,value=${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
+            type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest-${{ matrix.wheel_tag }}
             type=sha
 
