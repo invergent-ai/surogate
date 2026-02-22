@@ -1,2 +1,4 @@
 model: "./reverse-fft"
-enable_lora: false
+enable_lora: true
+max_lora_rank: 32
+

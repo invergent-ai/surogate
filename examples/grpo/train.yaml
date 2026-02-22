@@ -22,16 +22,25 @@ sequence_len: 2048
 max_steps: 20
 logging_steps: 1
 
-learning_rate: 3e-6
+learning_rate: 2e-4
 lr_scheduler_type: constant
 warmup_steps: 0
 max_grad_norm: 1.0
 weight_decay: 0.01
-pad_to_multiple_of: 1
 
 recipe: bf16
 
-lora: false
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
 
 # GRPO loss
 loss:

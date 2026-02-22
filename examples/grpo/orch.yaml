@@ -6,6 +6,9 @@
 
 model:
   name: "./reverse-fft"
+  lora_adapter: "default"
+  lora_rank: 16
+  lora_alpha: 32
 
 env:
   - id: reverse-text
