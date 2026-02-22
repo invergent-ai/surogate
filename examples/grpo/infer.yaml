@@ -1,4 +1,6 @@
-model: "./reverse-fft"
+# model: "./Qwen3-0.6B-NVFP4"
+model: "./reverse-fft-NVFP4"
 enable_lora: true
 max_lora_rank: 32
-
+gpu_memory_utilization: 0.5
+enforce_eager: false

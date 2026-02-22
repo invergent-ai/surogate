@@ -1,11 +1,8 @@
-# GRPO Orchestrator Example: Reverse Text
-# Based on prime-rl/examples/reverse_text/rl/orch.toml
-#
-# Uses an SFT'd model that already knows how to reverse text.
-# GRPO then refines it with RL reward signal.
+# GRPO Orchestrator Example
 
 model:
-  name: "./reverse-fft"
+  # name: "./Qwen3-0.6B-NVFP4"
+  name: "./reverse-fft-NVFP4"
   lora_adapter: "default"
   lora_rank: 16
   lora_alpha: 32
@@ -20,3 +17,5 @@ max_steps: 20
 
 sampling:
   max_tokens: 128
+
+  

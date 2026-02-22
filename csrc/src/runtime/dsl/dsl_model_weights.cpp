@@ -18,6 +18,7 @@
 #include "runtime/dsl/graph_executor.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/qlora/adapter_merger.h"
+#include "runtime/qlora/generic_qlora_provider.h"
 #include "utilities/utils.h"
 #include "utilities/safetensors.h"
 #include "utilities/dtype.h"
@@ -901,6 +902,176 @@ IRunState& DslModel::get_run_state() const {
 
 bool DslModel::is_weight_streaming_enabled() const {
     return mWeightManager && mWeightManager->is_streaming_enabled();
+}
+
+void DslModel::import_weights_from_external(
+    const std::string& safetensors_path,
+    const std::vector<qlora::ExternalWeight>& external_weights,
+    NCCLCommunicator& comm) {
+
+    if (!mParams) {
+        throw std::logic_error("DslModel::import_weights_from_external called before parameters are initialized");
+    }
+    if (!mLoRAConfig) {
+        throw std::runtime_error("import_weights_from_external requires LoRA config (QLoRA mode)");
+    }
+
+    // Populate MoE config from model
+    if (mModelConfig.moe_config.has_value()) {
+        const auto& moe = mModelConfig.moe_config.value();
+        if (mQLoRAConfig.num_experts == 0) mQLoRAConfig.num_experts = moe.num_experts;
+        if (mQLoRAConfig.num_experts_per_tok == 0) mQLoRAConfig.num_experts_per_tok = moe.top_k;
+        if (mQLoRAConfig.moe_intermediate_size == 0) mQLoRAConfig.moe_intermediate_size = moe.moe_intermediate_size;
+        if (mQLoRAConfig.num_shared_experts == 0 && moe.use_shared_expert) mQLoRAConfig.num_shared_experts = 1;
+        if (mQLoRAConfig.moe_shared_expert_intermediate_size == 0 && moe.use_shared_expert)
+            mQLoRAConfig.moe_shared_expert_intermediate_size = moe.shared_expert_size;
+    } else if (mModelConfig.NumExperts > 0) {
+        if (mQLoRAConfig.num_experts == 0) mQLoRAConfig.num_experts = mModelConfig.NumExperts;
+        if (mQLoRAConfig.num_experts_per_tok == 0) mQLoRAConfig.num_experts_per_tok = mModelConfig.NumExpertsPerTok;
+        if (mQLoRAConfig.moe_intermediate_size == 0) mQLoRAConfig.moe_intermediate_size = mModelConfig.MoeIntermediateSize;
+    }
+
+    // Create the QLoRA provider (builds pipeline config from IR)
+    mQLoRAProvider = internal::create_dsl_qlora_provider(
+        *mModule, mModelConfig, *mConfig, mOptions,
+        *mLoRAConfig, mQLoRAConfig, mAllocator,
+        mHfMapping, mShardIdx, mNumShards, mAdapterPath);
+
+    // Use the provider's import_from_external instead of import_and_quantize
+    auto* generic_provider = dynamic_cast<qlora::GenericQLoRAProvider*>(mQLoRAProvider.get());
+    if (!generic_provider) {
+        throw std::runtime_error("import_weights_from_external: expected GenericQLoRAProvider");
+    }
+
+    cudaStream_t quant_stream = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&quant_stream));
+    generic_provider->import_from_external(safetensors_path, external_weights, quant_stream);
+    CUDA_CHECK(cudaStreamSynchronize(quant_stream));
+    CUDA_CHECK(cudaStreamDestroy(quant_stream));
+
+    mParams->set_qlora_provider(mQLoRAProvider.get());
+    if (mRunState) {
+        mParams->set_default_stream(mRunState->MainStream);
+    }
+
+    // Load non-external params (embedding, lm_head, norms) from SafeTensors.
+    // The QLoRA provider manages quantizable linear weights, but non-QLoRA params
+    // (embedding, lm_head, layer norms) are stored directly in DslParamStore and
+    // must be loaded from disk here.
+    {
+        SafeTensorsReader reader(safetensors_path);
+        std::vector<std::pair<std::string, std::string>> tied_params;
+        const bool allow_cast = true;
+        int loaded_count = 0;
+        int skipped_external = 0;
+
+        for (const auto& name : mParams->param_names()) {
+            if (mParams->is_external(name)) {
+                skipped_external++;
+                continue;  // QLoRA-managed, already loaded
+            }
+            Tensor& param = mParams->get(name);
+            int layer_idx = -1;
+            const MappingSpec* spec = internal::find_mapping_spec(mHfMapping, name, layer_idx);
+            MappingSpec direct_fallback;
+            if (!spec) {
+                direct_fallback.kind = MappingSpec::Kind::Direct;
+                direct_fallback.source = name;
+                spec = &direct_fallback;
+            }
+
+            if (spec->kind == MappingSpec::Kind::TiedTo) {
+                tied_params.emplace_back(name, spec->target);
+                continue;
+            }
+
+            if (spec->kind == MappingSpec::Kind::Direct) {
+                const std::string hf_name = internal::format_hf_name(
+                    spec->source.empty() ? name : spec->source, layer_idx);
+                const SafeTensorEntry* entry_ptr = nullptr;
+                try {
+                    entry_ptr = &reader.find_entry(hf_name);
+                } catch (const std::out_of_range&) {
+                    if (mConfig->TiedWordEmbeddings && hf_name == "lm_head.weight") {
+                        // Try tied embedding fallback
+                        int emb_layer_idx = -1;
+                        if (const auto* emb_spec = internal::find_mapping_spec(mHfMapping, "embedding", emb_layer_idx)) {
+                            if (emb_spec->kind == MappingSpec::Kind::Direct && !emb_spec->source.empty()) {
+                                try { entry_ptr = &reader.find_entry(
+                                    internal::format_hf_name(emb_spec->source, emb_layer_idx)); } catch (...) {}
+                            }
+                        }
+                        if (!entry_ptr) {
+                            try { entry_ptr = &reader.find_entry("model.embed_tokens.weight"); } catch (...) {}
+                        }
+                        if (!entry_ptr) {
+                            throw std::runtime_error("import_weights_from_external: missing '" + hf_name
+                                                     + "' (and tied fallback) for '" + name + "'");
+                        }
+                    } else {
+                        throw std::runtime_error("import_weights_from_external: missing '" + hf_name
+                                                 + "' for '" + name + "'");
+                    }
+                }
+                const auto& entry = *entry_ptr;
+                const auto& file_shape = entry.shape();
+                if (static_cast<int>(file_shape.size()) != param.Rank) {
+                    std::vector<long> squeezed;
+                    for (long d : file_shape) { if (d != 1) squeezed.push_back(d); }
+                    bool match = (static_cast<int>(squeezed.size()) == param.Rank);
+                    for (int i = 0; match && i < param.Rank; ++i) {
+                        if (squeezed[i] != param.Sizes[i]) match = false;
+                    }
+                    if (!match) {
+                        throw std::runtime_error("import_weights_from_external: shape mismatch for '"
+                                                 + hf_name + "' param '" + name + "'");
+                    }
+                    entry.read_raw(param, 0, param.nelem(), allow_cast);
+                } else {
+                    entry.read_tensor(param, allow_cast);
+                }
+                continue;
+            }
+
+            if (spec->kind == MappingSpec::Kind::Fuse) {
+                std::vector<long> slice_sizes = internal::infer_fuse_slices(name, *mConfig,
+                    static_cast<int>(spec->sources.size()));
+                if (slice_sizes.empty()) {
+                    if (param.Sizes[0] % static_cast<long>(spec->sources.size()) == 0) {
+                        const long chunk = param.Sizes[0] / static_cast<long>(spec->sources.size());
+                        slice_sizes.assign(spec->sources.size(), chunk);
+                    } else {
+                        throw std::runtime_error("import_weights_from_external: cannot infer fuse slices for " + name);
+                    }
+                }
+                long offset = 0;
+                for (std::size_t i = 0; i < spec->sources.size(); ++i) {
+                    const std::string hf_name = internal::format_hf_name(spec->sources[i], layer_idx);
+                    const auto& entry = reader.find_entry(hf_name);
+                    Tensor slice = internal::slice_dim0(param, offset, slice_sizes[i]);
+                    entry.read_raw(slice, 0, slice.nelem(), allow_cast);
+                    offset += slice_sizes[i];
+                }
+                continue;
+            }
+        }
+
+        // Resolve tied parameters
+        for (const auto& tie : tied_params) {
+            if (mParams->is_external(tie.first) || mParams->is_external(tie.second)) {
+                continue;
+            }
+            Tensor& dst = mParams->get(tie.first);
+            Tensor& src = mParams->get(tie.second);
+            CUDA_CHECK(cudaMemcpy(dst.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice));
+        }
+    }
+
+    if (lora_enabled()) {
+        mLoRAWeights->random_init(42, comm);
+    }
+
+    comm.barrier();
 }
 
 }  // namespace dsl

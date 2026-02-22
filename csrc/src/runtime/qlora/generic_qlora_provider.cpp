@@ -152,6 +152,55 @@ void GenericQLoRAProvider::import_and_quantize(
     mPtConfig = nullptr;
 }
 
+void GenericQLoRAProvider::import_from_external(
+    const std::string& file_name,
+    const std::vector<ExternalWeight>& external_weights,
+    cudaStream_t stream) {
+
+    if (mWeightMgr) {
+        throw std::runtime_error(
+            "GenericQLoRAProvider: weights already imported");
+    }
+
+    if (!mDeferredConfig) {
+        throw std::runtime_error(
+            "GenericQLoRAProvider: no deferred config (constructed with "
+            "pre-built weight manager?)");
+    }
+
+    // Use import_external_weights for all formats (BnB NF4, FP8, NVFP4).
+    // For NVFP4 (pre-quantized): vLLM's post-transform in-memory layout is compatible
+    // with surogate's dequant kernel — the F8_128x4 scale swizzle is identical, and
+    // the packed FP4 data is unchanged. Non-quantized weights (norms, embeddings)
+    // are loaded from SafeTensors as a fallback.
+    mWeightMgr = import_external_weights(
+        file_name,
+        external_weights,
+        *mDeferredConfig,
+        *mPtConfig,
+        mAllocator,
+        stream);
+
+    // Compute total BF16 bytes for memory savings
+    mTotalBF16Bytes = 0;
+    for (const auto& name : mWeightMgr->weight_names()) {
+        const auto* qt = mWeightMgr->get_quantized(name);
+        if (qt) {
+            mTotalBF16Bytes += static_cast<size_t>(qt->nelem()) * 2;
+        }
+    }
+
+    // Build layer → offload group mapping
+    build_layer_offload_map();
+
+    // QLoRA base weights are frozen
+    mWeightMgr->set_frozen(true);
+
+    // Release deferred config
+    mDeferredConfig.reset();
+    mPtConfig = nullptr;
+}
+
 void GenericQLoRAProvider::invalidate_cache() {
     if (mWeightMgr) {
         mWeightMgr->new_step();

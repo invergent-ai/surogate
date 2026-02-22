@@ -1,9 +1,9 @@
 model: PrimeIntellect/Qwen3-0.6B
-output_dir: ./reverse-fft-2
+output_dir: ./reverse-fft
 model_type: qwen3_thinking
 
 per_device_train_batch_size: 2
-gradient_accumulation_steps: 64
+gradient_accumulation_steps: 16
 
 sample_packing: true
 sequence_len: 4096
@@ -11,7 +11,7 @@ save_steps: 0
 
 max_steps: 100
 eval_steps: 25
-gpus: 1
+gpus: 4
 
 learning_rate: 3e-5
 lr_scheduler_type: constant
@@ -19,7 +19,6 @@ lr_scheduler_type: constant
 recipe: fp8-hybrid
 
 lora: false
-recompute: true
 
 dataloader_num_workers: 4
 datasets:

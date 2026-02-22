@@ -1,19 +1,9 @@
-# GRPO RL Training Example: Reverse Text
-# Based on prime-rl/examples/reverse_text/rl/train.toml
-#
-# Uses an SFT'd model that already knows how to reverse text.
-# Surogate replaces the trainer process.
-#
-# Usage:
-#   surogate grpo examples/grpo/grpo.yaml
-#
-model: "./reverse-fft"
+# GRPO RL Training Example
+
+# model: "Qwen3-0.6B-NVFP4"
+model: "./reverse-fft-NVFP4"
 output_dir: ./outputs
 gpus: 1
-
-# No datasets — GRPO data comes from the transport layer
-sample_packing: false
-datasets: []
 
 per_device_train_batch_size: 1
 sequence_len: 2048
@@ -28,7 +18,7 @@ warmup_steps: 0
 max_grad_norm: 1.0
 weight_decay: 0.01
 
-recipe: bf16
+recipe: fp8-hybrid
 
 lora: true
 lora_rank: 16
@@ -52,8 +42,13 @@ loss:
   geo_mask_low: 0.1
   geo_mask_high: 10.0
 
-transport_type: filesystem
-max_async_level: 1
+# QeRL noise scheduler (Adaptive Quantization Noise)
+# Adds Gaussian noise to RMSNorm weights in inference model for exploration.
+# noise_scheduler:
+#   enabled: true
+#   sigma_start: 5e-2
+#   sigma_end: 5e-4
+#   num_stages: 10
 
 # Checkpointing
 save_steps: 100

@@ -23,6 +23,7 @@
 #include "runtime/lora/lora_run_state.h"
 #include "runtime/lora/lora_weights_manager.h"
 #include "runtime/qlora/qlora_config.h"
+#include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "runtime/training/model.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
@@ -208,6 +209,19 @@ public:
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
+
+    /// Import model weights from external GPU pointers (zero-copy from vLLM).
+    ///
+    /// Quantized weights are borrowed from the external source (no disk I/O).
+    /// Non-quantized weights (norms, biases, embeddings) are still loaded from SafeTensors.
+    ///
+    /// @param safetensors_path  Path to HF SafeTensors (for non-quantized weights).
+    /// @param external_weights  Externally-owned quantized weight descriptors.
+    /// @param comm              NCCL communicator.
+    void import_weights_from_external(
+        const std::string& safetensors_path,
+        const std::vector<qlora::ExternalWeight>& external_weights,
+        NCCLCommunicator& comm);
     void on_restore_checkpoint(NCCLCommunicator& comm) override;
     void export_weights(const std::string& file_name, NCCLCommunicator& comm) override;
     void prepare_optimizer_for_checkpoint_load() override;

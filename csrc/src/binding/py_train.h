@@ -18,6 +18,7 @@
 #include "runtime/training/runtime_options.h"
 #include "config/lora_adapter_config.h"
 #include "runtime/qlora/qlora_config.h"
+#include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "runtime/optimizers/optimizer_config.h"
 
 class DataLoader;
@@ -66,6 +67,9 @@ public:
 
     void set_adapter_path(std::string path);
     void import_weights(std::string path);
+    void import_weights_from_external(
+        std::string safetensors_path,
+        std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
     void export_model(std::string path);
     void export_adapter(std::string path, std::string base_model_path = "");
     void init_weights();
@@ -99,6 +103,7 @@ public:
     std::vector<std::pair<std::string, long>> get_stack_info(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
+    std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);
     void set_visual_inputs(const std::int32_t* visual_pos_masks,
                            const float* visual_embeds,

@@ -15,6 +15,7 @@ logger = get_logger()
 COMMAND_MAPPING: Dict[str, str] = {
     'sft': 'surogate.cli.sft',
     'pt': 'surogate.cli.pt',
+    'grpo': 'surogate.cli.grpo',
     'grpo-train': 'surogate.cli.grpo_train',
     'grpo-infer': 'surogate.cli.grpo_infer',
     'grpo-orch': 'surogate.cli.grpo_orch',
@@ -47,6 +48,10 @@ def parse_args():
     # pretrain command
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
     pt_prepare_command_parser(subparsers.add_parser('pt', help="Pretraining"))
+
+    # grpo command (unified co-locate mode)
+    from surogate.cli.grpo import prepare_command_parser as grpo_prepare_command_parser
+    grpo_prepare_command_parser(subparsers.add_parser('grpo', help="GRPO RL (unified co-locate mode)"))
 
     # grpo-infer command
     from surogate.cli.grpo_infer import prepare_command_parser as grpo_infer_prepare_command_parser

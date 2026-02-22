@@ -58,6 +58,12 @@ public:
                              NCCLCommunicator& comm,
                              cudaStream_t stream) override;
 
+    /// Import externally-owned quantized weights (e.g., from vLLM GPU memory).
+    /// Non-quantizable weights (norms, biases) are still loaded from SafeTensors.
+    void import_from_external(const std::string& file_name,
+                              const std::vector<ExternalWeight>& external_weights,
+                              cudaStream_t stream);
+
     void invalidate_cache() override;
 
     bool refresh_moe_experts(int layer_idx,

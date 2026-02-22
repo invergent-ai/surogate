@@ -56,7 +56,7 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
 class GRPOTrainer:
     """GRPO RL trainer using Surogate's C++ engine."""
 
-    def __init__(self, config: GRPOTrainConfig):
+    def __init__(self, config: GRPOTrainConfig, external_weights: list[list[dict]] | None = None):
         self.config = config
 
         # Build DSL IR for the model (same pattern as SurogateTrainerWrapper)
@@ -94,8 +94,14 @@ class GRPOTrainer:
 
         # Import pretrained weights
         model_weights_path = get_model_weights_path(config.model_dir)
-        logger.info(f"Importing weights from {model_weights_path}")
-        self.trainer.import_weights(model_weights_path)
+        if external_weights is not None:
+            # Zero-copy import from external GPU pointers (colocate mode with vLLM)
+            logger.info(f"Importing weights from external GPU pointers "
+                        f"(non-quantized from {model_weights_path})")
+            self.trainer.import_weights_from_external(model_weights_path, external_weights)
+        else:
+            logger.info(f"Importing weights from {model_weights_path}")
+            self.trainer.import_weights(model_weights_path)
 
         # loss_scale is computed dynamically per pack — see train() loop
 
@@ -116,12 +122,25 @@ class GRPOTrainer:
             wsd_decay_steps_fraction=config.wsd_decay_steps_fraction,
         )
 
-        # Weight broadcast
-        self.broadcast = SurogateWeightBroadcast(
-            output_dir=config.output_dir,
-            adapter_only=config.lora,
-            max_async_level=config.max_async_level,
-        )
+        # Weight broadcast (with optional QeRL noise injection)
+        if config.weight_broadcast_type == "colocate":
+            from surogate.grpo.weight_broadcast import ColocateWeightBroadcast
+            self.broadcast = ColocateWeightBroadcast(
+                output_dir=config.output_dir,
+                max_async_level=config.max_async_level,
+                noise_config=config.noise_scheduler,
+                base_model_dir=config.model_dir,
+                max_steps=config.max_steps,
+            )
+        else:
+            self.broadcast = SurogateWeightBroadcast(
+                output_dir=config.output_dir,
+                adapter_only=config.lora,
+                max_async_level=config.max_async_level,
+                noise_config=config.noise_scheduler,
+                base_model_dir=config.model_dir,
+                max_steps=config.max_steps,
+            )
 
         # Data loader setup is deferred to train() since packer must run first
         self.data_loader: GRPODataLoader | None = None
@@ -204,6 +223,10 @@ class GRPOTrainer:
         logger.info(f"  Loss: ratio_type={config.loss.ratio_type}, "
                      f"kl_tau={config.loss.kl_tau}, adv_tau={config.loss.adv_tau}")
         logger.info(f"  Doc masking: {config.doc_masking}")
+        if config.noise_scheduler and config.noise_scheduler.enabled:
+            ns = config.noise_scheduler
+            logger.info(f"  QeRL noise: sigma_start={ns.sigma_start}, "
+                         f"sigma_end={ns.sigma_end}, num_stages={ns.num_stages}")
         if max_steps > 0:
             logger.info(f"  Max steps (orchestrator): {max_steps}")
         else:

@@ -303,6 +303,47 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
 
 
 /**
+ * @brief Import weights from external GPU pointers (zero-copy from vLLM).
+ *
+ * Quantized base weights are borrowed from external GPU memory (no disk I/O).
+ * Non-quantized weights (norms, biases, embeddings) are loaded from SafeTensors on disk.
+ *
+ * @param safetensors_path Path to HuggingFace SafeTensors (for non-quantized weights).
+ * @param per_gpu_weights  Per-GPU external weight descriptors (one vector per local GPU).
+ */
+void MultiGPUPyTrainer::import_weights_from_external(
+        std::string safetensors_path,
+        std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights) {
+    if (per_gpu_weights.size() != mContexts.size()) {
+        throw std::runtime_error(fmt::format(
+            "import_weights_from_external: expected {} GPU weight sets, got {}",
+            mContexts.size(), per_gpu_weights.size()));
+    }
+
+    // Distribute per-GPU weights to each context
+    for (int i = 0; i < (int)mContexts.size(); ++i) {
+        mContexts[i].Work = nullptr;  // clear any stale work
+    }
+
+    // Store per-GPU weights in a shared vector (captured by reference)
+    run_work([this, &safetensors_path, &per_gpu_weights](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("import_weights_from_external: DSL model required");
+        }
+
+        const int local_rank = ctx.Communicator->local_rank();
+        dsl_model->import_weights_from_external(
+            safetensors_path,
+            per_gpu_weights[local_rank],
+            *ctx.Communicator);
+
+        // Schedule deferred QLoRA offloading auto-tune
+        dsl_model->auto_tune_offloading();
+    });
+}
+
+/**
  * @brief Export the model configuration and weights to a directory.
  *
  * Creates the directory (and parents) if needed, writes `config.json`, and writes
@@ -1301,6 +1342,113 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     add_layer(expert_prefix + ".up_proj", expert.up);
                     add_layer(expert_prefix + ".down_proj", expert.down);
                 }
+                }
+            } else {
+                if (is_nemotron) {
+                    const std::string mixer_prefix = prefix + ".mixer";
+                    add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
+                    add_layer(mixer_prefix + ".up_proj", block.mlp.up);
+                    add_layer(mixer_prefix + ".down_proj", block.mlp.down);
+                } else {
+                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                }
+            }
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }, gpu_id);
+    return result;
+}
+
+std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(int gpu_id) {
+    std::vector<std::pair<std::string, Tensor>> result;
+    run_work([&result](sThreadContext& ctx) {
+        auto add_layer = [&](const std::string& module_prefix,
+                             const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
+            if (!layer.has_value()) return;
+            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
+        };
+        auto add_grouped_layer = [&](const std::string& module_prefix,
+                                     const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& layer) {
+            if (!layer.has_value()) return;
+            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
+        };
+        auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+            auto to_lower = [](std::string_view in) {
+                std::string out(in);
+                for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return out;
+            };
+            const std::string h = to_lower(haystack);
+            const std::string n = to_lower(needle);
+            return h.find(n) != std::string::npos;
+        };
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("get_lora_weights: DSL model required");
+        }
+        if (!dsl_model->lora_enabled()) {
+            throw std::runtime_error("get_lora_weights: DSL model is not configured for LoRA");
+        }
+        const auto& config = *ctx.Model->get_run_state().Config;
+        const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
+                                 contains_ci(config.ArchitectureName, "nemotron") ||
+                                 contains_ci(config.ModelTypeName, "nemotron");
+        const bool is_moe = dsl_model->is_moe_model();
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        for (int l = 0; l < config.NumLayers; ++l) {
+            auto& block = dsl_model->lora_weights().get_block(l, /*stream=*/nullptr);
+            std::string prefix;
+            if (is_nemotron) {
+                prefix = fmt::format("base_model.model.backbone.layers.{}", l);
+            } else {
+                prefix = fmt::format("base_model.model.model.layers.{}", l);
+            }
+
+            // Attention LoRA
+            if (is_nemotron) {
+                const std::string mixer_prefix = prefix + ".mixer";
+                add_layer(mixer_prefix + ".q_proj", block.attention.q);
+                add_layer(mixer_prefix + ".k_proj", block.attention.k);
+                add_layer(mixer_prefix + ".v_proj", block.attention.v);
+                add_layer(mixer_prefix + ".o_proj", block.attention.o);
+            } else {
+                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            }
+
+            if (is_moe) {
+                if (block.moe.use_grouped) {
+                    std::string expert_prefix;
+                    if (is_nemotron) {
+                        expert_prefix = fmt::format("{}.mixer.experts", prefix);
+                    } else {
+                        expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                    }
+                    add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                    add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
+                    add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
+                    add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+                } else {
+                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                        auto& expert = block.moe.experts[e];
+                        std::string expert_prefix;
+                        if (is_nemotron) {
+                            expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+                        } else {
+                            expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        }
+                        add_layer(expert_prefix + ".gate_proj", expert.gate);
+                        add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
+                        add_layer(expert_prefix + ".up_proj", expert.up);
+                        add_layer(expert_prefix + ".down_proj", expert.down);
+                    }
                 }
             } else {
                 if (is_nemotron) {

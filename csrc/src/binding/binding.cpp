@@ -27,6 +27,8 @@
 #include "config/lora_adapter_config.h"
 #include "recipes/recipe_factory.h"
 #include "runtime/qlora/qlora_config.h"
+#include "runtime/qlora/dsl_qlora_pipeline.h"
+#include "utilities/dtype.h"
 
 namespace nb = nanobind;
 
@@ -850,6 +852,84 @@ NB_MODULE(_surogate, m) {
         .def("import_weights", &MultiGPUPyTrainer::import_weights, nb::arg("path"),
              "Import weights from a HuggingFace model file.\n\n"
              "Parameters:\n- path: Path to model.safetensors or model.safetensors.index.json.")
+        .def("import_weights_from_external",
+             [](MultiGPUPyTrainer& self,
+                const std::string& safetensors_path,
+                nb::list per_gpu_list) {
+                 // per_gpu_list: list of list[dict] — one per GPU.
+                 // Each dict describes an externally-owned quantized weight:
+                 //   name: str, format: int, M: int, K: int, block_size: int,
+                 //   double_quant: bool, double_quant_group_size: int, global_scale: float,
+                 //   data_ptr: int, data_shape: list[int], data_dtype: str,
+                 //   scales_ptr: int, scales_shape: list[int], scales_dtype: str,
+                 //   meta_ptr: int (optional), meta_shape: list[int], meta_dtype: str,
+                 //   meta2_ptr: int (optional), meta2_shape: list[int], meta2_dtype: str,
+                 //   device: int
+
+                 std::vector<std::vector<qlora::ExternalWeight>> per_gpu;
+                 per_gpu.reserve(nb::len(per_gpu_list));
+
+                 for (size_t g = 0; g < nb::len(per_gpu_list); ++g) {
+                     nb::list gpu_weights = nb::cast<nb::list>(per_gpu_list[g]);
+                     std::vector<qlora::ExternalWeight> weights;
+                     weights.reserve(nb::len(gpu_weights));
+
+                     for (size_t w = 0; w < nb::len(gpu_weights); ++w) {
+                         nb::dict d = nb::cast<nb::dict>(gpu_weights[w]);
+                         qlora::ExternalWeight ew;
+                         ew.name = nb::cast<std::string>(d["name"]);
+                         ew.format = static_cast<qlora::QuantFormat>(nb::cast<int>(d["format"]));
+                         ew.M = nb::cast<int>(d["M"]);
+                         ew.K = nb::cast<int>(d["K"]);
+                         ew.block_size = nb::cast<int>(d["block_size"]);
+                         ew.double_quant = nb::cast<bool>(d["double_quant"]);
+                         ew.double_quant_group_size = nb::cast<int>(d["double_quant_group_size"]);
+                         ew.global_scale = nb::cast<float>(d["global_scale"]);
+                         ew.device = nb::cast<int>(d["device"]);
+
+                         // GPU pointers as Python ints (from tensor.data_ptr())
+                         ew.data_ptr = reinterpret_cast<std::byte*>(nb::cast<uintptr_t>(d["data_ptr"]));
+                         nb::list ds = nb::cast<nb::list>(d["data_shape"]);
+                         for (size_t i = 0; i < nb::len(ds); ++i)
+                             ew.data_shape.push_back(nb::cast<long>(ds[i]));
+                         ew.data_dtype = dtype_from_str(nb::cast<std::string>(d["data_dtype"]));
+
+                         ew.scales_ptr = reinterpret_cast<std::byte*>(nb::cast<uintptr_t>(d["scales_ptr"]));
+                         nb::list ss = nb::cast<nb::list>(d["scales_shape"]);
+                         for (size_t i = 0; i < nb::len(ss); ++i)
+                             ew.scales_shape.push_back(nb::cast<long>(ss[i]));
+                         ew.scales_dtype = dtype_from_str(nb::cast<std::string>(d["scales_dtype"]));
+
+                         // Optional meta pointers
+                         if (d.contains("meta_ptr") && nb::cast<uintptr_t>(d["meta_ptr"]) != 0) {
+                             ew.meta_ptr = reinterpret_cast<std::byte*>(nb::cast<uintptr_t>(d["meta_ptr"]));
+                             nb::list ms = nb::cast<nb::list>(d["meta_shape"]);
+                             for (size_t i = 0; i < nb::len(ms); ++i)
+                                 ew.meta_shape.push_back(nb::cast<long>(ms[i]));
+                             ew.meta_dtype = dtype_from_str(nb::cast<std::string>(d["meta_dtype"]));
+                         }
+                         if (d.contains("meta2_ptr") && nb::cast<uintptr_t>(d["meta2_ptr"]) != 0) {
+                             ew.meta2_ptr = reinterpret_cast<std::byte*>(nb::cast<uintptr_t>(d["meta2_ptr"]));
+                             nb::list m2s = nb::cast<nb::list>(d["meta2_shape"]);
+                             for (size_t i = 0; i < nb::len(m2s); ++i)
+                                 ew.meta2_shape.push_back(nb::cast<long>(m2s[i]));
+                             ew.meta2_dtype = dtype_from_str(nb::cast<std::string>(d["meta2_dtype"]));
+                         }
+
+                         weights.push_back(std::move(ew));
+                     }
+                     per_gpu.push_back(std::move(weights));
+                 }
+
+                 self.import_weights_from_external(safetensors_path, std::move(per_gpu));
+             },
+             nb::arg("safetensors_path"), nb::arg("per_gpu_weights"),
+             "Import weights from external GPU pointers (zero-copy from vLLM).\n\n"
+             "Quantized weights are borrowed from external GPU memory.\n"
+             "Non-quantized weights are loaded from SafeTensors on disk.\n\n"
+             "Parameters:\n"
+             "- safetensors_path: Path to model.safetensors (for norms, biases, etc.)\n"
+             "- per_gpu_weights: list[list[dict]], one inner list per GPU.")
         .def("export_model", &MultiGPUPyTrainer::export_model, nb::arg("path"),
              "Export model weights and config to a directory.\n\n"
              "Parameters:\n- path: Output directory path.")
@@ -1153,6 +1233,23 @@ NB_MODULE(_surogate, m) {
            "Parameters:\n- gpu_id: Which GPU's gradients to return.\n\n"
            "Returns: dict[str, ndarray] mapping adapter parameter name -> gradient view.\n"
            "Note: blocking; intended for debugging only.")
+        .def("get_lora_weights", [](MultiGPUPyTrainer* trainer, int gpu_id)
+        {
+            auto raw = trainer->get_lora_weights(gpu_id);
+            nb::dict ret;
+            for (const auto& [name, value] : raw) {
+                std::array<std::size_t, 6> shape;
+                std::copy_n(value.Sizes.begin(), value.Rank, shape.begin());
+                nb::ndarray<> view{value.Data, (size_t)value.Rank, shape.data(), ret, nullptr, to_dlpack_dtype(value.DType), nb::device::cuda::value, value.Device};
+                ret[nb::cast(name)] = view;
+            }
+            return ret;
+        }, nb::arg("gpu_id"),
+           "Return LoRA adapter weight tensors as zero-copy GPU views.\n\n"
+           "Only works if the trainer was constructed with a LoRA configuration.\n\n"
+           "Parameters:\n- gpu_id: Which GPU's LoRA weights to return.\n\n"
+           "Returns: dict[str, ndarray] mapping PEFT parameter name -> GPU tensor view.\n"
+           "Tensors are live views into surogate's GPU memory (zero-copy via DLPack).")
         .def("get_valid_token_count", &MultiGPUPyTrainer::get_valid_token_count, nb::arg("gpu_id"),
              "Return the accumulated valid-token count for the last training step.\n\n"
              "Parameters:\n- gpu_id: Which GPU's count to return.\n\n"

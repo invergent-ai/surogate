@@ -1777,6 +1777,312 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
 }
 
 // =============================================================================
+// External weight import pipeline (zero-copy from vLLM)
+// =============================================================================
+
+namespace {
+
+/// Build a lookup map from HF weight name → ExternalWeight pointer.
+std::unordered_map<std::string, const ExternalWeight*>
+build_external_lookup(const std::vector<ExternalWeight>& external_weights) {
+    std::unordered_map<std::string, const ExternalWeight*> lookup;
+    lookup.reserve(external_weights.size());
+    for (const auto& ew : external_weights) {
+        lookup[ew.name] = &ew;
+    }
+    return lookup;
+}
+
+/// Parse a DSL block parameter name to extract the layer index.
+/// e.g. "blocks[3].qkv_weight" → layer_idx=3, base="qkv_weight"
+/// Returns true if parsed successfully.
+bool parse_dsl_block_param(const std::string& name, int& layer_idx, std::string& base) {
+    auto bracket = name.find("blocks[");
+    if (bracket == std::string::npos) return false;
+    auto close = name.find(']', bracket);
+    if (close == std::string::npos) return false;
+    auto dot = name.find('.', close);
+    if (dot == std::string::npos) return false;
+
+    auto idx_start = bracket + 7;  // length of "blocks["
+    try {
+        layer_idx = std::stoi(name.substr(idx_start, close - idx_start));
+    } catch (...) {
+        return false;
+    }
+    base = name.substr(dot + 1);
+    return true;
+}
+
+/// Find the MappingSpec for an internal name from the mapping table.
+/// Similar to DslWeightLoader::find_mapping_spec.
+const dsl::MappingSpec* find_spec_in_table(
+    const dsl::MappingTable& mapping,
+    const std::string& internal_name,
+    int& layer_idx) {
+
+    layer_idx = -1;
+
+    // Try exact match first
+    auto it = mapping.find(internal_name);
+    if (it != mapping.end()) return &it->second;
+
+    // Try block pattern: "X_blocks[N].param" → "X_blocks[{layer}].param"
+    std::string base;
+    if (parse_dsl_block_param(internal_name, layer_idx, base)) {
+        // Extract block prefix (e.g., "blocks", "moe_blocks", "attn_blocks")
+        auto bracket = internal_name.find("blocks[");
+        std::string prefix = internal_name.substr(0, bracket);
+        std::string placeholder = prefix + "blocks[{layer}]." + base;
+        it = mapping.find(placeholder);
+        if (it != mapping.end()) return &it->second;
+
+        // Try just the base name
+        it = mapping.find(base);
+        if (it != mapping.end()) return &it->second;
+    }
+
+    return nullptr;
+}
+
+}  // anonymous namespace
+
+std::unique_ptr<GenericWeightManager> import_external_weights(
+    const std::string& file_name,
+    const std::vector<ExternalWeight>& external_weights,
+    const DslQLoRAPipelineConfig& config,
+    const PretrainedConfig& pt_config,
+    std::shared_ptr<TensorAllocator> allocator,
+    cudaStream_t stream) {
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    // Build lookup from HF name → ExternalWeight
+    auto ext_lookup = build_external_lookup(external_weights);
+
+    // Create quantizer and weight manager (same as import_and_quantize_weights)
+    auto quantizer = create_quantizer(config.quantizer_config);
+    auto weight_mgr = std::make_unique<GenericWeightManager>(
+        config.weight_manager_config,
+        std::move(quantizer),
+        allocator);
+
+    // Open SafeTensors for non-quantized weights (norms, biases, embeddings)
+    SafeTensorsReader reader(file_name);
+
+    dsl::ShardConfig shard_config;
+    shard_config.shard_idx = config.shard_idx;
+    shard_config.num_shards = config.num_shards;
+
+    dsl::MoEWeightConfig moe_config;
+    moe_config.num_experts = config.num_experts;
+    moe_config.moe_intermediate_size = config.moe_intermediate_size;
+
+    dsl::DslWeightLoader loader(
+        reader, config.mapping, pt_config, *allocator, shard_config, moe_config);
+
+    int loaded_external = 0;
+    int loaded_disk = 0;
+    const int total = static_cast<int>(config.weight_specs.size());
+
+    // Fallback: load a weight from disk as full-precision (BF16).
+    // Used for weights not found in the external lookup (e.g., embeddings, LM head
+    // that vLLM keeps in full precision even in pre-quantized models).
+    auto load_full_precision_from_disk = [&](const WeightLoadSpec& spec) -> bool {
+        std::vector<long> shape;
+        if (!spec.shape.empty()) {
+            shape = spec.shape;
+        } else if (spec.K > 0) {
+            shape = {static_cast<long>(spec.M), static_cast<long>(spec.K)};
+        } else {
+            shape = {static_cast<long>(spec.M)};
+        }
+
+        Tensor tensor = allocator->allocate(
+            spec.target_dtype,
+            spec.name.c_str(),
+            EAllocationType::ON_DEVICE,
+            shape);
+
+        bool success = loader.load_param(spec.name, tensor, true, spec.sharded, nullptr, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (success) {
+            weight_mgr->register_full_precision(spec.name, tensor);
+            loaded_disk++;
+        }
+        return success;
+    };
+
+    for (int i = 0; i < total; ++i) {
+        const auto& spec = config.weight_specs[i];
+
+        if (!spec.quantize) {
+            // Non-quantized weight: load from disk
+            load_full_precision_from_disk(spec);
+            continue;
+        }
+
+        // Quantized weight: find in external lookup by resolving HF name(s)
+        int layer_idx = -1;
+        const dsl::MappingSpec* map_spec = find_spec_in_table(
+            config.mapping, spec.name, layer_idx);
+
+        if (!map_spec) {
+            // No mapping found — fall back to disk loading
+            load_full_precision_from_disk(spec);
+            continue;
+        }
+
+        // For Direct mappings: look up the single HF name
+        if (map_spec->kind == dsl::MappingSpec::Kind::Direct ||
+            map_spec->kind == dsl::MappingSpec::Kind::Transform) {
+            std::string hf_name = resolve_hf_name(map_spec->source, layer_idx);
+
+            auto ext_it = ext_lookup.find(hf_name);
+            if (ext_it == ext_lookup.end()) {
+                // Not in external weights — fall back to disk loading
+                // (common for embeddings, LM head in pre-quantized models)
+                load_full_precision_from_disk(spec);
+                continue;
+            }
+            const ExternalWeight& ew = *ext_it->second;
+
+            // Build QuantizedTensor from GPU pointers
+            QuantizedTensor qt;
+            qt.format = ew.format;
+            qt.M = ew.M;
+            qt.K = ew.K;
+            qt.block_size = ew.block_size;
+            qt.double_quant = ew.double_quant;
+            qt.double_quant_group_size = ew.double_quant_group_size;
+            qt.global_scale = ew.global_scale;
+
+            qt.data = Tensor::from_pointer(ew.data_ptr, ew.device, ew.data_dtype, ew.data_shape);
+            qt.scales = Tensor::from_pointer(ew.scales_ptr, ew.device, ew.scales_dtype, ew.scales_shape);
+
+            if (ew.meta_ptr) {
+                qt.meta = Tensor::from_pointer(ew.meta_ptr, ew.device, ew.meta_dtype, ew.meta_shape);
+            }
+            if (ew.meta2_ptr) {
+                qt.meta2 = Tensor::from_pointer(ew.meta2_ptr, ew.device, ew.meta2_dtype, ew.meta2_shape);
+            }
+
+            std::string transform_fn;
+            if (map_spec->kind == dsl::MappingSpec::Kind::Transform) {
+                transform_fn = map_spec->fn;
+            }
+
+            weight_mgr->store_prequantized(
+                spec.name, std::move(qt), spec.offload_group, spec.shape, transform_fn);
+            loaded_external++;
+
+        } else if (map_spec->kind == dsl::MappingSpec::Kind::StackExperts) {
+            // Expert weights: vLLM may store stacked [E, M, K] under a single HF name
+            std::string hf_name = resolve_hf_name(map_spec->source, layer_idx);
+
+            auto ext_it = ext_lookup.find(hf_name);
+            if (ext_it != ext_lookup.end()) {
+                // Found stacked weight — store directly
+                const ExternalWeight& ew = *ext_it->second;
+
+                QuantizedTensor qt;
+                qt.format = ew.format;
+                qt.M = ew.M;
+                qt.K = ew.K;
+                qt.block_size = ew.block_size;
+                qt.double_quant = ew.double_quant;
+                qt.double_quant_group_size = ew.double_quant_group_size;
+                qt.global_scale = ew.global_scale;
+
+                qt.data = Tensor::from_pointer(ew.data_ptr, ew.device, ew.data_dtype, ew.data_shape);
+                qt.scales = Tensor::from_pointer(ew.scales_ptr, ew.device, ew.scales_dtype, ew.scales_shape);
+                if (ew.meta_ptr) {
+                    qt.meta = Tensor::from_pointer(ew.meta_ptr, ew.device, ew.meta_dtype, ew.meta_shape);
+                }
+                if (ew.meta2_ptr) {
+                    qt.meta2 = Tensor::from_pointer(ew.meta2_ptr, ew.device, ew.meta2_dtype, ew.meta2_shape);
+                }
+
+                weight_mgr->store_prequantized(
+                    spec.name, std::move(qt), spec.offload_group, spec.shape);
+                loaded_external++;
+            } else {
+                // Not in external weights — fall back to disk loading
+                load_full_precision_from_disk(spec);
+            }
+
+        } else if (map_spec->kind == dsl::MappingSpec::Kind::Fuse) {
+            // Fused weight (e.g., QKV): vLLM may already have the fused version.
+            // Try each source name in the mapping.
+            bool found = false;
+            for (const auto& src : map_spec->sources) {
+                std::string hf_name = resolve_hf_name(src, layer_idx);
+                auto ext_it = ext_lookup.find(hf_name);
+                if (ext_it != ext_lookup.end()) {
+                    // Found — this must be the fused weight from vLLM
+                    const ExternalWeight& ew = *ext_it->second;
+
+                    QuantizedTensor qt;
+                    qt.format = ew.format;
+                    qt.M = ew.M;
+                    qt.K = ew.K;
+                    qt.block_size = ew.block_size;
+                    qt.double_quant = ew.double_quant;
+                    qt.double_quant_group_size = ew.double_quant_group_size;
+                    qt.global_scale = ew.global_scale;
+
+                    qt.data = Tensor::from_pointer(ew.data_ptr, ew.device, ew.data_dtype, ew.data_shape);
+                    qt.scales = Tensor::from_pointer(ew.scales_ptr, ew.device, ew.scales_dtype, ew.scales_shape);
+                    if (ew.meta_ptr) {
+                        qt.meta = Tensor::from_pointer(ew.meta_ptr, ew.device, ew.meta_dtype, ew.meta_shape);
+                    }
+                    if (ew.meta2_ptr) {
+                        qt.meta2 = Tensor::from_pointer(ew.meta2_ptr, ew.device, ew.meta2_dtype, ew.meta2_shape);
+                    }
+
+                    weight_mgr->store_prequantized(
+                        spec.name, std::move(qt), spec.offload_group, spec.shape);
+                    loaded_external++;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // Not in external weights — fall back to disk loading
+                load_full_precision_from_disk(spec);
+            }
+
+        } else {
+            // Unsupported mapping kind — fall back to disk loading
+            load_full_precision_from_disk(spec);
+        }
+    }
+
+    // Resolve tied parameters
+    loader.resolve_tied_params([&](const std::string& name) -> Tensor& {
+        return weight_mgr->get(name, stream);
+    });
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto t_end = std::chrono::steady_clock::now();
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    fmt::print("[external import] Loaded {} weights from GPU pointers, "
+               "{} from disk in {:.1f} ms\n",
+               loaded_external, loaded_disk, elapsed_ms);
+
+    const size_t quant_bytes = weight_mgr->quantized_bytes();
+    const size_t fp_bytes = weight_mgr->full_precision_bytes();
+    fmt::print("[external import] Memory: quantized={:.1f} MB (borrowed), "
+               "full_precision={:.1f} MB (from disk)\n",
+               static_cast<double>(quant_bytes) / (1024.0 * 1024.0),
+               static_cast<double>(fp_bytes) / (1024.0 * 1024.0));
+
+    return weight_mgr;
+}
+
+// =============================================================================
 // Config builder
 // =============================================================================
 

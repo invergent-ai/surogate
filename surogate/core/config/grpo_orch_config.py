@@ -558,9 +558,18 @@ class NCCLWeightBroadcastConfig:
 
 
 @dataclass
+class ColocateWeightBroadcastConfig:
+    """Configures colocate weight broadcast (zero-copy shared GPU memory)."""
+    type: Optional[Literal["colocate"]] = "colocate"
+
+    def __init__(self, cfg: DictDefault):
+        self.type = cfg.get("type", self.type)
+
+
+@dataclass
 class FileSystemTransportConfig:
     """Configures filesystem-based transport for training examples."""
-    
+
     type: Optional[Literal["filesystem"]] = "filesystem"
     
     def __init__(self, cfg: DictDefault):
@@ -629,7 +638,7 @@ class GRPOOrchestratorConfig:
     report_to: Optional[GRPOReportingConfig] = None
     ckpt: Optional[GRPOCheckpointConfig] = None
     val: Optional[GRPOValConfig] = None
-    weight_broadcast: Optional[FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig] = None
+    weight_broadcast: Optional[FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | ColocateWeightBroadcastConfig] = None
     rollout_transport: Optional[FileSystemTransportConfig | ZMQTransportConfig] = None
     output_dir: Optional[str] = "outputs/run_default"
     max_concurrent: Optional[int] = None
@@ -699,8 +708,11 @@ class GRPOOrchestratorConfig:
             self.val = GRPOValConfig(cfg.get("val"))
         
         if cfg.get("weight_broadcast") is not None:
-            if cfg.get("weight_broadcast").get("type") == "nccl":
+            wb_type = cfg.get("weight_broadcast").get("type")
+            if wb_type == "nccl":
                 self.weight_broadcast = NCCLWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
+            elif wb_type == "colocate":
+                self.weight_broadcast = ColocateWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
             else:
                 self.weight_broadcast = FileSystemWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
         else:

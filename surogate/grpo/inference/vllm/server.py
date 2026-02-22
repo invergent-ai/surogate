@@ -61,6 +61,7 @@ def models(request: Request) -> OpenAIServingModels:
 WORKER_EXTENSION_CLS = {
     "nccl": "surogate.grpo.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "surogate.grpo.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
+    "colocate": "surogate.grpo.inference.vllm.worker.colocate.ColocateWeightUpdateWorker",
 }
 
 

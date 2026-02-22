@@ -33,6 +33,23 @@ class GRPOLossConfig:
 
 
 @dataclass
+class NoiseSchedulerConfig:
+    """QeRL Adaptive Quantization Noise (AQN) parameters.
+
+    Adds Gaussian noise to RMSNorm weights in the inference model before
+    rollout generation.  The noise standard deviation decays geometrically
+    from sigma_start to sigma_end over num_stages intervals.
+
+    Reference: https://arxiv.org/abs/2510.11696
+    """
+
+    enabled: bool = False
+    sigma_start: float = 5e-2
+    sigma_end: float = 5e-4
+    num_stages: int = 10
+
+
+@dataclass
 class GRPOTrainConfig(SFTConfig):
     """Configuration for GRPO RL training with Surogate.
 
@@ -44,8 +61,13 @@ class GRPOTrainConfig(SFTConfig):
     # GRPO loss
     loss: Optional[GRPOLossConfig] = None
 
+    # QeRL noise scheduler (Adaptive Quantization Noise)
+    noise_scheduler: Optional[NoiseSchedulerConfig] = None
+
     # Prime-RL integration
     transport_type: Literal["filesystem", "zmq"] = "filesystem"
+    # Weight broadcast backend: "filesystem" (disk), "nccl" (GPU broadcast), "colocate" (zero-copy shared memory)
+    weight_broadcast_type: Literal["filesystem", "nccl", "colocate"] = "filesystem"
     max_async_level: int = 1
     # Padding multiple for packed micro-batches.
     pad_to_multiple_of: int = 1
@@ -62,6 +84,9 @@ class GRPOTrainConfig(SFTConfig):
         if "gradient_dtype" not in cfg:
             cfg["gradient_dtype"] = "fp32"
 
+        cfg["sample_packing"] = "false"
+        cfg["datasets"] = []
+        
         super().__init__(cfg)
 
         # Parse nested loss config
@@ -73,7 +98,17 @@ class GRPOTrainConfig(SFTConfig):
         else:
             self.loss = GRPOLossConfig()
 
+        # Parse nested noise scheduler config
+        ns_dict = cfg.get("noise_scheduler", {})
+        if isinstance(ns_dict, dict) and ns_dict:
+            self.noise_scheduler = NoiseSchedulerConfig(**ns_dict)
+        elif isinstance(ns_dict, NoiseSchedulerConfig):
+            self.noise_scheduler = ns_dict
+        else:
+            self.noise_scheduler = NoiseSchedulerConfig()
+
         self.transport_type = cfg.get("transport_type", self.transport_type)
+        self.weight_broadcast_type = cfg.get("weight_broadcast_type", self.weight_broadcast_type)
         self.max_async_level = cfg.get("max_async_level", self.max_async_level)
         self.pad_to_multiple_of = cfg.get("pad_to_multiple_of", self.pad_to_multiple_of)
         self.doc_masking = cfg.get("doc_masking", self.doc_masking)

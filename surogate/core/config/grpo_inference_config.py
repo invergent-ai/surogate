@@ -75,7 +75,7 @@ class GRPOInferenceConfig:
     gpu_memory_utilization: Optional[float] = 0.9
     api_server_count: Optional[int] = 1
     seed: Optional[int] = 0
-    weight_broadcast_type: Literal["nccl", "filesystem"] = "filesystem"
+    weight_broadcast_type: Literal["nccl", "filesystem", "colocate"] = "filesystem"
 
     def __init__(self, cfg: DictDefault):
         self.host = cfg.get("host", self.host)

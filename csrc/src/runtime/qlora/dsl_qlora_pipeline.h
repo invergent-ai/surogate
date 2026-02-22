@@ -38,6 +38,38 @@ struct MoEWeightConfig;
 
 namespace qlora {
 
+/// Describes an externally-owned quantized weight (e.g., from vLLM's GPU memory).
+/// The pointers are borrowed — the caller must keep the source alive.
+struct ExternalWeight {
+    std::string name;              ///< HF weight name (e.g., "model.layers.0.self_attn.q_proj.weight")
+    QuantFormat format;            ///< Quantization format
+    int M = 0;                     ///< Original matrix rows
+    int K = 0;                     ///< Original matrix cols
+    int block_size = 64;           ///< Quantization block size
+    bool double_quant = false;     ///< BnB NF4: double quantization enabled
+    int double_quant_group_size = 256;
+    float global_scale = 1.0f;     ///< FP4: global decode scale
+
+    // GPU tensor descriptors: pointer + shape + dtype
+    std::byte* data_ptr = nullptr;
+    std::vector<long> data_shape;
+    ETensorDType data_dtype = ETensorDType::BYTE;
+
+    std::byte* scales_ptr = nullptr;
+    std::vector<long> scales_shape;
+    ETensorDType scales_dtype = ETensorDType::FP32;
+
+    std::byte* meta_ptr = nullptr;
+    std::vector<long> meta_shape;
+    ETensorDType meta_dtype = ETensorDType::FP32;
+
+    std::byte* meta2_ptr = nullptr;
+    std::vector<long> meta2_shape;
+    ETensorDType meta2_dtype = ETensorDType::FP32;
+
+    int device = 0;                ///< CUDA device ID
+};
+
 /// Describes a weight parameter to be loaded and (optionally) quantized.
 struct WeightLoadSpec {
     /// Internal parameter name (e.g., "blocks[0].qkv_weight", "embedding").
@@ -167,6 +199,32 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
 /// @return Fully initialized GenericWeightManager with all weights loaded.
 std::unique_ptr<GenericWeightManager> import_prequantized_weights(
     const std::string& file_name,
+    const DslQLoRAPipelineConfig& config,
+    const PretrainedConfig& pt_config,
+    std::shared_ptr<TensorAllocator> allocator,
+    cudaStream_t stream);
+
+/// Import externally-owned quantized weights (e.g., from vLLM) into a GenericWeightManager.
+///
+/// Unlike import_and_quantize_weights(), this does NOT load from SafeTensors or
+/// run online quantization. Instead, it wraps existing GPU pointers into
+/// QuantizedTensors and stores them via store_prequantized(). The external
+/// memory is borrowed — the caller must keep it alive.
+///
+/// Non-quantizable weights (norms, biases, embeddings) are loaded from SafeTensors
+/// on disk using the standard path.
+///
+/// @param file_name        SafeTensors path (for non-quantizable weights like norms/biases).
+/// @param external_weights List of externally-owned quantized weights (HF names).
+/// @param config           Pipeline configuration.
+/// @param pt_config        Pretrained model configuration.
+/// @param allocator        Tensor allocator for non-quantizable weight memory.
+/// @param stream           CUDA stream for operations.
+///
+/// @return Fully initialized GenericWeightManager with all weights loaded.
+std::unique_ptr<GenericWeightManager> import_external_weights(
+    const std::string& file_name,
+    const std::vector<ExternalWeight>& external_weights,
     const DslQLoRAPipelineConfig& config,
     const PretrainedConfig& pt_config,
     std::shared_ptr<TensorAllocator> allocator,
