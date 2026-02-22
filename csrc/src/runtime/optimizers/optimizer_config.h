@@ -44,6 +44,23 @@ struct OptimizerConfig {
     bool normuon_cautious_wd = true;    // Use cautious (sign-aware) weight decay
 
     /**
+     * @brief Create default AdamW (full-precision) config
+     */
+    static OptimizerConfig adamw(float lr = 2e-4f, float beta1 = 0.9f,
+                                  float beta2 = 0.999f, float epsilon = 1e-8f,
+                                  float weight_decay = 0.1f, float grad_clip = 0.0f) {
+        OptimizerConfig config;
+        config.type = OptimizerType::ADAMW;
+        config.learning_rate = lr;
+        config.adamw_beta1 = beta1;
+        config.adamw_beta2 = beta2;
+        config.adamw_epsilon = epsilon;
+        config.weight_decay = weight_decay;
+        config.grad_clip = grad_clip;
+        return config;
+    }
+
+    /**
      * @brief Create default AdamW 8-bit config
      */
     static OptimizerConfig adamw_8bit(float lr = 2e-4f, float beta1 = 0.9f,

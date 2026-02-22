@@ -903,3 +903,39 @@ void extract_logprobs(const nv_bfloat16* logits, float* logprobs, const int* tar
     extract_logprobs_kernel<<<BT, block_size, 0, stream>>>(logits, logprobs, targets, BT, V, P);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ----------------------------------------------------------------------------
+// Per-token temperature scaling (in-place): logits[idx, :] *= inv_temperature[idx]
+
+template <class floatX>
+__global__ void scale_logits_rows_kernel(floatX* logits, const float* inv_temperature,
+                                         int BT, int V, int P) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int col = static_cast<int>(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (row >= BT || col >= V) {
+        return;
+    }
+    const float inv_t = inv_temperature[row];
+    const int64_t idx = static_cast<int64_t>(row) * static_cast<int64_t>(P) + col;
+    float v = static_cast<float>(logits[idx]);
+    v *= inv_t;
+    logits[idx] = static_cast<floatX>(v);
+}
+
+void scale_logits_rows(float* logits, const float* inv_temperature,
+                       int BT, int V, int P, cudaStream_t stream) {
+    if (!inv_temperature) return;
+    const int block_size = 256;
+    dim3 grid(BT, (V + block_size - 1) / block_size);
+    scale_logits_rows_kernel<<<grid, block_size, 0, stream>>>(logits, inv_temperature, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void scale_logits_rows(nv_bfloat16* logits, const float* inv_temperature,
+                       int BT, int V, int P, cudaStream_t stream) {
+    if (!inv_temperature) return;
+    const int block_size = 256;
+    dim3 grid(BT, (V + block_size - 1) / block_size);
+    scale_logits_rows_kernel<<<grid, block_size, 0, stream>>>(logits, inv_temperature, BT, V, P);
+    CUDA_CHECK(cudaGetLastError());
+}

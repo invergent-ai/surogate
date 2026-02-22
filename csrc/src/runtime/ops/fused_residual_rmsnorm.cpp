@@ -202,11 +202,31 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             : mRunState.simplified_quant_grads().d_res_ffn.abs_max();
     }
 
-    rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
-                     *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
-                     abs_max_ptr,
-                     static_cast<int>(mB), static_cast<int>(mT), C,
-                     mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
+    const bool mixed_weight_grad =
+        (!skip_weight_grad && d_weight_ptr &&
+         d_weight_ptr->DType == ETensorDType::FP32 &&
+         d_input.DType == ETensorDType::BF16);
+
+    if (mixed_weight_grad) {
+        // Compute d_input in BF16 and weight grad separately in FP32.
+        Tensor tmp_dw = mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(C)});
+        mTemps.push_back(tmp_dw);
+        rmsnorm_backward(d_input, tmp_dw, mRunState.scratch().rmsnorm_scratch,
+                         *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
+                         abs_max_ptr,
+                         static_cast<int>(mB), static_cast<int>(mT), C,
+                         mRunState.DeviceProp, mRunState.MainStream,
+                         /*skip_weight_grad=*/true);
+        rmsnorm_backward_dweight_fp32(*d_weight_ptr, d_y, residual_out, *rstd_ptr,
+                                      static_cast<int>(mB), static_cast<int>(mT), C,
+                                      mRunState.MainStream);
+    } else {
+        rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
+                         *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
+                         abs_max_ptr,
+                         static_cast<int>(mB), static_cast<int>(mT), C,
+                         mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
+    }
 
     // Register d_input in mTensors for both graph outputs. Both outputs carry the same
     // gradient (add backward is identity for both inputs). Using store_tensor ensures

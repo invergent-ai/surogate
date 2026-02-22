@@ -278,6 +278,11 @@ GraphExecutor::~GraphExecutor() {
         cudaEventDestroy(mPrefetchEvent);
         mPrefetchEvent = nullptr;
     }
+    // Clean up document masking GPU buffer
+    if (mCuSeqlensGpu) {
+        cudaFree(mCuSeqlensGpu);
+        mCuSeqlensGpu = nullptr;
+    }
 }
 
 void GraphExecutor::set_lora_state(const modules::ModularLoRAConfig* config,
@@ -777,25 +782,6 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mCompiledExecutor->save_tensors(mSaveList);
     }
     mCompiledExecutor->set_capturing(false);
-
-    // Post-forward debug tensor dump (env-driven, cached to avoid per-step getenv).
-    static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-    static const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
-    if (dump_tensors_env && dump_dir_env && *dump_tensors_env && *dump_dir_env) {
-        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-        const std::string dump_dir(dump_dir_env);
-        auto tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
-        for (const auto& name : tensor_names) {
-            // Skip block-prefixed tensors — already dumped at layer boundaries.
-            if (name.rfind("blocks[", 0) == 0) {
-                continue;
-            }
-            const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
-            if (t && t->Data) {
-                debug_dump_tensor(name, *t, dump_dir, rs.MainStream);
-            }
-        }
-    }
 }
 
 void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
@@ -1451,7 +1437,9 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
                                               const std::int32_t* targets_cpu,
                                               float* logprobs_cpu,
                                               const modules::ForwardHook* hook,
-                                              NCCLCommunicator& comm)
+                                              NCCLCommunicator& comm,
+                                              const std::int32_t* position_ids_cpu,
+                                              const float* temperatures_cpu)
 {
     if (!mCompiledExecutor) {
         throw std::runtime_error("GraphExecutor: compiled executor not initialized");
@@ -1472,8 +1460,13 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_cpu, token_bytes,
                                cudaMemcpyHostToDevice, rs.MainStream));
 
-    // Build position IDs: [0, 1, ..., T-1] repeated B times.
-    {
+    // Copy or build position IDs.
+    if (position_ids_cpu) {
+        // Use caller-provided position IDs (e.g. packed sequences with resets).
+        CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_cpu, token_bytes,
+                                   cudaMemcpyHostToDevice, rs.MainStream));
+    } else {
+        // Default: [0, 1, ..., T-1] repeated B times.
         std::vector<std::int32_t> pos_cpu(static_cast<std::size_t>(BT));
         for (long b = 0; b < B; ++b) {
             for (long t = 0; t < T; ++t) {
@@ -1489,6 +1482,20 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     CUDA_CHECK(cudaMalloc(&logprobs_gpu, static_cast<std::size_t>(BT) * sizeof(float)));
     CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0,
                                static_cast<std::size_t>(BT) * sizeof(float), rs.MainStream));
+
+    // Optional per-token inverse temperature buffer.
+    float* inv_temperature_gpu = nullptr;
+    if (temperatures_cpu) {
+        std::vector<float> inv_temp(static_cast<std::size_t>(BT));
+        for (int i = 0; i < BT; ++i) {
+            inv_temp[static_cast<std::size_t>(i)] = 1.0f / temperatures_cpu[i];
+        }
+        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, static_cast<std::size_t>(BT) * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu, inv_temp.data(),
+                                   static_cast<std::size_t>(BT) * sizeof(float),
+                                   cudaMemcpyHostToDevice, rs.MainStream));
+        mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
+    }
 
     // Configure logprobs context (intercepted in dispatch_fused_lm_head_loss).
     mCompiledExecutor->set_logprobs_context(logprobs_gpu);
@@ -1510,6 +1517,10 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     // Cleanup.
     CUDA_CHECK(cudaFree(logprobs_gpu));
     mCompiledExecutor->set_logprobs_context(nullptr);
+    if (inv_temperature_gpu) {
+        mCompiledExecutor->set_inv_temperature_context(nullptr);
+        CUDA_CHECK(cudaFree(inv_temperature_gpu));
+    }
     mCompiledExecutor->set_save_list(&mSaveList);
 }
 
@@ -1521,7 +1532,8 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
                                                 const float* per_token_grads_cpu,
                                                 NCCLCommunicator& comm,
                                                 int grad_accum_steps, int micro_step,
-                                                const modules::BackwardHook* hook)
+                                                const modules::BackwardHook* hook,
+                                                const float* temperatures_cpu)
 {
     auto& rs = mRunState;
     const long B = inputs.Sizes[0];
@@ -1535,6 +1547,18 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
     CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu, per_token_grads_cpu,
                                BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
     mCompiledExecutor->set_custom_dloss_context(custom_dloss_gpu);
+
+    float* inv_temperature_gpu = nullptr;
+    if (temperatures_cpu) {
+        std::vector<float> inv_temp(BT);
+        for (std::size_t i = 0; i < BT; ++i) {
+            inv_temp[i] = 1.0f / temperatures_cpu[i];
+        }
+        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, BT * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu, inv_temp.data(),
+                                   BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
+        mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
+    }
 
     // Run standard backward (with or without LoRA backward hook).
     if (hook) {
@@ -1550,6 +1574,57 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
     CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
     mCompiledExecutor->set_custom_dloss_context(nullptr);
     CUDA_CHECK(cudaFree(custom_dloss_gpu));
+    if (inv_temperature_gpu) {
+        mCompiledExecutor->set_inv_temperature_context(nullptr);
+        CUDA_CHECK(cudaFree(inv_temperature_gpu));
+    }
+}
+
+// ============================================================================
+// Document masking (Flash Attention varlen)
+// ============================================================================
+
+void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu,
+                                     int num_docs, int max_seqlen, int total_q)
+{
+    const int count = num_docs + 1;
+    // Reallocate GPU buffer if size changed
+    if (mCuSeqlensGpu && mCuSeqlensCount != count) {
+        CUDA_CHECK(cudaFree(mCuSeqlensGpu));
+        mCuSeqlensGpu = nullptr;
+    }
+    if (!mCuSeqlensGpu) {
+        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu,
+                              static_cast<std::size_t>(count) * sizeof(std::int32_t)));
+        mCuSeqlensCount = count;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu, cu_seqlens_cpu,
+                               static_cast<std::size_t>(count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, mRunState.MainStream));
+    mDocMaskingNumDocs = num_docs;
+    mDocMaskingMaxSeqlen = max_seqlen;
+    mDocMaskingTotalQ = total_q;
+    if (mCompiledExecutor) {
+        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, num_docs,
+                                                    max_seqlen, total_q);
+    }
+}
+
+void GraphExecutor::clear_doc_masking()
+{
+    if (mCompiledExecutor) {
+        mCompiledExecutor->clear_doc_masking_context();
+    }
+    mDocMaskingNumDocs = 0;
+    mDocMaskingMaxSeqlen = 0;
+    mDocMaskingTotalQ = 0;
+    // Keep GPU buffer allocated for reuse (freed in destructor)
+}
+
+void GraphExecutor::set_inv_temperature_context(const float* inv_temperature_gpu) {
+    if (mCompiledExecutor) {
+        mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
+    }
 }
 
 }  // namespace dsl

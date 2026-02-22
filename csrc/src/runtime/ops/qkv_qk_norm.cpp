@@ -264,14 +264,26 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
 
     // Compute d_weight before overwriting d_out_view.
     if (d_q_norm) {
-        qkv_head_rmsnorm_backward_dweight(*d_q_norm, d_out_view, qkv_view, q_norm,
-                                          static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                          Hq, Hs, 0, accum_q, mRunState.MainStream);
+        if (d_q_norm->DType == ETensorDType::FP32 && q_norm.DType != ETensorDType::FP32) {
+            qkv_head_rmsnorm_backward_dweight_fp32(*d_q_norm, d_out_view, qkv_view, q_norm,
+                                                   static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                                   Hq, Hs, 0, accum_q, mRunState.MainStream);
+        } else {
+            qkv_head_rmsnorm_backward_dweight(*d_q_norm, d_out_view, qkv_view, q_norm,
+                                              static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                              Hq, Hs, 0, accum_q, mRunState.MainStream);
+        }
     }
     if (d_k_norm) {
-        qkv_head_rmsnorm_backward_dweight(*d_k_norm, d_out_view, qkv_view, k_norm,
-                                          static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                          Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
+        if (d_k_norm->DType == ETensorDType::FP32 && k_norm.DType != ETensorDType::FP32) {
+            qkv_head_rmsnorm_backward_dweight_fp32(*d_k_norm, d_out_view, qkv_view, k_norm,
+                                                   static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                                   Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
+        } else {
+            qkv_head_rmsnorm_backward_dweight(*d_k_norm, d_out_view, qkv_view, k_norm,
+                                              static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
+                                              Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
+        }
     }
 
     if (d_qkv_view.Data != d_out_view.Data) {

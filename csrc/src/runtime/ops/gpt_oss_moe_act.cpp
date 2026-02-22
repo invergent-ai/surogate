@@ -38,37 +38,6 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act(const CompiledOp& op) {
 
         store_tensor(op.outputs[0], out);
 
-        const char* debug_env = std::getenv("SUROGATE_DEBUG_MOE_LOGITS");
-        const bool debug_logits = (debug_env && *debug_env && std::string(debug_env) != "0");
-        if (debug_logits) {
-            Tensor non_finite = mRunState.Stack.allocate(ETensorDType::INT32, {1}, "gpt_oss_act_nonfinite");
-            fill_zero(non_finite, mRunState.MainStream);
-            count_non_finite(non_finite, out, mRunState.MainStream);
-            int out_non_finite = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&out_non_finite, non_finite.Data, sizeof(int),
-                                       cudaMemcpyDeviceToHost, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            if (out_non_finite > 0) {
-                int inp_non_finite = 0;
-                fill_zero(non_finite, mRunState.MainStream);
-                count_non_finite(non_finite, inp, mRunState.MainStream);
-                CUDA_CHECK(cudaMemcpyAsync(&inp_non_finite, non_finite.Data, sizeof(int),
-                                           cudaMemcpyDeviceToHost, mRunState.MainStream));
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                int layer_idx = -1;
-                std::string field;
-                parse_block_param(op.inputs[0].name, layer_idx, field);
-                fprintf(stderr,
-                        "[MoE] Non-finite GPT-OSS MoE activation at layer %d: expert_act=%d, gate_up_bias=%d\n",
-                        layer_idx, out_non_finite, inp_non_finite);
-                if (mDebugDumpFn) {
-                    std::vector<std::string> names;
-                    if (!op.inputs.empty() && !op.inputs[0].name.empty()) names.push_back(op.inputs[0].name);
-                    if (!op.outputs.empty() && !op.outputs[0].name.empty()) names.push_back(op.outputs[0].name);
-                    mDebugDumpFn(names, layer_idx);
-                }
-            }
-        }
         return;
     }
 
@@ -88,38 +57,6 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act(const CompiledOp& op) {
                                 alpha, limit, mRunState.MainStream);
     } else {
         throw std::logic_error("gpt_oss_moe_act: unsupported input dtype");
-    }
-
-    const char* debug_env = std::getenv("SUROGATE_DEBUG_MOE_LOGITS");
-    const bool debug_logits = (debug_env && *debug_env && std::string(debug_env) != "0");
-    if (debug_logits) {
-        Tensor non_finite = mRunState.Stack.allocate(ETensorDType::INT32, {1}, "gpt_oss_act_nonfinite");
-        fill_zero(non_finite, mRunState.MainStream);
-        count_non_finite(non_finite, out, mRunState.MainStream);
-        int out_non_finite = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&out_non_finite, non_finite.Data, sizeof(int),
-                                   cudaMemcpyDeviceToHost, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        if (out_non_finite > 0) {
-            int inp_non_finite = 0;
-            fill_zero(non_finite, mRunState.MainStream);
-            count_non_finite(non_finite, inp, mRunState.MainStream);
-            CUDA_CHECK(cudaMemcpyAsync(&inp_non_finite, non_finite.Data, sizeof(int),
-                                       cudaMemcpyDeviceToHost, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            int layer_idx = -1;
-            std::string field;
-            parse_block_param(op.inputs[0].name, layer_idx, field);
-            fprintf(stderr,
-                    "[MoE] Non-finite GPT-OSS MoE activation at layer %d: expert_act=%d, gate_up_bias=%d\n",
-                    layer_idx, out_non_finite, inp_non_finite);
-            if (mDebugDumpFn) {
-                std::vector<std::string> names;
-                if (!op.inputs.empty() && !op.inputs[0].name.empty()) names.push_back(op.inputs[0].name);
-                if (!op.outputs.empty() && !op.outputs[0].name.empty()) names.push_back(op.outputs[0].name);
-                mDebugDumpFn(names, layer_idx);
-            }
-        }
     }
 }
 

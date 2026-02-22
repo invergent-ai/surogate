@@ -364,6 +364,8 @@ target_sources(surogate-common PRIVATE
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
     src/kernels/cudnn_att.cpp
+    src/kernels/flash_attn_varlen.cpp
+    src/kernels/flash_attn_scatter.cu
     src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu
     src/kernels/mxfp4_dequant.cu
@@ -371,6 +373,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/global_norm.cu
     src/kernels/bias.cu
     src/runtime/optimizers/adamw_8bit.cu
+    src/runtime/optimizers/adamw.cu
     src/runtime/optimizers/polar_express.cu
     src/runtime/optimizers/normuon.cu
     src/kernels/attention.cu
@@ -411,11 +414,41 @@ target_sources(surogate-common PRIVATE
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm120.cu
 )
 
-target_link_libraries(surogate-common PRIVATE ${CUFILE_LIBS} cudnn_frontend ${CUDNN_LIBRARY} nvidia::nccl fmt::fmt-header-only)
+# Flash Attention varlen kernels (from DAO-AiLab/flash-attention)
+# Used for document-level attention masking in GRPO training
+set(FLASH_ATTN_DIR ${CMAKE_SOURCE_DIR}/../study/flash-attention/csrc/flash_attn)
+set(FLASH_ATTN_SOURCES
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim64_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim96_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim128_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim256_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim64_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim96_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim128_bf16_causal_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim256_bf16_causal_sm80.cu
+)
+add_library(flash_attn STATIC ${FLASH_ATTN_SOURCES})
+set_target_properties(flash_attn PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(flash_attn PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/shims        # ATen shim for PhiloxCudaState
+    ${CMAKE_SOURCE_DIR}/src/third_party  # c10/cuda/CUDAException.h shim
+    ${FLASH_ATTN_DIR}/src
+    ${cutlass_SOURCE_DIR}/include
+    ${cutlass_SOURCE_DIR}/tools/util/include
+)
+target_compile_definitions(flash_attn PRIVATE FLASH_NAMESPACE=surogate_flash)
+target_compile_options(flash_attn PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+)
+
+target_link_libraries(surogate-common PRIVATE flash_attn ${CUFILE_LIBS} cudnn_frontend ${CUDNN_LIBRARY} nvidia::nccl fmt::fmt-header-only)
 target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt ${NVML_LIBS} nlohmann_json::nlohmann_json)
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
-target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
+target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/src/shims ${FLASH_ATTN_DIR}/src)
 target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
 
 # backward-cpp for stack traces

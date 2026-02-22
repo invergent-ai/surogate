@@ -400,9 +400,9 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
 
     // Final: norm = amax * sqrt(prescaled_sum), with token scaling and clipping
     const bool capturing = internal::stream_is_capturing(stream);
+    const int* token_count = mUseTokenScale ? rs.ValidTokenCount.template get<int>() : nullptr;
     global_norm_sqrt_prescaled(buf.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
-                                rs.ValidTokenCount.template get<int>(), total_tokens,
-                                amax_ptr, rs.DeviceProp, stream);
+                                token_count, total_tokens, amax_ptr, rs.DeviceProp, stream);
     internal::record_event_if_not_capturing(rs.NormDone, stream);
 }
 

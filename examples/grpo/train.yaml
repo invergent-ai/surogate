@@ -1,0 +1,51 @@
+# GRPO RL Training Example: Reverse Text
+# Based on prime-rl/examples/reverse_text/rl/train.toml
+#
+# Uses an SFT'd model that already knows how to reverse text.
+# Surogate replaces the trainer process.
+#
+# Usage:
+#   surogate grpo examples/grpo/grpo.yaml
+#
+model: "./reverse-fft"
+output_dir: ./outputs
+gpus: 1
+
+# No datasets — GRPO data comes from the transport layer
+sample_packing: false
+datasets: []
+
+per_device_train_batch_size: 1
+sequence_len: 2048
+
+# max_steps = orchestrator steps (must match orch.yaml max_steps)
+max_steps: 20
+logging_steps: 1
+
+learning_rate: 3e-6
+lr_scheduler_type: constant
+warmup_steps: 0
+max_grad_norm: 1.0
+weight_decay: 0.01
+pad_to_multiple_of: 1
+
+recipe: bf16
+
+lora: false
+
+# GRPO loss
+loss:
+  ratio_type: token
+  kl_tau: 0.0
+  adv_tau: 1.0
+  token_mask_low: 0.125
+  token_mask_high: 8.0
+  geo_mask_low: 0.1
+  geo_mask_high: 10.0
+
+transport_type: filesystem
+max_async_level: 1
+
+# Checkpointing
+save_steps: 100
+checkpoint_dir: ./outputs/checkpoints

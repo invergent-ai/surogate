@@ -867,6 +867,67 @@ void rmsnorm_backward(nv_bfloat16* dinp, nv_bfloat16* dweight, std::byte* scratc
     rmsnorm_backward_imp(dinp, dweight, scratch, dresidual, dout, inp, weight, rstd, abs_max_ptr, B, T, C, dp, stream, skip_weight_grad);
 }
 
+// -----------------------------------------------------------------------------
+// FP32 weight gradients (BF16/FP16 activations)
+// -----------------------------------------------------------------------------
+
+template<typename T>
+__device__ __forceinline__ float rmsnorm_to_float(T v);
+
+template<>
+__device__ __forceinline__ float rmsnorm_to_float<nv_bfloat16>(nv_bfloat16 v) {
+    return __bfloat162float(v);
+}
+
+template<>
+__device__ __forceinline__ float rmsnorm_to_float<half>(half v) {
+    return __half2float(v);
+}
+
+template<typename T>
+__global__ void rmsnorm_backward_dweight_fp32_kernel(const T* dout, const T* inp, const float* rstd,
+                                                     float* dweight, int BT, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) {
+        return;
+    }
+    float sum = 0.0f;
+    const int stride = C;
+    const int idx = c;
+    for (int i = 0; i < BT; ++i) {
+        const int off = i * stride + idx;
+        const float d = rmsnorm_to_float(dout[off]);
+        const float x = rmsnorm_to_float(inp[off]);
+        sum += d * x * rstd[i];
+    }
+    atomicAdd(&dweight[c], sum);
+}
+
+void rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tensor& dout, const Tensor& inp, const Tensor& rstd,
+                                   int B, int T, int C, cudaStream_t stream) {
+    if (dweight_fp32.DType != ETensorDType::FP32) {
+        throw std::logic_error("rmsnorm_backward_dweight_fp32: dweight must be FP32");
+    }
+    if (rstd.DType != ETensorDType::FP32) {
+        throw std::logic_error("rmsnorm_backward_dweight_fp32: rstd must be FP32");
+    }
+    if (dout.DType != inp.DType) {
+        throw std::logic_error("rmsnorm_backward_dweight_fp32: dout/inp dtype mismatch");
+    }
+    const int BT = B * T;
+    const int threads = 256;
+    const int blocks = (C + threads - 1) / threads;
+    if (inp.DType == ETensorDType::BF16) {
+        rmsnorm_backward_dweight_fp32_kernel<<<blocks, threads, 0, stream>>>(
+            dout.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), rstd.get<float>(), dweight_fp32.get<float>(), BT, C);
+    } else if (inp.DType == ETensorDType::FP16) {
+        rmsnorm_backward_dweight_fp32_kernel<<<blocks, threads, 0, stream>>>(
+            dout.get<half>(), inp.get<half>(), rstd.get<float>(), dweight_fp32.get<float>(), BT, C);
+    } else {
+        throw std::logic_error("rmsnorm_backward_dweight_fp32: unsupported dtype");
+    }
+}
+
 /**
  * @brief RMS normalization forward pass with fused FP8 quantization.
  *

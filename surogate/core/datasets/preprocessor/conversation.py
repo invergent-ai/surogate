@@ -13,9 +13,12 @@ class ConversationPreprocessor(RowPreprocessor):
         self.ds_cfg = dataset_config
         self.message_property_mappings = dataset_config.message_property_mappings
         self.messages_field = dataset_config.messages_field
+        self.completion_field = dataset_config.completion_field
         self.system_field = dataset_config.system_field or "system"
         self.tools_field = dataset_config.tools_field or "tools"
         self.columns[self.messages_field] = "messages"
+        if self.completion_field:
+            self.columns[self.completion_field] = "completion"
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         row["messages"] = self.get_conversation_thread(row)
@@ -68,17 +71,25 @@ class ConversationPreprocessor(RowPreprocessor):
         return transformed_message
 
     def _get_messages(self, row):
-        messages = row.get(self.messages_field, None)
+        messages = row.get("messages", None)
         if messages is None:
             raise ValueError("Messages is null. Please check `messages_field`.")
 
-        if isinstance(messages, list):
-            return messages
+        if not isinstance(messages, list):
+            raise ValueError(
+                "Unknown messages format. Please convert it into a list[dict].\n"
+                f"Current format: {type(messages)}"
+            )
 
-        raise ValueError(
-            "Unknown messages format. Please convert it into a list[dict].\n"
-            f"Current format: {type(messages)}"
-        )
+        if self.completion_field:
+            completion = row.get("completion", None)
+            if completion is not None:
+                if isinstance(completion, list):
+                    messages = messages + completion
+                elif isinstance(completion, dict):
+                    messages = messages + [completion]
+
+        return messages
 
     def _get_tools(self, row) -> list[dict] | None:
         """Get tools from prompt if available."""

@@ -1,0 +1,2 @@
+model: "./reverse-fft"
+enable_lora: false

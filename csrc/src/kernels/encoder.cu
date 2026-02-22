@@ -434,3 +434,38 @@ void encoder_backward(nv_bfloat16* dwte, int* scratch, // gpu outputs & scratch
                       int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream) {
     encoder_backward_imp(dwte, scratch, workload_indices, bucket_info, dout, inp, inputs_cpu, B, T, C, seed, stream, sync_event, copy_stream);
 }
+
+template <typename InT>
+__global__ void embedding_backward_atomic_kernel(float* dwte, const InT* dout, const int* inp,
+                                                 int B, int T, int C) {
+    const long total = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
+    const long stride = static_cast<long>(blockDim.x) * static_cast<long>(gridDim.x);
+    for (long idx = static_cast<long>(blockIdx.x) * static_cast<long>(blockDim.x) + static_cast<long>(threadIdx.x);
+         idx < total;
+         idx += stride) {
+        const int c = static_cast<int>(idx % C);
+        const long bt = idx / C;
+        const int token = inp[bt];
+        atomicAdd(&dwte[static_cast<long>(token) * C + c], static_cast<float>(dout[idx]));
+    }
+}
+
+void encoder_backward_atomic(float* dwte, const nv_bfloat16* dout, const int* inp,
+                             int B, int T, int C, cudaStream_t stream) {
+    const long total = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
+    if (total <= 0) return;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<long>(65535, (total + threads - 1) / threads));
+    embedding_backward_atomic_kernel<<<blocks, threads, 0, stream>>>(dwte, dout, inp, B, T, C);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void encoder_backward_atomic(float* dwte, const half* dout, const int* inp,
+                             int B, int T, int C, cudaStream_t stream) {
+    const long total = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
+    if (total <= 0) return;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<long>(65535, (total + threads - 1) / threads));
+    embedding_backward_atomic_kernel<<<blocks, threads, 0, stream>>>(dwte, dout, inp, B, T, C);
+    CUDA_CHECK(cudaGetLastError());
+}

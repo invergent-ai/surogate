@@ -47,10 +47,3 @@ def create_hfhub_tqdm(prefix=""):
 
     return HfHubPrettyTqdm
 
-import datasets
-# datasets.utils.logging.tqdm = create_hfhub_tqdm("Dataset - ")
-# datasets.utils.tqdm = create_hfhub_tqdm("Dataset - ")
-# datasets.download.download_manager.tqdm = create_hfhub_tqdm("Downloading dataset - ")
-# datasets.arrow_dataset.hf_tqdm = create_hfhub_tqdm("Processing dataset - ")
-import transformers
-# transformers.utils.logging.tqdm = create_hfhub_tqdm("Loading model - ")

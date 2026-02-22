@@ -125,6 +125,7 @@ public:
     // Master weight access for optimizer
     Tensor& get_master(const std::string& name);
     void synchronize_master(const std::string& name, cudaStream_t stream);
+    void sync_work_from_master(cudaStream_t stream);
 
     // Metadata
     const std::vector<std::string>& param_names() const { return mParamOrder; }

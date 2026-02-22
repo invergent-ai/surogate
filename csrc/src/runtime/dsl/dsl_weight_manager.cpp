@@ -224,7 +224,8 @@ void DslWeightManager::allocate_weights(const Module& module,
             continue;
         }
 
-        ETensorDType dtype = info.dtype.value_or(mConfig.master_dtype);
+        const ETensorDType param_dtype = info.dtype.value_or(mConfig.work_dtype);
+        const ETensorDType master_dtype = mConfig.master_dtype;
         std::vector<long> shape = resolve_shape(info.shape, env);
 
         DslWeightEntry entry;
@@ -261,24 +262,27 @@ void DslWeightManager::allocate_weights(const Module& module,
 
         // Allocate master weight (sharded if enabled)
         if (entry_sharded) {
-            TensorShard shard = mAllocator->allocate_shard(dtype, mConfig.shard_idx, mConfig.num_shards,
+            TensorShard shard = mAllocator->allocate_shard(master_dtype, mConfig.shard_idx, mConfig.num_shards,
                                                            name.c_str(), shape, master_alloc);
             entry.master = static_cast<Tensor>(shard);
         } else {
-            entry.master = mAllocator->allocate(dtype, name.c_str(), master_alloc, shape);
+            entry.master = mAllocator->allocate(master_dtype, name.c_str(), master_alloc, shape);
         }
         entry.master_sharded = entry_sharded;
 
+        const bool separate_work = mStreamWeights || mConfig.offload_master ||
+            (master_dtype != param_dtype);
+
         // Allocate work weight (always on device)
         // If not streaming/offloading, master and work can share storage
-        if (!mStreamWeights && !mConfig.offload_master) {
+        if (!separate_work) {
             entry.work = entry.master;  // Alias
-        } else if (entry.is_block) {
+        } else if (entry.is_block && (mStreamWeights || mConfig.offload_master)) {
             // Work weights for blocks are allocated in prefetch buffers
             entry.work = Tensor{};  // Will be set during gather
         } else {
-            // Non-block weights: always keep work copy on device
-            entry.work = mAllocator->allocate(mConfig.work_dtype, (name + "_work").c_str(),
+            // Work weights on device (use param dtype for compute)
+            entry.work = mAllocator->allocate(param_dtype, (name + "_work").c_str(),
                                               EAllocationType::ON_DEVICE, shape);
         }
 
@@ -487,6 +491,22 @@ void DslWeightManager::synchronize_master(const std::string& name, cudaStream_t 
                           reinterpret_cast<const nv_bfloat16*>(entry.work.Data),
                           entry.work.nelem(), stream);
         }
+    }
+}
+
+void DslWeightManager::sync_work_from_master(cudaStream_t stream) {
+    for (auto& kv : mWeights) {
+        auto& entry = kv.second;
+        if (!entry.work.Data) {
+            continue;
+        }
+        if (entry.work.Data == entry.master.Data) {
+            continue;  // Alias - nothing to sync
+        }
+        if ((mStreamWeights || mConfig.offload_master) && entry.is_block) {
+            continue;  // Block weights are gathered on demand
+        }
+        convert_to_work(entry.master, entry.work, stream);
     }
 }
 

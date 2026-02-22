@@ -58,6 +58,10 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
                V, static_cast<int>(BT), C,
                swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
 
+        if (mInvTemperatureGpu) {
+            scale_logits_rows(logits, mInvTemperatureGpu, static_cast<int>(BT), V, P, mRunState.MainStream);
+        }
+
         extract_logprobs(logits, mLogprobsGpu, targets,
                          static_cast<int>(BT), V, P, mRunState.MainStream);
 
@@ -104,6 +108,11 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
                std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(C),
                swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        if (mInvTemperatureGpu) {
+            const float* inv_t = mInvTemperatureGpu + token_offset;
+            scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
 
         Tensor logsumexp_view{};
         Tensor* logsumexp = nullptr;
@@ -177,9 +186,10 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         }
     }
 
-    // HuggingFace-style normalization: use reduction="sum" semantics.
+    // Use reduction="sum" semantics by default.
     // dloss = 1.0 means each valid token contributes equally to the gradient sum.
-    // The actual normalization by accumulated valid tokens happens in global_norm_sqrt.
+    // If token scaling is enabled, global_norm_sqrt applies 1/valid_token_count;
+    // custom losses may pre-scale dloss instead.
     // Robustly seed d_loss even if the name has SSA suffixes or mapped to loss/losses.
     const std::string d_loss_name = strip_ssa_suffix(op.inputs[0].name);
     bool d_loss_seeded = false;
@@ -262,12 +272,23 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             logsumexp = &logsumexp_view;
         }
 
+        if (mInvTemperatureGpu) {
+            const float* inv_t = mInvTemperatureGpu + token_offset;
+            scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
+
         if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
             chunked_cross_entropy_backward(logits, logits, logsumexp, dloss_slice, tgt_slice,
                                            static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
         } else {
             fused_cross_entropy_backward(logits, logits, logsumexp, dloss_slice, tgt_slice,
                                          static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
+
+        if (mInvTemperatureGpu) {
+            const float* inv_t = mInvTemperatureGpu + token_offset;
+            // Chain through temperature scaling: dlogits *= inv_temperature
+            scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
         }
 
         if (d_weight_ptr) {

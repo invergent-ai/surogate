@@ -629,6 +629,20 @@ void extract_logprobs(const Tensor& logits, float* logprobs, const Tensor& targe
     }
 }
 
+void scale_logits_rows(Tensor& logits, const float* inv_temperature,
+                       int BT, int V, int P, cudaStream_t stream) {
+    if (!inv_temperature) {
+        return;
+    }
+    if (logits.DType == ETensorDType::FP32) {
+        scale_logits_rows(logits.get<float>(), inv_temperature, BT, V, P, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        scale_logits_rows(logits.get<nv_bfloat16>(), inv_temperature, BT, V, P, stream);
+    } else {
+        throw std::runtime_error("scale_logits_rows: unsupported logits dtype");
+    }
+}
+
 /**
  * @brief Performs the forward pass of the encoder layer (embedding lookup + positional encoding).
  *

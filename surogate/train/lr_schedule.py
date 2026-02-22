@@ -66,7 +66,9 @@ class LRSchedule:
         main_step = step - self.warmup_steps
         progress = min(1.0, main_step / self.main_steps)
 
-        if self.schedule_type == "cosine":
+        if self.schedule_type == "constant":
+            return self.base_lr
+        elif self.schedule_type == "cosine":
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             return self.final_lr + (self.base_lr - self.final_lr) * cosine_decay
         elif self.schedule_type == "linear":

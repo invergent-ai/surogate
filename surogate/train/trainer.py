@@ -274,10 +274,12 @@ class SurogateTrainerWrapper():
         return self._block_types
 
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
-        """Copy tokenizer and vocab files from source model to output directory."""
+        """Copy tokenizer, vocab, and config files from source model to output directory."""
         tokenizer_files = [
+            "config.json",
             "tokenizer.json", "tokenizer_config.json",
-            "special_tokens_map.json", "vocab.json", "merges.txt"
+            "special_tokens_map.json", "vocab.json", "merges.txt", 
+            "added_tokens.json", "chat_template.jinja", "generation_config.json"
         ]
         src_path = Path(src_dir)
         dst_path = Path(dst_dir)

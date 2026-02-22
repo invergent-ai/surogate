@@ -36,6 +36,10 @@ void encoder_backward(nv_bfloat16* dwte, int* scratch,
                       int* workload_indices, int4* bucket_info,
                       const nv_bfloat16* dout, const int* inp, const int* inputs_cpu,
                       int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream);
+void encoder_backward_atomic(float* dwte, const nv_bfloat16* dout, const int* inp,
+                             int B, int T, int C, cudaStream_t stream);
+void encoder_backward_atomic(float* dwte, const half* dout, const int* inp,
+                             int B, int T, int C, cudaStream_t stream);
 
 // The kernel runs on `stream`, but the bucket info that gets generated on CPU to enable efficient determinism
 // can be copied using `copy_stream`, so the kernel launch does not have to wait.
@@ -65,6 +69,9 @@ void rmsnorm_backward(nv_bfloat16* dinp, nv_bfloat16* dweight, std::byte* scratc
                       int B, int T, int C, const cudaDeviceProp& dp, cudaStream_t stream, bool skip_weight_grad = false);
 void rmsnorm_backward(Tensor& dinp, Tensor& dweight, Tensor& scratch, const Tensor& dresidual, const Tensor& dout, const Tensor& inp, const Tensor& weight, const Tensor& rstd, float* abs_max_ptr,
                       int B, int T, int C,  const cudaDeviceProp& dp, cudaStream_t stream, bool skip_weight_grad = false);
+// Compute RMSNorm weight gradients in FP32 while activations are BF16/FP16.
+void rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tensor& dout, const Tensor& inp, const Tensor& rstd,
+                                   int B, int T, int C, cudaStream_t stream);
 
 void fused_residual_rmsnorm_forward(float* residual, float* normed, float* rrms, const float* inp1, const float* inp2, const float* weight, float* abs_max_ptr,
                                     float epsilon, int N, int C, cudaStream_t stream);
@@ -95,6 +102,10 @@ void qkv_head_rmsnorm_backward_dweight(Tensor& d_weight, const Tensor& d_qkv, co
                                        int B, int T, int qkv_channels,
                                        int num_heads, int head_size, int channel_offset,
                                        bool accumulate, cudaStream_t stream);
+void qkv_head_rmsnorm_backward_dweight_fp32(Tensor& d_weight_fp32, const Tensor& d_qkv, const Tensor& qkv_out, const Tensor& weight,
+                                            int B, int T, int qkv_channels,
+                                            int num_heads, int head_size, int channel_offset,
+                                            bool accumulate, cudaStream_t stream);
 
 // Fused QK RMSNorm + RoPE for Qwen3-style Q/K norm.
 // Forward: computes per-head RMSNorm (with weight) on Q and K heads and applies RoPE rotation in-place on @p qkv.
@@ -117,6 +128,11 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qk
                                             int B, int T, int qkv_channels,
                                             int num_heads, int head_size, int channel_offset,
                                             bool accumulate, cudaStream_t stream);
+void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32, const Tensor& d_qkv, const Tensor& qkv_rope, const Tensor& weight,
+                                                 const Tensor& freqs_cis, const int* position_ids,
+                                                 int B, int T, int qkv_channels,
+                                                 int num_heads, int head_size, int channel_offset,
+                                                 bool accumulate, cudaStream_t stream);
 
 void qkv_abs_max_slice(const Tensor& qkv, int B, int T, int qkv_channels,
                        int channel_offset, int channel_count,
@@ -482,6 +498,41 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
                               Tensor& workspace, cudnnHandle_t handle,
                               int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
+// Flash Attention varlen forward (for document-level attention masking in packed sequences).
+// Q/K/V read from interleaved qkv buffer via strides; output written to out (total_q, Hq, HS).
+// LSE written in unpadded (Hq, total_q) format.
+void attention_forward_flash_varlen(
+    nv_bfloat16* out, float* lse, const nv_bfloat16* qkv,
+    const int32_t* cu_seqlens_gpu,
+    int B_ragged, int max_seqlen, int total_q,
+    int Hq, int Hkv, int HS, cudaStream_t stream);
+
+// Flash Attention varlen backward.
+// dq_accum: (total_q + 128*B_ragged, Hq, HS_rounded) FP32 temp.
+// dsoftmax_sum: (Hq, total_q + 128*B_ragged) FP32 temp.
+// dk_expanded/dv_expanded: (total_q, Hq, HS) BF16 temps for GQA (Hq != Hkv).
+//   When Hq != Hkv, these must be non-null. The backward kernel writes dK/dV with
+//   Hq head indices; these buffers are then reduced to Hkv heads and scattered
+//   into the K/V sections of interleaved dqkv.
+//   When Hq == Hkv (MHA), pass nullptr — dK/dV are written directly to dqkv.
+void attention_backward_flash_varlen(
+    nv_bfloat16* dqkv, const float* lse,
+    const nv_bfloat16* out, const nv_bfloat16* dout, const nv_bfloat16* qkv,
+    const int32_t* cu_seqlens_gpu,
+    float* dq_accum, float* dsoftmax_sum,
+    nv_bfloat16* dk_expanded, nv_bfloat16* dv_expanded,
+    int B_ragged, int max_seqlen, int total_q,
+    int Hq, int Hkv, int HS, bool deterministic, cudaStream_t stream);
+
+// Reduce dk_expanded/dv_expanded (Hq heads) to Hkv KV heads and scatter
+// into the K/V sections of interleaved dqkv buffer (total_q, Hq+2*Hkv, HS).
+void reduce_scatter_dkv(
+    nv_bfloat16* dqkv,
+    const nv_bfloat16* dk_expanded,
+    const nv_bfloat16* dv_expanded,
+    int total_q, int Hq, int Hkv, int HS,
+    cudaStream_t stream);
+
 // Apply attention sinks: scale output and update LSE to include sink logits.
 void attention_apply_sinks(nv_bfloat16* out, float* lse, const nv_bfloat16* sinks,
                            int B, int T, int Hq, int Hs, cudaStream_t stream);
@@ -568,6 +619,15 @@ void extract_logprobs(const nv_bfloat16* logits, float* logprobs, const int* tar
                       int BT, int V, int P, cudaStream_t stream);
 void extract_logprobs(const Tensor& logits, float* logprobs, const Tensor& targets,
                       int BT, int V, int P, cudaStream_t stream);
+
+/// Scale logits rows by per-token inverse temperature (in-place).
+/// logits is [BT, P], inv_temperature is [BT].
+void scale_logits_rows(float* logits, const float* inv_temperature,
+                       int BT, int V, int P, cudaStream_t stream);
+void scale_logits_rows(nv_bfloat16* logits, const float* inv_temperature,
+                       int BT, int V, int P, cudaStream_t stream);
+void scale_logits_rows(Tensor& logits, const float* inv_temperature,
+                       int BT, int V, int P, cudaStream_t stream);
 
 int get_max_num_block_sums(const cudaDeviceProp& dp);
 void global_norm_squared(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);

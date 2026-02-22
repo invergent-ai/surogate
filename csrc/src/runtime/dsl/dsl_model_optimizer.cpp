@@ -10,6 +10,7 @@
 #include "kernels/kernels.h"
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/adamw.h"
 #include "runtime/optimizers/normuon.h"
 #include "runtime/optimizers/polar_express.h"
 #include "utilities/comm.h"
@@ -24,6 +25,7 @@
 #include "runtime/dsl/graph_executor_utils.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 namespace dsl {
 
@@ -107,9 +109,6 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         }
 
         float wd = weight_decay;
-        if (is_norm_param_name(name) || is_bias_param_name(name)) {
-            wd = 0.f;
-        }
 
         state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         const size_t n = val.nelem();
@@ -175,6 +174,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
 
     if (mWeightManager) {
         mWeightManager->invalidate();
+        mWeightManager->sync_work_from_master(stream);
     }
 
     // Deferred NaN check: norm kernel completed long ago, event sync is ~free
@@ -182,6 +182,158 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
         if (!std::isfinite(*rs.GradScaleHost)) {
             throw std::runtime_error("DslModel::update: grad_scale is NaN/Inf");
+        }
+    }
+    record_event_if_not_capturing(rs.OptimizerDone, stream);
+}
+
+void DslModel::update_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t,
+                            float epsilon, float weight_decay, float grad_clip) {
+    if (!mRunState || !mParams || !mGrads) {
+        throw std::logic_error("DslModel::update_adamw called before allocate_run_state()");
+    }
+    if (lora_enabled()) {
+        throw std::logic_error("DslModel::update_adamw: LoRA AdamW not yet supported");
+    }
+
+    if (!mAdamWState) {
+        mAdamWState = std::make_unique<AdamWState>();
+    }
+
+    auto& rs = *mRunState;
+    cudaStream_t stream = rs.MainStream;
+    wait_event_if_not_capturing(stream, rs.BackwardDone);
+
+    const bool use_weight_manager = (mWeightManager != nullptr);
+    const bool sharded_weights = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1);
+    auto param_is_sharded = [&](const std::string& name) -> bool {
+        return sharded_weights && mWeightManager->is_sharded(name);
+    };
+
+    const bool grads_reduced = comm.world_size() > 1;
+    if (grads_reduced) {
+        if (mGrads->is_reduce_pending()) {
+            wait_event_if_not_capturing(stream, rs.all_reduce_done_event());
+            mGrads->clear_reduce_pending();
+        } else {
+            mGrads->reduce_all(comm, stream);
+        }
+    }
+
+    calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
+    const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
+
+    if (!mAdamWState->initialized) {
+        if (stream_is_capturing(stream)) {
+            throw std::runtime_error("DslModel::update_adamw: optimizer state must be initialized before capture");
+        }
+        init_adamw_state(stream);
+    }
+
+    auto& state = *mAdamWState;
+    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
+    size_t state_offset = 0;
+
+    const float beta1_correction = 1.0f - std::pow(beta_1, static_cast<float>(t));
+    const float beta2_correction = 1.0f - std::pow(beta_2, static_cast<float>(t));
+
+    std::unordered_set<void*> seen_grad_ptrs;
+
+    for (const auto& name : mGrads->param_names()) {
+        Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
+        bool accumulate = false;
+        Tensor* grad = mGrads->get_param_grad(name, accumulate);
+        (void)accumulate;
+        if (!grad) {
+            continue;
+        }
+
+        if (seen_grad_ptrs.count(grad->Data) > 0) {
+            state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            state_offset += val.nelem();
+            continue;
+        }
+        seen_grad_ptrs.insert(grad->Data);
+
+        const bool param_sharded = param_is_sharded(name);
+        Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
+        if (param_sharded && grad_view.nelem() != val.nelem()) {
+            throw std::runtime_error("DslModel::update_adamw: sharded grad size mismatch for " + name);
+        }
+
+        state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        const size_t n = val.nelem();
+        if (!val.Data || !grad_view.Data) {
+            state_offset += n;
+            continue;
+        }
+
+        float* m = state.state1.template get<float>() + state_offset;
+        float* v = state.state2.template get<float>() + state_offset;
+
+        if (val.DType == ETensorDType::FP32) {
+            if (grad_view.DType == ETensorDType::FP32) {
+                optimizers::adamw_update(
+                    val.template get<float>(),
+                    grad_view.template get<float>(),
+                    m, v, n,
+                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    epsilon, weight_decay, grad_scale,
+                    stream
+                );
+            } else if (grad_view.DType == ETensorDType::BF16) {
+                optimizers::adamw_update(
+                    val.template get<float>(),
+                    grad_view.template get<nv_bfloat16>(),
+                    m, v, n,
+                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    epsilon, weight_decay, grad_scale,
+                    stream
+                );
+            } else {
+                throw std::runtime_error("DslModel::update_adamw: unsupported grad dtype for " + name);
+            }
+        } else if (val.DType == ETensorDType::BF16) {
+            if (grad_view.DType == ETensorDType::BF16) {
+                optimizers::adamw_update(
+                    val.template get<nv_bfloat16>(),
+                    grad_view.template get<nv_bfloat16>(),
+                    m, v, n,
+                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    epsilon, weight_decay, grad_scale,
+                    stream
+                );
+            } else if (grad_view.DType == ETensorDType::FP32) {
+                optimizers::adamw_update(
+                    val.template get<nv_bfloat16>(),
+                    grad_view.template get<float>(),
+                    m, v, n,
+                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    epsilon, weight_decay, grad_scale,
+                    stream
+                );
+            } else {
+                throw std::runtime_error("DslModel::update_adamw: unsupported grad dtype for " + name);
+            }
+        } else {
+            throw std::runtime_error("DslModel::update_adamw: unsupported param dtype for " + name);
+        }
+
+        state_offset += n;
+        if (state_offset > state.total_state_elems) {
+            throw std::runtime_error("DslModel::update_adamw: state buffer overflow");
+        }
+    }
+
+    if (mWeightManager) {
+        mWeightManager->invalidate();
+        mWeightManager->sync_work_from_master(stream);
+    }
+
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
+        if (!std::isfinite(*rs.GradScaleHost)) {
+            throw std::runtime_error("DslModel::update_adamw: grad_scale is NaN/Inf");
         }
     }
     record_event_if_not_capturing(rs.OptimizerDone, stream);
@@ -255,7 +407,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
             throw std::runtime_error("DslModel::update_adamw_8bit_graph: sharded grad size mismatch for " + name);
         }
 
-        const float wd_scale = (is_norm_param_name(name) || is_bias_param_name(name)) ? 0.f : 1.f;
+        const float wd_scale = 1.f;
 
         state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         const size_t n = val.nelem();
@@ -321,6 +473,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
 
     if (mWeightManager) {
         mWeightManager->invalidate();
+        mWeightManager->sync_work_from_master(stream);
     }
 
     // Deferred NaN check: norm kernel completed long ago, event sync is ~free
@@ -336,6 +489,8 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
 void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
     if (lora_enabled()) {
         switch (config.type) {
+            case optimizers::OptimizerType::ADAMW:
+                throw std::logic_error("DslModel::update_with_config: LoRA AdamW not yet supported");
             case optimizers::OptimizerType::ADAMW_8BIT:
                 update_lora_adamw_8bit(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
                                        step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
@@ -348,6 +503,10 @@ void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::Opti
         }
     }
     switch (config.type) {
+        case optimizers::OptimizerType::ADAMW:
+            update_adamw(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
+                         step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+            break;
         case optimizers::OptimizerType::ADAMW_8BIT:
             update(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
                    step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
@@ -513,6 +672,59 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
     mAdamWVarianceContainer.update_pointers(&state.state2, &state.absmax2);
 }
 
+void DslModel::init_adamw_state(cudaStream_t stream) {
+    if (!mAdamWState) {
+        throw std::runtime_error("DslModel::init_adamw_state: optimizer state not allocated");
+    }
+    auto& state = *mAdamWState;
+    if (state.initialized) {
+        return;
+    }
+
+    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
+    size_t total_params = 0;
+    size_t state_elems = 0;
+    const bool use_weight_manager = (mWeightManager != nullptr);
+    auto add_tensor = [&](size_t n) {
+        total_params += n;
+        state_elems = (state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        state_elems += n;
+    };
+
+    for (const auto& name : mGrads->param_names()) {
+        Tensor& param = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
+        add_tensor(param.nelem());
+    }
+
+    state.total_params = total_params;
+    state.total_state_elems = state_elems;
+
+    state.offload_state = mOptions.OffloadOptimizer;
+    state.use_zero_copy = mOptions.UseZeroCopy;
+    EAllocationType alloc_kind = EAllocationType::ON_DEVICE;
+    if (state.offload_state) {
+        if (state.use_zero_copy) {
+            alloc_kind = mOptions.offload_alloc();
+        } else {
+            alloc_kind = EAllocationType::ON_DEVICE;
+        }
+    }
+
+    state.state1 = mAllocator->allocate(ETensorDType::FP32, "adamw_state1", alloc_kind,
+                                        {static_cast<long>(state.total_state_elems)});
+    state.state2 = mAllocator->allocate(ETensorDType::FP32, "adamw_state2", alloc_kind,
+                                        {static_cast<long>(state.total_state_elems)});
+
+    const std::size_t bytes1 = state.state1.bytes();
+    const std::size_t bytes2 = state.state2.bytes();
+    CUDA_CHECK(cudaMemsetAsync(state.state1.Data, 0, bytes1, stream));
+    CUDA_CHECK(cudaMemsetAsync(state.state2.Data, 0, bytes2, stream));
+
+    state.initialized = true;
+    mAdamWMomentumContainer.update_pointers(&state.state1, nullptr);
+    mAdamWVarianceContainer.update_pointers(&state.state2, nullptr);
+}
+
 void DslModel::calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced) {
     auto& rs = *mRunState;
 
@@ -543,9 +755,9 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, 
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
     const bool capturing = stream_is_capturing(stream);
+    const int* token_count = mUseTokenScale ? rs.ValidTokenCount.template get<int>() : nullptr;
     global_norm_sqrt(rs.scratch().norm_buffer.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
-                     rs.ValidTokenCount.template get<int>(), total_tokens,
-                     rs.DeviceProp, stream);
+                     token_count, total_tokens, rs.DeviceProp, stream);
     // Async copy grad_scale to pinned host memory for deferred NaN check (avoids cudaStreamSynchronize)
     if (!capturing) {
         CUDA_CHECK(cudaMemcpyAsync(rs.GradScaleHost,
@@ -815,9 +1027,6 @@ void DslModel::update_normuon(NCCLCommunicator& comm, const optimizers::Optimize
         Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
 
         float wd = weight_decay;
-        if (is_norm_param_name(name) || is_bias_param_name(name)) {
-            wd = 0.f;
-        }
 
         if (use_normuon) {
             // NorMuon update for 2D weight matrices
@@ -916,6 +1125,7 @@ void DslModel::update_normuon(NCCLCommunicator& comm, const optimizers::Optimize
 
     if (mWeightManager) {
         mWeightManager->invalidate();
+        mWeightManager->sync_work_from_master(stream);
     }
 
     // Deferred NaN check: norm kernel completed long ago, event sync is ~free
@@ -998,7 +1208,7 @@ void DslModel::update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
         Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
 
         // Weight decay scale: 0 for norms/biases, 1 otherwise
-        float wd_scale = (is_norm_param_name(name) || is_bias_param_name(name)) ? 0.f : 1.f;
+        float wd_scale = 1.f;
 
         if (use_normuon) {
             // NorMuon update for 2D weight matrices (graph-compatible)
@@ -1099,6 +1309,7 @@ void DslModel::update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
 
     if (mWeightManager) {
         mWeightManager->invalidate();
+        mWeightManager->sync_work_from_master(stream);
     }
 
     // Deferred NaN check: norm kernel completed long ago, event sync is ~free

@@ -18,7 +18,6 @@ from surogate.core.datasets.preprocessor.auto import AutoPreprocessor
 from surogate.core.datasets.preprocessor.conversation import ConversationPreprocessor
 from surogate.core.datasets.preprocessor.instruction import InstructionPreprocessor
 from surogate.core.datasets.preprocessor.text import TextPreprocessor
-from surogate.core.datasets.progress import create_hfhub_tqdm
 from surogate.core.datasets.utils import DATASET_TYPE, sample_dataset
 from surogate.utils.logger import get_logger
 from surogate.utils.np_utils import get_seed
@@ -146,8 +145,7 @@ def _check_if_hub_dataset(path: str) -> bool:
         snapshot_download(
             repo_id=path,
             repo_type="dataset",
-            ignore_patterns=["*"],
-            tqdm_class=create_hfhub_tqdm('Downloading dataset - ')
+            ignore_patterns=["*"]
         )
         return True
     except (

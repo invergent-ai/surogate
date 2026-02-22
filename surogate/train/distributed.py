@@ -1461,8 +1461,10 @@ class RayDistributedTrainer:
         from surogate.utils.logger import get_logger
         logger = get_logger()
         tokenizer_files = [
+            "config.json",
             "tokenizer.json", "tokenizer_config.json",
-            "special_tokens_map.json", "vocab.json", "merges.txt"
+            "special_tokens_map.json", "vocab.json", "merges.txt",
+            "added_tokens.json", "chat_template.jinja", "generation_config.json"
         ]
         src_path = Path(src_dir)
         dst_path = Path(dst_dir)

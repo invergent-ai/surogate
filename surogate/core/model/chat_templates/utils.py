@@ -141,10 +141,19 @@ def get_packed_seq_params(position_ids: torch.Tensor):
     position_ids_f = position_ids.flatten()
     indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
 
-    cu_seqlens = torch.cat([
-        indices_q[position_ids_f == 0],
-        torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
-    ])
+    if position_ids_f.numel() == 0:
+        cu_seqlens = torch.tensor([0], device=position_ids_f.device, dtype=torch.int32)
+    else:
+        diffs = position_ids_f[1:] - position_ids_f[:-1]
+        boundaries = torch.where(diffs != 1)[0] + 1
+        starts = torch.cat([
+            torch.tensor([0], device=position_ids_f.device, dtype=boundaries.dtype),
+            boundaries,
+        ])
+        cu_seqlens = torch.cat([
+            starts,
+            torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
+        ])
 
     max_length = cu_seqlens.diff().max()  # position_ids_f.max() + 1
     return {

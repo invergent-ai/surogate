@@ -95,6 +95,10 @@ struct RuntimeOptions {
     // Eliminates precomputed freq_cis tensor, reduces memory bandwidth.
     bool UseFusedRope = false;
 
+    // Document-level attention masking for packed sequences.
+    // When enabled, doc boundaries are inferred from position_id resets.
+    bool DocMasking = true;
+
     // DSL IR execution (deprecated flag; DSL backend is always used).
     bool UseDslIr = true;
     std::string DslIrJson;

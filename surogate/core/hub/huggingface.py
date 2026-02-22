@@ -4,7 +4,6 @@ from typing import Optional, Union, List, Literal
 
 from transformers.utils import strtobool
 
-from surogate.core.datasets.progress import create_hfhub_tqdm
 from surogate.core.hub.base_hub import HubOperation
 from surogate.utils.logger import get_logger
 
@@ -80,5 +79,4 @@ class HuggingFaceHub(HubOperation):
             _snapshot_download.HF_HUB_ENABLE_HF_TRANSFER = True
         from huggingface_hub import snapshot_download
         return snapshot_download(
-            model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_patterns,
-            tqdm_class=create_hfhub_tqdm('Downloading model: '), **kwargs)
+            model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_patterns, **kwargs)

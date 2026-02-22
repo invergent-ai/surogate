@@ -90,6 +90,7 @@ public:
     int batch_size() const { return B; }
     int seq_length() const { return T; }
     int grad_accumulation() const { return mGradAccumulation; }
+    void set_grad_accumulation(int n) { mGradAccumulation = n; mTrainMicroStep = 0; }
     const PretrainedConfig& config() const { return *mConfig; }
     const RuntimeOptions& options() const { return mOptions; }
     bool is_qlora() const { return mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized(); }
@@ -105,16 +106,20 @@ public:
 
     // Compute per-token log-probabilities for a batch [B, T].
     // use_lora=true applies LoRA (policy model); use_lora=false skips LoRA (reference model).
+    // position_ids: optional [B, T] position IDs for packed sequences (nullptr = sequential).
     // Returns B*T float log-probs; masked positions (target==-100) receive 0.
     std::vector<float> compute_logprobs(const std::int32_t* input_ids, const std::int32_t* targets,
-                                        int B, int T, bool use_lora);
+                                        int B, int T, bool use_lora,
+                                        const std::int32_t* position_ids = nullptr,
+                                        const float* temperatures = nullptr);
 
     // GRPO: run one training micro-step with externally-computed per-token gradient multipliers.
     // per_token_grads[b*T + t] = dL_GRPO/d(log_prob_policy)[b, t].
     // Replaces the standard d_loss=1.0 seeding; call update_with_config() after grad_accum steps.
     void step_with_custom_loss(const std::int32_t* inputs, const std::int32_t* targets,
                                 const float* per_token_grads,
-                                const std::int32_t* position_ids = nullptr);
+                                const std::int32_t* position_ids = nullptr,
+                                const float* temperatures = nullptr);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism

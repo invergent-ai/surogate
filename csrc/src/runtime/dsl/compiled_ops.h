@@ -108,6 +108,13 @@ public:
         mLogprobsGpu = logprobs_gpu;
     }
 
+    /// Set per-token inverse temperatures (1 / T) for logprob/CE computation.
+    /// When non-null, logits are scaled by inv_temperature before logsoftmax,
+    /// and gradients are chained through the scaling in backward.
+    void set_inv_temperature_context(const float* inv_temperature_gpu) {
+        mInvTemperatureGpu = inv_temperature_gpu;
+    }
+
     /// Set the GPU buffer containing per-token custom d_loss values for GRPO backward.
     /// When non-null, dispatch_fused_lm_head_loss_backward copies these values into
     /// d_loss instead of seeding with 1.0 (standard cross-entropy training).
@@ -115,6 +122,22 @@ public:
     /// Lifetime must extend through the execute_backward call.
     void set_custom_dloss_context(float* custom_dloss_gpu) {
         mCustomDLossGpu = custom_dloss_gpu;
+    }
+
+    /// Set document masking context for Flash Attention varlen dispatch.
+    /// When set, dispatch_flash_attention routes to flash varlen instead of cuDNN.
+    void set_doc_masking_context(const std::int32_t* cu_seqlens_gpu,
+                                 int num_docs, int max_seqlen, int total_q) {
+        mCuSeqlensGpu = cu_seqlens_gpu;
+        mNumDocs = num_docs;
+        mMaxDocSeqlen = max_seqlen;
+        mTotalDocTokens = total_q;
+    }
+    void clear_doc_masking_context() {
+        mCuSeqlensGpu = nullptr;
+        mNumDocs = 0;
+        mMaxDocSeqlen = 0;
+        mTotalDocTokens = 0;
     }
 
     void set_recompute_fn(std::function<void(int, long, long, bool)> fn);
@@ -288,6 +311,13 @@ private:
 
     // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)
     float*   mCustomDLossGpu       = nullptr;
+    const float* mInvTemperatureGpu = nullptr;
+
+    // Document masking context for Flash Attention varlen (null = disabled)
+    const std::int32_t* mCuSeqlensGpu = nullptr;
+    int mNumDocs = 0;
+    int mMaxDocSeqlen = 0;
+    int mTotalDocTokens = 0;
 
     // Optional components
     const modules::ModularLoRAConfig* mLoRAConfig = nullptr;

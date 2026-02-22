@@ -1322,15 +1322,17 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
 
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
                                                         const std::int32_t* targets,
-                                                        int B, int T, bool use_lora) {
+                                                        int B, int T, bool use_lora,
+                                                        const std::int32_t* position_ids,
+                                                        const float* temperatures) {
     std::vector<float> result;
-    run_work([&result, input_ids, targets, B, T, use_lora](sThreadContext& ctx) {
+    run_work([&result, input_ids, targets, B, T, use_lora, position_ids, temperatures](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("compute_logprobs: model is not a DslModel");
         }
         auto logprobs = dsl_model->compute_logprobs(input_ids, targets, B, T, use_lora,
-                                                    *ctx.Communicator);
+                                                    *ctx.Communicator, position_ids, temperatures);
         if (ctx.Communicator->local_rank() == 0) {
             result = std::move(logprobs);
         }
@@ -1342,7 +1344,8 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         const std::int32_t* inputs,
         const std::int32_t* targets,
         const float* per_token_grads,
-        const std::int32_t* position_ids) {
+        const std::int32_t* position_ids,
+        const float* temperatures) {
     // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -1372,7 +1375,7 @@ void MultiGPUPyTrainer::step_with_custom_loss(
     }
 
     run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
-              per_token_grads, B = this->B, T = this->T](sThreadContext& ctx) {
+              per_token_grads, temperatures, B = this->B, T = this->T](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("step_with_custom_loss: model is not a DslModel");
@@ -1386,10 +1389,14 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         const int gpu_rank = ctx.Communicator->local_rank();
         const float* grads_for_this_gpu = per_token_grads +
                                           static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+        const float* temps_for_this_gpu = nullptr;
+        if (temperatures) {
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+        }
 
         dsl_model->step_with_custom_loss(inputs_tensor, position_ids_tensor, targets_tensor,
                                           grads_for_this_gpu, micro_batches, micro_idx,
-                                          *ctx.Communicator);
+                                          *ctx.Communicator, temps_for_this_gpu);
     });
 
     ++mTrainMicroStep;

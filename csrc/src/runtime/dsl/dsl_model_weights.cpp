@@ -89,6 +89,12 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         mLoRAWeights->random_init(42, comm);
     }
 
+    if (mWeightManager) {
+        cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+        mWeightManager->sync_work_from_master(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     comm.barrier();
 }
 
@@ -644,6 +650,12 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
 
     if (lora_enabled()) {
         mLoRAWeights->random_init(42, comm);
+    }
+
+    if (mWeightManager) {
+        cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+        mWeightManager->sync_work_from_master(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     comm.barrier();

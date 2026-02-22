@@ -1328,6 +1328,17 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
     const int tid = ref.tensor_id;
+    const bool debug_dtype = []() {
+        const char* env = std::getenv("SUROGATE_DEBUG_DTYPE_RUNTIME");
+        return env && std::string(env) == "1";
+    }();
+    const bool debug_name = debug_dtype && (ref.name.find("d_xF") != std::string::npos);
+    auto log_tensor = [&](const Tensor& t, const char* tag) {
+        if (debug_name) {
+            fprintf(stderr, "[DEBUG_DTYPE_RUNTIME] resolve_tensor %s %s dtype=%s\n",
+                    ref.name.c_str(), tag, dtype_to_str(t.DType));
+        }
+    };
 
     // Only check gradient resolution for tensors flagged as gradients at compile time.
     // This avoids calling base_param_from_grad() (string substr + find) for the ~80%
@@ -1400,6 +1411,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // This is critical because view_backward stores aliases, and subsequent ops
     // (like rmsnorm_backward) must use that aliased tensor, not the pre-allocated simplified_grads buffer.
     if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+        log_tensor(mTensors[static_cast<std::size_t>(tid)], "cached");
         return mTensors[static_cast<std::size_t>(tid)];
     }
 
@@ -1515,6 +1527,15 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     const int tid = ref.tensor_id;
+    const bool debug_dtype = []() {
+        const char* env = std::getenv("SUROGATE_DEBUG_DTYPE_RUNTIME");
+        return env && std::string(env) == "1";
+    }();
+    const bool debug_name = debug_dtype && (ref.name.find("d_xF") != std::string::npos);
+    if (debug_name) {
+        fprintf(stderr, "[DEBUG_DTYPE_RUNTIME] ensure_output_tensor enter %s slot=%d ref=%s\n",
+                ref.name.c_str(), static_cast<int>(ref.slot), dtype_to_str(ref.dtype));
+    }
 
     // Fast path: pre-allocated block slots with existing data bypass string parsing.
     // This covers most activation and gradient outputs during forward/backward.
@@ -1621,6 +1642,11 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 
     // For mapped/temporary tensors, check flat vector first
     if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+        if (debug_name) {
+            const auto& t = mTensors[static_cast<std::size_t>(tid)];
+            fprintf(stderr, "[DEBUG_DTYPE_RUNTIME] reuse tid=%d dtype=%s\n",
+                    tid, dtype_to_str(t.DType));
+        }
         return mTensors[static_cast<std::size_t>(tid)];
     }
 
@@ -1634,6 +1660,10 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     mTemps.push_back(t);
     if (tid >= 0) {
         mTensors[static_cast<std::size_t>(tid)] = t;
+        if (debug_name) {
+            fprintf(stderr, "[DEBUG_DTYPE_RUNTIME] alloc tid=%d dtype=%s\n",
+                    tid, dtype_to_str(t.DType));
+        }
         return mTensors[static_cast<std::size_t>(tid)];
     }
     throw std::runtime_error("CompiledExecutor: ensure_output_tensor requires valid tensor_id for: " + ref.name);

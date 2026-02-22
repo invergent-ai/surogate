@@ -35,6 +35,26 @@
             "env": {"PYTHONPATH": "${workspaceFolder}"}
         },
         {
+            "name": "Surogate CLI - GRPO Inference",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surogate.cli.main",
+            "args": ["grpo-infer", "${workspaceFolder}/examples/grpo/infer.yaml"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"}
+        },
+        {
+            "name": "Surogate CLI - GRPO Orchestrator",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surogate.cli.main",
+            "args": ["grpo-orch", "${workspaceFolder}/examples/grpo/orch.yaml"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"}
+        },
+        {
             "name": "train",
             "type": "cppdbg",
             "request": "launch",

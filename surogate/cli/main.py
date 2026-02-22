@@ -15,10 +15,10 @@ logger = get_logger()
 COMMAND_MAPPING: Dict[str, str] = {
     'sft': 'surogate.cli.sft',
     'pt': 'surogate.cli.pt',
+    'grpo-train': 'surogate.cli.grpo_train',
+    'grpo-infer': 'surogate.cli.grpo_infer',
+    'grpo-orch': 'surogate.cli.grpo_orch',
     'tokenize': 'surogate.cli.tokenize_cmd',
-    'serve': 'surogate.cli.serve',
-    'eval': 'surogate.cli.eval',
-    'ptq': 'surogate.cli.ptq',
 }
 
 def _get_version() -> str:
@@ -48,6 +48,18 @@ def parse_args():
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
     pt_prepare_command_parser(subparsers.add_parser('pt', help="Pretraining"))
 
+    # grpo-infer command
+    from surogate.cli.grpo_infer import prepare_command_parser as grpo_infer_prepare_command_parser
+    grpo_infer_prepare_command_parser(subparsers.add_parser('grpo-infer', help="GRPO RL Inference"))
+    
+    # grpo-train command
+    from surogate.cli.grpo_train import prepare_command_parser as grpo_train_prepare_command_parser
+    grpo_train_prepare_command_parser(subparsers.add_parser('grpo-train', help="GRPO RL Training"))
+    
+    # grpo-orch command
+    from surogate.cli.grpo_orch import prepare_command_parser as grpo_orch_prepare_command_parser
+    grpo_orch_prepare_command_parser(subparsers.add_parser('grpo-orch', help="GRPO RL Orchestrator"))
+
     # tokenize command
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser
     tokenize_prepare_command_parser(subparsers.add_parser('tokenize', help="Tokenize datasets for training"))
@@ -57,7 +69,7 @@ def parse_args():
         parser.print_help()
         sys.exit(1)
     
-    commands_with_config = ['serve', 'pretrain', 'sft', 'pt', 'tokenize']
+    commands_with_config = ['sft', 'pt', 'grpo_train', 'grpo_infer', 'grpo_orch', 'tokenize']
     if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
         sys.exit(1)

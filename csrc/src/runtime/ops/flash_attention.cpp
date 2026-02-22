@@ -56,7 +56,15 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         window_size = mConfig.sliding_window_size;
     }
 
-    if (window_size > 0) {
+    if (mCuSeqlensGpu) {
+        // Document-level masking: Flash Attention varlen path.
+        // Write LSE directly into the pre-allocated output tensor (persists to backward).
+        // For B=1 (GRPO packed sequences), (B, Hq, T) and (Hq, total_q) have identical layout.
+        attention_forward_flash_varlen(
+            out.get<nv_bfloat16>(), lse.get<float>(), qkv.get<nv_bfloat16>(),
+            mCuSeqlensGpu, mNumDocs, mMaxDocSeqlen, mTotalDocTokens,
+            Hq, Hkv, Hs, mRunState.MainStream);
+    } else if (window_size > 0) {
         attention_forward_custom(out, lse, qkv,
                                  static_cast<int>(mB), static_cast<int>(mT),
                                  Hq, Hkv, Hs, window_size, mRunState.MainStream);
@@ -101,43 +109,6 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             throw std::logic_error("flash_attention: unsupported output dtype");
         }
     }
-
-    const char* debug_env = std::getenv("SUROGATE_DEBUG_MOE_LOGITS");
-    const bool debug_logits = (debug_env && *debug_env && std::string(debug_env) != "0");
-    if (debug_logits) {
-        Tensor non_finite = mRunState.Stack.allocate(ETensorDType::INT32, {1}, "att_nonfinite");
-        fill_zero(non_finite, mRunState.MainStream);
-        count_non_finite(non_finite, out, mRunState.MainStream);
-        int out_non_finite = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&out_non_finite, non_finite.Data, sizeof(int),
-                                   cudaMemcpyDeviceToHost, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        if (out_non_finite > 0) {
-            int qkv_non_finite = 0;
-            fill_zero(non_finite, mRunState.MainStream);
-            count_non_finite(non_finite, qkv, mRunState.MainStream);
-            CUDA_CHECK(cudaMemcpyAsync(&qkv_non_finite, non_finite.Data, sizeof(int),
-                                       cudaMemcpyDeviceToHost, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            fprintf(stderr,
-                    "[MoE] Non-finite attention output at layer %d: att=%d, qkv=%d\n",
-                    layer_idx, out_non_finite, qkv_non_finite);
-            if (mDebugDumpFn) {
-                std::vector<std::string> names;
-                if (!op.inputs.empty() && !op.inputs[0].name.empty()) {
-                    names.push_back(op.inputs[0].name);
-                }
-                if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
-                    names.push_back(op.outputs[0].name);
-                }
-                if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-                    names.push_back(op.outputs[1].name);
-                }
-                mDebugDumpFn(names, layer_idx);
-            }
-        }
-    }
-
 }
 
 void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
@@ -169,7 +140,45 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         window_size = mConfig.sliding_window_size;
     }
 
-    if (window_size > 0) {
+    if (mCuSeqlensGpu) {
+        // Document-level masking: Flash Attention varlen backward
+        const int Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
+        const long padded_total = static_cast<long>(mTotalDocTokens) + 128L * static_cast<long>(mNumDocs);
+        const long dq_accum_elems = padded_total * static_cast<long>(Hq) * static_cast<long>(Hs_rounded);
+        const long dsoftmax_elems = static_cast<long>(Hq) * padded_total;
+        Tensor dq_accum = mRunState.temp_alloc(ETensorDType::FP32, {dq_accum_elems});
+        Tensor dsoftmax = mRunState.temp_alloc(ETensorDType::FP32, {dsoftmax_elems});
+        mTemps.push_back(dq_accum);
+        mTemps.push_back(dsoftmax);
+
+        // GQA expanded dk/dv buffers: flash backward writes dK/dV with Hq head
+        // indices, but interleaved buffer only has Hkv slots. Allocate separate
+        // (total_q, Hq, HS) buffers when Hq != Hkv.
+        nv_bfloat16* dk_exp_ptr = nullptr;
+        nv_bfloat16* dv_exp_ptr = nullptr;
+        Tensor dk_expanded, dv_expanded;
+        if (Hq != Hkv) {
+            const long exp_elems = static_cast<long>(mTotalDocTokens) * static_cast<long>(Hq) * static_cast<long>(Hs);
+            dk_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems});
+            dv_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems});
+            mTemps.push_back(dk_expanded);
+            mTemps.push_back(dv_expanded);
+            dk_exp_ptr = dk_expanded.get<nv_bfloat16>();
+            dv_exp_ptr = dv_expanded.get<nv_bfloat16>();
+        }
+
+        // Zero dqkv — convert_dQ writes all Q elements, but K/V sections need
+        // zeroing for MHA path (or are overwritten by reduce_scatter for GQA).
+        fill_zero(d_qkv, mRunState.MainStream);
+
+        attention_backward_flash_varlen(
+            d_qkv.get<nv_bfloat16>(), lse.get<float>(),
+            out.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(),
+            mCuSeqlensGpu, dq_accum.get<float>(), dsoftmax.get<float>(),
+            dk_exp_ptr, dv_exp_ptr,
+            mNumDocs, mMaxDocSeqlen, mTotalDocTokens,
+            Hq, Hkv, Hs, /*deterministic=*/false, mRunState.MainStream);
+    } else if (window_size > 0) {
         if (out.DType == ETensorDType::FP32) {
             attention_backward_custom(d_qkv, lse, out, d_out, qkv,
                                       static_cast<int>(mB), static_cast<int>(mT),

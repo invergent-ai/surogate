@@ -34,8 +34,12 @@ DslGradStore::DslGradStore(const DslParamStore& params,
                            bool offload_grads,
                            EAllocationType offload_alloc,
                            int num_shards,
-                           bool tied_embeddings)
-    : mAllocator(allocator), mOffloadGrads(offload_grads), mOffloadAlloc(offload_alloc) {
+                           bool tied_embeddings,
+                           std::optional<ETensorDType> grad_dtype_override)
+    : mAllocator(allocator),
+      mOffloadGrads(offload_grads),
+      mOffloadAlloc(offload_alloc),
+      mGradDtypeOverride(grad_dtype_override) {
     if (!mAllocator) {
         throw std::runtime_error("DslGradStore: allocator is null");
     }
@@ -74,7 +78,8 @@ DslGradStore::DslGradStore(const DslParamStore& params,
 
         const Tensor& weight = params.template_tensor(name);
         std::vector<long> shape(weight.Sizes.begin(), weight.Sizes.begin() + weight.Rank);
-        Tensor grad = mAllocator->allocate(weight.DType, ("d_" + name).c_str(), grad_alloc, shape);
+        const ETensorDType grad_dtype = mGradDtypeOverride.value_or(weight.DType);
+        Tensor grad = mAllocator->allocate(grad_dtype, ("d_" + name).c_str(), grad_alloc, shape);
         mGrads.emplace(name, grad);
         mParamOrder.push_back(name);
     }

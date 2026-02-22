@@ -1,0 +1,19 @@
+# GRPO Orchestrator Example: Reverse Text
+# Based on prime-rl/examples/reverse_text/rl/orch.toml
+#
+# Uses an SFT'd model that already knows how to reverse text.
+# GRPO then refines it with RL reward signal.
+
+model:
+  name: "./reverse-fft"
+
+env:
+  - id: reverse-text
+
+batch_size: 128
+rollouts_per_example: 16
+seq_len: 2048
+max_steps: 20
+
+sampling:
+  max_tokens: 128

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -44,7 +45,8 @@ public:
                  bool offload_grads = false,
                  EAllocationType offload_alloc = EAllocationType::PINNED,
                  int num_shards = 1,
-                 bool tied_embeddings = false);
+                 bool tied_embeddings = false,
+                 std::optional<ETensorDType> grad_dtype_override = std::nullopt);
 
     /// Configure multi-GPU gradient reduction
     void configure(const DslGradStoreConfig& config);
@@ -109,6 +111,7 @@ private:
     std::unordered_map<std::string, Tensor> mGrads;          ///< Full gradients (always on device for NCCL)
     std::unordered_map<std::string, Tensor> mShardedGrads;   ///< ZeRO-2: sharded gradient storage (may be on host)
     std::vector<std::string> mParamOrder;
+    std::optional<ETensorDType> mGradDtypeOverride;
     bool mAccumulate = false;
     bool mReducePending = false;  ///< True if async reduce has been started
     int mMicroStep = 0;

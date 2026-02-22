@@ -25,8 +25,66 @@
 #include "utilities/dtype.h"
 
 #include <iostream>
+#include <optional>
+#include <vector>
 
 namespace dsl {
+
+// ============================================================================
+// Document masking: detect document boundaries from position_ids resets
+// ============================================================================
+
+struct DocMaskingInfo {
+    std::vector<std::int32_t> cu_seqlens;  // (num_docs + 1,) cumulative offsets
+    int num_docs;
+    int max_seqlen;
+    int total_q;
+};
+
+/// Scan position_ids for non-consecutive transitions to detect document
+/// boundaries in packed sequences. Returns nullopt if no boundaries found (i.e.
+/// single contiguous sequence per batch element — standard SFT/PT).
+static std::optional<DocMaskingInfo> compute_doc_masking(
+        const std::int32_t* position_ids, int B, int T) {
+    if (!position_ids) return std::nullopt;
+
+    std::vector<std::int32_t> cu_seqlens;
+    cu_seqlens.push_back(0);
+    int max_seqlen = 0;
+    bool has_boundaries = false;
+
+    for (int b = 0; b < B; ++b) {
+        int doc_start = b * T;
+        for (int t = 1; t < T; ++t) {
+            int idx = b * T + t;
+            const int prev = position_ids[idx - 1];
+            const int curr = position_ids[idx];
+            if (curr - prev != 1) {
+                // Document boundary: position_ids are not strictly consecutive.
+                // Mirrors HF packed-sequence detection (diff != 1).
+                int doc_len = (b * T + t) - doc_start;
+                if (doc_len > 0) {
+                    cu_seqlens.push_back(cu_seqlens.back() + doc_len);
+                    max_seqlen = std::max(max_seqlen, doc_len);
+                }
+                doc_start = b * T + t;
+                has_boundaries = true;
+            }
+        }
+        // Last document in this batch element
+        int last_len = (b + 1) * T - doc_start;
+        if (last_len > 0) {
+            cu_seqlens.push_back(cu_seqlens.back() + last_len);
+            max_seqlen = std::max(max_seqlen, last_len);
+        }
+    }
+
+    if (!has_boundaries) return std::nullopt;
+
+    int num_docs = static_cast<int>(cu_seqlens.size()) - 1;
+    int total_q = cu_seqlens.back();
+    return DocMaskingInfo{std::move(cu_seqlens), num_docs, max_seqlen, total_q};
+}
 
 void DslModel::build_lora_name_tables() {
     const int num_layers = static_cast<int>(mModelConfig.NumLayers);
@@ -265,6 +323,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
     if (!mExecutor) {
         throw std::logic_error("DslModel::backward called before allocate_run_state()");
     }
+    mUseTokenScale = true;
 
     if (!lora_enabled()) {
         mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
@@ -750,7 +809,9 @@ bool DslModel::internal_graphs_enabled() const {
 std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                                                const std::int32_t* targets,
                                                int B, int T, bool use_lora,
-                                               NCCLCommunicator& comm) {
+                                               NCCLCommunicator& comm,
+                                               const std::int32_t* position_ids,
+                                               const float* temperatures) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::compute_logprobs called before allocate_run_state()");
     }
@@ -853,22 +914,74 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
         hook_ptr = &hook;
     }
 
+    // Detect document boundaries and enable flash varlen masking if needed.
+    std::optional<DocMaskingInfo> doc_info;
+    if (mOptions.DocMasking) {
+        doc_info = compute_doc_masking(position_ids, B, T);
+    }
+    if (doc_info) {
+        graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
+                                     doc_info->num_docs,
+                                     doc_info->max_seqlen,
+                                     doc_info->total_q);
+    }
+
     graph_exec->execute_logprobs_forward((long)B, (long)T, input_ids, targets,
-                                          result.data(), hook_ptr, comm);
+                                          result.data(), hook_ptr, comm, position_ids, temperatures);
+
+    if (doc_info) {
+        graph_exec->clear_doc_masking();
+    }
+
     return result;
 }
 
 void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor targets,
                                       const float* per_token_grads_cpu,
                                       int grad_accum_steps, int micro_step,
-                                      NCCLCommunicator& comm) {
+                                      NCCLCommunicator& comm,
+                                      const float* temperatures) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::step_with_custom_loss called before allocate_run_state()");
     }
+    mUseTokenScale = false;
 
     auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
     if (!graph_exec) {
         throw std::runtime_error("DslModel::step_with_custom_loss: executor is not a GraphExecutor");
+    }
+
+    // Detect document boundaries and enable flash varlen masking if needed.
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::int32_t* position_ids_ptr =
+        (position_ids.Data && position_ids.Device == -1)
+            ? reinterpret_cast<const std::int32_t*>(position_ids.Data)
+            : nullptr;
+    std::optional<DocMaskingInfo> doc_info;
+    if (mOptions.DocMasking) {
+        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val);
+    }
+    if (doc_info) {
+        graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
+                                     doc_info->num_docs,
+                                     doc_info->max_seqlen,
+                                     doc_info->total_q);
+    }
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+    float* inv_temperature_gpu = nullptr;
+    if (temperatures) {
+        const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+        std::vector<float> inv_temp(bt);
+        for (std::size_t i = 0; i < bt; ++i) {
+            inv_temp[i] = 1.0f / temperatures[i];
+        }
+        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, bt * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu, inv_temp.data(),
+                                   bt * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+        graph_exec->set_inv_temperature_context(inv_temperature_gpu);
     }
 
     // Forward pass (with LoRA hooks if enabled) — saves activations for backward.
@@ -877,15 +990,18 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
     if (!lora_enabled()) {
         // No LoRA: plain backward with custom d_loss.
         graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
-                                               comm, grad_accum_steps, micro_step, nullptr);
+                                               comm, grad_accum_steps, micro_step, nullptr,
+                                               nullptr);
+        if (doc_info) graph_exec->clear_doc_masking();
+        if (inv_temperature_gpu) {
+            graph_exec->set_inv_temperature_context(nullptr);
+            CUDA_CHECK(cudaFree(inv_temperature_gpu));
+        }
         return;
     }
 
     // LoRA backward: mirror DslModel::backward() exactly, but use backward_with_custom_dloss.
     ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
-
-    auto& rs = *mRunState;
-    cudaStream_t main_stream = rs.MainStream;
 
     if (mLoRALn1Names.empty()) {
         build_lora_name_tables();
@@ -1077,7 +1193,14 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
     };
 
     graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
-                                            comm, grad_accum_steps, micro_step, &hook);
+                                            comm, grad_accum_steps, micro_step, &hook,
+                                            nullptr);
+
+    if (doc_info) graph_exec->clear_doc_masking();
+    if (inv_temperature_gpu) {
+        graph_exec->set_inv_temperature_context(nullptr);
+        CUDA_CHECK(cudaFree(inv_temperature_gpu));
+    }
 
     mLoRAGrads->end_micro_step(main_stream, comm);
     // Extend the base-model BackwardDone event to include LoRA gradient reductions.

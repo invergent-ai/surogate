@@ -13,9 +13,11 @@ class OptimizerType(enum.Enum):
     Optimizer algorithm types.
 
     Values:
+    - ADAMW: Full-precision AdamW.
     - ADAMW_8BIT: 8-bit AdamW with blockwise quantization.
     - NORMUON: NorMuon hybrid optimizer (orthogonalized momentum for 2D weights, AdamW for others).
     """
+    ADAMW: typing.ClassVar[OptimizerType]  # value = OptimizerType.ADAMW
     ADAMW_8BIT: typing.ClassVar[OptimizerType]  # value = OptimizerType.ADAMW_8BIT
     NORMUON: typing.ClassVar[OptimizerType]  # value = OptimizerType.NORMUON
 
@@ -36,7 +38,7 @@ class OptimizerConfig:
         Create an optimizer configuration.
 
         Parameters:
-        - optimizer: Type of optimizer ('adamw_8bit' or 'normuon').
+        - optimizer: Type of optimizer ('adamw', 'adamw_8bit' or 'normuon').
         - learning_rate: Base learning rate.
         - weight_decay: Weight decay coefficient.
         - grad_clip: Gradient clipping threshold (0 = disabled).
@@ -46,6 +48,11 @@ class OptimizerConfig:
     def __repr__(self) -> str:
         """
         Return a debug string representation.
+        """
+    @staticmethod
+    def adamw(lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.999, epsilon: float = 1e-8, weight_decay: float = 0.1, grad_clip: float = 0.0) -> OptimizerConfig:
+        """
+        Create AdamW (full-precision) configuration.
         """
     @staticmethod
     def adamw_8bit(lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.999, epsilon: float = 1e-8, weight_decay: float = 0.1, grad_clip: float = 0.0) -> OptimizerConfig:
@@ -896,7 +903,7 @@ class RuntimeOptions:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, recompute_swiglu: bool = False, recompute_rmsnorm: bool = False, recompute_ffn: bool = False, recompute_qkv: bool = False, recompute_att: bool = False, recompute_block: bool = False, offload_residual: bool = False, use_cuda_graphs: bool = True, trigger_timing_events: bool = False, offload_master: bool = False, offload_quants: bool = False, offload_optimizer: bool = False, offload_grads: bool = False, use_zero_copy: bool = False, use_write_combined: bool = False, shard_weights: bool = False, persistent_quants: bool = False, shard_gradients: bool = False, use_all_to_all_reduce: bool = False, init_projections_to_zero: bool = False, lmhead_chunks: int = 1, attn_bwd_chunks: int = 1, matmul_type: str = '', gradient_type: str = '', master_dtype: str = '', recipe: str = 'bf16', matmul_backend: str = '', use_fused_rope: bool = False, fp8_amax_history: int = 1024, fp4_backend: str = 'cutlass', no_fp4_stochastic_rounding: bool = False, skip_quant_first_layers: int = 0, skip_quant_last_layers: int = 0) -> None:
+    def __init__(self, *, recompute_swiglu: bool = False, recompute_rmsnorm: bool = False, recompute_ffn: bool = False, recompute_qkv: bool = False, recompute_att: bool = False, recompute_block: bool = False, offload_residual: bool = False, use_cuda_graphs: bool = True, trigger_timing_events: bool = False, offload_master: bool = False, offload_quants: bool = False, offload_optimizer: bool = False, offload_grads: bool = False, use_zero_copy: bool = False, use_write_combined: bool = False, shard_weights: bool = False, persistent_quants: bool = False, shard_gradients: bool = False, use_all_to_all_reduce: bool = False, init_projections_to_zero: bool = False, lmhead_chunks: int = 1, attn_bwd_chunks: int = 1, matmul_type: str = '', gradient_type: str = '', master_dtype: str = '', recipe: str = 'bf16', matmul_backend: str = '', use_fused_rope: bool = False, doc_masking: bool = True, fp8_amax_history: int = 1024, fp4_backend: str = 'cutlass', no_fp4_stochastic_rounding: bool = False, skip_quant_first_layers: int = 0, skip_quant_last_layers: int = 0) -> None:
         """
         Create runtime/training options.
         
@@ -911,6 +918,7 @@ class RuntimeOptions:
         - recipe: Training recipe (bf16, fp8-hybrid, nvfp4, nvfp4-quartet).
         - matmul_backend: Matmul backend (auto, cublaslt, cutlass).
         - use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.
+        - doc_masking: Enable document-level attention masking for packed sequences.
         - fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).
         - fp4_backend: FP4 matmul backend (cudnn, cutlass).
         - no_fp4_stochastic_rounding: Disable stochastic rounding for NVFP4 gradients.
@@ -940,6 +948,16 @@ class RuntimeOptions:
     def fp8_enabled(self) -> bool:
         """
         Whether FP8 forward pass is enabled.
+        """
+    @property
+    def doc_masking(self) -> bool:
+        """
+        Enable document-level attention masking for packed sequences.
+        """
+    @doc_masking.setter
+    def doc_masking(self, arg: bool) -> None:
+        """
+        Enable document-level attention masking for packed sequences.
         """
     @property
     def gradient_type(self) -> ETensorDType:
@@ -1250,6 +1268,8 @@ class SurogateTrainer:
         input_ids: npt.NDArray[np.int32],
         targets: npt.NDArray[np.int32],
         use_lora: bool = True,
+        position_ids: typing.Optional[npt.NDArray[np.int32]] = None,
+        temperatures: typing.Optional[npt.NDArray[np.float32]] = None,
     ) -> npt.NDArray[np.float32]:
         """
         Compute per-token log-probabilities for a batch.
@@ -1257,8 +1277,11 @@ class SurogateTrainer:
         Parameters:
         - input_ids: int32 token IDs shaped [B, T].
         - targets:   int32 target IDs shaped [B, T]; -100 for masked positions.
-        - use_lora:  If True (default), apply LoRA adapters (policy model).
-                     If False, skip LoRA (reference model).
+        - use_lora:     If True (default), apply LoRA adapters (policy model).
+                        If False, skip LoRA (reference model).
+        - position_ids:  Optional int32 position IDs shaped [B, T].
+                         If None (default), uses sequential [0..T-1] per row.
+        - temperatures:  Optional float32 per-token temperatures shaped [B, T].
 
         Returns: float32 log-probabilities shaped [B, T].
                  Masked positions (target == -100) receive 0.
@@ -1268,6 +1291,8 @@ class SurogateTrainer:
         input_ids: npt.NDArray[np.int32],
         targets: npt.NDArray[np.int32],
         per_token_grads: npt.NDArray[np.float32],
+        position_ids: typing.Optional[npt.NDArray[np.int32]] = None,
+        temperatures: typing.Optional[npt.NDArray[np.float32]] = None,
     ) -> None:
         """
         Run one training micro-step with externally-computed per-token gradient multipliers.
@@ -1278,6 +1303,10 @@ class SurogateTrainer:
         - per_token_grads: float32 per-token gradient multipliers shaped [B, T].
                            per_token_grads[b, t] = dL_GRPO/d(log_prob_policy)[b, t].
                            Masked positions should be 0.
+
+        - position_ids:  Optional int32 position IDs shaped [B, T].
+                         If None (default), uses sequential [0..T-1] per row.
+        - temperatures:  Optional float32 per-token temperatures shaped [B, T].
 
         Equivalent to step() but uses provided per-token gradients instead of d_loss=1.0.
         Call update_with_config() after grad_accum steps to apply gradients.
@@ -1366,7 +1395,7 @@ class SurogateTrainer:
         Run the optimizer step with full configuration and return metrics.
 
         This call blocks until the optimizer step is complete.
-        Supports both AdamW 8-bit and NorMuon optimizers based on config.type.
+        Supports AdamW (full), AdamW 8-bit and NorMuon optimizers based on config.type.
 
         Parameters:
         - config: OptimizerConfig with all hyperparameters.

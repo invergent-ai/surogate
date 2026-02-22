@@ -144,8 +144,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
               (uses AdamW for embeddings, norms, and lm_head; NorMuon for attention/MLP weights)
         learning_rate (Optional[float], defaults to 1e-4):
             The initial learning rate for the optimizer.
-        lr_scheduler_type (Optional[Literal['linear', 'cosine', 'wsd']]*, defaults to `"linear"`):
-           Learning rate schedule function: Cosine or Linear
+        lr_scheduler_type (Optional[Literal['constant', 'linear', 'cosine', 'wsd']]*, defaults to `"linear"`):
+           Learning rate schedule function: Constant, Cosine, Linear, or WSD
         cooldown_steps (Optional[int], defaults to 0):
             Number of steps used for a linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`.
         wsd_decay_steps_fraction (Optional[float], defaults to 0.1):
@@ -309,7 +309,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     use_cuda_graphs: Optional[bool] = True
     optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
-    lr_scheduler_type: Optional[Literal['linear', 'cosine', 'wsd']] = 'linear'
+    lr_scheduler_type: Optional[Literal['constant', 'linear', 'cosine', 'wsd']] = 'linear'
     cooldown_steps: Optional[int] = 0
     wsd_decay_steps_fraction: Optional[float] = 0.1
     final_lr_fraction: Optional[float] = 0.0

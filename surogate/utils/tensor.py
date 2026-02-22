@@ -36,11 +36,28 @@ def seed_everything(seed: Optional[int] = None, full_determinism: bool = False) 
 
 
 def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
+    """Compute cu_seqlens from packed position_ids.
+
+    A new sequence starts whenever position_ids are not strictly consecutive
+    (i.e., diff != 1). This mirrors HF packed-sequence detection.
+    """
     position_ids = position_ids[0]
-    seq_start_indices = torch.where(position_ids == 0)[0]
-    seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(position_ids)], device=position_ids.device)])
-    seq_lengths = seq_end_indices - seq_start_indices
-    cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=position_ids.device), seq_lengths]), dim=0)
+    if position_ids.numel() == 0:
+        return torch.tensor([0], device=position_ids.device, dtype=torch.int32)
+
+    diffs = position_ids[1:] - position_ids[:-1]
+    boundaries = torch.where(diffs != 1)[0] + 1  # indices where a new seq starts
+    starts = torch.cat(
+        [torch.tensor([0], device=position_ids.device, dtype=boundaries.dtype), boundaries]
+    )
+    ends = torch.cat(
+        [boundaries, torch.tensor([len(position_ids)], device=position_ids.device, dtype=boundaries.dtype)]
+    )
+    seq_lengths = ends - starts
+    cu_seqlens = torch.cumsum(
+        torch.cat([torch.tensor([0], device=position_ids.device, dtype=seq_lengths.dtype), seq_lengths]),
+        dim=0,
+    )
     return cu_seqlens
 
 

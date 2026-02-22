@@ -433,6 +433,11 @@ struct RecomputeContext {
     std::function<const FP4WeightCacheEntry*(const std::string&, Tensor&, cudaStream_t)> get_fp4_cached_weight;
     bool lora_only_mode = false;  // FFT mode when false
     int layer_idx = -1;           // Current layer being processed
+    // Document masking (Flash Attention varlen) — set when doc_masking is active
+    const std::int32_t* cu_seqlens_gpu = nullptr;
+    int doc_masking_num_docs = 0;
+    int doc_masking_max_seqlen = 0;
+    int doc_masking_total_q = 0;
 };
 
 Tensor& ensure_activation(RecomputeContext& ctx, int layer_idx, const std::string& name, cudaStream_t stream) {
@@ -1620,7 +1625,13 @@ void execute_flash_attention(RecomputeContext& ctx,
         }
     }
 
-    if (window_size > 0) {
+    if (ctx.cu_seqlens_gpu) {
+        // Document-level masking: use Flash Attention varlen (must match main forward path).
+        attention_forward_flash_varlen(
+            att_view.get<nv_bfloat16>(), lse_view.get<float>(), qkv_view.get<nv_bfloat16>(),
+            ctx.cu_seqlens_gpu, ctx.doc_masking_num_docs, ctx.doc_masking_max_seqlen,
+            ctx.doc_masking_total_q, Hq, Hkv, Hs, ctx.rs.MainStream);
+    } else if (window_size > 0) {
         attention_forward_custom(att_view, lse_view, qkv_view,
                                  static_cast<int>(B), static_cast<int>(T),
                                  Hq, Hkv, Hs, window_size, ctx.rs.MainStream);
@@ -2523,7 +2534,11 @@ void RecomputePlan::execute_layer(GraphExecutor& executor,
             return executor.get_fp4_cached_weight(name, weight, s);
         },
         lora_only_mode,
-        layer_idx
+        layer_idx,
+        executor.mCuSeqlensGpu,
+        executor.mDocMaskingNumDocs,
+        executor.mDocMaskingMaxSeqlen,
+        executor.mDocMaskingTotalQ
     };
 
     RecomputeScratch scratch;

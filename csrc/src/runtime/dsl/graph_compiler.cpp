@@ -2536,6 +2536,27 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 ref.shape = {Bdim, Tdim, Cdim};
             }
 
+            // If an explicit gradient dtype override is configured, apply it to parameter gradients.
+            if (mOptions.GradientType.has_value() && ref.is_gradient) {
+                const std::string grad_name = strip_ssa_suffix(ref.name);
+                if (auto base = base_param_from_grad(grad_name)) {
+                    if (mWeights.has(*base)) {
+                        ref.dtype = *mOptions.GradientType;
+                        if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
+                            fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n",
+                                    ref.name.c_str(), dtype_to_str(ref.dtype));
+                        }
+                    }
+                }
+            }
+
+            if (const char* env = std::getenv("SUROGATE_DEBUG_DTYPES")) {
+                if (ref.name.find("xF") != std::string::npos) {
+                    fprintf(stderr, "[DEBUG_DTYPES] op=%s output=%s dtype=%s\n",
+                            op.id.c_str(), ref.name.c_str(), dtype_to_str(ref.dtype));
+                }
+            }
+
             // Track output dtype and shape for downstream operations to reference.
             // This allows intermediate tensors to have their dtypes/shapes properly propagated.
             // Skip shapes from the catch-all default — they are often wrong for custom ops.

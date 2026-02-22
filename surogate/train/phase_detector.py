@@ -82,13 +82,19 @@ class PhaseDetector:
 
         older_mean = float(np.mean(older))
         recent_mean = float(np.mean(recent))
-        recent_std = float(np.std(recent))
 
         if older_mean <= 0:
             return TrainingPhase.CONVERGING
 
-        # Coefficient of variation of recent losses — high means unstable.
-        cv = recent_std / max(recent_mean, 1e-8)
+        # Detrend recent losses before checking instability so that a
+        # steady downward trend is not confused with noisy oscillations.
+        n = len(recent)
+        x = np.arange(n, dtype=np.float64)
+        slope = (np.dot(x, recent) - n * x.mean() * recent.mean()) / max(np.dot(x, x) - n * x.mean() ** 2, 1e-12)
+        residuals = recent - (recent.mean() + slope * (x - x.mean()))
+        residual_std = float(np.std(residuals))
+
+        cv = residual_std / max(recent_mean, 1e-8)
         if cv > self.instability_cv:
             return TrainingPhase.UNSTABLE
 

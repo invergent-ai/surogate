@@ -172,10 +172,17 @@ public:
     ///            If false, skip LoRA (reference model).
     ///
     /// Returns a vector of B*T float log-probabilities; masked positions receive 0.
+    /// position_ids: Optional CPU int32 position IDs, shape [B, T].
+    ///               If nullptr, sequential [0..T-1] per row is used.
+    ///               Provide explicit position_ids for packed sequences.
+    /// temperatures: Optional CPU float per-token temperatures, shape [B, T].
+    ///               If nullptr, uses temperature=1.0 for all tokens.
     std::vector<float> compute_logprobs(const std::int32_t* input_ids,
                                         const std::int32_t* targets,
                                         int B, int T, bool use_lora,
-                                        NCCLCommunicator& comm);
+                                        NCCLCommunicator& comm,
+                                        const std::int32_t* position_ids = nullptr,
+                                        const float* temperatures = nullptr);
 
     /// Run one training micro-step with externally-computed per-token gradient multipliers.
     ///
@@ -189,12 +196,15 @@ public:
     /// per_token_grads_cpu: CPU float32 per-token gradient multipliers, shape [B*T].
     ///   per_token_grads_cpu[b*T + t] = dL_GRPO / d(log_prob_policy)[b, t].
     ///   Masked positions (target==-100) should have 0 gradient.
+    /// temperatures: Optional CPU float per-token temperatures, shape [B*T].
+    ///   If nullptr, uses temperature=1.0 for all tokens.
     /// grad_accum_steps:    Total gradient accumulation steps.
     /// micro_step:          Current micro-step index within grad_accum_steps.
     void step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor targets,
                                 const float* per_token_grads_cpu,
                                 int grad_accum_steps, int micro_step,
-                                NCCLCommunicator& comm);
+                                NCCLCommunicator& comm,
+                                const float* temperatures = nullptr);
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
@@ -225,7 +235,10 @@ private:
     void validate_config_mapping(const Module& module) const;
     void validate_param_shapes(const Module& module) const;
     void init_optimizer_state(cudaStream_t stream);
+    void init_adamw_state(cudaStream_t stream);
     void init_normuon_state(cudaStream_t stream);
+    void update_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
+                      int t, float epsilon, float weight_decay, float grad_clip);
     void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
@@ -269,6 +282,7 @@ private:
     std::unique_ptr<modules::LoRAAdamW8BitState> mLoRAAdamW8BitState;
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
+    bool mUseTokenScale = true;  // apply 1/valid_token_count in global_norm_sqrt
 
     // Pre-built name tables for LoRA backward (avoids per-layer string construction).
     // Indexed by layer. Populated lazily on first use.
@@ -301,6 +315,18 @@ private:
         Tensor absmax2;
     };
     std::unique_ptr<AdamW8BitState> mAdamW8BitState;
+
+    struct AdamWState {
+        bool initialized = false;
+        size_t total_params = 0;
+        size_t total_state_elems = 0;
+        // Offloading configuration (copied from options during init)
+        bool offload_state = false;
+        bool use_zero_copy = false;
+        Tensor state1;  // FP32 momentum
+        Tensor state2;  // FP32 variance
+    };
+    std::unique_ptr<AdamWState> mAdamWState;
 
     // NorMuon optimizer state for full fine-tuning (hybrid: AdamW for 1D, NorMuon for 2D)
     struct FFTNorMuonState {

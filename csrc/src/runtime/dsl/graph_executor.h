@@ -180,7 +180,9 @@ public:
                                    const std::int32_t* targets_cpu,
                                    float* logprobs_cpu,
                                    const modules::ForwardHook* hook,
-                                   NCCLCommunicator& comm);
+                                   NCCLCommunicator& comm,
+                                   const std::int32_t* position_ids_cpu = nullptr,
+                                   const float* temperatures_cpu = nullptr);
 
     /// Execute a backward pass with custom per-token d_loss values (for GRPO).
     ///
@@ -196,7 +198,16 @@ public:
                                      const float* per_token_grads_cpu,
                                      NCCLCommunicator& comm,
                                      int grad_accum_steps, int micro_step,
-                                     const modules::BackwardHook* hook);
+                                     const modules::BackwardHook* hook,
+                                     const float* temperatures_cpu = nullptr);
+
+    /// Set document masking context for Flash Attention varlen dispatch.
+    /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
+    /// Copies to GPU and propagates to CompiledExecutor.
+    void set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs,
+                         int max_seqlen, int total_q);
+    void clear_doc_masking();
+    void set_inv_temperature_context(const float* inv_temperature_gpu);
 
 private:
     friend class RecomputePlan;
@@ -286,6 +297,13 @@ private:
     void build_layer_boundaries();  // Pre-compute layer start/end operation indices
 
     std::minstd_rand mRng{42};
+
+    // Document masking (Flash Attention varlen) — GPU cu_seqlens buffer
+    std::int32_t* mCuSeqlensGpu = nullptr;
+    int mCuSeqlensCount = 0;  // num_docs + 1
+    int mDocMaskingNumDocs = 0;
+    int mDocMaskingMaxSeqlen = 0;
+    int mDocMaskingTotalQ = 0;
 
     // Layer-to-weight-names map for prefetching
     std::vector<std::vector<std::string>> mLayerWeightNames;

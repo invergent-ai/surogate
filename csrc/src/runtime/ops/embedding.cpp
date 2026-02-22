@@ -48,6 +48,13 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
         return;
     }
     Tensor& d_emb = *d_emb_ptr;
+    // Fast atomic fallback for FP32 embedding grads with BF16 upstream grads.
+    if (d_emb.DType == ETensorDType::FP32 && d_out.DType == ETensorDType::BF16) {
+        encoder_backward_atomic(d_emb.get<float>(), d_out.get<nv_bfloat16>(), mRunState.Inputs.get<int>(),
+                                static_cast<int>(mB), static_cast<int>(mT), mConfig.HiddenSize,
+                                mRunState.MainStream);
+        return;
+    }
 
     // encoder_backward requires CPU-side inputs for deterministic bucketing
     if (!mLastInputsCpu || !mLastInputsCpu->Data) {

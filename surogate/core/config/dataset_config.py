@@ -137,9 +137,17 @@ class InstructionDatasetConfig(DatasetConfig):
 class ConversationDatasetConfig(DatasetConfig):
     """
     ConversationDatasetConfig class is a dataclass that holds configuration parameters for a conversation dataset.
+
+    Args:
+        messages_field (str): Column containing message list. Defaults to "messages".
+        completion_field (Optional[str]): If set, messages are built by concatenating
+            messages_field + completion_field. Useful for datasets that split prompt
+            and completion into separate columns (e.g. prompt=[{role:user,...}],
+            completion=[{role:assistant,...}]).
     """
     system_field: Optional[str] = None
     messages_field: Optional[str] = None
+    completion_field: Optional[str] = None
     tools_field: Optional[str] = None
     message_property_mappings: Optional[dict[str, str]] = None
 
@@ -147,6 +155,7 @@ class ConversationDatasetConfig(DatasetConfig):
         super().__init__(cfg)
         self.system_field = cfg['system_field']
         self.messages_field = cfg['messages_field'] or "messages"
+        self.completion_field = cfg['completion_field']
         self.tools_field = cfg['tools_field']
         self.message_property_mappings = cfg['message_property_mappings'] or {
             "role": "role",

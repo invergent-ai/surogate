@@ -306,7 +306,7 @@ NB_MODULE(_surogate, m) {
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
             bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks,
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
-            const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope,
+            const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope, bool doc_masking,
             int fp8_amax_history, const std::string& fp4_backend,
             int skip_quant_first_layers, int skip_quant_last_layers,
             bool use_dsl_ir) {
@@ -350,6 +350,7 @@ NB_MODULE(_surogate, m) {
                 .TrainingRecipe = std::move(training_recipe),
                 .RecipeOptions = recipe_options,
                 .UseFusedRope = use_fused_rope,
+                .DocMasking = doc_masking,
                 .UseDslIr = use_dsl_ir,
                 .MatmulBackend = backend,
                 .MatmulType = opt_dtype_from_str(matmul_type),
@@ -381,6 +382,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("recipe") = "bf16",
              nb::arg("matmul_backend") = "",
              nb::arg("use_fused_rope") = false,
+             nb::arg("doc_masking") = true,
              nb::arg("fp8_amax_history") = 1024,
              nb::arg("fp4_backend") = "cutlass",
              nb::arg("skip_quant_first_layers") = 0,
@@ -400,6 +402,7 @@ NB_MODULE(_surogate, m) {
              "- recipe: Training recipe (bf16, fp8-hybrid, nvfp4, nvfp4-quartet).\n"
              "- matmul_backend: Matmul backend (auto, cublaslt, cutlass).\n"
              "- use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.\n"
+             "- doc_masking: Enable document-level attention masking for packed sequences.\n"
              "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
@@ -429,6 +432,7 @@ NB_MODULE(_surogate, m) {
         .def_rw("init_projections_to_zero", &RuntimeOptions::InitProjectionsToZero, "Initialize certain projections to zero (for experiments).")
         .def_rw("debug_memory_breakdown", &RuntimeOptions::DebugMemoryBreakdown, "Print detailed memory breakdown after model allocation.")
         .def_rw("use_fused_rope", &RuntimeOptions::UseFusedRope, "Use fused RoPE kernel with on-the-fly cos/sin computation.")
+        .def_rw("doc_masking", &RuntimeOptions::DocMasking, "Enable document-level attention masking for packed sequences.")
         .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Deprecated (DSL backend is always enabled).")
         .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
@@ -719,8 +723,10 @@ NB_MODULE(_surogate, m) {
     nb::enum_<optimizers::OptimizerType>(m, "OptimizerType",
         "Optimizer algorithm types.\n\n"
         "Values:\n"
+        "- ADAMW: Full-precision AdamW.\n"
         "- ADAMW_8BIT: 8-bit AdamW with blockwise quantization.\n"
         "- NORMUON: NorMuon hybrid optimizer (orthogonalized momentum for 2D weights, AdamW for others).")
+        .value("ADAMW", optimizers::OptimizerType::ADAMW, "Full-precision AdamW")
         .value("ADAMW_8BIT", optimizers::OptimizerType::ADAMW_8BIT, "8-bit AdamW with blockwise quantization")
         .value("NORMUON", optimizers::OptimizerType::NORMUON, "NorMuon hybrid optimizer")
         ;
@@ -735,12 +741,14 @@ NB_MODULE(_surogate, m) {
                            float adamw_beta1, float adamw_beta2, float adamw_epsilon,
                            float normuon_momentum, float normuon_beta2, float normuon_lr, bool normuon_cautious_wd) {
             auto cfg = optimizers::OptimizerConfig{};
-            if (optimizer == "adamw_8bit" || optimizer == "adamw") {
+            if (optimizer == "adamw") {
+                cfg.type = optimizers::OptimizerType::ADAMW;
+            } else if (optimizer == "adamw_8bit") {
                 cfg.type = optimizers::OptimizerType::ADAMW_8BIT;
             } else if (optimizer == "normuon") {
                 cfg.type = optimizers::OptimizerType::NORMUON;
             } else {
-                throw std::runtime_error("Unknown optimizer type: " + optimizer + " (valid: adamw_8bit, normuon)");
+                throw std::runtime_error("Unknown optimizer type: " + optimizer + " (valid: adamw, adamw_8bit, normuon)");
             }
             cfg.learning_rate = learning_rate;
             cfg.weight_decay = weight_decay;
@@ -767,7 +775,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("normuon_cautious_wd") = true,
              "Create an optimizer configuration.\n\n"
              "Parameters:\n"
-             "- optimizer: Type of optimizer ('adamw_8bit' or 'normuon').\n"
+             "- optimizer: Type of optimizer ('adamw', 'adamw_8bit' or 'normuon').\n"
              "- learning_rate: Base learning rate.\n"
              "- weight_decay: Weight decay coefficient.\n"
              "- grad_clip: Gradient clipping threshold (0 = disabled).\n"
@@ -786,13 +794,19 @@ NB_MODULE(_surogate, m) {
         .def_prop_rw("type",
                      [](const optimizers::OptimizerConfig* cfg) { return optimizers::to_string(cfg->type); },
                      [](optimizers::OptimizerConfig* cfg, const std::string& type) {
-                         if (type == "adamw_8bit" || type == "adamw") {
+                         if (type == "adamw") {
+                             cfg->type = optimizers::OptimizerType::ADAMW;
+                         } else if (type == "adamw_8bit") {
                              cfg->type = optimizers::OptimizerType::ADAMW_8BIT;
                          } else if (type == "normuon") {
                              cfg->type = optimizers::OptimizerType::NORMUON;
                          }
                      },
                      "Optimizer type as string.")
+        .def_static("adamw", &optimizers::OptimizerConfig::adamw,
+             nb::arg("lr") = 2e-4f, nb::arg("beta1") = 0.9f, nb::arg("beta2") = 0.999f,
+             nb::arg("epsilon") = 1e-8f, nb::arg("weight_decay") = 0.1f, nb::arg("grad_clip") = 0.0f,
+             "Create AdamW (full-precision) configuration.")
         .def_static("adamw_8bit", &optimizers::OptimizerConfig::adamw_8bit,
              nb::arg("lr") = 2e-4f, nb::arg("beta1") = 0.9f, nb::arg("beta2") = 0.999f,
              nb::arg("epsilon") = 1e-8f, nb::arg("weight_decay") = 0.1f, nb::arg("grad_clip") = 0.0f,
@@ -1160,27 +1174,64 @@ NB_MODULE(_surogate, m) {
         .def("step_with_custom_loss", [](MultiGPUPyTrainer* trainer,
                 nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
                 nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
-                nb::ndarray<float, nb::ndim<2>, nb::c_contig> per_token_grads) {
-            trainer->step_with_custom_loss(input_ids.data(), targets.data(), per_token_grads.data());
+                nb::ndarray<float, nb::ndim<2>, nb::c_contig> per_token_grads,
+                nb::object position_ids_obj,
+                nb::object temperatures_obj) {
+            const std::int32_t* position_ids_ptr = nullptr;
+            if (!position_ids_obj.is_none()) {
+                auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                position_ids_ptr = position_ids.data();
+            }
+            const float* temperatures_ptr = nullptr;
+            if (!temperatures_obj.is_none()) {
+                auto temperatures = nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(temperatures_obj);
+                temperatures_ptr = temperatures.data();
+            }
+            trainer->step_with_custom_loss(input_ids.data(), targets.data(),
+                                           per_token_grads.data(), position_ids_ptr,
+                                           temperatures_ptr);
         },
         nb::arg("input_ids"), nb::arg("targets"), nb::arg("per_token_grads"),
+        nb::arg("position_ids") = nb::none(),
+        nb::arg("temperatures") = nb::none(),
         "Run one training micro-step with externally-computed per-token gradient multipliers.\n\n"
         "Parameters:\n"
         "- input_ids:       int32 token IDs shaped [B, T] (or [ngpu*B, T] for multi-GPU).\n"
         "- targets:         int32 target IDs shaped [B, T]; -100 for masked positions.\n"
         "- per_token_grads: float32 per-token gradient multipliers shaped [B, T].\n"
         "                   per_token_grads[b, t] = dL_GRPO/d(log_prob_policy)[b, t].\n"
-        "                   Masked positions should be 0.\n\n"
+        "                   Masked positions should be 0.\n"
+        "- position_ids:    Optional int32 position IDs shaped [B, T]. If None, uses [0..T-1].\n"
+        "- temperatures:    Optional float32 per-token temperatures shaped [B, T].\n\n"
         "Equivalent to step() but uses provided per-token gradients instead of d_loss=1.0.\n"
         "Call update_with_config() after grad_accum steps to apply gradients.")
+        .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),
+             "Set the gradient accumulation step count for the next training step.\n\n"
+             "Call this before the first step_with_custom_loss() of each optimizer step\n"
+             "to dynamically adjust the number of micro-batches per step.\n"
+             "Also resets the internal micro-step counter to 0.\n\n"
+             "Parameters:\n- n: Number of micro-batches for the next optimizer step.")
         .def("compute_logprobs", [](MultiGPUPyTrainer* trainer,
                 nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
                 nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
-                bool use_lora) {
+                bool use_lora,
+                nb::object position_ids_obj,
+                nb::object temperatures_obj) {
             const int B = static_cast<int>(input_ids.shape(0));
             const int T = static_cast<int>(input_ids.shape(1));
+            const std::int32_t* position_ids_ptr = nullptr;
+            if (!position_ids_obj.is_none()) {
+                auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                position_ids_ptr = position_ids.data();
+            }
+            const float* temperatures_ptr = nullptr;
+            if (!temperatures_obj.is_none()) {
+                auto temperatures = nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(temperatures_obj);
+                temperatures_ptr = temperatures.data();
+            }
             auto logprobs = trainer->compute_logprobs(input_ids.data(), targets.data(),
-                                                      B, T, use_lora);
+                                                      B, T, use_lora, position_ids_ptr,
+                                                      temperatures_ptr);
             const std::size_t n = logprobs.size();
             float* data = new float[n];
             std::copy(logprobs.begin(), logprobs.end(), data);
@@ -1189,12 +1240,18 @@ NB_MODULE(_surogate, m) {
                 data, {static_cast<std::size_t>(B), static_cast<std::size_t>(T)}, owner);
         },
         nb::arg("input_ids"), nb::arg("targets"), nb::arg("use_lora") = true,
+        nb::arg("position_ids") = nb::none(),
+        nb::arg("temperatures") = nb::none(),
         "Compute per-token log-probabilities for a batch.\n\n"
         "Parameters:\n"
-        "- input_ids: int32 token IDs shaped [B, T].\n"
-        "- targets:   int32 target IDs shaped [B, T]; -100 for masked positions.\n"
-        "- use_lora:  If True (default), apply LoRA adapters (policy model).\n"
-        "             If False, skip LoRA (reference model).\n\n"
+        "- input_ids:    int32 token IDs shaped [B, T].\n"
+        "- targets:      int32 target IDs shaped [B, T]; -100 for masked positions.\n"
+        "- use_lora:     If True (default), apply LoRA adapters (policy model).\n"
+        "                If False, skip LoRA (reference model).\n"
+        "- position_ids: Optional int32 position IDs shaped [B, T].\n"
+        "                If None (default), uses sequential [0..T-1] per row.\n"
+        "- temperatures: Optional float32 per-token temperatures shaped [B, T].\n"
+        "                Provide position_ids for packed sequences where positions reset.\n\n"
         "Returns: float32 log-probabilities shaped [B, T].\n"
         "         Masked positions (target==-100) receive 0.")
         .def_prop_ro("world_size", &MultiGPUPyTrainer::world_size, "Number of participating GPUs.")

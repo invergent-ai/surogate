@@ -885,7 +885,11 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
     }
 
-    const bool use_weight_manager = (options.ShardWeights || options.OffloadMaster) && !mQLoRAConfig.is_quantized();
+    const ETensorDType model_dtype = options.ModelType.value_or(mConfig->DType);
+    const ETensorDType master_dtype = options.MasterDType.value_or(mConfig->DType);
+    const bool need_master_work = master_dtype != model_dtype;
+    const bool use_weight_manager =
+        (options.ShardWeights || options.OffloadMaster || need_master_work) && !mQLoRAConfig.is_quantized();
 
     // DEBUG: Log weight manager decision
     if (options.DebugMemoryBreakdown) {
@@ -907,11 +911,13 @@ DslModel::DslModel(const PretrainedConfig& config,
                                               lora_config ? &*lora_config : nullptr,
                                               external_params.empty() ? nullptr : &external_params,
                                               use_weight_manager);
+    std::optional<ETensorDType> grad_dtype_override = options.GradientType;
     mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator,
                                             options.OffloadGrads,
                                             options.offload_alloc(),
                                             mNumShards,
-                                            mConfig->TiedWordEmbeddings);
+                                            mConfig->TiedWordEmbeddings,
+                                            grad_dtype_override);
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {
