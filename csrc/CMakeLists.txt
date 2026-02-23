@@ -447,8 +447,8 @@ set(FLASH_ATTN_SOURCES
 add_library(flash_attn STATIC ${FLASH_ATTN_SOURCES})
 set_target_properties(flash_attn PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(flash_attn PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/shims        # ATen shim for PhiloxCudaState
-    ${CMAKE_SOURCE_DIR}/src/third_party  # c10/cuda/CUDAException.h shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/shims        # ATen shim for PhiloxCudaState
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party  # c10/cuda/CUDAException.h shim
     ${FLASH_ATTN_DIR}/src
     ${cutlass_SOURCE_DIR}/include
     ${cutlass_SOURCE_DIR}/tools/util/include
@@ -465,7 +465,7 @@ target_link_libraries(surogate-common PRIVATE flash_attn ${CUFILE_LIBS} cudnn_fr
 target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt ${NVML_LIBS} nlohmann_json::nlohmann_json)
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
-target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/src/shims ${FLASH_ATTN_DIR}/src)
+target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/shims ${FLASH_ATTN_DIR}/src)
 target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
 
 # backward-cpp for stack traces
