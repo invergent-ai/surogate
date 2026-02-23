@@ -916,6 +916,11 @@ NB_MODULE(_surogate, m) {
                              ew.meta2_dtype = dtype_from_str(nb::cast<std::string>(d["meta2_dtype"]));
                          }
 
+                         // Fuse swap flag: when true, swap equal halves after dequant
+                         if (d.contains("fuse_swap")) {
+                             ew.fuse_swap = nb::cast<bool>(d["fuse_swap"]);
+                         }
+
                          weights.push_back(std::move(ew));
                      }
                      per_gpu.push_back(std::move(weights));

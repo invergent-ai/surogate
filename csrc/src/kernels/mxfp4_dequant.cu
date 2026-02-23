@@ -366,3 +366,29 @@ void batched_transpose_2d_bf16(
         dst, src, batches, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// In-place swap of two equal halves of a BF16 buffer.
+// Used after dequantization when the external weight has swapped partition order
+// (e.g., vLLM stores [gate, up] but surogate expects [up, gate]).
+// Zero extra memory — each thread swaps one element pair via registers.
+// ============================================================================
+
+__global__ void swap_halves_bf16_kernel(nv_bfloat16* __restrict__ data, long half_nelem) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < half_nelem) {
+        nv_bfloat16 tmp = data[idx];
+        data[idx] = data[half_nelem + idx];
+        data[half_nelem + idx] = tmp;
+    }
+}
+
+void swap_halves_bf16(nv_bfloat16* data, int rows, int cols, int swap_at_row, cudaStream_t stream) {
+    // swap_at_row must equal rows - swap_at_row (equal halves)
+    assert(swap_at_row * 2 == rows && "swap_halves_bf16 requires equal halves");
+    const long half_nelem = (long)swap_at_row * cols;
+    constexpr int BLOCK = 256;
+    const int grid = (int)((half_nelem + BLOCK - 1) / BLOCK);
+    swap_halves_bf16_kernel<<<grid, BLOCK, 0, stream>>>(data, half_nelem);
+    CUDA_CHECK(cudaGetLastError());
+}

@@ -1392,6 +1392,19 @@ void batched_transpose_2d_bf16(
     int batches, int rows, int cols,
     const cudaDeviceProp& dp, cudaStream_t stream);
 
+/// @brief In-place swap of two equal halves of a BF16 buffer.
+///
+/// Used after dequantization when the external weight has swapped partition
+/// order (e.g., vLLM stores [gate, up] but surogate expects [up, gate]).
+/// Zero extra memory — each thread swaps one element pair via registers.
+///
+/// @param data        BF16 buffer of shape [rows, cols].
+/// @param rows        Total number of rows.
+/// @param cols        Number of columns.
+/// @param swap_at_row Row index at which to split. Must equal rows/2 (equal halves).
+/// @param stream      CUDA stream.
+void swap_halves_bf16(nv_bfloat16* data, int rows, int cols, int swap_at_row, cudaStream_t stream);
+
 // ============================================================================
 // CUTLASS FP4 GEMM Operations (Blackwell-only: SM100+)
 // ============================================================================

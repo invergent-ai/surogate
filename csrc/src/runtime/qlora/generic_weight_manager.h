@@ -104,6 +104,13 @@ struct ManagedWeight {
     int hf_inner_cols = 0;
     int num_experts_for_transpose = 0;
 
+    /// Row index at which to swap fused partition halves after dequantization.
+    /// When > 0, the first fuse_swap_at rows and the next (M - fuse_swap_at) rows
+    /// of the BF16 output are swapped in-place. Used when external weights have
+    /// different partition order than surogate expects (e.g., vLLM [gate, up] vs
+    /// surogate [up, gate]). Currently requires equal halves (fuse_swap_at == M/2).
+    int fuse_swap_at = 0;
+
     /// Whether this weight currently holds a buffer from the pool.
     bool has_pool_buffer = false;
 
@@ -238,7 +245,8 @@ public:
         QuantizedTensor&& qt,
         int offload_group = -1,
         const std::vector<long>& shape = {},
-        const std::string& transform_fn = "");
+        const std::string& transform_fn = "",
+        int fuse_swap_at = 0);
 
     /// Quantize a single expert's BF16 data into a slice of a registered weight.
     ///
@@ -417,9 +425,6 @@ private:
     /// Allocated lazily on first use, sized for the largest weight that needs
     /// transpose. Reused across all transpose dequant calls.
     Tensor mTransposeTemp;
-
-    /// Diagnostic: remaining dequant NaN checks (counts down from initial value).
-    int mDiagChecksRemaining = 5;
 };
 
 }  // namespace qlora

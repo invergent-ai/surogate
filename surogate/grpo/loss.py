@@ -6,7 +6,6 @@ import numpy as np
 from surogate.grpo.config import GRPOLossConfig
 
 _logger = logging.getLogger(__name__)
-_diag_calls_remaining = 40  # Log first 40 calls to _compute_sample_grads (covers ~3 micro-batches)
 
 
 def _safe_mean(values: np.ndarray, mask: np.ndarray) -> float:
@@ -77,49 +76,6 @@ def _compute_sample_grads(
         | seq_mask_low | seq_mask_high
     )
     keep_mask = loss_mask & ~is_masked
-
-    # --- Diagnostic: per-sample masking breakdown ---
-    global _diag_calls_remaining
-    if _diag_calls_remaining > 0:
-        _diag_calls_remaining -= 1
-        lm = loss_mask.astype(bool)
-        n_loss = int(lm.sum())
-        t_lp = trainer_logprobs[lm]
-        i_lp = inference_logprobs[lm]
-        n_nan_t = int(np.isnan(t_lp).sum())
-        n_nan_i = int(np.isnan(i_lp).sum())
-        ratio_lm = token_importance_ratio[lm]
-        finite_ratio = ratio_lm[np.isfinite(ratio_lm)]
-        n_masked_tok_lo = int((token_mask_low & lm).sum())
-        n_masked_tok_hi = int((token_mask_high & lm).sum())
-        n_masked_geo_lo = int((geo_mask_low & lm).sum())
-        n_masked_geo_hi = int((geo_mask_high & lm).sum())
-        n_masked_seq_lo = int((seq_mask_low & lm).sum())
-        n_masked_seq_hi = int((seq_mask_high & lm).sum())
-        n_masked_total = int((is_masked & lm).sum())
-        if len(finite_ratio) > 0:
-            ratio_str = (f"ratio_stats=[min={finite_ratio.min():.4f} "
-                         f"max={finite_ratio.max():.4f} med={np.median(finite_ratio):.4f}]")
-        else:
-            ratio_str = "NO_FINITE_RATIOS"
-        _logger.info(
-            f"[GRPO-DIAG] tokens={n_loss} nan_trainer={n_nan_t} nan_infer={n_nan_i} "
-            f"finite_ratios={len(finite_ratio)} {ratio_str}"
-        )
-        _logger.info(
-            f"[GRPO-DIAG] geo_seq_ratio={float(geo_seq_ratio):.6f} "
-            f"seq_min_ratio={float(seq_min_ratio):.6f} seq_max_ratio={float(seq_max_ratio):.6f} "
-            f"masked: tok_lo={n_masked_tok_lo} tok_hi={n_masked_tok_hi} "
-            f"geo_lo={n_masked_geo_lo} geo_hi={n_masked_geo_hi} "
-            f"seq_lo={n_masked_seq_lo} seq_hi={n_masked_seq_hi} "
-            f"total_masked={n_masked_total}/{n_loss} "
-            f"frac={n_masked_total/max(n_loss,1):.2%}"
-        )
-        if len(finite_ratio) > 0 and len(finite_ratio) <= 20:
-            _logger.info(f"[GRPO-DIAG] all finite ratios: {finite_ratio.tolist()}")
-        elif len(finite_ratio) > 20:
-            _logger.info(f"[GRPO-DIAG] first20 finite ratios: {finite_ratio[:20].tolist()}")
-    # --- End diagnostic ---
 
     # Choose importance ratio type
     if loss_config.ratio_type == "sequence":

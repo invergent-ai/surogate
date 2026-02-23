@@ -8,6 +8,7 @@ def setup_vllm_env(config: GRPOInferenceConfig):
 
     # spawn is more robust in vLLM nightlies and Qwen3-VL (fork can deadlock with multithreaded processes)
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARN")
 
     if config.enable_lora:
         os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"

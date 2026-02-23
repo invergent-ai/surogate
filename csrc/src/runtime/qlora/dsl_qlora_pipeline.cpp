@@ -2043,8 +2043,16 @@ std::unique_ptr<GenericWeightManager> import_external_weights(
                         qt.meta2 = Tensor::from_pointer(ew.meta2_ptr, ew.device, ew.meta2_dtype, ew.meta2_shape);
                     }
 
+                    // Compute fuse_swap_at: when the external weight has swapped
+                    // partition order, swap the two equal halves after dequant.
+                    int fuse_swap_at = 0;
+                    if (ew.fuse_swap) {
+                        fuse_swap_at = ew.M / 2;
+                    }
+
                     weight_mgr->store_prequantized(
-                        spec.name, std::move(qt), spec.offload_group, spec.shape);
+                        spec.name, std::move(qt), spec.offload_group, spec.shape,
+                        /*transform_fn=*/"", fuse_swap_at);
                     loaded_external++;
                     found = true;
                     break;

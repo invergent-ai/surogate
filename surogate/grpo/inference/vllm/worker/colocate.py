@@ -27,9 +27,6 @@ else:
 
 logger = init_logger("vllm.inference.vllm.worker_colocate")
 
-# Keep references to reordered tensors so their GPU memory stays valid for IPC
-_reordered_refs: list[torch.Tensor] = []
-
 # QuantFormat enum values must match C++ qlora::QuantFormat
 QUANT_FORMAT_NONE = 0
 QUANT_FORMAT_BNB_NF4 = 1
@@ -104,8 +101,8 @@ class ColocateWeightUpdateWorker(Worker):
 
     # Fused projections where vLLM and surogate use different row orderings.
     # vLLM gate_up_proj stores [gate; up], but surogate's SwiGLUMLP expects
-    # fuse(up_proj, gate_proj) = [up; gate]. We must swap the halves.
-    # QKV doesn't need swapping: both use [q; k; v] order.
+    # fuse(up_proj, gate_proj) = [up; gate]. Instead of copying, we set
+    # fuse_swap=True so the C++ dequantizer swaps the BF16 halves in-place.
     _FUSE_SWAP_NAMES = {"gate_up_proj"}
 
     def init_broadcaster(self) -> None:
@@ -126,24 +123,6 @@ class ColocateWeightUpdateWorker(Worker):
         for fused, first_hf in ColocateWeightUpdateWorker._VLLM_FUSED_TO_HF.items():
             name = name.replace(f".{fused}.", f".{first_hf}.")
         return name
-
-    @staticmethod
-    def _swap_rows(
-        tensor: torch.Tensor,
-        first_rows: int,
-        second_rows: int,
-    ) -> torch.Tensor:
-        """Swap two row-partitions of a tensor, preserving any trailing padding.
-
-        Input layout:  [first(first_rows) ; second(second_rows) ; padding(...)]
-        Output layout: [second(second_rows) ; first(first_rows) ; padding(...)]
-        """
-        first = tensor[:first_rows]
-        second = tensor[first_rows:first_rows + second_rows]
-        rest = tensor[first_rows + second_rows:]  # trailing padding (may be empty)
-        swapped = torch.cat([second, first, rest], dim=0).contiguous()
-        _reordered_refs.append(swapped)
-        return swapped
 
     def extract_weight_ipc_handles(self) -> list[dict[str, Any]]:
         """Extract CUDA IPC handles for all quantized weights in the model.
@@ -186,39 +165,34 @@ class ColocateWeightUpdateWorker(Worker):
                      len(results), device_idx)
         return results
 
-    def _get_fuse_swap_sizes(self, name: str, module: Any) -> tuple[int, int] | None:
-        """Return (first_rows, second_rows) for fused projections that need swapping.
-
-        vLLM's gate_up_proj stores [gate; up] but surogate expects [up; gate].
-        Returns (gate_size, up_size) so the caller can swap them.
-        """
-        for fused_name in self._FUSE_SWAP_NAMES:
-            if f".{fused_name}." in name:
-                sizes = getattr(module, "output_partition_sizes", None)
-                if sizes and len(sizes) == 2:
-                    return (sizes[0], sizes[1])
-        return None
+    @staticmethod
+    def _needs_fuse_swap(name: str) -> bool:
+        """Check if this weight needs fuse_swap (different partition order in vLLM vs surogate)."""
+        return any(f".{n}." in name for n in ColocateWeightUpdateWorker._FUSE_SWAP_NAMES)
 
     def _extract_quant_ipc(
         self, name: str, param: torch.Tensor, module: Any, device: int
     ) -> dict[str, Any] | None:
         """Try to extract IPC info for a quantized weight. Returns None if not quantized."""
-        swap_sizes = self._get_fuse_swap_sizes(name, module)
-
         # Try BnB NF4
-        # TODO: apply gate/up swap for BnB NF4 (flat 1D data needs byte-level split)
         entry = self._extract_bnb_nf4_ipc(name, param, module, device)
         if entry is not None:
+            if self._needs_fuse_swap(name):
+                entry["fuse_swap"] = True
             return entry
 
         # Try FP8
-        entry = self._extract_fp8_ipc(name, param, module, device, swap_sizes)
+        entry = self._extract_fp8_ipc(name, param, module, device)
         if entry is not None:
+            if self._needs_fuse_swap(name):
+                entry["fuse_swap"] = True
             return entry
 
         # Try NVFP4 (ModelOpt)
-        entry = self._extract_nvfp4_ipc(name, param, module, device, swap_sizes)
+        entry = self._extract_nvfp4_ipc(name, param, module, device)
         if entry is not None:
+            if self._needs_fuse_swap(name):
+                entry["fuse_swap"] = True
             return entry
 
         return None
@@ -265,7 +239,6 @@ class ColocateWeightUpdateWorker(Worker):
 
     def _extract_fp8_ipc(
         self, name: str, param: torch.Tensor, module: Any, device: int,
-        swap_sizes: tuple[int, int] | None = None,
     ) -> dict[str, Any] | None:
         if param.dtype != torch.float8_e4m3fn:
             return None
@@ -280,17 +253,6 @@ class ColocateWeightUpdateWorker(Worker):
         block_size = 128
         if hasattr(module, "weight_block_size"):
             block_size = module.weight_block_size[0]
-
-        # Swap fused gate/up halves if needed
-        if swap_sizes is not None:
-            gate_rows, up_rows = swap_sizes
-            # FP8 scales have ceil(M/bs) rows, not M rows
-            s_gate = (gate_rows + block_size - 1) // block_size
-            s_up = (up_rows + block_size - 1) // block_size
-            param = self._swap_rows(param, gate_rows, up_rows)
-            weight_scale = self._swap_rows(weight_scale, s_gate, s_up)
-            logger.info("Swapped gate/up halves for %s (gate=%d, up=%d)",
-                        name, gate_rows, up_rows)
 
         return {
             "name": name,
@@ -309,7 +271,6 @@ class ColocateWeightUpdateWorker(Worker):
 
     def _extract_nvfp4_ipc(
         self, name: str, param: torch.Tensor, module: Any, device: int,
-        swap_sizes: tuple[int, int] | None = None,
     ) -> dict[str, Any] | None:
         """Try to extract IPC info for NVFP4 (ModelOpt) weight.
 
@@ -334,19 +295,6 @@ class ColocateWeightUpdateWorker(Worker):
         weight_global_scale = getattr(module, "weight_global_scale", None)
         if weight_global_scale is None:
             return None
-
-        # Swap fused gate/up halves if needed.
-        # NVFP4 scales are F8_128x4 swizzled but each 128-row block is self-contained,
-        # so swapping at a 128-aligned boundary works correctly.
-        if swap_sizes is not None:
-            gate_rows, up_rows = swap_sizes
-            assert gate_rows % 128 == 0 and up_rows % 128 == 0, (
-                f"gate/up swap requires 128-row alignment, got gate={gate_rows}, up={up_rows}"
-            )
-            param = self._swap_rows(param, gate_rows, up_rows)
-            weight_scale = self._swap_rows(weight_scale, gate_rows, up_rows)
-            logger.info("Swapped gate/up halves for %s (gate=%d, up=%d)",
-                        name, gate_rows, up_rows)
 
         # Use original dimensions (pre-padding) from the module
         M = getattr(module, "output_size_per_partition", param.shape[0])

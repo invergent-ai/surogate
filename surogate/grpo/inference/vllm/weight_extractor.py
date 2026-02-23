@@ -126,6 +126,8 @@ def _ipc_entry_to_external_weight(entry: dict[str, Any]) -> dict:
         "meta2_ptr": meta2_tensor.data_ptr() if meta2_tensor is not None else 0,
         "meta2_shape": list(meta2_tensor.shape) if meta2_tensor is not None else [],
         "meta2_dtype": entry["meta2"]["dtype"] if entry.get("meta2") else "fp32",
+        # Fuse swap: swap equal halves after dequant (e.g., gate/up reorder)
+        "fuse_swap": entry.get("fuse_swap", False),
     }
 
 

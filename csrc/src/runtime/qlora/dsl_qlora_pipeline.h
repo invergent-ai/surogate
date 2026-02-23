@@ -68,6 +68,11 @@ struct ExternalWeight {
     ETensorDType meta2_dtype = ETensorDType::FP32;
 
     int device = 0;                ///< CUDA device ID
+
+    /// When true, the fused weight has swapped partition order compared to what
+    /// surogate expects (e.g., vLLM stores [gate, up] but SwiGLU expects [up, gate]).
+    /// The dequantizer will swap the two equal halves of the BF16 output after dequant.
+    bool fuse_swap = false;
 };
 
 /// Describes a weight parameter to be loaded and (optionally) quantized.
