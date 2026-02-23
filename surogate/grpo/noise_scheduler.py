@@ -32,8 +32,8 @@ _NORM_WEIGHT_RE = re.compile(
     r"\.weight$"
 )
 
-# PEFT modules_to_save naming — short module names for adapter_config.json.
-_PEFT_MODULES_TO_SAVE = ["input_layernorm", "post_attention_layernorm"]
+# Path for noisy norms saved alongside LoRA adapter (not inside it).
+NOISY_NORMS_FILENAME = "noisy_norms.safetensors"
 
 
 def compute_sigma(step: int, total_steps: int, config: NoiseSchedulerConfig) -> float:
@@ -110,72 +110,33 @@ def inject_noise_adapter(
     base_model_dir: Path,
     sigma: float,
 ) -> int:
-    """Inject noise into a LoRA adapter export, adding base model norms if needed.
+    """Inject noise into norm weights for a LoRA adapter export.
 
-    If the adapter doesn't already contain RMSNorm weights (i.e. norms are
-    not in modules_to_save), reads them from the base model, adds noise, and
-    appends them to the adapter safetensors with PEFT-compatible naming.
+    Reads RMSNorm weights from the base model, adds Gaussian noise, and saves
+    them as a separate ``noisy_norms.safetensors`` file alongside the adapter.
+    The adapter itself (adapter_config.json, adapter_model.safetensors) is NOT
+    modified — this avoids vLLM's ``modules_to_save`` validation error.
 
-    Returns the number of tensors modified.
+    The noisy norms are applied to vLLM's base model by a monkey-patch in
+    ``patches.py`` after the adapter is loaded.
+
+    Returns the number of tensors written.
     """
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import save_file
 
-    adapter_st = adapter_dir / "adapter_model.safetensors"
-    if not adapter_st.exists():
-        logger.warning(f"Adapter safetensors not found: {adapter_st}")
-        return 0
-
-    adapter_tensors = load_file(str(adapter_st), device="cpu")
-
-    # Check if adapter already has norm weights
-    has_norms = any(
-        _NORM_WEIGHT_RE.search(k.replace("base_model.model.", ""))
-        for k in adapter_tensors
-    )
-
-    if has_norms:
-        # Norms already in adapter (modules_to_save) — just add noise
-        return inject_noise_into_safetensors(adapter_st, sigma)
-
-    # Norms not in adapter — read from base model and add noisy copies
     base_norms = _load_base_model_norms(base_model_dir)
     if not base_norms:
         logger.warning("No RMSNorm weights found in base model")
         return 0
 
-    modified = 0
-    modules_to_save_set = set()
-
+    noisy_norms = {}
     for hf_name, weight in base_norms.items():
-        noisy = _add_noise_to_tensor(weight, sigma)
+        noisy_norms[hf_name] = _add_noise_to_tensor(weight, sigma)
 
-        # PEFT modules_to_save key format:
-        # base_model.model.{path}.modules_to_save.default.weight
-        # e.g. model.layers.0.input_layernorm.weight ->
-        #      base_model.model.model.layers.0.input_layernorm.modules_to_save.default.weight
-        parts = hf_name.rsplit(".weight", 1)
-        peft_key = f"base_model.model.{parts[0]}.modules_to_save.default.weight"
-        adapter_tensors[peft_key] = noisy
-        modified += 1
+    if noisy_norms:
+        save_file(noisy_norms, str(adapter_dir / "noisy_norms.safetensors"))
 
-        # Track module short names for adapter_config
-        for suffix in _PEFT_MODULES_TO_SAVE:
-            if suffix in hf_name:
-                modules_to_save_set.add(suffix)
-
-    if modified > 0:
-        save_file(adapter_tensors, str(adapter_st))
-
-        # Update adapter_config.json with modules_to_save
-        config_path = adapter_dir / "adapter_config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                adapter_config = json.load(f)
-            adapter_config["modules_to_save"] = sorted(modules_to_save_set)
-            with open(config_path, "w") as f:
-                json.dump(adapter_config, f, indent=2)
-
-    return modified
+    return len(noisy_norms)
 
 
 def inject_noise_model(model_dir: Path, sigma: float) -> int:

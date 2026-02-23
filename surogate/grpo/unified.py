@@ -166,6 +166,152 @@ def _extract_vllm_weights(
         return None
 
 
+def _estimate_trainer_memory(train_config: GRPOTrainConfig) -> tuple[float, dict]:
+    """Estimate GPU memory (bytes) the surogate trainer needs beyond shared base weights.
+
+    In colocate mode, base weights live in vLLM's allocation. The trainer adds:
+      1. LoRA parameters (weights + master copy + gradients + optimizer states)
+      2. Activation memory (with recompute: just working set + logits)
+      3. Dequantization buffers (BF16 dequant of quantized base weights)
+      4. Fixed overhead (NCCL, cuDNN workspace, Python/CUDA runtime)
+
+    Returns (total_bytes, breakdown_dict) for logging.
+    """
+    from surogate.core.model.hf_config import HfConfigFactory
+
+    config = train_config.model_info.config
+    d_model = HfConfigFactory.get_config_attr(config, 'hidden_size') or 1024
+    n_layers = HfConfigFactory.get_config_attr(config, 'num_hidden_layers') or 1
+    d_ff = HfConfigFactory.get_config_attr(config, 'intermediate_size') or d_model * 4
+    n_heads = HfConfigFactory.get_config_attr(config, 'num_attention_heads') or 1
+    n_kv_heads = HfConfigFactory.get_config_attr(config, 'num_key_value_heads') or n_heads
+    vocab_size = HfConfigFactory.get_config_attr(config, 'vocab_size') or 32000
+    tie_word_embeddings = HfConfigFactory.get_config_attr(config, 'tie_word_embeddings')
+    if tie_word_embeddings is None:
+        tie_word_embeddings = True
+
+    kv_size = d_model // n_heads * n_kv_heads
+    rank = train_config.lora_rank or 16
+    bsz = train_config.per_device_train_batch_size or 1
+    seq_len = train_config.sequence_len or 2048
+
+    # --- 1. LoRA parameter memory ---
+    # A + B matrices for each target module per layer.
+    # Standard targets: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+    attn_A = d_model * rank * 4                          # A for q, k, v, o (all use d_model input)
+    attn_B = rank * (d_model + kv_size + kv_size + d_model)  # B outputs
+    mlp_A = d_model * rank * 2 + d_ff * rank             # A for gate, up (d_model input) + down (d_ff input)
+    mlp_B = rank * d_ff * 2 + rank * d_model             # B for gate, up (d_ff output) + down (d_model output)
+    lora_elements_per_layer = attn_A + attn_B + mlp_A + mlp_B
+    total_lora_elements = lora_elements_per_layer * n_layers
+
+    # Per-element byte cost: weight + master + gradient + optimizer
+    lora_w_bytes = 4 if train_config.lora_dtype == 'fp32' else 2
+    master_bytes = 4 if train_config.master_dtype == 'fp32' else 2
+    grad_bytes = 4 if train_config.gradient_dtype == 'fp32' else 2
+    optim_bytes = 2  # 8-bit AdamW (momentum + variance)
+    bytes_per_lora_param = lora_w_bytes + master_bytes + grad_bytes + optim_bytes
+    lora_memory = total_lora_elements * bytes_per_lora_param
+
+    # --- 2. Activation memory ---
+    # With recompute enabled (default for GRPO QLoRA):
+    #   - Working set: ~4 tensors of (bsz, seq, d_model) in BF16 for current layer
+    #   - Logits: (bsz * seq, vocab_size) in BF16 — often the largest single allocation
+    #   - Recompute checkpoints: residual per layer boundary ≈ n_layers * bsz * seq * d_model * 2
+    # Without recompute: all intermediate activations saved (much larger)
+    logits_memory = bsz * seq_len * vocab_size * 2  # BF16
+    lmhead_chunks = train_config.lmhead_chunks or 1
+    logits_memory //= lmhead_chunks  # chunked LM head reduces peak logit memory
+
+    if train_config.recompute:
+        # Only store residuals at checkpoint boundaries + current layer working set
+        working_set = bsz * seq_len * d_model * 2 * 6  # ~6 BF16 tensors for current layer
+        # Residuals at boundaries: each is (bsz, seq, d_model) in BF16
+        residual_checkpoints = n_layers * bsz * seq_len * d_model * 2
+        activation_memory = working_set + logits_memory + residual_checkpoints
+    else:
+        # All activations saved — roughly 4 tensors per layer
+        activation_memory = n_layers * bsz * seq_len * d_model * 2 * 4 + logits_memory
+
+    # --- 3. Dequantization buffers ---
+    # DequantBufferPool recycles BF16 buffers via LRU. Peak: ~3 concurrent buffers
+    # (current layer forward + backward overlap during recompute)
+    max_weight_elements = max(
+        2 * d_ff * d_model,                      # gate_up_proj fused
+        d_ff * d_model,                           # down_proj
+        (d_model + 2 * kv_size) * d_model,        # qkv fused
+        d_model * d_model,                         # o_proj
+    )
+    dequant_buffer_memory = max_weight_elements * 2 * 3  # 3 concurrent BF16 buffers
+
+    # --- 4. Embeddings + LM head (not quantized, loaded from disk) ---
+    embed_memory = vocab_size * d_model * 2  # embed_tokens in BF16
+    if not tie_word_embeddings:
+        embed_memory += vocab_size * d_model * 2  # lm_head in BF16
+
+    # --- 5. Fixed overhead ---
+    # The trainer runs in the parent process (vLLM engine is in a child process),
+    # so the parent has its own CUDA context (~1.5 GB on modern GPUs).
+    # Additional overhead: cuDNN workspace (~0.5 GB), PyTorch allocator
+    # fragmentation/caching (~0.5 GB).
+    fixed_overhead = int(2.5 * 1024**3)  # 2.5 GB
+
+    total = lora_memory + activation_memory + dequant_buffer_memory + embed_memory + fixed_overhead
+
+    breakdown = {
+        "lora_params": total_lora_elements,
+        "lora_memory_mb": lora_memory / 1024**2,
+        "activation_memory_mb": activation_memory / 1024**2,
+        "dequant_buffer_memory_mb": dequant_buffer_memory / 1024**2,
+        "embed_memory_mb": embed_memory / 1024**2,
+        "fixed_overhead_mb": fixed_overhead / 1024**2,
+        "total_mb": total / 1024**2,
+    }
+    return total, breakdown
+
+
+def _compute_gpu_memory_utilization(
+    train_config: GRPOTrainConfig,
+    safety_fraction: float = 0.10,
+) -> float:
+    """Compute optimal gpu_memory_utilization for vLLM in colocate mode.
+
+    Estimates trainer memory and reserves it from vLLM's allocation.
+    Returns a float in [0.1, 0.95] for gpu_memory_utilization.
+    """
+    import torch
+
+    trainer_bytes, breakdown = _estimate_trainer_memory(train_config)
+
+    # Get GPU memory. Use device 0 — all GPUs in a homogeneous setup have
+    # the same total memory, and we just need the capacity for the ratio.
+    total_gpu_bytes = torch.cuda.get_device_properties(0).total_memory
+
+    # Reserve: trainer memory + safety margin
+    reserve_bytes = trainer_bytes + int(safety_fraction * total_gpu_bytes)
+    vllm_bytes = total_gpu_bytes - reserve_bytes
+    gpu_memory_utilization = vllm_bytes / total_gpu_bytes
+
+    # Clamp to reasonable range
+    gpu_memory_utilization = max(0.1, min(0.95, gpu_memory_utilization))
+
+    total_gb = total_gpu_bytes / 1024**3
+    trainer_gb = trainer_bytes / 1024**3
+    logger.info(
+        f"Auto gpu_memory_utilization: {gpu_memory_utilization:.2f} "
+        f"(GPU: {total_gb:.1f} GB, trainer estimate: {trainer_gb:.2f} GB, "
+        f"safety: {safety_fraction:.0%})"
+    )
+    logger.info(
+        f"  Breakdown — LoRA: {breakdown['lora_memory_mb']:.0f} MB, "
+        f"activations: {breakdown['activation_memory_mb']:.0f} MB, "
+        f"dequant: {breakdown['dequant_buffer_memory_mb']:.0f} MB, "
+        f"embeddings: {breakdown['embed_memory_mb']:.0f} MB, "
+        f"overhead: {breakdown['fixed_overhead_mb']:.0f} MB"
+    )
+    return gpu_memory_utilization
+
+
 def _run_trainer(
     train_config: GRPOTrainConfig,
     external_weights: list[list[dict]] | None,
@@ -203,6 +349,12 @@ def grpo_unified(
     train_config.weight_broadcast_type = "filesystem"
     # vLLM needs ColocateWeightUpdateWorker for extract_weight_ipc_handles()
     infer_config.weight_broadcast_type = "colocate"
+
+    # Auto-compute gpu_memory_utilization based on trainer memory requirements.
+    # In colocate mode, vLLM and the trainer share the GPU. We estimate how much
+    # memory the trainer needs (LoRA, activations, dequant buffers) and give
+    # vLLM the rest.
+    infer_config.gpu_memory_utilization = _compute_gpu_memory_utilization(train_config)
 
     # Setup vLLM environment (must happen before importing vLLM)
     setup_vllm_env(infer_config)

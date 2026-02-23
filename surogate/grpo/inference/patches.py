@@ -100,7 +100,10 @@ def monkey_patch_load_lora_adapter():
 
 # Monkeypatch LRUCacheWorkerLoRAManager to allow loading adapter inplace without doing it every request
 def monkey_patch_LRUCacheWorkerLoRAManager():
+    from vllm.logger import init_logger
     from vllm.lora.worker_manager import LoRARequest, LRUCacheLoRAModelManager, LRUCacheWorkerLoRAManager
+
+    _lora_logger = init_logger(__name__)
 
     # The dunder is intended. It's a private method that we're patching.
     def _patched__apply_adapters(self: LRUCacheWorkerLoRAManager, lora_requests: set[LoRARequest]) -> None:
@@ -148,11 +151,46 @@ def monkey_patch_LRUCacheWorkerLoRAManager():
             # update its position in the caches
             loaded = self._adapter_manager.get_adapter(lora_request.lora_int_id) is not None
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+
+        ## START PATCHED CODE — QeRL noisy norms
+        # Apply noisy norm weights to the base model if present alongside the adapter.
+        # The noise scheduler saves these as a separate file to avoid vLLM's
+        # modules_to_save validation error.
+        _apply_noisy_norms(self._adapter_manager.model, lora_request.lora_path, _lora_logger)
+        ## END PATCHED CODE
+
         return loaded
 
     LRUCacheWorkerLoRAManager._apply_adapters = _patched__apply_adapters
     LRUCacheWorkerLoRAManager.add_adapter = _patched_add_adapter
 
+
+def _apply_noisy_norms(model, adapter_path: str, logger) -> None:
+    """Apply QeRL noisy norm weights to vLLM's base model parameters.
+
+    Looks for ``noisy_norms.safetensors`` in the adapter directory. If found,
+    loads the tensors and overwrites matching base model parameters in-place.
+    Each call uses fresh noise computed from clean base weights (no compounding).
+    """
+    import os
+
+    from surogate.grpo.noise_scheduler import NOISY_NORMS_FILENAME
+
+    noisy_path = os.path.join(adapter_path, NOISY_NORMS_FILENAME)
+    if not os.path.isfile(noisy_path):
+        return
+
+    from safetensors.torch import load_file
+
+    noisy_norms = load_file(noisy_path, device="cpu")
+    if not noisy_norms:
+        return
+
+    param_dict = dict(model.named_parameters())
+    for name, tensor in noisy_norms.items():
+        if name in param_dict:
+            param = param_dict[name]
+            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
 # Monkeypatch TokenizeParams to fix overly conservative validation
 def monkey_patch_tokenize_params_validation():
