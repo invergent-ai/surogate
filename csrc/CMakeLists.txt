@@ -132,6 +132,17 @@ FetchContent_Declare(
         EXCLUDE_FROM_ALL
 )
 
+# Flash Attention — only the source tree is needed; we compile specific .cu files
+# directly into our own static library, so we use Populate (not MakeAvailable) to
+# avoid running flash-attention's own CMakeLists.txt / Python extension build.
+FetchContent_Declare(
+        flash_attn
+        GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+        GIT_TAG v2.8.3
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL
+)
+
 find_package(CUDAToolkit COMPONENTS cuBLAS REQUIRED)
 
 FetchContent_MakeAvailable(json)
@@ -141,6 +152,12 @@ FetchContent_MakeAvailable(fmt)
 FetchContent_MakeAvailable(catch2)
 FetchContent_MakeAvailable(cutlass)
 FetchContent_MakeAvailable(backward)
+
+# Populate flash-attention source tree without invoking its build system
+FetchContent_GetProperties(flash_attn)
+if(NOT flash_attn_POPULATED)
+    FetchContent_Populate(flash_attn)
+endif()
 
 # Find libdw (elfutils) or libdwarf for stack traces with backward-cpp
 # libdw (from elfutils) is preferred, libdwarf is a fallback
@@ -416,7 +433,7 @@ target_sources(surogate-common PRIVATE
 
 # Flash Attention varlen kernels (from DAO-AiLab/flash-attention)
 # Used for document-level attention masking in GRPO training
-set(FLASH_ATTN_DIR ${CMAKE_SOURCE_DIR}/../study/flash-attention/csrc/flash_attn)
+set(FLASH_ATTN_DIR ${flash_attn_SOURCE_DIR}/csrc/flash_attn)
 set(FLASH_ATTN_SOURCES
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim64_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim96_bf16_causal_sm80.cu
