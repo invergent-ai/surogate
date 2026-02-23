@@ -3,7 +3,7 @@
 QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model weights while training LoRA adapters in higher precision. Surogate supports two modes:
 
 - **Online QLoRA**: Weights are quantized on-the-fly at startup from a standard BF16/FP16 checkpoint.
-- **Pre-quantized models**: Load a model that is already quantized (e.g., from HuggingFace Hub). Supported formats are **Fine-Grained FP8** (compatible with NVIDIA ModelOpt FP8 exports) and **ModelOpt NVFP4** (two-level FP8+FP32 block scaling). Pre-quantized models skip the quantization step at startup and load directly into the quantized format.
+- **Pre-quantized models**: Load a model that is already quantized (e.g., from HuggingFace Hub). Supported formats are **Fine-Grained FP8** (compatible with NVIDIA ModelOpt FP8 exports), **ModelOpt NVFP4** (two-level FP8+FP32 block scaling), and **MXFP4** (microscaling FP4, GPT-OSS models). Pre-quantized models skip the quantization step at startup and load directly into the quantized format.
 
 Surogate supports three online QLoRA quantization formats:
 
@@ -20,10 +20,11 @@ When a HuggingFace model already ships with pre-quantized weights (e.g., a Model
 
 ### Supported Formats
 
-| Format               | HF `quant_method`   | Data dtype  | Scale dtype           | Notes                              |
-| -------------------- | ------------------- | ----------- | --------------------- | ---------------------------------- |
-| **Fine-Grained FP8** | `fp8`               | FP8 E4M3    | FP32 (inverse scale)  | Per-block 2D tile scaling          |
-| **ModelOpt NVFP4**   | `modelopt` / NVFP4  | FP4 E2M1    | FP8 block + FP32 global | Two-level scaling (FP8 + FP32)  |
+| Format                                                                                           | HF `quant_method`  | Data dtype | Scale dtype             | Notes                                                       |
+| ------------------------------------------------------------------------------------------------ | ------------------ | ---------- | ----------------------- | ----------------------------------------------------------- |
+| [**Fine-Grained FP8**](https://huggingface.co/docs/transformers/en/quantization/finegrained_fp8) | `fp8`              | FP8 E4M3   | FP32 (inverse scale)    | Per-block 2D tile scaling                                   |
+| [**ModelOpt NVFP4**](https://huggingface.co/docs/transformers/en/quantization/mxfp4)             | `modelopt` / NVFP4 | FP4 E2M1   | FP8 block + FP32 global | Two-level scaling (FP8 + FP32)                              |
+| [**MXFP4**](https://huggingface.co/docs/transformers/en/quantization/mxfp4)                      | `mxfp4`            | FP4 E2M1   | FP8 per-block           | GPT-OSS models only; uses `_blocks`/`_scales` tensor naming |
 
 ### How It Works
 
@@ -31,12 +32,15 @@ Surogate inspects the model's `quantization_config` in its HuggingFace `config.j
 
 **HuggingFace tensor naming:**
 
-| Format             | Data tensor            | Block scale tensor         | Global scale tensor          |
-| ------------------ | ---------------------- | -------------------------- | ---------------------------- |
-| Fine-Grained FP8   | `{name}.weight`        | `{name}.weight_scale_inv`  | —                            |
-| ModelOpt NVFP4     | `{name}.weight`        | `{name}.weight_scale`      | `{name}.weight_scale_2`      |
+| Format           | Data tensor     | Block scale tensor        | Global scale tensor     |
+| ---------------- | --------------- | ------------------------- | ----------------------- |
+| Fine-Grained FP8 | `{name}.weight` | `{name}.weight_scale_inv` | —                       |
+| ModelOpt NVFP4   | `{name}.weight` | `{name}.weight_scale`     | `{name}.weight_scale_2` |
+| MXFP4            | `{base}_blocks` | `{base}_scales`           | —                       |
 
-For both formats, layers listed in the model's `modules_to_not_convert` (typically the embedding and LM head) are loaded at full BF16 precision.
+MXFP4 uses a different base name convention — there is no `.weight` suffix; instead, the packed FP4 data is stored as `{base}_blocks` and the FP8 scales as `{base}_scales`.
+
+For all formats, layers listed in the model's `modules_to_not_convert` (typically the embedding and LM head) are loaded at full BF16 precision.
 
 Fused weight tensors (e.g., `gate_up_proj`) that are stored as separate components in the pre-quantized checkpoint are loaded, dequantized, fused, and re-quantized automatically.
 
@@ -65,6 +69,17 @@ lora: true
 lora_rank: 16
 recipe: nvfp4
 ```
+
+### Example — MXFP4 (GPT-OSS)
+
+```yaml
+model: nvidia/Nemotron-H-47B-Base-MXFP4
+lora: true
+lora_rank: 16
+recipe: bf16
+```
+
+MXFP4 is currently only supported for GPT-OSS model architectures. The format is detected automatically from the checkpoint's `quantization_config`.
 
 ---
 
@@ -155,12 +170,12 @@ FP4 E2M1 provides extreme compression with only 8 representable values per sign:
 
 ### Parameters
 
-| Parameter                 | Default | Description               |
-| ------------------------ | ------- | ------------------------- |
-| `qlora_fp4`              | false   | Enable FP4 QLoRA          |
-| `skip_quant_first_layers`| 0       | Skip FP4 for first N layers |
-| `skip_quant_last_layers` | 0       | Skip FP4 for last N layers  |
-| `backend`                | cutlass | Backend: cudnn or cutlass |
+| Parameter                 | Default | Description                 |
+| ------------------------- | ------- | --------------------------- |
+| `qlora_fp4`               | false   | Enable FP4 QLoRA            |
+| `skip_quant_first_layers` | 0       | Skip FP4 for first N layers |
+| `skip_quant_last_layers`  | 0       | Skip FP4 for last N layers  |
+| `backend`                 | cutlass | Backend: cudnn or cutlass   |
 
 ### Recommended Recipe Combinations
 
@@ -233,7 +248,7 @@ Unlike FP8 and FP4 QLoRA which require specific GPU architectures, NF4 QLoRA wor
 ### Recommended Recipe Combinations
 
 | Recipe     | Use Case                                         |
-| ---------- | ----------------------------------------------- |
+| ---------- | ------------------------------------------------ |
 | **bf16**   | Best accuracy, broad compatibility (Recommended) |
 | fp8-hybrid | Faster compute on SM89+ GPUs                     |
 
