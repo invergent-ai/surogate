@@ -15,6 +15,7 @@ Startup sequence:
 """
 
 import asyncio
+import logging
 import sys
 import time
 from threading import Event, Thread
@@ -34,6 +35,7 @@ def _run_vllm_server(
     error_event: Event,
     engine_holder: list,
     loop_holder: list,
+    shutdown_event: Event,
 ):
     """Run vLLM server in a background thread. Signals ready_event when serving.
 
@@ -41,6 +43,8 @@ def _run_vllm_server(
         init_app_state stores it so the main thread can use it for collective_rpc.
     loop_holder: shared list; we append the asyncio event loop so the main thread
         can schedule coroutines on it via asyncio.run_coroutine_threadsafe().
+    shutdown_event: set by the main thread before stopping the loop, so we can
+        distinguish intentional shutdown from unexpected errors.
     """
     try:
         import signal
@@ -79,6 +83,7 @@ def _run_vllm_server(
         # Suppress both when running in a background thread.
         _original_signal = signal.signal
         signal.signal = lambda *a, **kw: signal.SIG_DFL
+        loop = None
         try:
             loop = uvloop.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -86,13 +91,42 @@ def _run_vllm_server(
             # Share the loop so the main thread can schedule collective_rpc calls
             loop_holder.append(loop)
             loop.run_until_complete(run_server(args))
+        except RuntimeError as e:
+            # When the main thread calls loop.stop() for graceful shutdown,
+            # run_until_complete() raises "Event loop stopped before Future completed".
+            # This is expected — not an error.
+            if shutdown_event.is_set():
+                logger.info(f"vLLM server stopped (graceful shutdown)")
+            else:
+                raise
         finally:
             signal.signal = _original_signal
             _api_server_mod.init_app_state = _prev_init_app_state
-            try:
-                loop.close()
-            except Exception:
-                pass
+            # Cancel all pending async tasks to suppress "Task was destroyed but
+            # it is pending!" warnings (e.g., listen_for_disconnect coroutines).
+            # Mute uvicorn's error logger during cancellation — it logs
+            # CancelledError stack traces for in-flight ASGI requests.
+            if loop is not None:
+                uvicorn_logger = logging.getLogger("uvicorn.error")
+                prev_level = uvicorn_logger.level
+                uvicorn_logger.setLevel(logging.CRITICAL)
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    # Give cancelled tasks a chance to run their cleanup.
+                    # After loop.stop(), we need to restart before run_until_complete.
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+                finally:
+                    uvicorn_logger.setLevel(prev_level)
+                try:
+                    loop.close()
+                except Exception:
+                    pass
     except Exception as e:
         logger.error(f"vLLM server error: {e}")
         error_event.set()
@@ -175,6 +209,7 @@ def grpo_unified(
 
     error_event = Event()
     vllm_ready = Event()
+    shutdown_event = Event()  # Set before stopping vLLM loop for graceful shutdown
     engine_holder: list = []  # Shared: vLLM thread appends engine_client here
     loop_holder: list = []    # Shared: vLLM thread appends event loop here
 
@@ -182,7 +217,8 @@ def grpo_unified(
     logger.info(f"Starting vLLM server on port {infer_config.port}" )
     vllm_thread = Thread(
         target=_run_vllm_server,
-        args=(infer_config, vllm_ready, error_event, engine_holder, loop_holder),
+        args=(infer_config, vllm_ready, error_event, engine_holder, loop_holder,
+              shutdown_event),
         daemon=True,
         name="vllm-server",
     )
@@ -231,3 +267,15 @@ def grpo_unified(
         raise
     finally:
         logger.info("Unified GRPO pipeline shutting down")
+
+        # Wait for trainer to finish (it stops when orchestrator writes the stop signal)
+        trainer_thread.join(timeout=30.0)
+        if trainer_thread.is_alive():
+            logger.warning("Trainer thread did not finish within 30s")
+
+        # Stop vLLM event loop gracefully. Set shutdown_event first so the
+        # vLLM thread knows the "Event loop stopped" RuntimeError is expected.
+        shutdown_event.set()
+        if event_loop is not None and not event_loop.is_closed():
+            event_loop.call_soon_threadsafe(event_loop.stop)
+            vllm_thread.join(timeout=10.0)
