@@ -32,8 +32,8 @@ _NORM_WEIGHT_RE = re.compile(
     r"\.weight$"
 )
 
-# Path for noisy norms saved alongside LoRA adapter (not inside it).
-NOISY_NORMS_FILENAME = "noisy_norms.safetensors"
+# Sigma file written alongside LoRA adapter for vLLM worker to read.
+NOISE_SIGMA_FILENAME = "qerl_sigma.json"
 
 
 def compute_sigma(step: int, total_steps: int, config: NoiseSchedulerConfig) -> float:
@@ -105,38 +105,15 @@ def inject_noise_into_safetensors(
     return modified
 
 
-def inject_noise_adapter(
-    adapter_dir: Path,
-    base_model_dir: Path,
-    sigma: float,
-) -> int:
-    """Inject noise into norm weights for a LoRA adapter export.
+def write_noise_sigma(adapter_dir: Path, sigma: float) -> None:
+    """Write the noise sigma to a JSON file alongside the LoRA adapter.
 
-    Reads RMSNorm weights from the base model, adds Gaussian noise, and saves
-    them as a separate ``noisy_norms.safetensors`` file alongside the adapter.
-    The adapter itself (adapter_config.json, adapter_model.safetensors) is NOT
-    modified — this avoids vLLM's ``modules_to_save`` validation error.
-
-    The noisy norms are applied to vLLM's base model by a monkey-patch in
-    ``patches.py`` after the adapter is loaded.
-
-    Returns the number of tensors written.
+    The vLLM worker reads this file and applies noise in-place to the base
+    model's RMSNorm weights on GPU, matching the QeRL reference implementation.
     """
-    from safetensors.torch import save_file
-
-    base_norms = _load_base_model_norms(base_model_dir)
-    if not base_norms:
-        logger.warning("No RMSNorm weights found in base model")
-        return 0
-
-    noisy_norms = {}
-    for hf_name, weight in base_norms.items():
-        noisy_norms[hf_name] = _add_noise_to_tensor(weight, sigma)
-
-    if noisy_norms:
-        save_file(noisy_norms, str(adapter_dir / "noisy_norms.safetensors"))
-
-    return len(noisy_norms)
+    sigma_file = adapter_dir / NOISE_SIGMA_FILENAME
+    with open(sigma_file, "w") as f:
+        json.dump({"sigma": sigma}, f)
 
 
 def inject_noise_model(model_dir: Path, sigma: float) -> int:
@@ -150,36 +127,3 @@ def inject_noise_model(model_dir: Path, sigma: float) -> int:
     return total
 
 
-def _load_base_model_norms(model_dir: Path) -> dict[str, torch.Tensor]:
-    """Load RMSNorm weight tensors from a HuggingFace model directory."""
-    from safetensors.torch import load_file
-
-    norms: dict[str, torch.Tensor] = {}
-
-    # Handle sharded models (model.safetensors.index.json)
-    index_file = model_dir / "model.safetensors.index.json"
-    if index_file.exists():
-        with open(index_file) as f:
-            index = json.load(f)
-        # Collect norm weights and their shard files
-        shard_keys: dict[str, list[str]] = {}  # shard_file -> [key, ...]
-        for key, shard in index.get("weight_map", {}).items():
-            if _NORM_WEIGHT_RE.search(key):
-                shard_keys.setdefault(shard, []).append(key)
-        for shard, keys in shard_keys.items():
-            shard_path = model_dir / shard
-            if shard_path.exists():
-                all_tensors = load_file(str(shard_path), device="cpu")
-                for key in keys:
-                    if key in all_tensors:
-                        norms[key] = all_tensors[key]
-    else:
-        # Single file model
-        st_file = model_dir / "model.safetensors"
-        if st_file.exists():
-            all_tensors = load_file(str(st_file), device="cpu")
-            for key, val in all_tensors.items():
-                if _NORM_WEIGHT_RE.search(key):
-                    norms[key] = val
-
-    return norms

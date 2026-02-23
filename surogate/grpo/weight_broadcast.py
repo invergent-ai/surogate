@@ -96,26 +96,22 @@ class SurogateWeightBroadcast:
         if self.max_steps <= 0:
             return
 
-        from surogate.grpo.noise_scheduler import (
-            compute_sigma,
-            inject_noise_adapter,
-            inject_noise_model,
-        )
+        from surogate.grpo.noise_scheduler import compute_sigma
 
         sigma = compute_sigma(step, self.max_steps, self.noise_config)
         if sigma <= 0.0:
             return
 
         if self.adapter_only:
-            if not self.base_model_dir:
-                logger.warning("QeRL noise: base_model_dir not set, skipping noise injection")
-                return
-            n = inject_noise_adapter(save_dir, self.base_model_dir, sigma)
+            # Write sigma file — vLLM worker applies noise in-place on GPU
+            from surogate.grpo.noise_scheduler import write_noise_sigma
+            write_noise_sigma(save_dir, sigma)
+            logger.info(f"QeRL noise: wrote sigma={sigma:.6f} for step {step}")
         else:
+            from surogate.grpo.noise_scheduler import inject_noise_model
             n = inject_noise_model(save_dir, sigma)
-
-        if n > 0:
-            logger.info(f"QeRL noise: injected sigma={sigma:.6f} into {n} norm tensors (step {step})")
+            if n > 0:
+                logger.info(f"QeRL noise: injected sigma={sigma:.6f} into {n} norm tensors (step {step})")
 
     def cleanup(self, current_step: int) -> None:
         """Remove old broadcast directories, keeping only recent ones."""
@@ -205,25 +201,20 @@ class ColocateWeightBroadcast:
             mrm.ready_to_update[idx] = False
 
     def _maybe_inject_noise_on_disk(self, save_dir: Path, step: int) -> None:
-        """Inject QeRL AQN noise into exported adapter files (same as SurogateWeightBroadcast)."""
+        """Write QeRL noise sigma file for vLLM worker to apply in-place on GPU."""
         if not self.noise_config or not self.noise_config.enabled:
             return
         if self.max_steps <= 0:
             return
 
-        from surogate.grpo.noise_scheduler import compute_sigma, inject_noise_adapter
+        from surogate.grpo.noise_scheduler import compute_sigma, write_noise_sigma
 
         sigma = compute_sigma(step, self.max_steps, self.noise_config)
         if sigma <= 0.0:
             return
 
-        if not self.base_model_dir:
-            logger.warning("QeRL noise: base_model_dir not set, skipping noise injection")
-            return
-
-        n = inject_noise_adapter(save_dir, self.base_model_dir, sigma)
-        if n > 0:
-            logger.info(f"QeRL noise (colocate): injected sigma={sigma:.6f} into {n} norm tensors (step {step})")
+        write_noise_sigma(save_dir, sigma)
+        logger.info(f"QeRL noise (colocate): wrote sigma={sigma:.6f} for step {step}")
 
     def cleanup(self, current_step: int) -> None:
         """Remove old broadcast directories, keeping only recent ones."""

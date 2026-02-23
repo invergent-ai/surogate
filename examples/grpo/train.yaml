@@ -44,11 +44,11 @@ loss:
 
 # QeRL noise scheduler (Adaptive Quantization Noise)
 # Adds Gaussian noise to RMSNorm weights in inference model for exploration.
-# noise_scheduler:
-#   enabled: true
-#   sigma_start: 5e-2
-#   sigma_end: 5e-4
-#   num_stages: 10
+noise_scheduler:
+  enabled: true
+  sigma_start: 5e-2
+  sigma_end: 5e-4
+  num_stages: 10
 
 # Checkpointing
 save_steps: 100

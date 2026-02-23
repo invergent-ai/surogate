@@ -165,32 +165,56 @@ def monkey_patch_LRUCacheWorkerLoRAManager():
     LRUCacheWorkerLoRAManager.add_adapter = _patched_add_adapter
 
 
-def _apply_noisy_norms(model, adapter_path: str, logger) -> None:
-    """Apply QeRL noisy norm weights to vLLM's base model parameters.
+# Module-level storage for original norm weights (prevents noise compounding
+# since our architecture only syncs LoRA adapters, not base model norms).
+_original_norms: dict[str, "torch.Tensor"] = {}
 
-    Looks for ``noisy_norms.safetensors`` in the adapter directory. If found,
-    loads the tensors and overwrites matching base model parameters in-place.
-    Each call uses fresh noise computed from clean base weights (no compounding).
+
+def _apply_noisy_norms(model, adapter_path: str, logger) -> None:
+    """Apply QeRL noise to vLLM's base model RMSNorm weights in-place.
+
+    Matches the reference implementation: generates Gaussian noise in float32,
+    moves to device, casts to weight dtype, adds in-place via ``param.add_(noise)``.
+
+    Saves original norm weights on first call and restores them before each fresh
+    noise addition to prevent noise compounding across steps.
     """
+    import json
     import os
 
-    from surogate.grpo.noise_scheduler import NOISY_NORMS_FILENAME
+    import torch
 
-    noisy_path = os.path.join(adapter_path, NOISY_NORMS_FILENAME)
-    if not os.path.isfile(noisy_path):
+    from surogate.grpo.noise_scheduler import NOISE_SIGMA_FILENAME, _NORM_WEIGHT_RE
+
+    sigma_path = os.path.join(adapter_path, NOISE_SIGMA_FILENAME)
+    if not os.path.isfile(sigma_path):
         return
 
-    from safetensors.torch import load_file
+    with open(sigma_path) as f:
+        sigma = json.load(f).get("sigma", 0.0)
 
-    noisy_norms = load_file(noisy_path, device="cpu")
-    if not noisy_norms:
+    if sigma <= 0.0:
         return
 
-    param_dict = dict(model.named_parameters())
-    for name, tensor in noisy_norms.items():
-        if name in param_dict:
-            param = param_dict[name]
-            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+    count = 0
+    for name, param in model.named_parameters():
+        if not _NORM_WEIGHT_RE.search(name):
+            continue
+
+        # Save original on first call
+        if name not in _original_norms:
+            _original_norms[name] = param.data.clone()
+
+        # Restore original before adding fresh noise
+        param.data.copy_(_original_norms[name])
+
+        # Match reference: float32 on CPU → move to device → cast to weight dtype → add_
+        noise = torch.normal(mean=0.0, std=sigma, size=param.shape, dtype=torch.float32).to(param.device)
+        noise = noise.to(param.dtype)
+        with torch.no_grad():
+            param.data.add_(noise)
+        count += 1
+
 
 # Monkeypatch TokenizeParams to fix overly conservative validation
 def monkey_patch_tokenize_params_validation():
