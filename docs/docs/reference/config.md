@@ -130,7 +130,7 @@ distributed:
 | `cooldown_steps`    | int    | `0`            | Number of steps for linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`. |
 | `final_lr_fraction` | float  | `0.0`          | Final learning rate as a fraction of the initial learning rate.                                  |
 | `weight_decay`      | float  | `0.1`          | Weight decay applied to all layers except bias and LayerNorm weights.                            |
-| `max_grad_norm`     | float  | `0.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                            |
+| `max_grad_norm`     | float  | `1.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                            |
 
 ### AdamW 8-bit Optimizer Parameters
 

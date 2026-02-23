@@ -1301,7 +1301,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                         }
                         comp_qt.data = Tensor::from_pointer(
                             static_cast<std::byte*>(comp_data_gpu), 0,
-                            ETensorDType::BYTE,
+                            qt.data.DType,
                             std::vector<long>{static_cast<long>(need_data)});
 
                         // Read packed quantized data
@@ -1309,12 +1309,16 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                             comp_qt.data, 0, comp_qt.data.nelem(), true);
 
                         // Read per-block scales
+                        // Use the target scale dtype (e.g. FP32 for FP8, FP8_E4M3
+                        // for NVFP4) — HF files may store scales in a different
+                        // dtype (e.g. BF16) and read_raw handles conversion.
                         std::string comp_scale_hf = comp_hf + config.scale_suffix;
                         const auto& comp_scale_entry =
                             reader.find_entry(comp_scale_hf);
+                        const auto target_scale_dtype = qt.scales.DType;
                         size_t need_scale =
                             static_cast<size_t>(entry_nelem(comp_scale_entry))
-                            * get_dtype_size(comp_scale_entry.dtype());
+                            * get_dtype_size(target_scale_dtype);
                         if (need_scale > comp_scale_cap) {
                             if (comp_scale_gpu) CUDA_CHECK(cudaFree(comp_scale_gpu));
                             CUDA_CHECK(cudaMalloc(&comp_scale_gpu, need_scale));
@@ -1322,7 +1326,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                         }
                         comp_qt.scales = Tensor::from_pointer(
                             static_cast<std::byte*>(comp_scale_gpu), 0,
-                            comp_scale_entry.dtype(),
+                            target_scale_dtype,
                             std::vector<long>(comp_scale_entry.shape().begin(),
                                               comp_scale_entry.shape().end()));
                         comp_scale_entry.read_raw(

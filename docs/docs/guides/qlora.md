@@ -1,6 +1,11 @@
 # Quantized LoRA (QLoRA)
 
-QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model weights while training LoRA adapters in higher precision. Surogate supports three QLoRA quantization formats:
+QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model weights while training LoRA adapters in higher precision. Surogate supports two modes:
+
+- **Online QLoRA**: Weights are quantized on-the-fly at startup from a standard BF16/FP16 checkpoint.
+- **Pre-quantized models**: Load a model that is already quantized (e.g., from HuggingFace Hub). Supported formats are **Fine-Grained FP8** (compatible with NVIDIA ModelOpt FP8 exports) and **ModelOpt NVFP4** (two-level FP8+FP32 block scaling). Pre-quantized models skip the quantization step at startup and load directly into the quantized format.
+
+Surogate supports three online QLoRA quantization formats:
 
 | Aspect                 | FP8 QLoRA                      | FP4 QLoRA                    | NF4 QLoRA (BitsAndBytes)          |
 | ---------------------- | ------------------------------ | ---------------------------- | --------------------------------- |
@@ -8,6 +13,60 @@ QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model w
 | **Scaling**            | Per-tensor delayed             | Two-level block (FP8 + FP32) | Per-block absmax (+ double quant) |
 | **GPU Requirement**    | SM89+ (Ada, Hopper, Blackwell) | SM100+ (Blackwell only)      | Any CUDA GPU                      |
 | **Memory Compression** | ~50% vs FP16                   | ~75% vs FP16                 | ~75% vs FP16                      |
+
+## Pre-Quantized Models
+
+When a HuggingFace model already ships with pre-quantized weights (e.g., a ModelOpt-quantized checkpoint), Surogate can load the quantized tensors directly from the safetensors files without running an online quantization pass at startup. This saves significant startup time for large models and ensures the training run uses exactly the same quantized representation as the published checkpoint.
+
+### Supported Formats
+
+| Format               | HF `quant_method`   | Data dtype  | Scale dtype           | Notes                              |
+| -------------------- | ------------------- | ----------- | --------------------- | ---------------------------------- |
+| **Fine-Grained FP8** | `fp8`               | FP8 E4M3    | FP32 (inverse scale)  | Per-block 2D tile scaling          |
+| **ModelOpt NVFP4**   | `modelopt` / NVFP4  | FP4 E2M1    | FP8 block + FP32 global | Two-level scaling (FP8 + FP32)  |
+
+### How It Works
+
+Surogate inspects the model's `quantization_config` in its HuggingFace `config.json` at startup to detect the pre-quantized format automatically — no extra config keys are needed.
+
+**HuggingFace tensor naming:**
+
+| Format             | Data tensor            | Block scale tensor         | Global scale tensor          |
+| ------------------ | ---------------------- | -------------------------- | ---------------------------- |
+| Fine-Grained FP8   | `{name}.weight`        | `{name}.weight_scale_inv`  | —                            |
+| ModelOpt NVFP4     | `{name}.weight`        | `{name}.weight_scale`      | `{name}.weight_scale_2`      |
+
+For both formats, layers listed in the model's `modules_to_not_convert` (typically the embedding and LM head) are loaded at full BF16 precision.
+
+Fused weight tensors (e.g., `gate_up_proj`) that are stored as separate components in the pre-quantized checkpoint are loaded, dequantized, fused, and re-quantized automatically.
+
+### Constraints
+
+- **Requires `lora: true`** — base weights are frozen; only LoRA adapters are trained.
+- **Mutually exclusive with online QLoRA** — `qlora_fp8`, `qlora_fp4`, and `qlora_bnb` must all be `false`.
+- **No adapter merging** — `adapter_path` is not supported because there is no BF16 intermediate.
+
+### Example — Fine-Grained FP8
+
+```yaml
+model: nvidia/Llama-3.1-8B-Instruct-FP8
+lora: true
+lora_rank: 16
+recipe: bf16
+```
+
+No quantization flags are needed — the format is detected from the checkpoint's `quantization_config`.
+
+### Example — ModelOpt NVFP4
+
+```yaml
+model: nvidia/Llama-3.1-8B-Instruct-NVFP4
+lora: true
+lora_rank: 16
+recipe: nvfp4
+```
+
+---
 
 ## QLoRA vs Recipes
 
