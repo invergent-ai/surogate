@@ -360,6 +360,21 @@ class GRPOTrainer:
                 if loss_scale > 1:
                     per_token_grads_flat = per_token_grads_flat / float(loss_scale)
 
+                # --- Diagnostic: per-micro-batch logprob + masking summary ---
+                if step <= 1:
+                    mask = loss_mask_flat[:T_actual].astype(bool)
+                    t_lp = all_trainer_logprobs[:T_actual]
+                    n_nan = int(np.isnan(t_lp[mask]).sum())
+                    n_fin = int(np.isfinite(t_lp[mask]).sum())
+                    logger.info(
+                        f"[DIAG] step={step} mb={mb_idx}: "
+                        f"T={T_actual} mask_count={mask.sum()} "
+                        f"nan_trainer={n_nan} finite_trainer={n_fin} "
+                        f"mb_is_masked_frac={mb_metrics.get('is_masked_frac', -1):.4f} "
+                        f"mb_policy_loss={mb_metrics.get('policy_loss', -1):.4f} "
+                        f"n_samples={len(sample_ranges)}"
+                    )
+
                 # --- Global left-shift of gradients (packed sequence) ---
                 # Align with global next-token shift used for labels.
                 surogate_grads = np.zeros(T_actual, dtype=np.float32)

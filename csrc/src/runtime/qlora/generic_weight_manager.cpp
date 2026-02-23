@@ -5,6 +5,7 @@
 
 #include "runtime/qlora/generic_weight_manager.h"
 
+#include <cmath>
 #include <stdexcept>
 
 #include <fmt/format.h>
@@ -434,6 +435,31 @@ Tensor& GenericWeightManager::get(const std::string& name, cudaStream_t stream) 
 
     // Full-precision weights: return directly
     if (!entry.is_quantized_weight) {
+        // Diagnostic: check first few full-precision weights
+        if (mDiagChecksRemaining > 0 && entry.full_precision.DType == ETensorDType::BF16) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const long n = entry.full_precision.nelem();
+            const int check_count = std::min(n, 32L);
+            std::vector<nv_bfloat16> host_vals(check_count);
+            CUDA_CHECK(cudaMemcpy(host_vals.data(), entry.full_precision.Data,
+                                  check_count * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            int nan_count = 0, inf_count = 0, zero_count = 0;
+            for (int i = 0; i < check_count; ++i) {
+                float v = __bfloat162float(host_vals[i]);
+                if (std::isnan(v)) nan_count++;
+                else if (std::isinf(v)) inf_count++;
+                else if (v == 0.0f) zero_count++;
+            }
+            fmt::print("[DIAG-FP] '{}' nelem={} first32: nan={} inf={} zero={} ok={} "
+                       "first4=[{:.4f},{:.4f},{:.4f},{:.4f}]\n",
+                       name, n, nan_count, inf_count, zero_count,
+                       check_count - nan_count - inf_count - zero_count,
+                       __bfloat162float(host_vals[0]),
+                       check_count > 1 ? __bfloat162float(host_vals[1]) : 0.0f,
+                       check_count > 2 ? __bfloat162float(host_vals[2]) : 0.0f,
+                       check_count > 3 ? __bfloat162float(host_vals[3]) : 0.0f);
+            --mDiagChecksRemaining;
+        }
         return entry.full_precision;
     }
 
@@ -647,6 +673,34 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry,
 
     entry.dequant_valid = true;
     entry.dequant_step = mCurrentStep;
+
+    // Diagnostic: check first few dequantized weights for NaN/Inf
+    if (mDiagChecksRemaining > 0) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const long n = entry.dequant_buffer.nelem();
+        const int check_count = std::min(n, 32L);
+        std::vector<nv_bfloat16> host_vals(check_count);
+        CUDA_CHECK(cudaMemcpy(host_vals.data(), entry.dequant_buffer.Data,
+                              check_count * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+        int nan_count = 0, inf_count = 0, zero_count = 0;
+        for (int i = 0; i < check_count; ++i) {
+            float v = __bfloat162float(host_vals[i]);
+            if (std::isnan(v)) nan_count++;
+            else if (std::isinf(v)) inf_count++;
+            else if (v == 0.0f) zero_count++;
+        }
+        fmt::print("[DIAG-DEQUANT] '{}' M={} K={} fmt={} global_scale={:.6g} "
+                   "first32: nan={} inf={} zero={} ok={} first4=[{:.4f},{:.4f},{:.4f},{:.4f}]\n",
+                   name, entry.M, entry.K, (int)entry.quantized.format,
+                   entry.quantized.global_scale,
+                   nan_count, inf_count, zero_count,
+                   check_count - nan_count - inf_count - zero_count,
+                   __bfloat162float(host_vals[0]),
+                   check_count > 1 ? __bfloat162float(host_vals[1]) : 0.0f,
+                   check_count > 2 ? __bfloat162float(host_vals[2]) : 0.0f,
+                   check_count > 3 ? __bfloat162float(host_vals[3]) : 0.0f);
+        --mDiagChecksRemaining;
+    }
 }
 
 void GenericWeightManager::acquire_pool_buffer(ManagedWeight& entry,

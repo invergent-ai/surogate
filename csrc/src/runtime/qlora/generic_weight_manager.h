@@ -417,6 +417,9 @@ private:
     /// Allocated lazily on first use, sized for the largest weight that needs
     /// transpose. Reused across all transpose dequant calls.
     Tensor mTransposeTemp;
+
+    /// Diagnostic: remaining dequant NaN checks (counts down from initial value).
+    int mDiagChecksRemaining = 5;
 };
 
 }  // namespace qlora

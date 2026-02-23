@@ -1883,7 +1883,9 @@ std::unique_ptr<GenericWeightManager> import_external_weights(
 
     int loaded_external = 0;
     int loaded_disk = 0;
+    int skipped_non_quant = 0;
     const int total = static_cast<int>(config.weight_specs.size());
+    std::vector<std::string> disk_loaded_names;
 
     // Fallback: load a weight from disk as full-precision (BF16).
     // Used for weights not found in the external lookup (e.g., embeddings, LM head
@@ -1909,6 +1911,7 @@ std::unique_ptr<GenericWeightManager> import_external_weights(
         if (success) {
             weight_mgr->register_full_precision(spec.name, tensor);
             loaded_disk++;
+            disk_loaded_names.push_back(spec.name);
         }
         return success;
     };
@@ -2071,6 +2074,16 @@ std::unique_ptr<GenericWeightManager> import_external_weights(
     fmt::print("[external import] Loaded {} weights from GPU pointers, "
                "{} from disk in {:.1f} ms\n",
                loaded_external, loaded_disk, elapsed_ms);
+    if (!disk_loaded_names.empty()) {
+        fmt::print("[external import] Disk-loaded: ");
+        for (size_t i = 0; i < disk_loaded_names.size() && i < 20; ++i) {
+            fmt::print("{}{}", (i > 0 ? ", " : ""), disk_loaded_names[i]);
+        }
+        if (disk_loaded_names.size() > 20) {
+            fmt::print(" ... and {} more", disk_loaded_names.size() - 20);
+        }
+        fmt::print("\n");
+    }
 
     const size_t quant_bytes = weight_mgr->quantized_bytes();
     const size_t fp_bytes = weight_mgr->full_precision_bytes();
