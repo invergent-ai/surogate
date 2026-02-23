@@ -17,7 +17,7 @@
   </a>
 </p>
 
-<h3>LLM pre-training & fine-tuning at practical hardware limits<br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
+<h3>LLM Pre-training, Fine-Tuning and Reinforcement Learning at practical hardware limits<br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
 <div>
 <a href="https://surogate.ai">Home</a> ·
 <a href="https://docs.surogate.ai">Docs</a> ·
@@ -53,6 +53,8 @@ See reproducible comparisons in [Benchmarks](https://docs.surogate.ai/reference/
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
+- [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](https://docs.surogate.ai/guides/rl-training): advanced GRPO training and evaluation with custom, deterministic environments
+- [**🔧 RL Environments***](https://docs.surogate.ai/guides/rl-environments): predictable environments for RL training
 - [**🖥️...🖥️ Native multi-GPU**](https://docs.surogate.ai/guides/multi-gpu) training with multi-threaded backend
 - [**🖥️...🖥️ Native multi-Node**](https://docs.surogate.ai/guides/multi-node) DDP training with Ray
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
