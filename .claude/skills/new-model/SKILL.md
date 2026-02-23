@@ -564,15 +564,19 @@ stack_experts("...experts.{expert}.gate_proj.weight", fuse_gate_up=True)
 
 ### Step 6: Register the Model
 
-Add imports in `surogate/dsl/blocks/__init__.py` and `surogate/dsl/models/__init__.py`:
+Add explicit imports in `surogate/dsl/blocks/__init__.py` and `surogate/dsl/models/__init__.py`:
 
 ```python
-# In surogate/dsl/blocks/__init__.py
-from . import my_model  # noqa: F401
+# In surogate/dsl/blocks/__init__.py — add import and __all__ entry
+from .my_model import MyModelBlock
+# Add "MyModelBlock" to __all__ list
 
-# In surogate/dsl/models/__init__.py
-from . import my_model  # noqa: F401
+# In surogate/dsl/models/__init__.py — add import and __all__ entry
+from .my_model import MyModel
+# Add "MyModel" to __all__ list
 ```
+
+If you created a custom attention module (e.g., `MyAttention`), also register it in `surogate/dsl/modules/__init__.py`.
 
 ### Step 7: Register in Core (Optional but recommended)
 

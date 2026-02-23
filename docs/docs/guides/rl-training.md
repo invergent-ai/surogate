@@ -383,6 +383,100 @@ noise_scheduler:
 
 QeRL works with both co-locate and multi-process modes.
 
+### On-Policy Distillation
+
+On-policy distillation uses a teacher model to provide dense token-level feedback alongside (or instead of) the reward signal. The student generates rollouts, and the teacher's log-probabilities guide the student to stay close to stronger behavior while still learning from rewards.
+
+The loss coefficient for each token becomes:
+
+```
+coeff = importance_ratio * (adv_tau * advantages + teacher_tau * (teacher_logprob - trainer_logprob) - kl_tau * log_ratio)
+```
+
+The `teacher_tau * (teacher_logprob - trainer_logprob)` term is positive when the teacher assigns higher probability to a token than the student, pulling the student toward the teacher's distribution.
+
+#### Enabling distillation
+
+Set `teacher_tau > 0` in `train.yaml` and configure the teacher in `orch.yaml`. The orchestrator computes teacher log-probabilities and delivers them alongside advantages in each micro-batch — no changes to the trainer command are needed.
+
+**`train.yaml`** — add `teacher_tau` to the loss block:
+
+```yaml
+loss:
+  ratio_type: token
+  adv_tau: 1.0
+  teacher_tau: 0.5   # blend: half reward signal, half teacher signal
+  kl_tau: 0.0
+```
+
+**`orch.yaml`** — add a `teacher_model` section to the orchestrator:
+
+```yaml
+model:
+  name: "Qwen/Qwen3-0.6B"
+  lora_adapter: "default"
+  lora_rank: 16
+
+teacher_model:
+  model:
+    name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+
+env:
+  - id: reverse-text
+
+batch_size: 128
+rollouts_per_example: 16
+seq_len: 2048
+max_steps: 40
+```
+
+If the teacher inference server is already running externally, point to it with a `client` entry instead:
+
+```yaml
+teacher_model:
+  model:
+    name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+  client:
+    base_url: ["http://teacher-server:8000/v1"]
+```
+
+#### Pure distillation (no reward verification)
+
+For agentic tasks where verification is expensive (code execution, tool use, multi-turn), skip reward scoring entirely and learn only from the teacher signal:
+
+**`train.yaml`**:
+
+```yaml
+loss:
+  adv_tau: 0.0       # disable reward signal
+  teacher_tau: 1.0   # learn only from teacher
+  kl_tau: 0.0
+```
+
+**`orch.yaml`**:
+
+```yaml
+teacher_model:
+  model:
+    name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+
+buffer:
+  skip_verification: true  # skip reward scoring
+
+env:
+  - id: your-env
+```
+
+#### Monitoring
+
+When teacher log-probabilities are present, the trainer logs an additional metric:
+
+| Metric       | Description                                                   |
+| ------------ | ------------------------------------------------------------- |
+| `teacher_kl` | Mean KL divergence from teacher to student (lower = closer to teacher) |
+
+A decreasing `teacher_kl` confirms the student is learning to match the teacher's distribution.
+
 
 ### Learning Rate
 
@@ -408,13 +502,14 @@ Unlike SFT where gradient accumulation increases effective batch size, in RL tra
 
 The trainer logs these GRPO-specific metrics at each step:
 
-| Metric      | Description                                             |
-| ----------- | ------------------------------------------------------- |
-| `kl`        | Mean KL divergence between current and inference policy |
-| `masked`    | Fraction of loss-eligible tokens that were masked       |
-| `tokens`    | Total loss-eligible tokens in the step                  |
-| `loss`      | Training loss (from the backward pass)                  |
-| `grad_norm` | Gradient norm after clipping                            |
+| Metric       | Description                                             |
+| ------------ | ------------------------------------------------------- |
+| `kl`         | Mean KL divergence between current and inference policy |
+| `masked`     | Fraction of loss-eligible tokens that were masked       |
+| `tokens`     | Total loss-eligible tokens in the step                  |
+| `loss`       | Training loss (from the backward pass)                  |
+| `grad_norm`  | Gradient norm after clipping                            |
+| `teacher_kl` | KL from teacher to student (only when `teacher_tau > 0`) |
 
 A healthy training run shows:
 
