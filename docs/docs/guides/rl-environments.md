@@ -1,4 +1,4 @@
-# Environments
+# RL Environments
 
 This guide walks through building environments with the [verifiers](https://github.com/PrimeIntellect-ai/verifiers) library, from simple single-turn tasks to complex multi-turn agents with tools. 
 
@@ -11,7 +11,7 @@ surogate vf-init <env_name>
 This creates a new empty environment in `./environments/<env_name>`
 
 ## Table of Contents
-- [Environments](#environments)
+- [RL Environments](#rl-environments)
   - [Table of Contents](#table-of-contents)
   - [Your First Environment](#your-first-environment)
   - [Datasets](#datasets)
