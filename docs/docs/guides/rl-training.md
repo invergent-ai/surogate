@@ -8,11 +8,11 @@ This gives you:
 - Async RL pipeline (rollouts, reward computation, sample packing)
 - vLLM for fast inference and generation
 - Optional zero-copy GPU weight sharing between trainer and inference (co-locate mode)
-- QeRL Adaptive Quantization Noise for improved exploration
-
+- Training & Evaluation with [Environments](./rl-environments.md)
+  
 ## Architecture
 
-GRPO training supports two deployment modes: **co-locate** (single command, recommended) and **multi-process** (three separate terminals).
+GRPO training supports two deployment modes: **co-locate** (single command, recommended) and **multi-process** (three separate processes).
 
 ### Co-locate mode (single command)
 
@@ -30,14 +30,14 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 │     └─ Owns quantized base weights on GPU                 │
 │     └─ Serves /v1/chat/completions                        │
 │                                                           │
-│  2. Surogate trainer (background thread)                  │
+│  2. Trainer (background thread)                           │
 │     └─ Borrows vLLM's quantized weights (zero-copy IPC)   │
 │     └─ Dequantizes on-the-fly for forward/backward        │
 │                                                           │
 │  3. Orchestrator (main async event loop)                  │
 │     └─ Sends rollout requests to vLLM via HTTP            │
 │     └─ Computes rewards and advantages                    │
-│     └─ Sends training batches via filesystem transport     │
+│     └─ Sends training batches via filesystem transport    │
 │     └─ Signals LoRA weight updates to vLLM                │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -46,13 +46,13 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 
 **Automatic memory management**: The trainer's GPU memory footprint (LoRA parameters, activations, dequantization buffers) is estimated automatically, and `gpu_memory_utilization` is computed so vLLM uses the remaining GPU memory for its KV cache. No manual tuning needed.
 
-### Multi-process mode (three terminals)
+### Multi-process mode (three processes)
 
 The original three-process architecture, useful for multi-node setups or when inference and training run on different GPUs:
 
 ```
 ┌─────────────┐    rollouts    ┌──────────────┐    batches    ┌──────────────────┐
-│   vLLM      │ ─────────────> │ Orchestrator │ ────────────> │ Surogate Trainer │
+│   vLLM      │ ─────────────> │ Orchestrator │ ────────────> │     Trainer      │
 └─────────────┘   new weights  └──────────────┘               └──────────────────┘
        ^                                                             │
        └─────────────── weight broadcast (filesystem) ───────────────┘
@@ -192,41 +192,161 @@ CUDA_VISIBLE_DEVICES=0 surogate grpo-train train.yaml
 
 For single-GPU setups, co-locate mode is generally better since it shares base weights and computes memory splits automatically.
 
-### Math reasoning example
+## How the Training Loop Works
 
-For a more practical task, here's a Hendrycks MATH setup with Qwen3-4B:
+Each training step performs:
 
-**`orch.yaml`**:
-```yaml
-model:
-  name: "Qwen/Qwen3-4B-Instruct"
+1. **Weight broadcast** (after step > 0): Saves LoRA adapter to `{output_dir}/broadcasts/step_{N}/` with a `STABLE` marker file. vLLM polls for this marker to hot-reload weights. If QeRL is enabled, noisy norm weights are saved alongside the adapter.
 
-env:
-  - id: "primeintellect/math-env"
-    name: "hendrycks-math"
-    args:
-      dataset_name: "PrimeIntellect/Hendrycks-Math"
-      dataset_subset: "default"
+2. **Pack and receive batch**: The packer (on master) converts `TrainingBatch` from the orchestrator into packed `MicroBatch` sequences. The data loader delivers these as numpy arrays.
 
-batch_size: 512
-rollouts_per_example: 16
-seq_len: 2048
-max_steps: 500
+3. **For each micro-batch** (gradient accumulation):
+    - `compute_logprobs()` computes log-probabilities under the current policy
+    - `compute_grpo_per_token_grads()` computes per-token gradient multipliers using the GRPO loss formula
+    - `step_with_custom_loss()` performs the forward + backward pass with GRPO gradient seeding
 
-sampling:
-  max_tokens: 2048
+4. **Optimizer step**: Updates LoRA adapter weights with the configured optimizer and learning rate schedule.
+
+### GRPO Loss Formula
+
+The GRPO loss for each token is:
+
+```
+loss = -(coeff * trainer_logprobs)[keep_mask].sum()
+
+where:
+  log_ratio = trainer_logprobs - inference_logprobs
+  importance_ratio = exp(log_ratio)
+  coeff = importance_ratio * (adv_tau * advantages - kl_tau * log_ratio)
 ```
 
-**`infer.yaml`**:
-```yaml
-model: "Qwen/Qwen3-4B-Instruct"
+The coefficient is treated as a constant (detached) during backpropagation, so the per-token gradient is simply:
+
+```
+grad[t] = -coeff[t] * keep_mask[t] / loss_scale
 ```
 
-## QeRL Adaptive Quantization Noise
+Tokens are masked (excluded) when their importance ratio falls outside `[token_mask_low, token_mask_high]`, or when sequence-level ratios exceed the geometric or sequence mask thresholds.
+
+## Asynchronous Off-Policy Training
+
+Surogate implements asynchronous off-policy training: inference generates rollouts from a policy that may lag behind the trainer by up to `max_async_level` steps (call this $k$). With $k=1$ and equal trainer/inference step times, neither component idles. The default is `max_async_level: 1`; increase it to `2` when weight broadcasts have higher latency (e.g., over a network).
+
+### Step Semantics
+
+Surogate uses a global step counter $n = 1, 2, 3, \ldots$ to tag all artifacts:
+
+- **Trainer**: Produces policy $\pi_n$ with weights $\theta_n$ from rollouts $(x_n, y_n)$
+- **Inference**: Produces rollouts $(x_n, y_n)$ from policy $\pi_{\max(0,\, n-k)}$
+
+The off-policy gap is at most $k$ steps. Rollouts whose gap exceeds `max_off_policy_steps` are discarded by the orchestrator.
+
+### Loss Objective
+
+The loss is a token-level variant of the [AIPO objective](https://arxiv.org/abs/2505.24034) (introduced in Llama-RL), without the entropy and KL terms. For $N$ prompts, each with a group of $G$ rollouts:
+
+$$
+\mathcal{J}(\theta)
+= \frac{1}{\sum_{j=1}^N \sum_{i=1}^G |y_i^{(j)}|}
+\sum_{j=1}^N
+\sum_{i=1}^G
+\sum_{t=1}^{|y_i^{(j)}|}
+\min\!\left(
+\frac{\pi_\theta(y^{(j)}_{i,t}\mid x_j, y^{(j)}_{i,<t})}{\mu(y^{(j)}_{i,t}\mid x_j, y^{(j)}_{i,<t})},\;
+\delta
+\right)\hat{A}^{(j)}_{i,t}
+$$
+
+where $\mu$ is the rollout policy, $\pi_\theta$ is the current trainer policy, $\hat{A}_{i,t}$ is the token-level advantage, and $\delta$ is the importance-sampling clip ratio (`token_mask_high`). The token masking thresholds (`token_mask_low`, `token_mask_high`, `geo_mask_low`, `geo_mask_high`) guard against tokens or sequences with extreme importance ratios caused by the off-policy gap.
+
+## Co-locate Mode Details
+
+### How weight sharing works
+
+In co-locate mode, the base model is loaded only once:
+
+1. vLLM starts first and loads the model (quantized weights go to GPU)
+2. The trainer receives GPU pointers to vLLM's quantized tensors via CUDA IPC
+3. Both vLLM and the trainer read from the same GPU memory — zero copy, zero duplication
+4. Only LoRA adapter updates (~10 MB) are written to disk and reloaded by vLLM
+
+This saves roughly 50% of GPU memory for the base model. For example, a Qwen3-8B model in NF4 takes ~4.5 GB — in co-locate mode this is shared instead of duplicated.
+
+### Automatic gpu_memory_utilization
+
+In co-locate mode, `gpu_memory_utilization` is computed automatically by estimating the trainer's GPU memory needs:
+
+| Component              | Estimate                                                        |
+| ---------------------- | --------------------------------------------------------------- |
+| LoRA parameters        | Weight + master copy + gradient + 8-bit optimizer (6 bytes/param) |
+| Activations            | Working set (6 BF16 tensors/layer) + logits + residual checkpoints |
+| Dequantization buffers | 3 concurrent BF16 buffers (max weight size)                     |
+| Embeddings + LM head   | vocab_size * hidden_size * 2 bytes (BF16, loaded from disk)     |
+| Fixed overhead         | 2.5 GB (CUDA context, cuDNN workspace, allocator fragmentation) |
+
+The remaining GPU memory (minus a 10% safety margin) is assigned to vLLM. You can override this by setting `gpu_memory_utilization` explicitly in `infer.yaml`.
+
+### Multi-GPU co-locate
+
+Both the trainer and vLLM use data parallelism (`tp=1, dp=N`). Each GPU has a full model replica, and weight sharing is 1:1 per GPU:
+
+```yaml
+# train.yaml
+gpus: 2
+
+# infer.yaml
+dp: 2
+```
+
+### Supported quantization formats
+
+Co-locate weight sharing works with all quantization formats since it operates on raw GPU pointers:
+
+- **BnB NF4** — Packed uint8 data + FP32 scales
+- **FP8** (E4M3) — FP8 data + FP32 block scales
+- **NVFP4** — Packed FP4 data + FP8 scales + FP32 global scale
+
+## QLoRA for RL Training
+
+All QLoRA formats work with GRPO. QLoRA is particularly useful for RL training since it reduces the memory footprint of the frozen base model, leaving more room for the sequence buffers and logprob computations:
+
+```yaml
+# FP8 QLoRA (SM89+: RTX 40xx, L40, H100)
+lora: true
+qlora_fp8: true
+recipe: bf16
+
+# NF4 QLoRA (any GPU)
+lora: true
+qlora_bnb: true
+recipe: bf16
+
+# FP4 QLoRA (SM100+: Blackwell)
+lora: true
+qlora_fp4: true
+recipe: nvfp4
+```
+
+See [QLoRA guide](qlora.md) for details on each format.
+
+## Multi-GPU RL Training
+
+Multi-GPU training works the same as SFT. Surogate handles data parallelism internally — the trainer presents as a single process to the orchestrator:
+
+```yaml
+gpus: 4
+zero_level: 1  # Default: shard optimizer states
+```
+
+Each micro-batch is replicated across all GPUs. The per-token gradient computation happens on the first GPU's logprobs, and the resulting gradients are replicated for the backward pass.
+
+## Tuning Tips
+
+### QeRL Adaptive Quantization Noise
 
 QeRL (Quantization-enhanced RL, [arXiv:2510.11696](https://arxiv.org/abs/2510.11696)) adds controlled Gaussian noise to the inference model's RMSNorm weights during rollout generation. This encourages exploration by making the inference policy slightly stochastic, improving reward signal diversity in early training.
 
-### How it works
+#### How it works
 
 1. At each training step, the noise scheduler computes a sigma value based on a geometric decay schedule
 2. All RMSNorm weights (input_layernorm, post_attention_layernorm, etc.) are read from the base model
@@ -236,7 +356,7 @@ QeRL (Quantization-enhanced RL, [arXiv:2510.11696](https://arxiv.org/abs/2510.11
 
 The sigma decays geometrically from `sigma_start` to `sigma_end` over `num_stages` intervals. The first interval uses sigma=0 (no noise) to establish a baseline.
 
-### Configuration
+#### Configuration
 
 Add `noise_scheduler` to `train.yaml`:
 
@@ -255,13 +375,55 @@ noise_scheduler:
 | `sigma_end`   | `5e-4`  | Final noise standard deviation                  |
 | `num_stages`  | `10`    | Number of geometric decay intervals             |
 
-### When to use QeRL
+#### When to use QeRL
 
 - Models that converge too quickly to a local optimum
 - Tasks where reward signal diversity is low (many rollouts get the same reward)
 - Pre-quantized models (NVFP4, FP8) where quantization already introduces noise — QeRL amplifies this effect in a controlled way
 
 QeRL works with both co-locate and multi-process modes.
+
+
+### Learning Rate
+
+RL training typically uses a lower learning rate than SFT (5e-7 to 5e-5). Start with `5e-6` and adjust based on the KL divergence metrics.
+
+### Masking Thresholds
+
+The importance ratio masks are critical for training stability:
+
+- **Token masks** (`token_mask_low`/`token_mask_high`): Filter individual tokens with extreme policy drift. The defaults (0.125, 8.0) allow up to 8x ratio before masking.
+- **Geometric masks** (`geo_mask_low`/`geo_mask_high`): Filter entire sequences based on the geometric mean of token ratios. Catches sequences where many tokens have drifted moderately.
+- If you see high `is_masked_frac` in logs (>50%), your policy is drifting too fast. Reduce the learning rate or increase `kl_tau`.
+
+### KL Penalty
+
+Setting `kl_tau > 0` adds a KL penalty that keeps the policy close to the reference (inference) policy. This prevents reward hacking but slows learning. Start with `kl_tau: 0.0` and increase if the policy diverges.
+
+### Gradient Accumulation
+
+Unlike SFT where gradient accumulation increases effective batch size, in RL training it controls how many packed micro-batches are processed per optimizer step. With `gradient_accumulation_steps: 1` and packed sequences, each step processes one densely-packed sequence.
+
+## Monitoring
+
+The trainer logs these GRPO-specific metrics at each step:
+
+| Metric      | Description                                             |
+| ----------- | ------------------------------------------------------- |
+| `kl`        | Mean KL divergence between current and inference policy |
+| `masked`    | Fraction of loss-eligible tokens that were masked       |
+| `tokens`    | Total loss-eligible tokens in the step                  |
+| `loss`      | Training loss (from the backward pass)                  |
+| `grad_norm` | Gradient norm after clipping                            |
+
+A healthy training run shows:
+
+- `kl` gradually increasing from near-zero (policy is improving)
+- `masked` staying below 30-40% (policy isn't drifting too fast)
+- `loss` trending downward
+- `grad_norm` staying within the clip threshold
+
+---
 
 ## Configuration Reference
 
@@ -488,166 +650,6 @@ How the orchestrator delivers batches to the trainer.
 #### `max_async_level`
 
 Controls how many weight broadcasts can be in-flight simultaneously. Default: `1`. Higher values allow the inference engine to lag behind the trainer by more steps.
-
-## How the Training Loop Works
-
-Each training step performs:
-
-1. **Weight broadcast** (after step > 0): Saves LoRA adapter to `{output_dir}/broadcasts/step_{N}/` with a `STABLE` marker file. vLLM polls for this marker to hot-reload weights. If QeRL is enabled, noisy norm weights are saved alongside the adapter.
-
-2. **Pack and receive batch**: The packer (on master) converts `TrainingBatch` from the orchestrator into packed `MicroBatch` sequences. The data loader delivers these as numpy arrays.
-
-3. **For each micro-batch** (gradient accumulation):
-    - `compute_logprobs()` computes log-probabilities under the current policy
-    - `compute_grpo_per_token_grads()` computes per-token gradient multipliers using the GRPO loss formula
-    - `step_with_custom_loss()` performs the forward + backward pass with GRPO gradient seeding
-
-4. **Optimizer step**: Updates LoRA adapter weights with the configured optimizer and learning rate schedule.
-
-### GRPO Loss Formula
-
-The GRPO loss for each token is:
-
-```
-loss = -(coeff * trainer_logprobs)[keep_mask].sum()
-
-where:
-  log_ratio = trainer_logprobs - inference_logprobs
-  importance_ratio = exp(log_ratio)
-  coeff = importance_ratio * (adv_tau * advantages - kl_tau * log_ratio)
-```
-
-The coefficient is treated as a constant (detached) during backpropagation, so the per-token gradient is simply:
-
-```
-grad[t] = -coeff[t] * keep_mask[t] / loss_scale
-```
-
-Tokens are masked (excluded) when their importance ratio falls outside `[token_mask_low, token_mask_high]`, or when sequence-level ratios exceed the geometric or sequence mask thresholds.
-
-## Co-locate Mode Details
-
-### How weight sharing works
-
-In co-locate mode, the base model is loaded only once:
-
-1. vLLM starts first and loads the model (quantized weights go to GPU)
-2. The trainer receives GPU pointers to vLLM's quantized tensors via CUDA IPC
-3. Both vLLM and the trainer read from the same GPU memory — zero copy, zero duplication
-4. Only LoRA adapter updates (~10 MB) are written to disk and reloaded by vLLM
-
-This saves roughly 50% of GPU memory for the base model. For example, a Qwen3-8B model in NF4 takes ~4.5 GB — in co-locate mode this is shared instead of duplicated.
-
-### Automatic gpu_memory_utilization
-
-In co-locate mode, `gpu_memory_utilization` is computed automatically by estimating the trainer's GPU memory needs:
-
-| Component              | Estimate                                                        |
-| ---------------------- | --------------------------------------------------------------- |
-| LoRA parameters        | Weight + master copy + gradient + 8-bit optimizer (6 bytes/param) |
-| Activations            | Working set (6 BF16 tensors/layer) + logits + residual checkpoints |
-| Dequantization buffers | 3 concurrent BF16 buffers (max weight size)                     |
-| Embeddings + LM head   | vocab_size * hidden_size * 2 bytes (BF16, loaded from disk)     |
-| Fixed overhead         | 2.5 GB (CUDA context, cuDNN workspace, allocator fragmentation) |
-
-The remaining GPU memory (minus a 10% safety margin) is assigned to vLLM. You can override this by setting `gpu_memory_utilization` explicitly in `infer.yaml`.
-
-### Multi-GPU co-locate
-
-Both the trainer and vLLM use data parallelism (`tp=1, dp=N`). Each GPU has a full model replica, and weight sharing is 1:1 per GPU:
-
-```yaml
-# train.yaml
-gpus: 2
-
-# infer.yaml
-dp: 2
-```
-
-### Supported quantization formats
-
-Co-locate weight sharing works with all quantization formats since it operates on raw GPU pointers:
-
-- **BnB NF4** — Packed uint8 data + FP32 scales
-- **FP8** (E4M3) — FP8 data + FP32 block scales
-- **NVFP4** — Packed FP4 data + FP8 scales + FP32 global scale
-
-## QLoRA for RL Training
-
-All QLoRA formats work with GRPO. QLoRA is particularly useful for RL training since it reduces the memory footprint of the frozen base model, leaving more room for the sequence buffers and logprob computations:
-
-```yaml
-# FP8 QLoRA (SM89+: RTX 40xx, L40, H100)
-lora: true
-qlora_fp8: true
-recipe: bf16
-
-# NF4 QLoRA (any GPU)
-lora: true
-qlora_bnb: true
-recipe: bf16
-
-# FP4 QLoRA (SM100+: Blackwell)
-lora: true
-qlora_fp4: true
-recipe: nvfp4
-```
-
-See [QLoRA guide](qlora.md) for details on each format.
-
-## Multi-GPU RL Training
-
-Multi-GPU training works the same as SFT. Surogate handles data parallelism internally — the trainer presents as a single process to the orchestrator:
-
-```yaml
-gpus: 4
-zero_level: 1  # Default: shard optimizer states
-```
-
-Each micro-batch is replicated across all GPUs. The per-token gradient computation happens on the first GPU's logprobs, and the resulting gradients are replicated for the backward pass.
-
-## Tuning Tips
-
-### Learning Rate
-
-RL training typically uses a lower learning rate than SFT (5e-7 to 5e-5). Start with `5e-6` and adjust based on the KL divergence metrics.
-
-### Masking Thresholds
-
-The importance ratio masks are critical for training stability:
-
-- **Token masks** (`token_mask_low`/`token_mask_high`): Filter individual tokens with extreme policy drift. The defaults (0.125, 8.0) allow up to 8x ratio before masking.
-- **Geometric masks** (`geo_mask_low`/`geo_mask_high`): Filter entire sequences based on the geometric mean of token ratios. Catches sequences where many tokens have drifted moderately.
-- If you see high `is_masked_frac` in logs (>50%), your policy is drifting too fast. Reduce the learning rate or increase `kl_tau`.
-
-### KL Penalty
-
-Setting `kl_tau > 0` adds a KL penalty that keeps the policy close to the reference (inference) policy. This prevents reward hacking but slows learning. Start with `kl_tau: 0.0` and increase if the policy diverges.
-
-### Gradient Accumulation
-
-Unlike SFT where gradient accumulation increases effective batch size, in RL training it controls how many packed micro-batches are processed per optimizer step. With `gradient_accumulation_steps: 1` and packed sequences, each step processes one densely-packed sequence.
-
-## Monitoring
-
-The trainer logs these GRPO-specific metrics at each step:
-
-| Metric      | Description                                             |
-| ----------- | ------------------------------------------------------- |
-| `kl`        | Mean KL divergence between current and inference policy |
-| `masked`    | Fraction of loss-eligible tokens that were masked       |
-| `tokens`    | Total loss-eligible tokens in the step                  |
-| `loss`      | Training loss (from the backward pass)                  |
-| `grad_norm` | Gradient norm after clipping                            |
-
-A healthy training run shows:
-
-- `kl` gradually increasing from near-zero (policy is improving)
-- `masked` staying below 30-40% (policy isn't drifting too fast)
-- `loss` trending downward
-- `grad_norm` staying within the clip threshold
-
----
 
 ## See also
 

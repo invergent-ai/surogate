@@ -12,7 +12,7 @@ import gradio as gr
 from openai import OpenAI
 
 
-def chat_function(message, history, endpoint, model_name, key, temperature, top_p, max_tokens):
+def chat_function(message, history, endpoint, model_name, key, system_prompt, temperature, top_p, max_tokens, repetition_penalty):
     """
     Chat function that communicates with OpenAI-compatible endpoint.
     """
@@ -20,8 +20,11 @@ def chat_function(message, history, endpoint, model_name, key, temperature, top_
 
     messages = []
 
+    if system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+
     for msg in history:
-        if msg["role"] in ["user", "assistant"]:
+        if msg["role"] in ["user", "assistant"] and not msg.get("metadata"):
             msg_content = msg["content"]
             if "</think>" in msg_content:
                 msg_content = msg_content.split("</think>")[-1]
@@ -37,6 +40,7 @@ def chat_function(message, history, endpoint, model_name, key, temperature, top_
             temperature=temperature,
             top_p=top_p,
             max_tokens=int(max_tokens),
+            extra_body={"repetition_penalty": repetition_penalty},
         )
 
         # Initialize buffers
@@ -152,7 +156,13 @@ def chat_function(message, history, endpoint, model_name, key, temperature, top_
                 if final_content.strip() and seen_non_whitespace:
                     # Only show if we're not in the middle of a potential tag
                     if not re.search(r"^\s*<t?h?i?n?k?$", current_buffer):
-                        result.append(gr.ChatMessage(role="assistant", content=final_content.strip()))
+                        # Escape custom XML-like tags so they render as literal text
+                        display_content = re.sub(
+                            r"<(/?[a-zA-Z_][a-zA-Z0-9_-]*)>",
+                            lambda m: f"&lt;{m.group(1)}&gt;",
+                            final_content.strip(),
+                        )
+                        result.append(gr.ChatMessage(role="assistant", content=display_content))
 
                 # Only yield if we have content
                 if result:
@@ -166,7 +176,7 @@ def chat_function(message, history, endpoint, model_name, key, temperature, top_
         ]
 
 
-def create_demo():
+def create_demo(model_name="Qwen/Qwen3-8B", system_prompt=""):
     """Create and configure the Gradio interface."""
 
     with gr.Blocks(title="LLM Chat Interface") as demo:
@@ -183,7 +193,7 @@ def create_demo():
                 )
                 model_input = gr.Textbox(
                     label="Model Name",
-                    value="Qwen/Qwen3-8B",
+                    value=model_name,
                     placeholder="Enter model name",
                     info="Name of the model to use",
                 )
@@ -194,10 +204,18 @@ def create_demo():
                     info="API key for the OpenAI-compatible API",
                 )
 
+                system_prompt_input = gr.Textbox(
+                    label="System Prompt",
+                    value=system_prompt,
+                    placeholder="Enter system prompt (optional)",
+                    lines=3,
+                )
+
                 gr.Markdown("### Generation Parameters")
                 temp_slider = gr.Slider(minimum=0.0, maximum=2.0, value=0.7, step=0.1, label="Temperature")
                 top_p_slider = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Top P")
                 max_tokens_slider = gr.Slider(minimum=16, maximum=8192, value=2048, step=16, label="Max Tokens")
+                repetition_penalty_slider = gr.Slider(minimum=1.0, maximum=2.0, value=1.0, step=0.05, label="Repetition Penalty")
 
             with gr.Column(scale=3):
                 # Create chat interface with custom settings
@@ -207,14 +225,17 @@ def create_demo():
                         endpoint_input,
                         model_input,
                         key_input,
+                        system_prompt_input,
                         temp_slider,
                         top_p_slider,
                         max_tokens_slider,
+                        repetition_penalty_slider,
                     ],
                     chatbot=gr.Chatbot(
                         height=500,
                         placeholder="Start chatting with the AI assistant...",
-                        render_markdown=True,
+                        render_markdown=False,
+                        type="messages",
                     ),
                     textbox=gr.Textbox(placeholder="Type your message here...", container=False, scale=7),
                 )
@@ -226,19 +247,18 @@ def main():
     """Main function to launch the Gradio app."""
     parser = argparse.ArgumentParser(description="LLM Chat UI with OpenAI-compatible endpoint")
     parser.add_argument("--port", type=int, default=7860, help="Port to run the server on")
-    parser.add_argument(
-        "--no-share", action="store_true", help="Disable public shareable link (share is enabled by default)"
-    )
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B", help="Default model name")
+    parser.add_argument("--system-prompt", type=str, default="", help="Default system prompt")
     args = parser.parse_args()
 
     # Create the demo
-    demo = create_demo()
+    demo = create_demo(model_name=args.model, system_prompt=args.system_prompt)
 
     # Launch the app
     demo.launch(
         server_name="0.0.0.0",  # Bind to all interfaces
         server_port=args.port,
-        share=not args.no_share,  # Share by default unless --no-share is specified
+        share=False,  # Share by default unless --no-share is specified
     )
 
 

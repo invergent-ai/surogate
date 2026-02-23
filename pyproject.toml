@@ -51,6 +51,7 @@ dependencies = [
     "torch @ https://download.pytorch.org/whl/cpu/torch-2.9.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
     "torchvision @ https://download.pytorch.org/whl/cpu/torchvision-0.24.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
     "ray>=2.5.0",
+    "verifiers>=0.1.10"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

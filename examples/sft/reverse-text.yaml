@@ -11,7 +11,7 @@ save_steps: 0
 
 max_steps: 100
 eval_steps: 25
-gpus: 4
+gpus: 1
 
 learning_rate: 3e-5
 lr_scheduler_type: constant

@@ -1,10 +1,11 @@
 # Training Modes
 
-Surogate supports three practical ways to adapt a model:
+Surogate supports four practical ways to adapt a model:
 
 1) **Pretraining / Continued Pretraining (PT)**
 2) **Full Fine-Tuning**
 3) **LoRA / QLoRA (Adapter Fine-Tuning)**
+4) **RL Fine-Tuning (GRPO)**
 
 They differ in *which parameters are updated*, *how much data you need*, and *how much compute/VRAM you’ll spend*.
 
@@ -19,6 +20,7 @@ They differ in *which parameters are updated*, *how much data you need*, and *ho
 | Maximize quality for a specific task/domain and you can afford it | **Full fine-tuning** |
 | Fast adaptation, smaller GPU, cheaper runs, easy iteration | **LoRA** |
 | Same as LoRA but you’re VRAM-limited | **QLoRA** |
+| Improve reasoning, math, coding via reward-based training | **GRPO** |
 
 ---
 
@@ -112,12 +114,40 @@ Surogate supports:
 
 ---
 
+## 4) RL Fine-Tuning (GRPO)
+
+### How it works
+**GRPO** (Group Relative Policy Optimization) is a reinforcement learning method that improves a model by generating rollouts, scoring them with a reward function, and updating the policy to favor higher-reward responses.
+
+- **What updates?** LoRA adapter parameters (base model is frozen)
+- **Typical data:** Prompts + reward environments (math, code, custom verifiers)
+- **Typical run shape:** Iterative rollout → reward → gradient loop
+
+GRPO coordinates three components in a single command:
+
+```bash
+surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
+```
+
+### When to use it
+- You want to improve reasoning, math, or coding capabilities beyond what SFT achieves.
+- You have a reward signal (verifier, unit tests, reference answers) rather than just demonstration data.
+- You want to optimize for outcome quality rather than imitating a fixed dataset.
+
+### Tradeoffs
+- Requires a reward environment (built-in or custom).
+- More complex pipeline than SFT (inference server + orchestrator + trainer).
+- Training dynamics are less predictable — requires monitoring importance ratios and masking fractions.
+
+---
+
 ## Practical recommendations
 
 - Start with **LoRA (bf16 recipe)** unless you have a strong reason not to.
 - Use **QLoRA** when you can’t fit the base model + activations comfortably.
 - Use **Full fine-tuning** when you want maximum quality and have budget.
 - Use **(Continued) pretraining** for domain adaptation on large raw text.
+- Use **GRPO** when you have a reward signal and want to go beyond imitation learning.
 
 ---
 
@@ -125,6 +155,7 @@ Surogate supports:
 
 - [Quickstart: Pretraining](quickstart-pretraining.md)
 - [Quickstart: Supervised Fine-Tuning](quickstart-sft.md)
+- [Quickstart: GRPO](quickstart-grpo.md)
 - [Configuration](../guides/configuration.md)
 - [Precision & recipes](../guides/precision-and-recipes.md)
 - [QLoRA](../guides/qlora.md)

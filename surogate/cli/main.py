@@ -19,6 +19,8 @@ COMMAND_MAPPING: Dict[str, str] = {
     'grpo-train': 'surogate.cli.grpo_train',
     'grpo-infer': 'surogate.cli.grpo_infer',
     'grpo-orch': 'surogate.cli.grpo_orch',
+    'vf-init': 'surogate.cli.vf_init',
+    'vf-eval': 'surogate.cli.vf_eval',
     'tokenize': 'surogate.cli.tokenize_cmd',
 }
 
@@ -64,6 +66,14 @@ def parse_args():
     # grpo-orch command
     from surogate.cli.grpo_orch import prepare_command_parser as grpo_orch_prepare_command_parser
     grpo_orch_prepare_command_parser(subparsers.add_parser('grpo-orch', help="GRPO RL Orchestrator"))
+    
+    # vf-init command
+    from surogate.cli.vf_init import prepare_command_parser as vf_init_prepare_command_parser
+    vf_init_prepare_command_parser(subparsers.add_parser('vf-init', help="RL Environment Initialization"))
+    
+    # vf-eval command
+    from surogate.cli.vf_eval import prepare_command_parser as vf_eval_prepare_command_parser
+    vf_eval_prepare_command_parser(subparsers.add_parser('vf-eval', help="RL Environment Evaluation"))
 
     # tokenize command
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser

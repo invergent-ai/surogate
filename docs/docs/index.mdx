@@ -12,7 +12,7 @@ import Figure from '@site/src/components/Figure';
     alt="Surogate logo"
 />
 </a>
-<h2>LLM pre-training & fine-tuning at practical hardware limits <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h2>
+<h2>LLM Pre-training, Fine-Tuning and Reinforcement Learning at practical hardware limits <br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h2>
 <br/>
 <iframe src="https://ghbtns.com/github-btn.html?user=invergent-ai&repo=surogate&type=star&count=true&size=large" frameborder="0" scrolling="0" width="170" height="30" title="GitHub"></iframe>
 </div>
@@ -28,6 +28,8 @@ By combining a native **C++/CUDA execution engine**, a low-overhead [Python DSL]
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
+- [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](./guides/rl-training.md): advanced GRPO training and evaluation with custom, deterministic environments
+- [**🔧 RL Environments**](./guides/rl-environments.md): predictable environments for RL training
 - [**🖥️...🖥️ Native multi-GPU**](./guides/multi-gpu.md) training with the multi-threaded backend
 - [**🖥️...🖥️ Native multi-Node**](./guides/multi-node.md) DDP training with Ray
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
@@ -74,6 +76,7 @@ Follow these guides to run your first training:
 - [Training modes: Pretraining vs Full Fine-Tuning vs LoRA](getting-started/training-modes.md)
 - [Quickstart: SFT](getting-started/quickstart-sft.md)
 - [Quickstart: Pre-training](getting-started/quickstart-pretraining.md)
+- [Quickstart: GRPO](getting-started/quickstart-grpo.md)
 
 ## Hardware / Requirements
 

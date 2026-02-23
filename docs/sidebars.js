@@ -25,6 +25,7 @@ module.exports = {
         'getting-started/training-modes',
         'getting-started/quickstart-pretraining',
         'getting-started/quickstart-sft',
+        'getting-started/quickstart-grpo',
       ],
     },
     {
@@ -68,6 +69,8 @@ module.exports = {
         'guides/offloading',
         'guides/memory',
         'guides/debugging',
+        'guides/rl-environments',
+        'guides/rl-training',
       ],
     },
     {
