@@ -159,6 +159,22 @@ def _check_if_hub_dataset(path: str) -> bool:
         return False
 
 
+def _extract_split(dataset, split: str | None):
+    """Extract a split from a DatasetDict if needed."""
+    if not isinstance(dataset, (DatasetDict, IterableDatasetDict)):
+        return dataset
+    if split and split in dataset:
+        return dataset[split]
+    if len(dataset) == 1:
+        return next(iter(dataset.values()))
+    available = list(dataset.keys())
+    raise ValueError(
+        f"Dataset has multiple splits {available} but no split was specified "
+        f"(or the specified split '{split}' was not found). "
+        f"Please set 'split' in your dataset config to one of: {available}"
+    )
+
+
 def _load_from_local_path(
         dataset_config: DatasetConfig, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
@@ -168,7 +184,8 @@ def _load_from_local_path(
     if local_path.is_dir():
         try:
             logger.info(f"Loading dataset from {local_path}...")
-            return load_from_disk(dataset_config.path)
+            dataset = load_from_disk(dataset_config.path)
+            return _extract_split(dataset, dataset_config.split)
         except FileNotFoundError:
             return load_dataset(dataset_config.path, **load_dataset_kwargs)
     elif local_path.is_file():
@@ -203,10 +220,11 @@ def _load_from_cloud(
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from cloud storage."""
     if remote_fs.isdir(dataset_config.path):
-        return load_from_disk(
+        dataset = load_from_disk(
             dataset_config.path,
             storage_options=storage_options,
         )
+        return _extract_split(dataset, dataset_config.split)
 
     if remote_fs.isfile(dataset_config.path):
         dataset_type = get_dataset_type(dataset_config)
