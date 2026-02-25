@@ -52,7 +52,7 @@ class TrainDatasetConfig(ABC):
         self.datasets = [create_dataset_config(ds_cfg) for ds_cfg in cfg.get('datasets', [])]
         self.validation_datasets = [create_dataset_config(ds_cfg) for ds_cfg in cfg.get('validation_datasets', [])]
         self.validation_split_ratio = cfg.get('validation_split_ratio', self.validation_split_ratio)
-        self.dataloader_num_workers = cfg.get('dataloader_num_workers', get_default_process_count())
+        self.dataloader_num_workers = min(cfg.get('dataloader_num_workers', get_default_process_count()), 8)
         self.sample_packing = cfg.get('sample_packing', self.sample_packing)
         self.sequence_len = cfg.get('sequence_len', self.sequence_len)
 
