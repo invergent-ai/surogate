@@ -24,6 +24,7 @@
 <a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
 <a href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a> ·
 <a href="https://github.com/invergent-ai/surogate-studio">Studio</a>
+<a href="https://github.com/invergent-ai/surogate-agent">Agent</a>
 </div>
 <br/>
   
