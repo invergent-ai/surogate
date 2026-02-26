@@ -92,6 +92,13 @@ def training_logger_context(config: SFTConfig):
 
             handlers.append(functools.partial(log_line_to_wandb, wandb_run))
 
+        if "surogate" in backends_set:
+            from surogate.train.metrics_writer import MetricsWriter
+            
+            metrics_path = getattr(config, "surogate_metrics_path", None)
+            writer = stack.enter_context(MetricsWriter(output_path=metrics_path))
+            handlers.append(functools.partial(log_line_to_surogate, writer))
+
         if "aim" in backends_set:
             aim_run = stack.enter_context(_aim_run_context(config))
             try:
@@ -276,6 +283,37 @@ def log_line_to_aim(run: "aim.Run", entry: dict):
         run.track(entry.get("blocks", 0), name="flops/blocks", step=step)
         run.track(entry.get("lm_head", 0), name="flops/lm_head", step=step)
         run.track(entry.get("attention", 0), name="flops/attention", step=step)
+    else:
+        raise RuntimeError(f"Unknown kind {kind}")
+
+
+def log_line_to_surogate(writer, entry: dict):
+    kind = entry["log"]
+    step = entry["step"]
+
+    if kind == "step":
+        metrics = {
+            f"train/{k}": v for k, v in entry.items()
+            if k not in {"log", "step", "time", "step_tokens"} and isinstance(v, (int, float))
+        }
+        step_tokens = entry.get("step_tokens", 0)
+        duration_ms = entry.get("duration_ms", 0)
+        if duration_ms:
+            metrics["train/tokens_per_second"] = step_tokens / (duration_ms / 1000)
+        writer.track(step, **metrics)
+    elif kind == "eval":
+        metrics = {
+            f"eval/{k}": v for k, v in entry.items()
+            if k not in {"log", "step", "time", "eval_tokens"} and isinstance(v, (int, float))
+        }
+        eval_tokens = entry.get("eval_tokens", 0)
+        duration_ms = entry.get("duration_ms", 0)
+        if duration_ms:
+            metrics["eval/tokens_per_second"] = eval_tokens / (duration_ms / 1000)
+        writer.track(step, **metrics)
+    elif kind in {"gpu", "cmd", "gpu-model", "allocator", "dataset",
+                   "option", "info", "message", "sol"}:
+        pass  # skip non-training metrics
     else:
         raise RuntimeError(f"Unknown kind {kind}")
 

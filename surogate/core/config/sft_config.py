@@ -183,8 +183,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
              Run evaluation every N optimizer steps. Evaluation runs on the full eval dataset.
         logging_steps (Optional[int], defaults to 1):
             Log training metrics every N optimizer steps. Set to 1 to log every step (default).
-        report_to (Optional[Literal['wandb', 'aim']], *optional*, defaults to None):
-            Report the results and logs to. Supported platforms are `"wandb"`, `"aim"`.
+        report_to (Optional[Literal['wandb', 'aim', 'surogate']], *optional*, defaults to None):
+            Report the results and logs to. Supported platforms are `"wandb"`, `"aim"`, `"surogate"`.
         warmup_ratio (Optional[float], defaults to 0.0):
             Ratio of total training steps used for a linear warmup from 0 to `learning_rate`.
         warmup_steps (Optional[int], defaults to 0):
@@ -266,6 +266,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Aim repository path for logging.
         aim_name: (Optional[str], defaults to run_name):
             Aim run name for logging.
+        surogate_metrics_path: (Optional[str], defaults to None):
+            Path for surogate metrics JSONL file. If None, uses SUROGATE_METRICS_PATH env var
+            or defaults to /tmp/surogate_metrics.jsonl.
     """
     run_name: Optional[str] = None
     apply_recommended_values: Optional[bool] = False
@@ -329,7 +332,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     eval_steps: Optional[int] = 100
     logging_steps: Optional[int] = 1
     per_device_train_batch_size: Optional[int] = 2
-    report_to: Optional[List[Literal['wandb', 'aim']]] = None
+    report_to: Optional[List[Literal['wandb', 'aim', 'surogate']]] = None
     warmup_ratio: Optional[float] = 0
     warmup_steps: Optional[int] = 0
     log_file: Optional[str] = None
@@ -373,6 +376,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     aim_experiment: Optional[str] = None
     aim_repo: Optional[str] = None
     aim_name: Optional[str] = None
+    surogate_metrics_path: Optional[str] = '/tmp/surogate_metrics.jsonl'
 
     # Multi-node distributed training config (optional)
     distributed: Optional[DistributedConfig] = None
@@ -489,6 +493,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.aim_experiment = cfg.get('aim_experiment', self.aim_experiment)
         self.aim_repo = cfg.get('aim_repo', self.aim_repo)
         self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
+        self.surogate_metrics_path = cfg.get('surogate_metrics_path', self.surogate_metrics_path)
         
         # Validate recompute is boolean
         if not isinstance(self.recompute, bool):
