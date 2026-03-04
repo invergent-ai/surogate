@@ -5,14 +5,15 @@ from typing import Optional, List, Union, Any, Dict, Tuple, Literal
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig, AutoConfig, AutoTokenizer, AutoModelForCausalLM
+import transformers
+from packaging import version
 
 from surogate.core.hub.huggingface import HuggingFaceHub
 from surogate.core.model.attn import AttnImpl
 from surogate.core.model.hf_config import HfConfigFactory
 from surogate.core.model.model_info import ModelInfo
 from surogate.core.model.registry import MODEL_MAPPING, ModelTemplate
-from surogate.core.model.utils import fix_do_sample_warning, get_default_torch_dtype, \
-    get_causal_lm_model_cls_prefix
+from surogate.core.model.utils import fix_do_sample_warning, get_default_torch_dtype
 from surogate.core.model.patcher import get_lm_head_model, \
     patch_getattr, \
     patch_automodel, patch_awq_compat
@@ -122,7 +123,7 @@ def get_model_and_tokenizer_from_local(
         automodel_class = automodel_class or AutoModelForCausalLM
         context_kwargs = {
             'model_info': model_info,
-            'model_meta': model_template,
+            'model_template': model_template,
             'automodel_class': automodel_class,
         }
         if model is None:
@@ -136,6 +137,11 @@ def get_model_and_tokenizer_from_local(
         has_remote_code = hasattr(model_config, 'auto_map') and automodel_class.__name__ in model_config.auto_map
         if has_remote_code and model._auto_class is None:
             model._auto_class = automodel_class.__name__
+            
+        if version.parse(transformers.__version__) >= version.parse('5.0.0.dev'):
+            if model_template.is_multimodal:
+                for key in ['language_model', 'vision_tower', 'multi_modal_projector', 'visual', 'vision_model']:
+                    _set_property(model, key)
 
     model_info.config = model_config if model is None else model.config
 
@@ -199,83 +205,6 @@ def get_model_info_and_template(
     model_info.torch_dtype = torch_dtype
 
     return model_info, model_template
-
-
-def get_model_and_tokenizer_from_local(
-        model_dir: str,
-        model_info: ModelInfo,
-        model_kwargs: Dict[str, Any],
-        load_model: bool = True,
-        *,
-        tokenizer=None,
-        model_config=None,
-        automodel_class=None,
-        **kwargs
-):
-    """
-    Load the model and tokenizer from a local directory.
-    """
-    if model_config is None:
-        model_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-
-    torch_dtype = model_info.torch_dtype
-    HfConfigFactory.set_config_attr(model_config, 'torch_dtype', torch_dtype, include_vit=True)
-    rope_scaling = kwargs.get('rope_scaling')
-    max_model_len = kwargs.get('max_model_len')
-
-    if rope_scaling:
-        HfConfigFactory.set_config_attr(model_config, 'rope_scaling', rope_scaling)
-
-    if max_model_len:
-        HfConfigFactory.set_max_model_len(model_config, max_model_len)
-
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, use_fast=True)
- 
-    model_kwargs['dtype'] = torch_dtype
-
-    model = None
-
-    if load_model:
-        patch_awq_compat(model_info)
-        automodel_class = automodel_class or AutoModelForCausalLM
-        model_template: ModelTemplate = kwargs['model_template']
-        context_kwargs = {
-            'model_info': model_info,
-            'model_template': model_template,
-            'automodel_class': automodel_class,
-        }
-
-        if model is None:
-            context = partial(patch_automodel, **context_kwargs)
-            with context():
-                model = automodel_class.from_pretrained(
-                        model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
-                    
-
-        # fix not save modeling_xxx.py (transformers 4.45)
-        # https://github.com/huggingface/transformers/issues/24737
-        has_remote_code = hasattr(model_config, 'auto_map') and automodel_class.__name__ in model_config.auto_map
-        if has_remote_code and model._auto_class is None:
-            model._auto_class = automodel_class.__name__
-
-    model_info.config = model_config if model is None else model.config
-
-    pad_token = tokenizer.pad_token_id
-    if pad_token is None:
-        pad_token = tokenizer.eos_token_id
-    if tokenizer.eos_token_id is None:
-        tokenizer.eos_token_id = pad_token
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = pad_token
-    assert tokenizer.eos_token_id is not None
-    assert tokenizer.pad_token_id is not None
-
-    if model is not None:
-        # fix seq classification task
-        HfConfigFactory.set_model_config_attr(model, 'pad_token_id', pad_token)
-
-    return model, tokenizer
 
 
 def get_model_tokenizer_with_flash_attn(
@@ -405,3 +334,16 @@ def get_model_info_and_tokenizer(
         processor.model_template = model_template
 
     return model_info, model_template, model, processor
+
+
+def _set_property(model, key):
+    if not hasattr(model, 'model'):
+        return
+    text_model = model.model
+    if not hasattr(text_model, key):
+        return
+
+    def _value(self):
+        return getattr(text_model, key)
+
+    setattr(model.__class__, key, property(_value))

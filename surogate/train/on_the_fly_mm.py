@@ -412,9 +412,11 @@ class OnTheFlyMultimodalBatcher:
                         raise ValueError("pixel_values present but image_grid_thw missing")
                     pixel_values = torch.cat(image_pixel_values_list, dim=0).to(self.vision_device)
                     image_grid_thw_vis = image_grid_thw_cpu.to(self.vision_device)
-                    image_embeds_list, deepstack_image = self.hf_model.get_image_features(
+                    _img_out = self.hf_model.get_image_features(
                         pixel_values, image_grid_thw=image_grid_thw_vis
                     )
+                    image_embeds_list = _img_out.pooler_output
+                    deepstack_image = _img_out.deepstack_features or []
                     if image_embeds_list:
                         image_embeds_flat = torch.cat(image_embeds_list, dim=0)
 
@@ -423,9 +425,11 @@ class OnTheFlyMultimodalBatcher:
                         raise ValueError("pixel_values_videos present but video_grid_thw missing")
                     pixel_values_v = torch.cat(video_pixel_values_list, dim=0).to(self.vision_device)
                     video_grid_thw_vis = video_grid_thw_cpu.to(self.vision_device)
-                    video_embeds_list, deepstack_video = self.hf_model.get_video_features(
+                    _vid_out = self.hf_model.get_video_features(
                         pixel_values_v, video_grid_thw=video_grid_thw_vis
                     )
+                    video_embeds_list = _vid_out.pooler_output
+                    deepstack_video = _vid_out.deepstack_features or []
                     if video_embeds_list:
                         video_embeds_flat = torch.cat(video_embeds_list, dim=0)
 

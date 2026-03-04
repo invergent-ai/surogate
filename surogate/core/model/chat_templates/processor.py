@@ -1305,7 +1305,64 @@ class ChatTemplateProcessor:
         rows = RowPreprocessor.rows_to_batched(batch)
         return {k: rows[k] for k in keys if rows.get(k) is not None}
 
+    @staticmethod
+    def _get_inputs_embeds_hf(inputs_embeds, inputs, visual, processor, config):
+        input_ids = inputs['input_ids']
+        pixel_values = inputs.get('pixel_values')
+        pixel_values_videos = inputs.get('pixel_values_videos')
+        image_grid_thw = inputs.get('image_grid_thw')
+        video_grid_thw = inputs.get('video_grid_thw')
+        dtype = visual.dtype
+        
+        if pixel_values is None and pixel_values_videos is None:  # plain-text
+            images = [Image.new('RGB', (32, 32), (0, 0, 0))]
+            media_inputs = processor.image_processor(images=images, return_tensors='pt')
+            media_inputs = to_device(media_inputs, input_ids.device)
+            pixel_values = media_inputs['pixel_values'].type(dtype)
+            image_embeds = visual(pixel_values, grid_thw=media_inputs['image_grid_thw'])
+            if hasattr(image_embeds, 'pooler_output'):
+                image_embeds = image_embeds.pooler_output
+            inputs_embeds = inputs_embeds + image_embeds.mean().to(device=inputs_embeds.device) * 0.
+        else:
+            if pixel_values is None:
+                pixel_values_mixed = pixel_values_videos
+                grid_thw = video_grid_thw
+            elif pixel_values_videos is None:
+                pixel_values_mixed = pixel_values
+                grid_thw = image_grid_thw
+            else:
+                pixel_values_mixed = torch.concat([pixel_values, pixel_values_videos], dim=0)
+                grid_thw = torch.concat([image_grid_thw, video_grid_thw], dim=0)
+            pixel_values_mixed = pixel_values_mixed.type(dtype)
+            mixed_embeds = visual(pixel_values_mixed, grid_thw=grid_thw)
+            if hasattr(mixed_embeds, 'pooler_output'):
+                mixed_embeds = mixed_embeds.pooler_output
+            if pixel_values is None:
+                image_embeds = None
+                video_embeds = mixed_embeds
+            elif pixel_values_videos is None:
+                image_embeds = mixed_embeds
+                video_embeds = None
+            else:
+                merge_length = processor.image_processor.merge_size**2
+                image_tokens = (image_grid_thw.prod(dim=-1) // merge_length).sum()
+                image_embeds = mixed_embeds[:image_tokens]
+                video_embeds = mixed_embeds[image_tokens:]
 
+            if image_embeds is not None:
+                image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                image_mask = image_mask.to(inputs_embeds.device)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            if video_embeds is not None:
+                video_mask = (input_ids == config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                video_mask = video_mask.to(inputs_embeds.device)
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        return inputs_embeds
+        
+        
 def get_chat_template_processor(
         template_type: str,
         processor: Optional['Processor'],
