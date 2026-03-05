@@ -406,3 +406,20 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
 register_chat_template(
     QwenChatTemplate(
         ChatTemplateType.qwen3_vl, template_processor_cls=Qwen3VLTemplate, default_system=None, thinking_prefix='<think>\n'))
+
+class Qwen3_5Template(Qwen3VLTemplate):
+    image_token_id = 248056
+    video_token_id = 248057
+
+    def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return Qwen2VLTemplate._post_encode(self, model, inputs)
+    
+register_chat_template(
+    QwenChatTemplate(
+        ChatTemplateType.qwen3_5, 
+        template_processor_cls=Qwen3_5Template, 
+        default_system=None, 
+        thinking_prefix='<think>\n', 
+        non_thinking_prefix='<think>\n\n</think>\n\n',
+        agent_template='qwen3_5',
+        is_thinking=True))

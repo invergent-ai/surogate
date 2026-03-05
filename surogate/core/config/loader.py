@@ -4,16 +4,15 @@ import re
 from typing import Any, Type
 from urllib.request import urlopen
 import yaml
-from surogate.core.config.eval_config import EvalConfig
-from surogate.core.config.ptq_config import PTQConfig
-from surogate.core.config.serve_config import ServeConfig
+from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
+from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.core.config.sft_config import SFTConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
-SurogateConfig = SFTConfig | ServeConfig | PTQConfig | EvalConfig
+SurogateConfig = SFTConfig | GRPOInferenceConfig | GRPOOrchestratorConfig
 
 def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
     # Check if path is an HTTP(S) URL

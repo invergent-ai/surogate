@@ -1,17 +1,12 @@
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Union, List
 
 import torch
-from torch import nn
 from transformers import PreTrainedTokenizerBase, GenerationConfig, BaseImageProcessor, \
     FeatureExtractionMixin
 from transformers import ProcessorMixin as HfProcessorMixin
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.utils import is_torch_bf16_gpu_available, is_torch_cuda_available
 
-from surogate.core.model.hf_config import HfConfigFactory
-from surogate.core.model.registry import ModelTemplate
 from surogate.utils.logger import get_logger
-from surogate.utils.utils import deep_getattr
 
 logger = get_logger()
 

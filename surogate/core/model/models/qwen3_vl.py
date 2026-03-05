@@ -3,10 +3,12 @@ from typing import Optional, Union
 
 import torch
 from PIL import Image
+from transformers import PreTrainedModel
+from transformers.utils.versions import require_version
 
 from surogate.core.config.enums import ChatTemplateType
-from surogate.core.model.models.qwen25_vl import compat_qwen_vl_utils, get_model_tokenizer_qwen2_vl
-from surogate.core.model.registry import register_model, ModelTemplate, MLLMModelType
+from surogate.core.model.models.qwen25_vl import Qwen2VLLoader, compat_qwen_vl_utils
+from surogate.core.model.registry import register_model, ModelTemplate
 from surogate.utils.tensor import to_device
 
 
@@ -177,27 +179,82 @@ def _compat_qwen3_vl_mixed_data(model, processor, is_moe: bool = False):
     model.forward = MethodType(forward, model)
     _patch_deepstack_process(model.language_model)
 
+class Qwen3VLLoader(Qwen2VLLoader):
 
-def get_model_tokenizer_qwen3_vl(model_dir, *args, **kwargs):
-    from transformers import Qwen3VLForConditionalGeneration
-    compat_qwen_vl_utils(image_patch_size=16)
-    kwargs['automodel_class'] = kwargs['automodel_class'] or Qwen3VLForConditionalGeneration
-    kwargs['_check_qwen_vl_utils'] = False
-    model, processor = get_model_tokenizer_qwen2_vl(model_dir, *args, **kwargs)
-    if model is not None:
+    def _check_qwen_vl_utils(self):
+        require_version('qwen_vl_utils>=0.0.14')
+        compat_qwen_vl_utils(image_patch_size=16)
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers import Qwen3VLForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen3VLForConditionalGeneration
+        model = super().get_model(model_dir, config, processor, model_kwargs)
         _compat_qwen3_vl_mixed_data(model.model, processor)
-    return model, processor
-
+        return model
 
 """
-- Qwen/Qwen2.5-VL-3B-Instruct
-- Qwen/Qwen2.5-VL-7B-Instruct
-- Qwen/Qwen2.5-VL-32B-Instruct
+- Qwen/Qwen3-VL-2B-Instruct
+- Qwen/Qwen3-VL-2B-Thinking
+- Qwen/Qwen3-VL-4B-Instruct
+- Qwen/Qwen3-VL-4B-Thinking
+- Qwen/Qwen3-VL-8B-Instruct
+- Qwen/Qwen3-VL-8B-Thinking
+- Qwen/Qwen3-VL-32B-Instruct
+- Qwen/Qwen3-VL-32B-Thinking
 """
 register_model(
     ModelTemplate(
-        MLLMModelType.qwen3_vl,
-        ChatTemplateType.qwen3_vl,
-        get_model_tokenizer_qwen3_vl,
-        architectures=['Qwen3VLForConditionalGeneration'],
+        model_type='Qwen3VLForConditionalGeneration',
+        chat_templates=[ChatTemplateType.qwen3_vl],
+        loader=Qwen3VLLoader,
+        is_multimodal=True,
+        tags=['vision', 'video']))
+
+
+class Qwen3_5MoeLoader(Qwen3VLLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers import Qwen3_5MoeForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen3_5MoeForConditionalGeneration
+        return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+    
+
+"""
+- Qwen/Qwen3.5-35B-A3B-Base
+- Qwen/Qwen3.5-35B-A3B
+- Qwen/Qwen3.5-122B-A10B
+- Qwen/Qwen3.5-397B-A17B
+"""
+register_model(
+    ModelTemplate(
+        model_type='Qwen3_5MoeForConditionalGeneration',
+        chat_templates=[ChatTemplateType.qwen3_5],
+        loader=Qwen3_5MoeLoader,
+        is_multimodal=True,
+        tags=['vision', 'video']))
+
+class Qwen3_5Loader(Qwen3VLLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers import Qwen3_5ForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen3_5ForConditionalGeneration
+        return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+    
+"""
+- Qwen/Qwen3.5-0.8B
+- Qwen/Qwen3.5-2B
+- Qwen/Qwen3.5-4B
+- Qwen/Qwen3.5-9B
+- Qwen/Qwen3.5-27B
+- Qwen/Qwen3.5-0.8B-Base
+- Qwen/Qwen3.5-2B-Base
+- Qwen/Qwen3.5-4B-Base
+- Qwen/Qwen3.5-9B-Base
+"""
+register_model(
+    ModelTemplate(
+        model_type='Qwen3_5ForConditionalGeneration',
+        chat_templates=[ChatTemplateType.qwen3_5],
+        loader=Qwen3_5Loader,
+        is_multimodal=True,
         tags=['vision', 'video']))

@@ -9,6 +9,9 @@ from surogate.utils.utils import deep_getattr
 
 
 class HfConfigFactory:
+    llm_keys = ['language_config', 'llm_config', 'text_config']
+    vision_keys = ['vit_config', 'vision_config', 'audio_config']
+    
     @staticmethod
     def get_torch_dtype(config: Union[PretrainedConfig, Dict[str, Any]],
                         quant_info: Dict[str, Any]) -> Optional[torch.dtype]:
@@ -27,6 +30,20 @@ class HfConfigFactory:
             return True
         for key in ['num_experts', 'num_experts_per_tok', 'moe_intermediate_size']:
             if HfConfigFactory.get_config_attr(config, key):
+                return True
+        return False
+    
+    @staticmethod
+    def is_multimodal(config) -> bool:
+        if isinstance(config, dict):
+            keys = config.keys()
+        elif isinstance(config, PretrainedConfig):
+            keys = dir(config)
+        else:
+            keys = []
+        keys = set(keys)
+        for key in (HfConfigFactory.llm_keys + HfConfigFactory.vision_keys + ['thinker_config']):
+            if key in keys:
                 return True
         return False
 

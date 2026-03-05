@@ -1,6 +1,5 @@
-from surogate.core.config.enums import LLMModelType, ChatTemplateType
+from surogate.core.config.enums import ChatTemplateType
 from surogate.core.model.registry import register_model, ModelTemplate
-from surogate.core.model.loader import get_model_tokenizer_with_flash_attn
 
 """
 Instruct models:
@@ -20,10 +19,8 @@ Base models:
 """
 register_model(
     ModelTemplate(
-        LLMModelType.qwen3,
-        ChatTemplateType.qwen3,
-        get_model_tokenizer_with_flash_attn,
-        architectures=['Qwen3ForCausalLM']))
+        model_type='Qwen3ForCausalLM',
+        chat_templates=[ChatTemplateType.qwen3]))
 
 
 """
@@ -33,28 +30,5 @@ register_model(
 """
 register_model(
     ModelTemplate(
-        LLMModelType.qwen3_moe,
-        ChatTemplateType.qwen3,
-        get_model_tokenizer_with_flash_attn,
-        architectures=['Qwen3MoeForCausalLM']))
-
-"""
-- Qwen/Qwen3-4B-Thinking-2507
-"""
-register_model(
-    ModelTemplate(
-        LLMModelType.qwen3_thinking,
-        ChatTemplateType.qwen3_thinking,
-        get_model_tokenizer_with_flash_attn,
-        architectures=['Qwen3ForCausalLM']))
-
-"""
-- Qwen/Qwen3-30B-A3B-Instruct-2507
-- Qwen/Qwen3-235B-A22B-Instruct-2507
-"""
-register_model(
-    ModelTemplate(
-        LLMModelType.qwen3_nothinking,
-        ChatTemplateType.qwen3_nothinking,
-        get_model_tokenizer_with_flash_attn,
-        architectures=['Qwen3MoeForCausalLM', 'Qwen3ForCausalLM']))
+        model_type='Qwen3MoeForCausalLM',
+        chat_templates=[ChatTemplateType.qwen3]))

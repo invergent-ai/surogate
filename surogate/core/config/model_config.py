@@ -6,7 +6,7 @@ from typing import Optional, Union, Any
 import torch
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
-from surogate.core.model.loader import get_model_info_and_tokenizer
+from surogate.train.on_the_fly_mm import get_model_info_and_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.jsonl import json_parse_to_dict
 from surogate.utils.logger import get_logger
@@ -19,7 +19,7 @@ class ModelConfig(ABC):
 
     Args:
         model (Optional[str]): model_id or model_path. Default is None.
-        model_type (Optional[str]): Type of the model group. Default is None.
+        template_type (Optional[str]): Type of the chat template to use. Default is None.
         max_model_len (Optional[int]): Maximum model length for rope scaling. Default is None.
         rope_scaling (Literal): Type of RoPE scaling. Only relevant for vision-language models — it is applied
             to the HuggingFace vision model loaded in Python for multi-modal preprocessing (on_the_fly_mm.py).
@@ -28,7 +28,7 @@ class ModelConfig(ABC):
             or a JSON string like '{"factor": 2.0, "type": "yarn"}'. Default is None.
     """
     model: Optional[str] = None
-    model_type: Optional[str] = None
+    template_type: Optional[str] = None
     torch_dtype: Optional[Union[torch.bfloat16, torch.float16, torch.float32]] = None
     max_model_len: Optional[int] = None
     rope_scaling: Optional[str] = None
@@ -37,7 +37,7 @@ class ModelConfig(ABC):
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
         self.model = cfg['model']
-        self.model_type = cfg['model_type']
+        self.template_type = cfg['template_type']
         self.torch_dtype = cfg['torch_dtype']
         self.max_model_len = cfg['max_model_len']
         self.rope_scaling = cfg['rope_scaling']
@@ -52,7 +52,7 @@ class ModelConfig(ABC):
         logger.debug("init model info and template...")
         self.model_info, self.model_template, self._model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs(), load_model=False, download_model=True)
         self.model_dir = self.model_info.model_dir
-        self.model_type = self.model_info.model_type
+        self.template_type = self.model_info.template_type
 
         if self.model_info.rope_scaling and self.max_model_len is not None:
             self._init_rope_scaling()
@@ -116,14 +116,14 @@ class ModelConfig(ABC):
             self,
             model_id_or_path: Optional[str] = None,
             torch_dtype: Optional[torch.dtype] = None,
-            model_type: Optional[str] = None,
+            template_type: Optional[str] = None,
             rope_scaling: Optional[Union[str, dict]] = None,
             max_model_len: Optional[int] = None,
     ) -> dict[str, Any]:
         return {
             'model_id_or_path': model_id_or_path or self.model,
             'torch_dtype': torch_dtype or self.torch_dtype,
-            'model_type': model_type or self.model_type,
+            'template_type': template_type or self.template_type,
             'rope_scaling': rope_scaling or self.rope_scaling,
             'max_model_len': max_model_len or self.max_model_len,
         }

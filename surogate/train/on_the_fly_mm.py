@@ -5,7 +5,7 @@ import os
 from surogate.core.datasets.datasets import disable_datasets_caching
 from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \
     shuffle_dataset
-from surogate.core.model.loader import get_model_info_and_tokenizer
+from surogate.core.model.registry import get_model_info_and_tokenizer
 from surogate.utils.logger import get_logger
 from surogate.utils.np_utils import get_seed
 
@@ -30,7 +30,7 @@ def init_mm_helpers(config):
         load_model=True,
         max_model_len=config.max_model_len,
         rope_scaling=config.rope_scaling,
-        model_type=config.model_type,
+        template_type=config.template_type,
     )
 
     hf_model.eval()

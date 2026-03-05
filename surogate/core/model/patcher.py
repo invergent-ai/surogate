@@ -1,14 +1,8 @@
-import copy
 from contextlib import contextmanager
 from types import MethodType
 
-import torch
-from peft import PeftModel
 from torch import nn
-from transformers import PreTrainedModel
 
-from surogate.core.model.model_info import ModelInfo
-from surogate.core.model.registry import ModelTemplate
 from surogate.utils.logger import get_logger
 from surogate.utils.utils import deep_getattr
 
@@ -20,13 +14,6 @@ def patch_get_input_embeddings(model, embedding_keys: str):
         return deep_getattr(model, embedding_keys)
 
     model.get_input_embeddings = MethodType(get_input_embeddings, model)
-
-
-def get_lm_head_model(model, model_template: ModelTemplate = None, lm_heads=None):
-    if isinstance(model, PeftModel):
-        model = model.model
-
-    return model
 
 
 def patch_getattr(obj_cls, item_name: str):

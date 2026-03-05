@@ -1,6 +1,5 @@
-from surogate.core.config.enums import LLMModelType, ChatTemplateType
+from surogate.core.config.enums import ChatTemplateType
 from surogate.core.model.registry import register_model, ModelTemplate
-from surogate.core.model.loader import get_model_tokenizer_with_flash_attn
 
 """
 Instruct models:
@@ -21,9 +20,7 @@ Base models:
 """
 register_model(
     ModelTemplate(
-        LLMModelType.qwen2_5,
-        ChatTemplateType.qwen2_5,
-        get_model_tokenizer_with_flash_attn,
-        architectures=['Qwen2ForCausalLM']))
+        model_type='Qwen2ForCausalLM',
+        chat_templates=[ChatTemplateType.qwen2_5]))
 
 

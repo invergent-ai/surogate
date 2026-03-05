@@ -1,12 +1,15 @@
+import importlib
 import os
 
 from surogate.core.config.enums import ChatTemplateType
 from surogate.core.model.chat_templates.vision_utils import load_file
 from surogate.core.model.patcher import patch_get_input_embeddings
-from surogate.core.model.registry import register_model, ModelTemplate, MLLMModelType
-from surogate.core.model.loader import get_model_tokenizer_multimodal
+from surogate.core.model.registry import ModelLoader, register_model, ModelTemplate
+from surogate.core.model.utils import Processor
 from surogate.utils.env import get_env_args
-
+from transformers import PretrainedConfig, PreTrainedModel
+from packaging import version
+from transformers.utils.versions import require_version
 
 def patch_qwen_vl_utils(vision_process):
     if hasattr(vision_process, '_patch'):
@@ -75,30 +78,41 @@ def compat_qwen_vl_utils(image_patch_size: int):
             os.environ[target_var] = str(int(value) // image_factor ** 2)
 
 
-def get_model_tokenizer_qwen2_vl(*args, **kwargs):
-    from transformers import Qwen2VLForConditionalGeneration
-    kwargs['automodel_class'] = kwargs['automodel_class'] or Qwen2VLForConditionalGeneration
-    model, tokenizer = get_model_tokenizer_multimodal(*args, **kwargs)
-    if model is not None:
+class Qwen2VLLoader(ModelLoader):
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers import Qwen2VLForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen2VLForConditionalGeneration
+        model = super().get_model(model_dir, config, processor, model_kwargs)
         base_model = model.model if 'AWQ' in model.__class__.__name__ else model
         patch_get_input_embeddings(base_model.visual, 'patch_embed')
+        return model
+    
+    def _check_qwen_vl_utils(self):
+        try:
+            qwen_vl_utils_version = importlib.metadata.version('qwen_vl_utils')
+        except importlib.metadata.PackageNotFoundError:
+            raise importlib.metadata.PackageNotFoundError(
+                "The 'qwen_vl_utils' distribution was not found and is required by this application.")
+        if version.parse(qwen_vl_utils_version) >= version.parse('0.0.14'):
+            compat_qwen_vl_utils(image_patch_size=14)
+        else:
+            require_version('qwen_vl_utils<0.0.12')
+            
+    def get_processor(self, model_dir: str, config: PretrainedConfig) -> Processor:
+        self._check_qwen_vl_utils()
+        from qwen_vl_utils import vision_process
+        processor = super().get_processor(model_dir, config)
+        global_vars = patch_qwen_vl_utils(vision_process)
+        processor.global_vars = global_vars  # In order to have different hashes for the template.
+        return processor
 
-    from qwen_vl_utils import vision_process
-    check_qwen_vl_utils = kwargs.get('_check_qwen_vl_utils', True)
-    if check_qwen_vl_utils:
-        compat_qwen_vl_utils(image_patch_size=14)
+class Qwen2_5VLLoader(Qwen2VLLoader):
 
-    global_vars = patch_qwen_vl_utils(vision_process)
-    tokenizer.global_vars = global_vars  # In order to have different hashes for the template.
-    return model, tokenizer
-
-
-def get_model_tokenizer_qwen2_5_vl(*args, **kwargs):
-    from transformers import Qwen2_5_VLForConditionalGeneration
-    kwargs['automodel_class'] = kwargs['automodel_class'] or Qwen2_5_VLForConditionalGeneration
-    return get_model_tokenizer_qwen2_vl(*args, **kwargs)
-
-
+    def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen2_5_VLForConditionalGeneration
+        return super().get_model(model_dir, *args, **kwargs)
+    
 """
 - Qwen/Qwen2.5-VL-3B-Instruct
 - Qwen/Qwen2.5-VL-7B-Instruct
@@ -106,8 +120,8 @@ def get_model_tokenizer_qwen2_5_vl(*args, **kwargs):
 """
 register_model(
     ModelTemplate(
-        MLLMModelType.qwen2_5_vl,
-        ChatTemplateType.qwen2_5_vl,
-        get_model_tokenizer_qwen2_5_vl,
-        architectures=['Qwen2_5_VLForConditionalGeneration'],
+        model_type='Qwen2_5_VLForConditionalGeneration',
+        chat_templates=[ChatTemplateType.qwen2_5_vl],
+        loader=Qwen2_5VLLoader,
+        is_multimodal=True,
         tags=['vision', 'video']))
