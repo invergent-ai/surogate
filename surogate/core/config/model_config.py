@@ -6,7 +6,7 @@ from typing import Optional, Union, Any
 import torch
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
-from surogate.train.on_the_fly_mm import get_model_info_and_tokenizer
+from surogate.train.vision import get_model_info_and_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.jsonl import json_parse_to_dict
 from surogate.utils.logger import get_logger
@@ -22,7 +22,7 @@ class ModelConfig(ABC):
         template_type (Optional[str]): Type of the chat template to use. Default is None.
         max_model_len (Optional[int]): Maximum model length for rope scaling. Default is None.
         rope_scaling (Literal): Type of RoPE scaling. Only relevant for vision-language models — it is applied
-            to the HuggingFace vision model loaded in Python for multi-modal preprocessing (on_the_fly_mm.py).
+            to the HuggingFace vision model loaded in Python for multi-modal preprocessing (vision.py).
             Has no effect for pure LLM fine-tuning: the C++ training engine reads rope config directly from
             config.json on disk and ignores this value. You can pass a string such as 'linear', 'dynamic', 'yarn',
             or a JSON string like '{"factor": 2.0, "type": "yarn"}'. Default is None.

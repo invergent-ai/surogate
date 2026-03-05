@@ -28,8 +28,8 @@ class SurogateSFT(TokenizeDatasets):
             logger.info(f"Starting training run '{self.config.run_name}'...")
             return self._train_distributed()
 
-        if self.config.multimodal_on_the_fly and self.config.model_template.is_multimodal:
-            logger.info("Multimodal on-the-fly enabled; skipping tokenization.")
+        if self.config.train_vision and self.config.model_template.is_multimodal:
+            logger.info("Vision training enabled; skipping tokenization.")
             logger.info(f"Starting training run '{self.config.run_name}'...")
             return self.train_with_oom_recovery([], [])
 
@@ -64,8 +64,8 @@ class SurogateSFT(TokenizeDatasets):
         logger.metric("Ray address", dist_cfg.ray_address)
         logger.metric("Nodes", dist_cfg.num_nodes)
         logger.metric("GPUs per node", dist_cfg.gpus_per_node or self.config.gpus)
-        tokenize_on_node = not (self.config.multimodal_on_the_fly and self.config.model_template.is_multimodal)
-        logger.metric("Per-node tokenization", "enabled" if tokenize_on_node else "disabled (on-the-fly)")
+        tokenize_on_node = not (self.config.train_vision and self.config.model_template.is_multimodal)
+        logger.metric("Per-node tokenization", "enabled" if tokenize_on_node else "disabled (vision training)")
 
         trainer = RayDistributedTrainer(
             config=self.config,

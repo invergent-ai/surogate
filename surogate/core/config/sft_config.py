@@ -252,8 +252,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Whether to enable detailed training timing breakdown for debugging.
         debug_memory_breakdown (Optional[bool], defaults to False):
             Print detailed memory breakdown after model allocation (useful for QLoRA optimization).
-        multimodal_on_the_fly (Optional[bool], defaults to None):
-            If True, compute multimodal visual inputs on-the-fly during training instead of using pre-tokenized files.
+        train_vision (Optional[bool], defaults to None):
+            If True, run the vision encoder during training to process images/videos.
+            If False, train on text only (even for multimodal models).
             If None and the model is multimodal, defaults to True.
             
         wandb_project (Optional[str], defaults to "Surogate"):
@@ -365,7 +366,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     use_chat_template: Optional[bool] = True
     debug_time_breakdown: Optional[bool] = False
     debug_memory_breakdown: Optional[bool] = False
-    multimodal_on_the_fly: Optional[bool] = None
+    train_vision: Optional[bool] = None
     log_gpu_util: Optional[int] = 100
     auto_lr_reduction: Optional[bool] = False
     early_stop: Optional[bool] = False
@@ -483,7 +484,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
         self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
-        self.multimodal_on_the_fly = cfg.get('multimodal_on_the_fly', self.multimodal_on_the_fly)
+        self.train_vision = cfg.get('train_vision', cfg.get('train_vision', self.train_vision))
         self.auto_lr_reduction = cfg.get('auto_lr_reduction', self.auto_lr_reduction)
         self.early_stop = cfg.get('early_stop', self.early_stop)
         self.epoch_adjustment = cfg.get('epoch_adjustment', self.epoch_adjustment)
@@ -569,12 +570,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         self.ensure_directories()
 
-        # Default multimodal training to on-the-fly if not explicitly set.
-        if self.multimodal_on_the_fly is None and getattr(self.model_template, 'is_multimodal', False):
-            self.multimodal_on_the_fly = True
-        if self.multimodal_on_the_fly and not getattr(self.model_template, 'is_multimodal', False):
-            logger.warning("multimodal_on_the_fly=True but model is not multimodal; disabling on-the-fly mode.")
-            self.multimodal_on_the_fly = False
+        # Default vision training to enabled for multimodal models.
+        if self.train_vision is None and getattr(self.model_template, 'is_multimodal', False):
+            self.train_vision = True
+        if self.train_vision and not getattr(self.model_template, 'is_multimodal', False):
+            logger.warning("train_vision=True but model is not multimodal; disabling vision training.")
+            self.train_vision = False
 
     def _validate_chunking_config(self):
         """Validate that chunking parameters are compatible with batch size and sequence length."""

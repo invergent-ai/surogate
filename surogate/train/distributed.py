@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from surogate.core.config.sft_config import SFTConfig
-from surogate.train.on_the_fly_mm import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
+from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 
 # Lazy import Ray to avoid dependency when not using distributed training
 _ray = None
@@ -178,7 +178,7 @@ class NodeTrainer:
         self._trainer = None
         self._train_loader = None
         self._eval_loader = None
-        self._mm_on_the_fly = False
+        self._train_vision = False
         self._mm_batcher = None
         self._mm_train_dataset = None
         self._mm_eval_dataset = None
@@ -187,6 +187,16 @@ class NodeTrainer:
         self._mm_template_processor = None
         self._mm_vision_device = None
         self._mm_rope_fn = None
+
+    @staticmethod
+    def _detect_pos_planes(config) -> int:
+        """Detect if the model uses multi-plane position IDs (e.g. MRoPE).
+
+        All multimodal models currently supported (Qwen3-VL) use 3-plane MRoPE.
+        """
+        if getattr(config.model_info, 'is_multimodal', False):
+            return 3
+        return 1
 
     def setup(self) -> None:
         """Initialize data and model config on this node (non-blocking phase)."""
@@ -202,24 +212,25 @@ class NodeTrainer:
         
         logger.info(f"Node {self.node_rank}: Model download complete, weights at {config.model_dir}")
 
-        self._mm_on_the_fly = bool(config.multimodal_on_the_fly and config.model_template.is_multimodal)
+        self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
+        self._uses_mrope = self._detect_pos_planes(config) > 1
 
-        if self._mm_on_the_fly:
+        if self._train_vision:
             if config.sample_packing:
-                logger.warning("multimodal_on_the_fly disables sample_packing; forcing sample_packing=False.")
+                logger.warning("train_vision disables sample_packing; forcing sample_packing=False.")
                 config.sample_packing = False
             if config.padding_free:
-                logger.warning("multimodal_on_the_fly disables padding_free; forcing padding_free=False.")
+                logger.warning("train_vision disables padding_free; forcing padding_free=False.")
                 config.padding_free = False
 
         # Handle per-node tokenization if enabled (disabled for on-the-fly multimodal)
-        if self.tokenize_on_node and not self._mm_on_the_fly:
+        if self.tokenize_on_node and not self._train_vision:
             train_files, eval_files = self._tokenize_node_data(config)
         else:
             train_files = self.train_files
             eval_files = self.eval_files
 
-        if self._mm_on_the_fly:
+        if self._train_vision:
             # Shard training data across nodes for on-the-fly mode
             self._mm_train_dataset, self._mm_eval_dataset = load_multimodal_datasets(
                 config, node_rank=self.node_rank, num_nodes=self.num_nodes
@@ -336,7 +347,7 @@ class NodeTrainer:
         # When tokenize_on_node=True, each node has its own complete shard,
         # so we use rank=0, world_size=1 (no further sharding needed)
         # When tokenize_on_node=False, we use strided access across pre-tokenized files
-        if not self._mm_on_the_fly:
+        if not self._train_vision:
             if self.tokenize_on_node:
                 self._train_loader = _surogate.DataLoader(
                     self._train_files,
@@ -476,7 +487,7 @@ class NodeTrainer:
                 self._trainer.set_adapter_path(self._config.adapter_path)
             self._trainer.import_weights(model_weights_path)
 
-        if self._mm_on_the_fly:
+        if self._train_vision:
             (self._mm_hf_model,
              self._mm_processor,
              self._mm_template_processor,
@@ -580,7 +591,7 @@ class NodeTrainer:
         T = config.sequence_len
         local_gpus = self.local_gpus
 
-        if self._mm_on_the_fly:
+        if self._train_vision:
             for micro_step in range(config.gradient_accumulation_steps):
                 batch = self._mm_batcher.next_batch()
                 self._trainer.set_visual_inputs(
@@ -617,6 +628,10 @@ class NodeTrainer:
         out_tokens = np.empty((total_rows, T), dtype=np.int32)
         pos_ids = np.empty((total_rows, T), dtype=np.int32)
 
+        # MRoPE models (e.g. Qwen3-VL) need multi-plane position IDs.
+        # The DataLoader only produces 1-plane IDs, so let C++ fill them.
+        uses_mrope = self._uses_mrope
+
         if use_full_step_graphs:
             chunk = local_gpus * B
             for micro_step in range(config.gradient_accumulation_steps):
@@ -624,15 +639,22 @@ class NodeTrainer:
                     self._train_loader.advance_epoch()
                 start = micro_step * chunk
                 end = start + chunk
-                self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+                if uses_mrope:
+                    self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end])
+                else:
+                    self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
         else:
             # Run gradient accumulation steps
             for micro_step in range(config.gradient_accumulation_steps):
                 if not self._train_loader.has_next():
                     self._train_loader.advance_epoch()
 
-                self._train_loader.load_batch(in_tokens, out_tokens, pos_ids)
-                self._trainer.step(in_tokens, out_tokens, pos_ids)
+                if uses_mrope:
+                    self._train_loader.load_batch(in_tokens, out_tokens)
+                    self._trainer.step(in_tokens, out_tokens)
+                else:
+                    self._train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                    self._trainer.step(in_tokens, out_tokens, pos_ids)
 
         # Optimizer update
         opt_config = _surogate.OptimizerConfig(
@@ -649,14 +671,17 @@ class NodeTrainer:
             normuon_cautious_wd=config.normuon_cautious_wd
         )
         if use_full_step_graphs:
-            result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+            if uses_mrope:
+                result = self._trainer.train_step_graphed(in_tokens, out_tokens, opt_config, step + 1)
+            else:
+                result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
         else:
             result = self._trainer.update_with_config(opt_config, step + 1)
 
         return result['loss'], result['norm']
 
     def get_num_tokens(self) -> int:
-        if self._mm_on_the_fly:
+        if self._train_vision:
             if self._mm_train_dataset is None:
                 return -1
             try:
@@ -681,7 +706,7 @@ class NodeTrainer:
 
     def validate(self, max_steps: int = 100) -> Tuple[float, int]:
         """Run validation and return (mean_loss, batches_processed)."""
-        if self._mm_on_the_fly:
+        if self._train_vision:
             if self._mm_eval_dataset is None:
                 return 0.0, 0
             pad_token_id = self._config.tokenizer.pad_token_id
@@ -735,8 +760,12 @@ class NodeTrainer:
         batches = 0
 
         while self._eval_loader.has_next() and (max_steps < 0 or batches < max_steps):
-            self._eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
-            loss = self._trainer.validate(in_tokens, out_tokens, pos_ids)
+            if self._uses_mrope:
+                self._eval_loader.load_batch(in_tokens, out_tokens)
+                loss = self._trainer.validate(in_tokens, out_tokens)
+            else:
+                self._eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                loss = self._trainer.validate(in_tokens, out_tokens, pos_ids)
             total_loss += loss
             batches += 1
 
@@ -1134,7 +1163,7 @@ class RayDistributedTrainer:
         if config.max_steps > 0:
             max_steps = config.max_steps
         elif num_tokens <= 0:
-            raise ValueError("multimodal_on_the_fly requires max_steps when dataset length is unknown.")
+            raise ValueError("train_vision requires max_steps when dataset length is unknown.")
         elif config.epoch_adjustment and config.from_scratch:
             import math as _math
             chinchilla_epochs = max(1, _math.ceil(chinchilla_tokens / max(num_tokens, 1)))
@@ -1194,14 +1223,14 @@ class RayDistributedTrainer:
         has_eval = False
         if self.eval_files:
             has_eval = True
-        elif config.multimodal_on_the_fly:
+        elif config.train_vision:
             has_eval = bool(config.validation_datasets) or (config.validation_split_ratio and config.validation_split_ratio > 0)
 
         with training_logger_context(config) as train_logger:
             # log_cmd and log_options are already called by training_logger_context.
             # Log dataset info (log_dataset requires C++ DataLoader objects on the driver,
             # so we log token counts manually from node 0)
-            if not config.multimodal_on_the_fly:
+            if not config.train_vision:
                 dataset_info = ray.get(self.node_trainers[0].get_dataset_info.remote())
                 if dataset_info.get("train_tokens"):
                     logger.info(f"Train dataset: {dataset_info['train_tokens']} tokens")

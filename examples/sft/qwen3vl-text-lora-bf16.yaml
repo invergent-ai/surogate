@@ -1,0 +1,31 @@
+model: Qwen/Qwen3-VL-2B-Instruct
+output_dir: ./output_vl
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+
+max_steps: 100
+eval_steps: 20
+
+learning_rate: 2e-4
+
+recipe: bf16
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+train_vision: false
+
+dataloader_num_workers: 4
+datasets:
+  - path: "OpenLLM-Ro/ro_gsm8k"
+    type: auto

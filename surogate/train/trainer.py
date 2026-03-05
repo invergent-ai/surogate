@@ -21,7 +21,7 @@ from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
 from surogate.train.training_plot import generate_training_plot
-from surogate.train.on_the_fly_mm import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
+from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
@@ -40,7 +40,7 @@ class SurogateTrainerWrapper():
     ):
         self.config = config
         self._block_types = None
-        self._mm_on_the_fly = bool(config.multimodal_on_the_fly and config.model_template.is_multimodal)
+        self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
 
         model_weights_path = get_model_weights_path(config.model_dir)
 
@@ -56,12 +56,12 @@ class SurogateTrainerWrapper():
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
         self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
 
-        if self._mm_on_the_fly:
+        if self._train_vision:
             if config.sample_packing:
-                logger.warning("multimodal_on_the_fly disables sample_packing; forcing sample_packing=False.")
+                logger.warning("train_vision disables sample_packing; forcing sample_packing=False.")
                 config.sample_packing = False
             if config.padding_free:
-                logger.warning("multimodal_on_the_fly disables padding_free; forcing padding_free=False.")
+                logger.warning("train_vision disables padding_free; forcing padding_free=False.")
                 config.padding_free = False
 
             self.train_loader = None
@@ -197,9 +197,9 @@ class SurogateTrainerWrapper():
         # Determine max_steps
         if config.max_steps > 0:
             self.max_steps = config.max_steps
-        elif self._mm_on_the_fly:
+        elif self._train_vision:
             if self.steps_per_epoch == 0:
-                raise ValueError("multimodal_on_the_fly requires max_steps when dataset length is unknown.")
+                raise ValueError("train_vision requires max_steps when dataset length is unknown.")
             self.max_steps = self.steps_per_epoch * self.config.num_epochs
             logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
         elif config.epoch_adjustment and self.config.from_scratch:
@@ -234,6 +234,15 @@ class SurogateTrainerWrapper():
             schedule_type=config.lr_scheduler_type,
             wsd_decay_steps_fraction=config.wsd_decay_steps_fraction
         )
+
+    def _detect_pos_planes(self) -> int:
+        """Detect if the model uses multi-plane position IDs (e.g. MRoPE).
+
+        All multimodal models currently supported (Qwen3-VL) use 3-plane MRoPE.
+        """
+        if getattr(self.config.model_info, 'is_multimodal', False):
+            return 3
+        return 1
 
     def _load_block_types(self) -> Optional[list]:
         if self._block_types is not None:
@@ -292,9 +301,9 @@ class SurogateTrainerWrapper():
     def train(self):
         with training_logger_context(self.config) as train_logger:
             # Log dataset information
-            if not self._mm_on_the_fly and self.eval_loader:
+            if not self._train_vision and self.eval_loader:
                 train_logger.log_dataset(self.train_loader, self.eval_loader)
-            elif self._mm_on_the_fly:
+            elif self._train_vision:
                 try:
                     train_len = len(self.mm_train_dataset)
                 except Exception:
@@ -354,7 +363,7 @@ class SurogateTrainerWrapper():
                     logger.info("  QLoRA-FP4 enabled: NVFP4 (E2M1)")
                 logger.info("Note: Base model weights are frozen, only LoRA adapters will be trained")
 
-            if self._mm_on_the_fly:
+            if self._train_vision:
                 self.run_training_loop_mm(train_logger)
             else:
                 self.run_training_loop(train_logger)
@@ -608,11 +617,22 @@ class SurogateTrainerWrapper():
         total_rows = self.config.gpus * self.config.per_device_train_batch_size * micro_steps
         in_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
         out_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
+
+        # MRoPE models (e.g. Qwen3-VL) need multi-plane position IDs (3 planes).
+        # The DataLoader only produces 1-plane IDs.  For text-only data all MRoPE
+        # planes are identical sequential IDs, so we let C++ fill them via
+        # fill_sequential_position_ids (by not passing position_ids).
+        uses_mrope = self._detect_pos_planes() > 1
         pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
+        if uses_mrope:
+            logger.info("MRoPE model in DataLoader path: C++ will fill multi-plane position IDs")
 
         # Preload first batch (eager path only)
         if not use_full_step_graphs:
-            self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+            if uses_mrope:
+                self.train_loader.load_batch(in_tokens, out_tokens)
+            else:
+                self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
         # Auto LR reduction guard
         loss_guard = LossGuard(self.lr_schedule, logger) if self.config.auto_lr_reduction else None
@@ -653,11 +673,13 @@ class SurogateTrainerWrapper():
                 # Limit periodic eval to 100 batches for speed; full eval runs at end of training
                 if use_full_step_graphs:
                     chunk = self.config.gpus * self.config.per_device_train_batch_size
+                    eval_pos = None if uses_mrope else pos_ids[:chunk]
                     val_loss, elapsed_ms, batches_processed = self.run_evaluation(
-                        in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], max_steps=100
+                        in_tokens[:chunk], out_tokens[:chunk], eval_pos, max_steps=100
                     )
                 else:
-                    val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, pos_ids, max_steps=100)
+                    eval_pos = None if uses_mrope else pos_ids
+                    val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, eval_pos, max_steps=100)
                 epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
                 # Calculate actual tokens processed based on batches run
                 # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
@@ -668,9 +690,15 @@ class SurogateTrainerWrapper():
                 # Reload training batch after evaluation (eval leaves its last batch in the buffers)
                 if use_full_step_graphs:
                     chunk = self.config.gpus * self.config.per_device_train_batch_size
-                    self.train_loader.load_batch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk])
+                    if uses_mrope:
+                        self.train_loader.load_batch(in_tokens[:chunk], out_tokens[:chunk])
+                    else:
+                        self.train_loader.load_batch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk])
                 else:
-                    self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                    if uses_mrope:
+                        self.train_loader.load_batch(in_tokens, out_tokens)
+                    else:
+                        self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic checkpointing (before training step)
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
@@ -707,12 +735,21 @@ class SurogateTrainerWrapper():
                         self.train_loader.advance_epoch()
                     start = micro_step * chunk
                     end = start + chunk
-                    self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+                    if uses_mrope:
+                        self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end])
+                    else:
+                        self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
             else:
                 for micro_step in range(self.config.gradient_accumulation_steps):
-                    self.trainer.step(in_tokens, out_tokens, pos_ids)
+                    if uses_mrope:
+                        self.trainer.step(in_tokens, out_tokens)
+                    else:
+                        self.trainer.step(in_tokens, out_tokens, pos_ids)
                     if self.train_loader.has_next():
-                        self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                        if uses_mrope:
+                            self.train_loader.load_batch(in_tokens, out_tokens)
+                        else:
+                            self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Log GPU utilization
             if self.config.log_gpu_util > 0 and step % self.config.log_gpu_util == 0:
@@ -738,7 +775,10 @@ class SurogateTrainerWrapper():
                 normuon_cautious_wd=self.config.normuon_cautious_wd
             )
             if use_full_step_graphs:
-                result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+                if uses_mrope:
+                    result = self.trainer.train_step_graphed(in_tokens, out_tokens, opt_config, step + 1)
+                else:
+                    result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
                 # Optional LoRA grad debug runs after graph replay (post-update).
                 self._maybe_log_lora_grad_stats(step)
             else:
@@ -992,13 +1032,13 @@ class SurogateTrainerWrapper():
                     stat["nan"],
                 )
 
-    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
+    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: Optional[np.ndarray], max_steps: int) -> Tuple[float, int, int]:
         """
         Run evaluation on test set.
         Args:
             in_tokens (np.ndarray): Input token buffer.
             out_tokens (np.ndarray): Output token buffer.
-            pos_ids (np.ndarray): Position id buffer.
+            pos_ids (Optional[np.ndarray]): Position id buffer. None for MRoPE models (C++ fills sequential IDs).
             max_steps (int): Maximum number of eval batches to process. Pass -1 to process all available batches.
         Returns:
             Tuple of (mean_loss, elapsed_ms, batches_processed)
@@ -1014,8 +1054,12 @@ class SurogateTrainerWrapper():
         # Use has_next() to check data availability (matches C++ implementation)
         # max_steps < 0 means process all available batches
         while self.eval_loader.has_next() and (max_steps < 0 or batches < max_steps):
-            self.eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
-            loss = self.trainer.validate(in_tokens, out_tokens, pos_ids)
+            if pos_ids is not None:
+                self.eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                loss = self.trainer.validate(in_tokens, out_tokens, pos_ids)
+            else:
+                self.eval_loader.load_batch(in_tokens, out_tokens)
+                loss = self.trainer.validate(in_tokens, out_tokens)
             total_loss += loss
             batches += 1
 
