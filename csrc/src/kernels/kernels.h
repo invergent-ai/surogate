@@ -678,10 +678,15 @@ void global_norm_squared_multi_tensor(float* out, const void* const* data_ptrs,
                                        const size_t* sizes, const int* dtype_flags,
                                        int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream);
 
-// 8-bit AdamW optimizer - functions moved to runtime/adamw_8bit.h
-// Bring them into global namespace for backward compatibility
-#include "runtime/optimizers/adamw_8bit.h"
+// 8-bit AdamW optimizer (flash softsign/sqrt quantization)
+#include "runtime/optimizers/flash_adamw_8bit.h"
+using optimizers::flash_adamw_update_8bit;
+using optimizers::flash_adamw_update_8bit_multi_tensor;
+using optimizers::init_flash_adamw8bit_state;
+using optimizers::flash_adamw8bit_num_scales;
 
+// 8-bit AdamW optimizer (BnB-style quantile quantization, used by NorMuon)
+#include "runtime/optimizers/adamw_8bit.h"
 using optimizers::adamw_update_8bit;
 using optimizers::adamw_update_8bit_multi_tensor;
 using optimizers::init_adamw8bit_state;
@@ -2360,6 +2365,34 @@ void gated_delta_rule_chunk_backward_v2(
 void elementwise_mul(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long total, cudaStream_t stream);
 void elementwise_mul(half* out, const half* a, const half* b, long total, cudaStream_t stream);
 void elementwise_mul(float* out, const float* a, const float* b, long total, cudaStream_t stream);
+
+// Qwen3.5 decay primitive:
+// g = -exp(A_log) * softplus(a + dt_bias)
+void qwen3_5_decay_forward(Tensor& out,
+                           const Tensor& a,
+                           const Tensor& A_log,
+                           const Tensor& dt_bias,
+                           cudaStream_t stream);
+void qwen3_5_decay_backward(Tensor& d_a,
+                            Tensor& d_A_log,
+                            Tensor& d_dt_bias,
+                            const Tensor& d_out,
+                            const Tensor& a,
+                            const Tensor& A_log,
+                            const Tensor& dt_bias,
+                            cudaStream_t stream);
+
+// Repeat heads along the head axis:
+// forward: [B,T,H,D] -> [B,T,H*repeats,D]
+// backward: sum repeated head-gradients back to [B,T,H,D]
+void repeat_interleave_heads_forward(Tensor& out,
+                                     const Tensor& inp,
+                                     int repeats,
+                                     cudaStream_t stream);
+void repeat_interleave_heads_backward(Tensor& d_inp,
+                                      const Tensor& d_out,
+                                      int repeats,
+                                      cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // LoRA Dropout

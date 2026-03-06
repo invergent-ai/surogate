@@ -666,8 +666,8 @@ void DslModel::on_restore_checkpoint(NCCLCommunicator& comm) {
     (void)comm;
     if (mAdamW8BitState && mAdamW8BitState->state1.Data) {
         mAdamW8BitState->initialized = true;
-        mAdamWMomentumContainer.update_pointers(&mAdamW8BitState->state1, &mAdamW8BitState->absmax1);
-        mAdamWVarianceContainer.update_pointers(&mAdamW8BitState->state2, &mAdamW8BitState->absmax2);
+        mAdamWMomentumContainer.update_pointers(&mAdamW8BitState->state1, &mAdamW8BitState->scales1);
+        mAdamWVarianceContainer.update_pointers(&mAdamW8BitState->state2, &mAdamW8BitState->scales2);
     }
 }
 

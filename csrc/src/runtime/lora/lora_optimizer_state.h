@@ -116,32 +116,30 @@ private:
     void allocate_state();
 };
 
-// 8-bit AdamW optimizer state for LoRA weights
+// 8-bit AdamW optimizer state for LoRA weights (flash softsign/sqrt quantization)
 struct LoRAAdamW8BitState {
     bool initialized = false;
     bool values_restored = false;  // Set when state values loaded from checkpoint
     bool grad_ptrs_initialized = false;  // Set after grad pointer array is populated
     size_t total_params = 0;
-    size_t num_blocks = 0;
+    size_t num_groups = 0;
     int num_tensors = 0;
 
     // Offloading configuration
     bool offload_state = false;  // If true, state tensors are in pinned host memory
     bool use_zero_copy = false;  // If true, use zero-copy access instead of transfers
 
-    Tensor quantiles1;   // 256 entries - quantization map for m
-    Tensor quantiles2;   // 256 entries - quantization map for v
-    Tensor state1;       // uint8 quantized m, size = total_params
-    Tensor state2;       // uint8 quantized v, size = total_params
-    Tensor absmax1;      // per-block absmax for m
-    Tensor absmax2;      // per-block absmax for v
+    Tensor state1;       // signed char (int8) - softsign-quantized momentum
+    Tensor state2;       // unsigned char (uint8) - sqrt-quantized variance
+    Tensor scales1;      // FP16 per-group scales for momentum
+    Tensor scales2;      // FP16 per-group scales for variance
 
     // Multi-tensor optimizer buffers (device memory)
     // Pre-allocated arrays of pointers/sizes to avoid per-step CPU work
     Tensor param_ptrs;      // float** or nv_bfloat16** - array of param pointers
     Tensor grad_ptrs;       // float** or nv_bfloat16** - array of grad pointers
     Tensor tensor_sizes;    // int* - array of tensor sizes
-    Tensor state_offsets;   // int* - element offset for each tensor in state buffers
+    Tensor state_offsets;   // int* - element offset for each tensor in state buffers (GROUP_SIZE-aligned)
 };
 
 // NorMuon optimizer state for LoRA weights

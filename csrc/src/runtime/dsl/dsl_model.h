@@ -51,48 +51,48 @@ namespace detail {
 
 class AdamW8BitMomentumContainer final : public ITensorContainer {
 public:
-    AdamW8BitMomentumContainer(Tensor* state1 = nullptr, Tensor* absmax1 = nullptr)
-        : mState1(state1), mAbsmax1(absmax1) {}
+    AdamW8BitMomentumContainer(Tensor* state1 = nullptr, Tensor* scales1 = nullptr)
+        : mState1(state1), mScales1(scales1) {}
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
         if (!mState1 || !mState1->Data) return;
         callback("adamw8bit.state1", TensorShard(*mState1));
-        if (mAbsmax1 && mAbsmax1->Data) {
-            callback("adamw8bit.absmax1", TensorShard(*mAbsmax1));
+        if (mScales1 && mScales1->Data) {
+            callback("adamw8bit.scales1", TensorShard(*mScales1));
         }
     }
 
-    void update_pointers(Tensor* state1, Tensor* absmax1) {
+    void update_pointers(Tensor* state1, Tensor* scales1) {
         mState1 = state1;
-        mAbsmax1 = absmax1;
+        mScales1 = scales1;
     }
 
 private:
     Tensor* mState1 = nullptr;
-    Tensor* mAbsmax1 = nullptr;
+    Tensor* mScales1 = nullptr;
 };
 
 class AdamW8BitVarianceContainer final : public ITensorContainer {
 public:
-    AdamW8BitVarianceContainer(Tensor* state2 = nullptr, Tensor* absmax2 = nullptr)
-        : mState2(state2), mAbsmax2(absmax2) {}
+    AdamW8BitVarianceContainer(Tensor* state2 = nullptr, Tensor* scales2 = nullptr)
+        : mState2(state2), mScales2(scales2) {}
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
         if (!mState2 || !mState2->Data) return;
         callback("adamw8bit.state2", TensorShard(*mState2));
-        if (mAbsmax2 && mAbsmax2->Data) {
-            callback("adamw8bit.absmax2", TensorShard(*mAbsmax2));
+        if (mScales2 && mScales2->Data) {
+            callback("adamw8bit.scales2", TensorShard(*mScales2));
         }
     }
 
-    void update_pointers(Tensor* state2, Tensor* absmax2) {
+    void update_pointers(Tensor* state2, Tensor* scales2) {
         mState2 = state2;
-        mAbsmax2 = absmax2;
+        mScales2 = scales2;
     }
 
 private:
     Tensor* mState2 = nullptr;
-    Tensor* mAbsmax2 = nullptr;
+    Tensor* mScales2 = nullptr;
 };
 
 }  // namespace detail
@@ -317,16 +317,14 @@ private:
         bool initialized = false;
         size_t total_params = 0;
         size_t total_state_elems = 0;
-        size_t num_blocks = 0;
+        size_t num_groups = 0;
         // Offloading configuration (copied from options during init)
         bool offload_state = false;
         bool use_zero_copy = false;
-        Tensor quantiles1;
-        Tensor quantiles2;
-        Tensor state1;
-        Tensor state2;
-        Tensor absmax1;
-        Tensor absmax2;
+        Tensor state1;       // signed char (int8) - softsign-quantized momentum
+        Tensor state2;       // unsigned char (uint8) - sqrt-quantized variance
+        Tensor scales1;      // FP16 per-group scales for momentum
+        Tensor scales2;      // FP16 per-group scales for variance
     };
     std::unique_ptr<AdamW8BitState> mAdamW8BitState;
 

@@ -27,6 +27,10 @@
 #include "utilities/tensor.h"
 #include "utilities/utils.h"
 
+#if defined(GDR_V2_COMPILE_FWD_ONLY) && defined(GDR_V2_COMPILE_BWD_ONLY)
+#error "GDR_V2_COMPILE_FWD_ONLY and GDR_V2_COMPILE_BWD_ONLY are mutually exclusive."
+#endif
+
 namespace {
 
 // ============================================================================
@@ -158,6 +162,7 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float x) {
     return x;
 }
 
+#if !defined(GDR_V2_COMPILE_BWD_ONLY)
 // ============================================================================
 // Forward multi-kernel workspace layout (per chunk)
 // ============================================================================
@@ -488,6 +493,7 @@ __global__ void gdr_fwd_precompute_wmma(
 
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
+    const bool tail_chunk = (L < chunk_size);
 
     float* ws = fwd_workspace + (long)block_id * fwd_ws_stride;
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
@@ -798,6 +804,7 @@ __global__ void gdr_fwd_output_wmma(
 
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
+    const bool tail_chunk = (L < chunk_size);
 
     const float* ws = fwd_workspace + (long)block_id * fwd_ws_stride;
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
@@ -890,6 +897,9 @@ __global__ void gdr_fwd_output_wmma(
 // Shared memory: h[K×V]f + scratch1[C×C]f + scratch2[C×C]f
 //   + k[C×K]TQ + buf1[C×C]TQ + buf2[C×V]TQ + buf3[C×K]TQ + scalars[3×C]f
 // ============================================================================
+#endif  // !GDR_V2_COMPILE_BWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_FWD_ONLY)
 template<typename TQ, typename TG, typename TB>
 __global__ void gdr_chunk_checkpoint_wmma(
     float* __restrict__ checkpoints,
@@ -1084,6 +1094,9 @@ __global__ void gdr_chunk_checkpoint_wmma(
     }
 }
 
+#endif  // !GDR_V2_COMPILE_FWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_BWD_ONLY)
 // ============================================================================
 // Forward kernel — fully parallelized (scalar fallback)
 // ============================================================================
@@ -1389,6 +1402,9 @@ __global__ void gdr_chunk_fwd_v2(
     }
 }
 
+#endif  // !GDR_V2_COMPILE_BWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_FWD_ONLY)
 // ============================================================================
 // Checkpoint kernel — fully parallelized
 // Recomputes state at each chunk boundary for the backward pass.
@@ -3005,7 +3021,7 @@ struct ChunkWorkspaceLayout {
     int DG_off;      // [Lp]
     int DB_off;      // [Lp]
     int DHT1_off;    // [K×V]
-    int C_off;       // [K×K] packed as TQ — correction matrix for Phase 2 ds recurrence
+    int C_off;       // [K×K] float — correction matrix for Phase 2 ds recurrence
     int EG_off;      // [1]   — exp(g_last) per chunk
     int total;       // total floats per chunk
 };
@@ -3019,8 +3035,7 @@ __host__ __device__ ChunkWorkspaceLayout make_chunk_ws(int Lp, int Kdim, int Vdi
     constexpr int kWsAlignFloats = 128 / sizeof(float);
     ChunkWorkspaceLayout l;
     int off = 0;
-    const int c_storage_floats =
-        static_cast<int>((static_cast<long>(Kdim) * Kdim * sizeof(TQ) + sizeof(float) - 1) / sizeof(float));
+    const int c_storage_floats = Kdim * Kdim;
     l.M_off    = align_up_int(off, kWsAlignFloats); off = l.M_off + Lp * Lp;
     l.A_off    = align_up_int(off, kWsAlignFloats); off = l.A_off + Lp * Lp;
     l.W_off    = align_up_int(off, kWsAlignFloats); off = l.W_off + Lp * Kdim;
@@ -3388,11 +3403,11 @@ __global__ void gdr_bwd_phase1_wmma(
     __syncthreads();
 
     // DG from S gradient without atomics:
-    // DG[i] += sum_{j<=i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
+    // DG[i] += sum_{j<i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
     for (int i = tid; i < L; i += nthr) {
         float dg_pos = 0.0f;
         float dg_neg = 0.0f;
-        for (int j = 0; j <= i; ++j) {
+        for (int j = 0; j < i; ++j) {
             dg_pos += scratch1[i * Lp + j] * scratch2[i * Lp + j];
         }
         for (int r = i + 1; r < L; ++r) {
@@ -3447,7 +3462,7 @@ __global__ void gdr_bwd_phase1_wmma(
     // Precompute correction matrix C and correction_local for Phase 2
     // This allows Phase 2 to use a single matmul: ds = ds*eg + DHT1_corrected - C@ds
     // ================================================================
-    TQ* C_mat = reinterpret_cast<TQ*>(cws + cwl.C_off);
+    float* C_mat = cws + cwl.C_off;
     const float g_last_val_p1 = g_last_val;
 
     // Store eg_last for Phase 2
@@ -3469,9 +3484,9 @@ __global__ void gdr_bwd_phase1_wmma(
     wmma_tn<TQ>(buf3, Kdim, smem_k, Kdim, scratch1, Kdim, Kdim, Kdim, Lp);
     __syncthreads();
 
-    // Store C in workspace as packed TQ once; Phase 2 reuses directly.
+    // Store C in workspace as fp32; Phase 2 converts to TQ for WMMA use.
     for (int idx = tid; idx < Kdim * Kdim; idx += nthr)
-        C_mat[idx] = from_float<TQ>(bf16_trunc<TQ>(scratch1[idx]));
+        C_mat[idx] = scratch1[idx];
     __syncthreads();
 
     // d_pre_local = DU * exp(g_last - g[i]) → buf2[Lp×V]
@@ -3554,12 +3569,12 @@ __global__ void gdr_bwd_phase2_wmma(
         const int chunk_block_id = bh * num_chunks + chunk;
         float* cws = chunk_workspace + (long)chunk_block_id * chunk_ws_stride;
         float* DHT1 = cws + cwl.DHT1_off;   // already corrected by Phase 1
-        const TQ* C_mat = reinterpret_cast<const TQ*>(cws + cwl.C_off);
+        const float* C_mat = cws + cwl.C_off;
         float  eg_last = *(cws + cwl.EG_off);
 
-        // Load packed C directly into buf1 [K×K]
+        // Load C (fp32) and convert to TQ into buf1 [K×K]
         for (long idx = tid; idx < kk; idx += nthr)
-            buf1[idx] = C_mat[idx];
+            buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(C_mat[idx]));
         // Load ds → buf2 bf16 [K×V]
         for (long idx = tid; idx < kv; idx += nthr)
             buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(ds[idx]));
@@ -3590,6 +3605,7 @@ __global__ void gdr_bwd_phase3_wmma(
     TQ* __restrict__ d_v,
     TG* __restrict__ d_g,
     TB* __restrict__ d_beta,
+    const TQ* __restrict__ d_out_global,
     const TQ* __restrict__ q_global,
     const TQ* __restrict__ k_global,
     const TQ* __restrict__ v_global,
@@ -3601,6 +3617,7 @@ __global__ void gdr_bwd_phase3_wmma(
     int chunk_ws_stride,
     int Tlen, int H, int Kdim, int Vdim,
     int num_chunks, int chunk_size,
+    float scale,
     bool use_qk_l2norm_in_kernel)
 {
     const int tid = threadIdx.x;
@@ -3614,6 +3631,7 @@ __global__ void gdr_bwd_phase3_wmma(
 
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
+    const bool tail_chunk = (L < chunk_size);
 
     ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
     float* cws = chunk_workspace + (long)block_id * chunk_ws_stride;
@@ -3718,9 +3736,82 @@ __global__ void gdr_bwd_phase3_wmma(
     // Checkpoint access for h_in
     const float* cp_base = checkpoints + (long)bh * (num_chunks + 1) * kv;
     const float* h_in = cp_base + (long)chunk * kv;
-
-    // Temp storage in DHT1 area (K*V = Lp*Lp for K=V=64)
+    // Reuse per-chunk DHT1 storage as temporary global staging for phase3.
     float* tmp_area = cws + cwl.DHT1_off;
+
+    // Tail chunks are sensitive to padded WMMA numerics; recompute DG base terms
+    // (term1 + intra-chunk term2) in scalar math to match reference behavior.
+    if (tail_chunk) {
+        for (int i = tid; i < L; i += nthr) {
+            DG[i] = 0.0f;
+        }
+        __syncthreads();
+
+        // term1: scale * exp(g[i]) * dot(d_out[i], q[i] @ bf16(h_in))
+        for (int i = tid; i < L; i += nthr) {
+            float dg_i = 0.0f;
+            const long do_i_base = (((long)b * Tlen + cs + i) * H + h) * Vdim;
+            for (int vv = 0; vv < Vdim; ++vv) {
+                const float do_v = to_float(d_out_global[do_i_base + vv]) * scale;
+                float qh = 0.0f;
+                for (int kk = 0; kk < Kdim; ++kk) {
+                    const float qi = to_float(smem_q[i * Kdim + kk]);
+                    const float hq = bf16_trunc<TQ>(h_in[kk * Vdim + vv]);
+                    qh += qi * hq;
+                }
+                dg_i += do_v * smem_eg[i] * qh;
+            }
+            DG[i] = dg_i;
+        }
+        __syncthreads();
+
+        // term2: DG[i] += sum_{j<i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
+        for (int i = tid; i < L; i += nthr) {
+            float dg_pos = 0.0f;
+            float dg_neg = 0.0f;
+
+            for (int j = 0; j < i; ++j) {
+                const float exp_ij = smem_eg[i] * smem_e_last[j] * inv_eg_last_p3;
+                float dot_qk = 0.0f;
+                for (int kk = 0; kk < Kdim; ++kk) {
+                    dot_qk += to_float(smem_q[i * Kdim + kk]) * to_float(smem_k[j * Kdim + kk]);
+                }
+                const float s_ij = bf16_trunc<TQ>(exp_ij * dot_qk);
+
+                const float e_j = smem_e_last[j];
+                float grad_s = 0.0f;
+                const long do_i_base = (((long)b * Tlen + cs + i) * H + h) * Vdim;
+                for (int vv = 0; vv < Vdim; ++vv) {
+                    const float do_v = to_float(d_out_global[do_i_base + vv]) * scale;
+                    const float v_new_pre = VNEW[j * Vdim + vv] / e_j;
+                    grad_s += do_v * v_new_pre;
+                }
+                dg_pos += grad_s * s_ij;
+            }
+
+            for (int r = i + 1; r < L; ++r) {
+                const float exp_ri = smem_eg[r] * smem_e_last[i] * inv_eg_last_p3;
+                float dot_qk = 0.0f;
+                for (int kk = 0; kk < Kdim; ++kk) {
+                    dot_qk += to_float(smem_q[r * Kdim + kk]) * to_float(smem_k[i * Kdim + kk]);
+                }
+                const float s_ri = bf16_trunc<TQ>(exp_ri * dot_qk);
+
+                const float e_i = smem_e_last[i];
+                float grad_s = 0.0f;
+                const long do_r_base = (((long)b * Tlen + cs + r) * H + h) * Vdim;
+                for (int vv = 0; vv < Vdim; ++vv) {
+                    const float do_v = to_float(d_out_global[do_r_base + vv]) * scale;
+                    const float v_new_pre = VNEW[i * Vdim + vv] / e_i;
+                    grad_s += do_v * v_new_pre;
+                }
+                dg_neg += grad_s * s_ri;
+            }
+
+            DG[i] += dg_pos - dg_neg;
+        }
+        __syncthreads();
+    }
 
     // ================================================================
     // Step 0-pre: k@ds → add to DU, apply gating, DG contributions
@@ -3734,33 +3825,54 @@ __global__ void gdr_bwd_phase3_wmma(
         buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(dh_chunk[idx]));
     __syncthreads();
 
-    // k @ ds → scratch1[Lp×V]
-    wmma_nn<TQ>(smem_k, Kdim, buf1, Vdim, scratch1, Vdim, Lp, Vdim, Kdim);
-    __syncthreads();
-
-    // DU += k@ds, then apply gating: DU → d_pre
-    for (int idx = tid; idx < L * Vdim; idx += nthr) {
-        const int i = idx / Vdim;
-        const float e_i = smem_e_last[i];
-        const float kds_val = scratch1[idx];
-        const float d_vnew = DU[idx] + kds_val;
-        const float d_pre = d_vnew * e_i;
-
-        DU[idx] = d_pre;  // overwrite DU with d_pre
-    }
-    __syncthreads();
-
-    // DG gating contribution:
-    //   DG[i]     -= Σ_v (k@ds)[i,v] * VNEW[i,v]
-    //   DG[L - 1] += Σ_i,v (k@ds)[i,v] * VNEW[i,v]
     float dg_last_local = 0.0f;
-    for (int i = tid; i < L; i += nthr) {
-        float row_sum = 0.0f;
-        for (int vv = 0; vv < Vdim; ++vv) {
-            row_sum += scratch1[i * Vdim + vv] * VNEW[i * Vdim + vv];
+    if (!tail_chunk) {
+        // k @ ds → scratch1[Lp×V]
+        wmma_nn<TQ>(smem_k, Kdim, buf1, Vdim, scratch1, Vdim, Lp, Vdim, Kdim);
+        __syncthreads();
+
+        // DU += k@ds, then apply gating: DU → d_pre
+        for (int idx = tid; idx < L * Vdim; idx += nthr) {
+            const int i = idx / Vdim;
+            const float e_i = smem_e_last[i];
+            const float kds_val = scratch1[idx];
+            const float d_vnew = DU[idx] + kds_val;
+            const float d_pre = d_vnew * e_i;
+
+            DU[idx] = d_pre;  // overwrite DU with d_pre
         }
-        DG[i] -= row_sum;
-        dg_last_local += row_sum;
+        __syncthreads();
+
+        // DG gating contribution:
+        //   DG[i]     -= Σ_v (k@ds)[i,v] * VNEW[i,v]
+        //   DG[L - 1] += Σ_i,v (k@ds)[i,v] * VNEW[i,v]
+        for (int i = tid; i < L; i += nthr) {
+            float row_sum = 0.0f;
+            for (int vv = 0; vv < Vdim; ++vv) {
+                row_sum += scratch1[i * Vdim + vv] * VNEW[i * Vdim + vv];
+            }
+            DG[i] -= row_sum;
+            dg_last_local += row_sum;
+        }
+    } else {
+        // Tail chunks: compute k@ds in fp32 scalar math to match reference numerics.
+        for (int i = tid; i < L; i += nthr) {
+            float row_sum = 0.0f;
+            const float e_i = smem_e_last[i];
+            for (int vv = 0; vv < Vdim; ++vv) {
+                float kds_val = 0.0f;
+                for (int kk = 0; kk < Kdim; ++kk) {
+                    kds_val += dh_chunk[(long)kk * Vdim + vv] * to_float(smem_k[i * Kdim + kk]);
+                }
+                const int idx = i * Vdim + vv;
+                const float d_vnew = DU[idx] + kds_val;
+                const float d_pre = d_vnew * e_i;
+                DU[idx] = d_pre;
+                row_sum += kds_val * VNEW[idx];
+            }
+            DG[i] -= row_sum;
+            dg_last_local += row_sum;
+        }
     }
 
     const float dg_last_warp = warp_reduce_sum_f32(dg_last_local);
@@ -3837,9 +3949,12 @@ __global__ void gdr_bwd_phase3_wmma(
         DW[idx] = -scratch1[idx];
     __syncthreads();
 
-    // Load M → scratch2
-    for (int idx = tid; idx < Lp * Lp; idx += nthr)
-        scratch2[idx] = M_ws[idx];
+    // Load active causal block of M and zero-pad the rest.
+    for (int idx = tid; idx < Lp * Lp; idx += nthr) {
+        const int i = idx / Lp;
+        const int j = idx % Lp;
+        scratch2[idx] = (i < L && j <= i) ? M_ws[idx] : 0.0f;
+    }
     __syncthreads();
 
     // ================================================================
@@ -4000,7 +4115,7 @@ __global__ void gdr_bwd_phase3_wmma(
     for (int idx = tid; idx < Lp * Lp; idx += nthr)
         tmp_area[idx] = scratch2[idx];
     for (int idx = tid; idx < Lp * Lp; idx += nthr)
-        scratch2[idx] = 0.0f;  // ddot_sym accumulator
+        scratch2[idx] = 0.0f;
     __syncthreads();
 
     // Process lower triangle:
@@ -4013,13 +4128,13 @@ __global__ void gdr_bwd_phase3_wmma(
 
         const float exp_ij = smem_eg[i] * smem_e_last[j] * inv_eg_last_p3;
         const float a_grad = scratch1[i * Lp + j];
-        const float dot_k = tmp_area[i * Lp + j];  // precomputed kkt
+        const float dot_k = tmp_area[i * Lp + j];
         const float val = dot_k * exp_ij;
 
         const float db_pair = a_grad * val;
         const float dval = a_grad * smem_beta[i];
-        const float ddot = dval * exp_ij;
         const float dg_pair = dval * dot_k * exp_ij;
+        const float ddot = dval * exp_ij;
 
         scratch1[i * Lp + j] = db_pair;
         tmp_area[i * Lp + j] = dg_pair;
@@ -4214,13 +4329,14 @@ void launch_bwd_v2_multikernel(
     gdr_bwd_phase3_wmma<TQ, TG, TB><<<B * H * num_chunks, threads, phase_smem, stream>>>(
         d_q.get<TQ>(), d_k.get<TQ>(), d_v.get<TQ>(),
         d_g.get<TG>(), d_beta.get<TB>(),
+        d_out.get<TQ>(),
         q.get<TQ>(), k.get<TQ>(), v.get<TQ>(),
         g.get<TG>(), beta.get<TB>(),
         checkpoints.get<float>(),
         dh_storage,
         chunk_ws,
         chunk_ws_stride,
-        Tlen, H, Kdim, Vdim, num_chunks, chunk_size,
+        Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
         use_qk_l2norm_in_kernel);
 
     if (profile) {
@@ -4234,6 +4350,9 @@ void launch_bwd_v2_multikernel(
     }
 }
 
+#endif  // !GDR_V2_COMPILE_FWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_BWD_ONLY)
 // ============================================================================
 // Multi-kernel forward launcher (3 kernels: precompute → state → output)
 // ============================================================================
@@ -4448,6 +4567,9 @@ void launch_fwd_v2(
         Tlen, H, Kdim, Vdim, chunk_size, scale, use_qk_l2norm_in_kernel);
 }
 
+#endif  // !GDR_V2_COMPILE_BWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_FWD_ONLY)
 template<typename TQ, typename TG, typename TB>
 void launch_bwd_v2(
     Tensor& d_q, Tensor& d_k, Tensor& d_v, Tensor& d_g, Tensor& d_beta,
@@ -4465,10 +4587,14 @@ void launch_bwd_v2(
 
     const int threads = 128;
     dim3 grid(B, H);
+    const bool force_scalar_bwd = (std::getenv("SUROGATE_GDR_FORCE_SCALAR_BWD") != nullptr);
 
     // Try WMMA multi-kernel path for bf16/fp16 with K,V multiples of 16 and <= 64
     constexpr bool can_wmma = std::is_same_v<TQ, nv_bfloat16> || std::is_same_v<TQ, half>;
     if constexpr (can_wmma) {
+        if (force_scalar_bwd) {
+            // Debug switch to compare multikernel path against scalar fallback.
+        } else
         if (Kdim <= 64 && Vdim <= 64 && Kdim % 16 == 0 && Vdim % 16 == 0) {
             launch_bwd_v2_multikernel<TQ, TG, TB>(
                 d_q, d_k, d_v, d_g, d_beta, d_initial_state,
@@ -4526,6 +4652,9 @@ void launch_bwd_v2(
         Tlen, H, Kdim, Vdim, chunk_size, scale, use_qk_l2norm_in_kernel);
 }
 
+#endif  // !GDR_V2_COMPILE_FWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_BWD_ONLY)
 // Dtype dispatch chain for forward
 template<typename TQ, typename TG>
 void dispatch_fwd_v2_beta(
@@ -4571,6 +4700,9 @@ void dispatch_fwd_v2_g(
     }
 }
 
+#endif  // !GDR_V2_COMPILE_BWD_ONLY
+
+#if !defined(GDR_V2_COMPILE_FWD_ONLY)
 // Dtype dispatch chain for backward
 template<typename TQ, typename TG>
 void dispatch_bwd_v2_beta(
@@ -4626,12 +4758,15 @@ void dispatch_bwd_v2_g(
     }
 }
 
+#endif  // !GDR_V2_COMPILE_FWD_ONLY
+
 }  // namespace
 
 // ============================================================================
 // Public API
 // ============================================================================
 
+#if !defined(GDR_V2_COMPILE_BWD_ONLY)
 void gated_delta_rule_chunk_forward_v2(
     Tensor& out,
     Tensor& final_state,
@@ -4662,7 +4797,9 @@ void gated_delta_rule_chunk_forward_v2(
             throw std::logic_error("gated_delta_rule_chunk_forward_v2: unsupported q dtype");
     }
 }
+#endif  // !GDR_V2_COMPILE_BWD_ONLY
 
+#if !defined(GDR_V2_COMPILE_FWD_ONLY)
 void gated_delta_rule_chunk_backward_v2(
     Tensor& d_q,
     Tensor& d_k,
@@ -4703,3 +4840,4 @@ void gated_delta_rule_chunk_backward_v2(
             throw std::logic_error("gated_delta_rule_chunk_backward_v2: unsupported q dtype");
     }
 }
+#endif  // !GDR_V2_COMPILE_FWD_ONLY

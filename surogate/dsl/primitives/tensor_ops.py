@@ -44,3 +44,13 @@ def split(
 ) -> tuple[Tensor["*"], ...]:
     """Split tensor along dimension."""
     ...
+
+
+@primitive(impl="kernels.repeat_interleave_heads")
+def repeat_interleave_heads(
+    x: Tensor["B", "T", "H", "D"],
+    *,
+    repeats: int,
+) -> Tensor["*"]:
+    """Repeat-interleave tensor along head axis (dim=2)."""
+    ...

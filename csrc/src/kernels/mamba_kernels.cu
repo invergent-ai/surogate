@@ -47,6 +47,11 @@ __device__ __forceinline__ half from_float<half>(float v) {
     return __float2half(v);
 }
 
+template<>
+__device__ __forceinline__ float from_float<float>(float v) {
+    return v;
+}
+
 inline int div_up(long n, int d) {
     return static_cast<int>((n + d - 1) / d);
 }
@@ -862,4 +867,404 @@ void elementwise_mul(half* out, const half* a, const half* b, long total, cudaSt
 void elementwise_mul(float* out, const float* a, const float* b, long total, cudaStream_t stream) {
     const int threads = 256;
     elementwise_mul_kernel<<<div_up(total, threads), threads, 0, stream>>>(out, a, b, total);
+}
+
+namespace {
+
+__device__ __forceinline__ float softplus_stable(float x) {
+    // Stable softplus: log(1 + exp(x))
+    // For large x, softplus(x) ~= x.
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+template<typename TData, typename TParam>
+__global__ void qwen3_5_decay_forward_kernel(
+    TData* out,
+    const TData* a,
+    const TParam* a_log,
+    const TParam* dt_bias,
+    long total,
+    int H
+) {
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int h = static_cast<int>(idx % H);
+    const float af = to_float(a[idx]);
+    const float A = to_float(a_log[h]);
+    const float dt = to_float(dt_bias[h]);
+    const float x = af + dt;
+    const float sp = softplus_stable(x);
+    const float g = -expf(A) * sp;
+    out[idx] = from_float<TData>(g);
+}
+
+template<typename TData, typename TParam>
+__global__ void qwen3_5_decay_backward_kernel(
+    TData* d_a,
+    float* d_a_log,
+    float* d_dt_bias,
+    const TData* d_out,
+    const TData* a,
+    const TParam* a_log,
+    const TParam* dt_bias,
+    long total,
+    int H
+) {
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int h = static_cast<int>(idx % H);
+
+    const float dout = to_float(d_out[idx]);
+    const float af = to_float(a[idx]);
+    const float A = to_float(a_log[h]);
+    const float dt = to_float(dt_bias[h]);
+    const float x = af + dt;
+    const float expA = expf(A);
+    const float sig = 1.0f / (1.0f + expf(-x));
+    const float sp = softplus_stable(x);
+
+    const float dga = -expA * sig;  // dg/da and dg/ddt_bias
+    d_a[idx] = from_float<TData>(dout * dga);
+    atomicAdd(&d_a_log[h], dout * (-expA * sp));  // dg/dA_log
+    atomicAdd(&d_dt_bias[h], dout * dga);
+}
+
+template<typename T>
+__global__ void repeat_interleave_heads_forward_kernel(
+    T* out,
+    const T* inp,
+    int B,
+    int Tlen,
+    int H_in,
+    int D,
+    int repeats
+) {
+    const int H_out = H_in * repeats;
+    const long total = static_cast<long>(B) * Tlen * H_out * D;
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % D);
+    long t0 = idx / D;
+    const int h_out = static_cast<int>(t0 % H_out);
+    t0 /= H_out;
+    const int t = static_cast<int>(t0 % Tlen);
+    const int b = static_cast<int>(t0 / Tlen);
+    const int h_in = h_out / repeats;
+
+    const long in_idx = (((static_cast<long>(b) * Tlen + t) * H_in + h_in) * D + d);
+    out[idx] = inp[in_idx];
+}
+
+template<typename T>
+__global__ void repeat_interleave_heads_backward_kernel(
+    T* d_inp,
+    const T* d_out,
+    int B,
+    int Tlen,
+    int H_in,
+    int D,
+    int repeats
+) {
+    const long total = static_cast<long>(B) * Tlen * H_in * D;
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % D);
+    long t0 = idx / D;
+    const int h_in = static_cast<int>(t0 % H_in);
+    t0 /= H_in;
+    const int t = static_cast<int>(t0 % Tlen);
+    const int b = static_cast<int>(t0 / Tlen);
+
+    const int base_h_out = h_in * repeats;
+    const int H_out = H_in * repeats;
+    float acc = 0.0f;
+    for (int r = 0; r < repeats; ++r) {
+        const int h_out = base_h_out + r;
+        const long out_idx = (((static_cast<long>(b) * Tlen + t) * H_out + h_out) * D + d);
+        acc += to_float(d_out[out_idx]);
+    }
+    d_inp[idx] = from_float<T>(acc);
+}
+
+template<typename TData, typename TParam>
+void launch_qwen3_5_decay_forward(
+    TData* out,
+    const TData* a,
+    const TParam* a_log,
+    const TParam* dt_bias,
+    long total,
+    int H,
+    cudaStream_t stream
+) {
+    const int threads = 256;
+    qwen3_5_decay_forward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
+        out, a, a_log, dt_bias, total, H);
+}
+
+template<typename TData, typename TParam>
+void launch_qwen3_5_decay_backward(
+    TData* d_a,
+    float* d_a_log,
+    float* d_dt_bias,
+    const TData* d_out,
+    const TData* a,
+    const TParam* a_log,
+    const TParam* dt_bias,
+    long total,
+    int H,
+    cudaStream_t stream
+) {
+    const int threads = 256;
+    qwen3_5_decay_backward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
+        d_a, d_a_log, d_dt_bias, d_out, a, a_log, dt_bias, total, H);
+}
+
+template<typename T>
+void launch_repeat_interleave_heads_forward(
+    T* out, const T* inp, int B, int Tlen, int H_in, int D, int repeats, cudaStream_t stream) {
+    const int H_out = H_in * repeats;
+    const long total = static_cast<long>(B) * Tlen * H_out * D;
+    const int threads = 256;
+    repeat_interleave_heads_forward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
+        out, inp, B, Tlen, H_in, D, repeats);
+}
+
+template<typename T>
+void launch_repeat_interleave_heads_backward(
+    T* d_inp, const T* d_out, int B, int Tlen, int H_in, int D, int repeats, cudaStream_t stream) {
+    const long total = static_cast<long>(B) * Tlen * H_in * D;
+    const int threads = 256;
+    repeat_interleave_heads_backward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
+        d_inp, d_out, B, Tlen, H_in, D, repeats);
+}
+
+}  // namespace
+
+void qwen3_5_decay_forward(
+    Tensor& out,
+    const Tensor& a,
+    const Tensor& A_log,
+    const Tensor& dt_bias,
+    cudaStream_t stream
+) {
+    if (a.Rank != 3 || A_log.Rank != 1 || dt_bias.Rank != 1) {
+        throw std::logic_error("qwen3_5_decay_forward: invalid ranks");
+    }
+    const int H = static_cast<int>(a.Sizes[2]);
+    const long total = a.nelem();
+    if (A_log.Sizes[0] != H || dt_bias.Sizes[0] != H) {
+        throw std::logic_error("qwen3_5_decay_forward: head dimension mismatch");
+    }
+
+    if (a.DType == ETensorDType::BF16) {
+        if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+            launch_qwen3_5_decay_forward(
+                out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+            launch_qwen3_5_decay_forward(
+                out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                A_log.get<float>(), dt_bias.get<float>(),
+                total, H, stream);
+        } else {
+            throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+        }
+    } else if (a.DType == ETensorDType::FP16) {
+        if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+            launch_qwen3_5_decay_forward(
+                out.get<half>(), a.get<half>(),
+                A_log.get<half>(), dt_bias.get<half>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+            launch_qwen3_5_decay_forward(
+                out.get<half>(), a.get<half>(),
+                A_log.get<float>(), dt_bias.get<float>(),
+                total, H, stream);
+        } else {
+            throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+        }
+    } else if (a.DType == ETensorDType::FP32) {
+        if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+            launch_qwen3_5_decay_forward(
+                out.get<float>(), a.get<float>(),
+                A_log.get<float>(), dt_bias.get<float>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+            launch_qwen3_5_decay_forward(
+                out.get<float>(), a.get<float>(),
+                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+            launch_qwen3_5_decay_forward(
+                out.get<float>(), a.get<float>(),
+                A_log.get<half>(), dt_bias.get<half>(),
+                total, H, stream);
+        } else {
+            throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+        }
+    } else {
+        throw std::logic_error("qwen3_5_decay_forward: unsupported dtype");
+    }
+}
+
+void qwen3_5_decay_backward(
+    Tensor& d_a,
+    Tensor& d_A_log,
+    Tensor& d_dt_bias,
+    const Tensor& d_out,
+    const Tensor& a,
+    const Tensor& A_log,
+    const Tensor& dt_bias,
+    cudaStream_t stream
+) {
+    if (d_out.Rank != 3 || a.Rank != 3 || A_log.Rank != 1 || dt_bias.Rank != 1) {
+        throw std::logic_error("qwen3_5_decay_backward: invalid ranks");
+    }
+    if (d_A_log.DType != ETensorDType::FP32 || d_dt_bias.DType != ETensorDType::FP32) {
+        throw std::logic_error("qwen3_5_decay_backward: d_A_log and d_dt_bias must be FP32");
+    }
+    const int H = static_cast<int>(a.Sizes[2]);
+    const long total = a.nelem();
+
+    fill_zero(d_A_log, stream);
+    fill_zero(d_dt_bias, stream);
+
+    if (a.DType == ETensorDType::BF16 && d_out.DType == ETensorDType::BF16) {
+        if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                A_log.get<float>(), dt_bias.get<float>(),
+                total, H, stream);
+        } else {
+            throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+        }
+    } else if (a.DType == ETensorDType::FP16 && d_out.DType == ETensorDType::FP16) {
+        if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<half>(), a.get<half>(),
+                A_log.get<half>(), dt_bias.get<half>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<half>(), a.get<half>(),
+                A_log.get<float>(), dt_bias.get<float>(),
+                total, H, stream);
+        } else {
+            throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+        }
+    } else if (a.DType == ETensorDType::FP32 && d_out.DType == ETensorDType::FP32) {
+        if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<float>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<float>(), a.get<float>(),
+                A_log.get<float>(), dt_bias.get<float>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<float>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<float>(), a.get<float>(),
+                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                total, H, stream);
+        } else if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+            launch_qwen3_5_decay_backward(
+                d_a.get<float>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                d_out.get<float>(), a.get<float>(),
+                A_log.get<half>(), dt_bias.get<half>(),
+                total, H, stream);
+        } else {
+            throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+        }
+    } else {
+        throw std::logic_error("qwen3_5_decay_backward: unsupported dtype");
+    }
+}
+
+void repeat_interleave_heads_forward(
+    Tensor& out,
+    const Tensor& inp,
+    int repeats,
+    cudaStream_t stream
+) {
+    if (repeats <= 0) {
+        throw std::logic_error("repeat_interleave_heads_forward: repeats must be > 0");
+    }
+    if (inp.Rank != 4 || out.Rank != 4) {
+        throw std::logic_error("repeat_interleave_heads_forward: rank must be 4");
+    }
+    const int B = static_cast<int>(inp.Sizes[0]);
+    const int Tlen = static_cast<int>(inp.Sizes[1]);
+    const int H_in = static_cast<int>(inp.Sizes[2]);
+    const int D = static_cast<int>(inp.Sizes[3]);
+    if (out.Sizes[0] != B || out.Sizes[1] != Tlen ||
+        out.Sizes[2] != static_cast<long>(H_in * repeats) || out.Sizes[3] != D) {
+        throw std::logic_error("repeat_interleave_heads_forward: output shape mismatch");
+    }
+    if (inp.DType != out.DType) {
+        throw std::logic_error("repeat_interleave_heads_forward: dtype mismatch");
+    }
+
+    if (inp.DType == ETensorDType::BF16) {
+        launch_repeat_interleave_heads_forward(
+            out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), B, Tlen, H_in, D, repeats, stream);
+    } else if (inp.DType == ETensorDType::FP16) {
+        launch_repeat_interleave_heads_forward(
+            out.get<half>(), inp.get<half>(), B, Tlen, H_in, D, repeats, stream);
+    } else if (inp.DType == ETensorDType::FP32) {
+        launch_repeat_interleave_heads_forward(
+            out.get<float>(), inp.get<float>(), B, Tlen, H_in, D, repeats, stream);
+    } else {
+        throw std::logic_error("repeat_interleave_heads_forward: unsupported dtype");
+    }
+}
+
+void repeat_interleave_heads_backward(
+    Tensor& d_inp,
+    const Tensor& d_out,
+    int repeats,
+    cudaStream_t stream
+) {
+    if (repeats <= 0) {
+        throw std::logic_error("repeat_interleave_heads_backward: repeats must be > 0");
+    }
+    if (d_inp.Rank != 4 || d_out.Rank != 4) {
+        throw std::logic_error("repeat_interleave_heads_backward: rank must be 4");
+    }
+    const int B = static_cast<int>(d_inp.Sizes[0]);
+    const int Tlen = static_cast<int>(d_inp.Sizes[1]);
+    const int H_in = static_cast<int>(d_inp.Sizes[2]);
+    const int D = static_cast<int>(d_inp.Sizes[3]);
+    if (d_out.Sizes[0] != B || d_out.Sizes[1] != Tlen ||
+        d_out.Sizes[2] != static_cast<long>(H_in * repeats) || d_out.Sizes[3] != D) {
+        throw std::logic_error("repeat_interleave_heads_backward: output shape mismatch");
+    }
+    if (d_inp.DType != d_out.DType) {
+        throw std::logic_error("repeat_interleave_heads_backward: dtype mismatch");
+    }
+
+    if (d_inp.DType == ETensorDType::BF16) {
+        launch_repeat_interleave_heads_backward(
+            d_inp.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), B, Tlen, H_in, D, repeats, stream);
+    } else if (d_inp.DType == ETensorDType::FP16) {
+        launch_repeat_interleave_heads_backward(
+            d_inp.get<half>(), d_out.get<half>(), B, Tlen, H_in, D, repeats, stream);
+    } else if (d_inp.DType == ETensorDType::FP32) {
+        launch_repeat_interleave_heads_backward(
+            d_inp.get<float>(), d_out.get<float>(), B, Tlen, H_in, D, repeats, stream);
+    } else {
+        throw std::logic_error("repeat_interleave_heads_backward: unsupported dtype");
+    }
 }

@@ -15,11 +15,11 @@ namespace optimizers {
  * @brief Supported optimizer types
  */
 enum class OptimizerType {
-    ADAMW,          // full-precision AdamW
-    ADAMW_8BIT,     // 8-bit blockwise quantized AdamW (default)
-    MUON,           // Muon optimizer (future)
-    SGD,            // SGD with momentum (future)
-    NORMUON         // NormUon optimizer (future)
+    ADAMW,              // full-precision AdamW
+    ADAMW_8BIT,         // 8-bit AdamW with softsign/sqrt quantization (FlashOptim-style)
+    MUON,               // Muon optimizer (future)
+    SGD,                // SGD with momentum (future)
+    NORMUON             // NormUon optimizer (future)
 };
 
 /**

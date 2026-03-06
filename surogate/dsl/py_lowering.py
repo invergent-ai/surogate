@@ -74,6 +74,7 @@ def _kernel_type_from_op(op_name: str) -> KernelType:
         "layernorm": KernelType.LAYERNORM,
         "swiglu": KernelType.SWIGLU,
         "silu": KernelType.SILU,
+        "sigmoid": KernelType.CUSTOM,
         "relu": KernelType.RELU,
         "relu2": KernelType.RELU2,
         "gelu": KernelType.GELU,
@@ -89,6 +90,7 @@ def _kernel_type_from_op(op_name: str) -> KernelType:
         "permute": KernelType.PERMUTE,
         "contiguous": KernelType.CONTIGUOUS,
         "split": KernelType.SPLIT,
+        "repeat_interleave_heads": KernelType.CUSTOM,
         "concat": KernelType.CONCAT,
         "copy": KernelType.COPY,
         "add": KernelType.ADD,
@@ -105,6 +107,7 @@ def _kernel_type_from_op(op_name: str) -> KernelType:
         "moe_permute": KernelType.MOE_PERMUTE,
         "moe_unpermute": KernelType.MOE_UNPERMUTE,
         "moe_grouped_gemm": KernelType.GROUPED_GEMM,
+        "qwen3_5_decay": KernelType.CUSTOM,
         "silu_mul": KernelType.SILU,
     }
     return op_map.get(op_name, KernelType.CUSTOM)

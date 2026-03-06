@@ -307,6 +307,16 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
+    def sigmoid(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+        """Sigmoid activation."""
+        out = out_name if out_name else self._fresh_name("sigmoid")
+        self._add_node(GraphNode(
+            op="sigmoid",
+            inputs=[self._resolve_input(x)],
+            outputs=[out],
+        ))
+        return self._make_output(out)
+
     def relu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """ReLU activation."""
         out = out_name if out_name else self._fresh_name("relu")
@@ -668,6 +678,23 @@ class GraphBuilder:
             attrs={"split_size": split_size, "dim": dim},
         ))
         return self._make_outputs(outputs)
+
+    def repeat_interleave_heads(
+        self,
+        x: str | GraphRef,
+        *,
+        repeats: int,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Repeat-interleave a [B,T,H,D] tensor on the head axis (dim=2)."""
+        out = out_name if out_name else self._fresh_name("repeat_heads")
+        self._add_node(GraphNode(
+            op="repeat_interleave_heads",
+            inputs=[self._resolve_input(x)],
+            outputs=[out],
+            attrs={"repeats": repeats},
+        ))
+        return self._make_output(out)
 
     def concat(
         self,
@@ -1270,6 +1297,27 @@ class GraphBuilder:
                 "n_groups": n_groups,
                 "norm_before_gate": norm_before_gate,
             },
+        ))
+        return self._make_output(out)
+
+    def qwen3_5_decay(
+        self,
+        a: str | GraphRef,
+        a_log: str | GraphRef,
+        dt_bias: str | GraphRef,
+        *,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Qwen3.5 decay: -exp(A_log) * softplus(a + dt_bias)."""
+        out = out_name or self._fresh_name("qwen_decay")
+        self._add_node(GraphNode(
+            op="qwen3_5_decay",
+            inputs=[
+                self._resolve_input(a),
+                self._resolve_input(a_log),
+                self._resolve_input(dt_bias),
+            ],
+            outputs=[out],
         ))
         return self._make_output(out)
 

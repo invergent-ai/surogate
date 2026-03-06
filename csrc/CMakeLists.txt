@@ -333,6 +333,8 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/mamba_gated_rmsnorm.cpp
     src/runtime/ops/mamba_out_proj.cpp
     src/runtime/ops/gated_delta_rule.cpp
+    src/runtime/ops/qwen3_5_decay.cpp
+    src/runtime/ops/repeat_interleave_heads.cpp
 
     src/config/pretrained_config.cpp
 
@@ -377,7 +379,8 @@ target_sources(surogate-common PRIVATE
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
     src/kernels/gated_delta_rule.cu
-    src/kernels/gated_delta_rule_v2.cu
+    src/kernels/gated_delta_rule_v2_fwd.cu
+    src/kernels/gated_delta_rule_v2_bwd.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu
@@ -393,6 +396,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/global_norm.cu
     src/kernels/bias.cu
     src/runtime/optimizers/adamw_8bit.cu
+    src/runtime/optimizers/flash_adamw_8bit.cu
     src/runtime/optimizers/adamw.cu
     src/runtime/optimizers/polar_express.cu
     src/runtime/optimizers/normuon.cu
@@ -576,6 +580,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # Optimizers
             src/testing/optimizers/test-adamw.cu
+            src/testing/optimizers/test-flash-adamw.cu
             src/testing/optimizers/test-normuon.cu
 
             # LoRA

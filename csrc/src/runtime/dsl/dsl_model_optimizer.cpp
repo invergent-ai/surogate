@@ -9,6 +9,7 @@
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "kernels/kernels.h"
 #include "runtime/core/fp8_scaling_state.h"
+#include "runtime/optimizers/flash_adamw_8bit.h"
 #include "runtime/optimizers/adamw_8bit.h"
 #include "runtime/optimizers/adamw.h"
 #include "runtime/optimizers/normuon.h"
@@ -78,7 +79,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
     }
 
     auto& state = *mAdamW8BitState;
-    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;  // Must match optimizer block size
+    constexpr size_t GROUP_SIZE = optimizers::FLASH_ADAMW8BIT_GROUP_SIZE;
     size_t state_offset = 0;
 
     // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
@@ -96,7 +97,7 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
         // Skip if we've already updated with this gradient (tied weights share the same gradient pointer)
         if (seen_grad_ptrs.count(grad->Data) > 0) {
             // Still advance state_offset to maintain alignment for subsequent params
-            state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
             state_offset += val.nelem();
             continue;
         }
@@ -110,38 +111,30 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
 
         float wd = weight_decay;
 
-        state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
         const size_t n = val.nelem();
         if (!val.Data || !grad_view.Data) {
             state_offset += n;
             continue;
         }
-        const size_t block_offset = state_offset / BLOCK_SIZE;
+        const size_t group_offset = state_offset / GROUP_SIZE;
 
-        unsigned char* s1 = reinterpret_cast<unsigned char*>(state.state1.template get<std::byte>()) + state_offset;
+        signed char* s1 = reinterpret_cast<signed char*>(state.state1.template get<std::byte>()) + state_offset;
         unsigned char* s2 = reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()) + state_offset;
-        float* am1 = state.absmax1.template get<float>() + block_offset;
-        float* am2 = state.absmax2.template get<float>() + block_offset;
-        float* q1 = state.quantiles1.template get<float>();
-        float* q2 = state.quantiles2.template get<float>();
+        half* sc1 = state.scales1.template get<half>() + group_offset;
+        half* sc2 = state.scales2.template get<half>() + group_offset;
 
         if (val.DType == ETensorDType::FP32) {
             if (grad_view.DType == ETensorDType::FP32) {
-                adamw_update_8bit(
+                optimizers::flash_adamw_update_8bit(
                     val.template get<float>(),
                     grad_view.template get<float>(),
-                    s1, s2, n,
+                    s1, s2, sc1, sc2, n,
                     learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
-                    q1, q2, am1, am2, nullptr, nullptr, stream
+                    nullptr, nullptr, stream
                 );
             } else if (grad_view.DType == ETensorDType::BF16) {
-                adamw_update_8bit(
-                    val.template get<float>(),
-                    grad_view.template get<nv_bfloat16>(),
-                    s1, s2, n,
-                    learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
-                    q1, q2, am1, am2, nullptr, nullptr, stream
-                );
+                throw std::runtime_error("DslModel::update: FP32 param with BF16 grad not supported for flash adamw 8-bit");
             } else {
                 throw std::runtime_error("DslModel::update: unsupported grad dtype for " + name);
             }
@@ -149,12 +142,12 @@ void DslModel::update(NCCLCommunicator& comm, float learning_rate, float beta_1,
             if (grad_view.DType != ETensorDType::BF16) {
                 throw std::runtime_error("DslModel::update: unsupported grad dtype for " + name);
             }
-            adamw_update_8bit(
+            optimizers::flash_adamw_update_8bit(
                 val.template get<nv_bfloat16>(),
                 grad_view.template get<nv_bfloat16>(),
-                s1, s2, n,
+                s1, s2, sc1, sc2, n,
                 learning_rate, beta_1, beta_2, t, epsilon, wd, grad_scale,
-                q1, q2, am1, am2, nullptr, nullptr, stream
+                nullptr, nullptr, stream
             );
         } else {
             throw std::runtime_error("DslModel::update: unsupported param dtype for " + name);
@@ -377,7 +370,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
     }
 
     auto& state = *mAdamW8BitState;
-    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;  // Must match optimizer block size
+    constexpr size_t GROUP_SIZE = optimizers::FLASH_ADAMW8BIT_GROUP_SIZE;
     size_t state_offset = 0;
 
     // Track seen gradient pointers to avoid double-updating tied weights (e.g., embedding/lm_head)
@@ -394,8 +387,7 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
 
         // Skip if we've already updated with this gradient (tied weights share the same gradient pointer)
         if (seen_grad_ptrs_graph.count(grad->Data) > 0) {
-            // Still advance state_offset to maintain alignment for subsequent params
-            state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
             state_offset += val.nelem();
             continue;
         }
@@ -409,38 +401,30 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
 
         const float wd_scale = 1.f;
 
-        state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
         const size_t n = val.nelem();
         if (!val.Data || !grad_view.Data) {
             state_offset += n;
             continue;
         }
-        const size_t block_offset = state_offset / BLOCK_SIZE;
+        const size_t group_offset = state_offset / GROUP_SIZE;
 
-        unsigned char* s1 = reinterpret_cast<unsigned char*>(state.state1.template get<std::byte>()) + state_offset;
+        signed char* s1 = reinterpret_cast<signed char*>(state.state1.template get<std::byte>()) + state_offset;
         unsigned char* s2 = reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()) + state_offset;
-        float* am1 = state.absmax1.template get<float>() + block_offset;
-        float* am2 = state.absmax2.template get<float>() + block_offset;
-        float* q1 = state.quantiles1.template get<float>();
-        float* q2 = state.quantiles2.template get<float>();
+        half* sc1 = state.scales1.template get<half>() + group_offset;
+        half* sc2 = state.scales2.template get<half>() + group_offset;
 
         if (val.DType == ETensorDType::FP32) {
             if (grad_view.DType == ETensorDType::FP32) {
-                adamw_update_8bit(
+                optimizers::flash_adamw_update_8bit(
                     val.template get<float>(),
                     grad_view.template get<float>(),
-                    s1, s2, n,
+                    s1, s2, sc1, sc2, n,
                     /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, wd_scale, grad_scale,
-                    q1, q2, am1, am2, opt_params, opt_step, stream
+                    opt_params, opt_step, stream
                 );
             } else if (grad_view.DType == ETensorDType::BF16) {
-                adamw_update_8bit(
-                    val.template get<float>(),
-                    grad_view.template get<nv_bfloat16>(),
-                    s1, s2, n,
-                    /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, wd_scale, grad_scale,
-                    q1, q2, am1, am2, opt_params, opt_step, stream
-                );
+                throw std::runtime_error("DslModel::update_adamw_8bit_graph: FP32 param with BF16 grad not supported");
             } else {
                 throw std::runtime_error("DslModel::update_adamw_8bit_graph: unsupported grad dtype for " + name);
             }
@@ -448,12 +432,12 @@ void DslModel::update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
             if (grad_view.DType != ETensorDType::BF16) {
                 throw std::runtime_error("DslModel::update_adamw_8bit_graph: unsupported grad dtype for " + name);
             }
-            adamw_update_8bit(
+            optimizers::flash_adamw_update_8bit(
                 val.template get<nv_bfloat16>(),
                 grad_view.template get<nv_bfloat16>(),
-                s1, s2, n,
+                s1, s2, sc1, sc2, n,
                 /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, wd_scale, grad_scale,
-                q1, q2, am1, am2, opt_params, opt_step, stream
+                opt_params, opt_step, stream
             );
         } else {
             throw std::runtime_error("DslModel::update_adamw_8bit_graph: unsupported param dtype for " + name);
@@ -614,23 +598,13 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
         return;
     }
 
-    if (!state.quantiles1.Data) {
-        state.quantiles1 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_quantiles1", {256});
-        state.quantiles2 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_quantiles2", {256});
-        std::vector<float> h_q1(256), h_q2(256);
-        create_adamw8bit_quantiles1(h_q1.data());
-        create_adamw8bit_quantiles2(h_q2.data());
-        CUDA_CHECK(cudaMemcpy(state.quantiles1.Data, h_q1.data(), h_q1.size() * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(state.quantiles2.Data, h_q2.data(), h_q2.size() * sizeof(float), cudaMemcpyHostToDevice));
-    }
-
-    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
+    constexpr size_t GROUP_SIZE = optimizers::FLASH_ADAMW8BIT_GROUP_SIZE;
     size_t total_params = 0;
     size_t state_elems = 0;
     const bool use_weight_manager = (mWeightManager != nullptr);
     auto add_tensor = [&](size_t n) {
         total_params += n;
-        state_elems = (state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        state_elems = (state_elems + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
         state_elems += n;
     };
 
@@ -641,10 +615,9 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
 
     state.total_params = total_params;
     state.total_state_elems = state_elems;
-    state.num_blocks = (state.total_state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    state.num_groups = optimizers::flash_adamw8bit_num_scales(state.total_state_elems);
 
     // Determine allocation location based on offload options
-    // For adamw8bit, only zero-copy offloading is supported (state accessed directly by GPU).
     state.offload_state = mOptions.OffloadOptimizer;
     state.use_zero_copy = mOptions.UseZeroCopy;
     EAllocationType alloc_kind = EAllocationType::ON_DEVICE;
@@ -658,18 +631,19 @@ void DslModel::init_optimizer_state(cudaStream_t stream) {
 
     state.state1 = mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state1", alloc_kind, {(long)state.total_state_elems});
     state.state2 = mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state2", alloc_kind, {(long)state.total_state_elems});
-    state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_absmax1", alloc_kind, {(long)state.num_blocks});
-    state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_absmax2", alloc_kind, {(long)state.num_blocks});
+    state.scales1 = mAllocator->allocate(ETensorDType::FP16, "adamw8bit_scales1", alloc_kind, {(long)state.num_groups});
+    state.scales2 = mAllocator->allocate(ETensorDType::FP16, "adamw8bit_scales2", alloc_kind, {(long)state.num_groups});
 
-    init_adamw8bit_state(reinterpret_cast<unsigned char*>(state.state1.template get<std::byte>()),
-                         reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()),
-                         state.absmax1.template get<float>(),
-                         state.absmax2.template get<float>(),
-                         state.total_state_elems, stream);
+    optimizers::init_flash_adamw8bit_state(
+        reinterpret_cast<signed char*>(state.state1.template get<std::byte>()),
+        reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()),
+        state.scales1.template get<half>(),
+        state.scales2.template get<half>(),
+        state.total_state_elems, stream);
 
     state.initialized = true;
-    mAdamWMomentumContainer.update_pointers(&state.state1, &state.absmax1);
-    mAdamWVarianceContainer.update_pointers(&state.state2, &state.absmax2);
+    mAdamWMomentumContainer.update_pointers(&state.state1, &state.scales1);
+    mAdamWVarianceContainer.update_pointers(&state.state2, &state.scales2);
 }
 
 void DslModel::init_adamw_state(cudaStream_t stream) {

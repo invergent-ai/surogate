@@ -20,7 +20,7 @@
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/lora/lora_utils.h"
 #include "runtime/lora/lora_model_utils.h"
-#include "runtime/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/flash_adamw_8bit.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 
@@ -764,27 +764,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
             if (!mLoRAAdamW8BitState) {
                 mLoRAAdamW8BitState = std::make_unique<modules::LoRAAdamW8BitState>();
             }
-            if (!mLoRAAdamW8BitState->quantiles1.Data) {
-                mLoRAAdamW8BitState->quantiles1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_quantiles1", {256});
-                mLoRAAdamW8BitState->quantiles2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_quantiles2", {256});
-                std::vector<float> h_q1(256), h_q2(256);
-                create_adamw8bit_quantiles1(h_q1.data());
-                create_adamw8bit_quantiles2(h_q2.data());
-                CUDA_CHECK(cudaMemcpy(mLoRAAdamW8BitState->quantiles1.Data, h_q1.data(), h_q1.size() * sizeof(float), cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(mLoRAAdamW8BitState->quantiles2.Data, h_q2.data(), h_q2.size() * sizeof(float), cudaMemcpyHostToDevice));
-            }
         } else {
             if (!mAdamW8BitState) {
                 mAdamW8BitState = std::make_unique<AdamW8BitState>();
-            }
-            if (!mAdamW8BitState->quantiles1.Data) {
-                mAdamW8BitState->quantiles1 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_quantiles1", {256});
-                mAdamW8BitState->quantiles2 = mAllocator->allocate(ETensorDType::FP32, "adamw8bit_quantiles2", {256});
-                std::vector<float> h_q1(256), h_q2(256);
-                create_adamw8bit_quantiles1(h_q1.data());
-                create_adamw8bit_quantiles2(h_q2.data());
-                CUDA_CHECK(cudaMemcpy(mAdamW8BitState->quantiles1.Data, h_q1.data(), h_q1.size() * sizeof(float), cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(mAdamW8BitState->quantiles2.Data, h_q2.data(), h_q2.size() * sizeof(float), cudaMemcpyHostToDevice));
             }
         }
     }

@@ -190,6 +190,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"swiglu", CompiledOpType::SwiGLU},
         {"gpt_oss_moe_act", CompiledOpType::GptOssMoeAct},
         {"silu", CompiledOpType::Silu},
+        {"sigmoid", CompiledOpType::MoESigmoid},
         {"gelu", CompiledOpType::Gelu},
         {"relu2", CompiledOpType::Relu2},
         {"mul", CompiledOpType::Mul},
@@ -227,6 +228,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"swiglu_backward", CompiledOpType::SwiGLUBackward},
         {"gpt_oss_moe_act_backward", CompiledOpType::GptOssMoeActBackward},
         {"silu_backward", CompiledOpType::SiluBackward},
+        {"sigmoid_backward", CompiledOpType::MoESigmoidBackward},
         {"gelu_backward", CompiledOpType::GeluBackward},
         {"relu2_backward", CompiledOpType::Relu2Backward},
         {"mul_backward", CompiledOpType::MulBackward},
@@ -266,8 +268,12 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"mamba_out_proj", CompiledOpType::MambaOutProj},
         // Qwen3.5 gated delta rule forward operations
         {"chunk_gated_delta_rule", CompiledOpType::ChunkGatedDeltaRule},
+        {"qwen3_5_decay", CompiledOpType::Qwen3_5Decay},
+        {"repeat_interleave_heads", CompiledOpType::RepeatInterleaveHeads},
         // Qwen3.5 gated delta rule backward operations
         {"chunk_gated_delta_rule_backward", CompiledOpType::ChunkGatedDeltaRuleBackward},
+        {"qwen3_5_decay_backward", CompiledOpType::Qwen3_5DecayBackward},
+        {"repeat_interleave_heads_backward", CompiledOpType::RepeatInterleaveHeadsBackward},
         // Mamba/SSM backward operations
         {"mamba_split_proj_backward", CompiledOpType::MambaSplitProjBackward},
         {"mamba_conv1d_backward", CompiledOpType::MambaConv1dBackward},
@@ -884,6 +890,13 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 attrs.activation = *v;
             }
         }
+        if (auto* attr = find_attr(op.attrs, "norm_before_gate")) {
+            if (auto v = attr_bool(*attr)) {
+                attrs.norm_before_gate = *v;
+            } else if (auto v_int = attr_int(*attr)) {
+                attrs.norm_before_gate = (*v_int != 0);
+            }
+        }
         // n_groups for gated rmsnorm (passed directly from graph builder)
         if (auto* attr = find_attr(op.attrs, "n_groups")) {
             if (auto v = attr_int(*attr)) {
@@ -896,6 +909,15 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                 if (attrs.intermediate_size > 0 && *v > 0) {
                     attrs.n_groups = attrs.intermediate_size / static_cast<int>(*v);
                 }
+            }
+        }
+    }
+
+    if (type == CompiledOpType::RepeatInterleaveHeads ||
+        type == CompiledOpType::RepeatInterleaveHeadsBackward) {
+        if (auto* attr = find_attr(op.attrs, "repeats")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.repeat_factor = static_cast<int>(*v);
             }
         }
     }
@@ -1363,10 +1385,21 @@ void GraphCompiler::infer_output_shapes(
         case CompiledOpType::Relu2:
         case CompiledOpType::Mul:
         case CompiledOpType::SiluBackward:
-        case CompiledOpType::Relu2Backward:
-        case CompiledOpType::MulBackward: {
+        case CompiledOpType::Relu2Backward: {
             // Element-wise ops (and their backward) preserve shape
             if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::MulBackward: {
+            // Inputs: d_out, a, b
+            // Outputs: d_a, d_b
+            if (input_shapes.size() >= 3) {
+                if (!input_shapes[1].empty()) output_shapes.push_back(input_shapes[1]);
+                if (!input_shapes[2].empty()) output_shapes.push_back(input_shapes[2]);
+            } else if (!input_shapes.empty() && !input_shapes[0].empty()) {
                 output_shapes.push_back(input_shapes[0]);
             }
             break;
@@ -1546,6 +1579,51 @@ void GraphCompiler::infer_output_shapes(
                 output_shapes.push_back(g_shape);  // d_g
                 output_shapes.push_back(g_shape);  // d_beta
                 output_shapes.push_back({q_shape[0], q_shape[2], q_shape[3], v_shape[3]});  // d_initial_state
+            }
+            break;
+        }
+
+        case CompiledOpType::Qwen3_5Decay: {
+            // Output shape same as input `a` => [B,T,H]
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);
+            }
+            break;
+        }
+
+        case CompiledOpType::Qwen3_5DecayBackward: {
+            // Inputs: d_out, a, A_log, dt_bias
+            // Outputs: d_a, d_A_log, d_dt_bias
+            if (input_shapes.size() >= 4) {
+                if (!input_shapes[1].empty()) output_shapes.push_back(input_shapes[1]);
+                if (!input_shapes[2].empty()) output_shapes.push_back(input_shapes[2]);
+                if (!input_shapes[3].empty()) output_shapes.push_back(input_shapes[3]);
+            }
+            break;
+        }
+
+        case CompiledOpType::RepeatInterleaveHeads: {
+            // Input: [B,T,H,D], Output: [B,T,H*repeats,D]
+            if (!input_shapes.empty() && input_shapes[0].size() == 4) {
+                auto out_shape = input_shapes[0];
+                int repeats = 1;
+                if (auto* attr = find_attr(op.attrs, "repeats")) {
+                    if (auto v = attr_int(*attr)) {
+                        repeats = static_cast<int>(*v);
+                    }
+                }
+                if (repeats <= 0) repeats = 1;
+                out_shape[2] *= repeats;
+                output_shapes.push_back(std::move(out_shape));
+            }
+            break;
+        }
+
+        case CompiledOpType::RepeatInterleaveHeadsBackward: {
+            // Inputs: d_out, inp
+            // Output: d_inp (same shape as inp)
+            if (input_shapes.size() >= 2 && !input_shapes[1].empty()) {
+                output_shapes.push_back(input_shapes[1]);
             }
             break;
         }

@@ -3,10 +3,10 @@
 from .common import TransposeMode
 from .matmul import matmul, batched_matmul
 from .normalization import rmsnorm, fused_residual_rmsnorm
-from .activations import swiglu, silu, relu2, silu_mul
+from .activations import swiglu, silu, sigmoid, relu2, silu_mul
 from .attention import flash_attention, rope, mrope, qkv_qk_norm, qkv_qk_norm_rope
 from .embedding import embedding
-from .tensor_ops import view, transpose, concat, split
+from .tensor_ops import view, transpose, concat, split, repeat_interleave_heads
 from .elementwise import add, mul, scale, bias_add, mask_scatter, deepstack_inject
 from .initialization import zeros, ones, fill_normal
 from .losses import fused_lm_head_loss
@@ -30,6 +30,9 @@ from .mamba import (
 from .gated_delta_rule import (
     chunk_gated_delta_rule,
 )
+from .qwen3_5 import (
+    qwen3_5_decay,
+)
 from .ep import (
     ep_dispatch,
     ep_combine,
@@ -47,6 +50,7 @@ __all__ = [
     # Activations
     "swiglu",
     "silu",
+    "sigmoid",
     "relu2",
     "silu_mul",
     # Attention
@@ -62,6 +66,7 @@ __all__ = [
     "transpose",
     "concat",
     "split",
+    "repeat_interleave_heads",
     # Elementwise
     "add",
     "mul",
@@ -92,6 +97,7 @@ __all__ = [
     "mamba_combine_scan",
     # Qwen3.5 gated delta rule
     "chunk_gated_delta_rule",
+    "qwen3_5_decay",
     # Expert Parallelism
     "ep_dispatch",
     "ep_combine",

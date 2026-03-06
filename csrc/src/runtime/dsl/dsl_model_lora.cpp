@@ -21,7 +21,7 @@
 #include "runtime/dsl/dsl_run_state.h"
 #include "runtime/lora/lora_utils.h"
 #include "runtime/lora/lora_model_utils.h"
-#include "runtime/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/flash_adamw_8bit.h"
 #include "runtime/optimizers/normuon.h"
 #include "runtime/core/fp8_scaling_state.h"
 #include "kernels/kernels.h"
@@ -83,7 +83,7 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
             nlohmann::json opt_meta;
             opt_meta["optimizer_type"] = "adamw_8bit";
             opt_meta["total_params"] = mLoRAAdamW8BitState->total_params;
-            opt_meta["num_blocks"] = mLoRAAdamW8BitState->num_blocks;
+            opt_meta["num_groups"] = mLoRAAdamW8BitState->num_groups;
             opt_meta["num_tensors"] = mLoRAAdamW8BitState->num_tensors;
             std::ofstream meta_file(fs::path(checkpoint_dir) / "lora_optimizer.json");
             meta_file << opt_meta.dump(2);
@@ -137,22 +137,14 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
         }
         auto& state = *mLoRAAdamW8BitState;
         state.total_params = opt_meta["total_params"].get<size_t>();
-        state.num_blocks = opt_meta["num_blocks"].get<size_t>();
+        state.num_groups = opt_meta["num_groups"].get<size_t>();
         state.num_tensors = opt_meta["num_tensors"].get<int>();
 
         if (!state.state1.Data) {
             state.state1 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state1", {static_cast<long>(state.total_params)});
             state.state2 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state2", {static_cast<long>(state.total_params)});
-            state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax1", {static_cast<long>(state.num_blocks)});
-            state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax2", {static_cast<long>(state.num_blocks)});
-
-            state.quantiles1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_quantiles1", {256});
-            state.quantiles2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_quantiles2", {256});
-            std::vector<float> h_q1(256), h_q2(256);
-            optimizers::create_adamw8bit_quantiles1(h_q1.data());
-            optimizers::create_adamw8bit_quantiles2(h_q2.data());
-            CUDA_CHECK(cudaMemcpy(state.quantiles1.Data, h_q1.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(state.quantiles2.Data, h_q2.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
+            state.scales1 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales1", {static_cast<long>(state.num_groups)});
+            state.scales2 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales2", {static_cast<long>(state.num_groups)});
         }
 
         internal::LoRAAdamW8BitStateContainer container(&state);
@@ -466,8 +458,7 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
 
     state.num_tensors = static_cast<int>(h_param_ptrs.size());
     state.total_params = total_params;
-    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
-    state.num_blocks = (total_params + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    state.num_groups = optimizers::flash_adamw8bit_num_scales(total_params);
 
     state.param_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_mt_param_ptrs", EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
     state.grad_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_mt_grad_ptrs", EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
@@ -481,16 +472,17 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     if (!state.state1.Data) {
         state.state1 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state1", EAllocationType::ON_DEVICE, {(long)total_params});
         state.state2 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state2", EAllocationType::ON_DEVICE, {(long)total_params});
-        state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax1", EAllocationType::ON_DEVICE, {(long)state.num_blocks});
-        state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax2", EAllocationType::ON_DEVICE, {(long)state.num_blocks});
+        state.scales1 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales1", EAllocationType::ON_DEVICE, {(long)state.num_groups});
+        state.scales2 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales2", EAllocationType::ON_DEVICE, {(long)state.num_groups});
     }
 
     if (!state.values_restored) {
-        init_adamw8bit_state(reinterpret_cast<unsigned char*>(state.state1.Data),
-                             reinterpret_cast<unsigned char*>(state.state2.Data),
-                             state.absmax1.template get<float>(),
-                             state.absmax2.template get<float>(),
-                             total_params, stream);
+        optimizers::init_flash_adamw8bit_state(
+            reinterpret_cast<signed char*>(state.state1.Data),
+            reinterpret_cast<unsigned char*>(state.state2.Data),
+            state.scales1.template get<half>(),
+            state.scales2.template get<half>(),
+            total_params, stream);
     }
 
     state.initialized = true;
@@ -585,42 +577,34 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
 
     const ETensorDType lora_dtype = mLoRAConfig->dtype;
     if (lora_dtype == ETensorDType::FP32) {
-        adamw_update_8bit_multi_tensor(
+        optimizers::flash_adamw_update_8bit_multi_tensor(
             reinterpret_cast<float**>(mLoRAAdamW8BitState->param_ptrs.Data),
             reinterpret_cast<float**>(mLoRAAdamW8BitState->grad_ptrs.Data),
             mLoRAAdamW8BitState->tensor_sizes.template get<int>(),
             mLoRAAdamW8BitState->num_tensors,
-            reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state1.Data),
+            reinterpret_cast<signed char*>(mLoRAAdamW8BitState->state1.Data),
             reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state2.Data),
-            mLoRAAdamW8BitState->absmax1.template get<float>(),
-            mLoRAAdamW8BitState->absmax2.template get<float>(),
+            mLoRAAdamW8BitState->scales1.template get<half>(),
+            mLoRAAdamW8BitState->scales2.template get<half>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
             learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            mLoRAAdamW8BitState->quantiles1.template get<float>(),
-            mLoRAAdamW8BitState->quantiles2.template get<float>(),
-            nullptr,
-            nullptr,
-            stream
+            nullptr, nullptr, stream
         );
     } else if (lora_dtype == ETensorDType::BF16) {
-        adamw_update_8bit_multi_tensor(
+        optimizers::flash_adamw_update_8bit_multi_tensor(
             reinterpret_cast<nv_bfloat16**>(mLoRAAdamW8BitState->param_ptrs.Data),
             reinterpret_cast<nv_bfloat16**>(mLoRAAdamW8BitState->grad_ptrs.Data),
             mLoRAAdamW8BitState->tensor_sizes.template get<int>(),
             mLoRAAdamW8BitState->num_tensors,
-            reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state1.Data),
+            reinterpret_cast<signed char*>(mLoRAAdamW8BitState->state1.Data),
             reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state2.Data),
-            mLoRAAdamW8BitState->absmax1.template get<float>(),
-            mLoRAAdamW8BitState->absmax2.template get<float>(),
+            mLoRAAdamW8BitState->scales1.template get<half>(),
+            mLoRAAdamW8BitState->scales2.template get<half>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
             learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            mLoRAAdamW8BitState->quantiles1.template get<float>(),
-            mLoRAAdamW8BitState->quantiles2.template get<float>(),
-            nullptr,
-            nullptr,
-            stream
+            nullptr, nullptr, stream
         );
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
@@ -670,44 +654,34 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
     const ETensorDType lora_dtype = mLoRAConfig->dtype;
 
     if (lora_dtype == ETensorDType::FP32) {
-        adamw_update_8bit_multi_tensor(
+        optimizers::flash_adamw_update_8bit_multi_tensor(
             reinterpret_cast<float**>(state.param_ptrs.Data),
             reinterpret_cast<float**>(state.grad_ptrs.Data),
             state.tensor_sizes.template get<int>(),
             state.num_tensors,
-            reinterpret_cast<unsigned char*>(state.state1.Data),
+            reinterpret_cast<signed char*>(state.state1.Data),
             reinterpret_cast<unsigned char*>(state.state2.Data),
-            state.absmax1.template get<float>(),
-            state.absmax2.template get<float>(),
+            state.scales1.template get<half>(),
+            state.scales2.template get<half>(),
             state.state_offsets.template get<int>(),
             state.total_params,
             /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, /*weight_decay=*/1.f,
-            grad_scale,
-            state.quantiles1.template get<float>(),
-            state.quantiles2.template get<float>(),
-            opt_params,
-            opt_step,
-            stream
+            grad_scale, opt_params, opt_step, stream
         );
     } else if (lora_dtype == ETensorDType::BF16) {
-        adamw_update_8bit_multi_tensor(
+        optimizers::flash_adamw_update_8bit_multi_tensor(
             reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
             reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
             state.tensor_sizes.template get<int>(),
             state.num_tensors,
-            reinterpret_cast<unsigned char*>(state.state1.Data),
+            reinterpret_cast<signed char*>(state.state1.Data),
             reinterpret_cast<unsigned char*>(state.state2.Data),
-            state.absmax1.template get<float>(),
-            state.absmax2.template get<float>(),
+            state.scales1.template get<half>(),
+            state.scales2.template get<half>(),
             state.state_offsets.template get<int>(),
             state.total_params,
             /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, /*weight_decay=*/1.f,
-            grad_scale,
-            state.quantiles1.template get<float>(),
-            state.quantiles2.template get<float>(),
-            opt_params,
-            opt_step,
-            stream
+            grad_scale, opt_params, opt_step, stream
         );
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");

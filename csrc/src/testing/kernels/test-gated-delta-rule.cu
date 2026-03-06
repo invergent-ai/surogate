@@ -70,12 +70,18 @@ json stats(const std::vector<float>& x) {
     }
 
     json j;
+    j["numel"] = x.size();
     j["sum"] = sum;
     j["mean"] = x.empty() ? 0.0 : (sum / static_cast<double>(x.size()));
     j["l1"] = l1;
     j["l2"] = std::sqrt(l2);
     j["linf"] = linf;
     j["first8"] = std::move(first8);
+    json values = json::array();
+    for (float v : x) {
+        values.push_back(static_cast<double>(v));
+    }
+    j["values"] = std::move(values);
     return j;
 }
 
@@ -129,6 +135,15 @@ float benchmark_cuda_ms(int warmup_iters, int bench_iters, cudaStream_t stream, 
 }
 
 struct BenchConfig {
+    int B;
+    int T;
+    int H;
+    int K;
+    int V;
+};
+
+struct DumpConfig {
+    const char* case_name;
     int B;
     int T;
     int H;
@@ -197,8 +212,7 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
         static_cast<std::size_t>(B) * H * static_cast<std::size_t>(num_chunks + 1) * K * V;
     const int Lp = 64;
     constexpr std::size_t kWsAlignFloats = 128 / sizeof(float);
-    const std::size_t c_storage_floats =
-        (static_cast<std::size_t>(K) * K * sizeof(nv_bfloat16) + sizeof(float) - 1) / sizeof(float);
+    const std::size_t c_storage_floats = static_cast<std::size_t>(K) * K;
     auto align_up = [](std::size_t x, std::size_t align) {
         return ((x + align - 1) / align) * align;
     };
@@ -214,7 +228,7 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DG
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DB
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(K) * V;   // DHT1
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C packed as bf16
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C fp32
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                  // EG
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                       // total stride
     const std::size_t dh_storage_per_chunk = static_cast<std::size_t>(K) * V;
@@ -312,22 +326,12 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
     };
 }
 
-}  // namespace
-
-TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated_delta_rule][dump]") {
-    int device_count = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&device_count));
-    if (device_count <= 0) {
-        SUCCEED("CUDA not available; skipping gated delta rule value dump");
-        return;
-    }
-    CUDA_CHECK(cudaSetDevice(0));
-
-    const int B = 1;
-    const int T = 8;
-    const int H = 2;
-    const int K = 4;
-    const int V = 3;
+json dump_case(const DumpConfig& cfg) {
+    const int B = cfg.B;
+    const int T = cfg.T;
+    const int H = cfg.H;
+    const int K = cfg.K;
+    const int V = cfg.V;
     const int chunk_size = 64;
     const bool use_qk_l2norm_in_kernel = true;
     const float scale = 1.0f / std::sqrt(static_cast<float>(K));
@@ -386,7 +390,6 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
     Tensor checkpoints_fwd_t =
         tensor_view(d_checkpoints, ETensorDType::FP32, {B, H, num_chunks + 1, K, V});
 
-    // Forward pass with checkpoint saving (v2 API)
     gated_delta_rule_chunk_forward_v2(
         out_t,
         final_state_t,
@@ -415,8 +418,7 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
     thrust::device_vector<float> d_dfinal = to_device(d_final_state_f);
     const int Lp = 64;
     constexpr std::size_t kWsAlignFloats = 128 / sizeof(float);
-    const std::size_t c_storage_floats =
-        (static_cast<std::size_t>(K) * K * sizeof(nv_bfloat16) + sizeof(float) - 1) / sizeof(float);
+    const std::size_t c_storage_floats = static_cast<std::size_t>(K) * K;
     auto align_up = [](std::size_t x, std::size_t align) {
         return ((x + align - 1) / align) * align;
     };
@@ -432,7 +434,7 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DG
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DB
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(K) * V;   // DHT1
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C packed as bf16
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C fp32
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                  // EG
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                       // total stride
     const std::size_t dh_storage_per_chunk = static_cast<std::size_t>(K) * V;
@@ -489,6 +491,7 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
 
     json report;
     report["meta"] = {
+        {"case_name", cfg.case_name},
         {"B", B},
         {"T", T},
         {"H", H},
@@ -507,6 +510,34 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
     report["d_g"] = stats(dg_h);
     report["d_beta"] = stats(dbeta_h);
     report["d_initial_state"] = stats(dinit_h);
+    return report;
+}
+
+}  // namespace
+
+TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated_delta_rule][dump]") {
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count <= 0) {
+        SUCCEED("CUDA not available; skipping gated delta rule value dump");
+        return;
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+
+    const std::vector<DumpConfig> configs{
+        {"single_chunk_small", 1, 8, 2, 4, 3},
+        {"multi_chunk_tail", 1, 130, 2, 64, 64},
+    };
+
+    json report;
+    report["meta"] = {
+        {"impl", "surogate_cuda"},
+        {"num_cases", configs.size()},
+    };
+    report["cases"] = json::array();
+    for (const auto& cfg : configs) {
+        report["cases"].push_back(dump_case(cfg));
+    }
 
     const fs::path repo_root = find_repo_root();
     const fs::path out_dir = repo_root / "tests" / "artifacts";

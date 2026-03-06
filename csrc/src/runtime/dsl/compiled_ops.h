@@ -279,6 +279,10 @@ private:
     void dispatch_gated_delta_rule_common(const CompiledOp& op, const char* op_name);
     void dispatch_chunk_gated_delta_rule(const CompiledOp& op);
     void dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op);
+    void dispatch_qwen3_5_decay(const CompiledOp& op);
+    void dispatch_qwen3_5_decay_backward(const CompiledOp& op);
+    void dispatch_repeat_interleave_heads(const CompiledOp& op);
+    void dispatch_repeat_interleave_heads_backward(const CompiledOp& op);
 
     // Mamba/SSM backward dispatch
     void dispatch_mamba_split_proj_backward(const CompiledOp& op);

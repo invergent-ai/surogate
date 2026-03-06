@@ -308,7 +308,11 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MambaGatedRMSNorm: return "mamba_gated_rmsnorm";
         case CompiledOpType::MambaOutProj: return "mamba_out_proj";
         case CompiledOpType::ChunkGatedDeltaRule: return "chunk_gated_delta_rule";
+        case CompiledOpType::Qwen3_5Decay: return "qwen3_5_decay";
+        case CompiledOpType::RepeatInterleaveHeads: return "repeat_interleave_heads";
         case CompiledOpType::ChunkGatedDeltaRuleBackward: return "chunk_gated_delta_rule_backward";
+        case CompiledOpType::Qwen3_5DecayBackward: return "qwen3_5_decay_backward";
+        case CompiledOpType::RepeatInterleaveHeadsBackward: return "repeat_interleave_heads_backward";
         // Mamba/SSM backward
         case CompiledOpType::MambaSplitProjBackward: return "mamba_split_proj_backward";
         case CompiledOpType::MambaConv1dBackward: return "mamba_conv1d_backward";
@@ -2157,6 +2161,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::ChunkGatedDeltaRule:
                     dispatch_chunk_gated_delta_rule(op);
                     break;
+                case CompiledOpType::Qwen3_5Decay:
+                    dispatch_qwen3_5_decay(op);
+                    break;
+                case CompiledOpType::RepeatInterleaveHeads:
+                    dispatch_repeat_interleave_heads(op);
+                    break;
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
             }
@@ -2882,6 +2892,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::ChunkGatedDeltaRuleBackward:
                     dispatch_chunk_gated_delta_rule_backward(op);
                     break;
+                case CompiledOpType::Qwen3_5DecayBackward:
+                    dispatch_qwen3_5_decay_backward(op);
+                    break;
+                case CompiledOpType::RepeatInterleaveHeadsBackward:
+                    dispatch_repeat_interleave_heads_backward(op);
+                    break;
 
                 // Mamba forward ops that may appear in backward graph
                 case CompiledOpType::MambaSplitProj:
@@ -2891,6 +2907,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MambaGatedRMSNorm:
                 case CompiledOpType::MambaOutProj:
                 case CompiledOpType::ChunkGatedDeltaRule:
+                case CompiledOpType::Qwen3_5Decay:
+                case CompiledOpType::RepeatInterleaveHeads:
                     // These forward Mamba/GDN ops may appear in backward graph due to autodiff
                     throw std::runtime_error(
                         "CompiledExecutor: Mamba/GatedDelta forward op in backward graph not yet supported");

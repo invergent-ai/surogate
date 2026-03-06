@@ -19,9 +19,10 @@
             "type": "debugpy",
             "request": "launch",
             "module": "surogate.cli.main",
-            "args": ["sft", "${workspaceFolder}/examples/sft/qwen3-lora-bf16.yaml"],
+            "args": ["sft", "${workspaceFolder}/examples/sft/qwen3vl-lora-bf16.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
+            "justMyCode": true,
             "env": {"PYTHONPATH": "${workspaceFolder}"}
         },
         {
@@ -32,6 +33,7 @@
             "args": ["pt", "${workspaceFolder}/examples/pt/qwen3-bf16.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
+            "justMyCode": true,
             "env": {"PYTHONPATH": "${workspaceFolder}"}
         },
         {

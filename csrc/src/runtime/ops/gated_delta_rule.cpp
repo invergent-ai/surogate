@@ -277,8 +277,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     const int Lp = 64;
     constexpr long kWsAlignFloats = 128 / sizeof(float);
     auto align_up = [](long x, long align) { return ((x + align - 1) / align) * align; };
-    const long c_storage_floats =
-        (static_cast<long>(Kdim) * Kdim * get_dtype_size(q.DType) + sizeof(float) - 1) / sizeof(float);
+    const long c_storage_floats = static_cast<long>(Kdim) * Kdim;
     long chunk_ws_stride = 0;
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;   // M
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;   // A
@@ -291,7 +290,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);        // DG
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);        // DB
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Kdim) * Vdim; // DHT1
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;              // C packed as q dtype
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;              // C fp32
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                             // EG
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                 // total stride
     const long dh_storage_per_chunk = static_cast<long>(Kdim) * Vdim;

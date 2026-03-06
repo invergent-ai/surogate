@@ -28,6 +28,12 @@ def silu(x: Tensor["*"]) -> Tensor["*"]:
     ...
 
 
+@primitive(impl="kernels.sigmoid")
+def sigmoid(x: Tensor["*"]) -> Tensor["*"]:
+    """Sigmoid activation."""
+    ...
+
+
 @silu.backward
 @save("x")
 def silu_backward(d_out: Tensor["*"], x: Tensor["*"]) -> Tensor["*"]:

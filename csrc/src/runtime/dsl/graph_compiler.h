@@ -129,8 +129,12 @@ enum class CompiledOpType : std::uint8_t {
     MambaOutProj,
     // Qwen3.5 gated delta rule forward operations
     ChunkGatedDeltaRule,
+    Qwen3_5Decay,
+    RepeatInterleaveHeads,
     // Qwen3.5 gated delta rule backward operations
     ChunkGatedDeltaRuleBackward,
+    Qwen3_5DecayBackward,
+    RepeatInterleaveHeadsBackward,
     // Mamba/SSM backward operations
     MambaSplitProjBackward,
     MambaConv1dBackward,
@@ -221,6 +225,8 @@ struct CompiledAttrs {
     bool dt_softplus = true;
     bool use_conv_bias = true;
     std::string activation;  // for mamba_conv1d (e.g., "silu")
+    bool norm_before_gate = false;
+    int repeat_factor = 1;
 
     // Gated delta rule specific
     float delta_rule_scale = 0.0f;  // 0.0 means "derive from K at runtime"

@@ -66,8 +66,8 @@ void LoRAAdamW8BitStateContainer::iterate_tensors(
     if (!mState->state1.Data) return;
     callback("lora_adamw8bit.state1", TensorShard(mState->state1));
     callback("lora_adamw8bit.state2", TensorShard(mState->state2));
-    callback("lora_adamw8bit.absmax1", TensorShard(mState->absmax1));
-    callback("lora_adamw8bit.absmax2", TensorShard(mState->absmax2));
+    callback("lora_adamw8bit.scales1", TensorShard(mState->scales1));
+    callback("lora_adamw8bit.scales2", TensorShard(mState->scales2));
 }
 
 LoRANorMuonStateContainer::LoRANorMuonStateContainer(modules::LoRANorMuonState* state)

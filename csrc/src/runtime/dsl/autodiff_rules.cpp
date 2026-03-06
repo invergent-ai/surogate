@@ -178,24 +178,16 @@ std::vector<Operation> multiply_backward(const BackwardRuleContext& ctx) {
     const std::string& A = fwd.inputs[0];
     const std::string& B = fwd.inputs[1];
 
-    if (ctx.needs_grad(0)) {
-        // dA = dC * B
+    if (ctx.needs_grad(0) || ctx.needs_grad(1)) {
+        std::string a_ref = ctx.is_param(A) ? A : saved_ref(A);
+        std::string b_ref = ctx.is_param(B) ? B : saved_ref(B);
         ops.push_back(make_operation(
-            "mul_dA_" + std::to_string(ctx.op_counter++),
-            "multiply",
-            "multiply",
-            {ctx.d_output, saved_ref(B)},
-            {ctx.d_inputs[0]}));
-    }
-
-    if (ctx.needs_grad(1)) {
-        // dB = dC * A
-        ops.push_back(make_operation(
-            "mul_dB_" + std::to_string(ctx.op_counter++),
-            "multiply",
-            "multiply",
-            {ctx.d_output, saved_ref(A)},
-            {ctx.d_inputs[1]}));
+            "mul_backward_" + std::to_string(ctx.op_counter++),
+            "mul_backward",
+            "mul_backward",
+            {ctx.d_output, a_ref, b_ref},
+            {ctx.needs_grad(0) ? ctx.d_inputs[0] : "",
+             ctx.needs_grad(1) ? ctx.d_inputs[1] : ""}));
     }
 
     return ops;
@@ -1389,7 +1381,7 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
     outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // dgate
     outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // dweight
 
-    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups"}, "mamba_gated_rmsnorm");
+    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups", "norm_before_gate"}, "mamba_gated_rmsnorm");
 
     ops.push_back(make_operation(
         "mamba_gated_rmsnorm_backward_" + std::to_string(ctx.op_counter++),
@@ -1399,6 +1391,66 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
         outputs,
         attrs));
 
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Qwen3.5 decay backward rule
+// Forward: g = qwen3_5_decay(a, A_log, dt_bias)
+// Backward: d_a, d_A_log, d_dt_bias = qwen3_5_decay_backward(d_g, a, A_log, dt_bias)
+// -----------------------------------------------------------------------------
+std::vector<Operation> qwen3_5_decay_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 3) {
+        return ops;
+    }
+    if (!(ctx.needs_grad(0) || ctx.needs_grad(1) || ctx.needs_grad(2))) {
+        return ops;
+    }
+
+    const std::string& a = fwd.inputs[0];
+    const std::string& A_log = fwd.inputs[1];
+    const std::string& dt_bias = fwd.inputs[2];
+    const std::string a_ref = ctx.is_param(a) ? a : saved_ref(a);
+    const std::string a_log_ref = ctx.is_param(A_log) ? A_log : saved_ref(A_log);
+    const std::string dt_bias_ref = ctx.is_param(dt_bias) ? dt_bias : saved_ref(dt_bias);
+
+    ops.push_back(make_operation(
+        "qwen3_5_decay_backward_" + std::to_string(ctx.op_counter++),
+        "qwen3_5_decay_backward",
+        "qwen3_5_decay_backward",
+        {ctx.d_output, a_ref, a_log_ref, dt_bias_ref},
+        {ctx.needs_grad(0) ? ctx.d_inputs[0] : "",
+         ctx.needs_grad(1) ? ctx.d_inputs[1] : "",
+         ctx.needs_grad(2) ? ctx.d_inputs[2] : ""}));
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// RepeatInterleaveHeads backward rule
+// Forward: y = repeat_interleave_heads(x, repeats)
+// Backward: d_x = repeat_interleave_heads_backward(d_y, x, repeats)
+// -----------------------------------------------------------------------------
+std::vector<Operation> repeat_interleave_heads_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    if (!ctx.needs_grad(0)) {
+        return ops;
+    }
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.empty()) {
+        return ops;
+    }
+    const std::string& x = fwd.inputs[0];
+    const std::string x_ref = ctx.is_param(x) ? x : saved_ref(x);
+    AttrMap attrs = copy_attrs(fwd.attrs, {"repeats"}, "repeat_interleave_heads");
+    ops.push_back(make_operation(
+        "repeat_interleave_heads_backward_" + std::to_string(ctx.op_counter++),
+        "repeat_interleave_heads_backward",
+        "repeat_interleave_heads_backward",
+        {ctx.d_output, x_ref},
+        {ctx.d_inputs[0]},
+        attrs));
     return ops;
 }
 
@@ -1554,6 +1606,7 @@ void register_builtin_backward_rules() {
 
     // Activations
     reg.register_rule("silu", silu_backward);
+    reg.register_rule("sigmoid", moe_sigmoid_backward);
     reg.register_rule("gelu", gelu_backward);
     reg.register_rule("relu2", relu2_backward);
     reg.register_rule("swiglu", swiglu_backward);
@@ -1610,6 +1663,8 @@ void register_builtin_backward_rules() {
     reg.register_rule("mamba_gated_rmsnorm", mamba_gated_rmsnorm_backward);
     reg.register_rule("mamba_out_proj", mamba_out_proj_backward);
     reg.register_rule("chunk_gated_delta_rule", chunk_gated_delta_rule_backward_rule);
+    reg.register_rule("qwen3_5_decay", qwen3_5_decay_backward_rule);
+    reg.register_rule("repeat_interleave_heads", repeat_interleave_heads_backward_rule);
 }
 
 } // namespace dsl
