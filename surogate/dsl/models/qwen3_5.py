@@ -282,3 +282,64 @@ class Qwen3_5ConditionalModel(_Qwen3_5DenseBase):
     lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
 
     _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.language_model.layers.{layer}")
+
+    # Multimodal external inputs (for vision-enabled Qwen3.5 conditional models).
+    visual_pos_masks = Activation(
+        Tensor["B", "T"],
+        dtype="int32",
+        scope="global",
+        description="Mask for visual token positions",
+    )
+    visual_embeds = Activation(
+        Tensor["B * T", "d_model"],
+        scope="global",
+        description="Visual embeddings (packed by mask)",
+    )
+
+    @forward
+    def forward(
+        self,
+        token_ids: Tensor["B", "T", "int32"],
+        position_ids: Tensor[3, "B", "T", "int32"],
+        visual_pos_masks: Tensor["B", "T", "int32"],
+        visual_embeds: Tensor["B * T", "d_model"],
+        targets: Tensor["B", "T", "int32"],
+    ) -> Tensor["B * T", "fp32"]:
+        with graph() as g:
+            x0 = g.embedding(token_ids, "embedding")
+            x0 = g.mask_scatter(x0, visual_pos_masks, visual_embeds, out_name="x0")
+            residual0 = g.zeros(shape=["B", "T", "d_model"], dtype="bf16")
+
+            xN, residualN = g.call(
+                "HybridStackedBlocks",
+                x0,
+                residual0,
+                position_ids,
+                num_outputs=2,
+                mamba_blocks="linear_blocks",
+                attn_blocks="attn_blocks",
+                block_types=self.block_types,
+                n_layers=self.n_layers,
+            )
+
+            final_ones = g.ones(shape=["d_model"], dtype="bf16")
+            final_norm_eff = g.add("final_norm", final_ones, out_name="final_norm_eff")
+            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
+                residualN,
+                xN,
+                final_norm_eff,
+                eps=self.eps,
+                res_out_name="residual_final",
+                y_name="xF",
+                rstd_name="ln_final_rstd",
+            )
+
+            xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
+            loss = g.fused_lm_head_loss(
+                xF_flat,
+                "lm_head",
+                targets,
+                compute_accuracy=True,
+                out_name="loss",
+            )
+            return loss

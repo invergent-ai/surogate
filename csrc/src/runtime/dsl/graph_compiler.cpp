@@ -2903,6 +2903,26 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                             ref.shape = {q_shape[0], q_shape[2], q_shape[3], v_shape[3]};
                         }
                     }
+                } else if (compiled.type == CompiledOpType::Qwen3_5Decay) {
+                    // output[0] g = -exp(A_log) * softplus(a + dt_bias), always FP32.
+                    ref.dtype = ETensorDType::FP32;
+                    if (ref.shape.empty() && !compiled.inputs.empty()) {
+                        ref.shape = compiled.inputs[0].shape;
+                    }
+                } else if (compiled.type == CompiledOpType::Qwen3_5DecayBackward) {
+                    // outputs: d_a (same dtype/shape as a), d_A_log (FP32), d_dt_bias (FP32)
+                    if (i == 0) {
+                        if (compiled.inputs.size() > 1) {
+                            ref.dtype = compiled.inputs[1].dtype;
+                            ref.shape = compiled.inputs[1].shape;
+                        }
+                    } else if (i == 1 || i == 2) {
+                        ref.dtype = ETensorDType::FP32;
+                        const std::size_t src_idx = (i == 1) ? 2 : 3;
+                        if (compiled.inputs.size() > src_idx) {
+                            ref.shape = compiled.inputs[src_idx].shape;
+                        }
+                    }
                 } else {
                     // Default for activation tensors — this is a best-effort guess
                     // that is often wrong for Mamba/custom ops; do NOT persist.

@@ -131,10 +131,12 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
         vision_cfg = &config_json["vision_config"];
     }
 
+    bool vision_has_deepstack_indexes = false;
     if (vision_cfg) {
         cfg->UseVisualInputs = true;
         if (vision_cfg->contains("deepstack_visual_indexes") &&
             (*vision_cfg)["deepstack_visual_indexes"].is_array()) {
+            vision_has_deepstack_indexes = true;
             cfg->DeepstackVisualLayers =
                 static_cast<int>((*vision_cfg)["deepstack_visual_indexes"].size());
         }
@@ -146,7 +148,7 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
             cfg->UseVisualInputs = true;
         }
     }
-    if (cfg->UseVisualInputs && cfg->DeepstackVisualLayers == 0) {
+    if (cfg->UseVisualInputs && cfg->DeepstackVisualLayers == 0 && !vision_has_deepstack_indexes) {
         // Default to Qwen3-VL deepstack count when not specified.
         cfg->DeepstackVisualLayers = 3;
     }
