@@ -26,7 +26,7 @@ void launch_gdr_fwd_state(
     const float* initial_state,
     int fwd_ws_stride,
     int B, int Tlen, int H, int Kdim, int Vdim,
-    int num_chunks, int chunk_size,
+    int num_chunks, int chunk_size, int v_tile,
     int threads, std::size_t smem, cudaStream_t stream);
 
 template<typename TQ>
@@ -35,7 +35,7 @@ void launch_gdr_fwd_output(
     const float* fwd_checkpoints, const float* fwd_workspace,
     int fwd_ws_stride,
     int B, int Tlen, int H, int Kdim, int Vdim,
-    int num_chunks, int chunk_size, float scale,
+    int num_chunks, int chunk_size, int v_tile, float scale,
     bool use_qk_l2norm_in_kernel,
     int threads, std::size_t smem, cudaStream_t stream);
 

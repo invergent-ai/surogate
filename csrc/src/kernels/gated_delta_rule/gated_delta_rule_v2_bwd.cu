@@ -1441,7 +1441,20 @@ void launch_bwd_v2_multikernel(
     const int Vdim = static_cast<int>(v.Sizes[3]);
     const int num_chunks = (Tlen + chunk_size - 1) / chunk_size;
     const int Lp = kMaxC;
-    const int threads = 128;
+    int chunk_threads = 512;
+    if (const char* env = std::getenv("SUROGATE_GDR_CHUNK_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            chunk_threads = (parsed / 32) * 32;
+        }
+    }
+    int phase2_threads = 1024;
+    if (const char* env = std::getenv("SUROGATE_GDR_BWD_PHASE2_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            phase2_threads = (parsed / 32) * 32;
+        }
+    }
     const int v_tile = Vdim >= 64 ? 64 : Vdim;
 
     ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
@@ -1539,14 +1552,14 @@ void launch_bwd_v2_multikernel(
                 k.get<TQ>(), v.get<TQ>(), g.get<TG>(), beta.get<TB>(),
                 initial_state ? initial_state->get<float>() : nullptr,
                 B, Tlen, H, Kdim, Vdim, chunk_size, use_qk_l2norm_in_kernel,
-                threads, cp_wmma_smem, stream);
+                chunk_threads, cp_wmma_smem, stream);
         } else {
             launch_gdr_checkpoint_scalar<TQ, TG, TB>(
                 checkpoints.get<float>(),
                 k.get<TQ>(), v.get<TQ>(), g.get<TG>(), beta.get<TB>(),
                 initial_state ? initial_state->get<float>() : nullptr,
                 B, Tlen, H, Kdim, Vdim, chunk_size, use_qk_l2norm_in_kernel,
-                threads, cp_scalar_smem, stream);
+                chunk_threads, cp_scalar_smem, stream);
         }
     }
 
@@ -1564,7 +1577,7 @@ void launch_bwd_v2_multikernel(
         chunk_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
         use_qk_l2norm_in_kernel,
-        threads, phase1_smem, stream);
+        chunk_threads, phase1_smem, stream);
 
     if (profile) cudaEventRecord(ev[2], stream);
 
@@ -1577,7 +1590,7 @@ void launch_bwd_v2_multikernel(
         dh_storage,
         chunk_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size,
-        threads, phase2_smem, stream);
+        phase2_threads, phase2_smem, stream);
 
     if (profile) cudaEventRecord(ev[3], stream);
 
@@ -1594,7 +1607,7 @@ void launch_bwd_v2_multikernel(
         chunk_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
         use_qk_l2norm_in_kernel,
-        threads, phase3_smem, stream);
+        chunk_threads, phase3_smem, stream);
 
     if (profile) {
         cudaEventRecord(ev[4], stream);

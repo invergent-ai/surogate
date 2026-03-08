@@ -19,7 +19,7 @@ __global__ void gdr_fwd_output_wmma(
     const float* __restrict__ fwd_workspace,
     int fwd_ws_stride,
     int Tlen, int H, int Kdim, int Vdim,
-    int num_chunks, int chunk_size, float scale,
+    int num_chunks, int chunk_size, int v_tile_max, float scale,
     bool use_qk_l2norm_in_kernel)
 {
     const int tid = threadIdx.x;
@@ -31,7 +31,7 @@ __global__ void gdr_fwd_output_wmma(
     const int h = bh % H;
     const long kv = (long)Kdim * Vdim;
     const int Lp = kMaxC;
-    const int v_tile = Vdim >= 64 ? 64 : Vdim;
+    const int v_tile = (v_tile_max > 0) ? min(Vdim, v_tile_max) : min(Vdim, 64);
 
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
@@ -159,7 +159,7 @@ void launch_gdr_fwd_output(
     const float* fwd_checkpoints, const float* fwd_workspace,
     int fwd_ws_stride,
     int B, int Tlen, int H, int Kdim, int Vdim,
-    int num_chunks, int chunk_size, float scale,
+    int num_chunks, int chunk_size, int v_tile, float scale,
     bool use_qk_l2norm_in_kernel,
     int threads, std::size_t smem, cudaStream_t stream)
 {
@@ -171,7 +171,7 @@ void launch_gdr_fwd_output(
     gdr_fwd_output_wmma<TQ><<<B * H * num_chunks, threads, smem, stream>>>(
         out, q, fwd_checkpoints, fwd_workspace,
         fwd_ws_stride, Tlen, H, Kdim, Vdim,
-        num_chunks, chunk_size, scale, use_qk_l2norm_in_kernel);
+        num_chunks, chunk_size, v_tile, scale, use_qk_l2norm_in_kernel);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -179,10 +179,10 @@ void launch_gdr_fwd_output(
 template void launch_gdr_fwd_output<nv_bfloat16>(
     nv_bfloat16*, const nv_bfloat16*,
     const float*, const float*,
-    int, int, int, int, int, int, int, int, float, bool,
+    int, int, int, int, int, int, int, int, int, float, bool,
     int, std::size_t, cudaStream_t);
 template void launch_gdr_fwd_output<half>(
     half*, const half*,
     const float*, const float*,
-    int, int, int, int, int, int, int, int, float, bool,
+    int, int, int, int, int, int, int, int, int, float, bool,
     int, std::size_t, cudaStream_t);

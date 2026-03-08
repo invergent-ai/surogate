@@ -1654,16 +1654,7 @@ void execute_flash_attention(RecomputeContext& ctx,
         total_doc_tokens = num_docs * max_doc_seqlen;
 
         dense_cu_seqlens = ctx.rs.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
-        std::vector<int32_t> host_cu_seqlens(static_cast<std::size_t>(num_docs + 1));
-        for (int i = 0; i <= num_docs; ++i) {
-            host_cu_seqlens[static_cast<std::size_t>(i)] = i * max_doc_seqlen;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(
-            dense_cu_seqlens.get<int32_t>(),
-            host_cu_seqlens.data(),
-            host_cu_seqlens.size() * sizeof(int32_t),
-            cudaMemcpyHostToDevice,
-            ctx.rs.MainStream));
+        fill_dense_cu_seqlens(dense_cu_seqlens.get<int32_t>(), num_docs, max_doc_seqlen, ctx.rs.MainStream);
         cu_seqlens_ptr = dense_cu_seqlens.get<int32_t>();
     }
 

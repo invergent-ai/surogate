@@ -615,3 +615,123 @@ TEST_CASE("gated delta rule surogate perf benchmark", "[kernels][gated_delta_rul
     }
     REQUIRE(fs::exists(out_path));
 }
+
+TEST_CASE("gated delta rule forward cuda graph replay", "[kernels][gated_delta_rule][graph]") {
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count <= 0) {
+        SUCCEED("CUDA not available; skipping gated delta graph replay test");
+        return;
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+
+    constexpr int B = 2;
+    constexpr int T = 2048;
+    constexpr int H = 16;
+    constexpr int K = 128;
+    constexpr int V = 128;
+    constexpr int chunk_size = 64;
+    constexpr bool use_qk_l2norm_in_kernel = true;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(K));
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    const std::size_t n_qkvk = static_cast<std::size_t>(B) * T * H * K;
+    const std::size_t n_qvv = static_cast<std::size_t>(B) * T * H * V;
+    const std::size_t n_gh = static_cast<std::size_t>(B) * T * H;
+    const std::size_t n_state = static_cast<std::size_t>(B) * H * K * V;
+
+    std::vector<float> q_f = make_signal(n_qkvk, 0.173f, 0.31f, 0.097f, -0.22f);
+    std::vector<float> k_f = make_signal(n_qkvk, 0.137f, -0.41f, 0.083f, 0.57f);
+    std::vector<float> v_f = make_signal(n_qvv, 0.191f, 0.73f, 0.121f, -0.35f);
+    std::vector<float> g_raw = make_signal(n_gh, 0.157f, -0.27f, 0.109f, 0.44f);
+    std::vector<float> beta_raw = make_signal(n_gh, 0.113f, 0.19f, 0.071f, -0.63f);
+    std::vector<float> g_f(n_gh), beta_f(n_gh);
+    for (std::size_t i = 0; i < n_gh; ++i) {
+        g_f[i] = -0.7f + 0.2f * std::sin(g_raw[i]);
+        beta_f[i] = 1.0f / (1.0f + std::exp(-beta_raw[i]));
+    }
+    std::vector<float> initial_state_f = make_signal(n_state, 0.167f, -0.52f, 0.061f, 0.28f);
+
+    thrust::device_vector<nv_bfloat16> d_q = to_device(to_bf16(q_f));
+    thrust::device_vector<nv_bfloat16> d_k = to_device(to_bf16(k_f));
+    thrust::device_vector<nv_bfloat16> d_v = to_device(to_bf16(v_f));
+    thrust::device_vector<nv_bfloat16> d_g = to_device(to_bf16(g_f));
+    thrust::device_vector<nv_bfloat16> d_beta = to_device(to_bf16(beta_f));
+    thrust::device_vector<float> d_initial_state = to_device(initial_state_f);
+    thrust::device_vector<nv_bfloat16> d_out(n_qvv);
+    thrust::device_vector<float> d_final_state(n_state);
+    thrust::device_vector<float> d_forward_scratch(n_state);
+
+    const int num_chunks = (T + chunk_size - 1) / chunk_size;
+    const std::size_t n_checkpoints =
+        static_cast<std::size_t>(B) * H * static_cast<std::size_t>(num_chunks + 1) * K * V;
+    thrust::device_vector<float> d_checkpoints(n_checkpoints);
+
+    constexpr std::size_t kWsAlignFloats = 128 / sizeof(float);
+    auto align_up = [](std::size_t x, std::size_t align) {
+        return ((x + align - 1) / align) * align;
+    };
+    std::size_t fwd_ws_stride = 0;
+    fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(64) * V;
+    fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(64) * K;
+    fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(64) * K;
+    fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(64) * V;
+    fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(64);
+    fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats);
+    const std::size_t fwd_workspace_elems =
+        static_cast<std::size_t>(B) * H * static_cast<std::size_t>(num_chunks) * fwd_ws_stride;
+    thrust::device_vector<float> d_fwd_workspace(fwd_workspace_elems);
+
+    Tensor q_t = tensor_view(d_q, ETensorDType::BF16, {B, T, H, K});
+    Tensor k_t = tensor_view(d_k, ETensorDType::BF16, {B, T, H, K});
+    Tensor v_t = tensor_view(d_v, ETensorDType::BF16, {B, T, H, V});
+    Tensor g_t = tensor_view(d_g, ETensorDType::BF16, {B, T, H});
+    Tensor beta_t = tensor_view(d_beta, ETensorDType::BF16, {B, T, H});
+    Tensor init_t = tensor_view(d_initial_state, ETensorDType::FP32, {B, H, K, V});
+    Tensor out_t = tensor_view(d_out, ETensorDType::BF16, {B, T, H, V});
+    Tensor final_state_t = tensor_view(d_final_state, ETensorDType::FP32, {B, H, K, V});
+    Tensor forward_scratch_t = tensor_view(d_forward_scratch, ETensorDType::FP32, {B, H, K, V});
+    Tensor checkpoints_t =
+        tensor_view(d_checkpoints, ETensorDType::FP32, {B, H, num_chunks + 1, K, V});
+    Tensor fwd_workspace_t =
+        tensor_view(d_fwd_workspace, ETensorDType::FP32, {static_cast<long>(fwd_workspace_elems)});
+
+    auto run_fwd = [&]() {
+        gated_delta_rule_chunk_forward_v2(
+            out_t,
+            final_state_t,
+            forward_scratch_t,
+            q_t,
+            k_t,
+            v_t,
+            g_t,
+            beta_t,
+            &init_t,
+            scale,
+            chunk_size,
+            use_qk_l2norm_in_kernel,
+            &checkpoints_t,
+            &fwd_workspace_t,
+            stream);
+    };
+
+    run_fwd();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    run_fwd();
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    CUDA_CHECK(cudaGraphExecDestroy(graph_exec));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}

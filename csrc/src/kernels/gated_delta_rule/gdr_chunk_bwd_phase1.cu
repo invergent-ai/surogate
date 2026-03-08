@@ -172,10 +172,14 @@ __global__ void gdr_bwd_phase1_wmma(
     __syncthreads();
     for (int idx = tid; idx < Lp * Lp; idx += nthr) {
         const int i = idx / Lp, j = idx % Lp;
-        if (i < L && j <= i)
-            scratch1[idx] *= smem_beta[i] * expf(smem_gcum[i] - smem_gcum[j]);
-        else
+        if (i < L && j <= i) {
+            const float eg_j = smem_eg[j];
+            const float exp_ij =
+                (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
+            scratch1[idx] *= smem_beta[i] * exp_ij;
+        } else {
             scratch1[idx] = 0.0f;
+        }
     }
     __syncthreads();
     // Save A for Phase 3
@@ -345,7 +349,6 @@ __global__ void gdr_bwd_phase1_wmma(
 
         // vnew_pre = u - wh
         for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
-            const int i = idx / Vdim;
             float vnew_pre = bf16_trunc<TQ>(to_float(buf2[idx]) - scratch1[idx]);
             buf2[idx] = from_float<TQ>(vnew_pre);
             VNEW[idx] = vnew_pre;
@@ -535,7 +538,9 @@ __global__ void gdr_bwd_phase1_wmma(
     for (int idx = tid; idx < Lp * Lp; idx += nthr) {
             const int i = idx / Lp, j = idx % Lp;
             if (i < L && j <= i) {
-                const float exp_ij = expf(smem_gcum[i] - smem_gcum[j]);
+                const float eg_j = smem_eg[j];
+                const float exp_ij =
+                    (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
                 scratch1[idx] = bf16_trunc<TQ>(exp_ij * scratch1[idx]);
             }
             else
@@ -594,8 +599,12 @@ __global__ void gdr_bwd_phase1_wmma(
         for (int idx = tid; idx < Lp * Lp; idx += nthr) {
             const int i = idx / Lp, j = idx % Lp;
             float val = 0.0f;
-            if (i < L && j <= i)
-                val = scratch1[idx] * expf(smem_gcum[i] - smem_gcum[j]);
+            if (i < L && j <= i) {
+                const float eg_j = smem_eg[j];
+                const float exp_ij =
+                    (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
+                val = scratch1[idx] * exp_ij;
+            }
             buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
         }
         __syncthreads();
@@ -671,8 +680,12 @@ __global__ void gdr_bwd_phase1_wmma(
             for (int idx = tid; idx < Lp * Lp; idx += nthr) {
                 const int i = idx / Lp, j = idx % Lp;
                 float val = 0.0f;
-                if (i < L && j <= i)
-                    val = scratch1[idx] * expf(smem_gcum[i] - smem_gcum[j]);
+                if (i < L && j <= i) {
+                    const float eg_j = smem_eg[j];
+                    const float exp_ij =
+                        (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
+                    val = scratch1[idx] * exp_ij;
+                }
                 buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
             }
             __syncthreads();

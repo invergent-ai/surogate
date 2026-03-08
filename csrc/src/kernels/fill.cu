@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
@@ -76,6 +77,26 @@ void fill_constant(float* dst, float value, std::size_t count, cudaStream_t stre
  */
 void fill_constant(nv_bfloat16* dst, nv_bfloat16 value, std::size_t count, cudaStream_t stream) {
     fill_imp(dst, value, count, stream);
+}
+
+namespace {
+
+__global__ void dense_cu_seqlens_kernel(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i > num_docs) return;
+    cu_seqlens[i] = i * max_doc_seqlen;
+}
+
+}  // namespace
+
+void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen, cudaStream_t stream) {
+    if (cu_seqlens == nullptr || num_docs < 0 || max_doc_seqlen < 0) {
+        throw std::invalid_argument("fill_dense_cu_seqlens: invalid arguments");
+    }
+    constexpr int kBlockSize = 256;
+    const int grid = static_cast<int>(div_ceil(static_cast<std::size_t>(num_docs + 1), static_cast<std::size_t>(kBlockSize)));
+    dense_cu_seqlens_kernel<<<grid, kBlockSize, 0, stream>>>(cu_seqlens, num_docs, max_doc_seqlen);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================

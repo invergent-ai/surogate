@@ -20,7 +20,7 @@ __global__ void gdr_fwd_state_wmma(
     const float* __restrict__ initial_state,
     int fwd_ws_stride,
     int Tlen, int H, int Kdim, int Vdim,
-    int num_chunks, int chunk_size)
+    int num_chunks, int chunk_size, int v_tile_max)
 {
     const int tid = threadIdx.x;
     const int nthr = blockDim.x;
@@ -29,7 +29,7 @@ __global__ void gdr_fwd_state_wmma(
     const int bh = b * H + h;
     const long kv = (long)Kdim * Vdim;
     const int Lp = kMaxC;
-    const int v_tile = Vdim >= 64 ? 64 : Vdim;
+    const int v_tile = (v_tile_max > 0) ? min(Vdim, v_tile_max) : min(Vdim, 64);
 
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
 
@@ -142,7 +142,7 @@ void launch_gdr_fwd_state(
     const float* initial_state,
     int fwd_ws_stride,
     int B, int Tlen, int H, int Kdim, int Vdim,
-    int num_chunks, int chunk_size,
+    int num_chunks, int chunk_size, int v_tile,
     int threads, std::size_t smem, cudaStream_t stream)
 {
     CUDA_CHECK(cudaFuncSetAttribute(
@@ -153,16 +153,16 @@ void launch_gdr_fwd_state(
     gdr_fwd_state_wmma<TQ><<<dim3(B, H), threads, smem, stream>>>(
         final_state, state_scratch, fwd_checkpoints, fwd_workspace,
         initial_state, fwd_ws_stride,
-        Tlen, H, Kdim, Vdim, num_chunks, chunk_size);
+        Tlen, H, Kdim, Vdim, num_chunks, chunk_size, v_tile);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // Explicit template instantiations
 template void launch_gdr_fwd_state<nv_bfloat16>(
     float*, float*, float*, float*, const float*,
-    int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int, int,
     int, std::size_t, cudaStream_t);
 template void launch_gdr_fwd_state<half>(
     float*, float*, float*, float*, const float*,
-    int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int, int,
     int, std::size_t, cudaStream_t);

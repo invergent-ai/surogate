@@ -79,17 +79,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         total_doc_tokens = num_docs * max_doc_seqlen;
         generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
         mTemps.push_back(generated_cu_seqlens);
-
-        std::vector<int32_t> host_cu_seqlens(static_cast<std::size_t>(num_docs + 1));
-        for (int i = 0; i <= num_docs; ++i) {
-            host_cu_seqlens[static_cast<std::size_t>(i)] = i * max_doc_seqlen;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(
-            generated_cu_seqlens.get<int32_t>(),
-            host_cu_seqlens.data(),
-            host_cu_seqlens.size() * sizeof(int32_t),
-            cudaMemcpyHostToDevice,
-            mRunState.MainStream));
+        fill_dense_cu_seqlens(generated_cu_seqlens.get<int32_t>(), num_docs, max_doc_seqlen, mRunState.MainStream);
         cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
     }
 
@@ -206,17 +196,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         total_doc_tokens = num_docs * max_doc_seqlen;
         generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
         mTemps.push_back(generated_cu_seqlens);
-
-        std::vector<int32_t> host_cu_seqlens(static_cast<std::size_t>(num_docs + 1));
-        for (int i = 0; i <= num_docs; ++i) {
-            host_cu_seqlens[static_cast<std::size_t>(i)] = i * max_doc_seqlen;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(
-            generated_cu_seqlens.get<int32_t>(),
-            host_cu_seqlens.data(),
-            host_cu_seqlens.size() * sizeof(int32_t),
-            cudaMemcpyHostToDevice,
-            mRunState.MainStream));
+        fill_dense_cu_seqlens(generated_cu_seqlens.get<int32_t>(), num_docs, max_doc_seqlen, mRunState.MainStream);
         cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
     }
 

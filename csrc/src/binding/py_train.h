@@ -12,6 +12,7 @@
 #include <thread>
 #include <functional>
 #include <vector>
+#include <cstddef>
 #include <cuda_runtime.h>
 
 #include "config/pretrained_config.h"
@@ -145,6 +146,9 @@ private:
         int captured_B = 0;
         int captured_T = 0;
         int captured_grad_accum = 0;
+        bool has_stack_checkpoint = false;
+        std::byte* stack_top = nullptr;
+        std::size_t stack_alloc_count = 0;
         Tensor opt_params;
         Tensor opt_step;
         std::vector<Tensor> inputs;

@@ -665,6 +665,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 gs.graph_exec = nullptr;
             }
             gs.captured = false;
+            gs.has_stack_checkpoint = false;
+            gs.stack_top = nullptr;
+            gs.stack_alloc_count = 0;
         }
 
         // Allocate per-micro-step pinned buffers if needed.
@@ -754,21 +757,8 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data, &opt_step_host,
                                    sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
 
-        // If graphs are disabled or unsupported, fall back to eager execution.
-        const bool qwen3_family_model =
-            (mConfig != nullptr) &&
-            (mConfig->Architecture == PretrainedConfig::QWEN3);
-        const bool disable_outer_full_step_graph = qwen3_family_model;
-        if (!mOptions.UseCudaGraphs || disable_outer_full_step_graph) {
-            if (disable_outer_full_step_graph) {
-                static bool warned_once = false;
-                if (!warned_once && ctx.Communicator && ctx.Communicator->rank() == 0) {
-                    fprintf(stderr,
-                            "[CUDA graphs] Qwen3-family model: disabling outer full-step graph "
-                            "capture and using eager full-step with internal DSL graphs.\n");
-                    warned_once = true;
-                }
-            }
+        // If graphs are disabled, fall back to eager execution.
+        if (!mOptions.UseCudaGraphs) {
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
@@ -799,6 +789,28 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         // CUDA graph capture path (both AdamW and NorMuon support graph capture)
+        enum class FullStepGraphMode { Full, ForwardBackward, ForwardOnly };
+        const char* graph_mode_env = std::getenv("SUROGATE_FULLSTEP_GRAPH_MODE");
+        FullStepGraphMode graph_mode = FullStepGraphMode::Full;
+        if (graph_mode_env) {
+            if (std::strcmp(graph_mode_env, "fwd_bwd") == 0) {
+                graph_mode = FullStepGraphMode::ForwardBackward;
+            } else if (std::strcmp(graph_mode_env, "fwd") == 0) {
+                graph_mode = FullStepGraphMode::ForwardOnly;
+            }
+        }
+        const bool do_graph_backward = (graph_mode != FullStepGraphMode::ForwardOnly);
+        const bool do_graph_update = (graph_mode == FullStepGraphMode::Full);
+        if (graph_mode != FullStepGraphMode::Full) {
+            static bool graph_mode_warned = false;
+            if (!graph_mode_warned && ctx.Communicator && ctx.Communicator->rank() == 0) {
+                fprintf(stderr,
+                        "[CUDA graphs] SUROGATE_FULLSTEP_GRAPH_MODE=%s (debug mode)\n",
+                        graph_mode == FullStepGraphMode::ForwardBackward ? "fwd_bwd" : "fwd");
+                graph_mode_warned = true;
+            }
+        }
+
         const bool warmup_full_graph = !gs.captured
                                        && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
         const bool warmup_skip_bwd = env_enabled("SUROGATE_DSL_GRAPH_WARMUP_SKIP_BWD");
@@ -811,7 +823,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             for (int j = 0; j < micro_steps; ++j) {
                 rs.Targets_CPU = gs.targets[j];
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
-                if (!warmup_skip_bwd) {
+                if (do_graph_backward && !warmup_skip_bwd) {
                     dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
                 }
             }
@@ -824,16 +836,24 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             dsl_model->prepare_optimizer_state_for_graph(*ctx.Communicator, config);
             // Ensure the main stream is idle before beginning capture (no external dependencies).
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+            auto stack_cp = rs.Stack.checkpoint();
+            gs.stack_top = stack_cp.top;
+            gs.stack_alloc_count = stack_cp.alloc_count;
+            gs.has_stack_checkpoint = true;
             cudaGraph_t graph = nullptr;
             CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
             for (int j = 0; j < micro_steps; ++j) {
                 rs.Targets_CPU = gs.targets[j];
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
-                dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+                if (do_graph_backward) {
+                    dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+                }
             }
-            dsl_model->update_with_graph_params(*ctx.Communicator, config,
-                                               gs.opt_params.template get<float>(),
-                                               gs.opt_step.template get<int>());
+            if (do_graph_update) {
+                dsl_model->update_with_graph_params(*ctx.Communicator, config,
+                                                   gs.opt_params.template get<float>(),
+                                                   gs.opt_step.template get<int>());
+            }
             CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(graph));
@@ -844,6 +864,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             dsl_model->set_internal_graphs_enabled(true);
         }
 
+        if (gs.has_stack_checkpoint) {
+            rs.Stack.restore(DeviceMemoryStack::Checkpoint{gs.stack_top, gs.stack_alloc_count});
+        }
         CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
         CUDA_CHECK(cudaDeviceSynchronize());
 

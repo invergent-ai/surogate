@@ -4,6 +4,8 @@
 #include "gated_delta_rule_v2.cuh"
 #include "gdr_fwd_launchers.h"
 
+#include <algorithm>
+
 namespace {
 
 // ============================================================================
@@ -606,8 +608,34 @@ void launch_fwd_v2_multikernel(
     const int Vdim = static_cast<int>(v.Sizes[3]);
     const int num_chunks = (Tlen + chunk_size - 1) / chunk_size;
     const int Lp = kMaxC;
-    const int threads = 128;
-    const int v_tile = Vdim >= 64 ? 64 : Vdim;
+    int chunk_threads = 512;
+    if (const char* env = std::getenv("SUROGATE_GDR_CHUNK_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            chunk_threads = (parsed / 32) * 32;
+        }
+    }
+    int state_threads = 768;
+    if (const char* env = std::getenv("SUROGATE_GDR_FWD_STATE_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            state_threads = (parsed / 32) * 32;
+        }
+    }
+    int v_tile = Vdim >= 64 ? 64 : Vdim;
+    if (const char* env_vtile = std::getenv("SUROGATE_GDR_VTILE")) {
+        const int parsed = std::atoi(env_vtile);
+        if (parsed > 0) {
+            v_tile = std::min(Vdim, parsed);
+        }
+    }
+    // WMMA kernels expect tile multiples of 16.
+    if (v_tile >= 16) {
+        v_tile = (v_tile / 16) * 16;
+    }
+    if (v_tile <= 0) {
+        v_tile = std::min(Vdim, 16);
+    }
 
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
     const int fwd_ws_stride = fwl.total;
@@ -670,7 +698,7 @@ void launch_fwd_v2_multikernel(
         fwd_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size,
         use_qk_l2norm_in_kernel,
-        threads, precompute_smem, stream);
+        chunk_threads, precompute_smem, stream);
 
     if (profile) cudaEventRecord(ev[1], stream);
 
@@ -693,7 +721,8 @@ void launch_fwd_v2_multikernel(
         initial_state ? initial_state->get<float>() : nullptr,
         fwd_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size,
-        threads, state_smem, stream);
+        v_tile,
+        state_threads, state_smem, stream);
 
     if (profile) cudaEventRecord(ev[2], stream);
 
@@ -725,9 +754,9 @@ void launch_fwd_v2_multikernel(
         fwd_checkpoints_tensor->get<float>(),
         fwd_workspace,
         fwd_ws_stride,
-        B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
+        B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, v_tile, scale,
         use_qk_l2norm_in_kernel,
-        threads, output_smem, stream);
+        chunk_threads, output_smem, stream);
 
     if (profile) {
         cudaEventRecord(ev[3], stream);
@@ -777,10 +806,12 @@ void launch_fwd_v2(
     };
 
     // Try multi-kernel WMMA path for bf16/fp16 when K,V are tensor-core friendly.
+    const bool force_scalar_fwd = (std::getenv("SUROGATE_GDR_FORCE_SCALAR_FWD") != nullptr);
     // Supports <=64 generally, and Qwen3.5 K=V=128 via low-SMEM state-kernel aliasing.
     // Requires checkpoints (output kernel reads h_in from them).
     constexpr bool can_wmma = std::is_same_v<TQ, nv_bfloat16> || std::is_same_v<TQ, half>;
     if constexpr (can_wmma) {
+        if (!force_scalar_fwd) {
         const bool can_use_multi_wmma =
             (Kdim % 16 == 0) && (Vdim % 16 == 0) &&
             ((Kdim <= 64 && Vdim <= 64) || (Kdim == 128 && Vdim == 128));
@@ -824,6 +855,7 @@ void launch_fwd_v2(
                 Tlen, H, Kdim, Vdim, chunk_size, scale, use_qk_l2norm_in_kernel);
             CUDA_CHECK(cudaGetLastError());
             return;
+        }
         }
     }
 

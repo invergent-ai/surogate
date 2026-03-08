@@ -188,7 +188,9 @@ __global__ void gdr_bwd_phase3_wmma(
             float dg_neg = 0.0f;
 
             for (int j = 0; j < i; ++j) {
-                const float exp_ij = expf(smem_gcum[i] - smem_gcum[j]);
+                const float eg_j = smem_eg[j];
+                const float exp_ij =
+                    (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
                 float dot_qk = 0.0f;
                 for (int kk = 0; kk < Kdim; ++kk) {
                     const long qi_idx = (((long)b * Tlen + cs + i) * H + h) * Kdim + kk;
@@ -211,7 +213,9 @@ __global__ void gdr_bwd_phase3_wmma(
             }
 
             for (int r = i + 1; r < L; ++r) {
-                const float exp_ri = expf(smem_gcum[r] - smem_gcum[i]);
+                const float eg_i = smem_eg[i];
+                const float exp_ri =
+                    (eg_i > 0.0f) ? (smem_eg[r] / eg_i) : expf(smem_gcum[r] - smem_gcum[i]);
                 float dot_qk = 0.0f;
                 for (int kk = 0; kk < Kdim; ++kk) {
                     const long qr_idx = (((long)b * Tlen + cs + r) * H + h) * Kdim + kk;
@@ -710,7 +714,9 @@ __global__ void gdr_bwd_phase3_wmma(
         const int i = idx / L, j = idx % L;
         if (j >= i) continue;
 
-        const float exp_ij = expf(smem_gcum[i] - smem_gcum[j]);
+        const float eg_j = smem_eg[j];
+        const float exp_ij =
+            (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
         const float a_grad = scratch1[i * Lp + j];
         const float dot_k = tmp_area[i * Lp + j];
         const float val = dot_k * exp_ij;

@@ -5,6 +5,7 @@
 
 #include "model.h"
 
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -128,13 +129,26 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
     if (DeviceProp.major >= 12) {
         cublas_ws_size = 128*1024*1024;  // 128MB for Blackwell FP8
     }
+    if (const char* ws_mb_env = std::getenv("SUROGATE_CUBLAS_WS_MB")) {
+        const long ws_mb = std::strtol(ws_mb_env, nullptr, 10);
+        if (ws_mb > 0) {
+            cublas_ws_size = static_cast<std::size_t>(ws_mb) * 1024ull * 1024ull;
+        }
+    }
     CuBlasWorkspace = Allocator->allocate(ETensorDType::BYTE, "cublas_ws", {static_cast<long>(cublas_ws_size)});
 
     // CUTLASS workspace for SM120 MX FP8 operations
     // Size includes: FP8 A buffer, FP8 B buffer, MX scales, GEMM workspace
     // 128MB is sufficient for typical LLM dimensions (B*T=4096, hidden=4096, intermediate=11008)
     if (DeviceProp.major >= 12) {  // SM120+ (Blackwell GeForce)
-        CutlassWorkspace = Allocator->allocate(ETensorDType::BYTE, "cutlass_ws", {128*1024*1024});
+        std::size_t cutlass_ws_size = 128 * 1024 * 1024;
+        if (const char* ws_mb_env = std::getenv("SUROGATE_CUTLASS_WS_MB")) {
+            const long ws_mb = std::strtol(ws_mb_env, nullptr, 10);
+            if (ws_mb > 0) {
+                cutlass_ws_size = static_cast<std::size_t>(ws_mb) * 1024ull * 1024ull;
+            }
+        }
+        CutlassWorkspace = Allocator->allocate(ETensorDType::BYTE, "cutlass_ws", {static_cast<long>(cutlass_ws_size)});
     }
 
     MainStream = create_named_stream("main stream");

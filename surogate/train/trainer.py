@@ -620,13 +620,6 @@ class SurogateTrainerWrapper():
 
     def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
         use_full_step_graphs = True
-        template_type = str(getattr(self.config.model_info, "template_type", "") or "")
-        if self.config.use_cuda_graphs and template_type.startswith("Qwen3_5"):
-            logger.info(
-                "Qwen3.5: keeping use_cuda_graphs enabled while disabling outer full-step graph capture; "
-                "using micro-step execution path."
-            )
-            use_full_step_graphs = False
         if use_full_step_graphs and self.config.optimizer not in ("adamw_8bit", "normuon"):
             raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
         if use_full_step_graphs and not self.config.use_cuda_graphs:

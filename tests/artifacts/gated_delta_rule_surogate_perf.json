@@ -6,11 +6,11 @@
       "K": 128,
       "T": 512,
       "V": 128,
-      "backward_ms": 1.6817706823349,
+      "backward_ms": 1.7045973539352417,
       "chunk_size": 64,
       "dtype": "bfloat16",
-      "forward_ms": 1.063658595085144,
-      "total_ms": 2.8429224491119385,
+      "forward_ms": 1.0225707292556763,
+      "total_ms": 2.91320538520813,
       "use_qk_l2norm_in_kernel": true
     },
     {
@@ -19,11 +19,11 @@
       "K": 128,
       "T": 2048,
       "V": 128,
-      "backward_ms": 10.849163055419922,
+      "backward_ms": 10.891594886779785,
       "chunk_size": 64,
       "dtype": "bfloat16",
-      "forward_ms": 4.955679893493652,
-      "total_ms": 15.800822257995605,
+      "forward_ms": 5.015520095825195,
+      "total_ms": 16.812395095825195,
       "use_qk_l2norm_in_kernel": true
     }
   ],

@@ -7,6 +7,7 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <fmt/core.h>
+#include <cstdlib>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -123,6 +124,9 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
                      float alpha_val, float beta_val, int ldc_override = -1,
                      int lda_override = -1, int ldb_override = -1)
 {
+    static const bool debug_fallback = (std::getenv("SUROGATE_DEBUG_MATMUL_FALLBACK") != nullptr);
+    static int fallback_log_count = 0;
+
     bool has_bias = (bias != nullptr);
 
     // check alignment (some modes work unaligned, but it is always best to be aligned for performance)
@@ -239,6 +243,29 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
         }
     }
     if (matmul_status != CUBLAS_STATUS_SUCCESS) {
+        auto maybe_log_fallback = [&](const char* phase) {
+            if (!debug_fallback || fallback_log_count >= 256) {
+                return;
+            }
+            ++fallback_log_count;
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            const bool capturing =
+                (cudaStreamIsCapturing(stream, &cap) == cudaSuccess) &&
+                (cap != cudaStreamCaptureStatusNone);
+            std::fprintf(stderr,
+                         "[MATMUL-FALLBACK] phase=%s capture=%d m=%d n=%d k=%d mode=%d "
+                         "A_type=%d B_type=%d C_type=%d status=%d\n",
+                         phase,
+                         (int)capturing,
+                         m, n, k, (int)mode,
+                         (int)to_cuda_lib_type_enum<FloatA>,
+                         (int)to_cuda_lib_type_enum<FloatB>,
+                         (int)to_cuda_lib_type_enum<FloatC>,
+                         (int)matmul_status);
+        };
+
+        maybe_log_fallback("cublasLt_failed");
+
         // Fallback to cuBLAS GEMM for non-FP8 types when cuBLASLt fails.
         // This is slower but more robust for certain BF16 shapes.
         if constexpr (sizeof(FloatA) != 1 && sizeof(FloatB) != 1) {
@@ -249,6 +276,7 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
             // Also, non-unit alpha is not supported in fallback path yet.
             if ((!has_bias || ldc_fallback == m) && alpha_val == 1.0f) {
                 fallback_tried = true;
+                maybe_log_fallback("trying_cublas_gemmex");
                 cublasHandle_t fallback_handle = get_fallback_cublas_handle();
                 CUBLAS_CHECK(cublasSetStream(fallback_handle, stream));
 
@@ -303,6 +331,7 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
                 }
 
                 if (gemm_status == CUBLAS_STATUS_SUCCESS) {
+                    maybe_log_fallback("cublas_gemmex_success");
                     if (has_bias) {
                         if constexpr (std::is_same_v<FloatC, float> && std::is_same_v<FloatBias, float>) {
                             // Treat output as row-major (n x m) for bias add; only product matters.

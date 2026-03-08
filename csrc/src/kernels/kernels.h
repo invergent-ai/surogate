@@ -756,6 +756,8 @@ void fill_normal(Tensor& dest, std::size_t count, float mean, float std, unsigne
 void fill_constant(float* dst, float value, std::size_t count, cudaStream_t stream);
 void fill_constant(nv_bfloat16* dst, nv_bfloat16 value, std::size_t count, cudaStream_t stream);
 void fill_constant(Tensor& dest, float value, std::size_t count, cudaStream_t stream);
+// Build dense varlen offsets: cu_seqlens[i] = i * max_doc_seqlen for i in [0, num_docs].
+void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen, cudaStream_t stream);
 
 // Efficiently zero multiple non-contiguous device buffers in a single kernel launch.
 // `ptrs[i]` is a device pointer (encoded as uint64_t) and `sizes[i]` is the size in bytes.
