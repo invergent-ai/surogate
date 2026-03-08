@@ -1135,7 +1135,6 @@ void CompiledExecutor::prepare_gdr_buffers_for_capture(const CompiledGraph& capt
             const long c_storage_floats = Kdim * Kdim;
             long chunk_ws_stride = 0;
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * kLp;    // M
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * kLp;    // A
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // W
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // VNEW
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // DU
@@ -1147,6 +1146,9 @@ void CompiledExecutor::prepare_gdr_buffers_for_capture(const CompiledGraph& capt
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + Kdim * Vdim;                    // DHT1
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;               // C fp32
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                              // EG
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // K_NORM
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // INVQ
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // INVK
             chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                  // total stride
             const long dh_storage_per_chunk = Kdim * Vdim;
             const long multikernel_ws_size =

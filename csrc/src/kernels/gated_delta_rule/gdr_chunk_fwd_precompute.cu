@@ -47,6 +47,7 @@ __global__ void gdr_fwd_precompute_wmma(
     float* smem_gcum = (float*)(buf3 + Lp * Kdim);
     float* smem_beta = smem_gcum + Lp;
     float* smem_invk = smem_beta + Lp;
+    float* smem_eg   = smem_invk + Lp;
 
     // Zero-fill
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
@@ -61,18 +62,89 @@ __global__ void gdr_fwd_precompute_wmma(
     if (tid < Lp) {
         smem_gcum[tid] = 0.0f;
         smem_beta[tid] = 0.0f;
+        smem_eg[tid] = 0.0f;
     }
     __syncthreads();
 
-    // Load k, v
-    for (int idx = tid; idx < L * Kdim; idx += nthr) {
-        const int pos = idx / Kdim, kk = idx % Kdim;
-        const long gi = (((long)b * Tlen + cs + pos) * H + h) * Kdim + kk;
-        smem_k[pos * Kdim + kk] = k[gi];
-    }
-    for (int idx = tid; idx < L * Vdim; idx += nthr) {
-        const int pos = idx / Vdim, vv = idx % Vdim;
-        buf2[pos * Vdim + vv] = v[(((long)b * Tlen + cs + pos) * H + h) * Vdim + vv];
+    // Load k, v (vectorized for bf16/fp16 when possible).
+    if constexpr (std::is_same_v<TQ, nv_bfloat16>) {
+        if ((Kdim & 1) == 0) {
+            const int k2 = Kdim >> 1;
+            auto* smem_k2 = reinterpret_cast<__nv_bfloat162*>(smem_k);
+            const auto* k2_ptr = reinterpret_cast<const __nv_bfloat162*>(k);
+            for (int idx = tid; idx < L * k2; idx += nthr) {
+                const int pos = idx / k2;
+                const int kk2 = idx % k2;
+                const long gi2 = (((long)b * Tlen + cs + pos) * H + h) * k2 + kk2;
+                smem_k2[pos * k2 + kk2] = k2_ptr[gi2];
+            }
+        } else {
+            for (int idx = tid; idx < L * Kdim; idx += nthr) {
+                const int pos = idx / Kdim, kk = idx % Kdim;
+                const long gi = (((long)b * Tlen + cs + pos) * H + h) * Kdim + kk;
+                smem_k[pos * Kdim + kk] = k[gi];
+            }
+        }
+        if ((Vdim & 1) == 0) {
+            const int v2 = Vdim >> 1;
+            auto* smem_v2 = reinterpret_cast<__nv_bfloat162*>(buf2);
+            const auto* v2_ptr = reinterpret_cast<const __nv_bfloat162*>(v);
+            for (int idx = tid; idx < L * v2; idx += nthr) {
+                const int pos = idx / v2;
+                const int vv2 = idx % v2;
+                const long gi2 = (((long)b * Tlen + cs + pos) * H + h) * v2 + vv2;
+                smem_v2[pos * v2 + vv2] = v2_ptr[gi2];
+            }
+        } else {
+            for (int idx = tid; idx < L * Vdim; idx += nthr) {
+                const int pos = idx / Vdim, vv = idx % Vdim;
+                buf2[pos * Vdim + vv] = v[(((long)b * Tlen + cs + pos) * H + h) * Vdim + vv];
+            }
+        }
+    } else if constexpr (std::is_same_v<TQ, half>) {
+        if ((Kdim & 1) == 0) {
+            const int k2 = Kdim >> 1;
+            auto* smem_k2 = reinterpret_cast<__half2*>(smem_k);
+            const auto* k2_ptr = reinterpret_cast<const __half2*>(k);
+            for (int idx = tid; idx < L * k2; idx += nthr) {
+                const int pos = idx / k2;
+                const int kk2 = idx % k2;
+                const long gi2 = (((long)b * Tlen + cs + pos) * H + h) * k2 + kk2;
+                smem_k2[pos * k2 + kk2] = k2_ptr[gi2];
+            }
+        } else {
+            for (int idx = tid; idx < L * Kdim; idx += nthr) {
+                const int pos = idx / Kdim, kk = idx % Kdim;
+                const long gi = (((long)b * Tlen + cs + pos) * H + h) * Kdim + kk;
+                smem_k[pos * Kdim + kk] = k[gi];
+            }
+        }
+        if ((Vdim & 1) == 0) {
+            const int v2 = Vdim >> 1;
+            auto* smem_v2 = reinterpret_cast<__half2*>(buf2);
+            const auto* v2_ptr = reinterpret_cast<const __half2*>(v);
+            for (int idx = tid; idx < L * v2; idx += nthr) {
+                const int pos = idx / v2;
+                const int vv2 = idx % v2;
+                const long gi2 = (((long)b * Tlen + cs + pos) * H + h) * v2 + vv2;
+                smem_v2[pos * v2 + vv2] = v2_ptr[gi2];
+            }
+        } else {
+            for (int idx = tid; idx < L * Vdim; idx += nthr) {
+                const int pos = idx / Vdim, vv = idx % Vdim;
+                buf2[pos * Vdim + vv] = v[(((long)b * Tlen + cs + pos) * H + h) * Vdim + vv];
+            }
+        }
+    } else {
+        for (int idx = tid; idx < L * Kdim; idx += nthr) {
+            const int pos = idx / Kdim, kk = idx % Kdim;
+            const long gi = (((long)b * Tlen + cs + pos) * H + h) * Kdim + kk;
+            smem_k[pos * Kdim + kk] = k[gi];
+        }
+        for (int idx = tid; idx < L * Vdim; idx += nthr) {
+            const int pos = idx / Vdim, vv = idx % Vdim;
+            buf2[pos * Vdim + vv] = v[(((long)b * Tlen + cs + pos) * H + h) * Vdim + vv];
+        }
     }
     if (tid == 0) {
         float acc = 0.0f;
@@ -81,6 +153,7 @@ __global__ void gdr_fwd_precompute_wmma(
             acc += to_float(g[gh]);
             smem_gcum[i] = acc;
             smem_beta[i] = to_float(beta[gh]);
+            smem_eg[i] = expf(acc);
         }
     }
     __syncthreads();
@@ -121,10 +194,14 @@ __global__ void gdr_fwd_precompute_wmma(
     // Scale A
     for (int idx = tid; idx < Lp * Lp; idx += nthr) {
         const int i = idx / Lp, j = idx % Lp;
-        if (i < L && j <= i)
-            scratch1[idx] *= smem_beta[i] * expf(smem_gcum[i] - smem_gcum[j]);
-        else
+        if (i < L && j <= i) {
+            const float eg_j = smem_eg[j];
+            const float exp_ij =
+                (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
+            scratch1[idx] *= smem_beta[i] * exp_ij;
+        } else {
             scratch1[idx] = 0.0f;
+        }
     }
     __syncthreads();
 
@@ -166,7 +243,7 @@ __global__ void gdr_fwd_precompute_wmma(
     // beta*k*exp(g) -> buf3
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
         const int i = idx / Kdim;
-        float val = (i < L) ? to_float(smem_k[idx]) * smem_beta[i] * expf(smem_gcum[i]) : 0.0f;
+        float val = (i < L) ? to_float(smem_k[idx]) * smem_beta[i] * smem_eg[i] : 0.0f;
         buf3[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();

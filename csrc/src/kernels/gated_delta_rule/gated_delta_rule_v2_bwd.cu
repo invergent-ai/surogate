@@ -1448,7 +1448,30 @@ void launch_bwd_v2_multikernel(
             chunk_threads = (parsed / 32) * 32;
         }
     }
-    int phase2_threads = 1024;
+    int phase1_threads = chunk_threads;
+    if (Kdim == 128 && Vdim == 128) {
+        phase1_threads = 640;
+    }
+    if (const char* env = std::getenv("SUROGATE_GDR_BWD_PHASE1_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            phase1_threads = (parsed / 32) * 32;
+        }
+    }
+    int phase3_threads = chunk_threads;
+    if (Kdim == 128 && Vdim == 128) {
+        phase3_threads = 768;
+    }
+    if (const char* env = std::getenv("SUROGATE_GDR_BWD_PHASE3_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            phase3_threads = (parsed / 32) * 32;
+        }
+    }
+    int phase2_threads = 768;
+    if (Kdim == 128 && Vdim == 128) {
+        phase2_threads = 1024;
+    }
     if (const char* env = std::getenv("SUROGATE_GDR_BWD_PHASE2_THREADS")) {
         const int parsed = std::atoi(env);
         if (parsed >= 64 && parsed <= 1024) {
@@ -1532,8 +1555,9 @@ void launch_bwd_v2_multikernel(
     }
     if (std::getenv("SUROGATE_DEBUG_GDR")) {
         fprintf(stderr,
-                "[GDR bwd cfg] mode=tiled_multi K=%d V=%d Vtile=%d cp=%s smem_optin=%d cp_wmma=%zu cp_scalar=%zu p1=%zu p2=%zu p3=%zu\n",
+                "[GDR bwd cfg] mode=tiled_multi K=%d V=%d Vtile=%d cp=%s threads(cp=%d,p1=%d,p2=%d,p3=%d) smem_optin=%d cp_wmma=%zu cp_scalar=%zu p1=%zu p2=%zu p3=%zu\n",
                 Kdim, Vdim, v_tile, use_wmma_checkpoint ? "wmma" : "scalar",
+                chunk_threads, phase1_threads, phase2_threads, phase3_threads,
                 smem_optin, cp_wmma_smem, cp_scalar_smem, phase1_smem, phase2_smem, phase3_smem);
     }
 
@@ -1577,7 +1601,7 @@ void launch_bwd_v2_multikernel(
         chunk_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
         use_qk_l2norm_in_kernel,
-        chunk_threads, phase1_smem, stream);
+        phase1_threads, phase1_smem, stream);
 
     if (profile) cudaEventRecord(ev[2], stream);
 
@@ -1607,7 +1631,7 @@ void launch_bwd_v2_multikernel(
         chunk_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
         use_qk_l2norm_in_kernel,
-        chunk_threads, phase3_smem, stream);
+        phase3_threads, phase3_smem, stream);
 
     if (profile) {
         cudaEventRecord(ev[4], stream);

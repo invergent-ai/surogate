@@ -96,8 +96,12 @@ __device__ void wmma_nn(
     float* C, int ldC, int M, int N, int K) {
     const int wid = threadIdx.x / 32;
     const int nw = blockDim.x / 32;
-    for (int m = wid; m < M/16; m += nw)
-        for (int n = 0; n < N/16; ++n) {
+    const int m_tiles = M / 16;
+    const int n_tiles = N / 16;
+    const int num_tiles = m_tiles * n_tiles;
+    for (int tile = wid; tile < num_tiles; tile += nw) {
+        const int m = tile / n_tiles;
+        const int n = tile % n_tiles;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
             wmma::fill_fragment(acc, 0.0f);
             for (int kk = 0; kk < K/16; ++kk) {
@@ -108,7 +112,7 @@ __device__ void wmma_nn(
                 wmma::mma_sync(acc, af, bf, acc);
             }
             wmma::store_matrix_sync(C + m*16*ldC + n*16, acc, ldC, wmma::mem_row_major);
-        }
+    }
 }
 
 // C[M×N] = A[M×K] @ B^T, where B is [N×K] row-major
@@ -118,8 +122,12 @@ __device__ void wmma_nt(
     float* C, int ldC, int M, int N, int K) {
     const int wid = threadIdx.x / 32;
     const int nw = blockDim.x / 32;
-    for (int m = wid; m < M/16; m += nw)
-        for (int n = 0; n < N/16; ++n) {
+    const int m_tiles = M / 16;
+    const int n_tiles = N / 16;
+    const int num_tiles = m_tiles * n_tiles;
+    for (int tile = wid; tile < num_tiles; tile += nw) {
+        const int m = tile / n_tiles;
+        const int n = tile % n_tiles;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
             wmma::fill_fragment(acc, 0.0f);
             for (int kk = 0; kk < K/16; ++kk) {
@@ -130,7 +138,7 @@ __device__ void wmma_nt(
                 wmma::mma_sync(acc, af, bf, acc);
             }
             wmma::store_matrix_sync(C + m*16*ldC + n*16, acc, ldC, wmma::mem_row_major);
-        }
+    }
 }
 
 // C[M×N] = A^T @ B, where A is [K×M] row-major (A^T is [M×K])
@@ -140,8 +148,12 @@ __device__ void wmma_tn(
     float* C, int ldC, int M, int N, int K) {
     const int wid = threadIdx.x / 32;
     const int nw = blockDim.x / 32;
-    for (int m = wid; m < M/16; m += nw)
-        for (int n = 0; n < N/16; ++n) {
+    const int m_tiles = M / 16;
+    const int n_tiles = N / 16;
+    const int num_tiles = m_tiles * n_tiles;
+    for (int tile = wid; tile < num_tiles; tile += nw) {
+        const int m = tile / n_tiles;
+        const int n = tile % n_tiles;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
             wmma::fill_fragment(acc, 0.0f);
             for (int kk = 0; kk < K/16; ++kk) {
@@ -152,7 +164,7 @@ __device__ void wmma_tn(
                 wmma::mma_sync(acc, af, bf, acc);
             }
             wmma::store_matrix_sync(C + m*16*ldC + n*16, acc, ldC, wmma::mem_row_major);
-        }
+    }
 }
 
 __device__ __forceinline__ float warp_reduce_sum_f32(float x) {
@@ -165,7 +177,6 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float x) {
 // Per-chunk workspace offsets (all in floats, Lp-padded where needed)
 struct ChunkWorkspaceLayout {
     int M_off;       // [Lp×Lp]
-    int A_off;       // [Lp×Lp]
     int W_off;       // [Lp×K]
     int VNEW_off;    // [Lp×V]
     int DU_off;      // [Lp×V]
@@ -177,6 +188,9 @@ struct ChunkWorkspaceLayout {
     int DHT1_off;    // [K×V]
     int C_off;       // [K×K] float — correction matrix for Phase 2 ds recurrence
     int EG_off;      // [1]   — exp(g_last) per chunk
+    int KNORM_off;   // [Lp×K] float — normalized k cached from Phase 1
+    int INVQ_off;    // [Lp] float — q inverse L2 norm per token
+    int INVK_off;    // [Lp] float — k inverse L2 norm per token
     int total;       // total floats per chunk
 };
 
@@ -191,7 +205,6 @@ __host__ __device__ ChunkWorkspaceLayout make_chunk_ws(int Lp, int Kdim, int Vdi
     int off = 0;
     const int c_storage_floats = Kdim * Kdim;
     l.M_off    = align_up_int(off, kWsAlignFloats); off = l.M_off + Lp * Lp;
-    l.A_off    = align_up_int(off, kWsAlignFloats); off = l.A_off + Lp * Lp;
     l.W_off    = align_up_int(off, kWsAlignFloats); off = l.W_off + Lp * Kdim;
     l.VNEW_off = align_up_int(off, kWsAlignFloats); off = l.VNEW_off + Lp * Vdim;
     l.DU_off   = align_up_int(off, kWsAlignFloats); off = l.DU_off + Lp * Vdim;
@@ -203,6 +216,9 @@ __host__ __device__ ChunkWorkspaceLayout make_chunk_ws(int Lp, int Kdim, int Vdi
     l.DHT1_off = align_up_int(off, kWsAlignFloats); off = l.DHT1_off + Kdim * Vdim;
     l.C_off    = align_up_int(off, kWsAlignFloats); off = l.C_off + c_storage_floats;
     l.EG_off   = align_up_int(off, kWsAlignFloats); off = l.EG_off + 1;
+    l.KNORM_off = align_up_int(off, kWsAlignFloats); off = l.KNORM_off + Lp * Kdim;
+    l.INVQ_off  = align_up_int(off, kWsAlignFloats); off = l.INVQ_off + Lp;
+    l.INVK_off  = align_up_int(off, kWsAlignFloats); off = l.INVK_off + Lp;
     l.total    = align_up_int(off, kWsAlignFloats);
     return l;
 }

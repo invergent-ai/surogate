@@ -33,6 +33,7 @@ __global__ void gdr_bwd_phase2_wmma(
     const int tid = threadIdx.x;
     const int nthr = blockDim.x;
     const int bh = blockIdx.x;
+    const int tile_idx = blockIdx.y;
     const long kv = (long)Kdim * Vdim;
     const long kk = (long)Kdim * Kdim;
     const int Lp = kMaxC;
@@ -41,6 +42,11 @@ __global__ void gdr_bwd_phase2_wmma(
     float* ds = d_initial_state + (long)bh * kv;
 
     const int v_tile_max = (Vdim > kPhase2VTile) ? kPhase2VTile : Vdim;
+    const int v0 = tile_idx * v_tile_max;
+    if (v0 >= Vdim) {
+        return;
+    }
+    const int vt = min(v_tile_max, Vdim - v0);
     const long kvt_max = static_cast<long>(Kdim) * v_tile_max;
 
     // Shared memory: scratch1[K×Vtile] + buf1[K×K bf16] + buf2[K×Vtile bf16]
@@ -49,16 +55,24 @@ __global__ void gdr_bwd_phase2_wmma(
     TQ*    buf1     = reinterpret_cast<TQ*>(scratch1 + kvt_max); // [K×K] (C_bf16)
     TQ*    buf2     = buf1 + kk;                                 // [K×Vtile] (ds_bf16)
 
-    // Seed ds from d_final_state
-    for (long idx = tid; idx < kv; idx += nthr)
-        ds[idx] = d_final_state ? d_final_state[(long)bh * kv + idx] : 0.0f;
+    // Seed ds from d_final_state for this V-tile slice.
+    for (int idx = tid; idx < Kdim * vt; idx += nthr) {
+        const int kk_row = idx / vt;
+        const int vv = idx % vt;
+        const long ds_idx = static_cast<long>(kk_row) * Vdim + (v0 + vv);
+        ds[ds_idx] = d_final_state ? d_final_state[(long)bh * kv + ds_idx] : 0.0f;
+    }
     __syncthreads();
 
     for (int chunk = num_chunks - 1; chunk >= 0; --chunk) {
-        // Store entering ds for this chunk (Phase 3 needs it)
+        // Store entering ds for this chunk and V-tile slice (Phase 3 needs it).
         float* dh_store = dh_storage + (long)(bh * num_chunks + chunk) * kv;
-        for (long idx = tid; idx < kv; idx += nthr)
-            dh_store[idx] = ds[idx];
+        for (int idx = tid; idx < Kdim * vt; idx += nthr) {
+            const int kk_row = idx / vt;
+            const int vv = idx % vt;
+            const long ds_idx = static_cast<long>(kk_row) * Vdim + (v0 + vv);
+            dh_store[ds_idx] = ds[ds_idx];
+        }
         __syncthreads();
 
         // Per-chunk workspace
@@ -71,44 +85,25 @@ __global__ void gdr_bwd_phase2_wmma(
         // Load C (fp32) and convert to TQ into buf1 [K×K]
         for (long idx = tid; idx < kk; idx += nthr)
             buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(C_mat[idx]));
-        if (Vdim <= kPhase2VTile) {
-            // Fast path for smaller V: preserve original contiguous access pattern.
-            for (long idx = tid; idx < kv; idx += nthr)
-                buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(ds[idx]));
-            __syncthreads();
-
-            wmma_nn<TQ>(buf1, Kdim, buf2, Vdim, scratch1, Vdim, Kdim, Vdim, Kdim);
-            __syncthreads();
-
-            for (long idx = tid; idx < kv; idx += nthr)
-                ds[idx] = ds[idx] * eg_last + DHT1[idx] - scratch1[idx];
-            __syncthreads();
-        } else {
-            // Tile V to keep shared memory bounded: ds = ds*eg_last + DHT1 - C@ds.
-            for (int v0 = 0; v0 < Vdim; v0 += v_tile_max) {
-                const int vt = min(v_tile_max, Vdim - v0);
-                const long kvt = static_cast<long>(Kdim) * vt;
-
-                for (long idx = tid; idx < kvt; idx += nthr) {
-                    const int kk_row = static_cast<int>(idx / vt);
-                    const int vv = static_cast<int>(idx % vt);
-                    const long ds_idx = static_cast<long>(kk_row) * Vdim + (v0 + vv);
-                    buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(ds[ds_idx]));
-                }
-                __syncthreads();
-
-                wmma_nn<TQ>(buf1, Kdim, buf2, vt, scratch1, vt, Kdim, vt, Kdim);
-                __syncthreads();
-
-                for (long idx = tid; idx < kvt; idx += nthr) {
-                    const int kk_row = static_cast<int>(idx / vt);
-                    const int vv = static_cast<int>(idx % vt);
-                    const long ds_idx = static_cast<long>(kk_row) * Vdim + (v0 + vv);
-                    ds[ds_idx] = ds[ds_idx] * eg_last + DHT1[ds_idx] - scratch1[idx];
-                }
-                __syncthreads();
-            }
+        const long kvt = static_cast<long>(Kdim) * vt;
+        for (long idx = tid; idx < kvt; idx += nthr) {
+            const int kk_row = static_cast<int>(idx / vt);
+            const int vv = static_cast<int>(idx % vt);
+            const long ds_idx = static_cast<long>(kk_row) * Vdim + (v0 + vv);
+            buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(ds[ds_idx]));
         }
+        __syncthreads();
+
+        wmma_nn<TQ>(buf1, Kdim, buf2, vt, scratch1, vt, Kdim, vt, Kdim);
+        __syncthreads();
+
+        for (long idx = tid; idx < kvt; idx += nthr) {
+            const int kk_row = static_cast<int>(idx / vt);
+            const int vv = static_cast<int>(idx % vt);
+            const long ds_idx = static_cast<long>(kk_row) * Vdim + (v0 + vv);
+            ds[ds_idx] = ds[ds_idx] * eg_last + DHT1[ds_idx] - scratch1[idx];
+        }
+        __syncthreads();
     }
 }
 
@@ -128,6 +123,7 @@ void launch_gdr_bwd_phase2(
 {
     (void)smem;
     const int v_tile = (Vdim > kPhase2VTile) ? kPhase2VTile : Vdim;
+    const int num_v_tiles = (Vdim + v_tile - 1) / v_tile;
     const std::size_t phase2_smem_tiled =
         static_cast<std::size_t>(Kdim) * v_tile * sizeof(float)
         + static_cast<std::size_t>(Kdim) * Kdim * sizeof(TQ)
@@ -138,7 +134,7 @@ void launch_gdr_bwd_phase2(
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(phase2_smem_tiled)));
 
-    gdr_bwd_phase2_wmma<TQ><<<B * H, threads, phase2_smem_tiled, stream>>>(
+    gdr_bwd_phase2_wmma<TQ><<<dim3(B * H, num_v_tiles), threads, phase2_smem_tiled, stream>>>(
         checkpoints, d_final_state, d_initial_state,
         chunk_workspace, dh_storage,
         chunk_ws_stride,

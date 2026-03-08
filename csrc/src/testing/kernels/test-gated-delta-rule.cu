@@ -221,7 +221,6 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
     };
     std::size_t chunk_ws_stride = 0;
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // M
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // A
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // W
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // VNEW
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // DU
@@ -233,6 +232,9 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(K) * V;   // DHT1
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C fp32
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                  // EG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // K_NORM
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // INVQ
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // INVK
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                       // total stride
     const std::size_t dh_storage_per_chunk = static_cast<std::size_t>(K) * V;
     const std::size_t workspace_size =
@@ -429,7 +431,6 @@ json dump_case(const DumpConfig& cfg) {
     };
     std::size_t chunk_ws_stride = 0;
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // M
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // A
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // W
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // VNEW
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // DU
@@ -441,6 +442,9 @@ json dump_case(const DumpConfig& cfg) {
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(K) * V;   // DHT1
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C fp32
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                  // EG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // K_NORM
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // INVQ
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // INVK
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                       // total stride
     const std::size_t dh_storage_per_chunk = static_cast<std::size_t>(K) * V;
     const std::size_t workspace_size =

@@ -615,7 +615,25 @@ void launch_fwd_v2_multikernel(
             chunk_threads = (parsed / 32) * 32;
         }
     }
-    int state_threads = 768;
+    int precompute_threads = chunk_threads;
+    int output_threads = chunk_threads;
+    if (Kdim == 128 && Vdim == 128) {
+        precompute_threads = 512;
+        output_threads = 512;
+    }
+    if (const char* env = std::getenv("SUROGATE_GDR_FWD_PRE_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            precompute_threads = (parsed / 32) * 32;
+        }
+    }
+    if (const char* env = std::getenv("SUROGATE_GDR_FWD_OUT_THREADS")) {
+        const int parsed = std::atoi(env);
+        if (parsed >= 64 && parsed <= 1024) {
+            output_threads = (parsed / 32) * 32;
+        }
+    }
+    int state_threads = 640;
     if (const char* env = std::getenv("SUROGATE_GDR_FWD_STATE_THREADS")) {
         const int parsed = std::atoi(env);
         if (parsed >= 64 && parsed <= 1024) {
@@ -623,6 +641,10 @@ void launch_fwd_v2_multikernel(
         }
     }
     int v_tile = Vdim >= 64 ? 64 : Vdim;
+    if (Kdim == 128 && Vdim == 128) {
+        // 128x128 prod shape runs faster with finer V tiling.
+        v_tile = 32;
+    }
     if (const char* env_vtile = std::getenv("SUROGATE_GDR_VTILE")) {
         const int parsed = std::atoi(env_vtile);
         if (parsed > 0) {
@@ -680,14 +702,14 @@ void launch_fwd_v2_multikernel(
     // --- Kernel 1: Precompute (chunk-parallel) ---
     // smem: scratch1[Lp×Lp]f + scratch2[Lp×Lp]f
     //     + k[Lp×K]TQ + buf1[Lp×Lp]TQ + buf2[Lp×V]TQ + buf3[Lp×K]TQ
-    //     + scalars[3×Lp]f
+    //     + scalars[4×Lp]f
     const std::size_t precompute_smem =
         static_cast<std::size_t>(Lp) * Lp * sizeof(float) * 2          // scratch1 + scratch2
         + static_cast<std::size_t>(Lp) * Kdim * sizeof(TQ)             // smem_k
         + static_cast<std::size_t>(Lp) * Lp * sizeof(TQ)               // buf1
         + static_cast<std::size_t>(Lp) * Vdim * sizeof(TQ)             // buf2
         + static_cast<std::size_t>(Lp) * Kdim * sizeof(TQ)             // buf3
-        + static_cast<std::size_t>(Lp) * 3 * sizeof(float);            // gcum, beta, invk
+        + static_cast<std::size_t>(Lp) * 4 * sizeof(float);            // gcum, beta, invk, exp(gcum)
 
     require_smem("gdr_fwd_precompute_wmma", precompute_smem);
 
@@ -698,7 +720,7 @@ void launch_fwd_v2_multikernel(
         fwd_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size,
         use_qk_l2norm_in_kernel,
-        chunk_threads, precompute_smem, stream);
+        precompute_threads, precompute_smem, stream);
 
     if (profile) cudaEventRecord(ev[1], stream);
 
@@ -710,7 +732,7 @@ void launch_fwd_v2_multikernel(
         + static_cast<std::size_t>(Lp) * Kdim * sizeof(TQ)            // buf_k
         + static_cast<std::size_t>(Kdim) * v_tile * sizeof(TQ)        // buf_h
         + static_cast<std::size_t>(Lp) * v_tile * sizeof(TQ)          // buf_vnp
-        + static_cast<std::size_t>(Lp) * sizeof(float);               // gcum
+        + static_cast<std::size_t>(Lp) * 2 * sizeof(float);           // gcum + exp(g_last-gcum)
 
     require_smem("gdr_fwd_state_wmma", state_smem);
 
@@ -730,7 +752,7 @@ void launch_fwd_v2_multikernel(
     // smem: scratch_v[Lp×Vtile]f + scratch_s[Lp×Lp]f
     //     + smem_q[Lp×K]TQ + smem_k[Lp×K]TQ + buf_h[K×Vtile]TQ
     //     + buf_S[Lp×Lp]TQ + buf_vnp[Lp×Vtile]TQ
-    //     + gcum[Lp]f + invq[Lp]f
+    //     + gcum[Lp]f + invq[Lp]f + exp(gcum)[Lp]f
     const std::size_t output_smem =
         static_cast<std::size_t>(Lp) * v_tile * sizeof(float)         // scratch_v
         + static_cast<std::size_t>(Lp) * Lp * sizeof(float)           // scratch_s
@@ -739,13 +761,14 @@ void launch_fwd_v2_multikernel(
         + static_cast<std::size_t>(Kdim) * v_tile * sizeof(TQ)        // buf_h
         + static_cast<std::size_t>(Lp) * Lp * sizeof(TQ)              // buf_S
         + static_cast<std::size_t>(Lp) * v_tile * sizeof(TQ)          // buf_vnp
-        + static_cast<std::size_t>(Lp) * 2 * sizeof(float);           // gcum + invq
+        + static_cast<std::size_t>(Lp) * 3 * sizeof(float);           // gcum + invq + exp(gcum)
 
     require_smem("gdr_fwd_output_wmma", output_smem);
     if (std::getenv("SUROGATE_DEBUG_GDR")) {
         fprintf(stderr,
-                "[GDR fwd cfg] mode=tiled_multi K=%d V=%d Vtile=%d smem_optin=%d pre=%zu state=%zu out=%zu\n",
-                Kdim, Vdim, v_tile, smem_optin, precompute_smem, state_smem, output_smem);
+                "[GDR fwd cfg] mode=tiled_multi K=%d V=%d Vtile=%d threads(pre=%d,state=%d,out=%d) smem_optin=%d pre=%zu state=%zu out=%zu\n",
+                Kdim, Vdim, v_tile, precompute_threads, state_threads, output_threads,
+                smem_optin, precompute_smem, state_smem, output_smem);
     }
 
     launch_gdr_fwd_output<TQ>(
@@ -756,7 +779,7 @@ void launch_fwd_v2_multikernel(
         fwd_ws_stride,
         B, Tlen, H, Kdim, Vdim, num_chunks, chunk_size, v_tile, scale,
         use_qk_l2norm_in_kernel,
-        chunk_threads, output_smem, stream);
+        output_threads, output_smem, stream);
 
     if (profile) {
         cudaEventRecord(ev[3], stream);

@@ -61,6 +61,9 @@ __global__ void gdr_bwd_phase3_wmma(
     float* DK    = cws + cwl.DK_off;
     float* DG    = cws + cwl.DG_off;
     float* DB    = cws + cwl.DB_off;
+    const float* K_NORM = cws + cwl.KNORM_off;
+    const float* INVQ_WS = cws + cwl.INVQ_off;
+    const float* INVK_WS = cws + cwl.INVK_off;
 
     // Per-chunk dh from Phase 2
     const long kv = (long)Kdim * Vdim;
@@ -81,22 +84,26 @@ __global__ void gdr_bwd_phase3_wmma(
     float* smem_eg   = smem_invk + Lp;
     float* smem_e_last = smem_eg + Lp;
 
-    // Load k, q, scalars
-    for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
-        smem_k[idx] = from_float<TQ>(0.0f);
+    // Tail chunks need explicit zero-fill for padded rows.
+    if (tail_chunk) {
+        for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
+            smem_k[idx] = from_float<TQ>(0.0f);
+        }
+        if (tid < Lp) {
+            smem_gcum[tid] = 0.0f;
+            smem_beta[tid] = 0.0f;
+            smem_eg[tid] = 0.0f;
+            smem_e_last[tid] = 0.0f;
+        }
+        __syncthreads();
     }
-    if (tid < Lp) {
-        smem_gcum[tid] = 0.0f;
-        smem_beta[tid] = 0.0f;
-        smem_eg[tid] = 0.0f;
-        smem_e_last[tid] = 0.0f;
-    }
-    __syncthreads();
 
-    for (int idx = tid; idx < L * Kdim; idx += nthr) {
-        const int pos = idx / Kdim, kk = idx % Kdim;
-        const long gi = (((long)b * Tlen + cs + pos) * H + h) * Kdim + kk;
-        smem_k[pos * Kdim + kk] = k_global[gi];
+    for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
+        smem_k[idx] = from_float<TQ>(bf16_trunc<TQ>(K_NORM[idx]));
+    }
+    for (int idx = tid; idx < Lp; idx += nthr) {
+        smem_invq[idx] = INVQ_WS[idx];
+        smem_invk[idx] = INVK_WS[idx];
     }
     if (tid == 0) {
         float acc = 0.0f;
@@ -120,31 +127,7 @@ __global__ void gdr_bwd_phase3_wmma(
     }
     __syncthreads();
 
-    // L2 norms
-    for (int pos = tid; pos < L; pos += nthr) {
-        if (use_qk_l2norm_in_kernel) {
-            float qn2 = 0.0f, kn2 = 0.0f;
-            for (int kk = 0; kk < Kdim; ++kk) {
-                const long qi = (((long)b * Tlen + cs + pos) * H + h) * Kdim + kk;
-                float qv = to_float(q_global[qi]);
-                float kv2 = to_float(smem_k[pos * Kdim + kk]);
-                qn2 += qv * qv; kn2 += kv2 * kv2;
-            }
-            smem_invq[pos] = 1.0f / sqrtf(qn2 + 1e-6f);
-            smem_invk[pos] = 1.0f / sqrtf(kn2 + 1e-6f);
-        } else {
-            smem_invq[pos] = 1.0f; smem_invk[pos] = 1.0f;
-        }
-    }
     __syncthreads();
-    if (use_qk_l2norm_in_kernel) {
-        for (int idx = tid; idx < L * Kdim; idx += nthr) {
-            const int pos = idx / Kdim;
-            smem_k[pos * Kdim + idx % Kdim] = from_float<TQ>(
-                bf16_trunc<TQ>(to_float(smem_k[idx]) * smem_invk[pos]));
-        }
-        __syncthreads();
-    }
 
     // Checkpoint access for h_in
     const float* cp_base = checkpoints + (long)bh * (num_chunks + 1) * kv;
@@ -471,11 +454,7 @@ __global__ void gdr_bwd_phase3_wmma(
     // M_bf16 → buf1
     for (int idx = tid; idx < Lp * Lp; idx += nthr)
         buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(scratch2[idx]));
-    // DU_bf16 → buf2[Lp×V]
-    for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
-        float val = (idx < L * Vdim) ? DU[idx] : 0.0f;
-        buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
-    }
+    // buf2 already holds DU_bf16 from Step 0b.
     __syncthreads();
 
     if (small_kv) {
@@ -524,13 +503,7 @@ __global__ void gdr_bwd_phase3_wmma(
             __syncthreads();
         }
 
-        // Keep raw-v cached in buf2 for Step 3 (matches small-kv behavior).
-        for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
-            const int pos = idx / Vdim, vv = idx % Vdim;
-            buf2[idx] = (pos < L) ?
-                v_global[(((long)b * Tlen + cs + pos) * H + h) * Vdim + vv] :
-                from_float<TQ>(0.0f);
-        }
+        // Keep DU_bf16 in buf2 for Step 3 to avoid reloading DU from workspace.
         __syncthreads();
     }
 
@@ -590,17 +563,18 @@ __global__ void gdr_bwd_phase3_wmma(
     // ================================================================
     // Step 3: dM = DU @ (bv)^T + DW @ bkg^T
     // ================================================================
-    // beta*V → buf2[Lp×V] (reuse raw-v values already in buf2)
-    for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
-        const int pos = idx / Vdim;
-        float val = 0.0f;
-        if (pos < L) {
-            float vraw = to_float(buf2[idx]);
-            val = bf16_trunc<TQ>(vraw * smem_beta[pos]);
-        }
-        buf2[idx] = from_float<TQ>(val);
-    }
     if (small_kv) {
+        // beta*V → buf2[Lp×V] (reuse raw-v values already in buf2)
+        for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
+            const int pos = idx / Vdim;
+            float val = 0.0f;
+            if (pos < L) {
+                float vraw = to_float(buf2[idx]);
+                val = bf16_trunc<TQ>(vraw * smem_beta[pos]);
+            }
+            buf2[idx] = from_float<TQ>(val);
+        }
+
         // DU_bf16 → buf1
         for (int idx = tid; idx < Lp * Lp; idx += nthr)
             buf1[idx] = from_float<TQ>(0.0f);
@@ -617,22 +591,29 @@ __global__ void gdr_bwd_phase3_wmma(
         for (int idx = tid; idx < Lp * Lp; idx += nthr)
             tmp_area[idx] = scratch1[idx];
     } else {
-        // Tile V to keep DU staging in 64x64 buf1 while accumulating full dM_part1.
+        // Tile V and keep DU_bf16 resident in buf2 from Step 1.
+        // This avoids reloading DU from global workspace here.
         for (int idx = tid; idx < Lp * Lp; idx += nthr)
             tmp_area[idx] = 0.0f;
         __syncthreads();
 
         for (int v0 = 0; v0 < Vdim; v0 += v_tile) {
             const int vt = min(v_tile, Vdim - v0);
+            // Build beta*V tile in buf1 as [Lp x vt], row-major.
             for (int idx = tid; idx < Lp * vt; idx += nthr) {
-                const int i = idx / vt;
+                const int pos = idx / vt;
                 const int vv = idx % vt;
-                const float val = (i < L) ? DU[i * Vdim + (v0 + vv)] : 0.0f;
-                buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
+                float val = 0.0f;
+                if (pos < L) {
+                    const long v_idx =
+                        (((long)b * Tlen + cs + pos) * H + h) * Vdim + (v0 + vv);
+                    val = bf16_trunc<TQ>(to_float(v_global[v_idx]) * smem_beta[pos]);
+                }
+                buf1[idx] = from_float<TQ>(val);
             }
             __syncthreads();
 
-            wmma_nt<TQ>(buf1, vt, buf2 + v0, Vdim, scratch1, Lp, Lp, Lp, vt);
+            wmma_nt<TQ>(buf2 + v0, Vdim, buf1, vt, scratch1, Lp, Lp, Lp, vt);
             __syncthreads();
 
             for (int idx = tid; idx < Lp * Lp; idx += nthr)

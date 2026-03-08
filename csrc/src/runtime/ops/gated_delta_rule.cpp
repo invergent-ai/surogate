@@ -438,7 +438,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     const long c_storage_floats = static_cast<long>(Kdim) * Kdim;
     long chunk_ws_stride = 0;
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;    // M
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;    // A
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;  // W
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Vdim;  // VNEW
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Vdim;  // DU
@@ -450,6 +449,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Kdim) * Vdim; // DHT1
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                // C fp32
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                // EG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;    // K_NORM
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);            // INVQ
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);            // INVK
     chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                    // total stride
     const long dh_storage_per_chunk = static_cast<long>(Kdim) * Vdim;
     const long multikernel_ws_size = static_cast<long>(num_chunks) * chunk_ws_stride

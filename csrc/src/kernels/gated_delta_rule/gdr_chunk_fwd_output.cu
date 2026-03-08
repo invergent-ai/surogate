@@ -52,6 +52,7 @@ __global__ void gdr_fwd_output_wmma(
     TQ*    buf_vnp   = buf_S + Lp * Lp;                               // [Lp*Vtile]
     float* smem_gcum = (float*)(buf_vnp + Lp * v_tile);               // [Lp]
     float* smem_invq = smem_gcum + Lp;                                // [Lp]
+    float* smem_eg   = smem_invq + Lp;                                // [Lp]
 
     // Zero-fill q
     for (int idx = tid; idx < Lp * Kdim; idx += nthr)
@@ -61,21 +62,57 @@ __global__ void gdr_fwd_output_wmma(
     if (tid < Lp) smem_gcum[tid] = 0.0f;
     __syncthreads();
 
-    // Load q from global
-    for (int idx = tid; idx < L * Kdim; idx += nthr) {
-        const int pos = idx / Kdim, kk = idx % Kdim;
-        smem_q[pos * Kdim + kk] = q[(((long)b * Tlen + cs + pos) * H + h) * Kdim + kk];
+    // Load q from global (vectorized for bf16/fp16 when possible).
+    if constexpr (std::is_same_v<TQ, nv_bfloat16>) {
+        if ((Kdim & 1) == 0) {
+            const int k2 = Kdim >> 1;
+            auto* smem_q2 = reinterpret_cast<__nv_bfloat162*>(smem_q);
+            const auto* q2_ptr = reinterpret_cast<const __nv_bfloat162*>(q);
+            for (int idx = tid; idx < L * k2; idx += nthr) {
+                const int pos = idx / k2;
+                const int kk2 = idx % k2;
+                const long gi2 = (((long)b * Tlen + cs + pos) * H + h) * k2 + kk2;
+                smem_q2[pos * k2 + kk2] = q2_ptr[gi2];
+            }
+        } else {
+            for (int idx = tid; idx < L * Kdim; idx += nthr) {
+                const int pos = idx / Kdim, kk = idx % Kdim;
+                smem_q[pos * Kdim + kk] = q[(((long)b * Tlen + cs + pos) * H + h) * Kdim + kk];
+            }
+        }
+    } else if constexpr (std::is_same_v<TQ, half>) {
+        if ((Kdim & 1) == 0) {
+            const int k2 = Kdim >> 1;
+            auto* smem_q2 = reinterpret_cast<__half2*>(smem_q);
+            const auto* q2_ptr = reinterpret_cast<const __half2*>(q);
+            for (int idx = tid; idx < L * k2; idx += nthr) {
+                const int pos = idx / k2;
+                const int kk2 = idx % k2;
+                const long gi2 = (((long)b * Tlen + cs + pos) * H + h) * k2 + kk2;
+                smem_q2[pos * k2 + kk2] = q2_ptr[gi2];
+            }
+        } else {
+            for (int idx = tid; idx < L * Kdim; idx += nthr) {
+                const int pos = idx / Kdim, kk = idx % Kdim;
+                smem_q[pos * Kdim + kk] = q[(((long)b * Tlen + cs + pos) * H + h) * Kdim + kk];
+            }
+        }
+    } else {
+        for (int idx = tid; idx < L * Kdim; idx += nthr) {
+            const int pos = idx / Kdim, kk = idx % Kdim;
+            smem_q[pos * Kdim + kk] = q[(((long)b * Tlen + cs + pos) * H + h) * Kdim + kk];
+        }
     }
     // Load normalized k from workspace.
     for (int idx = tid; idx < Lp * Kdim; idx += nthr)
         smem_k[idx] = from_float<TQ>(bf16_trunc<TQ>(ws[fwl.k_off + idx]));
 
-    // Load gcum from workspace
+    // Load gcum from workspace.
     for (int idx = tid; idx < Lp; idx += nthr)
         smem_gcum[idx] = ws[fwl.gcum_off + idx];
     __syncthreads();
 
-    // L2 normalize q
+    // L2 normalize q.
     for (int pos = tid; pos < L; pos += nthr) {
         if (use_qk_l2norm_in_kernel) {
             float qn2 = 0.0f;
@@ -98,6 +135,29 @@ __global__ void gdr_fwd_output_wmma(
         __syncthreads();
     }
 
+    // Cache exp(gcum) once per chunk.
+    for (int i = tid; i < Lp; i += nthr) {
+        smem_eg[i] = (i < L) ? expf(smem_gcum[i]) : 0.0f;
+    }
+    __syncthreads();
+
+    // Compute S once per chunk and reuse across all V tiles.
+    wmma_nt<TQ>(smem_q, Kdim, smem_k, Kdim, scratch_s, Lp, Lp, Lp, Kdim);
+    __syncthreads();
+    for (int idx = tid; idx < Lp * Lp; idx += nthr) {
+        const int i = idx / Lp;
+        const int j = idx % Lp;
+        float val = 0.0f;
+        if (i < L && j <= i) {
+            const float eg_j = smem_eg[j];
+            const float exp_ij =
+                (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
+            val = bf16_trunc<TQ>(exp_ij * scratch_s[idx]);
+        }
+        buf_S[idx] = from_float<TQ>(val);
+    }
+    __syncthreads();
+
     // Compute output in V tiles.
     for (int v0 = 0; v0 < Vdim; v0 += v_tile) {
         // Load h_in tile.
@@ -109,22 +169,8 @@ __global__ void gdr_fwd_output_wmma(
         }
         __syncthreads();
 
-        // term1 = q @ h_tile
+        // term1 = q @ h_tile.
         wmma_nn<TQ>(smem_q, Kdim, buf_h, v_tile, scratch_v, v_tile, Lp, v_tile, Kdim);
-        __syncthreads();
-
-        // S = bf16_trunc(exp(g_i-g_j) * (q @ k^T)) with causal mask.
-        wmma_nt<TQ>(smem_q, Kdim, smem_k, Kdim, scratch_s, Lp, Lp, Lp, Kdim);
-        __syncthreads();
-        for (int idx = tid; idx < Lp * Lp; idx += nthr) {
-            const int i = idx / Lp;
-            const int j = idx % Lp;
-            float val = 0.0f;
-            if (i < L && j <= i) {
-                val = bf16_trunc<TQ>(expf(smem_gcum[i] - smem_gcum[j]) * scratch_s[idx]);
-            }
-            buf_S[idx] = from_float<TQ>(val);
-        }
         __syncthreads();
 
         // Load vnew_pre tile and compute term2 = S @ vnew_pre_tile.
@@ -144,7 +190,7 @@ __global__ void gdr_fwd_output_wmma(
             const int vv = idx % v_tile;
             const long oi = (((long)b * Tlen + cs + i) * H + h) * Vdim + (v0 + vv);
             out[oi] = from_float<TQ>(
-                scale * (expf(smem_gcum[i]) * scratch_v[idx] + scratch_s[idx]));
+                scale * (smem_eg[i] * scratch_v[idx] + scratch_s[idx]));
         }
         __syncthreads();
     }
