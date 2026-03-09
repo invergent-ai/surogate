@@ -40,8 +40,9 @@ __global__ void gdr_fwd_state_wmma(
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
 
     extern __shared__ char smem_raw[];
-    float* scratch   = (float*)smem_raw;                            // [K*Vtile] and [Lp*Vtile]
-    TQ*    buf_w     = (TQ*)(scratch + Kdim * v_tile);              // [Lp*K]
+    float* scratch   = (float*)smem_raw;                            // [K*Vtile] temporary matmul/output
+    float* state_tile = scratch + Kdim * v_tile;                    // [K*Vtile] persistent state in fp32
+    TQ*    buf_w     = (TQ*)(state_tile + Kdim * v_tile);           // [Lp*K]
     TQ*    buf_k     = buf_w + Lp * Kdim;                           // [Lp*K]
     TQ*    buf_h     = buf_k + Lp * Kdim;                           // [K*Vtile]
     TQ*    buf_vnp   = buf_h + Kdim * v_tile;                       // [Lp*Vtile]
@@ -50,12 +51,12 @@ __global__ void gdr_fwd_state_wmma(
 
     float* state_data = state_scratch + bh * kv;
 
-    // Init only this V-tile slice of state in global scratch.
+    // Init only this V-tile slice of state in shared persistent storage.
     for (int idx = tid; idx < Kdim * vt; idx += nthr) {
         const int kk = idx / vt;
         const int vv = idx % vt;
         const long s_idx = static_cast<long>(kk) * Vdim + (v0 + vv);
-        state_data[s_idx] = initial_state ? initial_state[bh * kv + s_idx] : 0.0f;
+        state_tile[idx] = initial_state ? initial_state[bh * kv + s_idx] : 0.0f;
     }
     __syncthreads();
 
@@ -66,7 +67,7 @@ __global__ void gdr_fwd_state_wmma(
             const int kk = idx / vt;
             const int vv = idx % vt;
             const long s_idx = static_cast<long>(kk) * Vdim + (v0 + vv);
-            cp_base[s_idx] = state_data[s_idx];
+            cp_base[s_idx] = state_tile[idx];
         }
     }
     __syncthreads();
@@ -75,15 +76,20 @@ __global__ void gdr_fwd_state_wmma(
         const int cs = chunk * chunk_size;
         const int L = min(chunk_size, Tlen - cs);
         const int block_id = bh * num_chunks + chunk;
-        float* ws = fwd_workspace + (long)block_id * fwd_ws_stride;
+        char* ws = reinterpret_cast<char*>(fwd_workspace) + (long)block_id * fwd_ws_stride;
+        TQ* ws_u = reinterpret_cast<TQ*>(ws + fwl.u_off);
+        TQ* ws_w = reinterpret_cast<TQ*>(ws + fwl.w_off);
+        TQ* ws_k = reinterpret_cast<TQ*>(ws + fwl.k_off);
+        TQ* ws_vnew_pre = reinterpret_cast<TQ*>(ws + fwl.vnew_pre_off);
+        float* ws_gcum = reinterpret_cast<float*>(ws + fwl.gcum_off);
 
         // Load w and gcum from workspace (k is loaded later so we can alias memory).
         for (int idx = tid; idx < Lp * Kdim; idx += nthr)
-            buf_w[idx] = from_float<TQ>(bf16_trunc<TQ>(ws[fwl.w_off + idx]));
+            buf_w[idx] = ws_w[idx];
         for (int idx = tid; idx < Lp; idx += nthr)
-            smem_gcum[idx] = ws[fwl.gcum_off + idx];
+            smem_gcum[idx] = ws_gcum[idx];
         for (int idx = tid; idx < Lp * Kdim; idx += nthr)
-            buf_k[idx] = from_float<TQ>(bf16_trunc<TQ>(ws[fwl.k_off + idx]));
+            buf_k[idx] = ws_k[idx];
         __syncthreads();
         const float g_last = (L > 0) ? smem_gcum[L - 1] : 0.0f;
         const float eg = expf(g_last);
@@ -92,12 +98,9 @@ __global__ void gdr_fwd_state_wmma(
         }
         __syncthreads();
 
-        // Load state tile and cast to bf16 for tensor-core matmul.
+        // Load state tile from shared and cast to bf16 for tensor-core matmul.
         for (int idx = tid; idx < Kdim * vt; idx += nthr) {
-            const int kk = idx / vt;
-            const int vv = idx % vt;
-            const long s_idx = static_cast<long>(kk) * Vdim + (v0 + vv);
-            buf_h[idx] = from_float<TQ>(bf16_trunc<TQ>(state_data[s_idx]));
+            buf_h[idx] = from_float<TQ>(bf16_trunc<TQ>(state_tile[idx]));
         }
         __syncthreads();
 
@@ -110,9 +113,9 @@ __global__ void gdr_fwd_state_wmma(
             const int i = idx / vt;
             const int vv = idx % vt;
             const long ws_idx = static_cast<long>(i) * Vdim + (v0 + vv);
-            const float u_val = ws[fwl.u_off + ws_idx];
+            const float u_val = to_float(ws_u[ws_idx]);
             const float vnew = bf16_trunc<TQ>(u_val - scratch[idx]);
-            ws[fwl.vnew_pre_off + ws_idx] = vnew;
+            ws_vnew_pre[ws_idx] = from_float<TQ>(vnew);
             buf_vnp[idx] = from_float<TQ>(bf16_trunc<TQ>(vnew * smem_e_last[i]));
         }
         __syncthreads();
@@ -121,13 +124,10 @@ __global__ void gdr_fwd_state_wmma(
         wmma_tn<TQ>(buf_k, Kdim, buf_vnp, vt, scratch, vt, Kdim, vt, Lp);
         __syncthreads();
 
-        // State update in FP32 global storage for this V-tile slice.
+        // State update in shared fp32 storage for this V-tile slice.
         for (int idx = tid; idx < Kdim * vt; idx += nthr) {
-            const int kk = idx / vt;
-            const int vv = idx % vt;
-            const long s_idx = static_cast<long>(kk) * Vdim + (v0 + vv);
-            const float old_h = state_data[s_idx];
-            state_data[s_idx] = eg * old_h + scratch[idx];
+            const float old_h = state_tile[idx];
+            state_tile[idx] = eg * old_h + scratch[idx];
         }
         __syncthreads();
 
@@ -139,18 +139,20 @@ __global__ void gdr_fwd_state_wmma(
                 const int kk = idx / vt;
                 const int vv = idx % vt;
                 const long s_idx = static_cast<long>(kk) * Vdim + (v0 + vv);
-                cp[s_idx] = state_data[s_idx];
+                cp[s_idx] = state_tile[idx];
             }
             __syncthreads();
         }
     }
 
-    // Write final state slice for this V-tile.
+    // Write final state slice (and mirror to state_scratch for compatibility).
     for (int idx = tid; idx < Kdim * vt; idx += nthr) {
         const int kk = idx / vt;
         const int vv = idx % vt;
         const long s_idx = static_cast<long>(kk) * Vdim + (v0 + vv);
-        final_state[bh * kv + s_idx] = state_data[s_idx];
+        const float val = state_tile[idx];
+        final_state[bh * kv + s_idx] = val;
+        state_data[s_idx] = val;
     }
 }
 

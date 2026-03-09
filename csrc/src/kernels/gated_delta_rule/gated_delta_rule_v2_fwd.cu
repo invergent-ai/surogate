@@ -660,8 +660,9 @@ void launch_fwd_v2_multikernel(
     }
 
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
-    const int fwd_ws_stride = fwl.total;
-    const long total_ws_floats = (long)B * H * num_chunks * fwd_ws_stride;
+    const int fwd_ws_stride = fwl.total;  // bytes per chunk
+    const long total_ws_bytes = static_cast<long>(B) * H * num_chunks * fwd_ws_stride;
+    const long total_ws_floats = (total_ws_bytes + static_cast<long>(sizeof(float)) - 1) / static_cast<long>(sizeof(float));
 
     float* fwd_workspace = nullptr;
     bool own_workspace = false;
@@ -727,7 +728,7 @@ void launch_fwd_v2_multikernel(
     // --- Kernel 2: State propagation (sequential per B,H) ---
     // Tiled state propagation (no full KxV shared state).
     const std::size_t state_smem =
-        static_cast<std::size_t>(Kdim) * v_tile * sizeof(float)       // scratch
+        static_cast<std::size_t>(Kdim) * v_tile * sizeof(float) * 2   // scratch + persistent state_tile
         + static_cast<std::size_t>(Lp) * Kdim * sizeof(TQ)            // buf_w
         + static_cast<std::size_t>(Lp) * Kdim * sizeof(TQ)            // buf_k
         + static_cast<std::size_t>(Kdim) * v_tile * sizeof(TQ)        // buf_h

@@ -16,7 +16,7 @@ namespace {
 // Stores results in per-chunk workspace for Phase 2 and 3.
 // ============================================================================
 
-template<typename TQ, typename TG, typename TB>
+template<typename TQ, typename TG, typename TB, bool kHasTail>
 __global__ void gdr_bwd_phase1_wmma(
     const TQ* __restrict__ d_out,
     const TQ* __restrict__ q_global,
@@ -48,8 +48,7 @@ __global__ void gdr_bwd_phase1_wmma(
     const int smem_v = small_kv ? Vdim : v_tile;
 
     const int cs = chunk * chunk_size;
-    const int L = min(chunk_size, Tlen - cs);
-    const bool full_chunk = (L == chunk_size);
+    const int L = kHasTail ? min(chunk_size, Tlen - cs) : chunk_size;
 
     const float* cp_base = checkpoints + (long)bh * (num_chunks + 1) * kv;
     const float* h_in = cp_base + (long)chunk * kv;
@@ -88,24 +87,27 @@ __global__ void gdr_bwd_phase1_wmma(
     float* smem_e_last = smem_eg + Lp;
 
     // Tail chunks need explicit zero-fill for padded rows/cols.
-    if (!full_chunk) {
-        for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
-            smem_k[idx] = from_float<TQ>(0.0f);
-            smem_q[idx] = from_float<TQ>(0.0f);
+    if constexpr (kHasTail) {
+        const bool full_chunk = (L == chunk_size);
+        if (!full_chunk) {
+            for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
+                smem_k[idx] = from_float<TQ>(0.0f);
+                smem_q[idx] = from_float<TQ>(0.0f);
+            }
+            for (int idx = tid; idx < Lp * smem_v; idx += nthr)
+                buf2[idx] = from_float<TQ>(0.0f);
+            for (int idx = tid; idx < Lp * Kdim; idx += nthr)
+                buf3[idx] = from_float<TQ>(0.0f);
+            for (int idx = tid; idx < Lp * Lp; idx += nthr)
+                buf1[idx] = from_float<TQ>(0.0f);
+            if (tid < Lp) {
+                smem_gcum[tid] = 0.0f;
+                smem_beta[tid] = 0.0f;
+                smem_eg[tid] = 0.0f;
+                smem_e_last[tid] = 0.0f;
+            }
+            __syncthreads();
         }
-        for (int idx = tid; idx < Lp * smem_v; idx += nthr)
-            buf2[idx] = from_float<TQ>(0.0f);
-        for (int idx = tid; idx < Lp * Kdim; idx += nthr)
-            buf3[idx] = from_float<TQ>(0.0f);
-        for (int idx = tid; idx < Lp * Lp; idx += nthr)
-            buf1[idx] = from_float<TQ>(0.0f);
-        if (tid < Lp) {
-            smem_gcum[tid] = 0.0f;
-            smem_beta[tid] = 0.0f;
-            smem_eg[tid] = 0.0f;
-            smem_e_last[tid] = 0.0f;
-        }
-        __syncthreads();
     }
 
     // Load k, q (vectorized for bf16/fp16 when possible).
@@ -979,19 +981,75 @@ void launch_gdr_bwd_phase1(
     bool use_qk_l2norm_in_kernel,
     int threads, std::size_t smem, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaFuncSetAttribute(
-        gdr_bwd_phase1_wmma<TQ, TG, TB>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem)));
+    const bool has_tail = (Tlen % chunk_size) != 0;
+    auto launch_once = [&](int launch_threads) -> cudaError_t {
+        if (launch_threads < 64 || launch_threads > 1024 || (launch_threads % 32) != 0) {
+            return cudaErrorInvalidConfiguration;
+        }
+        cudaError_t err = cudaSuccess;
+        if (has_tail) {
+            err = cudaFuncSetAttribute(
+                gdr_bwd_phase1_wmma<TQ, TG, TB, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem));
+            if (err != cudaSuccess) return err;
+            gdr_bwd_phase1_wmma<TQ, TG, TB, true><<<B * H * num_chunks, launch_threads, smem, stream>>>(
+                d_out, q, k, v, g, beta,
+                checkpoints, d_final_state,
+                chunk_workspace, ds_accum,
+                chunk_ws_stride,
+                Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
+                use_qk_l2norm_in_kernel);
+        } else {
+            err = cudaFuncSetAttribute(
+                gdr_bwd_phase1_wmma<TQ, TG, TB, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem));
+            if (err != cudaSuccess) return err;
+            gdr_bwd_phase1_wmma<TQ, TG, TB, false><<<B * H * num_chunks, launch_threads, smem, stream>>>(
+                d_out, q, k, v, g, beta,
+                checkpoints, d_final_state,
+                chunk_workspace, ds_accum,
+                chunk_ws_stride,
+                Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
+                use_qk_l2norm_in_kernel);
+        }
+        return cudaGetLastError();
+    };
 
-    gdr_bwd_phase1_wmma<TQ, TG, TB><<<B * H * num_chunks, threads, smem, stream>>>(
-        d_out, q, k, v, g, beta,
-        checkpoints, d_final_state,
-        chunk_workspace, ds_accum,
-        chunk_ws_stride,
-        Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
-        use_qk_l2norm_in_kernel);
-    CUDA_CHECK(cudaGetLastError());
+    std::vector<int> candidates;
+    candidates.reserve(12);
+    auto push_unique = [&](int t) {
+        if (t < 64 || t > 1024 || (t % 32) != 0) return;
+        for (int x : candidates) if (x == t) return;
+        candidates.push_back(t);
+    };
+    push_unique(threads);
+    push_unique(1024);
+    push_unique(896);
+    push_unique(768);
+    push_unique(640);
+    push_unique(512);
+    push_unique(384);
+    push_unique(256);
+    push_unique(192);
+    push_unique(128);
+    push_unique(96);
+    push_unique(64);
+
+    cudaError_t last_err = cudaErrorInvalidConfiguration;
+    for (int t : candidates) {
+        last_err = launch_once(t);
+        if (last_err == cudaSuccess) {
+            return;
+        }
+        if (last_err != cudaErrorLaunchOutOfResources &&
+            last_err != cudaErrorInvalidConfiguration) {
+            CUDA_CHECK(last_err);
+            return;
+        }
+    }
+    CUDA_CHECK(last_err);
 }
 
 #define INSTANTIATE_PHASE1(TQ, TG, TB) \

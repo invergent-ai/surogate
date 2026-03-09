@@ -227,12 +227,13 @@ __host__ __device__ ChunkWorkspaceLayout make_chunk_ws(int Lp, int Kdim, int Vdi
 // Forward multi-kernel workspace layout (per chunk)
 // ============================================================================
 struct FwdWorkspaceLayout {
-    int u_off;         // [Lp×V] — M @ (beta*v) (bf16-truncated float)
-    int w_off;         // [Lp×K] — M @ (beta*k*exp(g)) (bf16-truncated float)
-    int k_off;         // [Lp×K] — normalized k (float, from bf16)
-    int vnew_pre_off;  // [Lp×V] — u - w@h (filled by state kernel)
-    int gcum_off;      // [Lp] — cumulative gate values
-    int total;
+    // Byte offsets from chunk workspace base.
+    int u_off;         // [Lp×V] packed as bf16/fp16 (2B element)
+    int w_off;         // [Lp×K] packed as bf16/fp16
+    int k_off;         // [Lp×K] packed as bf16/fp16
+    int vnew_pre_off;  // [Lp×V] packed as bf16/fp16
+    int gcum_off;      // [Lp] float32
+    int total;         // total bytes per chunk
 };
 
 __host__ __device__ __forceinline__ int align_up_int_fwd(int x, int align) {
@@ -240,15 +241,16 @@ __host__ __device__ __forceinline__ int align_up_int_fwd(int x, int align) {
 }
 
 __host__ __device__ FwdWorkspaceLayout make_fwd_ws(int Lp, int Kdim, int Vdim) {
-    constexpr int kWsAlignFloats = 128 / sizeof(float);  // 128-byte alignment per field
+    constexpr int kWsAlignBytes = 128;
+    constexpr int kPackedElemBytes = 2;  // bf16/fp16
     FwdWorkspaceLayout l;
     int off = 0;
-    off = align_up_int_fwd(off, kWsAlignFloats); l.u_off = off; off += Lp * Vdim;
-    off = align_up_int_fwd(off, kWsAlignFloats); l.w_off = off; off += Lp * Kdim;
-    off = align_up_int_fwd(off, kWsAlignFloats); l.k_off = off; off += Lp * Kdim;
-    off = align_up_int_fwd(off, kWsAlignFloats); l.vnew_pre_off = off; off += Lp * Vdim;
-    off = align_up_int_fwd(off, kWsAlignFloats); l.gcum_off = off; off += Lp;
-    l.total = align_up_int_fwd(off, kWsAlignFloats);
+    off = align_up_int_fwd(off, kWsAlignBytes); l.u_off = off; off += Lp * Vdim * kPackedElemBytes;
+    off = align_up_int_fwd(off, kWsAlignBytes); l.w_off = off; off += Lp * Kdim * kPackedElemBytes;
+    off = align_up_int_fwd(off, kWsAlignBytes); l.k_off = off; off += Lp * Kdim * kPackedElemBytes;
+    off = align_up_int_fwd(off, kWsAlignBytes); l.vnew_pre_off = off; off += Lp * Vdim * kPackedElemBytes;
+    off = align_up_int_fwd(off, kWsAlignBytes); l.gcum_off = off; off += Lp * static_cast<int>(sizeof(float));
+    l.total = align_up_int_fwd(off, kWsAlignBytes);
     return l;
 }
 

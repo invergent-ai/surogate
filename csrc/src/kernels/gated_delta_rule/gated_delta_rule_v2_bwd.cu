@@ -1450,7 +1450,7 @@ void launch_bwd_v2_multikernel(
     }
     int phase1_threads = chunk_threads;
     if (Kdim == 128 && Vdim == 128) {
-        phase1_threads = 640;
+        phase1_threads = 768;
     }
     if (const char* env = std::getenv("SUROGATE_GDR_BWD_PHASE1_THREADS")) {
         const int parsed = std::atoi(env);
@@ -1460,7 +1460,7 @@ void launch_bwd_v2_multikernel(
     }
     int phase3_threads = chunk_threads;
     if (Kdim == 128 && Vdim == 128) {
-        phase3_threads = 768;
+        phase3_threads = 1024;
     }
     if (const char* env = std::getenv("SUROGATE_GDR_BWD_PHASE3_THREADS")) {
         const int parsed = std::atoi(env);

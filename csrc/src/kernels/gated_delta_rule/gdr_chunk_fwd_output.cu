@@ -36,8 +36,11 @@ __global__ void gdr_fwd_output_wmma(
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
 
-    const float* ws = fwd_workspace + (long)block_id * fwd_ws_stride;
+    const char* ws = reinterpret_cast<const char*>(fwd_workspace) + (long)block_id * fwd_ws_stride;
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
+    const TQ* ws_k = reinterpret_cast<const TQ*>(ws + fwl.k_off);
+    const TQ* ws_vnew_pre = reinterpret_cast<const TQ*>(ws + fwl.vnew_pre_off);
+    const float* ws_gcum = reinterpret_cast<const float*>(ws + fwl.gcum_off);
 
     // h_in from checkpoint (state entering this chunk)
     const float* h_in = fwd_checkpoints + (long)bh * (num_chunks + 1) * kv + (long)chunk * kv;
@@ -105,11 +108,11 @@ __global__ void gdr_fwd_output_wmma(
     }
     // Load normalized k from workspace.
     for (int idx = tid; idx < Lp * Kdim; idx += nthr)
-        smem_k[idx] = from_float<TQ>(bf16_trunc<TQ>(ws[fwl.k_off + idx]));
+        smem_k[idx] = ws_k[idx];
 
     // Load gcum from workspace.
     for (int idx = tid; idx < Lp; idx += nthr)
-        smem_gcum[idx] = ws[fwl.gcum_off + idx];
+        smem_gcum[idx] = ws_gcum[idx];
     __syncthreads();
 
     // L2 normalize q.
@@ -178,7 +181,7 @@ __global__ void gdr_fwd_output_wmma(
             const int i = idx / v_tile;
             const int vv = idx % v_tile;
             const long ws_idx = static_cast<long>(i) * Vdim + (v0 + vv);
-            buf_vnp[idx] = from_float<TQ>(bf16_trunc<TQ>(ws[fwl.vnew_pre_off + ws_idx]));
+            buf_vnp[idx] = ws_vnew_pre[ws_idx];
         }
         __syncthreads();
         wmma_nn<TQ>(buf_S, Lp, buf_vnp, v_tile, scratch_s, v_tile, Lp, v_tile, Lp);

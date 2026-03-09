@@ -34,8 +34,13 @@ __global__ void gdr_fwd_precompute_wmma(
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
 
-    float* ws = fwd_workspace + (long)block_id * fwd_ws_stride;
+    char* ws = reinterpret_cast<char*>(fwd_workspace) + (long)block_id * fwd_ws_stride;
     FwdWorkspaceLayout fwl = make_fwd_ws(Lp, Kdim, Vdim);
+    TQ* ws_u = reinterpret_cast<TQ*>(ws + fwl.u_off);
+    TQ* ws_w = reinterpret_cast<TQ*>(ws + fwl.w_off);
+    TQ* ws_k = reinterpret_cast<TQ*>(ws + fwl.k_off);
+    TQ* ws_vnew_pre = reinterpret_cast<TQ*>(ws + fwl.vnew_pre_off);
+    float* ws_gcum = reinterpret_cast<float*>(ws + fwl.gcum_off);
 
     extern __shared__ char smem_raw[];
     float* scratch1  = (float*)smem_raw;
@@ -183,9 +188,9 @@ __global__ void gdr_fwd_precompute_wmma(
 
     // Save normalized k and gcum to workspace
     for (int idx = tid; idx < Lp * Kdim; idx += nthr)
-        ws[fwl.k_off + idx] = to_float(smem_k[idx]);
+        ws_k[idx] = smem_k[idx];
     for (int idx = tid; idx < Lp; idx += nthr)
-        ws[fwl.gcum_off + idx] = smem_gcum[idx];
+        ws_gcum[idx] = smem_gcum[idx];
 
     // k@k^T -> scratch1
     wmma_nt<TQ>(smem_k, Kdim, smem_k, Kdim, scratch1, Lp, Lp, Lp, Kdim);
@@ -237,7 +242,7 @@ __global__ void gdr_fwd_precompute_wmma(
     __syncthreads();
     // Save u to workspace (bf16-truncated)
     for (int idx = tid; idx < Lp * Vdim; idx += nthr)
-        ws[fwl.u_off + idx] = bf16_trunc<TQ>(scratch1[idx]);
+        ws_u[idx] = from_float<TQ>(bf16_trunc<TQ>(scratch1[idx]));
     __syncthreads();
 
     // beta*k*exp(g) -> buf3
@@ -253,7 +258,9 @@ __global__ void gdr_fwd_precompute_wmma(
     __syncthreads();
     // Save w to workspace (bf16-truncated)
     for (int idx = tid; idx < Lp * Kdim; idx += nthr)
-        ws[fwl.w_off + idx] = bf16_trunc<TQ>(scratch1[idx]);
+        ws_w[idx] = from_float<TQ>(bf16_trunc<TQ>(scratch1[idx]));
+    // Keep vnew_pre pointer "used" for uniform typed layout.
+    (void)ws_vnew_pre;
     __syncthreads();
 }
 

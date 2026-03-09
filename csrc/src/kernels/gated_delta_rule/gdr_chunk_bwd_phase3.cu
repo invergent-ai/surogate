@@ -13,7 +13,7 @@ namespace {
 // Computes dM, M^T@DU, M^T@DW, dA_grad, writes d_q/d_k/d_v/d_beta/d_g.
 // ============================================================================
 
-template<typename TQ, typename TG, typename TB>
+template<typename TQ, typename TG, typename TB, bool kHasTail>
 __global__ void gdr_bwd_phase3_wmma(
     TQ* __restrict__ d_q,
     TQ* __restrict__ d_k,
@@ -48,8 +48,8 @@ __global__ void gdr_bwd_phase3_wmma(
     const int k_tile = (Kdim > Lp) ? Lp : Kdim;
 
     const int cs = chunk * chunk_size;
-    const int L = min(chunk_size, Tlen - cs);
-    const bool tail_chunk = (L < chunk_size);
+    const int L = kHasTail ? min(chunk_size, Tlen - cs) : chunk_size;
+    const bool tail_chunk = kHasTail && (L < chunk_size);
 
     ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
     float* cws = chunk_workspace + (long)block_id * chunk_ws_stride;
@@ -85,17 +85,19 @@ __global__ void gdr_bwd_phase3_wmma(
     float* smem_e_last = smem_eg + Lp;
 
     // Tail chunks need explicit zero-fill for padded rows.
-    if (tail_chunk) {
-        for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
-            smem_k[idx] = from_float<TQ>(0.0f);
+    if constexpr (kHasTail) {
+        if (tail_chunk) {
+            for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
+                smem_k[idx] = from_float<TQ>(0.0f);
+            }
+            if (tid < Lp) {
+                smem_gcum[tid] = 0.0f;
+                smem_beta[tid] = 0.0f;
+                smem_eg[tid] = 0.0f;
+                smem_e_last[tid] = 0.0f;
+            }
+            __syncthreads();
         }
-        if (tid < Lp) {
-            smem_gcum[tid] = 0.0f;
-            smem_beta[tid] = 0.0f;
-            smem_eg[tid] = 0.0f;
-            smem_e_last[tid] = 0.0f;
-        }
-        __syncthreads();
     }
 
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
@@ -137,92 +139,94 @@ __global__ void gdr_bwd_phase3_wmma(
 
     // Tail chunks are sensitive to padded WMMA numerics; recompute DG base terms
     // (term1 + intra-chunk term2) in scalar math to match reference behavior.
-    if (tail_chunk) {
-        for (int i = tid; i < L; i += nthr) {
-            DG[i] = 0.0f;
-        }
-        __syncthreads();
-
-        // term1: scale * exp(g[i]) * dot(d_out[i], q[i] @ bf16(h_in))
-        for (int i = tid; i < L; i += nthr) {
-            float dg_i = 0.0f;
-            const long do_i_base = (((long)b * Tlen + cs + i) * H + h) * Vdim;
-            for (int vv = 0; vv < Vdim; ++vv) {
-                const float do_v = to_float(d_out_global[do_i_base + vv]) * scale;
-                float qh = 0.0f;
-                for (int kk = 0; kk < Kdim; ++kk) {
-                    const long qi_idx = (((long)b * Tlen + cs + i) * H + h) * Kdim + kk;
-                    float qi = to_float(q_global[qi_idx]);
-                    if (use_qk_l2norm_in_kernel) {
-                        qi = bf16_trunc<TQ>(qi * smem_invq[i]);
-                    }
-                    const float hq = bf16_trunc<TQ>(h_in[kk * Vdim + vv]);
-                    qh += qi * hq;
-                }
-                dg_i += do_v * smem_eg[i] * qh;
+    if constexpr (kHasTail) {
+        if (tail_chunk) {
+            for (int i = tid; i < L; i += nthr) {
+                DG[i] = 0.0f;
             }
-            DG[i] = dg_i;
-        }
-        __syncthreads();
+            __syncthreads();
 
-        // term2: DG[i] += sum_{j<i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
-        for (int i = tid; i < L; i += nthr) {
-            float dg_pos = 0.0f;
-            float dg_neg = 0.0f;
-
-            for (int j = 0; j < i; ++j) {
-                const float eg_j = smem_eg[j];
-                const float exp_ij =
-                    (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
-                float dot_qk = 0.0f;
-                for (int kk = 0; kk < Kdim; ++kk) {
-                    const long qi_idx = (((long)b * Tlen + cs + i) * H + h) * Kdim + kk;
-                    float qi = to_float(q_global[qi_idx]);
-                    if (use_qk_l2norm_in_kernel) {
-                        qi = bf16_trunc<TQ>(qi * smem_invq[i]);
-                    }
-                    dot_qk += qi * to_float(smem_k[j * Kdim + kk]);
-                }
-                const float s_ij = bf16_trunc<TQ>(exp_ij * dot_qk);
-
-                float grad_s = 0.0f;
+            // term1: scale * exp(g[i]) * dot(d_out[i], q[i] @ bf16(h_in))
+            for (int i = tid; i < L; i += nthr) {
+                float dg_i = 0.0f;
                 const long do_i_base = (((long)b * Tlen + cs + i) * H + h) * Vdim;
                 for (int vv = 0; vv < Vdim; ++vv) {
                     const float do_v = to_float(d_out_global[do_i_base + vv]) * scale;
-                    const float v_new_pre = VNEW[j * Vdim + vv];
-                    grad_s += do_v * v_new_pre;
-                }
-                dg_pos += grad_s * s_ij;
-            }
-
-            for (int r = i + 1; r < L; ++r) {
-                const float eg_i = smem_eg[i];
-                const float exp_ri =
-                    (eg_i > 0.0f) ? (smem_eg[r] / eg_i) : expf(smem_gcum[r] - smem_gcum[i]);
-                float dot_qk = 0.0f;
-                for (int kk = 0; kk < Kdim; ++kk) {
-                    const long qr_idx = (((long)b * Tlen + cs + r) * H + h) * Kdim + kk;
-                    float qr = to_float(q_global[qr_idx]);
-                    if (use_qk_l2norm_in_kernel) {
-                        qr = bf16_trunc<TQ>(qr * smem_invq[r]);
+                    float qh = 0.0f;
+                    for (int kk = 0; kk < Kdim; ++kk) {
+                        const long qi_idx = (((long)b * Tlen + cs + i) * H + h) * Kdim + kk;
+                        float qi = to_float(q_global[qi_idx]);
+                        if (use_qk_l2norm_in_kernel) {
+                            qi = bf16_trunc<TQ>(qi * smem_invq[i]);
+                        }
+                        const float hq = bf16_trunc<TQ>(h_in[kk * Vdim + vv]);
+                        qh += qi * hq;
                     }
-                    dot_qk += qr * to_float(smem_k[i * Kdim + kk]);
+                    dg_i += do_v * smem_eg[i] * qh;
                 }
-                const float s_ri = bf16_trunc<TQ>(exp_ri * dot_qk);
-
-                float grad_s = 0.0f;
-                const long do_r_base = (((long)b * Tlen + cs + r) * H + h) * Vdim;
-                for (int vv = 0; vv < Vdim; ++vv) {
-                    const float do_v = to_float(d_out_global[do_r_base + vv]) * scale;
-                    const float v_new_pre = VNEW[i * Vdim + vv];
-                    grad_s += do_v * v_new_pre;
-                }
-                dg_neg += grad_s * s_ri;
+                DG[i] = dg_i;
             }
+            __syncthreads();
 
-            DG[i] += dg_pos - dg_neg;
+            // term2: DG[i] += sum_{j<i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
+            for (int i = tid; i < L; i += nthr) {
+                float dg_pos = 0.0f;
+                float dg_neg = 0.0f;
+
+                for (int j = 0; j < i; ++j) {
+                    const float eg_j = smem_eg[j];
+                    const float exp_ij =
+                        (eg_j > 0.0f) ? (smem_eg[i] / eg_j) : expf(smem_gcum[i] - smem_gcum[j]);
+                    float dot_qk = 0.0f;
+                    for (int kk = 0; kk < Kdim; ++kk) {
+                        const long qi_idx = (((long)b * Tlen + cs + i) * H + h) * Kdim + kk;
+                        float qi = to_float(q_global[qi_idx]);
+                        if (use_qk_l2norm_in_kernel) {
+                            qi = bf16_trunc<TQ>(qi * smem_invq[i]);
+                        }
+                        dot_qk += qi * to_float(smem_k[j * Kdim + kk]);
+                    }
+                    const float s_ij = bf16_trunc<TQ>(exp_ij * dot_qk);
+
+                    float grad_s = 0.0f;
+                    const long do_i_base = (((long)b * Tlen + cs + i) * H + h) * Vdim;
+                    for (int vv = 0; vv < Vdim; ++vv) {
+                        const float do_v = to_float(d_out_global[do_i_base + vv]) * scale;
+                        const float v_new_pre = VNEW[j * Vdim + vv];
+                        grad_s += do_v * v_new_pre;
+                    }
+                    dg_pos += grad_s * s_ij;
+                }
+
+                for (int r = i + 1; r < L; ++r) {
+                    const float eg_i = smem_eg[i];
+                    const float exp_ri =
+                        (eg_i > 0.0f) ? (smem_eg[r] / eg_i) : expf(smem_gcum[r] - smem_gcum[i]);
+                    float dot_qk = 0.0f;
+                    for (int kk = 0; kk < Kdim; ++kk) {
+                        const long qr_idx = (((long)b * Tlen + cs + r) * H + h) * Kdim + kk;
+                        float qr = to_float(q_global[qr_idx]);
+                        if (use_qk_l2norm_in_kernel) {
+                            qr = bf16_trunc<TQ>(qr * smem_invq[r]);
+                        }
+                        dot_qk += qr * to_float(smem_k[i * Kdim + kk]);
+                    }
+                    const float s_ri = bf16_trunc<TQ>(exp_ri * dot_qk);
+
+                    float grad_s = 0.0f;
+                    const long do_r_base = (((long)b * Tlen + cs + r) * H + h) * Vdim;
+                    for (int vv = 0; vv < Vdim; ++vv) {
+                        const float do_v = to_float(d_out_global[do_r_base + vv]) * scale;
+                        const float v_new_pre = VNEW[i * Vdim + vv];
+                        grad_s += do_v * v_new_pre;
+                    }
+                    dg_neg += grad_s * s_ri;
+                }
+
+                DG[i] += dg_pos - dg_neg;
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     // ================================================================
@@ -240,7 +244,7 @@ __global__ void gdr_bwd_phase3_wmma(
     }
 
     float dg_last_local = 0.0f;
-    if (!tail_chunk) {
+    if constexpr (!kHasTail) {
         if (small_kv) {
             // k @ ds → scratch1[Lp×V]
             wmma_nn<TQ>(smem_k, Kdim, buf1, Vdim, scratch1, Vdim, Lp, Vdim, Kdim);
@@ -301,22 +305,84 @@ __global__ void gdr_bwd_phase3_wmma(
             }
         }
     } else {
-        // Tail chunks: compute k@ds in fp32 scalar math to match reference numerics.
-        for (int i = tid; i < L; i += nthr) {
-            float row_sum = 0.0f;
-            const float e_i = smem_e_last[i];
-            for (int vv = 0; vv < Vdim; ++vv) {
-                float kds_val = 0.0f;
-                for (int kk = 0; kk < Kdim; ++kk) {
-                    kds_val += dh_chunk[(long)kk * Vdim + vv] * to_float(smem_k[i * Kdim + kk]);
+        if (!tail_chunk) {
+            if (small_kv) {
+                // k @ ds → scratch1[Lp×V]
+                wmma_nn<TQ>(smem_k, Kdim, buf1, Vdim, scratch1, Vdim, Lp, Vdim, Kdim);
+                __syncthreads();
+
+                // DU += k@ds, then apply gating: DU → d_pre
+                for (int idx = tid; idx < L * Vdim; idx += nthr) {
+                    const int i = idx / Vdim;
+                    const float e_i = smem_e_last[i];
+                    const float kds_val = scratch1[idx];
+                    const float d_pre = DU[idx] + kds_val * e_i;
+
+                    DU[idx] = d_pre;  // overwrite DU with d_pre
                 }
-                const int idx = i * Vdim + vv;
-                const float d_pre = DU[idx] + kds_val * e_i;
-                DU[idx] = d_pre;
-                row_sum += kds_val * (VNEW[idx] * e_i);
+                __syncthreads();
+
+                // DG gating contribution:
+                //   DG[i]     -= Σ_v (k@ds)[i,v] * VNEW[i,v]
+                //   DG[L - 1] += Σ_i,v (k@ds)[i,v] * VNEW[i,v]
+                for (int i = tid; i < L; i += nthr) {
+                    const float e_i = smem_e_last[i];
+                    float row_sum = 0.0f;
+                    for (int vv = 0; vv < Vdim; ++vv) {
+                        row_sum += scratch1[i * Vdim + vv] * (VNEW[i * Vdim + vv] * e_i);
+                    }
+                    DG[i] -= row_sum;
+                    dg_last_local += row_sum;
+                }
+            } else {
+                // Tile-safe path for K=V=128: keep outputs at [Lp×64].
+                for (int v0 = 0; v0 < Vdim; v0 += v_tile) {
+                    const int vt = min(v_tile, Vdim - v0);
+                    for (int idx = tid; idx < Kdim * vt; idx += nthr) {
+                        const int kk = idx / vt;
+                        const int vv = idx % vt;
+                        const long dh_idx = (long)kk * Vdim + (v0 + vv);
+                        buf3[idx] = from_float<TQ>(bf16_trunc<TQ>(dh_chunk[dh_idx]));
+                    }
+                    __syncthreads();
+
+                    wmma_nn<TQ>(smem_k, Kdim, buf3, vt, scratch1, vt, Lp, vt, Kdim);
+                    __syncthreads();
+
+                    for (int i = tid; i < L; i += nthr) {
+                        const float e_i = smem_e_last[i];
+                        float row_sum = 0.0f;
+                        for (int vv = 0; vv < vt; ++vv) {
+                            const int v_col = v0 + vv;
+                            const int idx = i * Vdim + v_col;
+                            const float kds_val = scratch1[i * vt + vv];
+                            DU[idx] = DU[idx] + kds_val * e_i;
+                            row_sum += kds_val * (VNEW[idx] * e_i);
+                        }
+                        DG[i] -= row_sum;
+                        dg_last_local += row_sum;
+                    }
+                    __syncthreads();
+                }
             }
-            DG[i] -= row_sum;
-            dg_last_local += row_sum;
+        } else {
+            // Tail chunks: compute k@ds in fp32 scalar math to match reference numerics.
+            for (int i = tid; i < L; i += nthr) {
+                float row_sum = 0.0f;
+                const float e_i = smem_e_last[i];
+                for (int vv = 0; vv < Vdim; ++vv) {
+                    float kds_val = 0.0f;
+                    for (int kk = 0; kk < Kdim; ++kk) {
+                        kds_val += dh_chunk[(long)kk * Vdim + vv] * to_float(smem_k[i * Kdim + kk]);
+                    }
+                    const int idx = i * Vdim + vv;
+                    const float d_pre = DU[idx] + kds_val * e_i;
+                    DU[idx] = d_pre;
+                    row_sum += kds_val * (VNEW[idx] * e_i);
+                }
+                DG[i] -= row_sum;
+                dg_last_local += row_sum;
+            }
         }
     }
 
@@ -825,19 +891,75 @@ void launch_gdr_bwd_phase3(
     bool use_qk_l2norm_in_kernel,
     int threads, std::size_t smem, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaFuncSetAttribute(
-        gdr_bwd_phase3_wmma<TQ, TG, TB>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem)));
+    const bool has_tail = (Tlen % chunk_size) != 0;
+    auto launch_once = [&](int launch_threads) -> cudaError_t {
+        if (launch_threads < 64 || launch_threads > 1024 || (launch_threads % 32) != 0) {
+            return cudaErrorInvalidConfiguration;
+        }
+        cudaError_t err = cudaSuccess;
+        if (has_tail) {
+            err = cudaFuncSetAttribute(
+                gdr_bwd_phase3_wmma<TQ, TG, TB, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem));
+            if (err != cudaSuccess) return err;
+            gdr_bwd_phase3_wmma<TQ, TG, TB, true><<<B * H * num_chunks, launch_threads, smem, stream>>>(
+                d_q, d_k, d_v, d_g, d_beta,
+                d_out, q, k, v, g, beta,
+                checkpoints, dh_storage,
+                chunk_workspace, chunk_ws_stride,
+                Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
+                use_qk_l2norm_in_kernel);
+        } else {
+            err = cudaFuncSetAttribute(
+                gdr_bwd_phase3_wmma<TQ, TG, TB, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem));
+            if (err != cudaSuccess) return err;
+            gdr_bwd_phase3_wmma<TQ, TG, TB, false><<<B * H * num_chunks, launch_threads, smem, stream>>>(
+                d_q, d_k, d_v, d_g, d_beta,
+                d_out, q, k, v, g, beta,
+                checkpoints, dh_storage,
+                chunk_workspace, chunk_ws_stride,
+                Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
+                use_qk_l2norm_in_kernel);
+        }
+        return cudaGetLastError();
+    };
 
-    gdr_bwd_phase3_wmma<TQ, TG, TB><<<B * H * num_chunks, threads, smem, stream>>>(
-        d_q, d_k, d_v, d_g, d_beta,
-        d_out, q, k, v, g, beta,
-        checkpoints, dh_storage,
-        chunk_workspace, chunk_ws_stride,
-        Tlen, H, Kdim, Vdim, num_chunks, chunk_size, scale,
-        use_qk_l2norm_in_kernel);
-    CUDA_CHECK(cudaGetLastError());
+    std::vector<int> candidates;
+    candidates.reserve(12);
+    auto push_unique = [&](int t) {
+        if (t < 64 || t > 1024 || (t % 32) != 0) return;
+        for (int x : candidates) if (x == t) return;
+        candidates.push_back(t);
+    };
+    push_unique(threads);
+    push_unique(1024);
+    push_unique(896);
+    push_unique(768);
+    push_unique(640);
+    push_unique(512);
+    push_unique(384);
+    push_unique(256);
+    push_unique(192);
+    push_unique(128);
+    push_unique(96);
+    push_unique(64);
+
+    cudaError_t last_err = cudaErrorInvalidConfiguration;
+    for (int t : candidates) {
+        last_err = launch_once(t);
+        if (last_err == cudaSuccess) {
+            return;
+        }
+        if (last_err != cudaErrorLaunchOutOfResources &&
+            last_err != cudaErrorInvalidConfiguration) {
+            CUDA_CHECK(last_err);
+            return;
+        }
+    }
+    CUDA_CHECK(last_err);
 }
 
 #define INSTANTIATE_PHASE3(TQ, TG, TB) \
