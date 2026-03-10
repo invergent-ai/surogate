@@ -32,6 +32,7 @@
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/jit/gated_delta_rule_kernels.h"
 
 namespace modules {
 struct ModelConfig;
@@ -187,9 +188,6 @@ public:
     void prepare_saved_buffers_for_capture(
         const std::vector<std::string>& save_list,
         const CompiledGraph* capture_graph = nullptr);
-    // Preallocate GDR backward workspaces/checkpoints before CUDA graph capture.
-    void prepare_gdr_buffers_for_capture(const CompiledGraph& capture_graph);
-
 private:
     // Save MoE layer tensors to persistent storage at layer boundaries
     void save_moe_layer_tensors(int layer_idx);
@@ -321,6 +319,9 @@ private:
     DslGradStore& mGrads;
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
+
+    // JIT-compiled Triton kernels for gated delta rule (loaded once from manifests)
+    GatedDeltaRuleKernels mGdrKernels;
 
     // Log-prob extraction context (null in training mode)
     float*   mLogprobsGpu          = nullptr;

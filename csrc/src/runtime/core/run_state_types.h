@@ -152,14 +152,6 @@ struct ScratchBuffers {
     Tensor attn_d_out_f32;
     Tensor attn_d_qkv_f32;
     Tensor attn_lse_f32;
-    // Optional per-layer forward checkpoints for gated-delta-rule.
-    // Populated during forward and consumed by backward to skip checkpoint recompute.
-    std::vector<Tensor> gdr_fwd_checkpoints;
-    std::size_t gdr_fwd_write_count = 0;
-    std::size_t gdr_fwd_read_count = 0;
-    Tensor gdr_fwd_workspace;  ///< Persistent workspace for gated-delta-rule forward
-    Tensor gdr_bwd_checkpoints;  ///< Persistent checkpoints for gated-delta-rule backward
-    Tensor gdr_bwd_workspace;  ///< Persistent workspace for gated-delta-rule backward (avoids stack OOM)
     // cuDNN attention backward workspace.
     // Like legacy `LLamaRunState::CuDNNWorkspace`, this is a descriptor that is backed by the DeviceMemoryStack
     // via temp_acquire/temp_free, so it can overlap with other temporaries (e.g. output logits chunks).

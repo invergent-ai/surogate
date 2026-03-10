@@ -776,9 +776,6 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // inside save_tensors (which is not allowed during capture).
         mCompiledExecutor->set_dimensions(B, T);
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
-        // GDR forward uses persistent checkpoint/workspace slots during capture.
-        // Preallocate them here so chunk_gated_delta_rule never attempts allocation in-capture.
-        mCompiledExecutor->prepare_gdr_buffers_for_capture(*mCompiledForward);
 
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
@@ -864,9 +861,6 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
         prime_fp4_weight_cache({});
-        // GDR backward uses large persistent workspaces/checkpoints; preallocate
-        // them before capture so no allocator cudaMalloc occurs inside capture.
-        mCompiledExecutor->prepare_gdr_buffers_for_capture(*mCompiledBackward);
     }
 
     auto run_ops = [&]() {

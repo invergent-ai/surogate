@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 #include "runtime/training/matmul_backend.h"  // EMatmulBackend
 #include "recipes/recipe.h"
@@ -102,6 +103,11 @@ struct RuntimeOptions {
     // DSL IR execution (deprecated flag; DSL backend is always used).
     bool UseDslIr = true;
     std::string DslIrJson;
+
+    // JIT kernel manifests: maps kernel name -> manifest JSON path.
+    // Populated by Python at model init time after AOT compilation.
+    // Consumed by C++ kernel managers (e.g. GatedDeltaRuleKernels).
+    std::unordered_map<std::string, std::string> JitKernelManifests;
 
     // Matmul backend selection
     // AUTO: Let the system auto-detect (CUTLASS for SM120+ FP8, cuBLAS otherwise)

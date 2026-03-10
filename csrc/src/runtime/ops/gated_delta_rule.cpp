@@ -1,24 +1,22 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Qwen3.5 gated delta rule operation dispatch.
+// Qwen3.5 gated delta rule operation dispatch using JIT-compiled Triton kernels.
 
 #include "runtime/dsl/compiled_ops.h"
 
 #include <cmath>
-#include <cstdlib>
-#include <iostream>
-#include <string>
+#include <cstdint>
 #include <stdexcept>
-#include <vector>
+#include <string>
+#include <algorithm>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
-#include "kernels/kernels.h"
 #include "utilities/utils.h"
 
 namespace dsl {
 namespace {
+
 
 bool tensor_shape_matches(const Tensor& t, long n0, long n1, long n2, long n3) {
     return t.Rank == 4 &&
@@ -28,21 +26,22 @@ bool tensor_shape_matches(const Tensor& t, long n0, long n1, long n2, long n3) {
            t.Sizes[3] == n3;
 }
 
-bool is_supported_gdr_dtype(ETensorDType dtype) {
-    return dtype == ETensorDType::FP16 ||
-           dtype == ETensorDType::BF16 ||
-           dtype == ETensorDType::FP32;
+inline int cdiv(int a, int b) { return (a + b - 1) / b; }
+inline int next_power_of_2(int v) {
+    v--;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    return v + 1;
 }
 
-bool supports_gdr_v2(const Tensor& q, const Tensor& v) {
-    const long kdim = q.Sizes[3];
-    const long vdim = v.Sizes[3];
-    return kdim <= 128 && vdim <= 128;
-}
 }  // namespace
 
 void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
-                                                        const char* op_name) {
+                                                         const char* op_name) {
+    if (!mGdrKernels.is_ready()) {
+        throw std::runtime_error(
+            std::string(op_name) + ": JIT Triton kernels not loaded. "
+            "Ensure compile_jit_kernels() ran in Python and manifests were passed via RuntimeOptions.");
+    }
     if (op.inputs.size() < 5) {
         throw std::runtime_error(std::string(op_name) + ": expected at least 5 inputs");
     }
@@ -50,10 +49,10 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     Tensor& q = resolve_tensor(op.inputs[0]);
     Tensor& k = resolve_tensor(op.inputs[1]);
     Tensor& v = resolve_tensor(op.inputs[2]);
-    Tensor& g = resolve_tensor(op.inputs[3]);
+    Tensor& g_input = resolve_tensor(op.inputs[3]);
     Tensor& beta = resolve_tensor(op.inputs[4]);
 
-    if (q.Rank != 4 || k.Rank != 4 || v.Rank != 4 || g.Rank != 3 || beta.Rank != 3) {
+    if (q.Rank != 4 || k.Rank != 4 || v.Rank != 4 || g_input.Rank != 3 || beta.Rank != 3) {
         throw std::runtime_error(
             std::string(op_name) + ": expected q/k/v rank 4 and g/beta rank 3");
     }
@@ -61,55 +60,31 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     const long B = q.Sizes[0];
     const long T = q.Sizes[1];
     const long H = q.Sizes[2];
-    const long Kdim = q.Sizes[3];
-    const long Vdim = v.Sizes[3];
+    const long K = q.Sizes[3];
+    const long V = v.Sizes[3];
 
-    if (!tensor_shape_matches(k, B, T, H, Kdim)) {
+    if (!tensor_shape_matches(k, B, T, H, K)) {
         throw std::runtime_error(std::string(op_name) + ": k shape must match q");
     }
     if (v.Sizes[0] != B || v.Sizes[1] != T || v.Sizes[2] != H) {
         throw std::runtime_error(std::string(op_name) + ": v must share B/T/H with q");
     }
-    if (g.Sizes[0] != B || g.Sizes[1] != T || g.Sizes[2] != H) {
-        throw std::runtime_error(std::string(op_name) + ": g shape must be [B,T,H]");
-    }
-    if (beta.Sizes[0] != B || beta.Sizes[1] != T || beta.Sizes[2] != H) {
-        throw std::runtime_error(std::string(op_name) + ": beta shape must be [B,T,H]");
-    }
-    if (!is_supported_gdr_dtype(q.DType) ||
-        !is_supported_gdr_dtype(g.DType) ||
-        !is_supported_gdr_dtype(beta.DType)) {
-        throw std::runtime_error(
-            std::string(op_name) + ": v2 supports q/g/beta dtypes in {FP16,BF16,FP32}");
-    }
-    if (!supports_gdr_v2(q, v)) {
-        throw std::runtime_error(
-            std::string(op_name) + ": v2 supports K,V <= 128; got K="
-            + std::to_string(Kdim) + " V=" + std::to_string(Vdim));
-    }
 
     Tensor* initial_state = nullptr;
     if (op.inputs.size() > 5 && !op.inputs[5].name.empty()) {
         initial_state = &resolve_tensor(op.inputs[5]);
-        if (initial_state->DType != ETensorDType::FP32) {
-            throw std::runtime_error(
-                std::string(op_name) + ": initial_state must be FP32");
-        }
-        if (!tensor_shape_matches(*initial_state, B, H, Kdim, Vdim)) {
-            throw std::runtime_error(
-                std::string(op_name) + ": initial_state must be [B,H,K,V]");
-        }
     }
 
+    // Allocate outputs
     Tensor* out_ptr = nullptr;
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
-        if (out_ref.DType == v.DType && tensor_shape_matches(out_ref, B, T, H, Vdim)) {
+        if (out_ref.DType == v.DType && tensor_shape_matches(out_ref, B, T, H, V)) {
             out_ptr = &out_ref;
         }
     }
     if (!out_ptr) {
-        Tensor out_t = mRunState.temp_alloc(v.DType, {B, T, H, Vdim});
+        Tensor out_t = mRunState.temp_alloc(v.DType, {B, T, H, V});
         mTemps.push_back(out_t);
         out_ptr = &mTemps.back();
     }
@@ -118,125 +93,171 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         Tensor& state_ref = ensure_output_tensor(op.outputs[1]);
         if (state_ref.DType == ETensorDType::FP32 &&
-            tensor_shape_matches(state_ref, B, H, Kdim, Vdim)) {
+            tensor_shape_matches(state_ref, B, H, K, V)) {
             final_state_ptr = &state_ref;
         }
     }
     if (!final_state_ptr) {
-        Tensor state_t = mRunState.temp_alloc(ETensorDType::FP32, {B, H, Kdim, Vdim});
+        Tensor state_t = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V});
         mTemps.push_back(state_t);
         final_state_ptr = &mTemps.back();
     }
 
     float scale = op.attrs.delta_rule_scale;
     if (!(scale > 0.0f)) {
-        scale = 1.0f / std::sqrt(static_cast<float>(Kdim));
+        scale = 1.0f / std::sqrt(static_cast<float>(K));
     }
 
-    int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
-    const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
-    const long checkpoints_elems =
-        B * H * static_cast<long>(num_chunks + 1) * Kdim * Vdim;
-    constexpr long kFwdWsAlignFloats = 128 / sizeof(float);
-    auto align_up = [](long x, long align) { return ((x + align - 1) / align) * align; };
-    const long fwd_lp = 64;
-    long fwd_ws_stride = 0;
-    fwd_ws_stride = align_up(fwd_ws_stride, kFwdWsAlignFloats) + fwd_lp * Vdim;  // u
-    fwd_ws_stride = align_up(fwd_ws_stride, kFwdWsAlignFloats) + fwd_lp * Kdim;  // w
-    fwd_ws_stride = align_up(fwd_ws_stride, kFwdWsAlignFloats) + fwd_lp * Kdim;  // k
-    fwd_ws_stride = align_up(fwd_ws_stride, kFwdWsAlignFloats) + fwd_lp * Vdim;  // vnew_pre
-    fwd_ws_stride = align_up(fwd_ws_stride, kFwdWsAlignFloats) + fwd_lp;         // gcum
-    fwd_ws_stride = align_up(fwd_ws_stride, kFwdWsAlignFloats);
-    const long fwd_workspace_elems =
-        B * H * static_cast<long>(num_chunks) * fwd_ws_stride;
+    const int BT = 64;
+    const int NT = cdiv(static_cast<int>(T), BT);
+    const int BK_kkt = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
+    const int BV_h = (K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    const int BK_o = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
+    const int BV_o = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    const int BH = static_cast<int>(B * H);
+    cudaStream_t stream = mRunState.MainStream;
 
-    Tensor state_scratch = mRunState.temp_alloc(ETensorDType::FP32, {B, H, Kdim, Vdim});
-    mTemps.push_back(state_scratch);
+    // Optional L2 normalization of q and k (Qwen3.5 requires this)
+    const bool use_l2norm = op.attrs.use_qk_l2norm_in_kernel;
+    void* q_eff = q.Data;
+    void* k_eff = k.Data;
+    if (use_l2norm) {
+        Tensor q_norm = mRunState.temp_alloc(q.DType, {B, T, H, K});
+        mTemps.push_back(q_norm);
+        Tensor q_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        mTemps.push_back(q_rstd);
+        Tensor k_norm = mRunState.temp_alloc(k.DType, {B, T, H, K});
+        mTemps.push_back(k_norm);
+        Tensor k_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        mTemps.push_back(k_rstd);
 
-    const bool use_v2 = true;
-    if (std::getenv("SUROGATE_DEBUG_GDR")) {
-        std::cerr << "[GDR fwd] B=" << B << " T=" << T << " H=" << H
-                  << " K=" << Kdim << " V=" << Vdim
-                  << " q_dtype=" << static_cast<int>(q.DType)
-                  << " g_dtype=" << static_cast<int>(g.DType)
-                  << " beta_dtype=" << static_cast<int>(beta.DType)
-                  << " use_v2=" << (use_v2 ? 1 : 0) << std::endl;
-    }
-    // Prefer persistent per-op checkpoint slots so backward can reuse forward
-    // checkpoints and skip expensive checkpoint recomputation.
-    Tensor fwd_checkpoints;
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    const bool in_capture =
-        (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
-         capture_status != cudaStreamCaptureStatusNone);
-    auto& scratch = mRunState.scratch();
-    const std::size_t slot = scratch.gdr_fwd_write_count++;
-    if (scratch.gdr_fwd_checkpoints.size() <= slot) {
-        if (in_capture) {
-            throw std::runtime_error(
-                "chunk_gated_delta_rule: missing preallocated forward checkpoint slot during CUDA graph capture");
+        // L2 norm Q: (x, y, rstd, T)
+        {
+            void* x = q.Data; void* y = q_norm.Data; void* r = q_rstd.Data;
+            int32_t T_val = static_cast<int32_t>(T);
+            void* args[] = { &x, &y, &r, &T_val };
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                     args, 4, stream);
         }
-        scratch.gdr_fwd_checkpoints.resize(slot + 1);
-    }
-    Tensor& slot_tensor = scratch.gdr_fwd_checkpoints[slot];
-    if (!slot_tensor.Data ||
-        slot_tensor.DType != ETensorDType::FP32 ||
-        slot_tensor.nelem() < checkpoints_elems) {
-        if (in_capture) {
-            throw std::runtime_error(
-                "chunk_gated_delta_rule: preallocated forward checkpoint slot is too small during CUDA graph capture");
+        // L2 norm K: same kernel (D=K)
+        {
+            void* x = k.Data; void* y = k_norm.Data; void* r = k_rstd.Data;
+            int32_t T_val = static_cast<int32_t>(T);
+            void* args[] = { &x, &y, &r, &T_val };
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                     args, 4, stream);
         }
-        const std::string name = "gdr_fwd_checkpoints_" + std::to_string(slot);
-        slot_tensor = mRunState.Allocator->allocate(
-            ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE, {checkpoints_elems});
+        q_eff = q_norm.Data;
+        k_eff = k_norm.Data;
     }
-    fwd_checkpoints = slot_tensor;
-    fwd_checkpoints.Rank = 5;
-    fwd_checkpoints.Sizes[0] = B;
-    fwd_checkpoints.Sizes[1] = H;
-    fwd_checkpoints.Sizes[2] = static_cast<long>(num_chunks + 1);
-    fwd_checkpoints.Sizes[3] = Kdim;
-    fwd_checkpoints.Sizes[4] = Vdim;
-    for (int i = 5; i < MAX_TENSOR_DIM; ++i) fwd_checkpoints.Sizes[i] = 1;
 
-    Tensor fwd_workspace;
-    Tensor& persistent_fwd_workspace = scratch.gdr_fwd_workspace;
-    if (persistent_fwd_workspace.Data &&
-        persistent_fwd_workspace.DType == ETensorDType::FP32 &&
-        persistent_fwd_workspace.nelem() >= fwd_workspace_elems) {
-        fwd_workspace = persistent_fwd_workspace;
-    } else if (in_capture) {
-        throw std::runtime_error(
-            "chunk_gated_delta_rule: missing preallocated forward workspace during CUDA graph capture");
+    // Allocate intermediates
+    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+    mTemps.push_back(g_cum);
+    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT});
+    mTemps.push_back(A);
+    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT});
+    mTemps.push_back(Ai);
+    CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
+    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K});
+    mTemps.push_back(w);
+    Tensor u = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    mTemps.push_back(u);
+    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V});
+    mTemps.push_back(h);
+    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    mTemps.push_back(v_new);
+
+    // If no initial_state, allocate a zeroed one.
+    // Note: the AOT kernel expects h0 as BF16 (see gdr_fwd_h manifest signature).
+    Tensor h0_buf;
+    void* h0_ptr;
+    if (initial_state) {
+        h0_ptr = initial_state->Data;
     } else {
-        if (!persistent_fwd_workspace.Data ||
-            persistent_fwd_workspace.DType != ETensorDType::FP32 ||
-            persistent_fwd_workspace.nelem() < fwd_workspace_elems) {
-            persistent_fwd_workspace = mRunState.Allocator->allocate(
-                ETensorDType::FP32,
-                "gdr_fwd_workspace",
-                EAllocationType::ON_DEVICE,
-                {fwd_workspace_elems});
-        }
-        fwd_workspace = persistent_fwd_workspace;
+        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V});
+        mTemps.push_back(h0_buf);
+        CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
+        h0_ptr = h0_buf.Data;
     }
 
-    gated_delta_rule_chunk_forward_v2(
-        *out_ptr,
-        *final_state_ptr,
-        state_scratch,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state,
-        scale,
-        chunk_size,
-        op.attrs.use_qk_l2norm_in_kernel,
-        &fwd_checkpoints,
-        &fwd_workspace,
-        mRunState.MainStream);
+    // ---- Forward pipeline: launch JIT Triton kernels ----
+
+    // 1. cumsum_fwd: (g_input, g_cum, T) grid=(NT, B*H)
+    {
+        void* g_in_ptr = g_input.Data;
+        void* g_out_ptr = g_cum.Data;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = { &g_in_ptr, &g_out_ptr, &T_val };
+        mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                               args, 3, stream);
+    }
+
+    // 2. kkt_fwd: (k, g_cum, beta, A, T) grid=(NT, B*H)
+    {
+        void* g_ptr = g_cum.Data;
+        void* beta_ptr = beta.Data;
+        void* A_ptr = A.Data;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &g_ptr, &beta_ptr, &A_ptr, &T_val };
+        mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                            args, 5, stream);
+    }
+
+    // 3. solve_tril: (A, Ai, T) grid=(NT, B*H)
+    {
+        void* A_ptr = A.Data;
+        void* Ai_ptr = Ai.Data;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = { &A_ptr, &Ai_ptr, &T_val };
+        mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                               args, 3, stream);
+    }
+
+    // 4. wy_fwd: (k, v, beta, w, u, Ai, g_cum, T) grid=(NT, B*H)
+    {
+        void* v_ptr = v.Data;
+        void* beta_ptr = beta.Data;
+        void* w_ptr = w.Data;
+        void* u_ptr = u.Data;
+        void* Ai_ptr = Ai.Data;
+        void* g_ptr = g_cum.Data;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &v_ptr, &beta_ptr, &w_ptr, &u_ptr, &Ai_ptr, &g_ptr, &T_val };
+        mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                           args, 8, stream);
+    }
+
+    // 5. fwd_h: (k, u, w, v_new, g_cum, h, h0, ht, T) grid=(cdiv(V,BV_h), B*H)
+    {
+        void* u_ptr = u.Data;
+        void* w_ptr = w.Data;
+        void* vn_ptr = v_new.Data;
+        void* g_ptr = g_cum.Data;
+        void* h_ptr = h.Data;
+        void* ht_ptr = final_state_ptr->Data;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &u_ptr, &w_ptr, &vn_ptr, &g_ptr, &h_ptr, &h0_ptr, &ht_ptr, &T_val };
+        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)),
+                           static_cast<unsigned>(BH), 1},
+                          args, 9, stream);
+    }
+
+    // 6. fwd_o: (q, k, v_new, h, g_cum, o, scale, T) grid=(cdiv(V,BV_o), NT, B*H)
+    {
+        void* vn_ptr = v_new.Data;
+        void* h_ptr = h.Data;
+        void* g_ptr = g_cum.Data;
+        void* o_ptr = out_ptr->Data;
+        float scale_val = scale;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = { &q_eff, &k_eff, &vn_ptr, &h_ptr, &g_ptr, &o_ptr, &scale_val, &T_val };
+        mGdrKernels.fwd_o({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_o)),
+                           static_cast<unsigned>(NT),
+                           static_cast<unsigned>(BH)},
+                          args, 8, stream);
+    }
+
     CUDA_CHECK(cudaGetLastError());
 
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
@@ -252,10 +273,10 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule(const CompiledOp& op) {
 }
 
 void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op) {
-    // Inputs:
-    //   d_out, d_final_state(optional), q, k, v, g, beta, initial_state(optional)
-    // Outputs:
-    //   d_q, d_k, d_v, d_g, d_beta, d_initial_state(optional)
+    if (!mGdrKernels.is_ready()) {
+        throw std::runtime_error(
+            "chunk_gated_delta_rule_backward: JIT Triton kernels not loaded.");
+    }
     if (op.inputs.size() < 7) {
         throw std::runtime_error(
             "chunk_gated_delta_rule_backward: expected at least 7 inputs");
@@ -264,300 +285,322 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
     Tensor* d_final_state = nullptr;
-    std::size_t tensor_input_offset = 1;
     if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
         d_final_state = &resolve_tensor(op.inputs[1]);
     }
-    tensor_input_offset = 2;
+    const std::size_t offs = 2;
 
-    Tensor& q = resolve_tensor(op.inputs[tensor_input_offset + 0]);
-    Tensor& k = resolve_tensor(op.inputs[tensor_input_offset + 1]);
-    Tensor& v = resolve_tensor(op.inputs[tensor_input_offset + 2]);
-    Tensor& g = resolve_tensor(op.inputs[tensor_input_offset + 3]);
-    Tensor& beta = resolve_tensor(op.inputs[tensor_input_offset + 4]);
+    Tensor& q = resolve_tensor(op.inputs[offs + 0]);
+    Tensor& k = resolve_tensor(op.inputs[offs + 1]);
+    Tensor& v = resolve_tensor(op.inputs[offs + 2]);
+    Tensor& g_input = resolve_tensor(op.inputs[offs + 3]);
+    Tensor& beta = resolve_tensor(op.inputs[offs + 4]);
 
     Tensor* initial_state = nullptr;
-    if (op.inputs.size() > tensor_input_offset + 5 &&
-        !op.inputs[tensor_input_offset + 5].name.empty()) {
-        initial_state = &resolve_tensor(op.inputs[tensor_input_offset + 5]);
+    if (op.inputs.size() > offs + 5 && !op.inputs[offs + 5].name.empty()) {
+        initial_state = &resolve_tensor(op.inputs[offs + 5]);
     }
 
     const long B = q.Sizes[0];
     const long T = q.Sizes[1];
     const long H = q.Sizes[2];
-    const long Kdim = q.Sizes[3];
-    const long Vdim = v.Sizes[3];
+    const long K = q.Sizes[3];
+    const long V = v.Sizes[3];
 
+    // Allocate gradient outputs
     auto ensure_or_temp = [&](std::size_t out_idx,
                               ETensorDType dtype,
                               const std::vector<long>& shape) -> Tensor* {
         if (op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty()) {
             Tensor& out_ref = ensure_output_tensor(op.outputs[out_idx]);
-            if (out_ref.DType == dtype && tensor_shape_matches(
-                    out_ref, shape[0], shape[1], shape[2], shape[3])) {
-                return &out_ref;
-            }
+            bool ok = true;
+            if (out_ref.DType != dtype) ok = false;
+            if (shape.size() == 4 && !tensor_shape_matches(out_ref, shape[0], shape[1], shape[2], shape[3])) ok = false;
+            if (shape.size() == 3 && (out_ref.Rank != 3 || out_ref.Sizes[0] != shape[0] ||
+                out_ref.Sizes[1] != shape[1] || out_ref.Sizes[2] != shape[2])) ok = false;
+            if (ok) return &out_ref;
         }
         Tensor temp = mRunState.temp_alloc(dtype, shape);
         mTemps.push_back(temp);
         return &mTemps.back();
     };
 
-    Tensor* d_q = ensure_or_temp(0, q.DType, {B, T, H, Kdim});
-    Tensor* d_k = ensure_or_temp(1, k.DType, {B, T, H, Kdim});
-    Tensor* d_v = ensure_or_temp(2, v.DType, {B, T, H, Vdim});
-    if (!is_supported_gdr_dtype(q.DType) ||
-        !is_supported_gdr_dtype(g.DType) ||
-        !is_supported_gdr_dtype(beta.DType)) {
-        throw std::runtime_error(
-            "chunk_gated_delta_rule_backward: v2 supports q/g/beta dtypes in {FP16,BF16,FP32}");
-    }
-    if (!supports_gdr_v2(q, v)) {
-        throw std::runtime_error(
-            "chunk_gated_delta_rule_backward: v2 supports K,V <= 128; got K="
-            + std::to_string(Kdim) + " V=" + std::to_string(Vdim));
-    }
-
-    Tensor* d_g = nullptr;
-    if (op.outputs.size() > 3 && !op.outputs[3].name.empty()) {
-        Tensor& out_ref = ensure_output_tensor(op.outputs[3]);
-        if (out_ref.DType == g.DType &&
-            out_ref.Rank == 3 &&
-            out_ref.Sizes[0] == B &&
-            out_ref.Sizes[1] == T &&
-            out_ref.Sizes[2] == H) {
-            d_g = &out_ref;
-        }
-    }
-    if (!d_g) {
-        Tensor temp = mRunState.temp_alloc(g.DType, {B, T, H});
-        mTemps.push_back(temp);
-        d_g = &mTemps.back();
-    }
-
-    Tensor* d_beta = nullptr;
-    if (op.outputs.size() > 4 && !op.outputs[4].name.empty()) {
-        Tensor& out_ref = ensure_output_tensor(op.outputs[4]);
-        if (out_ref.DType == beta.DType &&
-            out_ref.Rank == 3 &&
-            out_ref.Sizes[0] == B &&
-            out_ref.Sizes[1] == T &&
-            out_ref.Sizes[2] == H) {
-            d_beta = &out_ref;
-        }
-    }
-    if (!d_beta) {
-        Tensor temp = mRunState.temp_alloc(beta.DType, {B, T, H});
-        mTemps.push_back(temp);
-        d_beta = &mTemps.back();
-    }
-
-    Tensor* d_initial = nullptr;
-    if (op.outputs.size() > 5 && !op.outputs[5].name.empty()) {
-        Tensor& out_ref = ensure_output_tensor(op.outputs[5]);
-        if (out_ref.DType == ETensorDType::FP32 &&
-            tensor_shape_matches(out_ref, B, H, Kdim, Vdim)) {
-            d_initial = &out_ref;
-        }
-    }
-    if (!d_initial) {
-        Tensor temp = mRunState.temp_alloc(ETensorDType::FP32, {B, H, Kdim, Vdim});
-        mTemps.push_back(temp);
-        d_initial = &mTemps.back();
-    }
-
-    int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
-    const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
-
-    const bool use_v2 = true;
-    if (std::getenv("SUROGATE_DEBUG_GDR")) {
-        std::cerr << "[GDR bwd] B=" << B << " T=" << T << " H=" << H
-                  << " K=" << Kdim << " V=" << Vdim
-                  << " q_dtype=" << static_cast<int>(q.DType)
-                  << " g_dtype=" << static_cast<int>(g.DType)
-                  << " beta_dtype=" << static_cast<int>(beta.DType)
-                  << " use_v2=" << (use_v2 ? 1 : 0) << std::endl;
-    }
-
-    const long checkpoints_elems =
-        B * H * static_cast<long>(num_chunks + 1) * Kdim * Vdim;
-    bool skip_checkpoint = false;
-    Tensor checkpoints;
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    const bool in_capture =
-        (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
-         capture_status != cudaStreamCaptureStatusNone);
-    auto& scratch = mRunState.scratch();
-    if (scratch.gdr_fwd_write_count > scratch.gdr_fwd_read_count &&
-        scratch.gdr_fwd_write_count <= scratch.gdr_fwd_checkpoints.size()) {
-        const std::size_t slot =
-            scratch.gdr_fwd_write_count - 1 - scratch.gdr_fwd_read_count;
-        Tensor& saved_cp = scratch.gdr_fwd_checkpoints[slot];
-        if (saved_cp.Data &&
-            saved_cp.DType == ETensorDType::FP32 &&
-            saved_cp.nelem() >= checkpoints_elems) {
-            checkpoints = saved_cp;
-            skip_checkpoint = true;
-            scratch.gdr_fwd_read_count++;
-        }
-    }
-    if (!skip_checkpoint) {
-        // Fallback: materialize checkpoints inside backward.
-        Tensor& gdr_cp = scratch.gdr_bwd_checkpoints;
-        if (gdr_cp.Data && gdr_cp.DType == ETensorDType::FP32 && gdr_cp.nelem() >= checkpoints_elems) {
-            checkpoints = gdr_cp;
-        } else if (in_capture) {
-            throw std::runtime_error(
-                "chunk_gated_delta_rule_backward: missing preallocated backward checkpoints during CUDA graph capture");
-        } else {
-            if (!gdr_cp.Data || gdr_cp.DType != ETensorDType::FP32 || gdr_cp.nelem() < checkpoints_elems) {
-                gdr_cp = mRunState.Allocator->allocate(
-                    ETensorDType::FP32, "gdr_bwd_checkpoints", EAllocationType::ON_DEVICE, {checkpoints_elems});
-            }
-            checkpoints = gdr_cp;
-        }
-    }
-    checkpoints.Rank = 5;
-    checkpoints.Sizes[0] = B;
-    checkpoints.Sizes[1] = H;
-    checkpoints.Sizes[2] = static_cast<long>(num_chunks + 1);
-    checkpoints.Sizes[3] = Kdim;
-    checkpoints.Sizes[4] = Vdim;
-    for (int i = 5; i < MAX_TENSOR_DIM; ++i) checkpoints.Sizes[i] = 1;
-    if (std::getenv("SUROGATE_DEBUG_GDR")) {
-        std::cerr << "[GDR bwd cp] reuse_fwd_checkpoints=" << (skip_checkpoint ? 1 : 0) << std::endl;
-    }
-
-    const int Lp = 64;
-    // Keep runtime workspace sizing compatible with v2 multi-kernel routing.
-    // The launcher may choose the multi-kernel path for K/V up to 128, even when
-    // older host-side "can_wmma" checks would say false.
-    // Allocate a superset layout that is valid for both multi-kernel and scalar v2.
-    constexpr long kWsAlignFloats = 128 / sizeof(float);
-    auto align_up = [](long x, long align) { return ((x + align - 1) / align) * align; };
-    const long c_storage_floats = static_cast<long>(Kdim) * Kdim;
-    long chunk_ws_stride = 0;
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;    // M
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;  // W
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Vdim;  // VNEW
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Vdim;  // DU
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;  // DW
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;  // DQ
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;  // DK
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);          // DG
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);          // DB
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Kdim) * Vdim; // DHT1
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                // C fp32
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                // EG
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim;    // K_NORM
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);            // INVQ
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);            // INVK
-    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                    // total stride
-    const long dh_storage_per_chunk = static_cast<long>(Kdim) * Vdim;
-    const long multikernel_ws_size = static_cast<long>(num_chunks) * chunk_ws_stride
-        + static_cast<long>(num_chunks) * dh_storage_per_chunk;
-
-    // v2 scalar fallback only needs one chunk-local scratch per (B,H).
-    // Extra 2*Lp*Lp is used by scalar internals for temporary matmul buffers.
-    const long scalar_ws_stride =
-        static_cast<long>(chunk_size) * (4 * Kdim + 2 * Vdim + 2) +
-        static_cast<long>(2 * Lp * Lp);
-
-    const long workspace_size = std::max(multikernel_ws_size, scalar_ws_stride);
-    const long workspace_elems = B * H * workspace_size;
-
-    // This workspace can be very large on Qwen3.5 (hundreds of MB). Keeping it on the
-    // temp stack collides with recompute/checkpoint stack usage and causes Stack OOM.
-    // Use a persistent scratch allocation and reuse it across steps.
-    Tensor gdr_ws;
-    Tensor& persistent_ws = mRunState.scratch().gdr_bwd_workspace;
-    if (persistent_ws.Data && persistent_ws.DType == ETensorDType::FP32 && persistent_ws.nelem() >= workspace_elems) {
-        gdr_ws = persistent_ws;
-    } else if (in_capture) {
-        throw std::runtime_error(
-            "chunk_gated_delta_rule_backward: missing preallocated backward workspace during CUDA graph capture");
-    } else {
-        if (!persistent_ws.Data || persistent_ws.DType != ETensorDType::FP32 || persistent_ws.nelem() < workspace_elems) {
-            persistent_ws = mRunState.Allocator->allocate(
-                ETensorDType::FP32, "gdr_bwd_workspace", EAllocationType::ON_DEVICE, {workspace_elems});
-        }
-        gdr_ws = persistent_ws;
-    }
-
-    Tensor state_scratch = gdr_ws;
-    state_scratch.Rank = 3;
-    state_scratch.Sizes[0] = B;
-    state_scratch.Sizes[1] = H;
-    state_scratch.Sizes[2] = workspace_size;
-    for (int i = 3; i < MAX_TENSOR_DIM; ++i) state_scratch.Sizes[i] = 1;
+    Tensor* d_q = ensure_or_temp(0, q.DType, {B, T, H, K});
+    Tensor* d_k = ensure_or_temp(1, k.DType, {B, T, H, K});
+    Tensor* d_v = ensure_or_temp(2, v.DType, {B, T, H, V});
+    Tensor* d_g = ensure_or_temp(3, g_input.DType, {B, T, H});
+    Tensor* d_beta = ensure_or_temp(4, beta.DType, {B, T, H});
+    Tensor* d_initial = ensure_or_temp(5, ETensorDType::FP32, {B, H, K, V});
 
     float scale = op.attrs.delta_rule_scale;
     if (!(scale > 0.0f)) {
-        scale = 1.0f / std::sqrt(static_cast<float>(Kdim));
+        scale = 1.0f / std::sqrt(static_cast<float>(K));
     }
 
-    const bool debug_nan = (std::getenv("SUROGATE_DEBUG_GDR_NAN") != nullptr);
+    const int BT = 64;
+    const int NT = cdiv(static_cast<int>(T), BT);
+    const int BV_h = (K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    const int BK_bwd = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
+    const int BV_bwd = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    const int NK = cdiv(static_cast<int>(K), BK_bwd);
+    const int BH = static_cast<int>(B * H);
+    cudaStream_t stream = mRunState.MainStream;
 
-    auto count_nonfinite = [&](const char* name, const Tensor& t) {
-        if (!debug_nan) return;
-        if (!t.Data) {
-            std::cerr << "[GDR bwd nan] " << name << ": <null>\n";
-            return;
+    // Optional L2 normalization recompute (mirrors forward)
+    const bool use_l2norm = op.attrs.use_qk_l2norm_in_kernel;
+    void* q_eff = q.Data;
+    void* k_eff = k.Data;
+    void* dq_data = d_q->Data;
+    void* dk_data = d_k->Data;
+    Tensor q_norm_bwd, k_norm_bwd, q_rstd_bwd, k_rstd_bwd;
+    Tensor dq_norm_buf, dk_norm_buf;
+    if (use_l2norm) {
+        q_norm_bwd = mRunState.temp_alloc(q.DType, {B, T, H, K});
+        mTemps.push_back(q_norm_bwd);
+        q_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        mTemps.push_back(q_rstd_bwd);
+        k_norm_bwd = mRunState.temp_alloc(k.DType, {B, T, H, K});
+        mTemps.push_back(k_norm_bwd);
+        k_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        mTemps.push_back(k_rstd_bwd);
+        {
+            void* x = q.Data; void* y = q_norm_bwd.Data; void* r = q_rstd_bwd.Data;
+            int32_t T_val = static_cast<int32_t>(T);
+            void* args[] = { &x, &y, &r, &T_val };
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                     args, 4, stream);
         }
-        if (t.DType != ETensorDType::BF16 && t.DType != ETensorDType::FP32) {
-            std::cerr << "[GDR bwd nan] " << name << ": skipped dtype=" << static_cast<int>(t.DType) << "\n";
-            return;
+        {
+            void* x = k.Data; void* y = k_norm_bwd.Data; void* r = k_rstd_bwd.Data;
+            int32_t T_val = static_cast<int32_t>(T);
+            void* args[] = { &x, &y, &r, &T_val };
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                     args, 4, stream);
         }
-        Tensor cnt = mRunState.temp_alloc(ETensorDType::INT32, {1});
-        CUDA_CHECK(cudaMemsetAsync(cnt.Data, 0, sizeof(int), mRunState.MainStream));
-        count_non_finite(cnt, t, mRunState.MainStream);
-        int host_cnt = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&host_cnt, cnt.get<int>(), sizeof(int), cudaMemcpyDeviceToHost, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        mRunState.temp_free(cnt);
-        std::cerr << "[GDR bwd nan] " << name << ": count=" << host_cnt << "\n";
-    };
-
-    if (debug_nan) {
-        count_nonfinite("d_out", d_out);
-        if (d_final_state) count_nonfinite("d_final_state", *d_final_state);
-        count_nonfinite("q", q);
-        count_nonfinite("k", k);
-        count_nonfinite("v", v);
-        count_nonfinite("g", g);
-        count_nonfinite("beta", beta);
+        q_eff = q_norm_bwd.Data;
+        k_eff = k_norm_bwd.Data;
+        // Backward pipeline writes dq_norm/dk_norm to temp buffers
+        dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K});
+        mTemps.push_back(dq_norm_buf);
+        dk_norm_buf = mRunState.temp_alloc(k.DType, {B, T, H, K});
+        mTemps.push_back(dk_norm_buf);
+        dq_data = dq_norm_buf.Data;
+        dk_data = dk_norm_buf.Data;
     }
-    gated_delta_rule_chunk_backward_v2(
-        *d_q,
-        *d_k,
-        *d_v,
-        *d_g,
-        *d_beta,
-        *d_initial,
-        d_out,
-        d_final_state,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state,
-        scale,
-        chunk_size,
-        op.attrs.use_qk_l2norm_in_kernel,
-        checkpoints,
-        state_scratch,
-        skip_checkpoint,
-        mRunState.MainStream);
+
+    // ---- Recompute forward intermediates ----
+    // g_cum
+    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+    mTemps.push_back(g_cum);
+    {
+        void* g_in = g_input.Data; void* g_out = g_cum.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &g_in, &g_out, &Tv };
+        mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
+    }
+    // A, Ai
+    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT});
+    mTemps.push_back(A);
+    {
+        void* gp = g_cum.Data; void* bp = beta.Data; void* ap = A.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &gp, &bp, &ap, &Tv };
+        mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
+    }
+    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT});
+    mTemps.push_back(Ai);
+    CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
+    {
+        void* ap = A.Data; void* aip = Ai.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &ap, &aip, &Tv };
+        mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
+    }
+    // w, u
+    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K});
+    mTemps.push_back(w);
+    Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    mTemps.push_back(u_buf);
+    {
+        void* vp = v.Data; void* bp = beta.Data;
+        void* wp = w.Data; void* up = u_buf.Data; void* aip = Ai.Data; void* gp = g_cum.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &vp, &bp, &wp, &up, &aip, &gp, &Tv };
+        mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 8, stream);
+    }
+    // h, v_new
+    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V});
+    mTemps.push_back(h);
+    Tensor ht_dummy = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V});
+    mTemps.push_back(ht_dummy);
+    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    mTemps.push_back(v_new);
+
+    void* h0_ptr;
+    Tensor h0_buf;
+    if (initial_state) {
+        h0_ptr = initial_state->Data;
+    } else {
+        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V});
+        mTemps.push_back(h0_buf);
+        CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
+        h0_ptr = h0_buf.Data;
+    }
+    {
+        void* up = u_buf.Data; void* wp = w.Data;
+        void* vnp = v_new.Data; void* gp = g_cum.Data; void* hp = h.Data;
+        void* htp = ht_dummy.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &up, &wp, &vnp, &gp, &hp, &h0_ptr, &htp, &Tv };
+        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)),
+                           static_cast<unsigned>(BH), 1}, args, 9, stream);
+    }
+
+    // ---- Backward pipeline ----
+
+    // bwd_dv_local
+    {
+        void* gp = g_cum.Data;
+        void* dop = d_out.Data; void* dvp = d_v->Data;
+        float sv = scale; int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &q_eff, &k_eff, &gp, &dop, &dvp, &sv, &Tv };
+        mGdrKernels.bwd_dv_local({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                 args, 7, stream);
+    }
+
+    // bwd_dhu
+    Tensor dh = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V});
+    mTemps.push_back(dh);
+    Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    mTemps.push_back(dv2);
+    {
+        void* wp = w.Data; void* gp = g_cum.Data;
+        void* dhtp = d_final_state ? d_final_state->Data : nullptr;
+        Tensor dht_zero;
+        if (!dhtp) {
+            dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V});
+            mTemps.push_back(dht_zero);
+            CUDA_CHECK(cudaMemsetAsync(dht_zero.Data, 0, dht_zero.nelem() * sizeof(float), stream));
+            dhtp = dht_zero.Data;
+        }
+        void* dh0p = d_initial->Data;
+        void* dop = d_out.Data; void* dhp = dh.Data;
+        void* dvp = d_v->Data; void* dv2p = dv2.Data;
+        float sv = scale; int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &q_eff, &k_eff, &wp, &gp, &dhtp, &dh0p, &dop, &dhp, &dvp, &dv2p, &sv, &Tv };
+        mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)),
+                             static_cast<unsigned>(BH), 1},
+                            args, 12, stream);
+    }
+
+    // bwd_dqkwg
+    Tensor dw = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K});
+    mTemps.push_back(dw);
+    Tensor dg_nk = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), B, T, H});
+    mTemps.push_back(dg_nk);
+    {
+        void* vnp = v_new.Data;
+        void* gp = g_cum.Data; void* hp = h.Data; void* dop = d_out.Data;
+        void* dhp = dh.Data;
+        void* dwp = dw.Data; void* dv2p = dv2.Data; void* dgnkp = dg_nk.Data;
+        float sv = scale;
+        int32_t Bv = static_cast<int32_t>(B);
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &q_eff, &k_eff, &vnp, &gp, &hp, &dop, &dhp, &dq_data, &dk_data, &dwp, &dv2p, &dgnkp, &sv, &Bv, &Tv };
+        mGdrKernels.bwd_dqkwg({static_cast<unsigned>(NK),
+                                static_cast<unsigned>(NT),
+                                static_cast<unsigned>(BH)},
+                               args, 15, stream);
+    }
+
+    // TODO: dg_nk reduction across NK dimension needs a small kernel or cumsum approach.
+    // For now, the dg reduction is deferred to the cumsum_rev step below, which
+    // expects a pre-reduced dg tensor. We handle the NK reduction via a simple
+    // device-side sum using the host-side temp approach.
+    // Sum dg_nk[NK, B, T, H] -> dg[B, T, H]
+    // dg is d_g output. We sum in-place.
+    {
+        // Simple approach: use first slice as accumulator, add remaining slices.
+        // For NK=2 (typical), this is just one addition.
+        const long bth = B * T * H;
+        float* dg_base = dg_nk.get<float>();
+        float* dg_out_ptr = d_g->get<float>();
+        // Copy first slice
+        CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, bth * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, stream));
+        for (int nk = 1; nk < NK; ++nk) {
+            // dg_out += dg_nk[nk]
+            // Use a simple element-wise add via cublas or a tiny kernel.
+            // For correctness, use cuBLAS saxpy: y = alpha*x + y
+            float alpha = 1.0f;
+            cublasHandle_t handle = mRunState.cublas_handle();
+            cublasSetStream(handle, stream);
+            cublasSaxpy(handle, static_cast<int>(bth), &alpha,
+                        dg_base + nk * bth, 1, dg_out_ptr, 1);
+        }
+    }
+
+    // bwd_wy: (k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T)
+    Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+    mTemps.push_back(dg_wy);
+    {
+        void* vp = v.Data; void* bp = beta.Data;
+        void* gp = g_cum.Data; void* aip = Ai.Data; void* dwp = dw.Data;
+        void* dv2p = dv2.Data; void* dvp = d_v->Data;
+        void* dbp = d_beta->Data; void* dgwyp = dg_wy.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &k_eff, &vp, &bp, &gp, &aip, &dwp, &dv2p, &dk_data, &dvp, &dbp, &dgwyp, &Tv };
+        mGdrKernels.bwd_wy({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                           args, 12, stream);
+    }
+
+    // dg += dg_wy
+    {
+        float alpha = 1.0f;
+        cublasHandle_t handle = mRunState.cublas_handle();
+        cublasSetStream(handle, stream);
+        cublasSaxpy(handle, static_cast<int>(B * T * H), &alpha,
+                    dg_wy.get<float>(), 1, d_g->get<float>(), 1);
+    }
+
+    // cumsum_rev: reverse cumulative sum for dg
+    Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H});
+    mTemps.push_back(dg_out);
+    {
+        void* dg_in = d_g->Data; void* dg_outp = dg_out.Data;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = { &dg_in, &dg_outp, &Tv };
+        mGdrKernels.cumsum_rev({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                               args, 3, stream);
+    }
+    // Copy result back to d_g output
+    CUDA_CHECK(cudaMemcpyAsync(d_g->Data, dg_out.Data,
+                                d_g->nelem() * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream));
+
+    // L2 norm backward: map dq_norm/dk_norm -> dq/dk
+    if (use_l2norm) {
+        // l2norm_bwd(x_norm, rstd, dout, dx, T)
+        {
+            void* xn = q_norm_bwd.Data; void* r = q_rstd_bwd.Data;
+            void* dout = dq_norm_buf.Data; void* dx = d_q->Data;
+            int32_t T_val = static_cast<int32_t>(T);
+            void* args[] = { &xn, &r, &dout, &dx, &T_val };
+            mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                     args, 5, stream);
+        }
+        {
+            void* xn = k_norm_bwd.Data; void* r = k_rstd_bwd.Data;
+            void* dout = dk_norm_buf.Data; void* dx = d_k->Data;
+            int32_t T_val = static_cast<int32_t>(T);
+            void* args[] = { &xn, &r, &dout, &dx, &T_val };
+            mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+                                     args, 5, stream);
+        }
+    }
+
     CUDA_CHECK(cudaGetLastError());
 
-    if (debug_nan) {
-        count_nonfinite("d_q", *d_q);
-        count_nonfinite("d_k", *d_k);
-        count_nonfinite("d_v", *d_v);
-        count_nonfinite("d_g", *d_g);
-        count_nonfinite("d_beta", *d_beta);
-    }
     if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) store_tensor(op.outputs[0], *d_q);
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], *d_k);
     if (op.outputs.size() > 2 && !op.outputs[2].name.empty()) store_tensor(op.outputs[2], *d_v);

@@ -128,7 +128,7 @@ set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "N
 FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v4.3.5
+        GIT_TAG v4.4.1
         EXCLUDE_FROM_ALL
 )
 
@@ -357,6 +357,10 @@ target_sources(surogate-common PRIVATE
     src/runtime/lora/lora_optimizer_state.cpp
     src/runtime/lora/lora_utils.cpp
 
+    # JIT kernel loader (Triton, CuTe, etc.)
+    src/runtime/jit/jit_kernel.cpp
+    src/runtime/jit/gated_delta_rule_kernels.cpp
+
     # Recipe system
     src/recipes/recipe.cpp
     src/recipes/recipe_factory.cpp
@@ -381,15 +385,6 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe_kernels.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
-    src/kernels/gated_delta_rule/gated_delta_rule_v2_fwd.cu
-    src/kernels/gated_delta_rule/gdr_chunk_fwd_precompute.cu
-    src/kernels/gated_delta_rule/gdr_chunk_fwd_state.cu
-    src/kernels/gated_delta_rule/gdr_chunk_fwd_output.cu
-    src/kernels/gated_delta_rule/gated_delta_rule_v2_bwd.cu
-    src/kernels/gated_delta_rule/gdr_chunk_checkpoint.cu
-    src/kernels/gated_delta_rule/gdr_chunk_bwd_phase1.cu
-    src/kernels/gated_delta_rule/gdr_chunk_bwd_phase2.cu
-    src/kernels/gated_delta_rule/gdr_chunk_bwd_phase3.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu
@@ -581,7 +576,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/kernels/test-classifier.cu
             src/testing/kernels/test-grad-clip.cu
             src/testing/kernels/test-multi-tensor-norm.cu
-            src/testing/kernels/test-gated-delta-rule.cu
+
 
             # Quantization
             src/testing/quantization/test-qlora.cu
@@ -602,6 +597,9 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # Models
             src/testing/models/test_pretrained_config.cpp
+
+            # JIT kernel loader
+            src/testing/jit/test-jit-kernel.cpp
 
             # Utilities
             src/testing/utilities/test-sol.cpp

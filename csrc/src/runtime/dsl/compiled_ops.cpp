@@ -344,7 +344,12 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
     , mGrads(grads)
     , mConfig(config)
     , mOptions(options)
-{}
+{
+    // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
+    if (!options.JitKernelManifests.empty()) {
+        mGdrKernels.load(options.JitKernelManifests);
+    }
+}
 
 CompiledExecutor::~CompiledExecutor() {
     // Free persistent GPU buffers
@@ -1050,156 +1055,6 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(
                 ensure_buffer(op.op_id + ".rstd", rstd_bytes);
             }
         }
-    }
-}
-
-void CompiledExecutor::prepare_gdr_buffers_for_capture(const CompiledGraph& capture_graph) {
-    long max_checkpoints_elems = 0;
-    long max_workspace_elems = 0;
-    long max_fwd_workspace_elems = 0;
-    std::vector<long> fwd_checkpoint_requirements;
-
-    constexpr long kWsAlignFloats = 128 / sizeof(float);
-    constexpr int kLp = 64;
-    auto align_up = [](long x, long align) { return ((x + align - 1) / align) * align; };
-
-    for (const auto& op : capture_graph.ops) {
-        if (op.type == CompiledOpType::ChunkGatedDeltaRule) {
-            // Forward op layout:
-            // [q, k, v, g, beta, initial_state(optional)]
-            if (op.inputs.size() < 5) {
-                continue;
-            }
-            const auto& q_shape = op.inputs[0].shape;
-            const auto& v_shape = op.inputs[2].shape;
-            if (q_shape.size() != 4 || v_shape.size() != 4) {
-                continue;
-            }
-            const long B = q_shape[0];
-            const long T = q_shape[1];
-            const long H = q_shape[2];
-            const long Kdim = q_shape[3];
-            const long Vdim = v_shape[3];
-            if (B <= 0 || T <= 0 || H <= 0 || Kdim <= 0 || Vdim <= 0) {
-                continue;
-            }
-            const int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
-            const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
-            const long checkpoints_elems =
-                B * H * static_cast<long>(num_chunks + 1) * Kdim * Vdim;
-            fwd_checkpoint_requirements.push_back(checkpoints_elems);
-            long fwd_ws_stride = 0;
-            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // u
-            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // w
-            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // k
-            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // vnew_pre
-            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // gcum
-            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats);
-            const long workspace_elems = B * H * static_cast<long>(num_chunks) * fwd_ws_stride;
-            max_fwd_workspace_elems = std::max(max_fwd_workspace_elems, workspace_elems);
-            continue;
-        }
-
-        if (op.type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
-            // Backward op layout:
-            // [d_out, d_final_state(optional), q, k, v, g, beta, initial_state(optional)]
-            if (op.inputs.size() < 7) {
-                continue;
-            }
-            const std::size_t q_idx = 2;
-            const std::size_t v_idx = 4;
-            if (op.inputs.size() <= v_idx) {
-                continue;
-            }
-            const auto& q_shape = op.inputs[q_idx].shape;
-            const auto& v_shape = op.inputs[v_idx].shape;
-            if (q_shape.size() != 4 || v_shape.size() != 4) {
-                continue;
-            }
-
-            const long B = q_shape[0];
-            const long T = q_shape[1];
-            const long H = q_shape[2];
-            const long Kdim = q_shape[3];
-            const long Vdim = v_shape[3];
-            if (B <= 0 || T <= 0 || H <= 0 || Kdim <= 0 || Vdim <= 0) {
-                continue;
-            }
-
-            const int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
-            const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
-            const long checkpoints_elems =
-                B * H * static_cast<long>(num_chunks + 1) * Kdim * Vdim;
-            max_checkpoints_elems = std::max(max_checkpoints_elems, checkpoints_elems);
-
-            const long c_storage_floats = Kdim * Kdim;
-            long chunk_ws_stride = 0;
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * kLp;    // M
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // W
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // VNEW
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // DU
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // DW
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // DQ
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // DK
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // DG
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // DB
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + Kdim * Vdim;                    // DHT1
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;               // C fp32
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                              // EG
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // K_NORM
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // INVQ
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // INVK
-            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                  // total stride
-            const long dh_storage_per_chunk = Kdim * Vdim;
-            const long multikernel_ws_size =
-                static_cast<long>(num_chunks) * chunk_ws_stride +
-                static_cast<long>(num_chunks) * dh_storage_per_chunk;
-            const long scalar_ws_stride =
-                static_cast<long>(chunk_size) * (4 * Kdim + 2 * Vdim + 2) +
-                static_cast<long>(2 * kLp * kLp);
-            const long workspace_size = std::max(multikernel_ws_size, scalar_ws_stride);
-            const long workspace_elems = B * H * workspace_size;
-            max_workspace_elems = std::max(max_workspace_elems, workspace_elems);
-        }
-    }
-
-    auto& scratch = mRunState.scratch();
-    if (!fwd_checkpoint_requirements.empty()) {
-        if (scratch.gdr_fwd_checkpoints.size() < fwd_checkpoint_requirements.size()) {
-            scratch.gdr_fwd_checkpoints.resize(fwd_checkpoint_requirements.size());
-        }
-        for (std::size_t i = 0; i < fwd_checkpoint_requirements.size(); ++i) {
-            const long required = fwd_checkpoint_requirements[i];
-            Tensor& slot = scratch.gdr_fwd_checkpoints[i];
-            if (!slot.Data ||
-                slot.DType != ETensorDType::FP32 ||
-                slot.nelem() < required) {
-                const std::string name = "gdr_fwd_checkpoints_" + std::to_string(i);
-                slot = mRunState.Allocator->allocate(
-                    ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE, {required});
-            }
-        }
-    }
-    if (max_fwd_workspace_elems > 0 &&
-        (!scratch.gdr_fwd_workspace.Data ||
-         scratch.gdr_fwd_workspace.DType != ETensorDType::FP32 ||
-         scratch.gdr_fwd_workspace.nelem() < max_fwd_workspace_elems)) {
-        scratch.gdr_fwd_workspace = mRunState.Allocator->allocate(
-            ETensorDType::FP32, "gdr_fwd_workspace", EAllocationType::ON_DEVICE, {max_fwd_workspace_elems});
-    }
-    if (max_checkpoints_elems > 0 &&
-        (!scratch.gdr_bwd_checkpoints.Data ||
-         scratch.gdr_bwd_checkpoints.DType != ETensorDType::FP32 ||
-         scratch.gdr_bwd_checkpoints.nelem() < max_checkpoints_elems)) {
-        scratch.gdr_bwd_checkpoints = mRunState.Allocator->allocate(
-            ETensorDType::FP32, "gdr_bwd_checkpoints", EAllocationType::ON_DEVICE, {max_checkpoints_elems});
-    }
-    if (max_workspace_elems > 0 &&
-        (!scratch.gdr_bwd_workspace.Data ||
-         scratch.gdr_bwd_workspace.DType != ETensorDType::FP32 ||
-         scratch.gdr_bwd_workspace.nelem() < max_workspace_elems)) {
-        scratch.gdr_bwd_workspace = mRunState.Allocator->allocate(
-            ETensorDType::FP32, "gdr_bwd_workspace", EAllocationType::ON_DEVICE, {max_workspace_elems});
     }
 }
 
@@ -2066,8 +1921,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mComm = &comm;
     mCurrentGraph = &graph;
     mTemps.clear();
-    mRunState.scratch().gdr_fwd_write_count = 0;
-    mRunState.scratch().gdr_fwd_read_count = 0;
     mMoEHostOffsetsCache.clear();
     // cudaFree and cudaMemPoolTrimTo are prohibited during CUDA stream capture —
     // they invalidate the capture. Skip all cleanup when capturing; it will run
@@ -2695,7 +2548,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
-    mRunState.scratch().gdr_fwd_read_count = 0;
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward

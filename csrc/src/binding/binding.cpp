@@ -8,6 +8,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/set.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/ndarray.h>
 
 #include <filesystem>
@@ -437,6 +438,7 @@ NB_MODULE(_surogate, m) {
         .def_rw("doc_masking", &RuntimeOptions::DocMasking, "Enable document-level attention masking for packed sequences.")
         .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Deprecated (DSL backend is always enabled).")
         .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
+        .def_rw("jit_kernel_manifests", &RuntimeOptions::JitKernelManifests, "JIT kernel manifests: maps kernel name -> manifest JSON path.")
         .def_rw("router_aux_loss_coef", &RuntimeOptions::RouterAuxLossCoef, "MoE aux loss coefficient (-1 = use model config).")
         .def_rw("router_z_loss_coef", &RuntimeOptions::RouterZLossCoef, "MoE z-loss coefficient (-1 = use model config).")
         .def_rw("ep_size", &RuntimeOptions::EPSize, "Expert parallelism size (1 = no EP, all experts replicated).")

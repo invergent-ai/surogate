@@ -64,7 +64,13 @@ class SurogateTrainerWrapper():
             dsl_extra["ep_size"] = config.ep_size
         ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
         config.runtime_config.dsl_ir_json = ir_json
-        
+
+        # Compile JIT kernels (e.g. gated delta rule Triton kernels)
+        from surogate.kernels.jit_compile import compile_jit_kernels
+        jit_manifests = compile_jit_kernels(ir_json)
+        if jit_manifests:
+            config.runtime_config.jit_kernel_manifests = jit_manifests
+
         # Setup data loaders / on-the-fly batcher
         self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
         self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
