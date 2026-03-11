@@ -55,6 +55,7 @@ class Qwen3_5AttentionBlock:
         self.AttnDim = self.Hq * self.D
         self.QProjDim = 2 * self.AttnDim
         self.KVDim = self.Hkv * self.D
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.MUp = 2 * self.M
         self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
 
@@ -85,6 +86,10 @@ class Qwen3_5AttentionBlock:
     ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"], share_policy="when_recomputed")
     ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
 
+    # QKV (concat of separate Q, K, V projections — declared for cross-layer sharing)
+    qkv = Activation(Tensor["B", "T", "QKV"], save=True, share_policy="when_recomputed")
+    qkv_rope = Activation(Tensor["B", "T", "QKV"], save=True, share_policy="when_recomputed")
+
     # Attention output (flash_attention)
     att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat"], save=True, share_policy="always_recompute")
     lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True, share_policy="always_recompute")
@@ -110,6 +115,8 @@ class Qwen3_5AttentionBlock:
     # =========================================================================
 
     d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
+    d_qkv = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv")
+    d_qkv_rope = Gradient(Tensor["B", "T", "QKV"], gradient_of="qkv_rope")
     d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
     d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
     d_mlp_up = Gradient(Tensor["B", "T", "MUp"], gradient_of="mlp_up")

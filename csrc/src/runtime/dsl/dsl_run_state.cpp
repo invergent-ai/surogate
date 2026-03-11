@@ -408,9 +408,20 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {out_size, V});
 
     // RoPE frequencies (if not using fused RoPE).
+    // For multimodal MRoPE models, position IDs can reference spatial positions beyond
+    // the training sequence length when vision data is present. Cap at 4x training
+    // sequence length as a reasonable upper bound for text-heavy training — this avoids
+    // massive allocations (e.g. Qwen3.5 MaxPositionEmbeddings=262144 → 256 MiB for T=2048).
+    // If vision training needs the full range, set SUROGATE_ROPE_MAX_SEQ to override.
     int max_seq_len = static_cast<int>(T);
     if (cfg.Rope.is_multimodal() && cfg.MaxPositionEmbeddings > max_seq_len) {
-        max_seq_len = cfg.MaxPositionEmbeddings;
+        const char* rope_max_env = std::getenv("SUROGATE_ROPE_MAX_SEQ");
+        if (rope_max_env) {
+            max_seq_len = std::max(max_seq_len, static_cast<int>(std::strtol(rope_max_env, nullptr, 10)));
+        } else {
+            // Cap at 4x training sequence length — sufficient for text + minor spatial offsets
+            max_seq_len = std::min(cfg.MaxPositionEmbeddings, max_seq_len * 4);
+        }
     }
     if (max_seq_len > 0) {
         const int head_size = cfg.head_size();
