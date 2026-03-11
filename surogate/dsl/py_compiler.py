@@ -1765,7 +1765,7 @@ def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
         result["shares_with"] = slot.shares_with
     if slot.save_for_backward:
         result["save_for_backward"] = True
-    if slot.share_policy and slot.share_policy != "when_recomputed":
+    if slot.share_policy and slot.share_policy != "per_layer":
         result["share_policy"] = slot.share_policy
     if slot.gradient_of:
         result["gradient_of"] = slot.gradient_of

@@ -548,6 +548,16 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             logger.warning(
                 f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!")
 
+        # Auto-tune lmhead_chunks for LoRA + recompute to reduce logit buffer memory.
+        # The output buffer is {B*T/chunks, V} in bf16 which can be >1 GiB with chunks=1.
+        if self.lora and self.recompute and self.lmhead_chunks == 1:
+            total_tokens = self.per_device_train_batch_size * self.sequence_len
+            for chunks in (8, 4, 2):
+                if total_tokens % chunks == 0:
+                    self.lmhead_chunks = chunks
+                    logger.info(f"Auto-setting lmhead_chunks={chunks} (LoRA+recompute memory optimization)")
+                    break
+
         self._validate_chunking_config()
         if self.offload_optimizer and not self.use_zero_copy:
             logger.warning(
