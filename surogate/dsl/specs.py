@@ -52,6 +52,7 @@ class SharePolicy(str, Enum):
     ALWAYS_SHARE = "always_share"     # Always share across layers (use with caution)
     FFT_SHARE = "fft_share"           # Share only in FFT mode (not LoRA)
     LORA_SHARE = "lora_share"         # Share only in LoRA mode (not FFT)
+    ALWAYS_RECOMPUTE = "always_recompute"  # Share whenever recompute is enabled
 
 
 @dataclass

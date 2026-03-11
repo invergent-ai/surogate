@@ -6,8 +6,8 @@ gradient_accumulation_steps: 4
 
 sample_packing: true
 sequence_len: 512
-gpus: 4
-ep_size: 4
+gpus: 1
+ep_size: 1
 ep_load_balance_threshold: 1.0
 
 max_steps: 20
@@ -16,6 +16,8 @@ learning_rate: 2e-4
 
 recipe: bf16
 lmhead_chunks: 8
+recompute:  false
+
 
 warmup_ratio: 0.1
 

@@ -451,7 +451,7 @@ class NemotronHAttentionBlock:
         recompute_from=["qkv_rope"],
         recompute_op="flash_attention",
         recompute_policy="fft_only",
-        share_policy="fft_share",
+        share_policy="always_recompute",
     )
     lse = Activation(
         Tensor["B", "Hq", "T"],
@@ -460,7 +460,7 @@ class NemotronHAttentionBlock:
         recompute=True,
         recompute_group="attn_fwd",
         recompute_policy="fft_only",
-        share_policy="fft_share",
+        share_policy="always_recompute",
     )
     att_out = Activation(
         Tensor["B", "T", "C"],

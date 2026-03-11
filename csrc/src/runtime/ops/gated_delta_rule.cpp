@@ -273,6 +273,15 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule(const CompiledOp& op) {
 }
 
 void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op) {
+    static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
+    if (debug_replay) {
+        fprintf(stderr, "[GDR_BWD] inputs=%zu outputs=%zu\n", op.inputs.size(), op.outputs.size());
+        for (std::size_t i = 0; i < op.inputs.size(); ++i) {
+            fprintf(stderr, "[GDR_BWD]   input[%zu] name='%s' slot=%d layer=%d tid=%d\n",
+                    i, op.inputs[i].name.c_str(), static_cast<int>(op.inputs[i].slot),
+                    op.inputs[i].layer_idx, op.inputs[i].tensor_id);
+        }
+    }
     if (!mGdrKernels.is_ready()) {
         throw std::runtime_error(
             "chunk_gated_delta_rule_backward: JIT Triton kernels not loaded.");
@@ -282,24 +291,33 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             "chunk_gated_delta_rule_backward: expected at least 7 inputs");
     }
 
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving d_out...\n");
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving d_final_state...\n");
     Tensor* d_final_state = nullptr;
     if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
         d_final_state = &resolve_tensor(op.inputs[1]);
     }
     const std::size_t offs = 2;
 
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving q...\n");
     Tensor& q = resolve_tensor(op.inputs[offs + 0]);
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving k...\n");
     Tensor& k = resolve_tensor(op.inputs[offs + 1]);
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving v...\n");
     Tensor& v = resolve_tensor(op.inputs[offs + 2]);
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving g_input...\n");
     Tensor& g_input = resolve_tensor(op.inputs[offs + 3]);
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving beta...\n");
     Tensor& beta = resolve_tensor(op.inputs[offs + 4]);
 
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving initial_state...\n");
     Tensor* initial_state = nullptr;
     if (op.inputs.size() > offs + 5 && !op.inputs[offs + 5].name.empty()) {
         initial_state = &resolve_tensor(op.inputs[offs + 5]);
     }
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] all inputs resolved, q.Data=%p\n", q.Data);
 
     const long B = q.Sizes[0];
     const long T = q.Sizes[1];

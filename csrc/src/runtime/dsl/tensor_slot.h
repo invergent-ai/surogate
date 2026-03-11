@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Pre-resolved tensor slot types for compiled operation dispatch.
-// This header is separated from compiled_ops.h to break circular dependencies
-// with tensor_slot_registry.h.
 
 #ifndef SUROGATE_SRC_DSL_TENSOR_SLOT_H
 #define SUROGATE_SRC_DSL_TENSOR_SLOT_H

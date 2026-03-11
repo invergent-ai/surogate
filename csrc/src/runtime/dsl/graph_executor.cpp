@@ -11,8 +11,6 @@
 #include "runtime/dsl/graph_executor_internal.h"
 #include "runtime/dsl/graph_executor_tensors.h"
 #include "runtime/dsl/graph_executor_utils.h"
-// RecomputePlan removed — forward replay (gradient checkpointing) is handled
-// directly via CompiledExecutor::replay_layer_forward.
 
 #include <algorithm>
 #include <cctype>

@@ -894,6 +894,19 @@ bool DslWeightLoader::parse_block_param(std::string_view name, int& layer_idx, s
         return true;
     }
 
+    // layer<idx>.field — HybridStackedBlocks naming convention
+    if (prefix.size() > 5 && prefix.substr(0, 5) == "layer") {
+        auto idx_str = prefix.substr(5);
+        if (idx_str.empty()) return false;
+        try {
+            layer_idx = std::stoi(std::string(idx_str));
+        } catch (...) {
+            return false;
+        }
+        param_name = std::string(rest);
+        return true;
+    }
+
     return false;
 }
 

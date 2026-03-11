@@ -266,13 +266,12 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
 
         Tensor& dst_ref = ensure_output_tensor(out_ref);
         Tensor dst = dst_ref;
-        if (dst.Rank != src.Rank) {
+        if (dst.Rank != src.Rank || dst.nelem() != src.nelem()) {
+            // Reallocate when shape doesn't match (happens in hybrid models where
+            // different block types share tensor_ids but have different dimensions)
             std::vector<long> shape(src.Sizes.begin(), src.Sizes.begin() + src.Rank);
             dst = mRunState.temp_alloc(src.DType, shape);
             mTemps.push_back(dst);
-        }
-        if (dst.nelem() != src.nelem()) {
-            throw std::runtime_error("mamba_gated_rmsnorm_backward: output shape mismatch for " + out_ref.name);
         }
 
         bool accumulate = false;

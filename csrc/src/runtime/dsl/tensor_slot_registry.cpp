@@ -338,22 +338,12 @@ bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mo
             return true;
 
         case SharePolicy::FFTShare:
-            // Share only in FFT mode (not LoRA mode) when recompute is enabled
-            // Useful for tensors that:
-            // - Are safe to share in FFT (no backward hooks need per-layer values)
-            // - Need per-layer in LoRA (LoRA hooks need original values per-layer)
-            // Example: attention output (att, lse) - LoRA O-proj hook needs per-layer att
             return recompute_enabled && !lora_only_mode;
 
         case SharePolicy::LoRAShare:
-            // Share only in LoRA mode (not FFT mode) when recompute is enabled
-            // Useful for tensors that:
-            // - LoRA can recompute during backward (hooks don't need saved values)
-            // - FFT needs saved per-layer for bit-exact gradients
             return recompute_enabled && lora_only_mode;
 
         case SharePolicy::AlwaysRecompute:
-            // Share whenever recompute is enabled, regardless of FFT/LoRA mode
             return recompute_enabled;
     }
 

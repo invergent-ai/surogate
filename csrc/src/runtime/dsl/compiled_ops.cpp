@@ -1936,6 +1936,10 @@ void CompiledExecutor::handle_layer_end(int layer_idx) {
 void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                                             const CompiledGraph& fwd_graph,
                                             const modules::ForwardHook* hook) {
+    static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
+    if (debug_replay) {
+        fprintf(stderr, "[REPLAY] replay_layer_forward layer=%d B=%ld T=%ld\n", layer_idx, B, T);
+    }
     // Restore any previous deferred checkpoint before starting a new replay
     if (mHasDeferredReplayCheckpoint) {
         mRunState.Stack.restore(mDeferredReplayCheckpoint);
@@ -2055,6 +2059,36 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                         resolved = mRunState.non_block_activations().freq_cis;
                     }
                 }
+
+                // Cross-layer connector tensors: "layerN.field" (used by HybridStackedBlocks)
+                // These are inter-block connectors with a neutral naming prefix to avoid
+                // the block-activation resolver. Resolve them the same way as blocks[N].field.
+                if (!resolved.Data && inp.name.rfind("layer", 0) == 0) {
+                    auto dot = inp.name.find('.');
+                    if (dot != std::string::npos) {
+                        try {
+                            int cross_lyr = std::stoi(inp.name.substr(5, dot - 5));
+                            std::string cross_field = strip_ssa_suffix(inp.name.substr(dot + 1));
+                            if (cross_field == "res_ffn" || cross_field == "residual_ffn" || cross_field == "res_in") {
+                                resolved = mRunState.get_residual(cross_lyr, mRunState.MainStream);
+                            } else {
+                                auto& acts = mRunState.simplified_acts(cross_lyr);
+                                if (cross_field == "out" || cross_field == "out_flat" ||
+                                    cross_field == "mlp_down" || cross_field == "mlp_down_flat") resolved = acts.mlp_down;
+                                else if (cross_field == "res_att" || cross_field == "residual_att") resolved = acts.residual_att;
+                                else if (cross_field == "att_out" || cross_field == "att_out_flat") resolved = acts.att_out;
+                                else if (cross_field == "ln1" || cross_field == "ln1_flat" ||
+                                         cross_field == "ln" || cross_field == "ln_flat") resolved = acts.ln1;
+                                else if (cross_field == "ln2" || cross_field == "ln2_flat") resolved = acts.ln2;
+                                else if (cross_field == "qkv" || cross_field == "qkv_norm") resolved = acts.qkv;
+                                else if (cross_field == "qkv_rope") resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+                                else if (cross_field == "att" || cross_field == "att_flat") resolved = acts.att;
+                                else if (cross_field == "mlp_up" || cross_field == "mlp_up_flat") resolved = acts.mlp_up;
+                                else if (cross_field == "swiglu") resolved = acts.swiglu;
+                            }
+                        } catch (...) {}
+                    }
+                }
             }
 
             // For layer 0 input: the "zeros" residual
@@ -2096,6 +2130,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     }
 
     // Replay the layer's forward ops
+    static const bool replay_debug_sync = std::getenv("SUROGATE_REPLAY_SYNC") != nullptr;
     for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
         const auto& op = fwd_graph.ops[idx];
 
@@ -2106,6 +2141,14 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
 
         try {
+            // Debug: sync after each op to pinpoint async CUDA errors
+            if (replay_debug_sync) {
+                cudaError_t pre_err = cudaGetLastError();
+                if (pre_err != cudaSuccess) {
+                    fprintf(stderr, "[REPLAY_SYNC] layer=%d op=%zu type=%s: pending error BEFORE dispatch: %s\n",
+                            layer_idx, idx - start, op_type_to_string(op.type), cudaGetErrorString(pre_err));
+                }
+            }
             switch (op.type) {
                 case CompiledOpType::Embedding:           dispatch_embedding(op); break;
                 case CompiledOpType::Zeros:               dispatch_zeros(op); break;
@@ -2160,6 +2203,9 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;
                 default: break;  // Skip unknown ops
             }
+            if (replay_debug_sync) {
+                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            }
         } catch (const std::exception& e) {
             std::ostringstream oss;
             oss << "replay_layer_forward layer=" << layer_idx
@@ -2172,9 +2218,12 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     // Persist replayed tensors into mSaved — save stack pointers directly (no D2D copy).
     // The stack will stay live until backward consumes the data.
     if (mSaved && mSaveList) {
-        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
         for (const auto& name : *mSaveList) {
-            if (name.rfind(prefix, 0) != 0) continue;
+            {
+                int lyr_check = -1;
+                std::string fld_check;
+                if (!parse_block_param(name, lyr_check, fld_check) || lyr_check != layer_idx) continue;
+            }
 
             // Try to find the tensor from the replayed forward graph
             int tid = fwd_graph.find_tensor_id(name);
@@ -2369,17 +2418,22 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // replay_layer_forward during backward. Save metadata only — no D2D copies needed.
     const bool forward_replay_active = recompute_enabled_flag && static_cast<bool>(mRecomputeFn);
 
+    auto name_belongs_to_layer = [](const std::string& name, int target_layer) -> bool {
+        int lyr = -1;
+        std::string fld;
+        return parse_block_param(name, lyr, fld) && lyr == target_layer;
+    };
+
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
         }
-        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
 
         // When forward replay is active, save metadata only for ALL block tensors.
         // Replay will regenerate them during backward.
         if (forward_replay_active) {
             for (const auto& name : *mSaveList) {
-                if (name.rfind(prefix, 0) != 0) continue;
+                if (!name_belongs_to_layer(name, layer_idx)) continue;
                 if (mSaved->find(name) != mSaved->end()) continue;
                 // Save an empty metadata entry — replay_layer_forward will fill in real data
                 Tensor meta{};
@@ -2449,7 +2503,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         int saved_count = 0;
         int recompute_count = 0;
         for (const auto& name : *mSaveList) {
-            if (name.rfind(prefix, 0) != 0) {
+            if (!name_belongs_to_layer(name, layer_idx)) {
                 continue;
             }
             if (mSaved->find(name) != mSaved->end()) {
@@ -3311,6 +3365,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     };
     const int num_layers = static_cast<int>(mConfig.NumLayers);
+    static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
     const char* op_profile_env = std::getenv("SUROGATE_OP_PROFILE");
@@ -3399,6 +3454,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
+                if (debug_replay) {
+                    fprintf(stderr, "[BWD] layer_start=%d for op %zu type=%s\n",
+                            layer_idx, idx, op_type_to_string(op.type));
+                }
                 if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
                     clear_shared_grads(layer_idx);
                     layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
@@ -3414,6 +3473,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             const int layer_idx_any = op_layer_idx_any(op);
             const int effective_layer_idx = (layer_idx >= 0) ? layer_idx : layer_idx_any;
             if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
+                if (debug_replay) {
+                    fprintf(stderr, "[BWD] op_layer_detect=%d (non_grad=%d any=%d) for op %zu type=%s\n",
+                            effective_layer_idx, layer_idx, layer_idx_any, idx, op_type_to_string(op.type));
+                }
                 if (effective_layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
                     clear_shared_grads(effective_layer_idx);
                     layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;

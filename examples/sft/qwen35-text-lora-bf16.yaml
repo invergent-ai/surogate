@@ -1,5 +1,5 @@
-model: Qwen/Qwen3.5-2B
-output_dir: ./output
+model: Qwen/Qwen3.5-0.8B
+output_dir: ./output_q35
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
@@ -7,8 +7,10 @@ gpus: 1
 
 sample_packing: true
 sequence_len: 2048
+recompute:  true
+use_cuda_graphs: false
 
-max_steps: 50
+max_steps: 5
 eval_steps: 25
 
 learning_rate: 2e-4

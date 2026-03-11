@@ -35,6 +35,10 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     int fwd_layer_idx = -1;
     std::string fwd_field;
     parse_block_param(op.inputs[2].name, fwd_layer_idx, fwd_field);
+    // Strip _eff suffix for matching (Qwen3.5 uses weight+1 pattern)
+    if (fwd_field.size() > 4 && fwd_field.compare(fwd_field.size() - 4, 4, "_eff") == 0) {
+        fwd_field = fwd_field.substr(0, fwd_field.size() - 4);
+    }
 
     const bool is_ln2_fwd = (fwd_layer_idx >= 0 && fwd_field.find("ln2") != std::string::npos);
     const bool is_hybrid_norm = (fwd_layer_idx >= 0 &&
@@ -86,6 +90,37 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
             << dtype_to_str(rstd.DType) << ". Output tensor: " << op.outputs[2].name
             << " (slot=" << static_cast<int>(op.outputs[2].slot) << ")";
         throw std::runtime_error(oss.str());
+    }
+
+    // During replay, the LN1/hybrid fused_residual_rmsnorm cannot correctly reconstruct
+    // the residual from its components (res_att[K-1] + mlp_down[K-1]) because those live
+    // in shared buffers that contain the last layer's values. Instead, use the correct
+    // per-layer residual from ResidualManager as the residual input, with a zero "input"
+    // so the kernel computes: residual_out = stored_res + 0 = stored_res, y = rmsnorm(stored_res).
+    // This applies to both standard LN1 (dense models) and hybrid norm (Nemotron-H).
+    if (mInReplay && !is_ln2_fwd && !is_hybrid_norm && fwd_layer_idx >= 0) {
+        Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
+        if (stored_res_ffn.Data) {
+            // Use stored residual as residual_in, zero out input
+            Tensor zero_input = mRunState.temp_alloc(input.DType,
+                std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank));
+            mTemps.push_back(zero_input);
+            fill_zero(zero_input, mRunState.MainStream);
+            // Debug: validate tensor pointers before kernel call
+            static const bool replay_dbg = std::getenv("SUROGATE_REPLAY_SYNC") != nullptr;
+            if (replay_dbg) {
+                fprintf(stderr, "[REPLAY_BYPASS] layer=%d N=%d C=%d res_out=%p y=%p rstd=%p stored=%p zero=%p weight=%p"
+                        " res_out.nelem=%ld stored.nelem=%ld y.nelem=%ld rstd.nelem=%ld weight.nelem=%ld\n",
+                        fwd_layer_idx, static_cast<int>(mB * mT), mConfig.HiddenSize,
+                        (void*)residual_out.Data, (void*)y.Data, (void*)rstd.Data,
+                        (void*)stored_res_ffn.Data, (void*)zero_input.Data, (void*)weight.Data,
+                        residual_out.nelem(), stored_res_ffn.nelem(), y.nelem(), rstd.nelem(), weight.nelem());
+            }
+            fused_residual_rmsnorm_forward(residual_out, y, rstd, stored_res_ffn, zero_input, weight, nullptr,
+                                           op.attrs.eps, static_cast<int>(mB * mT),
+                                           mConfig.HiddenSize, mRunState.MainStream);
+            return;
+        }
     }
 
     fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
@@ -155,6 +190,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     std::string ln_field;
     if (!op.inputs[3].name.empty()) {
         parse_block_param(op.inputs[3].name, ln_layer_idx, ln_field);
+    }
+    // Strip _eff suffix from weight name for matching (Qwen3.5 uses weight+1 pattern
+    // producing "ln1_weight_eff", "ln2_weight_eff" etc.)
+    if (ln_field.size() > 4 && ln_field.compare(ln_field.size() - 4, 4, "_eff") == 0) {
+        ln_field = ln_field.substr(0, ln_field.size() - 4);
     }
     if (ln_layer_idx >= 0 && ln_field == "ln1_weight") {
         if (mRunState.has_residual_offloading()) {

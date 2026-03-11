@@ -583,6 +583,7 @@ class Activation:
             "always_share": SharePolicy.ALWAYS_SHARE,
             "fft_share": SharePolicy.FFT_SHARE,
             "lora_share": SharePolicy.LORA_SHARE,
+            "always_recompute": SharePolicy.ALWAYS_RECOMPUTE,
         }
         share_policy_enum = share_policy_map.get(self.share_policy, SharePolicy.WHEN_RECOMPUTED)
 
