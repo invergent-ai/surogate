@@ -636,10 +636,21 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(
     }
 
     const bool recompute_enabled = mRecomputeEnabled;
+    // When forward replay is active, ALL block tensors will be regenerated
+    // by replay_layer_forward during backward — no persistent buffers needed.
+    const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
         if (!recompute_enabled || !mSlotRegistry) {
             return false;
+        }
+        // Forward replay: all block tensors are replayed, no persistent save needed
+        if (forward_replay_active) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(tensor_name, layer_idx, field)) {
+                return true;
+            }
         }
         const bool lora_only_mode = mRunState.is_lora_only_mode();
         int layer_idx = -1;
@@ -1072,6 +1083,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     // Recompute is only active when explicitly enabled for this execution.
     // This gate is set by GraphExecutor after validating runtime options + plan.
     const bool recompute_enabled = mRecomputeEnabled;
+    const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
         if (force_persist) {
@@ -1080,16 +1092,16 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (!recompute_enabled || !mSlotRegistry) {
             return false;
         }
-        // Use will_recompute which checks the recompute_policy
-        // In FFT mode (!lora_only), tensors with lora_only policy should NOT prefer live
-        // because they won't be recomputed and the live buffer may have stale data
         const bool lora_only_mode = mRunState.is_lora_only_mode();
         int layer_idx = -1;
         std::string field;
         if (parse_block_param(tensor_name, layer_idx, field)) {
+            // When forward replay is active, ALL block tensors will be regenerated
+            if (forward_replay_active) {
+                return true;
+            }
             return mSlotRegistry->will_recompute(strip_ssa_suffix(field), lora_only_mode);
         }
-        const std::string base_name = strip_ssa_suffix(tensor_name);
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
@@ -1914,6 +1926,318 @@ void CompiledExecutor::handle_layer_end(int layer_idx) {
 }
 
 
+// ---------------------------------------------------------------------------
+// replay_layer_forward — torch-style gradient checkpointing
+//
+// Re-execute a single layer's compiled forward ops during backward to
+// regenerate activations. The data lives on the stack; the caller (backward)
+// must restore the stack checkpoint after consuming the data.
+// ---------------------------------------------------------------------------
+void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
+                                            const CompiledGraph& fwd_graph,
+                                            const modules::ForwardHook* hook) {
+    // Restore any previous deferred checkpoint before starting a new replay
+    if (mHasDeferredReplayCheckpoint) {
+        mRunState.Stack.restore(mDeferredReplayCheckpoint);
+        if (mTemps.size() > mDeferredReplayTempMark) {
+            mTemps.resize(mDeferredReplayTempMark);
+        }
+        mHasDeferredReplayCheckpoint = false;
+    }
+
+    // Save current execution state
+    const CompiledGraph* saved_graph = mCurrentGraph;
+    std::vector<Tensor> saved_tensors;
+    std::unordered_map<std::string, Tensor> saved_named_tensors;
+    saved_tensors.swap(mTensors);
+    saved_named_tensors.swap(mNamedTensors);
+
+    // Set replay mode
+    mInReplay = true;
+    mReplayLayerIdx = layer_idx;
+
+    // Initialize fresh tensor storage for the forward graph
+    mCurrentGraph = &fwd_graph;
+    mTensors.assign(static_cast<std::size_t>(fwd_graph.num_tensors), Tensor{});
+    mNamedTensors.clear();
+
+    // Bind known inputs
+    bind_tensor("token_ids", mRunState.Inputs);
+    bind_tensor("position_ids", mRunState.PositionIDs);
+    if (mRunState.VisualPosMasks.Data) {
+        bind_tensor("visual_pos_masks", mRunState.VisualPosMasks);
+    }
+    if (mRunState.VisualEmbeds.Data) {
+        bind_tensor("visual_embeds", mRunState.VisualEmbeds);
+    }
+    bind_tensor("x0", mRunState.non_block_activations().encoded);
+
+    // Take stack checkpoint — backward will restore this after consuming replay data
+    auto replay_checkpoint = mRunState.Stack.checkpoint();
+    auto replay_temp_mark = mTemps.size();
+
+    // Find the op range for this layer
+    if (layer_idx < 0 ||
+        static_cast<std::size_t>(layer_idx) >= fwd_graph.layer_start_indices.size() ||
+        fwd_graph.layer_start_indices[static_cast<std::size_t>(layer_idx)] == SIZE_MAX) {
+        // Layer not found in forward graph — restore state and return
+        mTensors.swap(saved_tensors);
+        mNamedTensors.swap(saved_named_tensors);
+        mCurrentGraph = saved_graph;
+        mInReplay = false;
+        mReplayLayerIdx = -1;
+        return;
+    }
+
+    const std::size_t start = fwd_graph.layer_start_indices[static_cast<std::size_t>(layer_idx)];
+    const std::size_t end = (static_cast<std::size_t>(layer_idx) < fwd_graph.layer_end_indices.size())
+                                ? fwd_graph.layer_end_indices[static_cast<std::size_t>(layer_idx)]
+                                : fwd_graph.ops.size();
+
+    // Collect tensor IDs produced within this layer's op range
+    std::unordered_set<int> produced_ids;
+    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+        for (const auto& out : fwd_graph.ops[idx].outputs) {
+            if (out.tensor_id >= 0) {
+                produced_ids.insert(out.tensor_id);
+            }
+        }
+    }
+
+    // Pre-bind external inputs: tensors consumed by this layer but produced before it.
+    // These include the layer's input residual, previous block outputs, RoPE freqs, etc.
+    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+        for (const auto& inp : fwd_graph.ops[idx].inputs) {
+            if (inp.tensor_id < 0) continue;
+            if (produced_ids.count(inp.tensor_id)) continue;
+            // Already bound?
+            if (static_cast<std::size_t>(inp.tensor_id) < mTensors.size() && mTensors[inp.tensor_id].Data) continue;
+
+            // Try to resolve from known sources
+            Tensor resolved{};
+
+            // Check slot type first
+            switch (inp.slot) {
+                case TensorSlot::FreqCis:
+                    resolved = mRunState.non_block_activations().freq_cis;
+                    break;
+                case TensorSlot::Encoded:
+                    resolved = mRunState.non_block_activations().encoded;
+                    break;
+                case TensorSlot::TokenIDs:
+                    resolved = mRunState.Inputs;
+                    break;
+                case TensorSlot::PositionIDs:
+                    resolved = mRunState.PositionIDs;
+                    break;
+                default:
+                    break;
+            }
+
+            // If not resolved by slot, try by name
+            if (!resolved.Data && !inp.name.empty()) {
+                int lyr = -1;
+                std::string field;
+                if (parse_block_param(inp.name, lyr, field)) {
+                    const std::string base = strip_ssa_suffix(field);
+                    if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
+                        resolved = mRunState.get_residual(lyr, mRunState.MainStream);
+                    } else {
+                        auto& acts = mRunState.simplified_acts(lyr);
+                        if (base == "mlp_down" || base == "mlp_down_flat") resolved = acts.mlp_down;
+                        else if (base == "res_att" || base == "residual_att") resolved = acts.residual_att;
+                        else if (base == "att_out" || base == "att_out_flat") resolved = acts.att_out;
+                    }
+                } else {
+                    // Global tensors by name
+                    if (inp.name.find("freq_cis") != std::string::npos ||
+                        inp.name.find("rope_freqs") != std::string::npos) {
+                        resolved = mRunState.non_block_activations().freq_cis;
+                    }
+                }
+            }
+
+            // For layer 0 input: the "zeros" residual
+            if (!resolved.Data && !inp.name.empty() && inp.name.find("zeros") != std::string::npos) {
+                // Allocate a zeros tensor on stack for the initial residual
+                long C = static_cast<long>(mConfig.HiddenSize);
+                resolved = mRunState.temp_alloc(ETensorDType::BF16, {mB, mT, C});
+                fill_zero(resolved, mRunState.MainStream);
+            }
+
+            // Embedding output (embed_1, embed_0, etc.)
+            if (!resolved.Data && !inp.name.empty() && inp.name.find("embed") != std::string::npos) {
+                resolved = mRunState.non_block_activations().encoded;
+            }
+
+            // Last resort: check mSaved (forward saved tensors)
+            if (!resolved.Data && mSaved && !inp.name.empty()) {
+                auto it = mSaved->find(inp.name);
+                if (it != mSaved->end() && it->second.Data) {
+                    resolved = it->second;
+                }
+            }
+
+            // Very last resort: check backward graph's named tensors
+            if (!resolved.Data && !inp.name.empty()) {
+                auto it = saved_named_tensors.find(inp.name);
+                if (it != saved_named_tensors.end() && it->second.Data) {
+                    resolved = it->second;
+                }
+            }
+
+            if (resolved.Data) {
+                store_tensor(inp, resolved);
+                if (!inp.name.empty()) {
+                    mNamedTensors[inp.name] = resolved;
+                }
+            }
+        }
+    }
+
+    // Replay the layer's forward ops
+    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+        const auto& op = fwd_graph.ops[idx];
+
+        // Skip loss ops — these should never be replayed
+        if (op.type == CompiledOpType::CrossEntropyLoss ||
+            op.type == CompiledOpType::FusedLMHeadLoss) {
+            continue;
+        }
+
+        try {
+            switch (op.type) {
+                case CompiledOpType::Embedding:           dispatch_embedding(op); break;
+                case CompiledOpType::Zeros:               dispatch_zeros(op); break;
+                case CompiledOpType::Ones:                dispatch_ones(op); break;
+                case CompiledOpType::FusedResidualRMSNorm: dispatch_fused_residual_rmsnorm(op); break;
+                case CompiledOpType::LayerNorm:           dispatch_layernorm(op); break;
+                case CompiledOpType::View:                dispatch_view(op); break;
+                case CompiledOpType::Transpose:           dispatch_transpose(op); break;
+                case CompiledOpType::Split:               dispatch_split(op); break;
+                case CompiledOpType::Concat:              dispatch_concat(op); break;
+                case CompiledOpType::Add:                 dispatch_add(op); break;
+                case CompiledOpType::Matmul:
+                case CompiledOpType::MatmulBias:          dispatch_matmul(op, hook); break;
+                case CompiledOpType::BiasAdd:             dispatch_bias_add(op); break;
+                case CompiledOpType::SwiGLU:              dispatch_swiglu(op); break;
+                case CompiledOpType::GptOssMoeAct:        dispatch_gpt_oss_moe_act(op); break;
+                case CompiledOpType::Silu:                dispatch_silu(op); break;
+                case CompiledOpType::Gelu:                dispatch_gelu(op); break;
+                case CompiledOpType::Relu2:               dispatch_relu2(op); break;
+                case CompiledOpType::Mul:                 dispatch_mul(op); break;
+                case CompiledOpType::MaskScatter:         dispatch_mask_scatter(op); break;
+                case CompiledOpType::DeepstackInject:     dispatch_deepstack_inject(op); break;
+                case CompiledOpType::MatmulSwiGLU:        dispatch_matmul_swiglu(op, hook); break;
+                case CompiledOpType::QKVQKNorm:           dispatch_qkv_qk_norm(op); break;
+                case CompiledOpType::QKVQKNormRoPE:       dispatch_qkv_qk_norm_rope(op); break;
+                case CompiledOpType::MRoPE:               dispatch_mrope(op); break;
+                case CompiledOpType::RoPE:                dispatch_rope(op); break;
+                case CompiledOpType::FlashAttention:       dispatch_flash_attention(op); break;
+                // MoE operations
+                case CompiledOpType::MoESoftmax:          dispatch_moe_softmax(op); break;
+                case CompiledOpType::MoESigmoid:          dispatch_moe_sigmoid(op); break;
+                case CompiledOpType::MoETopK:             dispatch_moe_topk(op); break;
+                case CompiledOpType::MoEPermute:          dispatch_moe_permute(op); break;
+                case CompiledOpType::MoEGroupedGemm:      dispatch_moe_grouped_gemm(op); break;
+                case CompiledOpType::MoEGroupedGemmGateUp: dispatch_moe_grouped_gemm_gate_up(op); break;
+                case CompiledOpType::MoEGroupedGemmDown:  dispatch_moe_grouped_gemm_down(op); break;
+                case CompiledOpType::MoEUnpermute:        dispatch_moe_unpermute(op); break;
+                case CompiledOpType::MoEExpertBiasAdd:    dispatch_moe_expert_bias_add(op); break;
+                // EP operations
+                case CompiledOpType::EpDispatch:          dispatch_ep_dispatch(op); break;
+                case CompiledOpType::EpCombine:           dispatch_ep_combine(op); break;
+                // Mamba/SSM operations
+                case CompiledOpType::MambaSplitProj:      dispatch_mamba_split_proj(op); break;
+                case CompiledOpType::MambaConv1d:         dispatch_mamba_conv1d(op); break;
+                case CompiledOpType::MambaSplitConvOut:   dispatch_mamba_split_conv_out(op); break;
+                case CompiledOpType::MambaSsmScan:        dispatch_mamba_ssm_scan(op); break;
+                case CompiledOpType::MambaGatedRMSNorm:   dispatch_mamba_gated_rmsnorm(op); break;
+                case CompiledOpType::MambaOutProj:        dispatch_mamba_out_proj(op, hook); break;
+                // Qwen3.5 gated delta rule
+                case CompiledOpType::ChunkGatedDeltaRule: dispatch_chunk_gated_delta_rule(op); break;
+                case CompiledOpType::Qwen3_5Decay:        dispatch_qwen3_5_decay(op); break;
+                case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;
+                default: break;  // Skip unknown ops
+            }
+        } catch (const std::exception& e) {
+            std::ostringstream oss;
+            oss << "replay_layer_forward layer=" << layer_idx
+                << " op=" << (idx - start) << " (type=" << op_type_to_string(op.type)
+                << "): " << e.what();
+            throw std::runtime_error(oss.str());
+        }
+    }
+
+    // Persist replayed tensors into mSaved — save stack pointers directly (no D2D copy).
+    // The stack will stay live until backward consumes the data.
+    if (mSaved && mSaveList) {
+        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+        for (const auto& name : *mSaveList) {
+            if (name.rfind(prefix, 0) != 0) continue;
+
+            // Try to find the tensor from the replayed forward graph
+            int tid = fwd_graph.find_tensor_id(name);
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
+                (*mSaved)[name] = mTensors[tid];
+                continue;
+            }
+            // Try SSA-stripped lookup
+            auto ssa_it = fwd_graph.ssa_base_to_id.find(name);
+            if (ssa_it != fwd_graph.ssa_base_to_id.end()) {
+                int sid = ssa_it->second;
+                if (sid >= 0 && static_cast<std::size_t>(sid) < mTensors.size() && mTensors[sid].Data) {
+                    (*mSaved)[name] = mTensors[sid];
+                    continue;
+                }
+            }
+            // Fallback: resolve from simplified_acts (for tensors that live in pre-allocated buffers)
+            int lyr = -1;
+            std::string field;
+            if (parse_block_param(name, lyr, field)) {
+                const std::string base = strip_ssa_suffix(field);
+                auto& acts = mRunState.simplified_acts(lyr);
+                Tensor resolved{};
+                if (base == "ln1_rstd" || base == "ln_rstd") resolved = acts.ln1_rstd;
+                else if (base == "ln2_rstd") resolved = acts.ln2_rstd;
+                else if (base == "q_rstd") resolved = acts.q_rstd;
+                else if (base == "k_rstd") resolved = acts.k_rstd;
+                else if (base == "lse") resolved = acts.lse;
+                else if (base == "att" || base == "att_flat") resolved = acts.att;
+                else if (base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat") resolved = acts.ln1;
+                else if (base == "ln2" || base == "ln2_flat") resolved = acts.ln2;
+                else if (base == "qkv" || base == "qkv_norm") resolved = acts.qkv;
+                else if (base == "qkv_rope") resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+                else if (base == "att_out" || base == "att_out_flat") resolved = acts.att_out;
+                else if (base == "mlp_up" || base == "mlp_up_flat") resolved = acts.mlp_up;
+                else if (base == "swiglu") resolved = acts.swiglu;
+                else if (base == "mlp_down" || base == "mlp_down_flat") resolved = acts.mlp_down;
+                else if (base == "res_att" || base == "residual_att") resolved = acts.residual_att;
+                else if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
+                    resolved = mRunState.get_residual(lyr, mRunState.MainStream);
+                }
+                if (resolved.Data) {
+                    (*mSaved)[name] = resolved;
+                }
+            }
+        }
+    }
+
+    // Restore tensor storage — backward graph uses its own namespace
+    mTensors.swap(saved_tensors);
+    mNamedTensors.swap(saved_named_tensors);
+    mCurrentGraph = saved_graph;
+    mInReplay = false;
+    mReplayLayerIdx = -1;
+
+    // Defer stack restore — backward ops will read from stack pointers in mSaved.
+    // The stack checkpoint will be restored before the next replay or at end of backward.
+    mHasDeferredReplayCheckpoint = true;
+    mDeferredReplayCheckpoint = replay_checkpoint;
+    mDeferredReplayTempMark = replay_temp_mark;
+}
+
+
 void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
@@ -2041,11 +2365,29 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
+    // When forward replay is active, ALL block tensors will be regenerated by
+    // replay_layer_forward during backward. Save metadata only — no D2D copies needed.
+    const bool forward_replay_active = recompute_enabled_flag && static_cast<bool>(mRecomputeFn);
+
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
         }
         const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+
+        // When forward replay is active, save metadata only for ALL block tensors.
+        // Replay will regenerate them during backward.
+        if (forward_replay_active) {
+            for (const auto& name : *mSaveList) {
+                if (name.rfind(prefix, 0) != 0) continue;
+                if (mSaved->find(name) != mSaved->end()) continue;
+                // Save an empty metadata entry — replay_layer_forward will fill in real data
+                Tensor meta{};
+                (*mSaved)[name] = meta;
+            }
+            return;
+        }
+
         auto resolve_saved_source = [&](const std::string& name) -> std::optional<Tensor> {
             // Prefer exact match from the flat tensor vector (O(1) lookup).
             if (mCurrentGraph) {
@@ -3070,14 +3412,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         if (mRecomputeEnabled && mRecomputeFn) {
             const int layer_idx = op_layer_idx(op);
             const int layer_idx_any = op_layer_idx_any(op);
-            // Always recompute when switching layers. This is critical because:
-            // - Shared buffers (ln1, ln2, qkv, mlp_up, swiglu) contain only ONE layer's data
-            // - If the backward graph interleaves ops from different layers, we MUST
-            //   recompute to ensure the correct layer's data is in the shared buffers
-            // - The old check (missing_start || op_before_start) would skip recomputation
-            //   for layer N's late ops if we had already visited layer N earlier, causing
-            //   those ops to read stale data from whatever layer was recomputed last
-            // Use layer_idx_any as fallback when layer_idx is -1
             const int effective_layer_idx = (layer_idx >= 0) ? layer_idx : layer_idx_any;
             if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
                 if (effective_layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
@@ -3452,6 +3786,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (op_profile) {
         if (op_profile_start) cudaEventDestroy(op_profile_start);
         if (op_profile_end) cudaEventDestroy(op_profile_end);
+    }
+
+    // Restore any deferred replay checkpoint before final cleanup
+    if (mHasDeferredReplayCheckpoint) {
+        mRunState.Stack.restore(mDeferredReplayCheckpoint);
+        if (mTemps.size() > mDeferredReplayTempMark) {
+            mTemps.resize(mDeferredReplayTempMark);
+        }
+        mHasDeferredReplayCheckpoint = false;
     }
 
     // Final cleanup - pass -1 to allow full pruning (backward complete)

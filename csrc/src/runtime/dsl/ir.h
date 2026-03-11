@@ -123,11 +123,12 @@ enum class ActivationMemoryHint : std::uint8_t {
 /// to reduce memory usage. The policy determines when sharing is safe based on
 /// the recompute strategy and training mode (FFT vs LoRA).
 enum class SharePolicy : std::uint8_t {
-    PerLayer,        ///< Always allocate per-layer (no sharing)
-    WhenRecomputed,  ///< Share when slot will be recomputed in backward (default)
-    AlwaysShare,     ///< Always share across layers (use with caution)
-    FFTShare,        ///< Share only in FFT mode (not LoRA)
-    LoRAShare,       ///< Share only in LoRA mode (not FFT)
+    PerLayer,          ///< Always allocate per-layer (no sharing)
+    WhenRecomputed,    ///< Share when slot will be recomputed in backward (default)
+    AlwaysShare,       ///< Always share across layers (use with caution)
+    FFTShare,          ///< Share only in FFT mode (not LoRA)
+    LoRAShare,         ///< Share only in LoRA mode (not FFT)
+    AlwaysRecompute,   ///< Share whenever recompute is enabled (regardless of mode)
 };
 
 /// @brief Specification for a single activation tensor slot

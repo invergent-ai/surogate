@@ -114,8 +114,8 @@ class LlamaBlock:
         recompute_op="flash_attention",
         recompute_attrs={"attn_impl": "cudnn"},
         recompute_policy="fft_only",
-        # Share only in FFT mode - LoRA O-proj hook needs per-layer att values
-        share_policy="fft_share",
+        # Share whenever recompute is enabled — replay will regenerate
+        share_policy="always_recompute",
         description="Attention output (pre out-proj)",
     )
     lse = Activation(
@@ -125,8 +125,8 @@ class LlamaBlock:
         recompute=True,
         recompute_group="attn_fwd",
         recompute_policy="fft_only",
-        # Share only in FFT mode - needed per-layer for attention backward in LoRA
-        share_policy="fft_share",
+        # Share whenever recompute is enabled — replay will regenerate
+        share_policy="always_recompute",
         description="Log-sum-exp from flash attention",
     )
     att_out = Activation(

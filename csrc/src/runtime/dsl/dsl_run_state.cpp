@@ -693,9 +693,9 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     // computed and consumed immediately, not stored across layers).
     //
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
-    const bool share_grads = false;
-    const bool share_res_ffn = false;
-    const bool share_mlp_down = false;
+    const bool share_grads = recompute_enabled;
+    const bool share_res_ffn = false;  // ResidualManager manages these
+    const bool share_mlp_down = recompute_enabled;
     const bool large_bwd_temps_on_stack = recompute_enabled;
 
     if (mStackSimulate && large_bwd_temps_on_stack) {

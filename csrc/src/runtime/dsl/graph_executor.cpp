@@ -11,7 +11,8 @@
 #include "runtime/dsl/graph_executor_internal.h"
 #include "runtime/dsl/graph_executor_tensors.h"
 #include "runtime/dsl/graph_executor_utils.h"
-#include "runtime/dsl/recompute_plan.h"
+// RecomputePlan removed — forward replay (gradient checkpointing) is handled
+// directly via CompiledExecutor::replay_layer_forward.
 
 #include <algorithm>
 #include <cctype>
@@ -550,13 +551,6 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
         mForwardPlan.resize(static_cast<std::size_t>(mConfig.NumLayers));
     }
 
-    // Initialize recompute plan from DSL activation layout (if present)
-    mRecomputePlan.reset();
-    if (mModule.activation_layout.has_value()) {
-        mRecomputePlan = std::make_unique<RecomputePlan>();
-        mRecomputePlan->init_from_layout(mModule.activation_layout.value(), mModule.config, mConfig);
-    }
-
     // Initialize compiled execution
     init_compiled_execution();
 }
@@ -624,7 +618,9 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_hook_context(mHookContext);
     mCompiledExecutor->set_recompute_fn(
         [this](int layer_idx, long B, long T, bool /*use_graph*/) {
-            recompute_block(layer_idx, B, T);
+            if (mCompiledForward) {
+                mCompiledExecutor->replay_layer_forward(layer_idx, B, T, *mCompiledForward, nullptr);
+            }
         });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
     mCompiledExecutor->set_fp8_cache_transposed(&mFP8WeightCacheT);
@@ -764,7 +760,7 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mGraphT = T;
     }
     const bool recompute_active =
-        mOptions.recompute_enabled() && mRecomputePlan && !mRecomputePlan->empty();
+        mOptions.recompute_enabled() && mCompiledForward != nullptr;
     mCompiledExecutor->set_recompute_enabled(recompute_active);
     const bool capturing = use_graphs && mForwardGraph == nullptr;
     if (!use_graphs || capturing) {
@@ -853,7 +849,7 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
         mGraphT = T;
     }
     const bool recompute_active =
-        mOptions.recompute_enabled() && mRecomputePlan && !mRecomputePlan->empty();
+        mOptions.recompute_enabled() && mCompiledForward != nullptr;
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
     if (capturing) {

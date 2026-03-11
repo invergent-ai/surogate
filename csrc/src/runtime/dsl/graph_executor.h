@@ -45,7 +45,6 @@ class CompiledExecutor;
 struct CompiledGraph;
 struct FP8WeightCacheEntry;
 struct FP4WeightCacheEntry;
-class RecomputePlan;
 }
 
 namespace dsl {
@@ -210,7 +209,6 @@ public:
     void set_inv_temperature_context(const float* inv_temperature_gpu);
 
 private:
-    friend class RecomputePlan;
     void init(const GraphExecutorOptions& options);
     void reset_cuda_graphs();
     void reset_forward_plan();
@@ -270,7 +268,6 @@ private:
     Tensor mLastInputsCpu{};
     bool mFP8ScalingInitialized = false;
     std::vector<LayerForwardPlan> mForwardPlan;
-    std::unique_ptr<RecomputePlan> mRecomputePlan;
 
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
@@ -337,12 +334,6 @@ private:
 
     // Per-layer CUDA graph execution (more granular than whole-graph capture)
     bool mPerLayerGraphsEnabled = false;
-
-    // ========================================================================
-    // DSL-driven recomputation (plan-based)
-    // ========================================================================
-    // Execute full block recomputation (both segments)
-    void recompute_block(int layer_idx, long B, long T);
 
     // ========================================================================
     // Compiled execution (operations pre-compiled into direct function calls)

@@ -351,6 +351,10 @@ bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mo
             // - LoRA can recompute during backward (hooks don't need saved values)
             // - FFT needs saved per-layer for bit-exact gradients
             return recompute_enabled && lora_only_mode;
+
+        case SharePolicy::AlwaysRecompute:
+            // Share whenever recompute is enabled, regardless of FFT/LoRA mode
+            return recompute_enabled;
     }
 
     // Fallback (should not reach here)

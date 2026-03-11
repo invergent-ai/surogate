@@ -83,6 +83,15 @@ public:
                          bool full,
                          const modules::ForwardHook* hook);
 
+    // Replay a single layer's forward ops to regenerate activations for backward.
+    // This is the torch-style gradient checkpointing: save only the layer input (residual),
+    // discard intermediates during forward, replay forward during backward.
+    // After this call, stack contains the replayed data. The caller must restore the stack
+    // after backward ops consume the data.
+    void replay_layer_forward(int layer_idx, long B, long T,
+                              const CompiledGraph& fwd_graph,
+                              const modules::ForwardHook* hook);
+
     // Execute a compiled backward graph
     // When skip_zeroing is true, gradient buffers are assumed to already be zeroed by the caller
     // (e.g., GraphExecutor::backward_with_hook zeros them before calling execute_backward).
@@ -376,6 +385,14 @@ private:
     int mCurrentLayer = -1;
     int mPrefetchDirection = 1;  // +1 for forward, -1 for backward
     bool mCapturing = false;
+    bool mInReplay = false;       ///< True during replay_layer_forward
+    int mReplayLayerIdx = -1;     ///< Layer being replayed
+
+    // Deferred stack checkpoint from replay_layer_forward.
+    // Stack restore is deferred until backward ops consume the replay data.
+    bool mHasDeferredReplayCheckpoint = false;
+    DeviceMemoryStack::Checkpoint mDeferredReplayCheckpoint{};
+    std::size_t mDeferredReplayTempMark = 0;
 
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;

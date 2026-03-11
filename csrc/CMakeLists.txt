@@ -278,7 +278,6 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/graph_executor_weight_cache.cpp
     src/runtime/dsl/graph_executor_backward.cpp
     src/runtime/dsl/graph_executor_helpers.cpp
-    src/runtime/dsl/recompute_plan.cpp
     src/runtime/dsl/compiled_ops.cpp
     src/runtime/dsl/graph_compiler.cpp
     src/runtime/dsl/weight_mapping.cpp

@@ -218,6 +218,7 @@ SharePolicy parse_share_policy(const std::string& policy_str) {
     if (policy_str == "always_share") return SharePolicy::AlwaysShare;
     if (policy_str == "fft_share") return SharePolicy::FFTShare;
     if (policy_str == "lora_share") return SharePolicy::LoRAShare;
+    if (policy_str == "always_recompute") return SharePolicy::AlwaysRecompute;
     return SharePolicy::WhenRecomputed;  // Default
 }
 

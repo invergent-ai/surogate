@@ -136,7 +136,7 @@ void DeviceMemoryStack::free(std::byte* ptr) {
 std::vector<std::pair<std::string, long>> DeviceMemoryStack::get_allocation_stats() const {
     std::vector<std::pair<std::string, long>> result;
     for (auto& [ptr, amount, name]: get_high_mark()) {
-        result.emplace_back(name, amount);
+        result.emplace_back(name ? name : "<unnamed>", static_cast<long>(amount));
     }
     return result;
 }
