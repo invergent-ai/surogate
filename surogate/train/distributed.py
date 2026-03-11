@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from surogate.core.config.sft_config import SFTConfig
-from surogate.train.qwen35_guard import apply_qwen35_sample_packing_guard
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 
 # Lazy import Ray to avoid dependency when not using distributed training
@@ -215,8 +214,6 @@ class NodeTrainer:
 
         self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
         self._uses_mrope = self._detect_pos_planes(config) > 1
-
-        apply_qwen35_sample_packing_guard(config, logger)
 
         if self._train_vision:
             if config.sample_packing:

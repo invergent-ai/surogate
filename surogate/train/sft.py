@@ -4,7 +4,6 @@ from transformers import PreTrainedTokenizerBase
 from surogate.core.config.sft_config import SFTConfig
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.train.tokenize import TokenizeDatasets
-from surogate.train.qwen35_guard import apply_qwen35_sample_packing_guard
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 from surogate.train.trainer import SurogateTrainerWrapper
@@ -22,9 +21,6 @@ class SurogateSFT(TokenizeDatasets):
         super().__init__(config=config, args=args)
 
     def run(self):
-        # Apply model-specific config guards before any tokenization/hash decisions.
-        apply_qwen35_sample_packing_guard(self.config, logger)
-
         # Check if distributed training is configured
         # In distributed mode, each worker node tokenizes its own shard of the data
         if self.config.distributed and self.config.distributed.num_nodes >= 1:

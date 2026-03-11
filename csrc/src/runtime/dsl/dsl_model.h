@@ -297,6 +297,7 @@ private:
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
     bool mUseTokenScale = true;  // apply 1/valid_token_count in global_norm_sqrt
+    bool mDocMaskingActive = false;  // set by forward(), cleared by backward()
 
     // Pre-built name tables for LoRA backward (avoids per-layer string construction).
     // Indexed by layer. Populated lazily on first use.

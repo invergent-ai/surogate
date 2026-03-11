@@ -111,6 +111,24 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
     }
 
+    // Detect document boundaries for packed sequence masking.
+    // Position_ids with per-document resets (e.g. [0,1,2, 0,1, 0,1,2,3])
+    // trigger Flash Attention varlen with cu_seqlens instead of cuDNN full-attention.
+    mDocMaskingActive = false;
+    if (mOptions.DocMasking && position_ids.Data && position_ids.Device == -1) {
+        const auto* pos_ptr = reinterpret_cast<const std::int32_t*>(position_ids.Data);
+        const int B = static_cast<int>(inputs.Sizes[0]);
+        const int T = static_cast<int>(inputs.Sizes[1]);
+        auto doc_info = compute_doc_masking(pos_ptr, B, T);
+        if (doc_info) {
+            mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
+                                        doc_info->num_docs,
+                                        doc_info->max_seqlen,
+                                        doc_info->total_q);
+            mDocMaskingActive = true;
+        }
+    }
+
     if (!lora_enabled()) {
         mExecutor->forward(inputs, position_ids, comm, micro_step);
         return;
@@ -132,7 +150,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         const int B = (int)rs.B;
         const int T = (int)rs.T;
         const int C = (int)cfg.HiddenSize;
-        const int D = (int)cfg.IntermediateSize;
+        const int D = cfg.get_intermediate_size(layer_idx);
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -210,7 +228,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
                     Tensor down_input = acts.swiglu;
                     Tensor down_input_tmp{};
                     bool free_down_input_tmp = false;
-                    if (!down_input.Data && gated_mlp && acts.mlp_up.Data) {
+                    if (!down_input.Data && acts.mlp_up.Data) {
                         down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D});
                         Tensor down_input_view = down_input_tmp;
                         down_input_view.Rank = 3;
@@ -218,7 +236,26 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
                         down_input_view.Sizes[1] = T;
                         down_input_view.Sizes[2] = D;
                         for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
-                        swiglu_forward(down_input_view, acts.mlp_up, nullptr, B, T, D, stream);
+                        switch (cfg.activation_type) {
+                            case modules::ActivationType::SwiGLU:
+                            case modules::ActivationType::GeGLU:
+                                swiglu_forward(down_input_view, acts.mlp_up, nullptr, B, T, D, stream);
+                                break;
+                            case modules::ActivationType::ReLU2: {
+                                const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(D);
+                                relu2_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            case modules::ActivationType::SiLU: {
+                                const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(D);
+                                silu_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            case modules::ActivationType::GeLU: {
+                                const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(D);
+                                gelu_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            default:
+                                throw std::runtime_error("unsupported activation type for LoRA MLPDown replay");
+                        }
                         down_input = down_input_view;
                         free_down_input_tmp = true;
                     }
@@ -263,7 +300,7 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
         const int B = (int)rs.B;
         const int T = (int)rs.T;
         const int C = (int)cfg.HiddenSize;
-        const int D = (int)cfg.IntermediateSize;
+        const int D = cfg.get_intermediate_size(layer_idx);
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -330,7 +367,7 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
                     Tensor down_input = acts.swiglu;
                     Tensor down_input_tmp{};
                     bool free_down_input_tmp = false;
-                    if (!down_input.Data && gated_mlp && acts.mlp_up.Data) {
+                    if (!down_input.Data && acts.mlp_up.Data) {
                         down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D});
                         Tensor down_input_view = down_input_tmp;
                         down_input_view.Rank = 3;
@@ -338,7 +375,26 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
                         down_input_view.Sizes[1] = T;
                         down_input_view.Sizes[2] = D;
                         for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
-                        swiglu_forward(down_input_view, acts.mlp_up, nullptr, B, T, D, stream);
+                        switch (cfg.activation_type) {
+                            case modules::ActivationType::SwiGLU:
+                            case modules::ActivationType::GeGLU:
+                                swiglu_forward(down_input_view, acts.mlp_up, nullptr, B, T, D, stream);
+                                break;
+                            case modules::ActivationType::ReLU2: {
+                                const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(D);
+                                relu2_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            case modules::ActivationType::SiLU: {
+                                const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(D);
+                                silu_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            case modules::ActivationType::GeLU: {
+                                const long N = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(D);
+                                gelu_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            default:
+                                throw std::runtime_error("unsupported activation type for LoRA MLPDown replay");
+                        }
                         down_input = down_input_view;
                         free_down_input_tmp = true;
                     }
@@ -373,6 +429,10 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
     if (!lora_enabled()) {
         mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+        if (mDocMaskingActive) {
+            mExecutor->clear_doc_masking();
+            mDocMaskingActive = false;
+        }
         return;
     }
 
@@ -395,7 +455,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
         const int B = (int)rs.B;
         const int T = (int)rs.T;
         const int C = (int)cfg.HiddenSize;
-        const int D = (int)cfg.IntermediateSize;
+        const int D = cfg.get_intermediate_size(layer_idx);
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -664,6 +724,11 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
     mExecutor->backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, hook);
 
+    if (mDocMaskingActive) {
+        mExecutor->clear_doc_masking();
+        mDocMaskingActive = false;
+    }
+
     mLoRAGrads->end_micro_step(main_stream, comm);
     // Extend the base-model BackwardDone event to include LoRA gradient reductions.
     internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
@@ -896,7 +961,7 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
             const int B_ = (int)rs.B;
             const int T_ = (int)rs.T;
             const int C = (int)cfg.HiddenSize;
-            const int D = (int)cfg.IntermediateSize;
+            const int D = cfg.get_intermediate_size(layer_idx);
             const int Hq = (int)cfg.NumQueryHeads;
             const int Hkv = (int)cfg.NumKeyValHeads;
             const int Hs = (int)cfg.head_size();
@@ -962,7 +1027,7 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                         Tensor down_input = acts.swiglu;
                         Tensor down_input_tmp{};
                         bool free_down_input_tmp = false;
-                        if (!down_input.Data && gated_mlp && acts.mlp_up.Data) {
+                        if (!down_input.Data && acts.mlp_up.Data) {
                             down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B_ * T_, D});
                             Tensor down_input_view = down_input_tmp;
                             down_input_view.Rank = 3;
@@ -970,7 +1035,26 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                             down_input_view.Sizes[1] = T_;
                             down_input_view.Sizes[2] = D;
                             for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
-                            swiglu_forward(down_input_view, acts.mlp_up, nullptr, B_, T_, D, stream);
+                            switch (cfg.activation_type) {
+                                case modules::ActivationType::SwiGLU:
+                                case modules::ActivationType::GeGLU:
+                                    swiglu_forward(down_input_view, acts.mlp_up, nullptr, B_, T_, D, stream);
+                                    break;
+                                case modules::ActivationType::ReLU2: {
+                                    const long N = static_cast<long>(B_) * static_cast<long>(T_) * static_cast<long>(D);
+                                    relu2_forward(down_input_view, acts.mlp_up, N, stream);
+                                } break;
+                                case modules::ActivationType::SiLU: {
+                                    const long N = static_cast<long>(B_) * static_cast<long>(T_) * static_cast<long>(D);
+                                    silu_forward(down_input_view, acts.mlp_up, N, stream);
+                                } break;
+                                case modules::ActivationType::GeLU: {
+                                    const long N = static_cast<long>(B_) * static_cast<long>(T_) * static_cast<long>(D);
+                                    gelu_forward(down_input_view, acts.mlp_up, N, stream);
+                                } break;
+                                default:
+                                    throw std::runtime_error("unsupported activation type for LoRA MLPDown replay");
+                            }
                             down_input = down_input_view;
                             free_down_input_tmp = true;
                         }
@@ -1099,7 +1183,7 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
         const int B = (int)rs.B;
         const int T = (int)rs.T;
         const int C = (int)cfg.HiddenSize;
-        const int D = (int)cfg.IntermediateSize;
+        const int D = cfg.get_intermediate_size(layer_idx);
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();

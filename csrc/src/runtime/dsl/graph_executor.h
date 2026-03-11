@@ -120,6 +120,11 @@ public:
         static const std::unordered_map<std::string, size_t> empty;
         return empty;
     }
+
+    /// Document masking for packed sequences (Flash Attention varlen).
+    virtual void set_doc_masking(const std::int32_t* /*cu_seqlens_cpu*/, int /*num_docs*/,
+                                 int /*max_seqlen*/, int /*total_q*/) {}
+    virtual void clear_doc_masking() {}
 };
 
 class GraphExecutor final : public IGraphExecutor {

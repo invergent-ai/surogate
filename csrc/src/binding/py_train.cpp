@@ -757,8 +757,34 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data, &opt_step_host,
                                    sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
 
-        // If graphs are disabled, fall back to eager execution.
-        if (!mOptions.UseCudaGraphs) {
+        // Detect packed sequences with document boundaries in any micro-step.
+        // When present, fall back to eager execution because CUDA graph replay
+        // cannot handle per-step cu_seqlens updates for Flash Attention varlen.
+        bool has_doc_boundaries = false;
+        if (mOptions.DocMasking) {
+            for (int j = 0; j < micro_steps && !has_doc_boundaries; ++j) {
+                const auto* pos = reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data);
+                for (int t = 1; t < B * T; ++t) {
+                    if (pos[t] - pos[t - 1] != 1) {
+                        has_doc_boundaries = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If graphs are disabled or packed sequences need doc masking, use eager execution.
+        if (!mOptions.UseCudaGraphs || has_doc_boundaries) {
+            // Disable internal per-layer CUDA graphs when falling back to eager mode
+            // with doc boundaries. Internal graphs capture the attention dispatch path
+            // (cuDNN vs Flash varlen) — replaying a cuDNN graph when doc masking
+            // switches to varlen produces incorrect results.
+            auto* dsl_model_eager = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            const bool had_internal_graphs = dsl_model_eager && dsl_model_eager->internal_graphs_enabled();
+            if (had_internal_graphs && has_doc_boundaries) {
+                dsl_model_eager->set_internal_graphs_enabled(false);
+            }
+
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
@@ -776,6 +802,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             ctx.Model->update_with_config(*ctx.Communicator, config, opt_step_host);
             if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerEnd, rs.MainStream));
             CUDA_CHECK(cudaDeviceSynchronize());
+
+            if (had_internal_graphs && has_doc_boundaries) {
+                dsl_model_eager->set_internal_graphs_enabled(true);
+            }
             return;
         }
 

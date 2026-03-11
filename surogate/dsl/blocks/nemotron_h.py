@@ -683,46 +683,49 @@ class NemotronHMoEBlock:
     # Activation slots (simplified - full MoE would have more)
     # =========================================================================
 
-    ln = Activation(Tensor["B", "T", "C"])
-    ln_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True)
+    ln = Activation(Tensor["B", "T", "C"], share_policy="when_recomputed")
+    ln_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
 
-    router_logits = Activation(Tensor["B * T", "E"], dtype="fp32", save=True)
-    router_probs = Activation(Tensor["B * T", "E"], dtype="fp32", save=True)
-    routing_weights = Activation(Tensor["B * T", "K"], dtype="fp32", save=True)
-    routing_indices = Activation(Tensor["B * T", "K"], dtype="int32", save=True)
+    router_logits = Activation(Tensor["B * T", "E"], dtype="fp32", save=True, share_policy="when_recomputed")
+    router_probs = Activation(Tensor["B * T", "E"], dtype="fp32", save=True, share_policy="when_recomputed")
+    routing_weights = Activation(Tensor["B * T", "K"], dtype="fp32", save=True, share_policy="when_recomputed")
+    routing_indices = Activation(Tensor["B * T", "K"], dtype="int32", save=True, share_policy="when_recomputed")
 
-    permuted_input = Activation(Tensor["B * T * K", "C"], save=True)
-    scatter_indices = Activation(Tensor["B * T * K"], dtype="int32", save=True)
+    permuted_input = Activation(Tensor["B * T * K", "C"], save=True, share_policy="when_recomputed")
+    scatter_indices = Activation(Tensor["B * T * K"], dtype="int32", save=True, share_policy="when_recomputed")
 
     # EP dispatch outputs (only present when ep_size > 1)
     ep_recv_input = Activation(
         Tensor["B * T * K", "C"], save=True,
         when=lambda self: self.ep_size > 1,
+        share_policy="per_layer",
         description="EP-dispatched input tokens (post-A2A)",
     )
     ep_recv_scatter = Activation(
         Tensor["B * T * K"], dtype="int32", save=True,
         when=lambda self: self.ep_size > 1,
+        share_policy="per_layer",
         description="EP-dispatched scatter indices (post-A2A)",
     )
 
-    expert_up = Activation(Tensor["B * T * K", "M"], save=True)
-    expert_act = Activation(Tensor["B * T * K", "M"], save=True)
-    expert_down = Activation(Tensor["B * T * K", "C"], save=True)
+    expert_up = Activation(Tensor["B * T * K", "M"], save=True, share_policy="when_recomputed")
+    expert_act = Activation(Tensor["B * T * K", "M"], save=True, share_policy="when_recomputed")
+    expert_down = Activation(Tensor["B * T * K", "C"], save=True, share_policy="when_recomputed")
     ep_combined = Activation(
         Tensor["B * T * K", "C"], save=True,
         when=lambda self: self.ep_size > 1,
+        share_policy="per_layer",
         description="EP-combined expert output (post reverse-A2A)",
     )
-    moe_out = Activation(Tensor["B * T", "C"], save=True)
+    moe_out = Activation(Tensor["B * T", "C"], save=True, share_policy="when_recomputed")
 
     # Shared expert activations
-    shared_up_out = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert")
-    shared_act = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert")
-    shared_out = Activation(Tensor["B * T", "C"], when="use_shared_expert")
+    shared_up_out = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert", share_policy="when_recomputed")
+    shared_act = Activation(Tensor["B * T", "SharedM"], when="use_shared_expert", share_policy="when_recomputed")
+    shared_out = Activation(Tensor["B * T", "C"], when="use_shared_expert", share_policy="when_recomputed")
 
-    out = Activation(Tensor["B", "T", "C"])
-    res_in = Activation(Tensor["B", "T", "C"])
+    out = Activation(Tensor["B", "T", "C"], share_policy="per_layer")
+    res_in = Activation(Tensor["B", "T", "C"], share_policy="per_layer")
 
     # =========================================================================
     # Gradient slots

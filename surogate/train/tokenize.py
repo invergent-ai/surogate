@@ -273,20 +273,27 @@ def _pack_buffer_to_sequence(
     tokens = np.concatenate(token_list).astype(np.int32)
     mask = np.concatenate(mask_list).astype(np.int32)
 
-    # IMPORTANT: For packed sequences, position_ids must be monotonic within the packed chunk
-    # (0..len-1, then 0 for padding). Resetting position IDs per original example (as in the
-    # unpadded docs) changes RoPE phases and hurts training.
+    # Per-document position IDs: each packed document gets 0..doc_len-1.
+    # This enables compute_doc_masking() to detect document boundaries via
+    # non-consecutive transitions, triggering Flash Attention varlen with
+    # cu_seqlens for proper document-level attention isolation.
+    pos_segments = [np.arange(len(arr), dtype=np.int32) for arr in token_list]
+    pos_ids = np.concatenate(pos_segments)
+
     if tokens.size > seq_len:
         tokens = tokens[:seq_len]
         mask = mask[:seq_len]
-        pos_ids = np.arange(seq_len, dtype=np.int32)
-    else:
-        pos_ids = np.arange(tokens.size, dtype=np.int32)
-        if tokens.size < seq_len:
-            pad_len = seq_len - tokens.size
-            tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
-            mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
-            pos_ids = np.pad(pos_ids, (0, pad_len), mode="constant", constant_values=0)
+        pos_ids = pos_ids[:seq_len]
+    elif tokens.size < seq_len:
+        pad_len = seq_len - tokens.size
+        tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
+        mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
+        # Continue position IDs monotonically through padding so that
+        # compute_doc_masking() sees consecutive transitions and absorbs
+        # padding into the last real document (no spurious length-1 docs).
+        last_pos = int(pos_ids[-1]) if pos_ids.size > 0 else -1
+        pad_pos = np.arange(last_pos + 1, last_pos + 1 + pad_len, dtype=np.int32)
+        pos_ids = np.concatenate([pos_ids, pad_pos])
 
     return tokens, pos_ids, mask
 

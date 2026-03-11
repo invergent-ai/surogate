@@ -16,7 +16,6 @@ from surogate.train.loss_guard import LossGuard
 from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.training_advisor import TrainingAdvisor
-from surogate.train.qwen35_guard import apply_qwen35_sample_packing_guard
 from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
@@ -42,9 +41,6 @@ class SurogateTrainerWrapper():
         self.config = config
         self._block_types = None
         self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
-
-        # Keep guard here too (covers direct trainer construction paths).
-        apply_qwen35_sample_packing_guard(config, logger)
 
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing

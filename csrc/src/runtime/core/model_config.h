@@ -395,6 +395,15 @@ struct ModelConfig : public PretrainedConfig {
                 return override.intermediate_size.value();
             }
         }
+        // MoE layers can use a distinct expert intermediate size.
+        if (layer_idx >= 0 && is_layer_moe(layer_idx)) {
+            if (MoeIntermediateSize > 0) {
+                return MoeIntermediateSize;
+            }
+            if (moe_config.has_value() && moe_config->moe_intermediate_size > 0) {
+                return moe_config->moe_intermediate_size;
+            }
+        }
         return IntermediateSize;
     }
 };
