@@ -45,6 +45,41 @@
 namespace dsl {
 namespace {
 
+/// Copy position IDs to the device-side PositionIDs buffer, replicating a single
+/// plane across all 3 mRoPE planes when the model uses multimodal RoPE but the
+/// caller provides only one plane (e.g. text-only GRPO training).
+inline void copy_position_ids_to_device(const Tensor& src_pos, Tensor& dst_pos,
+                                        long B, long T, cudaStream_t stream) {
+    const std::size_t plane_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * sizeof(std::int32_t);
+    const std::size_t src_bytes = src_pos.bytes();
+    const auto kind = (src_pos.Device == -1) ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+
+    // mRoPE: dst is [3, B, T] but src is single-plane [B, T] — replicate.
+    if (dst_pos.Rank == 3 && dst_pos.Sizes[0] == 3 && src_bytes <= plane_bytes) {
+        for (int p = 0; p < 3; ++p) {
+            auto* dst = static_cast<std::byte*>(dst_pos.Data) + p * plane_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(dst, src_pos.Data, src_bytes, kind, stream));
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst_pos.Data, src_pos.Data, src_bytes, kind, stream));
+    }
+}
+
+/// Overload for raw CPU pointer + known element count (used by execute_logprobs_forward).
+inline void copy_position_ids_to_device(const std::int32_t* src_cpu, std::size_t src_bytes,
+                                        Tensor& dst_pos, long B, long T, cudaStream_t stream) {
+    const std::size_t plane_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * sizeof(std::int32_t);
+
+    if (dst_pos.Rank == 3 && dst_pos.Sizes[0] == 3 && src_bytes <= plane_bytes) {
+        for (int p = 0; p < 3; ++p) {
+            auto* dst = static_cast<std::byte*>(dst_pos.Data) + p * plane_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(dst, src_cpu, src_bytes, cudaMemcpyHostToDevice, stream));
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst_pos.Data, src_cpu, src_bytes, cudaMemcpyHostToDevice, stream));
+    }
+}
+
 /**
  * @brief Execute a callable with stack checkpoint/restore for CUDA graph compatibility.
  *
@@ -941,12 +976,7 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = position_ids.bytes();
-        if (position_ids.Device == -1) {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
-        }
+        copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
@@ -1019,12 +1049,7 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = position_ids.bytes();
-        if (position_ids.Device == -1) {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
-        }
+        copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
@@ -1226,12 +1251,7 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = position_ids.bytes();
-        if (position_ids.Device == -1) {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
-        }
+        copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
@@ -1310,12 +1330,7 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
     {
         const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        const std::size_t pos_bytes = position_ids.bytes();
-        if (position_ids.Device == -1) {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyHostToDevice, rs.MainStream));
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids.Data, pos_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
-        }
+        copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
@@ -1519,8 +1534,8 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     // Copy or build position IDs.
     if (position_ids_cpu) {
         // Use caller-provided position IDs (e.g. packed sequences with resets).
-        CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_cpu, token_bytes,
-                                   cudaMemcpyHostToDevice, rs.MainStream));
+        // Replicate single plane to all 3 mRoPE planes for text-only training.
+        copy_position_ids_to_device(position_ids_cpu, token_bytes, rs.PositionIDs, B, T, rs.MainStream);
     } else {
         // Default: [0, 1, ..., T-1] repeated B times.
         std::vector<std::int32_t> pos_cpu(static_cast<std::size_t>(BT));
@@ -1529,8 +1544,7 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
                 pos_cpu[static_cast<std::size_t>(b * T + t)] = static_cast<std::int32_t>(t);
             }
         }
-        CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, pos_cpu.data(), token_bytes,
-                                   cudaMemcpyHostToDevice, rs.MainStream));
+        copy_position_ids_to_device(pos_cpu.data(), token_bytes, rs.PositionIDs, B, T, rs.MainStream);
     }
 
     // Allocate GPU buffer for per-token log-probs.

@@ -161,5 +161,6 @@ class GRPOInferenceConfig:
                 delattr(namespace, "rope_scaling")
         
         rsetattr(namespace, "disable_uvicorn_access_log", "true")
+        rsetattr(namespace, "language_model_only", "true")
         
         return namespace

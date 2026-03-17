@@ -456,12 +456,17 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         Tensor pos_buf = ctx.Model->get_position_ids_buffer();
         auto* pb = pos_buf.get<std::int32_t>();
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
-        const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) * static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
-            std::memcpy(pb, position_ids + i * pos_stride, pos_stride * sizeof(std::int32_t));
+            // Python binding provides 2D [B, T] position IDs (one plane per GPU).
+            // For mRoPE models the buffer is [3, B, T] — replicate the single plane.
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
         } else {
             fill_sequential_position_ids(pb, pos_planes, B, T);
         }
@@ -563,12 +568,17 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t
         Tensor pos_buf = ctx.Model->get_position_ids_buffer();
         auto* pb = pos_buf.get<std::int32_t>();
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
-        const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) * static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
 
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
-            std::memcpy(pb, position_ids + i * pos_stride, pos_stride * sizeof(std::int32_t));
+            // Python binding provides 2D [B, T] position IDs (one plane per GPU).
+            // For mRoPE models the buffer is [3, B, T] — replicate the single plane.
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
         } else {
             fill_sequential_position_ids(pb, pos_planes, B, T);
         }
@@ -1575,7 +1585,13 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
         std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
-            std::memcpy(pb, position_ids + i * pos_stride, pos_stride * sizeof(std::int32_t));
+            // Python binding provides 2D [B, T] position IDs (one plane per GPU).
+            // For mRoPE models the buffer is [3, B, T] — replicate the single plane.
+            const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
         } else {
             fill_sequential_position_ids(pb, pos_planes, B, T);
         }

@@ -1,8 +1,7 @@
 # GRPO Orchestrator Example
 
 model:
-  # name: "./Qwen3-0.6B-NVFP4"
-  name: "./reverse-fft-NVFP4"
+  name: "surogate/Qwen3.5-0.8B-FP8"
   lora_adapter: "default"
   lora_rank: 16
   lora_alpha: 32
@@ -10,12 +9,12 @@ model:
 env:
   - id: reverse-text
 
-batch_size: 128
-rollouts_per_example: 16
+batch_size: 16
+rollouts_per_example: 4
 seq_len: 2048
 max_steps: 20
 
 sampling:
-  max_tokens: 128
+  max_tokens: 1024
 
   

@@ -45,25 +45,51 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
 
     // -----------------------------------------------------------------------
     // Log-prob mode: compute log P(target | context) for all BT tokens, skip loss.
+    // Chunked to fit within the output buffer (sized for nano_batch_size rows).
     // -----------------------------------------------------------------------
     if (mLogprobsGpu) {
-        Tensor logits = mRunState.non_block_activations().output;
-        logits.Sizes[0] = BT;
-        logits.Sizes[1] = V;
-        logits.Rank = 2;
+        const std::size_t xf_stride_lp = get_dtype_size(xF_flat.DType);
+        const std::size_t tgt_stride_lp = get_dtype_size(targets.DType);
 
-        matmul(logits, weight, xF_flat,
-               std::nullopt, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               V, static_cast<int>(BT), C,
-               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+        for (int nano_step = 0; nano_step < lmhead_chunks; ++nano_step) {
+            const long token_offset = static_cast<long>(nano_step) * nano_batch_size;
 
-        if (mInvTemperatureGpu) {
-            scale_logits_rows(logits, mInvTemperatureGpu, static_cast<int>(BT), V, P, mRunState.MainStream);
+            // Slice xF_flat for this chunk.
+            Tensor xF_slice = xF_flat;
+            xF_slice.Data = static_cast<std::byte*>(xF_slice.Data) +
+                            static_cast<std::size_t>(token_offset) * xf_stride_lp * static_cast<std::size_t>(C);
+            xF_slice.Sizes[0] = nano_batch_size;
+            xF_slice.Sizes[1] = C;
+            xF_slice.Rank = 2;
+
+            // Slice targets for this chunk.
+            Tensor tgt_slice = targets;
+            tgt_slice.Data = static_cast<std::byte*>(tgt_slice.Data) +
+                             static_cast<std::size_t>(token_offset) * tgt_stride_lp;
+            tgt_slice.Sizes[0] = nano_batch_size;
+            tgt_slice.Rank = 1;
+
+            // Logits buffer fits nano_batch_size rows.
+            Tensor logits = mRunState.non_block_activations().output;
+            logits.Sizes[0] = nano_batch_size;
+            logits.Sizes[1] = V;
+            logits.Rank = 2;
+
+            matmul(logits, weight, xF_slice,
+                   std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   V, static_cast<int>(nano_batch_size), C,
+                   swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+            if (mInvTemperatureGpu) {
+                const float* inv_t = mInvTemperatureGpu + token_offset;
+                scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+            }
+
+            // Extract log-probs for this chunk into the correct offset of the output buffer.
+            extract_logprobs(logits, mLogprobsGpu + token_offset, tgt_slice,
+                             static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
         }
-
-        extract_logprobs(logits, mLogprobsGpu, targets,
-                         static_cast<int>(BT), V, P, mRunState.MainStream);
 
         if (need_lm_head) {
             mWeightManager->release_lm_head(mRunState.MainStream);

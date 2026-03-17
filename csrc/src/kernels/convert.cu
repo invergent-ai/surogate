@@ -14,6 +14,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "utilities/utils.h"
@@ -103,5 +104,13 @@ void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size, c
 }
 
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size, cudaStream_t stream) {
+    convert_dtype_launcher(target, source, size, stream);
+}
+
+void convert_dtype(nv_bfloat16* target, const __nv_fp8_e4m3* source, std::size_t size) {
+    convert_dtype_launcher(target, source, size, /*stream=*/0);
+}
+
+void convert_dtype(nv_bfloat16* target, const __nv_fp8_e4m3* source, std::size_t size, cudaStream_t stream) {
     convert_dtype_launcher(target, source, size, stream);
 }

@@ -27,7 +27,7 @@ def spawn_env_server(
     log_file: str | None = None,
     log_file_level: str | None = None,
     json_logging: bool = False,
-    daemon: bool = True,
+    daemon: bool = False,
 ) -> str:
     """
     Starts a ZMQEnvServer process in a subprocess.

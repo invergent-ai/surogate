@@ -71,9 +71,9 @@ bool graph_has_kernel(const Module& module, std::string_view kernel) {
     return false;
 }
 
-bool is_qlora_param_name(std::string_view name, bool train_router) {
+bool is_qlora_param_name(std::string_view name) {
     const std::string_view clean = trim_optional(name);
-    // Always keep router weights full precision (do not quantize in QLoRA).
+    // Router weights are always kept full precision (not quantized in QLoRA).
     if (clean.find("router") != std::string_view::npos) {
         return false;
     }
@@ -83,13 +83,11 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
         if (!field.empty() && field.back() == '?') {
             field.pop_back();
         }
-        (void)train_router;
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" ||
             field == "mlp_up_weight" || field == "mlp_down_weight" ||
             field == "up_weight" || field == "down_weight" ||
             field == "ln1_weight" || field == "ln2_weight" ||
             field == "q_norm_weight" || field == "k_norm_weight" ||
-            field == "router_weight" ||
             field == "experts_gate_up" || field == "experts_up" || field == "experts_down" ||
             field == "shared_expert_gate" || field == "shared_expert_up" ||
             field == "shared_expert_down") {
@@ -109,6 +107,19 @@ bool is_qlora_param_name(std::string_view name, bool train_router) {
             ends_with(field, "dt_bias") ||
             ends_with(field, "gated_norm_weight") ||
             ends_with(field, "norm_weight")) {
+            return true;
+        }
+        // Qwen3.5 hybrid: full-attention block params
+        if (field == "full_q_proj_weight" || field == "full_k_proj_weight" ||
+            field == "full_v_proj_weight" || field == "full_out_weight" ||
+            field == "full_q_proj_bias" || field == "full_k_proj_bias" ||
+            field == "full_v_proj_bias" || field == "full_out_bias") {
+            return true;
+        }
+        // Qwen3.5 hybrid: linear-attention (Gated DeltaNet) block params
+        if (field == "lin_in_proj_qkv_weight" || field == "lin_in_proj_z_weight" ||
+            field == "lin_in_proj_b_weight" || field == "lin_in_proj_a_weight" ||
+            field == "lin_out_weight") {
             return true;
         }
         return false;
@@ -651,8 +662,7 @@ qlora::QuantizerConfig build_quantizer_config(
 /// Iterates the IR's forward graph params, resolves shapes using the module's
 /// config, and creates a WeightLoadSpec for each QLoRA-managed parameter.
 std::vector<qlora::WeightLoadSpec> build_weight_specs(
-    const Module& module,
-    const modules::ModularLoRAConfig& lora_cfg) {
+    const Module& module) {
     if (!module.forward.has_value()) {
         return {};
     }
@@ -660,8 +670,6 @@ std::vector<qlora::WeightLoadSpec> build_weight_specs(
     const auto& graph = module.forward.value();
     ShapeEnv env = make_shape_env(module, /*B=*/1, /*T=*/1);
     augment_shape_env(env, module.config);
-
-    const bool train_router = lora_cfg.enabled() && lora_cfg.train_router;
 
     std::vector<qlora::WeightLoadSpec> specs;
     specs.reserve(graph.params.size());
@@ -671,7 +679,7 @@ std::vector<qlora::WeightLoadSpec> build_weight_specs(
         const TensorInfo& info = kv.second;
 
         // Only include QLoRA-managed parameters
-        if (!is_qlora_param_name(name, train_router)) {
+        if (!is_qlora_param_name(name)) {
             continue;
         }
 
@@ -765,7 +773,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     // Build the pipeline configuration
     qlora::DslQLoRAPipelineConfig config;
     config.mapping = build_mapping_table(hf_mapping);
-    config.weight_specs = build_weight_specs(module, lora_cfg);
+    config.weight_specs = build_weight_specs(module);
     config.quantizer_config = build_quantizer_config(qlora_cfg, options);
     config.shard_idx = shard_idx;
     config.num_shards = num_shards;
@@ -964,10 +972,9 @@ DslModel::DslModel(const PretrainedConfig& config,
     // QLoRA weight provider which holds quantized weights and dequantizes them as needed.
     // This is critical for memory efficiency: avoids allocating full-precision base weights.
     if (mQLoRAConfig.is_quantized()) {
-        const bool train_router = lora_config.has_value() && lora_config->train_router;
         for (const auto& kv : mModule->forward->params) {
             const std::string& name = kv.first;
-            if (is_qlora_param_name(name, train_router)) {
+            if (is_qlora_param_name(name)) {
                 external_params.insert(name);
             }
         }

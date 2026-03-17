@@ -235,7 +235,6 @@ def create_demo(model_name="Qwen/Qwen3-8B", system_prompt=""):
                         height=500,
                         placeholder="Start chatting with the AI assistant...",
                         render_markdown=False,
-                        type="messages",
                     ),
                     textbox=gr.Textbox(placeholder="Type your message here...", container=False, scale=7),
                 )

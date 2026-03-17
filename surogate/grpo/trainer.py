@@ -67,6 +67,12 @@ class GRPOTrainer:
         ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
         config.runtime_config.dsl_ir_json = ir_json
 
+        # Compile JIT kernels (e.g. gated delta rule Triton kernels)
+        from surogate.kernels.jit_compile import compile_jit_kernels
+        jit_manifests = compile_jit_kernels(ir_json)
+        if jit_manifests:
+            config.runtime_config.jit_kernel_manifests = jit_manifests
+
         # Create C++ trainer using inherited config objects
         logger.info(f"Creating GRPO trainer for {config.model} ({config.gpus} GPUs)")
         self.trainer = _surogate.SurogateTrainer(

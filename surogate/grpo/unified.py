@@ -272,7 +272,7 @@ def _estimate_trainer_memory(train_config: GRPOTrainConfig) -> tuple[float, dict
 
 def _compute_gpu_memory_utilization(
     train_config: GRPOTrainConfig,
-    safety_fraction: float = 0.10,
+    safety_fraction: float = 0.15,
 ) -> float:
     """Compute optimal gpu_memory_utilization for vLLM in colocate mode.
 
@@ -353,8 +353,16 @@ def grpo_unified(
     # Auto-compute gpu_memory_utilization based on trainer memory requirements.
     # In colocate mode, vLLM and the trainer share the GPU. We estimate how much
     # memory the trainer needs (LoRA, activations, dequant buffers) and give
-    # vLLM the rest.
-    infer_config.gpu_memory_utilization = _compute_gpu_memory_utilization(train_config)
+    # vLLM the rest. If the user set an explicit value in infer.yaml, use it as
+    # an upper bound (they may know their GPU budget better than our estimate).
+    auto_gpu_mem = _compute_gpu_memory_utilization(train_config)
+    user_gpu_mem = infer_config.gpu_memory_utilization
+    if user_gpu_mem is not None and user_gpu_mem < auto_gpu_mem:
+        logger.info(f"Using user-specified gpu_memory_utilization={user_gpu_mem:.2f} "
+                     f"(auto-computed was {auto_gpu_mem:.2f})")
+        infer_config.gpu_memory_utilization = user_gpu_mem
+    else:
+        infer_config.gpu_memory_utilization = auto_gpu_mem
 
     # Setup vLLM environment (must happen before importing vLLM)
     setup_vllm_env(infer_config)
@@ -396,6 +404,9 @@ def grpo_unified(
             logger.warning("No engine client captured from vLLM — falling back to disk loading")
         if event_loop is None:
             logger.warning("No event loop captured from vLLM — falling back to disk loading")
+
+    if external_weights is None:
+        raise RuntimeError("GRPO colocate mode requires quantized base weights in FP8, NVFP4 or BnB")
 
     # Phase 3: Start trainer in background thread
     logger.info("Starting GRPO trainer")

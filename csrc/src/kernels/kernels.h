@@ -769,6 +769,8 @@ void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size);
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size, cudaStream_t stream);
+void convert_dtype(nv_bfloat16* target, const __nv_fp8_e4m3* source, std::size_t size);
+void convert_dtype(nv_bfloat16* target, const __nv_fp8_e4m3* source, std::size_t size, cudaStream_t stream);
 
 // Fused BF16->FP32 accumulation for router LoRA
 // Accumulates BF16 values into FP32 output: out[i] += (float)src[i]

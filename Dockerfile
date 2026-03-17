@@ -32,7 +32,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_LIB_ROOT="/home/surogate/.venv/lib/python3.12/site-packages/nvidia"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl libdw-dev \
+    && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl libdw-dev python3-dev build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN echo "${CUDA_LIB_ROOT}/cu13/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \

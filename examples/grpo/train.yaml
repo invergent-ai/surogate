@@ -1,7 +1,6 @@
 # GRPO RL Training Example
 
-# model: "Qwen3-0.6B-NVFP4"
-model: "./reverse-fft-NVFP4"
+model: "surogate/Qwen3.5-0.8B-FP8"
 output_dir: ./outputs
 gpus: 1
 
@@ -19,6 +18,7 @@ max_grad_norm: 1.0
 weight_decay: 0.01
 
 recipe: fp8-hybrid
+use_cuda_graphs: false
 
 lora: true
 lora_rank: 16
@@ -41,14 +41,6 @@ loss:
   token_mask_high: 8.0
   geo_mask_low: 0.1
   geo_mask_high: 10.0
-
-# QeRL noise scheduler (Adaptive Quantization Noise)
-# Adds Gaussian noise to RMSNorm weights in inference model for exploration.
-noise_scheduler:
-  enabled: true
-  sigma_start: 5e-2
-  sigma_end: 5e-4
-  num_stages: 10
 
 # Checkpointing
 save_steps: 100
