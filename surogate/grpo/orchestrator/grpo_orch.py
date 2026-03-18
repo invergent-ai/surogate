@@ -618,7 +618,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         progress.total_tokens += num_tokens
         progress.total_samples += num_rollouts
         progress.total_problems += num_unique_examples
-        throughput = num_tokens / generate_completions_time
 
         # Compute solve all and none tensors
         problem_indices = results_df.index // config.rollouts_per_example
@@ -628,6 +627,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         effective_batch_size = 1 - solve_none - solve_all
 
         step_time = time.perf_counter() - step_start_time
+        throughput = num_tokens / step_time
         to_log = {
             # Progress metrics
             "progress/tokens": num_tokens,
