@@ -44,6 +44,7 @@
             "args": ["grpo-infer", "${workspaceFolder}/examples/grpo/infer.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
+            "justMyCode": true,
             "env": {"PYTHONPATH": "${workspaceFolder}"}
         },
         {
@@ -54,6 +55,7 @@
             "args": ["grpo-orch", "${workspaceFolder}/examples/grpo/orch.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
+            "justMyCode": true,
             "env": {"PYTHONPATH": "${workspaceFolder}"}
         },
         {

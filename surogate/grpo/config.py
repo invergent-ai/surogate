@@ -19,18 +19,11 @@ logger = get_logger()
 class GRPOLossConfig:
     """GRPO loss parameters (mirrors prime-rl's LossConfig)."""
 
-    ratio_type: Literal["token", "sequence"] = "token"
-    kl_tau: float = 0.0
+    ipo_mask_low: float = 0.2  # The low threshold for masking tokens (probability difference)
+    ipo_mask_high: float = 0.2  # The high threshold for masking tokens (probability difference)
     adv_tau: float = 1.0
     teacher_tau: float = 0.0
-    token_mask_low: float = 0.125
-    token_mask_high: float = 8.0
-    geo_mask_low: float = 0.1
-    geo_mask_high: float = 10.0
-    sequence_mask_low: float = 0.0
-    sequence_mask_high: float = 100.0
-    sequence_clip_high: float = 10.0
-
+    kl_tau: float = 1e-3  # The tau for KL divergence
 
 @dataclass
 class NoiseSchedulerConfig:

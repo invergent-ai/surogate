@@ -22,11 +22,11 @@ def _compute_sample_grads(
     loss_config: GRPOLossConfig,
     teacher_logprobs: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Compute GRPO per-token gradient multipliers for a single sample.
+    """Compute IPO per-token gradient multipliers for a single sample.
 
-    This matches prime-rl's default_loss_fn: all sequence-level quantities
-    (geo_seq_ratio, seq_importance_ratio, geo_mask, seq_mask) are computed
-    over this sample only.
+    Implements INTELLECT Policy Optimization (IPO) loss from prime-rl:
+    - DPPO-Binary TV masking based on probability difference
+    - Squared KL regularization
 
     Args:
         trainer_logprobs: [S] log-probs from current policy for this sample
@@ -40,81 +40,53 @@ def _compute_sample_grads(
         (per_token_grads [S], metrics dict)
     """
     log_importance_ratio = trainer_logprobs - inference_logprobs
-    token_importance_ratio = np.exp(log_importance_ratio)
+    importance_ratio = np.exp(log_importance_ratio)
 
-    # Geometric mean ratio (exp of mean log ratio over loss_mask) — per sample
-    loss_mask_count = max(loss_mask.sum(), 1)
-    geo_mean_log = log_importance_ratio[loss_mask].sum() / loss_mask_count
-    geo_seq_ratio = np.exp(geo_mean_log)
-
-    # KL mismatch (for metrics)
-    token_mismatch_kl = token_importance_ratio - log_importance_ratio - 1.0
-
-    # Sequence-level importance ratio (clamped) — per sample
-    seq_log_ratio = np.clip(log_importance_ratio[loss_mask].sum(), a_min=None, a_max=10.0)
-    seq_importance_ratio = np.clip(np.exp(seq_log_ratio), a_min=None, a_max=loss_config.sequence_clip_high)
-
-    # Token-level masks
-    token_mask_low = token_importance_ratio < loss_config.token_mask_low
-    token_mask_high = token_importance_ratio > loss_config.token_mask_high
-
-    # Geometric masks — per sample, broadcast to all tokens
-    geo_mask_low = np.full_like(loss_mask, geo_seq_ratio < loss_config.geo_mask_low)
-    geo_mask_high = np.full_like(loss_mask, geo_seq_ratio > loss_config.geo_mask_high)
-
-    # Sequence-level masks — per sample (min/max token ratio triggers full sample mask)
-    masked_ratios = np.where(loss_mask, token_importance_ratio, np.inf)
-    seq_min_ratio = masked_ratios.min()
-    masked_ratios_high = np.where(loss_mask, token_importance_ratio, -np.inf)
-    seq_max_ratio = masked_ratios_high.max()
-    seq_mask_low = np.full_like(loss_mask, seq_min_ratio < loss_config.sequence_mask_low)
-    seq_mask_high = np.full_like(loss_mask, seq_max_ratio > loss_config.sequence_mask_high)
-
-    is_masked = (
-        token_mask_low | token_mask_high
-        | geo_mask_low | geo_mask_high
-        | seq_mask_low | seq_mask_high
-    )
+    # IPO masking based on probability difference (DPPO-Binary TV)
+    trainer_probs = np.exp(trainer_logprobs)
+    inference_probs = np.exp(inference_logprobs)
+    probs_diff = trainer_probs - inference_probs
+    ipo_mask_high = probs_diff > loss_config.ipo_mask_high
+    ipo_mask_low = probs_diff < -loss_config.ipo_mask_low
+    is_masked = ipo_mask_high | ipo_mask_low
     keep_mask = loss_mask & ~is_masked
 
-    # Choose importance ratio type
-    if loss_config.ratio_type == "sequence":
-        importance_ratio = np.full_like(trainer_logprobs, seq_importance_ratio)
-    else:
-        importance_ratio = token_importance_ratio
+    # KL mismatch (for metrics)
+    mismatch_kl = importance_ratio - log_importance_ratio - 1.0
 
-    # Compute coefficient (detached in prime-rl, so treated as constant)
+    # Advantages with optional teacher KL
     scaled_advantages = loss_config.adv_tau * advantages
     if teacher_logprobs is not None:
         teacher_kl = teacher_logprobs - trainer_logprobs
         scaled_advantages = scaled_advantages + loss_config.teacher_tau * teacher_kl
 
-    coeff = importance_ratio * (scaled_advantages - loss_config.kl_tau * log_importance_ratio)
-
     # Per-token gradient seeding for surogate's CE backward kernel.
     #
-    # Sign convention: surogate's CE backward computes dlogit = dloss * (softmax - one_hot),
-    # while prime-rl's FusedOutputLinear backward computes dlogit = g * (one_hot - softmax).
-    # Since (softmax - one_hot) = -(one_hot - softmax), we need dloss = -g = +coeff.
+    # IPO loss = sum_t[-keep_mask_t * adv_t * ratio_t + kl_tau * loss_mask_t * log_ratio_t^2]
+    #
+    # Sign convention: surogate's CE backward computes dlogit = dloss * (softmax - one_hot).
+    # We need dloss = -d(loss)/d(trainer_logprob_t), giving:
+    #   dloss = keep_mask_t * adv_t * ratio_t - 2 * kl_tau * loss_mask_t * log_ratio_t
     per_token_grads = np.zeros_like(trainer_logprobs)
-    per_token_grads[keep_mask] = coeff[keep_mask]
+    per_token_grads[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
+    per_token_grads[loss_mask] -= 2.0 * loss_config.kl_tau * log_importance_ratio[loss_mask]
 
-    # For sequence ratio type, normalize by this sample's loss_mask count
-    if loss_config.ratio_type == "sequence":
-        per_token_grads = per_token_grads / loss_mask_count
-
-    # Policy loss: mean of -coeff over unmasked tokens
-    if keep_mask.any():
-        policy_loss = float(-coeff[keep_mask].mean())
-    else:
-        policy_loss = 0.0
+    # Policy loss metric
+    loss_mask_count = max(loss_mask.sum(), 1)
+    pg_loss = np.zeros_like(trainer_logprobs)
+    pg_loss[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
+    kl_loss = np.zeros_like(trainer_logprobs)
+    kl_loss[loss_mask] = loss_config.kl_tau * log_importance_ratio[loss_mask] ** 2
+    policy_loss = float((-pg_loss + kl_loss).sum() / loss_mask_count)
 
     metrics = {
         "policy_loss": policy_loss,
-        "mismatch_kl": _safe_mean(token_mismatch_kl, loss_mask),
-        "unmasked_mismatch_kl": _safe_mean(token_mismatch_kl, keep_mask),
-        "is_masked_frac": float(is_masked[loss_mask].mean()) if loss_mask.any() else 0.0,
-        "geo_seq_ratio": float(geo_seq_ratio),
+        "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),
+        "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & is_masked),
+        "unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),
+        "is_masked": float(is_masked[loss_mask].mean()) if loss_mask.any() else 0.0,
+        "is_masked_low": float(ipo_mask_low[loss_mask].mean()) if loss_mask.any() else 0.0,
+        "is_masked_high": float(ipo_mask_high[loss_mask].mean()) if loss_mask.any() else 0.0,
         "keep_tokens": int(keep_mask.sum()),
         "total_tokens": int(loss_mask.sum()),
     }
@@ -162,9 +134,11 @@ def compute_grpo_per_token_grads(
     agg_metrics: dict[str, float] = {
         "policy_loss": 0.0,
         "mismatch_kl": 0.0,
+        "masked_mismatch_kl": 0.0,
         "unmasked_mismatch_kl": 0.0,
-        "is_masked_frac": 0.0,
-        "geo_seq_ratio": 0.0,
+        "is_masked": 0.0,
+        "is_masked_low": 0.0,
+        "is_masked_high": 0.0,
         "keep_tokens": 0,
         "total_tokens": 0,
     }
@@ -190,8 +164,9 @@ def compute_grpo_per_token_grads(
         n_samples += 1
 
         # Accumulate metrics
-        for key in ("policy_loss", "mismatch_kl", "unmasked_mismatch_kl",
-                     "is_masked_frac", "geo_seq_ratio"):
+        for key in ("policy_loss", "mismatch_kl", "masked_mismatch_kl",
+                     "unmasked_mismatch_kl", "is_masked", "is_masked_low",
+                     "is_masked_high"):
             agg_metrics[key] += s_metrics[key]
         agg_metrics["keep_tokens"] += s_metrics["keep_tokens"]
         agg_metrics["total_tokens"] += s_metrics["total_tokens"]
@@ -202,8 +177,9 @@ def compute_grpo_per_token_grads(
 
     # Average float metrics over samples
     if n_samples > 0:
-        for key in ("policy_loss", "mismatch_kl", "unmasked_mismatch_kl",
-                     "is_masked_frac", "geo_seq_ratio"):
+        for key in ("policy_loss", "mismatch_kl", "masked_mismatch_kl",
+                     "unmasked_mismatch_kl", "is_masked", "is_masked_low",
+                     "is_masked_high"):
             agg_metrics[key] /= n_samples
         if "teacher_kl" in agg_metrics:
             agg_metrics["teacher_kl"] /= n_samples

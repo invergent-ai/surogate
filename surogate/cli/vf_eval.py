@@ -1,11 +1,9 @@
 import argparse
 import asyncio
-import importlib.resources
 import json
-import logging
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from verifiers.types import (
     ClientConfig,
@@ -15,16 +13,14 @@ from verifiers.types import (
     EvalRunConfig,
 )
 from verifiers.utils.eval_utils import (
-    get_log_level,
     load_endpoints,
     load_toml_config,
     resolve_endpoints_file,
     run_evaluations,
     run_evaluations_tui,
 )
-from verifiers.utils.import_utils import load_toml
 from verifiers.utils.install_utils import check_hub_env_installed
-from verifiers.scripts.eval import get_env_eval_defaults
+from verifiers.scripts.eval import find_latest_incomplete_eval_results_path, get_env_eval_defaults, is_valid_eval_results_path
 
 from surogate.utils.logger import get_logger
 
@@ -252,10 +248,6 @@ def prepare_command_parser(parser=None):
 
 if __name__ == '__main__':
     args = prepare_command_parser().parse_args(sys.argv[1:])
-        
-
-    if args.debug:  # only set up console logging in debug mode
-        setup_logging(get_log_level(args.verbose))
 
     # Build raw configs: both paths produce list[dict]
     if args.env_id_or_config.endswith(".toml"):

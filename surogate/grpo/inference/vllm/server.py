@@ -24,9 +24,11 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 
 from surogate.grpo.inference.patches import (
+    monkey_patch_hermes_tool_parser_thread_safety,
     monkey_patch_load_lora_adapter,
     monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode,
     monkey_patch_tokenize_params_validation,
+    monkey_patch_tokenizer_thread_safety,
 )
 from surogate.grpo.inference.vllm.serving_chat_with_tokens import (
     ChatCompletionRequestWithTokens,
@@ -39,6 +41,11 @@ monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode()
 monkey_patch_load_lora_adapter()
 # NOTE: Monkeypatch TokenizeParams to fix overly conservative validation
 monkey_patch_tokenize_params_validation()
+# NOTE: Monkeypatch Hermes tool parser to fix "Already borrowed" RuntimeError under concurrent load
+monkey_patch_hermes_tool_parser_thread_safety()
+# NOTE: Monkeypatch HF tokenizer to fix "Already borrowed" RuntimeError during concurrent chat template processing
+# Can be removed once https://github.com/vllm-project/vllm/pull/36557 is merged and we upgrade vllm
+monkey_patch_tokenizer_thread_safety()
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
@@ -163,29 +170,31 @@ async def custom_init_app_state(
         request_logger = None
 
     resolved_chat_template = load_chat_template(args.chat_template)
-
-    state.openai_serving_chat_with_tokens = (
-        OpenAIServingChatWithTokens(
-            engine_client,
-            state.openai_serving_models,
-            args.response_role,
-            request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-            trust_request_chat_template=args.trust_request_chat_template,
-            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-            enable_auto_tools=args.enable_auto_tool_choice,
-            exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-            tool_parser=args.tool_call_parser,
-            reasoning_parser=args.structured_outputs_config.reasoning_parser,
-            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-            enable_force_include_usage=args.enable_force_include_usage,
-            enable_log_outputs=args.enable_log_outputs,
-            log_error_stack=args.log_error_stack,
-        )
-        if "generate" in supported_tasks
-        else None
+    
+    chat_kwargs = dict(
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        trust_request_chat_template=args.trust_request_chat_template,
+        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+        enable_force_include_usage=args.enable_force_include_usage,
+        enable_log_outputs=args.enable_log_outputs,
     )
+    
+    serving_chat = OpenAIServingChatWithTokens(
+        engine_client,
+        state.openai_serving_models,
+        args.response_role,
+        **chat_kwargs,
+    )
+    
+    state.openai_serving_chat = serving_chat if "generate" in supported_tasks else None
+    state.openai_serving_chat_with_tokens = serving_chat if "generate" in supported_tasks else None
 
 
 def custom_run_api_server_worker_proc(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
@@ -228,6 +237,9 @@ vllm.entrypoints.cli.serve.run_api_server_worker_proc = custom_run_api_server_wo
 def server(config: GRPOInferenceConfig):
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
+        
+    if config.tool_call_parser is not None:
+        logger.info(f"Using tool_call_parser='{config.tool_call_parser}' for model '{config.model}'")
 
     parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
     parser = make_arg_parser(parser)

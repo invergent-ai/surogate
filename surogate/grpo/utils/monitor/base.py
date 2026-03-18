@@ -30,6 +30,10 @@ class Monitor(ABC):
     @abstractmethod
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:
         pass
+    
+    def flush(self, step: int) -> None:
+        """Commit all accumulated metrics for the given step."""
+        pass
 
     def close(self) -> None:
         """Close any resources held by the monitor. Override in subclasses that need cleanup."""

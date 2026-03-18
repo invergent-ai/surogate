@@ -10,8 +10,6 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-import torch
-
 from surogate.grpo.config import NoiseSchedulerConfig
 from surogate.utils.logger import get_logger
 

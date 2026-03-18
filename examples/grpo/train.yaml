@@ -32,16 +32,6 @@ lora_target_modules:
   - up_proj
   - down_proj
 
-# GRPO loss
-loss:
-  ratio_type: token
-  kl_tau: 0.0
-  adv_tau: 1.0
-  token_mask_low: 0.125
-  token_mask_high: 8.0
-  geo_mask_low: 0.1
-  geo_mask_high: 10.0
-
 # Checkpointing
 save_steps: 100
 checkpoint_dir: ./outputs/checkpoints

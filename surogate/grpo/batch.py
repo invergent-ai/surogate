@@ -58,15 +58,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         position_ids=position_ids,
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
-        temperatures=temperatures,
-        pixel_values=training_example.pixel_values,
-        image_grid_thw=training_example.image_grid_thw,
+        temperatures=temperatures
     )
-
-
-def _is_multimodal_sample(sample: MicroBatch) -> bool:
-    """Check if a sample contains multimodal data (images)."""
-    return sample.pixel_values is not None
 
 
 def packed_samples_into_micro_bs(
@@ -82,15 +75,7 @@ def packed_samples_into_micro_bs(
     micro_batches: list[MicroBatch] = []
 
     for idx, sample in samples:
-        if _is_multimodal_sample(sample):
-            sample.lora_num_tokens = [0] * num_loras
-            sample.lora_num_tokens[idx] = len(sample.input_ids)
-            micro_batches.append(sample)
-            continue
-
         for bin_content in micro_batches:
-            if _is_multimodal_sample(bin_content):
-                continue
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
                 bin_content.input_ids.extend(sample.input_ids)
                 bin_content.loss_mask.extend(sample.loss_mask)

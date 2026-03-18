@@ -15,6 +15,17 @@ logger = get_logger()
 # TODO: on newer vLLM, can import via `get_args(vllm.config.lora.MaxLoRARanks)`
 VALID_VLLM_LORA_RANKS = (8, 16, 32, 64, 128, 256, 320, 512)
 
+
+# vLLM all2all backend options for expert-parallel deployments.
+All2AllBackend = Literal[
+    "allgather_reducescatter",
+    "deepep_high_throughput",
+    "deepep_low_latency",
+    "flashinfer_all2allv",
+    "naive",
+    "pplx",
+]
+
 @dataclass
 class GRPOInferenceConfig:
     """
@@ -43,6 +54,9 @@ class GRPOInferenceConfig:
         api_server_count: The number of API servers to use. Passed to vLLM as `--api-server-count`. Default is 1, but will be automatically increased to match data parallel size if necessary.
         seed: The seed to use for inference. Passed to vLLM as `--seed`. Default is 0.
         weight_broadcast_type: The type of weight broadcast to use. Default is "filesystem".
+        enable_expert_parallel: Enable expert parallelism for MoE models. Passed to vLLM as `--enable-expert-parallel`.
+        all2all_backend: All-to-all backend for expert parallel communication. Passed to vLLM as `--all2all-backend`.
+        enable_eplb: Enable expert parallel load balancer (EPLB). Passed to vLLM as `--enable-eplb`.
     """
 
     # VLLM server configuration
@@ -76,7 +90,10 @@ class GRPOInferenceConfig:
     api_server_count: Optional[int] = 1
     seed: Optional[int] = 0
     weight_broadcast_type: Literal["nccl", "filesystem", "colocate"] = "filesystem"
-
+    enable_expert_parallel: Optional[bool] = False
+    all2all_backend: Optional[All2AllBackend] = "allgather_reducescatter"
+    enable_eplb: Optional[bool] = False
+    
     def __init__(self, cfg: DictDefault):
         self.host = cfg.get("host", self.host)
         self.port = cfg.get("port", self.port)
@@ -116,7 +133,7 @@ class GRPOInferenceConfig:
             self.api_server_count = self.dp
 
         if self.enable_lora:
-            self.api_server_count = 1  # LoRA requires only one API server
+            self.api_server_count = 1  # LoRA requires only one API server 
 
     def to_vllm(self) -> Namespace:
         """Convert InferenceConfig to vLLM-compatible Namespace."""
@@ -142,6 +159,9 @@ class GRPOInferenceConfig:
             "max_lora_rank": "max_lora_rank",
             "gpu_memory_utilization": "gpu_memory_utilization",
             "api_server_count": "api_server_count",
+            "enable_expert_parallel": "enable_expert_parallel",
+            "all2all_backend": "all2all_backend",
+            "enable_eplb": "enable_eplb",
         }
 
         for key, vllm_key in to_vllm.items():

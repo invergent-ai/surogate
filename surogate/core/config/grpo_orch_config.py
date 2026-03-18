@@ -24,25 +24,6 @@ class GRPOModelConfig:
         self.lora_adapter = cfg.get("lora_adapter", self.lora_adapter)
         self.lora_rank = cfg.get("lora_rank", self.lora_rank)
         self.lora_alpha = cfg.get("lora_alpha", self.lora_alpha)
-
-@dataclass
-class GRPOElasticConfig:
-    """
-    Configures elastic inference pool with DNS-based service discovery. Works with any DNS hostname that resolves to multiple IP addresses.
-    
-    Args:
-        hostname: DNS hostname that resolves to inference server IPs.
-        port: Port that inference servers listen on. Default is 8000.
-        sync_interval: Interval in seconds between server discovery checks. Default is 5.0 seconds
-    """
-    hostname: Optional[str] = None
-    port: Optional[int] = 8000
-    sync_interval: Optional[float] = 5.0
-    
-    def __init__(self, cfg: DictDefault):
-        self.hostname = cfg.get("hostname", self.hostname)
-        self.port = cfg.get("port", self.port)
-        self.sync_interval = cfg.get("sync_interval", self.sync_interval)
     
 @dataclass
 class GRPOClientConfig:
@@ -55,14 +36,12 @@ class GRPOClientConfig:
         api_key_var: Name of environment variable containing the API key to use for the inference API. Can be set to an arbitrary string if the inference server is not protected by an API key. If multiple URLs are specified, the same API key will be used for all servers.
         headers: Headers to use for the OpenAI API. By default, it is set to an empty dictionary.
         skip_model_check: Whether to skip checking if the model is available in the inference pool. Useful for external APIs or API Keys that don't support the /models endpoint.
-        elastic: Elastic inference pool configuration for DNS-based service discovery. If provided, base_url is ignored and inference servers are discovered dynamically via DNS.
     """
     timeout: Optional[int] = 1200
     base_url: Optional[List[str]] = field(default_factory=lambda: ["http://localhost:8000/v1"])
     api_key_var: Optional[str] = "VLLM_API_KEY"
     headers: Optional[Dict[str, str]] = field(default_factory=dict)
     skip_model_check: Optional[bool] = False
-    elastic: Optional[GRPOElasticConfig] = None
     
     def __init__(self, cfg: DictDefault):
         self.timeout = cfg.get("timeout", 1200)
@@ -70,15 +49,6 @@ class GRPOClientConfig:
         self.api_key_var = cfg.get("api_key_var", "VLLM_API_KEY")
         self.headers = cfg.get("headers", {})
         self.skip_model_check = cfg.get("skip_model_check", False)
-        self.elastic = None
-        elastic_cfg = cfg.get("elastic", None)
-        if elastic_cfg is not None:
-            self.elastic = GRPOElasticConfig(elastic_cfg)
-    
-    @property
-    def is_elastic(self) -> bool:
-        """Check if elastic mode is enabled."""
-        return self.elastic is not None
 
 
 @dataclass
@@ -164,12 +134,18 @@ class GRPOEnvConfig:
         name: Name of the environment to use.
         address: Address of the environment server. If None, will spawn an environment server in a subprocess automatically.If given, will try to connect an environment client to the environment server at this address.
         extra_env_kwargs: Extra kwargs passed to an env (e.g. seq_len, score_rollouts). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server.
+        max_retries: Maximum number of times the environment will retry a failed rollout.
     """
     id: Optional[str] = None
     args: Optional[Dict[str, Any]] = field(default_factory=dict)
     name: Optional[str] = None
     address: Optional[str] = None
     extra_env_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
+    max_retries: Optional[int] = 0
+    
+    @property
+    def resolved_name(self) -> str:
+        return self.name or self.id.split("@")[0]
     
     def __init__(self, cfg: DictDefault):   
         self.id = cfg.get("id", self.id)
@@ -177,6 +153,12 @@ class GRPOEnvConfig:
         self.name = cfg.get("name", self.name)
         self.address = cfg.get("address", self.address)
         self.extra_env_kwargs = cfg.get("extra_env_kwargs", {})
+        self.max_retries = cfg.get("max_retries", self.max_retries)
+        
+        if self.resolved_name == "all":
+            raise ValueError(
+                'Environment name "all" is reserved for global metric aggregation. Use a different name or id.'
+            )
 
 @dataclass
 class GRPOEvalEnvConfig:
@@ -187,18 +169,15 @@ class GRPOEvalEnvConfig:
         num_examples: Number of examples to evaluate per environment.
         rollouts_per_example: Number of rollouts to perform per example.
         skip_first: Number of initial examples to skip. Defaults to 0.
-        max_retries: Maximum number of retries for evaluation. Defaults to 0.
     """
     num_examples: Optional[int] = None
     rollouts_per_example: Optional[int] = None
     skip_first: Optional[int] = 0
-    max_retries: Optional[int] = 0
     
     def __init__(self, cfg: DictDefault):
         self.num_examples = cfg.get("num_examples", self.num_examples)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.skip_first = cfg.get("skip_first", self.skip_first)
-        self.max_retries = cfg.get("max_retries", self.max_retries)
     
     
 @dataclass
@@ -290,7 +269,6 @@ class GRPOBufferConfig:
         hard_fraction: Fraction of hard problems to convert to normal when resuming or starting training. Only problems with difficulty 'normal' are sampled.
         online_difficulty_filtering: Whether to filter rollouts based on difficulty. If True, rollouts with average reward 0.0 or 1.0 are not added to the buffer.
         hash_keys: Keys to use for computing example hashes. Will be used to match examples from buffer checkpoints and determine buffer resume behavior.
-        skip_verification: Whether to skip verification of rollouts using the environment's rubric. If True, rewards are always set to 0, online_difficulty_filtering is disabled, and easy/hard thresholds are not used. 
     """
     seed: Optional[int] = None
     env_ratios: Optional[List[float]] = None
@@ -300,7 +278,6 @@ class GRPOBufferConfig:
     hard_fraction: Optional[float] = 0.0
     online_difficulty_filtering: Optional[bool] = False
     hash_keys: Optional[List[str]] = field(default_factory=lambda: ["task", "prompt"])
-    skip_verification: Optional[bool] = False
     
     def __init__(self, cfg: DictDefault):
         self.seed = cfg.get("seed", self.seed)
@@ -311,7 +288,6 @@ class GRPOBufferConfig:
         self.hard_fraction = cfg.get("hard_fraction", self.hard_fraction)
         self.online_difficulty_filtering = cfg.get("online_difficulty_filtering", self.online_difficulty_filtering)
         self.hash_keys = cfg.get("hash_keys", ["task", "prompt"])
-        self.skip_verification = cfg.get("skip_verification", self.skip_verification)
         self.__post_init__()
     
     def __post_init__(self):
@@ -320,26 +296,17 @@ class GRPOBufferConfig:
             
         if self.env_ratios is not None:
             assert all(ratio > 0 for ratio in self.env_ratios), "All env_ratios must be positive."
-        
-        """Validate that skip_verification is not used with reward-dependent features."""
-        if self.skip_verification:
-            if self.online_difficulty_filtering:
-                raise ValueError(
-                    "skip_verification cannot be True when online_difficulty_filtering is True. "
-                    "These features depend on rewards which are disabled when skip_verification=True."
-                )
-            if self.easy_threshold is not None:
-                raise ValueError(
-                    "skip_verification cannot be True when easy_threshold is set. "
-                    "Easy threshold depends on rewards which are disabled when skip_verification=True."
-                )
-            if self.hard_threshold is not None:
-                raise ValueError(
-                    "skip_verification cannot be True when hard_threshold is set. "
-                    "Hard threshold depends on rewards which are disabled when skip_verification=True."
-                )
     
 
+@dataclass
+class GRPOVerificationConfig:
+    """Configures rollout verification and rubric scoring."""
+    
+    enabled: Optional[bool] = True
+    
+    def __init__(self, cfg: DictDefault):
+        self.enabled = cfg.get("enabled", self.enabled)
+    
 @dataclass    
 class GRPOAdvantageConfig:
     """Config for the default advantage."""
@@ -611,7 +578,7 @@ class GRPOOrchestratorConfig:
         output_dir: Directory to write outputs to. Will be populated with checkpoints, weights, rollouts and logs as subdirectories. Should be set to a persistent directory with enough disk space. This value should be distinct across experiments running on a single node. See the README for more details.
         max_concurrent: Maximum number of concurrent rollouts to generate and score per-environment. If None, will not limit concurrency.
         tasks_per_minute: Rate limit for tasks per environment worker, in tasks per minute. Recommended for sandbox-backed environments to prevent sandbox-not-ready errors during autoscaling. When set to None, no rate limiting is applied. Note: with multiple workers, the effective total rate equals workers × this value.
-        batch_size: Number of samples to train on per step. Default is 128.
+        batch_size: Number of samples to train on per step (rollout-based batching). Set this OR token_batch_size.
         oversampling_factor: Factor by which to oversample the batch. Will lead to more in-flight group rollout requests at the same time. Default is 1.0 (no oversampling).
         rollouts_per_example: Number of output sequences to return per example during training.
         sequence_len: Sequence length to use for training. If a sample is shorter than this, it will be padded. If a sequence is longer than this, it will be truncated.
@@ -622,6 +589,10 @@ class GRPOOrchestratorConfig:
         strict_async_level: Whether to strictly enforce the max async level. If True, will always ensure that the policy used for generating rollouts is exactly `max_async_level` steps ahead of training. If False, any policy that is at most `max_async_level` steps ahead of training is allowed, i.e. we always use the latest available policy.
         bench: Whether to run in benchmark mode. It will automatically set the maximum number of steps to run to 5, max async level to ~infinity and disable reporting.
         seed: Random seed for the orchestrator.
+        use_token_client: Whether to use the token-in-token-out (TITO) client for training across all environments. WARNING: Only use this if your environment has a linear history and the chat template has the extension property (i.e. no tokens are ever removed or inserted by the chat template)
+        token_batch_size: Number of tokens to train on per step (token-based batching). Set this OR batch_size.
+        max_inflight_rollouts: Maximum number of rollouts to keep in-flight. Required for token-based batching. If batch_size is set and this is unset, defaults to batch_size * oversampling_factor (or batch_size when oversampling_factor is unset).
+        verification: Rollout verification configuration
     """
     
     client: Optional[GRPOClientConfig] = None
@@ -632,6 +603,7 @@ class GRPOOrchestratorConfig:
     env: Optional[List[GRPOEnvConfig]] = None
     eval: Optional[GRPOEvalConfig] = None
     buffer: Optional[GRPOBufferConfig] = None
+    verification: Optional[GRPOVerificationConfig] = None
     advantage: Optional[GRPOAdvantageConfig | GRPOCustomAdvantageConfig] = None
     filters: Optional[List[GRPOGibberishFilterConfig | GRPORepetitionFilterConfig]] = None
     log: Optional[GRPOLogConfig] = None
@@ -644,16 +616,19 @@ class GRPOOrchestratorConfig:
     max_concurrent: Optional[int] = None
     tasks_per_minute: Optional[float] = None
     batch_size: Optional[int] = 128
-    oversampling_factor: Optional[float] = 1.0
+    oversampling_factor: Optional[float] = None
     rollouts_per_example: Optional[int] = 1
     sequence_len: Optional[int] = 2048
-    num_train_workers: Optional[int] = 1 # TODO: This should be automatic from the number of ZMQ connections
+    num_train_workers: Optional[int] = 1
     max_steps: Optional[int] = None
     max_off_policy_steps: Optional[int] = 8
     max_async_level: Optional[int] = 1
     strict_async_level: Optional[bool] = False
     bench: Optional[bool] = False
     seed: Optional[int] = 42
+    use_token_client: Optional[bool] = True
+    token_batch_size: Optional[int] = None
+    max_inflight_rollouts: Optional[int] = None
     
     def __init__(self, cfg: DictDefault):
         self.client = GRPOClientConfig(cfg.get("client", {}))
@@ -673,6 +648,11 @@ class GRPOOrchestratorConfig:
             
         self.buffer = GRPOBufferConfig(cfg.get("buffer", {}))
         
+        if cfg.get("verification") is not None:
+            self.verification = GRPOVerificationConfig(cfg.get("verification", {}))
+        else:
+            self.verification = GRPOVerificationConfig({})
+            
         if cfg.get("advantage") is not None:
             if cfg.get("advantage").get("type") == "custom":
                 self.advantage = GRPOCustomAdvantageConfig(cfg.get("advantage", {}))
@@ -726,14 +706,32 @@ class GRPOOrchestratorConfig:
         else:
             self.rollout_transport = FileSystemTransportConfig({})
         
-        self.output_dir = cfg.get("output_dir", self.output_dir)
+        self.output_dir = Path(cfg.get("output_dir", self.output_dir))
         self.max_concurrent = cfg.get("max_concurrent", self.max_concurrent)
         self.tasks_per_minute = cfg.get("tasks_per_minute", self.tasks_per_minute)
         self.batch_size = cfg.get("batch_size", self.batch_size)
         self.oversampling_factor = cfg.get("oversampling_factor", self.oversampling_factor)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.sequence_len = cfg.get("sequence_len", self.sequence_len)
-        self.num_train_workers = cfg.get("num_train_workers", self.num_train_workers)
+        configured_num_train_workers = cfg.get("num_train_workers")
+        
+        if configured_num_train_workers is not None:
+            self.num_train_workers = configured_num_train_workers
+        elif self.rollout_transport.type == "zmq":
+            rollout_transport_cfg = cfg.get("rollout_transport", {})
+            zmq_connections = rollout_transport_cfg.get("connections")
+
+            if isinstance(zmq_connections, int):
+                self.num_train_workers = max(1, zmq_connections)
+            elif isinstance(zmq_connections, (list, tuple, set)):
+                self.num_train_workers = max(1, len(zmq_connections))
+            elif isinstance(self.client.base_url, (list, tuple, set)):
+                self.num_train_workers = max(1, len(self.client.base_url))
+            else:
+                self.num_train_workers = 1
+        else:
+            self.num_train_workers = self.num_train_workers
+            
         self.max_steps = cfg.get("max_steps", self.max_steps)
         self.max_off_policy_steps = cfg.get("max_off_policy_steps", self.max_off_policy_steps)
         self.max_async_level = cfg.get("max_async_level", self.max_async_level)
@@ -755,8 +753,36 @@ class GRPOOrchestratorConfig:
             if not self.max_async_level == 1:
                 raise ValueError("max_async_level must be 1 for NCCL broadcast")
             
-        if self.batch_size % self.rollouts_per_example != 0:
-            raise ValueError("Batch size must be divisible by the number of samples per problem")
+        has_rollout_batch = self.batch_size is not None
+        has_token_batch = self.token_batch_size is not None
+        if has_rollout_batch and has_token_batch:
+            raise ValueError("Set exactly one of batch_size or token_batch_size")
+        
+        if not has_rollout_batch and not has_token_batch:
+            self.batch_size = 128
+            
+        if has_token_batch:
+            if self.oversampling_factor is not None:
+                raise ValueError("oversampling_factor can only be set when batch_size is set")
+            
+            if self.max_inflight_rollouts is None:
+                raise ValueError("max_inflight_rollouts must be set when token_batch_size is set")
+        else:
+            assert self.batch_size is not None
+            if self.batch_size % self.rollouts_per_example != 0:
+                raise ValueError("Batch size must be divisible by the number of samples per problem")
+            if self.max_inflight_rollouts is not None and self.oversampling_factor is not None:
+                expected_max_inflight_rollouts = int(self.batch_size * self.oversampling_factor)
+                if self.max_inflight_rollouts != expected_max_inflight_rollouts:
+                    raise ValueError(
+                        "max_inflight_rollouts conflicts with oversampling_factor * batch_size"
+                    )
+            if self.max_inflight_rollouts is None:
+                oversampling_factor = self.oversampling_factor if self.oversampling_factor is not None else 1.0
+                self.max_inflight_rollouts = int(self.batch_size * oversampling_factor)
+        
+        if self.max_inflight_rollouts is not None and self.max_inflight_rollouts < self.rollouts_per_example:
+            raise ValueError("max_inflight_rollouts must be at least the number of rollouts per example")
         
         if self.buffer.env_ratios is not None:
             assert len(self.buffer.env_ratios) == len(self.env), "env_ratios length must match number of environments"
@@ -771,8 +797,8 @@ class GRPOOrchestratorConfig:
                 self.report_to = None
 
         train_extra_env_kwargs = dict(
-            sequence_len=self.sequence_len,
-            score_rollouts=not self.buffer.skip_verification,
+            max_seq_len=self.sequence_len,
+            score_rollouts=not self.verification.enabled,  
         )
         for env in self.env:
             # extra_env_kwargs is not meant to be used by the user, we shamelessly override here
@@ -792,3 +818,22 @@ class GRPOOrchestratorConfig:
             scheduler = self.sampling.temp_scheduler
             if scheduler.total_steps is None and self.max_steps is None:
                 raise ValueError("temp_scheduler.total_steps must be set when max_steps is None")
+            
+        if not self.verification and self.buffer.online_difficulty_filtering:
+            raise ValueError(
+                "verification.enabled cannot be False when buffer.online_difficulty_filtering is True. "
+                "These features depend on rewards which are disabled when verification.enabled=False."
+            )
+            
+        if not self.verification and self.buffer.easy_threshold is not None:
+            raise ValueError(
+            "verification.enabled cannot be False when buffer.easy_threshold is set. "
+            "Easy threshold depends on rewards which are disabled when verification.enabled=False."
+        )
+             
+        if not self.verification and self.buffer.hard_threshold is not None:
+            raise ValueError(
+                "verification.enabled cannot be False when buffer.hard_threshold is set. "
+                "Hard threshold depends on rewards which are disabled when verification.enabled=False."
+            )
+            

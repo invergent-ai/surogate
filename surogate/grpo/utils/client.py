@@ -19,7 +19,7 @@ logger = get_logger()
 
 @runtime_checkable
 class InferencePool(Protocol):
-    """Protocol for inference pools (static or elastic)."""
+    """Protocol for inference pools."""
 
     @property
     def clients(self) -> list[vf.ClientConfig]:
@@ -97,29 +97,27 @@ class StaticInferencePool:
         pass
 
 
-async def setup_inference_pool(client_config: GRPOClientConfig, model_name: str) -> InferencePool:
-    """Create an inference pool from config (static or elastic)."""
-    if client_config.is_elastic:
-        from surogate.grpo.utils.elastic import ElasticInferencePool
-
-        return await ElasticInferencePool.from_config(client_config, model_name=model_name)
-
+async def setup_inference_pool(
+    client_config: GRPOClientConfig, model_name: str, client_type: str = "openai_chat_completions"
+) -> InferencePool:
+    """Create an inference pool from config."""
+    
     logger.info(
         f"Initializing static inference pool (base_url={', '.join(client_config.base_url)}, "
         f"api_key_var={client_config.api_key_var}, headers={client_config.headers})"
     )
     return StaticInferencePool(
-        clients=setup_clients(client_config),
+        clients=setup_clients(client_config, client_type=client_type),
         admin_clients=setup_admin_clients(client_config),
         skip_model_check=client_config.skip_model_check,
     )
 
 
-def setup_clients(client_config: GRPOClientConfig) -> list[vf.ClientConfig]:
+def setup_clients(client_config: GRPOClientConfig, client_type: str = "openai_chat_completions") -> list[vf.ClientConfig]:
     def setup_client(client_idx: int, base_url: str) -> vf.ClientConfig:
         return vf.ClientConfig(
             client_idx=client_idx,
-            client_type="openai_chat_completions_token",
+            client_type=client_type,
             api_base_url=base_url,
             api_key_var=client_config.api_key_var,
             timeout=client_config.timeout,
@@ -132,7 +130,7 @@ def setup_clients(client_config: GRPOClientConfig) -> list[vf.ClientConfig]:
     return [setup_client(client_idx, base_url) for client_idx, base_url in enumerate(client_config.base_url)]
 
 
-def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
+def setup_admin_clients(client_config: GRPOClientConfig) -> list[AsyncClient]:
     """Create a dedicated admin client for weight update operations.
 
     Uses a separate connection pool to avoid queueing behind streaming requests.
@@ -151,7 +149,7 @@ def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
             base_url=base_url,
             headers=headers,
             limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
-            timeout=httpx.Timeout(client_config.timeout),
+            timeout=httpx.Timeout(None),
         )
 
     return [_setup_admin_client(base_url) for base_url in client_config.base_url]

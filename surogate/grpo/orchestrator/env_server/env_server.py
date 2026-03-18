@@ -1,11 +1,10 @@
 import asyncio
-
+from pathlib import Path
 from verifiers.workers import ZMQEnvServer
 
 from surogate.grpo.orchestrator.env_server.config import EnvServerConfig
 from surogate.grpo.utils.logger import setup_logger
 from surogate.grpo.utils.pathing import get_log_dir
-from surogate.grpo.utils.pydantic_config import parse_argv
 from surogate.grpo.utils.utils import clean_exit, get_env_ids_to_install, install_env, strip_env_version
 
 
@@ -34,11 +33,3 @@ def run_server(config: EnvServerConfig):
     )
     asyncio.run(server.run())
 
-
-def main():
-    """Main entry-point for env-server. Run using `uv run env-server`"""
-    run_server(parse_argv(EnvServerConfig))
-
-
-if __name__ == "__main__":
-    main()

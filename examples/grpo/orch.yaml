@@ -9,12 +9,14 @@ model:
 env:
   - id: reverse-text
 
-batch_size: 16
-rollouts_per_example: 4
+batch_size: 128
+rollouts_per_example: 16
 seq_len: 2048
 max_steps: 20
 
 sampling:
-  max_tokens: 1024
+  max_tokens: 128
 
-  
+client:
+  base_url: 
+    - http://localhost:8007/v1

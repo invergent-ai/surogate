@@ -81,6 +81,10 @@ def add_cuda_version_tag(cuda_tag: str):
     print(f"Set version to {data['project']['version']}")
     
     existing_deps = list(data['project'].get('dependencies', []))
+    
+    # Remove 'torch*' dependencies if they exist to avoid conflicts
+    existing_deps = [dep for dep in existing_deps if not dep.startswith('torch')]
+    
     data['project']['dependencies'] = existing_deps + CUDA_DEPS[cuda_tag]
     
     with open('pyproject.toml', 'w') as f:

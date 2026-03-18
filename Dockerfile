@@ -22,6 +22,7 @@ FROM ubuntu:noble-20260210.1
 LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate
 ARG PACKAGE_VERSION=0.1.1
 ARG WHEEL_TAG=cu13
+ARG VLLM_TORCH_BACKEND=cu130
 ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${WHEEL_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -57,7 +58,7 @@ ENV PATH="/home/surogate/.venv/bin:$PATH" \
 
 # Install wheel from URL
 RUN uv pip install ${WHEEL_URL}
-RUN uv pip install -U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly --index-strategy unsafe-best-match --torch-backend=${WHEEL_TAG}
+RUN uv pip install -U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly --index-strategy unsafe-best-match --torch-backend=${VLLM_TORCH_BACKEND}
 RUN uv pip install "transformers==5.3.0"
 
 # Default entrypoint

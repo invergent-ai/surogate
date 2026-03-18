@@ -55,16 +55,6 @@ lora: true
 lora_rank: 16
 lora_alpha: 32
 
-# GRPO loss
-loss:
-  ratio_type: token
-  kl_tau: 0.0
-  adv_tau: 1.0
-  token_mask_low: 0.125
-  token_mask_high: 8.0
-  geo_mask_low: 0.1
-  geo_mask_high: 10.0
-
 # QeRL noise scheduler (optional, improves exploration)
 noise_scheduler:
   enabled: true

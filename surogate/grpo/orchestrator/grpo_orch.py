@@ -3,15 +3,16 @@ import dataclasses
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
 
 import yaml
 from pathlib import Path
 
 from surogate.grpo.orchestrator.advantage import compute_advantages
-from surogate.grpo.orchestrator.eval_utils import get_eval_sampling_args
+from surogate.grpo.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from surogate.grpo.orchestrator.event_loop_lag import EventLoopLagMonitor
 from surogate.grpo.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
-from surogate.grpo.orchestrator.trajectories import build_vlm_image_cache, interleave_rollout
+from surogate.grpo.orchestrator.trajectories import interleave_rollout
 from surogate.grpo.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from surogate.grpo.utils.pathing import get_log_dir
 
@@ -29,7 +30,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
-from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
+from surogate.core.config.grpo_orch_config import GRPOBufferConfig, GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
@@ -47,6 +48,7 @@ from surogate.grpo.orchestrator.vf_utils import (
     intercept_vf_logging,
     setup_env_client,
     spawn_env_server,
+    task_uses_group_scoring,
     wait_for_env_servers,
 )
 from surogate.grpo.utils.client import (
@@ -111,8 +113,14 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     for env_id in env_ids_to_install:
         install_env(env_id)
 
-    # Setup inference pool (handles both static and elastic modes)
-    inference_pool = await setup_inference_pool(config.client, model_name=config.model.name)
+    # Setup inference pool
+    client_type = "openai_chat_completions_token" if config.use_token_client else "openai_chat_completions"
+    if config.use_token_client:
+        logger.warning(
+            "Token-in-token-out (TITO) client is enabled. Only use this if your environment has a linear "
+            "history and the chat template has the extension property."
+        )
+    inference_pool = await setup_inference_pool(config.client, model_name=config.model.name, client_type=client_type)
 
     # Setup teacher inference pool if configured
     if config.teacher_model:
@@ -165,11 +173,32 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         env_names=train_env_names,
         map_kwargs=dict(writer_batch_size=1),  # set defensively to not error on map operations on large datasets
     )
+    
+    verification_enabled = config.verification.enabled
+    train_env_deferred_group_scoring_tasks = (
+        {env_name for env_name in train_env_names if task_uses_group_scoring(train_env_group, env_name)}
+        if verification_enabled
+        else set()
+    )
+    for train_env_name, env_cfg in zip(train_env_names, config.env):
+        env_cfg.extra_env_kwargs["score_rollouts"] = (
+            verification_enabled and train_env_name not in train_env_deferred_group_scoring_tasks
+        )
+    if not verification_enabled:
+        logger.info("Verification disabled; all training envs will skip scoring.")
+    elif train_env_deferred_group_scoring_tasks:
+        deferred_tasks = ", ".join(sorted(train_env_deferred_group_scoring_tasks))
+        logger.info(
+            f"Deferred group scoring enabled for training tasks: {deferred_tasks}. "
+            "Rollouts run individually and are scored once each group completes."
+        )
+    
 
     train_env_addresses = []
+    env_processes: list[mp.Process] = []
     for env_id, env, env_name in zip(env_ids, config.env, train_env_names):
         if env.address is None:
-            address = spawn_env_server(
+            address, process = spawn_env_server(
                 env_id=env_id,
                 env_args=env.args,
                 extra_env_kwargs=env.extra_env_kwargs,
@@ -178,7 +207,13 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 log_file_level=config.log.vf_level,
                 json_logging=config.log.json_logging,
             )
+            env_processes.append(process)
         else:
+            if env_name in train_env_deferred_group_scoring_tasks:
+                logger.warning(
+                    f"Training env {env_name} uses external server at {env.address}. "
+                    "Ensure that server was started with score_rollouts=False."
+                )
             address = env.address
         logger.info(f"Connecting train environment {env_name} to server at {address}")
         train_env_addresses.append(address)
@@ -204,7 +239,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         for env_id, env, eval_env_name in zip(env_ids, config.eval.env, eval_env_names):
             if env.address is None:
-                address = spawn_env_server(
+                address, process = spawn_env_server(
                     env_id=env_id,
                     env_args=env.args,
                     extra_env_kwargs=env.extra_env_kwargs,
@@ -213,6 +248,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     log_file_level=config.log.vf_level,
                     json_logging=config.log.json_logging,
                 )
+                env_processes.append(process)
             else:
                 address = env.address
             logger.info(f"Connecting eval environment {eval_env_name} to server at {address}")
@@ -240,7 +276,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
     buffer = Buffer(train_dataset, train_env_group.env_names, config.buffer)
     if config.val is not None:
-        val_buffer_config = BufferConfig(env_ratios=config.buffer.env_ratios)
+        val_buffer_config = GRPOBufferConfig(env_ratios=config.buffer.env_ratios)
         val_dataset = train_env_group.get_eval_dataset(seed=val_buffer_config.seed)
         val_buffer = Buffer(val_dataset, train_env_group.env_names, val_buffer_config)
     else:
@@ -261,13 +297,13 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         env=train_env_group,
         buffer=buffer,
         inference_pool=inference_pool,
-        oversampling_factor=config.oversampling_factor,
+        max_inflight_rollouts=config.max_inflight_rollouts,
         max_async_level=config.max_async_level,
         max_off_policy_steps=config.max_off_policy_steps,
         strict_async_level=config.strict_async_level,
         tasks_per_minute=config.tasks_per_minute,
         lora_name=config.model.lora_adapter,
-        output_dir=Path(config.output_dir),
+        deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
         config=config,
     )
 
@@ -302,6 +338,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
     # Track last online eval checkpoint step for this process
     last_eval_step = -1
+    # Track previous ckpt_step to detect when ckpt_step jumps over eval interval boundaries
+    prev_ckpt_step = -1
 
     # Reset weights to base model if starting from scratch
     progress = Progress()
@@ -311,9 +349,13 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
         scheduler.ckpt_step = progress.step  # Always resume from the latest checkpoint
         if config.eval and config.eval.skip_eval_on_resume:
+            prev_ckpt_step = scheduler.ckpt_step
             last_eval_step = scheduler.ckpt_step
             logger.info(f"Skipping online eval on resume (ckpt_step={scheduler.ckpt_step})")
-
+        else:
+            # Allow eval at resumed step by setting prev_ckpt_step one behind
+            prev_ckpt_step = scheduler.ckpt_step - 1
+            
         # In NCCL mode, skip existence check - weights are broadcasted, not stored on disk
         check_exists = config.weight_broadcast.type != "nccl"
         wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
@@ -331,13 +373,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     is_first_step = True
     await set_semaphore(config.max_concurrent or -1)
 
-    # Start update policy loop
-    update_policy_task = asyncio.create_task(scheduler.update_policy_loop())
-
-    # Track consecutive empty batches for retry logic
-    empty_batch_retries = 0
-    max_empty_batch_retries = 5
-
     # Persistent ThreadPoolExecutor for parallel rollout processing
     rollout_executor = ThreadPoolExecutor(max_workers=64)
 
@@ -348,13 +383,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             reason = evicted_path.read_text().strip()
             raise RuntimeError(f"Run evicted by trainer: {reason}")
 
-        # Check if update_policy_task has failed and propagate the exception
-        if update_policy_task.done():
-            # End all other tasks
-            for task in asyncio.all_tasks():
-                task.cancel()
-            update_policy_task.result()  # Raises if the task failed
-        # Capture ckpt_step once for consistency (it's updated by update_policy_loop concurrently)
+        # Capture ckpt_step once for consistency (it's updated inside the scheduler)
         ckpt_step = scheduler.ckpt_step
 
         # Save checkpoint (if we are at an interval step and not at the first or last step)
@@ -378,16 +407,25 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         logger.info(f"Starting orchestrator step {progress.step}")
         step_start_time = time.perf_counter()
 
-        # Run evals BEFORE training (blocking, in subprocess to isolate event loop)
-        # This ensures weights don't change during eval and eval doesn't cause event loop lag
-        if (
-            config.eval
-            and ckpt_step % config.eval.interval == 0
-            and ckpt_step > last_eval_step
-            and ((ckpt_step == 0 and config.eval.eval_base_model) or ckpt_step > 0)
-        ):
+        # Run evals BEFORE training (blocking). Weight updates are paused via
+        # scheduler.checkpoint_ready during eval to ensure consistent weights.
+        # Use range check to handle ckpt_step jumping over interval boundaries.
+        eval_ckpt_step = None
+        if config.eval:
+            eval_ckpt_step = compute_eval_ckpt_step(
+                ckpt_step=ckpt_step,
+                prev_ckpt_step=prev_ckpt_step,
+                last_eval_step=last_eval_step,
+                interval=config.eval.interval,
+                eval_base_model=config.eval.eval_base_model,
+            )
+            
+        if eval_ckpt_step is not None:
             last_eval_step = ckpt_step
-            logger.info(f"Running evals for checkpoint step {ckpt_step}")
+            if eval_ckpt_step != ckpt_step:
+                logger.info(f"Running evals for interval step {eval_ckpt_step} (current ckpt_step={ckpt_step})")
+            else:
+                logger.info(f"Running evals for checkpoint step {ckpt_step}")
 
             # Pause weight updates and re-scheduling of training rollouts during eval
             # to avoid evaluating across different checkpoints and avoid congestion
@@ -396,7 +434,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             # For heavy eval workloads, it might be necessary additionally cancel in-flight training rollouts
             if config.eval.cancel_inflight_rollouts_on_eval:
                 logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
-                scheduler.cancel_inflight_rollouts()
+                await scheduler.cancel_inflight_rollouts()
 
             results = await asyncio.gather(
                 *[
@@ -419,6 +457,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             # Resume weight updates
             scheduler.checkpoint_ready.set()
 
+        # Update prev_ckpt_step for next iteration
+        prev_ckpt_step = ckpt_step
+        
         # Schedule generating the training batch
         temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
         sampling_args = get_sampling_args(config.sampling, temperature=temperature)
@@ -453,6 +494,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         # Compute advantages
         example_ids = [r["example_id"] for r in train_rollouts]
+        num_rollouts = len(train_rollouts)
+        num_unique_examples = len(set(example_ids))
         rewards = [r["reward"] for r in train_rollouts]
         completion_lens = [get_completion_len(r) for r in train_rollouts]
         advantages = compute_advantages(
@@ -464,25 +507,15 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         # Convert rollouts to training samples
         parallel_preprocess_start = time.perf_counter()
-        num_unique_examples = len(set(example_ids))
-
-        # VLM: build image cache for efficient batched preprocessing
-        if is_vlm:
-            vlm_cache = build_vlm_image_cache(train_rollouts, processor)
-            logger.info(
-                f"VLM timing: extract={vlm_cache.extract_time:.2f}s, preprocess={vlm_cache.preprocess_time:.2f}s"
-            )
-        else:
-            vlm_cache = None
 
         # Process rollouts in parallel
-        def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
-            return interleave_rollout(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
+        def process_rollout(rollout: vf.RolloutOutput) -> list[TrainingSample] | None:
+            return interleave_rollout(rollout)
 
         loop = asyncio.get_event_loop()
         futures = [
-            loop.run_in_executor(rollout_executor, process_rollout, r, rollout_idx)
-            for rollout_idx, r in enumerate(train_rollouts)
+            loop.run_in_executor(rollout_executor, process_rollout, r) 
+            for _, r in enumerate(train_rollouts)
         ]
         results = await asyncio.gather(*futures)
 
@@ -490,12 +523,14 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         train_examples: list[TrainingSample] = []
         rollout_prefill_lens: list[int] = []
         rollout_decode_lens: list[int] = []
+        rollout_samples_per_rollout: list[int] = []
         num_prefill_tokens = 0
         num_decode_tokens = 0
         for rollout, advantage, samples in zip(train_rollouts, advantages, results):
             rollout_prefill_tokens = 0
             rollout_decode_tokens = 0
             if samples is not None:
+                rollout_samples_per_rollout.append(len(samples))
                 for sample in samples:
                     sample.advantage = advantage
                     sample.reward = rollout["reward"]
@@ -504,6 +539,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     rollout_decode_tokens += sample_decode_tokens
                     rollout_prefill_tokens += sample_prefill_tokens
                     train_examples.append(sample)
+            else:
+                rollout_samples_per_rollout.append(0)
             rollout_prefill_lens.append(rollout_prefill_tokens)
             rollout_decode_lens.append(rollout_decode_tokens)
             num_prefill_tokens += rollout_prefill_tokens
@@ -535,25 +572,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             step=progress.step,
         )
 
-        # Retry with exponential backoff if batch is empty (e.g., inference temporarily unavailable)
-        if len(training_batch.examples) == 0:
-            empty_batch_retries += 1
-            if empty_batch_retries >= max_empty_batch_retries:
-                raise RuntimeError(
-                    f"Step {progress.step} failed after {max_empty_batch_retries} consecutive empty batches"
-                )
-            backoff = min(30 * (2 ** (empty_batch_retries - 1)), 300)  # 30s, 60s, 120s, 240s, 300s cap
-            logger.warning(
-                f"Step {progress.step} produced 0 training samples "
-                f"(attempt {empty_batch_retries}/{max_empty_batch_retries}). Retrying in {backoff}s..."
-            )
-            # Cancel validation task to avoid accumulating background tasks
-            val_task.cancel()
-            await asyncio.sleep(backoff)
-            continue
-
-        # Reset retry counter on successful batch
-        empty_batch_retries = 0
         training_batch_sender.send(training_batch)
 
         # Await and process val results
@@ -568,9 +586,11 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 "reward": [rollout["reward"] for rollout in train_rollouts],
                 "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
                 "error": [rollout["error"] for rollout in train_rollouts],
+                "stop_condition": [rollout.get("stop_condition") for rollout in train_rollouts],
                 "seq_len": [get_seq_len(rollout) for rollout in train_rollouts],
                 "prefill_len": rollout_prefill_lens,
                 "decode_len": rollout_decode_lens,
+                "samples_per_rollout": rollout_samples_per_rollout,
                 "num_turns": [len(rollout["trajectory"]) for rollout in train_rollouts],
                 "generation_ms": [rollout["timing"]["generation_ms"] for rollout in train_rollouts],
                 "scoring_ms": [rollout["timing"]["scoring_ms"] for rollout in train_rollouts],
@@ -595,17 +615,15 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         # Update progress metrics and throughput
         num_tokens = int(results_df.seq_len.sum())
         progress.total_tokens += num_tokens
-        progress.total_samples += config.batch_size
-        progress.total_problems += config.batch_size // config.rollouts_per_example
+        progress.total_samples += num_rollouts
+        progress.total_problems += num_unique_examples
         throughput = num_tokens / generate_completions_time
 
         # Compute solve all and none tensors
-        solve_all = (
-            results_df.groupby("example_id")
-            .apply(lambda x: x.reward.sum() == config.rollouts_per_example, include_groups=False)
-            .mean()
-        )
-        solve_none = results_df.groupby("example_id").apply(lambda x: x.reward.sum() == 0, include_groups=False).mean()
+        problem_indices = results_df.index // config.rollouts_per_example
+        reward_sum_per_problem = results_df.groupby(problem_indices).reward.sum()
+        solve_all = (reward_sum_per_problem == config.rollouts_per_example).mean()
+        solve_none = (reward_sum_per_problem == 0).mean()
         effective_batch_size = 1 - solve_none - solve_all
 
         step_time = time.perf_counter() - step_start_time
@@ -614,8 +632,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             "progress/tokens": num_tokens,
             "progress/prefill_tokens": num_prefill_tokens,
             "progress/decode_tokens": num_decode_tokens,
-            "progress/samples": config.batch_size,
-            "progress/problems": config.batch_size // config.rollouts_per_example,
+            "progress/samples": num_rollouts,
+            "progress/problems": num_unique_examples,
             "progress/total_tokens": progress.total_tokens,
             "progress/total_samples": progress.total_samples,
             "progress/total_problems": progress.total_problems,
@@ -633,6 +651,18 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             "is_truncated/mean": results_df.groupby("example_id").is_truncated.mean().mean(),
             "is_truncated/max": results_df.groupby("example_id").is_truncated.mean().max(),
             "is_truncated/min": results_df.groupby("example_id").is_truncated.mean().min(),
+            "stop_condition/generation_truncated": (
+                results_df.is_truncated & (results_df.stop_condition != "prompt_too_long")
+            ).mean(),
+            # Log rate of each stop condition (e.g. max_turns, prompt_too_long, has_error)
+            **{
+                f"stop_condition/{sc}": rate
+                for sc, rate in results_df.stop_condition.dropna().value_counts(normalize=True).items()
+            },
+            # Seqs per rollout metrics
+            "samples_per_rollout/mean": results_df.groupby("example_id").samples_per_rollout.mean().mean(),
+            "samples_per_rollout/max": results_df.groupby("example_id").samples_per_rollout.mean().max(),
+            "samples_per_rollout/min": results_df.groupby("example_id").samples_per_rollout.mean().min(),
             # Turn metrics
             "num_turns/mean": results_df.groupby("example_id").num_turns.mean().mean(),
             "num_turns/max": results_df.groupby("example_id").num_turns.mean().max(),
@@ -648,6 +678,10 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             "perf/throughput": throughput,
             # Train reward
             "reward/mean": results_df.reward.mean(),
+            "reward/std": results_df.reward.std(),
+            "reward/min": results_df.reward.min(),
+            "reward/max": results_df.reward.max(),
+            "reward/median": results_df.reward.median(),
             "sampling/temperature": temperature,
             # Batch metrics
             "batch/solve_none": solve_none,
@@ -692,7 +726,15 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         # Optionally, add val metrics
         if val_results_df is not None:
-            to_log.update({"val_reward/mean": val_results_df.reward.mean()})
+            to_log.update(
+                {
+                    "val_reward/mean": val_results_df.reward.mean(),
+                    "val_reward/std": val_results_df.reward.std(),
+                    "val_reward/min": val_results_df.reward.min(),
+                    "val_reward/max": val_results_df.reward.max(),
+                    "val_reward/median": val_results_df.reward.median(),
+                }
+            )
 
             if val_results_df.task.nunique() > 1:
                 per_env_reward = val_results_df.groupby("task").reward.mean().to_dict()
@@ -702,7 +744,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 to_log.update({f"val_batch/{env}": ratio for env, ratio in per_env_ratio.items()})
 
         # Log metrics to monitor(s)
-        monitor.log(to_log)
+        monitor.log(to_log, step=progress.step)
 
         # Log samples to monitor(s) if enabled
         subset_train_rollouts = random.sample(train_rollouts, min(8, len(train_rollouts)))
@@ -716,6 +758,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             },
             step=progress.step,
         )
+        
+        # Flush all accumulated metrics for this step
+        monitor.flush(step=progress.step)
 
         step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {results_df.reward.mean():.4f} |{f' Val. Reward: {val_results_df.reward.mean():.4f} |' if val_results_df is not None else ''} Throughput: {throughput:.1f} tokens/s | Seq. Length: {results_df.groupby('example_id').seq_len.mean().mean():.1f} tokens/sample | Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
         logger.success(step_message)
@@ -762,8 +807,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     rollout_executor.shutdown(wait=False)
 
     # Stop scheduler
-    scheduler.cancel_inflight_rollouts()
-    update_policy_task.cancel()
+    await scheduler.stop()
 
     # Stop inference pool
     await inference_pool.stop()
@@ -774,6 +818,14 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     # Cancel event loop lag monitor task
     event_loop_lag_monitor_task.cancel()
 
+    # Shutdown env processes
+    for process in env_processes:
+        process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+            
     logger.success("Orchestrator finished.")
 
     # Optionally, print benchmark table

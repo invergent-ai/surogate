@@ -30,8 +30,11 @@ jobs:
       matrix:
         include:
           - wheel_tag: "cu128"
+            vllm_torch_backend: "cu128"
           - wheel_tag: "cu129"
+            vllm_torch_backend: "cu129"
           - wheel_tag: "cu13"
+            vllm_torch_backend: "cu130"
 
     steps:
       - name: Check if this CUDA version should be built
@@ -103,6 +106,7 @@ jobs:
           build-args: |
             PACKAGE_VERSION=${{ steps.version.outputs.version }}
             WHEEL_TAG=${{ matrix.wheel_tag }}
+            VLLM_TORCH_BACKEND=${{ matrix.vllm_torch_backend }}
           tags: |
             ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
             ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}

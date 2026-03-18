@@ -27,8 +27,7 @@ def spawn_env_server(
     log_file: str | None = None,
     log_file_level: str | None = None,
     json_logging: bool = False,
-    daemon: bool = False,
-) -> str:
+) -> tuple[str, mp.Process]:
     """
     Starts a ZMQEnvServer process in a subprocess.
 
@@ -38,7 +37,7 @@ def spawn_env_server(
     # Use spawn to avoid inheriting file descriptors (e.g. sockets) from
     # the parent process, which has caused hangs when multiple env server
     # subprocesses share the same fds.
-    mp.get_context("spawn").Process(
+    process = mp.get_context("spawn").Process(
         target=ZMQEnvServer.run_server,
         args=(
             env_id,
@@ -49,10 +48,11 @@ def spawn_env_server(
             log_file_level,
         ),
         kwargs=dict(address=address, json_logging=json_logging),
-        daemon=daemon,
-    ).start()
+        daemon=False, # cannot run daemon because env server uses subprocesses
+    )
+    process.start()
 
-    return address
+    return address, process
 
 
 def setup_env_client(
@@ -77,6 +77,33 @@ async def wait_for_env_servers(env_clients: list[EnvClient]) -> None:
     await asyncio.gather(*[env_client.wait_for_server_startup() for env_client in env_clients])
 
 
+
+async def run_rollout(
+    env: vf.Environment,
+    client: vf.ClientConfig,
+    model_name: str,
+    example: dict,
+    sampling_args: dict,
+    max_retries: int = DEFAULT_RETRIES,
+    state_columns: list[str] = DEFAULT_STATE_COLUMNS,
+) -> vf.RolloutOutput:
+    """
+    Wrapper for vf.Environment.run_rollout().
+
+    Asynchronously generates and scores one rollout.
+    """
+    state_columns = state_columns + REQUIRED_STATE_COLUMNS
+    rollout_input = vf.RolloutInput(**example)
+    return await env.run_rollout(
+        rollout_input,
+        client=client,
+        model=model_name,
+        sampling_args=sampling_args,
+        max_retries=max_retries,
+        state_columns=state_columns,
+    )
+    
+    
 async def run_group(
     env: vf.Environment,
     client: vf.ClientConfig,
@@ -239,6 +266,12 @@ def get_completion_len(output: vf.RolloutOutput) -> int:
     tokens.
     """
     return get_seq_len(output) - get_prompt_len(output)
+
+
+def task_uses_group_scoring(env: vf.Environment, task_name: str) -> bool:
+    """Check if a task's rubric contains any group-level reward functions."""
+    rubric = env.get_env_for_task(task_name).rubric
+    return any(rubric._is_group_func(func) for func in rubric._get_reward_funcs())
 
 
 def intercept_vf_logging(logger: str = "verifiers", level: str = "DEBUG", prefix: str | None = None):

@@ -1,4 +1,4 @@
-"""Main GRPO trainer: replaces prime-rl's trainer with Surogate's C++ engine.
+"""Main GRPO trainer
 
 Training loop:
     1. Wait for batch from orchestrator (packer on master, transport to all ranks)
@@ -10,8 +10,7 @@ Training loop:
     4. Broadcast updated weights to inference engine
 
 Document-level attention masking (Flash Attention varlen) can be enabled to
-prevent cross-sample attention in packed sequences. Prime-RL enables this for
-flash attention via position_id resets, so we default it on for parity.
+prevent cross-sample attention in packed sequences.
 """
 
 import shutil
@@ -43,7 +42,7 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
     boundaries = [0]
     for i in range(1, len(position_ids_flat)):
         if position_ids_flat[i] == 0 and position_ids_flat[i - 1] != 0:
-            # Only treat as a new sample if the next position is 1 (prime-rl behavior).
+            # Only treat as a new sample if the next position is 1.
             if i + 1 < len(position_ids_flat) and position_ids_flat[i + 1] == 1:
                 boundaries.append(i)
     ranges: list[tuple[int, int]] = []
@@ -88,7 +87,7 @@ class GRPOTrainer:
             qlora_config=config.qlora_config,
         )
 
-        # Prime-RL uses shift_tensor_right with pad_value=log(1/vocab_size).
+        # uses shift_tensor_right with pad_value=log(1/vocab_size).
         self._pad_logprob = None
         try:
             from surogate.core.model.hf_config import HfConfigFactory
@@ -111,8 +110,8 @@ class GRPOTrainer:
 
         # loss_scale is computed dynamically per pack — see train() loop
 
-        # LR schedule — max_steps here is "orchestrator steps" (one per pack() cycle),
-        # matching prime-rl's convention.  The internal micro-step counter is separate.
+        # LR schedule — max_steps here is "orchestrator steps" (one per pack() cycle).
+        # The internal micro-step counter is separate.
         lr_max_steps = config.max_steps if config.max_steps > 0 else 1_000_000
         warmup_steps = config.warmup_steps
         if warmup_steps == 0 and config.warmup_ratio > 0:
@@ -214,7 +213,7 @@ class GRPOTrainer:
         self._setup_data(start_step=0)
 
         # Get MultiRunManager — packer auto-increments progress[0].step after
-        # each pack() call, matching prime-rl's convention.
+        # each pack() call.
         mrm = get_multi_run_manager()
 
         logger.info("Starting GRPO training loop")
@@ -226,8 +225,8 @@ class GRPOTrainer:
         logger.info(f"  LoRA: enabled={config.lora}, rank={config.lora_rank}, alpha={config.lora_alpha}")
         logger.info(f"  Recipe: {config.recipe}")
         logger.info(f"  Optimizer: {config.optimizer}")
-        logger.info(f"  Loss: ratio_type={config.loss.ratio_type}, "
-                     f"kl_tau={config.loss.kl_tau}, adv_tau={config.loss.adv_tau}")
+        logger.info(f"  Loss: kl_tau={config.loss.kl_tau}, adv_tau={config.loss.adv_tau}, "
+                     f"ipo_mask_low={config.loss.ipo_mask_low}, ipo_mask_high={config.loss.ipo_mask_high}")
         logger.info(f"  Doc masking: {config.doc_masking}")
         if config.noise_scheduler and config.noise_scheduler.enabled:
             ns = config.noise_scheduler
@@ -247,7 +246,7 @@ class GRPOTrainer:
                 self.broadcast.broadcast(self.trainer, orch_step)
                 self.broadcast.cleanup(orch_step)
 
-            # Check if we've reached max steps (same check as prime-rl's trainer)
+            # Check if we've reached max steps
             if 0 < max_steps <= orch_step:
                 logger.info(f"Reached max steps ({max_steps}), stopping")
                 break
@@ -262,16 +261,15 @@ class GRPOTrainer:
                 logger.warning("No micro-batches received, retrying...")
                 continue
 
-            # Match prime-rl: accumulate ALL micro-batches from one pack into
-            # a single optimizer step.  No fixed gradient_accumulation_steps —
-            # the count is determined dynamically by the packer each step.
+            # Accumulate ALL micro-batches from one pack into a single optimizer step.  
+            # No fixed gradient_accumulation_steps — the count is determined dynamically by the packer each step.
             seq_len = config.sequence_len
             n_mb = len(micro_batches)
 
             # Tell the C++ engine how many micro-steps this optimizer step has.
             self.trainer.set_grad_accumulation(n_mb)
 
-            # Prime-RL loss scaling: divide total loss by the sum of loss_mask
+            # Divide total loss by the sum of loss_mask
             # across all micro-batches in this optimizer step.
             loss_scale = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))
             loss_scale = max(loss_scale, 1)
@@ -279,13 +277,13 @@ class GRPOTrainer:
             step_start = time.time()
 
             # Note: loss_scale normalization is applied explicitly to per-token grads
-            # (matching prime-rl's loss = total_loss / loss_scale).
+            # (loss = total_loss / loss_scale).
 
             # 4. Process each micro-batch (gradients accumulate in C++)
             step_metrics = {
                 "policy_loss": 0.0,
                 "mismatch_kl": 0.0,
-                "is_masked_frac": 0.0,
+                "is_masked": 0.0,
                 "keep_tokens": 0,
                 "total_tokens": 0,
             }
@@ -314,7 +312,7 @@ class GRPOTrainer:
                 sample_ranges = _find_sample_boundaries(pos_flat)
 
                 # --- Build logprob targets (global next-token shift across packed sequence) ---
-                # Matches prime-rl's shift_tensor_left on the packed input.
+                # shift_tensor_left on the packed input.
                 logprob_targets = np.full((1, seq_len), -100, dtype=np.int32)
                 logprob_targets[0, :T_actual] = orig_targets[0, :T_actual]
 
@@ -344,7 +342,7 @@ class GRPOTrainer:
                 raw_lp = np.asarray(raw_lp_full[0, :T_actual], dtype=np.float32)
                 logprob_time = time.time() - logprob_start
 
-                # Right-shift globally (packed sequence), matching prime-rl's
+                # Right-shift globally (packed sequence), 
                 # shift_tensor_right after a packed shift_tensor_left.
                 all_trainer_logprobs = np.zeros(T_actual, dtype=np.float32)
                 if T_actual > 1:
@@ -352,7 +350,7 @@ class GRPOTrainer:
                 if self._pad_logprob is not None and T_actual > 0:
                     all_trainer_logprobs[0] = self._pad_logprob
 
-                # --- GRPO gradient computation (per-sample, matching prime-rl) ---
+                # --- GRPO gradient computation (per-sample) ---
                 grpo_start = time.time()
                 per_token_grads_flat, mb_metrics = compute_grpo_per_token_grads(
                     trainer_logprobs=all_trainer_logprobs,
@@ -409,7 +407,7 @@ class GRPOTrainer:
                     if key in mb_metrics:
                         step_metrics[key] += mb_metrics[key]
 
-            # 5. Optimizer step — one per orchestrator step (matching prime-rl)
+            # 5. Optimizer step — one per orchestrator step
             lr = self.lr_schedule.get_lr(orch_step)
             opt_config = _surogate.OptimizerConfig(
                 optimizer=config.optimizer,
@@ -436,7 +434,7 @@ class GRPOTrainer:
                     f"step={step} loss={avg_metrics.get('policy_loss', 0):.4f} "
                     f"grad_norm={result['norm']:.4f} lr={lr:.2e} "
                     f"kl={avg_metrics.get('mismatch_kl', 0):.4f} "
-                    f"masked={avg_metrics.get('is_masked_frac', 0):.2%} "
+                    f"masked={avg_metrics.get('is_masked', 0):.2%} "
                     f"tokens={step_metrics.get('total_tokens', 0)} "
                     f"micro_batches={n_mb} "
                     f"vtc={vtc} expected={expected_loss_scale} "
