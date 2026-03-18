@@ -1,5 +1,5 @@
 model: Qwen/Qwen3.5-0.8B
-output_dir: ./reverse-fft
+output_dir: ./reverse-text
 merge_adapter: true
 
 per_device_train_batch_size: 2
@@ -9,10 +9,10 @@ sample_packing: true
 sequence_len: 4096
 save_steps: 0
 
-max_steps: 100
+max_steps: 150
 eval_steps: 25
 
-learning_rate: 2e-4
+learning_rate: 3e-5
 
 recipe: fp8-hybrid
 warmup_ratio: 0.15

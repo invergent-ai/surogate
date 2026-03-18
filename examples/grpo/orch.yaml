@@ -1,7 +1,7 @@
 # GRPO Orchestrator Example
 
 model:
-  name: "surogate/Qwen3.5-0.8B-FP8"
+  name: "./reverse-text"
   lora_adapter: "default"
   lora_rank: 16
   lora_alpha: 32
@@ -12,10 +12,13 @@ env:
 batch_size: 128
 rollouts_per_example: 16
 seq_len: 2048
-max_steps: 20
+max_steps: 50
+max_async_level: 0
+max_off_policy_steps: 0
+use_token_client: false
 
 sampling:
-  max_tokens: 128
+  max_tokens: 512
 
 client:
   base_url: 

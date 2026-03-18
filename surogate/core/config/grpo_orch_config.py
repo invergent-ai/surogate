@@ -738,6 +738,9 @@ class GRPOOrchestratorConfig:
         self.strict_async_level = cfg.get("strict_async_level", self.strict_async_level)
         self.bench = cfg.get("bench", self.bench)
         self.seed = cfg.get("seed", self.seed)
+        self.use_token_client = cfg.get("use_token_client", self.use_token_client)
+        self.token_batch_size = cfg.get("token_batch_size", self.token_batch_size)
+        self.max_inflight_rollouts = cfg.get("max_inflight_rollouts", self.max_inflight_rollouts)
         
         self.__post_init__()
 

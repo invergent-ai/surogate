@@ -1,6 +1,6 @@
 # GRPO RL Training Example
 
-model: "surogate/Qwen3.5-0.8B-FP8"
+model: "./reverse-text"
 output_dir: ./outputs
 gpus: 1
 
@@ -8,7 +8,7 @@ per_device_train_batch_size: 1
 sequence_len: 2048
 
 # max_steps = orchestrator steps (must match orch.yaml max_steps)
-max_steps: 20
+max_steps: 50
 logging_steps: 1
 
 learning_rate: 2e-4
@@ -17,8 +17,12 @@ warmup_steps: 0
 max_grad_norm: 1.0
 weight_decay: 0.01
 
+loss:
+  ipo_mask_low: 0.5
+  ipo_mask_high: 0.5
+  kl_tau: 0.01
+
 recipe: fp8-hybrid
-use_cuda_graphs: false
 
 lora: true
 lora_rank: 16

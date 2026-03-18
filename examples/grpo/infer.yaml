@@ -1,9 +1,8 @@
-model: "surogate/Qwen3.5-0.8B-FP8"
+model: "./reverse-text"
 enable_lora: true
 max_lora_rank: 32
 max_model_len: 2048
 gpu_memory_utilization: 0.3
 enforce_eager: false
-reasoning_parser: qwen3
 enable_prefix_caching: true
 port: 8007
