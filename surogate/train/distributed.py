@@ -212,7 +212,7 @@ class NodeTrainer:
         
         logger.info(f"Node {self.node_rank}: Model download complete, weights at {config.model_dir}")
 
-        self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
+        self._train_vision = bool(config.train_vision and config.is_multimodal)
         self._uses_mrope = self._detect_pos_planes(config) > 1
 
         if self._train_vision:

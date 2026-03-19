@@ -26,7 +26,6 @@ def training_logger_context(config: SFTConfig):
     # nanobind/extension objects (e.g., RuntimeOptions).
     log_options = dict(vars(config))
     log_options.pop("model_info")
-    log_options.pop("model_template")
     log_options.pop("model")
     log_options.pop("tokenizer")
     

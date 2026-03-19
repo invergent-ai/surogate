@@ -2,7 +2,7 @@ from argparse import Namespace
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
-from surogate.core.config.ct_config import DictDefault
+from surogate.utils.dict import DictDefault
 from surogate.grpo.utils.utils import rgetattr, rsetattr
 from surogate.utils.logger import get_logger
 

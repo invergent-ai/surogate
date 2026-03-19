@@ -40,7 +40,7 @@ class SurogateTrainerWrapper():
     ):
         self.config = config
         self._block_types = None
-        self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
+        self._train_vision = bool(config.train_vision and config.is_multimodal)
 
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing

@@ -1,10 +1,7 @@
 import abc
+import logging
 from typing import Any
 
-import datasets
-import transformers
-
-from surogate.core.config.loader import SurogateConfig
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info
 from surogate.utils.tensor import seed_everything
@@ -15,16 +12,16 @@ from surogate.utils.dict import DictDefault
 
 
 class SurogateCommand(abc.ABC):
-    config: SurogateConfig
+    config: Any
     model: Any
-    
-    def __init__(self, *, config: SurogateConfig, args: DictDefault):
+
+    def __init__(self, *, config, args: DictDefault):
         self.args = DictDefault(args)
         self.config = config
         self.system_info = get_system_info()
 
-        transformers.logging.set_verbosity_error()
-        datasets.logging.set_verbosity_error()
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("datasets").setLevel(logging.ERROR)
 
         if hasattr(self.config, 'seed') and self.config.seed:
             seed_everything(self.config.seed)

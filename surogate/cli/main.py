@@ -1,11 +1,8 @@
 import argparse
-import gc
-import importlib.util
 import os
-import subprocess
+import runpy
 import sys
 from typing import Dict
-import signal
 
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import print_system_diagnostics, get_system_info
@@ -46,7 +43,7 @@ def parse_args():
     # sft command
     from surogate.cli.sft import prepare_command_parser as sft_prepare_command_parser
     sft_prepare_command_parser(subparsers.add_parser('sft', help="Supervised Fine-Tuning"))
-    
+
     # pretrain command
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
     pt_prepare_command_parser(subparsers.add_parser('pt', help="Pretraining"))
@@ -58,19 +55,19 @@ def parse_args():
     # grpo-infer command
     from surogate.cli.grpo_infer import prepare_command_parser as grpo_infer_prepare_command_parser
     grpo_infer_prepare_command_parser(subparsers.add_parser('grpo-infer', help="GRPO RL Inference"))
-    
+
     # grpo-train command
     from surogate.cli.grpo_train import prepare_command_parser as grpo_train_prepare_command_parser
     grpo_train_prepare_command_parser(subparsers.add_parser('grpo-train', help="GRPO RL Training"))
-    
+
     # grpo-orch command
     from surogate.cli.grpo_orch import prepare_command_parser as grpo_orch_prepare_command_parser
     grpo_orch_prepare_command_parser(subparsers.add_parser('grpo-orch', help="GRPO RL Orchestrator"))
-    
+
     # vf-init command
     from surogate.cli.vf_init import prepare_command_parser as vf_init_prepare_command_parser
     vf_init_prepare_command_parser(subparsers.add_parser('vf-init', help="RL Environment Initialization"))
-    
+
     # vf-eval command
     from surogate.cli.vf_eval import prepare_command_parser as vf_eval_prepare_command_parser
     vf_eval_prepare_command_parser(subparsers.add_parser('vf-eval', help="RL Environment Evaluation"))
@@ -83,7 +80,7 @@ def parse_args():
     if args.command is None:
         parser.print_help()
         sys.exit(1)
-    
+
     commands_with_config = ['sft', 'pt', 'grpo_train', 'grpo_infer', 'grpo_orch', 'tokenize']
     if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
@@ -94,44 +91,16 @@ def parse_args():
 def cli_main():
     """Main CLI entry point for installed 'surogate' command."""
     args = parse_args()
-    file_path = importlib.util.find_spec(COMMAND_MAPPING[args.command]).origin
-    python_cmd = sys.executable
-    command_args = sys.argv[2:]
 
     system_info = get_system_info()
     print_system_diagnostics(system_info)
 
-    process = None
-    try:
-        cmd_args = [python_cmd, file_path, *command_args]
-        process = subprocess.Popen(cmd_args, preexec_fn=os.setsid)
-        exit_code = process.wait()
-        # If process died from a signal (negative exit code or 128+signal),
-        # give the crash handler time to finish printing
-        if exit_code < 0 or exit_code >= 128:
-            import time
-            time.sleep(0.1)  # Allow crash handler output to complete
-        return exit_code
-    except KeyboardInterrupt:
-        logger.warning("Process interrupted by user")
-        return 0
-    finally:
-        if process and process.poll() is not None and (process.returncode < 0 or process.returncode >= 128):
-            # Process crashed - don't print "Cleaning up" to avoid interleaving with crash output
-            pass
-        else:
-            logger.info("Cleaning up...")
-        if process:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                # Force kill if it doesn't respond
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    # Run the command module in-process (avoids a second Python startup).
+    # Rewrite sys.argv so the module's __main__ block sees only its own args.
+    module_name = COMMAND_MAPPING[args.command]
+    sys.argv = [module_name] + sys.argv[2:]
+    runpy.run_module(module_name, run_name='__main__', alter_sys=True)
 
-        gc.collect()
 
 if __name__ == '__main__':
-    exit(cli_main())
+    cli_main()

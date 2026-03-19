@@ -1,18 +1,21 @@
+from __future__ import annotations
+
 import json
 import os
 import re
-from typing import Any, Type
+from typing import Any, Type, TYPE_CHECKING, Union
 from urllib.request import urlopen
 import yaml
-from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
-from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
-from surogate.core.config.sft_config import SFTConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
-logger = get_logger()
+if TYPE_CHECKING:
+    from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
+    from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
+    from surogate.core.config.sft_config import SFTConfig
+    SurogateConfig = Union[SFTConfig, GRPOInferenceConfig, GRPOOrchestratorConfig]
 
-SurogateConfig = SFTConfig | GRPOInferenceConfig | GRPOOrchestratorConfig
+logger = get_logger()
 
 def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
     # Check if path is an HTTP(S) URL

@@ -44,8 +44,16 @@ struct DocMaskingInfo {
 /// Scan position_ids for non-consecutive transitions to detect document
 /// boundaries in packed sequences. Returns nullopt if no boundaries found (i.e.
 /// single contiguous sequence per batch element — standard SFT/PT).
+///
+/// When \p mrope is true the position_ids come from a multimodal RoPE model
+/// (e.g. Qwen3-VL / Qwen3.5-VL).  In that case image/video tokens share the
+/// same temporal position (the value stays constant across visual tokens within
+/// one image), so `curr - prev != 1` would create hundreds of false document
+/// boundaries.  We detect boundaries only by strict *decreases* in position
+/// (resets), which correctly identifies sample-packing boundaries while
+/// ignoring the flat temporal positions inside image regions.
 static std::optional<DocMaskingInfo> compute_doc_masking(
-        const std::int32_t* position_ids, int B, int T) {
+        const std::int32_t* position_ids, int B, int T, bool mrope = false) {
     if (!position_ids) return std::nullopt;
 
     std::vector<std::int32_t> cu_seqlens;
@@ -59,7 +67,8 @@ static std::optional<DocMaskingInfo> compute_doc_masking(
             int idx = b * T + t;
             const int prev = position_ids[idx - 1];
             const int curr = position_ids[idx];
-            if (curr - prev != 1) {
+            const bool is_boundary = mrope ? (curr < prev) : (curr - prev != 1);
+            if (is_boundary) {
                 // Document boundary: position_ids are not strictly consecutive.
                 // Mirrors HF packed-sequence detection (diff != 1).
                 int doc_len = (b * T + t) - doc_start;
@@ -119,7 +128,8 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         const auto* pos_ptr = reinterpret_cast<const std::int32_t*>(position_ids.Data);
         const int B = static_cast<int>(inputs.Sizes[0]);
         const int T = static_cast<int>(inputs.Sizes[1]);
-        auto doc_info = compute_doc_masking(pos_ptr, B, T);
+        const bool mrope = mModelConfig.Rope.is_multimodal();
+        auto doc_info = compute_doc_masking(pos_ptr, B, T, mrope);
         if (doc_info) {
             mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
                                         doc_info->num_docs,
@@ -1108,9 +1118,10 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     }
 
     // Detect document boundaries and enable flash varlen masking if needed.
+    const bool mrope = mModelConfig.Rope.is_multimodal();
     std::optional<DocMaskingInfo> doc_info;
     if (mOptions.DocMasking) {
-        doc_info = compute_doc_masking(position_ids, B, T);
+        doc_info = compute_doc_masking(position_ids, B, T, mrope);
     }
     if (doc_info) {
         graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
@@ -1151,9 +1162,10 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
         (position_ids.Data && position_ids.Device == -1)
             ? reinterpret_cast<const std::int32_t*>(position_ids.Data)
             : nullptr;
+    const bool mrope = mModelConfig.Rope.is_multimodal();
     std::optional<DocMaskingInfo> doc_info;
     if (mOptions.DocMasking) {
-        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val);
+        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val, mrope);
     }
     if (doc_info) {
         graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
@@ -1430,9 +1442,10 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs, Tensor position_ids
         (position_ids.Data && position_ids.Device == -1)
             ? reinterpret_cast<const std::int32_t*>(position_ids.Data)
             : nullptr;
+    const bool mrope = mModelConfig.Rope.is_multimodal();
     std::optional<DocMaskingInfo> doc_info;
     if (mOptions.DocMasking) {
-        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val);
+        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val, mrope);
     }
     if (doc_info) {
         graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),

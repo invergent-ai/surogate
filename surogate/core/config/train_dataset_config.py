@@ -2,9 +2,18 @@ from abc import ABC
 from dataclasses import dataclass
 from typing import Optional, List
 
+import os
+
 from surogate.core.config.dataset_config import SurogateDatasetConfig, create_dataset_config
-from surogate.core.datasets.datasets import get_default_process_count
 from surogate.utils.dict import DictDefault
+
+
+def _get_default_process_count():
+    if dataset_processes := os.environ.get("SUROGATE_DATASET_PROCESSES"):
+        return int(dataset_processes)
+    if runpod_cpu_count := os.environ.get("RUNPOD_CPU_COUNT"):
+        return int(runpod_cpu_count)
+    return os.cpu_count()
 from surogate.utils.seed import RAND_SEED
 
 
@@ -46,15 +55,14 @@ class TrainDatasetConfig(ABC):
     sequence_len: Optional[int] = 1024
 
     def __init__(self, cfg: DictDefault):
-        super().__init__(cfg)
         self.train_seed = cfg.get('train_seed', self.train_seed)
         self.eval_seed = cfg.get('eval_seed', self.eval_seed)
         self.datasets = [create_dataset_config(ds_cfg) for ds_cfg in cfg.get('datasets', [])]
         self.validation_datasets = [create_dataset_config(ds_cfg) for ds_cfg in cfg.get('validation_datasets', [])]
         self.validation_split_ratio = cfg.get('validation_split_ratio', self.validation_split_ratio)
-        self.dataloader_num_workers = min(cfg.get('dataloader_num_workers', get_default_process_count()), 8)
+        self.dataloader_num_workers = min(cfg.get('dataloader_num_workers', _get_default_process_count()), 8)
         self.sample_packing = cfg.get('sample_packing', self.sample_packing)
         self.sequence_len = cfg.get('sequence_len', self.sequence_len)
 
     def __post_init__(self):
-        super().__post_init__()
+        pass

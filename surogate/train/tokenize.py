@@ -1,31 +1,20 @@
 import hashlib
 import json
-import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
-from transformers import PreTrainedTokenizerBase
 
+from surogate._surogate import Tokenizer as NativeTokenizer
 from surogate.core.config.sft_config import SFTConfig
 from surogate.core.datasets.datasets import disable_datasets_caching
 from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \
     shuffle_dataset
-from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
-from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 from surogate.utils.np_utils import get_seed
-from rich.console import Console
-from rich.text import Text
-
-try:
-    from surogate._surogate import Tokenizer as NativeTokenizer
-    HAS_NATIVE_TOKENIZER = True
-except ImportError:
-    HAS_NATIVE_TOKENIZER = False
 
 logger = get_logger()
 
@@ -68,28 +57,15 @@ def compute_tokenize_hash(config: SFTConfig) -> str:
     If this hash matches a previously stored hash, tokenization can be skipped.
     """
     hash_dict = {
-        # Model/tokenizer identity
         "model_name": config.model,
-        # Tokenization parameters
         "sequence_len": config.sequence_len,
         "max_model_len": config.max_model_len,
         "sample_packing": config.sample_packing,
-        # Dataset split configuration
         "validation_split_ratio": config.validation_split_ratio,
         "train_seed": config.train_seed,
         "eval_seed": config.eval_seed,
-        # Chat template configuration
-        "template": config.template,
-        "use_chat_template": config.use_chat_template,
         "loss_scale": config.loss_scale,
         "padding_free": config.padding_free,
-        "padding_side": config.padding_side,
-        "sequence_parallel_size": config.sequence_parallel_size,
-        "truncation_strategy": config.truncation_strategy,
-        "max_length": config.max_length,
-        "max_pixels": config.max_pixels,
-        "norm_bbox": config.norm_bbox,
-        # Dataset configurations
         "datasets": [_dataset_config_to_dict(ds) for ds in config.datasets],
         "validation_datasets": [_dataset_config_to_dict(ds) for ds in config.validation_datasets],
     }
@@ -392,94 +368,62 @@ def write_padded(
 
         writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
 
-def debug_labels(example, tokenizer, text_only=False):
+def debug_labels(input_ids, labels, tokenizer, text_only=False):
     """Debug labels using Rich library Token Pill design for better readability.
 
     Args:
-        example: Dataset example with 'input_ids' and 'labels' keys
-        tokenizer: Tokenizer for decoding token IDs
+        input_ids: Token ID list
+        labels: Label ID list (-100 = masked)
+        tokenizer: Native tokenizer for decoding token IDs
         text_only: If True, only show text without token IDs
     """
-    # Force color output and use full terminal width
+    from rich.console import Console
+    from rich.text import Text
+
     console = Console(force_terminal=True, force_interactive=True, width=None, legacy_windows=False)
-
-    # Get the input_ids, labels, and attention_mask from the dataset
-    input_ids = example["input_ids"]
-    labels = example["labels"]
-    target_mask = example.pop("target_mask", None)
-
     output = Text()
     target_labels_count = 0
 
-    for input_id, label_id in zip(input_ids, labels, strict=False):
-        decoded_token = tokenizer.decode(input_id)
+    for input_id, label_id in zip(input_ids, labels):
+        decoded_token = tokenizer.decode([input_id])
 
-        # --- 1. Sanitize Special Characters ---
-        # Explicitly show newlines as symbols so the debug flow isn't broken
-        display_text = decoded_token.replace('\n', '⏎').replace('\r', '')
+        display_text = decoded_token.replace('\n', '\u23ce').replace('\r', '')
         if display_text.strip() == "":
-            display_text = "␣"  # Symbol for pure space if needed
+            display_text = "\u2423"
         elif decoded_token == " ":
             display_text = " "
 
-        # --- 2. Determine Logic/Style ---
         if label_id == -100:
-            # MASKED (Prompt) -> White
             main_style = "white"
-            id_style = "dim white"
             border_color = "white"
-            tag = "M"  # Masked
         elif label_id == input_id:
-            # TRAIN (Loss calculated) -> Green
             main_style = "bold green"
-            id_style = "green"
             border_color = "green"
-            tag = "T"  # Train
             target_labels_count += 1
+        elif label_id == 0:
+            main_style = "yellow"
+            border_color = "yellow"
         else:
-            # Different label (e.g., padding with label=0 but different token_id) -> Yellow
-            # Or ERROR (Mismatch) -> could be red, but let's use yellow for padding
-            if label_id == 0:
-                main_style = "yellow"
-                id_style = "dim yellow"
-                border_color = "yellow"
-                tag = "P"  # Padding
-            else:
-                # True error/mismatch
-                main_style = "bold white on red"
-                id_style = "white on red"
-                border_color = "red"
-                tag = "?"
+            main_style = "bold white on red"
+            border_color = "red"
 
-        # --- 3. Construct the "Pill" ---
-        # Format: [ Text | ID ] or just [ Text ] if text_only
         output.append("[", style=f"dim {border_color}")
         output.append(display_text, style=main_style)
-
         if not text_only:
             output.append("|", style=f"dim {border_color}")
-            output.append(str(input_id), style=id_style)
-
+            output.append(str(input_id), style=f"dim {border_color}")
         output.append("]", style=f"dim {border_color}")
-
-        # Add a tiny space between pills for readability
         output.append(" ")
 
-    # Print the formatted output with wrapping at full terminal width
     console.print(output, soft_wrap=True)
-    console.print()  # Extra newline
+    console.print()
 
-    # Print summary
     total_len = len(input_ids)
     console.print("=" * console.width, style="cyan")
     console.print("DEBUG SUMMARY:", style="bold cyan")
     console.print(f"  Total input len: {total_len}")
     console.print(f"  Count of trained labels: {target_labels_count}")
     console.print(f"  Trained ratio: {target_labels_count/total_len*100:.1f}%")
-    if target_mask:
-        target_mask_positions = sum(m[0] for m in target_mask)
-        console.print(f"  Number of positions in target_mask: {target_mask_positions}")
-
     console.print("Legend:", style="bold cyan", end=" ")
     console.print("[M]", style="white", end="=Masked (prompt), ")
     console.print("[T]", style="bold green", end="=Trained (response), ")
@@ -488,7 +432,6 @@ def debug_labels(example, tokenizer, text_only=False):
     console.print("=" * console.width, style="cyan")
     console.print()
 
-    return output
 
 def _encode_and_prepare_native(
     native_tokenizer,
@@ -577,26 +520,10 @@ def _encode_and_prepare_native(
 
 
 class TokenizeDatasets(SurogateCommand):
-    template_processor: ChatTemplateProcessor
-    tokenizer: PreTrainedTokenizerBase
 
     def __init__(self, config: SFTConfig, args: DictDefault):
         super().__init__(config=config, args=args)
         config.__post_init__()
-
-        self._prepare_chat_template()
-
-    def _prepare_chat_template(self) -> None:
-        template_processor = self.config.get_template_processor(self.config.tokenizer)
-        template_processor.set_mode('train')
-        if template_processor.use_model:
-            template_processor.model = self.config._model
-        
-        if self.config.model_template.is_multimodal and (
-                self.config.padding_free or self.config.sample_packing) and not template_processor.support_padding_free:
-            raise ValueError(f'Template `{self.config.template}` does not support padding free or packing.')
-        
-        self.template_processor = template_processor
 
     def _load_raw_datasets(self):
         """Load and preprocess datasets. Returns raw (train_dataset, val_dataset) with 'messages' column."""
@@ -675,19 +602,21 @@ class TokenizeDatasets(SurogateCommand):
             self.config.validation_datasets = []
             for ds_config in self.config.datasets:
                 ds_config.samples = 10
-
-            # If debug flag is set, always load and process datasets
             train_dataset, _ = self._load_raw_datasets()
-            train_dataset, _ = self._encode_dataset_python(train_dataset, None)
+            native_tok = NativeTokenizer.from_pretrained(self.config.model_dir)
+            loss_strategy = getattr(self.config, 'loss_scale', 'default')
             logger.info("Debug: printing labels for first 5 train dataset rows")
-            for i, row in enumerate(train_dataset):
-                if i >= 5:
+            count = 0
+            for batch in train_dataset.iter(batch_size=1):
+                if count >= 5:
                     break
-                debug_labels(row, self.config.tokenizer)
-            
+                msgs = batch['messages'][0]
+                result = native_tok.encode_for_training(msgs, strategy=loss_strategy)
+                if result is not None:
+                    debug_labels(result['input_ids'], result['labels'], native_tok)
+                    count += 1
             return
 
-        # No debug flag: check if we can skip entirely
         if stored_hash == current_hash and files_exist:
             logger.info(f"Tokenization hash unchanged ({current_hash}), skipping tokenization.")
             return
@@ -700,36 +629,13 @@ class TokenizeDatasets(SurogateCommand):
         elif not files_exist:
             logger.info(f"Tokenized files not found, tokenizing dataset (hash={current_hash})...")
 
-        # Load, encode and write datasets
+        # Load, encode and write datasets using the native C++ tokenizer
         train_dataset, val_dataset = self._load_raw_datasets()
-
-        if self._can_use_native_encoder():
-            # Native path: single-pass encode → numpy → pack → write
-            self._encode_and_write_native(train_dataset, val_dataset)
-        else:
-            # Python fallback: encode to HfDataset, then write separately
-            train_dataset, val_dataset = self._encode_dataset_python(train_dataset, val_dataset)
-            logger.info("Writing tokenized train files...")
-            self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=self.config.sample_packing)
-            if val_dataset is not None:
-                logger.info("Writing tokenized validation files...")
-                self._write_bin_tok(val_dataset, os.path.join(self.config.output_dir, 'eval.bin'), packing=False)
+        self._encode_and_write_native(train_dataset, val_dataset)
 
         # Write the hash after successful tokenization
         write_tokenize_hash(self.config.output_dir, current_hash)
         logger.info(f"Tokenization complete. Hash saved: {current_hash}")
-
-    def _can_use_native_encoder(self) -> bool:
-        """Check if we can use the fast C++ encoder instead of the Python one."""
-        if not HAS_NATIVE_TOKENIZER:
-            return False
-        if self.config.model_template.is_multimodal:
-            return False
-        # Only base strategies are supported by the native encoder
-        loss_scale = getattr(self.config, 'loss_scale', 'default')
-        if loss_scale not in ('default', 'last_round', 'all'):
-            return False
-        return True
 
     def _encode_and_write_native(self, train_dataset, val_dataset):
         """Encode and write datasets using the fast C++ tokenizer.
@@ -781,90 +687,6 @@ class TokenizeDatasets(SurogateCommand):
                     out_dir, name_prefix, vocab_size, seq_len,
                     pad_token_id, max_tokens_per_file, non_overlapping,
                 )
-
-    def _encode_dataset_python(self, train_dataset, val_dataset):
-        """Encode datasets using the Python ChatTemplateProcessor (fallback)."""
-        template_processor = self.template_processor
-
-        datasets = [train_dataset, val_dataset]
-        origin_template_model = template_processor.model
-        template_processor.model = None  # Avoid serializing the model with IPC when mapping the dataset.
-
-        for i, dataset in enumerate(datasets):
-            if dataset is None:
-                continue
-            logger.info(f"Encoding {'train' if i == 0 else 'validation'} dataset...")
-            preprocessor = EncodePreprocessor(template=template_processor)
-            batch_size = 100 if self.config.model_template.is_multimodal else 10000
-
-            dataset = preprocessor(
-                dataset,
-                num_proc=self.config.dataloader_num_workers,
-                load_from_cache_file=False,
-                strict=False,
-                batch_size=batch_size)
-
-            datasets[i] = dataset
-
-        template_processor.model = origin_template_model
-        return datasets
-
-    def _write_bin_tok(self, dataset, out_path: str, packing: bool = True,
-                       max_tokens_per_file: Optional[int] = None,
-                       num_workers: Optional[int] = None) -> None:
-        """Write dataset to BIN.TOK format file(s).
-
-        Vectorized implementation: bulk-converts all examples to numpy, concatenates,
-        builds position IDs and masks, slices into seq_len chunks, and writes files.
-        """
-        from tqdm import tqdm
-
-        vocab_size = self.config.tokenizer.vocab_size
-        seq_len = self.config.sequence_len or self.config.max_model_len
-        pad_token_id = self.config.tokenizer.pad_token_id if self.config.tokenizer.pad_token_id is not None else 0
-
-        if max_tokens_per_file is None:
-            max_tokens_per_file = DEFAULT_MAX_TOKENS_PER_FILE
-
-        non_overlapping = not packing
-        out_dir = os.path.dirname(out_path)
-        base_name = os.path.basename(out_path)
-        name_without_ext = base_name.rsplit('.', 1)[0] if '.' in base_name else base_name
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-        # Step 1: Bulk collect all doc tokens/masks and their lengths
-        all_tokens = []
-        all_masks = []
-        doc_lengths = []
-        n_docs = len(dataset)
-
-        for batch in tqdm(dataset.iter(batch_size=5000), desc="Preparing",
-                          total=(n_docs + 4999) // 5000, unit=" batches"):
-            for input_ids, labels in zip(batch['input_ids'], batch['labels']):
-                tokens = np.asarray(input_ids, dtype=np.int32)
-                lab = np.asarray(labels, dtype=np.int32)
-                if tokens.size == 0:
-                    continue
-                mask = _to_input_mask((lab != -100).astype(np.int32))
-                all_tokens.append(tokens)
-                all_masks.append(mask)
-                doc_lengths.append(tokens.size)
-
-        if not all_tokens:
-            return
-
-        if packing:
-            self._write_packed_vectorized(
-                all_tokens, all_masks, doc_lengths,
-                out_dir, name_without_ext, vocab_size, seq_len,
-                pad_token_id, max_tokens_per_file, non_overlapping,
-            )
-        else:
-            self._write_padded_vectorized(
-                all_tokens, all_masks, doc_lengths,
-                out_dir, name_without_ext, vocab_size, seq_len,
-                pad_token_id, max_tokens_per_file, non_overlapping,
-            )
 
     def _write_packed_vectorized(
         self, all_tokens, all_masks, doc_lengths,

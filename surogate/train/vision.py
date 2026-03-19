@@ -1,11 +1,11 @@
 import numpy as np
 import torch
 import os
+from typing import Optional, List
 
 from surogate.core.datasets.datasets import disable_datasets_caching
 from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \
     shuffle_dataset
-from surogate.core.model.registry import get_model_info_and_tokenizer
 from surogate.utils.logger import get_logger
 from surogate.utils.np_utils import get_seed
 
@@ -24,12 +24,7 @@ def _labels_to_input_mask(labels: np.ndarray) -> np.ndarray:
 
 
 def _extract_mm_feature_outputs(mm_out):
-    """Normalize HF multimodal feature outputs across model variants.
-
-    Returns:
-        pooled_list: list[Tensor] of pooled visual chunks.
-        deepstack_list: list[Tensor] or [] when model does not expose deepstack.
-    """
+    """Normalize HF multimodal feature outputs across model variants."""
     pooled = getattr(mm_out, "pooler_output", None)
     if pooled is None:
         pooled_list = []
@@ -53,26 +48,239 @@ def _extract_mm_feature_outputs(mm_out):
     return pooled_list, deepstack_list
 
 
-def init_mm_helpers(config):
-    _, _, hf_model, processor = get_model_info_and_tokenizer(
-        config.model_dir,
-        torch_dtype=config.torch_dtype,
-        load_model=True,
-        max_model_len=config.max_model_len,
-        rope_scaling=config.rope_scaling,
-        template_type=config.template_type,
-    )
+def _find_visual(hf_model):
+    """Find the visual encoder module, checking common attribute paths."""
+    for path in ['visual', 'model.visual', 'vision_tower', 'model.vision_tower']:
+        obj = hf_model
+        try:
+            for attr in path.split('.'):
+                obj = getattr(obj, attr)
+            return obj
+        except AttributeError:
+            continue
+    return None
 
+
+class MultimodalEncoder:
+    """Minimal encoder that uses the HF processor to tokenize multimodal conversations.
+
+    Replaces ChatTemplateProcessor for the on-the-fly vision training path.
+    Uses processor.apply_chat_template() for chat formatting and the processor
+    itself for image/video tokenization.
+    """
+
+    def __init__(self, processor, loss_scale: str = 'default'):
+        self.processor = processor
+        self.loss_scale = loss_scale
+
+    def _build_labels(self, input_ids, messages):
+        """Build labels by masking non-assistant tokens with -100.
+
+        For multimodal, the processor inserts visual placeholder tokens that
+        don't appear in text-only tokenization, so we can't use
+        return_assistant_tokens_mask (different lengths). Instead, find the
+        last assistant turn boundary via text markers.
+        """
+        if self.loss_scale == 'all':
+            return list(input_ids)
+
+        tokenizer = self.processor if not hasattr(self.processor, 'tokenizer') else self.processor.tokenizer
+
+        # Strategy: find where the last assistant response starts by tokenizing
+        # just the prompt (all messages except the last assistant turn).
+        # Everything before that is masked (-100), everything after is trained.
+        prompt_messages = []
+        for msg in messages:
+            if msg.get('role') == 'assistant':
+                break
+            prompt_messages.append(msg)
+
+        if not prompt_messages:
+            # No non-assistant prefix found; train on all tokens
+            return list(input_ids)
+
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True)
+            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+            prompt_len = len(prompt_ids)
+        except Exception:
+            # Can't determine boundary; train on all tokens
+            return list(input_ids)
+
+        # For multimodal, the actual prompt in input_ids is longer due to
+        # image tokens. Count image placeholders in the prompt portion.
+        n_images_in_prompt = 0
+        for msg in prompt_messages:
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                n_images_in_prompt += sum(1 for p in content if isinstance(p, dict) and p.get('type') == 'image')
+
+        # Each image placeholder expands to many visual tokens. Estimate
+        # the expansion from the total input length vs text-only length.
+        text_only_len = len(tokenizer.encode(
+            tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
+            add_special_tokens=False))
+        visual_expansion = len(input_ids) - text_only_len  # total visual tokens added
+
+        # Approximate: all visual tokens are in the prompt region
+        adjusted_prompt_len = prompt_len + visual_expansion
+
+        labels = [-100] * len(input_ids)
+        for i in range(min(adjusted_prompt_len, len(input_ids)), len(input_ids)):
+            labels[i] = input_ids[i]
+        return labels
+
+    def _ensure_user_turn(self, messages, row):
+        """If messages lack a user turn but the row has images, synthesize one."""
+        has_user = any(m.get('role') == 'user' for m in messages)
+        if has_user:
+            return messages
+
+        images = row.get('images')
+        if not images:
+            return messages
+
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        # Build a user message with image placeholders before the first assistant turn
+        user_content = [{"type": "image"}] * len(images) + [{"type": "text", "text": ""}]
+        return [{"role": "user", "content": user_content}] + list(messages)
+
+    def encode(self, row: dict, return_length: bool = False) -> Optional[dict]:
+        """Encode a single conversation row into input_ids, labels, and visual features."""
+        messages = row.get('messages')
+        if not messages:
+            logger.warning_once(f"Row has no 'messages' field. Keys: {list(row.keys())}")
+            return None
+
+        messages = self._ensure_user_turn(messages, row)
+        tokenizer = self.processor if not hasattr(self.processor, 'tokenizer') else self.processor.tokenizer
+
+        try:
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        except Exception as e:
+            roles = [m.get('role') for m in messages]
+            logger.warning_once(f"apply_chat_template failed: {e} | roles={roles}")
+            return None
+
+        # Collect images/videos — check top-level row fields first, then message content
+        images = row.get('images', []) or []
+        videos = row.get('videos', []) or []
+        if not images and not videos:
+            for msg in messages:
+                content = msg.get('content', '')
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get('type') == 'image':
+                                img = part.get('image')
+                                if img is not None:
+                                    images.append(img)
+                            elif part.get('type') == 'video':
+                                vid = part.get('video')
+                                if vid is not None:
+                                    videos.append(vid)
+
+        # Call processor with text + media
+        proc_kwargs = {'text': text, 'return_tensors': 'pt'}
+        if images:
+            proc_kwargs['images'] = images
+        if videos:
+            proc_kwargs['videos'] = videos
+
+        # Ensure images are PIL objects (HF datasets may store them as dicts)
+        if images:
+            from PIL import Image
+            loaded = []
+            for img in images:
+                if isinstance(img, Image.Image):
+                    loaded.append(img)
+                elif isinstance(img, dict) and 'bytes' in img:
+                    from io import BytesIO
+                    loaded.append(Image.open(BytesIO(img['bytes'])))
+                elif isinstance(img, dict) and 'path' in img:
+                    loaded.append(Image.open(img['path']))
+                elif isinstance(img, str):
+                    loaded.append(Image.open(img))
+                else:
+                    logger.warning_once(f"Unsupported image type: {type(img)}")
+                    return None
+            proc_kwargs['images'] = loaded
+
+        try:
+            encoded = self.processor(**proc_kwargs)
+        except Exception as e:
+            logger.warning_once(f"Processor call failed: {e}")
+            return None
+
+        input_ids = encoded['input_ids'].flatten()
+        if hasattr(input_ids, 'tolist'):
+            input_ids = input_ids.tolist()
+        labels = self._build_labels(input_ids, messages)
+
+        result = {
+            'input_ids': input_ids,
+            'labels': labels,
+        }
+
+        # Pass through visual features and metadata from the processor
+        for key in ('pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw', 'mm_token_type_ids'):
+            if key in encoded:
+                result[key] = encoded[key]
+
+        if return_length:
+            result['length'] = len(input_ids)
+
+        return result
+
+    def encode_batch(self, rows: list[dict], return_length: bool = False) -> list[Optional[dict]]:
+        """Encode a batch of rows."""
+        return [self.encode(row, return_length=return_length) for row in rows]
+
+
+def init_mm_helpers(config):
+    """Initialize multimodal helpers: HF model, processor, encoder."""
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+
+    model_dir = config.model_dir
+
+    hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+
+    model_kwargs = {'trust_remote_code': True}
+    if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+        model_kwargs['torch_dtype'] = config.torch_dtype
+
+    # Use the right Auto class: VL models need AutoModelForImageTextToText
+    auto_cls = AutoModelForCausalLM
+    if config.is_multimodal:
+        from transformers import AutoModelForImageTextToText
+        auto_cls = AutoModelForImageTextToText
+
+    hf_model = auto_cls.from_pretrained(model_dir, config=hf_config, **model_kwargs)
     hf_model.eval()
     hf_model.requires_grad_(False)
 
+    # Load processor (includes tokenizer + image processor)
+    if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
+        processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+    else:
+        processor = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+    visual = _find_visual(hf_model)
+    if visual is None:
+        raise ValueError(
+            f"train_vision=True but model '{type(hf_model).__name__}' has no visual encoder. "
+            f"Use train_vision=False for text-only models, or use a VL model variant.")
+
     vision_device = torch.device("cuda:0") if torch.cuda.is_available() and config.gpus > 0 else torch.device("cpu")
     try:
-        hf_model.model.visual.to(vision_device)
+        visual.to(vision_device)
     except Exception as exc:
         logger.warning(f"Failed to move visual encoder to {vision_device}: {exc}. Falling back to CPU.")
         vision_device = torch.device("cpu")
-        hf_model.model.visual.to(vision_device)
+        visual.to(vision_device)
 
     try:
         hf_model.model.language_model.to("cpu")
@@ -81,14 +289,12 @@ def init_mm_helpers(config):
     except Exception:
         pass
 
-    template_processor = config.get_template_processor(processor)
-    template_processor.set_mode('train')
-    if template_processor.use_model:
-        template_processor.model = hf_model
+    loss_scale = getattr(config, 'loss_scale', 'default')
+    encoder = MultimodalEncoder(processor, loss_scale=loss_scale)
 
     rope_fn = hf_model.get_rope_index if hasattr(hf_model, "get_rope_index") else hf_model.model.get_rope_index
 
-    return hf_model, processor, template_processor, vision_device, rope_fn
+    return hf_model, processor, encoder, vision_device, rope_fn
 
 
 def load_multimodal_datasets(config, *, node_rank=None, num_nodes=None):
@@ -172,9 +378,10 @@ class OnTheFlyMultimodalBatcher:
         self.image_token_id = cfg.image_token_id
         self.video_token_id = cfg.video_token_id
         self.hidden_size = cfg.text_config.hidden_size
-        self.deepstack_layers = len(getattr(hf_model.visual, "deepstack_visual_indexes", []))
+        visual = _find_visual(hf_model)
+        self.deepstack_layers = len(getattr(visual, "deepstack_visual_indexes", [])) if visual else 0
         vision_cfg = getattr(cfg, "vision_config", None)
-        merge_size = getattr(getattr(hf_model, "visual", None), "spatial_merge_size", None)
+        merge_size = getattr(visual, "spatial_merge_size", None) if visual else None
         if merge_size is None and vision_cfg is not None:
             merge_size = getattr(vision_cfg, "spatial_merge_size", None)
         self._merge_length = int(merge_size) ** 2 if merge_size is not None else 1
@@ -225,38 +432,31 @@ class OnTheFlyMultimodalBatcher:
         return rows
 
     def _encode_rows(self, rows: list[dict]) -> list[dict]:
-        # Multimodal templates need per-row encode to expand visual placeholders.
-        if getattr(self.template, "model_template", None) is not None and self.template.model_template.is_multimodal:
-            return self._encode_rows_single(rows)
-
-        try:
-            encoded = self.template.encode_batch(rows, return_length=True)
-            encoded_list: list[dict] = []
-            for item in encoded:
-                if item is None:
-                    continue
-                if isinstance(item, list):
-                    encoded_list.extend([x for x in item if x is not None])
-                else:
-                    encoded_list.append(item)
-            return [e for e in encoded_list if self._is_row_usable(e)]
-        except Exception:
-            return self._encode_rows_single(rows)
+        # Always encode per-row for multimodal (images need individual processing)
+        return self._encode_rows_single(rows)
 
     def _encode_rows_single(self, rows: list[dict]) -> list[dict]:
         encoded_list: list[dict] = []
+        n_none = 0
         for row in rows:
             try:
                 out = self.template.encode(row, return_length=True)
-            except Exception:
+            except Exception as e:
+                logger.warning_once(f"MultimodalEncoder.encode raised: {e}")
                 continue
             if out is None:
+                n_none += 1
                 continue
             if isinstance(out, list):
                 encoded_list.extend([x for x in out if x is not None])
             else:
                 encoded_list.append(out)
-        return [e for e in encoded_list if self._is_row_usable(e)]
+        usable = [e for e in encoded_list if self._is_row_usable(e)]
+        if n_none > 0 and not usable:
+            logger.warning_once(
+                f"All {len(rows)} rows failed encoding ({n_none} returned None, "
+                f"{len(encoded_list)} encoded but {len(encoded_list) - len(usable)} unusable)")
+        return usable
 
     def _is_row_usable(self, row: dict) -> bool:
         tokens = row.get("input_ids", None)
@@ -345,7 +545,10 @@ class OnTheFlyMultimodalBatcher:
             self._encoded_buffer.extend(encoded)
             attempts += 1
             if attempts > 100 and len(self._encoded_buffer) < self.batch_size:
-                raise RuntimeError("Failed to build a batch from the dataset after multiple attempts")
+                raise RuntimeError(
+                    f"Failed to build a batch after {attempts} attempts "
+                    f"(buffer={len(self._encoded_buffer)}/{self.batch_size}). "
+                    f"Check warnings above for encoding errors.")
 
         batch_rows = self._encoded_buffer[:self.batch_size]
         self._encoded_buffer = self._encoded_buffer[self.batch_size:]
@@ -416,12 +619,30 @@ class OnTheFlyMultimodalBatcher:
 
         input_ids_t = torch.from_numpy(inputs.astype(np.int64, copy=False))
         attn_t = torch.from_numpy(attention_mask.astype(np.int64, copy=False))
-        position_ids, _ = self.rope_fn(
-            input_ids_t,
+
+        # Build mm_token_type_ids from per-row data (if present)
+        mm_token_type_ids = torch.zeros((B, T), dtype=torch.int32)
+        for i, row in enumerate(rows):
+            if i >= B:
+                break
+            row_mm = row.get("mm_token_type_ids", None)
+            if row_mm is not None:
+                row_mm_t = self._to_torch(row_mm, dtype=torch.int32).flatten()
+                length = min(row_mm_t.shape[0], T)
+                mm_token_type_ids[i, :length] = row_mm_t[:length]
+
+        rope_kwargs = dict(
             image_grid_thw=image_grid_thw_cpu,
             video_grid_thw=video_grid_thw_cpu,
             attention_mask=attn_t,
         )
+        # Pass mm_token_type_ids if the rope function accepts it
+        import inspect
+        rope_params = inspect.signature(self.rope_fn).parameters
+        if 'mm_token_type_ids' in rope_params:
+            rope_kwargs['mm_token_type_ids'] = mm_token_type_ids
+
+        position_ids, _ = self.rope_fn(input_ids_t, **rope_kwargs)
 
         visual_mask = (inputs == self.image_token_id) | (inputs == self.video_token_id)
         num_visual = int(visual_mask.sum())

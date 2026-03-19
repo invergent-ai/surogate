@@ -21,9 +21,7 @@ def prepare_command_parser(parser=None):
     
     return parser
 
-import verifiers.scripts.init as vf_init
-
-vf_init.README_TEMPLATE = """\
+_README_TEMPLATE = """\
 # {env_id_dash}
 
 > Replace the placeholders below, then remove this callout.
@@ -77,9 +75,10 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 
 if __name__ == '__main__':
     args = prepare_command_parser().parse_args(sys.argv[1:])
-    
-    from verifiers.scripts.init import init_environment
-    init_environment(
+
+    import verifiers.scripts.init as vf_init
+    vf_init.README_TEMPLATE = _README_TEMPLATE
+    vf_init.init_environment(
         args.env,
         args.path,
         rewrite_readme=False,

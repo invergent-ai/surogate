@@ -1,26 +1,6 @@
 import argparse
-import asyncio
 import json
 import sys
-from pathlib import Path
-from typing import cast
-
-from verifiers.types import (
-    ClientConfig,
-    ClientType,
-    EndpointClientConfig,
-    EvalConfig,
-    EvalRunConfig,
-)
-from verifiers.utils.eval_utils import (
-    load_endpoints,
-    load_toml_config,
-    resolve_endpoints_file,
-    run_evaluations,
-    run_evaluations_tui,
-)
-from verifiers.utils.install_utils import check_hub_env_installed
-from verifiers.scripts.eval import find_latest_incomplete_eval_results_path, get_env_eval_defaults, is_valid_eval_results_path
 
 from surogate.utils.logger import get_logger
 
@@ -247,6 +227,27 @@ def prepare_command_parser(parser=None):
     return parser
 
 if __name__ == '__main__':
+    import asyncio
+    from pathlib import Path
+    from typing import cast
+
+    from verifiers.types import (
+        ClientConfig,
+        ClientType,
+        EndpointClientConfig,
+        EvalConfig,
+        EvalRunConfig,
+    )
+    from verifiers.utils.eval_utils import (
+        load_endpoints,
+        load_toml_config,
+        resolve_endpoints_file,
+        run_evaluations,
+        run_evaluations_tui,
+    )
+    from verifiers.utils.install_utils import check_hub_env_installed
+    from verifiers.scripts.eval import find_latest_incomplete_eval_results_path, get_env_eval_defaults, is_valid_eval_results_path
+
     args = prepare_command_parser().parse_args(sys.argv[1:])
 
     # Build raw configs: both paths produce list[dict]

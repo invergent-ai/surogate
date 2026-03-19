@@ -3,7 +3,7 @@ import os
 from typing import Any, Dict, Optional
 
 from surogate.core.datasets.preprocessor.row import RowPreprocessor
-from surogate.core.model.chat_templates.utils import history_to_messages
+from surogate.utils.messages import history_to_messages
 
 
 class ResponsePreprocessor(RowPreprocessor):
@@ -24,9 +24,7 @@ class ResponsePreprocessor(RowPreprocessor):
         response = row.pop('response', None)
         if response is not None:
             if isinstance(response, (list, tuple)):
-                from transformers.utils import strtobool
-                # sometimes response is a list, pick one randomly
-                if strtobool(os.environ.get('RANDOM_DATASET_RESPONSE', 'False')):
+                if os.environ.get('RANDOM_DATASET_RESPONSE', 'False').lower() in ('true', '1'):
                     response = self.random_state.choice(response)
                 else:
                     response = response[0]
@@ -35,6 +33,7 @@ class ResponsePreprocessor(RowPreprocessor):
         system = row.pop('system', None)
         if isinstance(history, str):  # e.g. "[['query1', 'response1']]"
             history = ast.literal_eval(history)
+
         history.append([query, response])
 
         row.update({'messages': history_to_messages(history, system)})

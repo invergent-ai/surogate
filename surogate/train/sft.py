@@ -1,8 +1,6 @@
 from pathlib import Path
-from transformers import PreTrainedTokenizerBase
 
 from surogate.core.config.sft_config import SFTConfig
-from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
 from surogate.train.tokenize import TokenizeDatasets
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -14,8 +12,6 @@ datasets.logging.set_verbosity_warning()
 logger = get_logger()
 
 class SurogateSFT(TokenizeDatasets):
-    template_processor: ChatTemplateProcessor
-    tokenizer: PreTrainedTokenizerBase
 
     def __init__(self, config: SFTConfig, args: DictDefault):
         super().__init__(config=config, args=args)
@@ -28,7 +24,7 @@ class SurogateSFT(TokenizeDatasets):
             logger.info(f"Starting training run '{self.config.run_name}'...")
             return self._train_distributed()
 
-        if self.config.train_vision and self.config.model_template.is_multimodal:
+        if self.config.train_vision and self.config.is_multimodal:
             logger.info("Vision training enabled; skipping tokenization.")
             logger.info(f"Starting training run '{self.config.run_name}'...")
             return self.train_with_oom_recovery([], [])
@@ -64,7 +60,7 @@ class SurogateSFT(TokenizeDatasets):
         logger.metric("Ray address", dist_cfg.ray_address)
         logger.metric("Nodes", dist_cfg.num_nodes)
         logger.metric("GPUs per node", dist_cfg.gpus_per_node or self.config.gpus)
-        tokenize_on_node = not (self.config.train_vision and self.config.model_template.is_multimodal)
+        tokenize_on_node = not (self.config.train_vision and self.config.is_multimodal)
         logger.metric("Per-node tokenization", "enabled" if tokenize_on_node else "disabled (vision training)")
 
         trainer = RayDistributedTrainer(
@@ -81,7 +77,7 @@ class SurogateSFT(TokenizeDatasets):
             trainer.train()
         finally:
             trainer.shutdown()
-    
+
     def train_with_oom_recovery(self, train_files, eval_files):
         original_batch_size = self.config.per_device_train_batch_size
         original_grad_accum = self.config.gradient_accumulation_steps
@@ -117,15 +113,12 @@ class SurogateSFT(TokenizeDatasets):
                     current_grad_accum = self.config.gradient_accumulation_steps
 
                     if current_grad_accum < 16 and current_batch > 1:
-                        # If gradient accumulation is reasonable, increase it and reduce batch size
                         new_batch_size = max(1, current_batch // 2)
                         new_grad_accum = min(32, current_grad_accum * 2)
                     elif current_batch > 1:
-                        # Just reduce batch size
                         new_batch_size = max(1, current_batch // 2)
                         new_grad_accum = current_grad_accum
                     else:
-                        # Can't reduce further
                         logger.error("Cannot reduce batch size further to recover from OOM.")
                         raise
 
@@ -137,7 +130,7 @@ class SurogateSFT(TokenizeDatasets):
                     logger.metric("New gradient accumulation", f"{current_grad_accum} → {new_grad_accum}")
                     logger.metric("New effective batch size",
                                     f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}")
-                    
+
                     trainer = SurogateTrainerWrapper(
                             config=self.config,
                             train_files=train_files,
@@ -161,7 +154,7 @@ class SurogateSFT(TokenizeDatasets):
                           f"{original_batch_size * original_grad_accum} → {final_batch * final_grad_accum}")
 
         return res
-                
+
 
 
 def sft_main(config: SFTConfig, args: DictDefault):

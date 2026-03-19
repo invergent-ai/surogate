@@ -404,16 +404,56 @@ def _is_from_libraries():
 logger = get_logger()
 
 os.environ['HF_HUB_VERBOSITY'] = 'error'
-import huggingface_hub
-huggingface_hub.logging.get_logger = get_logger
-huggingface_hub.utils.logging.get_logger = get_logger
 
-from transformers.utils.logging import EmptyTqdm
-import transformers.utils.logging
-transformers.utils.logging.get_logger = get_logger
+# Monkey-patch library loggers lazily — deferred until those libraries are actually imported.
+# This avoids importing transformers/datasets/huggingface_hub at startup.
+_patched_libs = set()
 
-import datasets
-datasets.utils.logging.get_logger = get_logger
+def _patch_library_loggers():
+    """Patch library loggers once they are imported. Called lazily."""
+    import sys
+    if 'huggingface_hub' not in _patched_libs and 'huggingface_hub' in sys.modules:
+        _patched_libs.add('huggingface_hub')
+        import huggingface_hub
+        huggingface_hub.logging.get_logger = get_logger
+        huggingface_hub.utils.logging.get_logger = get_logger
+
+    if 'transformers' not in _patched_libs and 'transformers.utils.logging' in sys.modules:
+        _patched_libs.add('transformers')
+        import transformers.utils.logging
+        transformers.utils.logging.get_logger = get_logger
+
+    if 'datasets' not in _patched_libs and 'datasets' in sys.modules:
+        _patched_libs.add('datasets')
+        import datasets
+        datasets.utils.logging.get_logger = get_logger
+
+
+# Install an import hook that patches library loggers when they are first imported.
+import sys
+
+class _LoggerPatchFinder:
+    """Meta path finder that patches library loggers after import."""
+    _target_modules = frozenset(['huggingface_hub', 'transformers', 'datasets'])
+
+    def find_module(self, fullname, path=None):
+        if fullname in self._target_modules:
+            return self
+        return None
+
+    def load_module(self, fullname):
+        # Remove ourselves temporarily to avoid recursion
+        sys.meta_path.remove(self)
+        try:
+            __import__(fullname)
+        finally:
+            # Re-add only if there are still targets to patch
+            if self._target_modules - _patched_libs:
+                sys.meta_path.append(self)
+        _patch_library_loggers()
+        return sys.modules[fullname]
+
+sys.meta_path.append(_LoggerPatchFinder())
 
 
 # Test the logger if run directly

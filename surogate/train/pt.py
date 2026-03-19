@@ -10,7 +10,6 @@ logger = get_logger()
 
 class SurogatePT(SurogateSFT):
     def __init__(self, config: SFTConfig, args: DictDefault):
-        config.use_chat_template = False
         config.loss_scale = 'all'
         config.init_projections_to_zero = True
         config.from_scratch = True

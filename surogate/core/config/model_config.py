@@ -1,58 +1,58 @@
+from __future__ import annotations
+
 import math
 from abc import ABC
 from dataclasses import dataclass
-from typing import Optional, Union, Any
+from typing import Optional, Union, Any, TYPE_CHECKING
 
-import torch
-from transformers.utils.quantization_config import QuantizationConfigMixin
+if TYPE_CHECKING:
+    import torch
 
-from surogate.train.vision import get_model_info_and_tokenizer
 from surogate.utils.dict import DictDefault
-from surogate.utils.jsonl import json_parse_to_dict
 from surogate.utils.logger import get_logger
-from surogate.utils.model import get_model_name
+
 
 @dataclass
 class ModelConfig(ABC):
     """
-    ModelConfig class is a dataclass that holds configuration parameters for quantizing a model using SurogatePtq.
+    ModelConfig class holds configuration for model loading and setup.
 
     Args:
-        model (Optional[str]): model_id or model_path. Default is None.
-        template_type (Optional[str]): Type of the chat template to use. Default is None.
-        max_model_len (Optional[int]): Maximum model length for rope scaling. Default is None.
-        rope_scaling (Literal): Type of RoPE scaling. Only relevant for vision-language models — it is applied
-            to the HuggingFace vision model loaded in Python for multi-modal preprocessing (vision.py).
-            Has no effect for pure LLM fine-tuning: the C++ training engine reads rope config directly from
-            config.json on disk and ignores this value. You can pass a string such as 'linear', 'dynamic', 'yarn',
-            or a JSON string like '{"factor": 2.0, "type": "yarn"}'. Default is None.
+        model (Optional[str]): model_id or model_path.
+        max_model_len (Optional[int]): Maximum model length for rope scaling.
+        rope_scaling: RoPE scaling config string (e.g. 'linear', 'yarn', or JSON).
     """
     model: Optional[str] = None
-    template_type: Optional[str] = None
     torch_dtype: Optional[Union[torch.bfloat16, torch.float16, torch.float32]] = None
     max_model_len: Optional[int] = None
     rope_scaling: Optional[str] = None
-    quantization_config: Optional[QuantizationConfigMixin] = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
         self.model = cfg['model']
-        self.template_type = cfg['template_type']
         self.torch_dtype = cfg['torch_dtype']
         self.max_model_len = cfg['max_model_len']
         self.rope_scaling = cfg['rope_scaling']
 
     def __post_init__(self):
+        from surogate.utils.model import get_model_name
         self.model_suffix = get_model_name(self.model)
         self.torch_dtype = self._init_model_info()
 
-
-    def _init_model_info(self) -> torch.dtype:
+    def _init_model_info(self):
+        from surogate.core.model.registry import get_model_info_and_tokenizer
         logger = get_logger()
-        logger.debug("init model info and template...")
-        self.model_info, self.model_template, self._model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs(), load_model=False, download_model=True)
+        logger.debug("init model info...")
+        self.model_info, self.tokenizer = get_model_info_and_tokenizer(
+            model_id_or_path=self.model,
+            torch_dtype=self.torch_dtype,
+            rope_scaling=self.rope_scaling,
+            max_model_len=self.max_model_len,
+            load_model=False,
+            download_model=True,
+        )
         self.model_dir = self.model_info.model_dir
-        self.template_type = self.model_info.template_type
+        self.is_multimodal = self.model_info.is_multimodal
 
         if self.model_info.rope_scaling and self.max_model_len is not None:
             self._init_rope_scaling()
@@ -63,13 +63,13 @@ class ModelConfig(ABC):
         logger = get_logger()
         logger.debug("preparing rope_scaling...")
         if self.rope_scaling:
+            from surogate.utils.jsonl import json_parse_to_dict
             rope_scaling: dict = json_parse_to_dict(self.rope_scaling, strict=False)
             if isinstance(rope_scaling, str):
                 assert rope_scaling in ['linear', 'dynamic', 'yarn']
                 rope_scaling = {'type': rope_scaling}
         else:
             rope_scaling = self.model_info.rope_scaling
-            # reset the factor
             rope_scaling.pop('factor', None)
 
         if 'factor' not in rope_scaling and self.max_model_len is None:
@@ -102,28 +102,3 @@ class ModelConfig(ABC):
         self.rope_scaling = rope_scaling
         logger.info(f'Setting args.rope_scaling: {rope_scaling}')
         logger.info(f'Setting args.max_model_len: {self.max_model_len}')
-
-
-    def _get_modules_to_skip_quant(self):
-        return [
-            'lm_head',
-            'multi_modal_projector', 'modality_projection', 'vision_tower', 'aligner', 'merger',  # multi-modal
-            'router', 'mlp.gate', 'mlp.shared_expert_gate', 'block_sparse_moe.gate',  # MoE
-            'mamba'
-        ]
-
-    def get_model_kwargs(
-            self,
-            model_id_or_path: Optional[str] = None,
-            torch_dtype: Optional[torch.dtype] = None,
-            template_type: Optional[str] = None,
-            rope_scaling: Optional[Union[str, dict]] = None,
-            max_model_len: Optional[int] = None,
-    ) -> dict[str, Any]:
-        return {
-            'model_id_or_path': model_id_or_path or self.model,
-            'torch_dtype': torch_dtype or self.torch_dtype,
-            'template_type': template_type or self.template_type,
-            'rope_scaling': rope_scaling or self.rope_scaling,
-            'max_model_len': max_model_len or self.max_model_len,
-        }

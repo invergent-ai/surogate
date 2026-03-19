@@ -1,6 +1,6 @@
 from typing import Tuple, List, Literal
 
-from surogate.core.model.chat_templates.utils import Messages, get_last_user_round
+from surogate.utils.messages import Messages, get_last_user_round
 from surogate.core.model.utils import ContextType
 
 ALL_BASE_STRATEGY = ['default', 'last_round', 'all']

@@ -1,16 +1,16 @@
-from typing import Optional, Union, List
+from __future__ import annotations
 
-import torch
-from transformers import PreTrainedTokenizerBase, GenerationConfig, BaseImageProcessor, \
-    FeatureExtractionMixin
-from transformers import ProcessorMixin as HfProcessorMixin
-from transformers.utils import is_torch_bf16_gpu_available, is_torch_cuda_available
+from typing import Optional, Union, List, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+    from transformers import GenerationConfig
 
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
-Processor = Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, HfProcessorMixin]
+Processor = Any  # Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, HfProcessorMixin]
 Prompt = List[Union[str, List[int], List[str]]]
 Word = Union[str, List[int]]
 Context = Word
@@ -22,16 +22,17 @@ class ContextType:
     OTHER = 'other'
 
 def get_default_torch_dtype(torch_dtype: Optional[torch.dtype]):
+    import torch
     # torch_dtype: torch_dtype in config.json
     if torch_dtype is not None:
         return torch_dtype
 
     try:
-        is_bf16_available = is_torch_bf16_gpu_available()
+        is_bf16_available = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     except:  # noqa
         is_bf16_available = False
 
-    if is_torch_cuda_available():
+    if torch.cuda.is_available():
         if is_bf16_available:
             return torch.bfloat16
         else:

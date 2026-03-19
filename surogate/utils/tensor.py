@@ -5,8 +5,6 @@ from typing_extensions import Literal
 import numpy as np
 import torch
 from transformers import enable_full_determinism, set_seed
-import surogate._surogate as _surogate
-import surogate
 
 def get_dataset_lengths(dataset, from_arrow=False):
     if "length" in dataset.column_names:

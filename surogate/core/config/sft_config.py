@@ -6,13 +6,11 @@ from typing import Optional, List, Literal
 from namer import generate as generate_unique_name
 
 from surogate import _surogate
-from surogate.core.config.ct_config import ChatTemplateConfig
 from surogate.core.config.model_config import ModelConfig
 from surogate.core.config.train_dataset_config import TrainDatasetConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.fs import to_abspath
 from surogate.utils.logger import get_logger
-from surogate.utils.model import estimate_model_parameters
 
 logger = get_logger()
 
@@ -42,7 +40,7 @@ class DistributedConfig:
     worker_output_dir: Optional[str] = None  # None = use /tmp/surogate-{run_name}/
 
 @dataclass
-class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
+class SFTConfig(ModelConfig, TrainDatasetConfig):
     """
     SFTConfig class is a dataclass that holds configuration parameters for Supervised Fine-Tuning (SFT)
 
@@ -365,7 +363,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     adapter_path: Optional[str] = None  # PEFT adapter dir to merge into base weights before training
     merge_adapter: Optional[bool] = False
-    use_chat_template: Optional[bool] = True
+
     debug_time_breakdown: Optional[bool] = False
     debug_memory_breakdown: Optional[bool] = False
     train_vision: Optional[bool] = None
@@ -386,6 +384,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
+
+        self.loss_scale = cfg.get('loss_scale', 'default')
+        self.padding_free = cfg.get('padding_free', False)
+
         self.run_name = cfg['run_name'] or self.generate_run_name()
         self.apply_recommended_values = cfg.get('apply_recommended_values', self.apply_recommended_values)
         self.num_epochs = cfg.get('num_epochs', self.num_epochs)
@@ -484,7 +486,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         self.adapter_path = cfg.get('adapter_path', self.adapter_path)
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
-        self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
+        # use_chat_template removed — native tokenizer always applies chat template
         self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
         self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
         self.train_vision = cfg.get('train_vision', cfg.get('train_vision', self.train_vision))
@@ -523,11 +525,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         
         ModelConfig.__post_init__(self)
         TrainDatasetConfig.__post_init__(self)
-        ChatTemplateConfig.__post_init__(self)
-        
-        self.prompt_template = self.model_template.chat_template
-        if self.use_chat_template is None:
-            self.use_chat_template = True
 
         if len(self.validation_datasets) > 0 and self.validation_split_ratio > 0:
             # Don't split training data if validation datasets are provided or dataset streaming is enabled
@@ -586,12 +583,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         # Vision training is opt-in. Even for multimodal templates, default to text
         # training unless explicitly requested by the user.
         if self.train_vision is None:
-            if getattr(self.model_template, 'is_multimodal', False):
+            if self.is_multimodal:
                 logger.info(
                     "train_vision is not set; defaulting to False for multimodal models. "
                     "Set train_vision=true to enable on-the-fly vision training.")
             self.train_vision = False
-        if self.train_vision and not getattr(self.model_template, 'is_multimodal', False):
+        if self.train_vision and not self.is_multimodal:
             logger.warning("train_vision=True but model is not multimodal; disabling vision training.")
             self.train_vision = False
 
@@ -884,41 +881,3 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     def generate_run_name(self):
         return generate_unique_name(category='science')
-
-    def estimate_training_memory(self, model):
-        params = estimate_model_parameters(model.config)
-        dtype = getattr(model.config, 'torch_dtype', None)
-        if dtype is None:
-            # Fall back to checking the first parameter's dtype
-            dtype = next(model.parameters()).dtype
-
-        import torch
-        dtype_to_bytes = {
-            torch.float32: 4,
-            torch.float16: 2,
-            torch.bfloat16: 2,
-            torch.float8_e4m3fn: 1,
-            torch.float8_e5m2: 1,
-            torch.int8: 1,
-        }
-        bytes_per_param = dtype_to_bytes.get(dtype, 4)  # Default to 4 if unknown
-        model_memory = params * bytes_per_param / 1e9
-
-        # Optimizer memory depends on training precision, not storage precision
-        # For mixed precision training, optimizer states are typically in fp32
-        optimizer_memory = params * 8 / 1e9  # Adam needs ~8 bytes per parameter
-
-        # Activation memory uses the training dtype
-        activation_memory = (
-                self.per_device_train_batch_size *
-                self.sequence_len *
-                model.config.hidden_size *
-                bytes_per_param / 1e9
-        )
-
-        total_memory_needed = model_memory + optimizer_memory + activation_memory
-
-        logger.info(f"Memory estimates - Model: {model_memory:.2f}GB, "
-                    f"Optimizer: {optimizer_memory:.2f}GB, "
-                    f"Activations: {activation_memory:.2f}GB, "
-                    f"Total: {total_memory_needed:.2f}GB")
