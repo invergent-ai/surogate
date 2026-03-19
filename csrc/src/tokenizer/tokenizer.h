@@ -14,6 +14,12 @@
 
 namespace tokenizer {
 
+// A single message in a conversation.
+struct ChatMessage {
+    std::string role;    // "system", "user", "assistant", "tool"
+    std::string content;
+};
+
 class Tokenizer {
 public:
     ~Tokenizer();
@@ -54,6 +60,19 @@ public:
 
     // Get the string content of a special token by name (e.g. "eos_token").
     std::string special_token(const std::string& name) const;
+
+    // Apply a chat template to a list of messages.
+    // Returns the formatted string ready for encode().
+    // If add_generation_prompt is true, appends the assistant header so the
+    // model can continue generating.
+    std::string apply_chat_template(
+        const std::vector<ChatMessage>& messages,
+        bool add_generation_prompt = false) const;
+
+    // Convenience: apply_chat_template + encode_with_special_tokens in one call.
+    std::vector<int32_t> apply_chat_template_and_encode(
+        const std::vector<ChatMessage>& messages,
+        bool add_generation_prompt = false) const;
 
 private:
     Tokenizer();

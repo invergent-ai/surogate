@@ -1763,6 +1763,41 @@ NB_MODULE(_surogate, m) {
         .def("special_token", &tokenizer::Tokenizer::special_token,
              nb::arg("name"),
              "Get special token string by name (e.g. 'eos_token'). Returns '' if not found.")
+        .def("apply_chat_template",
+             [](const tokenizer::Tokenizer& self, nb::list messages, bool add_generation_prompt) {
+                 std::vector<tokenizer::ChatMessage> msgs;
+                 msgs.reserve(nb::len(messages));
+                 for (auto item : messages) {
+                     nb::dict d = nb::cast<nb::dict>(item);
+                     msgs.push_back({
+                         nb::cast<std::string>(d["role"]),
+                         nb::cast<std::string>(d["content"])
+                     });
+                 }
+                 return self.apply_chat_template(msgs, add_generation_prompt);
+             },
+             nb::arg("messages"), nb::arg("add_generation_prompt") = false,
+             "Apply the model's chat template to format messages.\n\n"
+             "Parameters:\n"
+             "- messages: List of dicts with 'role' and 'content' keys.\n"
+             "- add_generation_prompt: If True, append assistant header for generation.\n\n"
+             "Returns the formatted string ready for encode().")
+        .def("apply_chat_template_and_encode",
+             [](const tokenizer::Tokenizer& self, nb::list messages, bool add_generation_prompt) {
+                 std::vector<tokenizer::ChatMessage> msgs;
+                 msgs.reserve(nb::len(messages));
+                 for (auto item : messages) {
+                     nb::dict d = nb::cast<nb::dict>(item);
+                     msgs.push_back({
+                         nb::cast<std::string>(d["role"]),
+                         nb::cast<std::string>(d["content"])
+                     });
+                 }
+                 return self.apply_chat_template_and_encode(msgs, add_generation_prompt);
+             },
+             nb::arg("messages"), nb::arg("add_generation_prompt") = false,
+             "Apply chat template and encode in one call.\n\n"
+             "Returns token IDs.")
         ;
 
     // Disable leak warnings during interpreter shutdown - these are false positives

@@ -7,6 +7,8 @@
 #include "bpe.h"
 #include "unicode.h"
 
+#include <minja/chat-template.hpp>
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -23,7 +25,8 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 
-using json = nlohmann::json;
+// minja uses nlohmann::ordered_json as 'json'. We use the same alias to avoid conflicts.
+using json = nlohmann::ordered_json;
 
 namespace tokenizer {
 
@@ -128,6 +131,9 @@ struct Tokenizer::Impl {
     // Config flags
     bool add_bos = false;
     bool add_eos = false;
+
+    // Chat template (Jinja2, rendered by minja)
+    std::unique_ptr<minja::chat_template> chat_tmpl;
 
     ~Impl() { delete encoder_lookup; }
 
@@ -442,6 +448,22 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
 
         impl.add_bos = config.value("add_bos_token", false);
         impl.add_eos = config.value("add_eos_token", false);
+
+        // Load chat template (Jinja2 string)
+        if (config.contains("chat_template") && config["chat_template"].is_string()) {
+            std::string tmpl_str = config["chat_template"].get<std::string>();
+            impl.chat_tmpl = std::make_unique<minja::chat_template>(tmpl_str, impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "", impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "");
+        }
+    }
+
+    // If no chat template in tokenizer_config.json, check for chat_template.jinja file
+    if (!impl.chat_tmpl) {
+        auto jinja_path = dir / "chat_template.jinja";
+        if (fs::exists(jinja_path)) {
+            std::ifstream f(jinja_path);
+            std::string tmpl_str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            impl.chat_tmpl = std::make_unique<minja::chat_template>(tmpl_str, impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "", impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "");
+        }
     }
 
     // Build fast lookup table
@@ -594,6 +616,35 @@ std::string Tokenizer::special_token(const std::string& name) const {
         return it->second;
     }
     return "";
+}
+
+std::string Tokenizer::apply_chat_template(
+        const std::vector<ChatMessage>& messages,
+        bool add_generation_prompt) const {
+    if (!impl_->chat_tmpl) {
+        throw std::runtime_error("No chat template loaded. Model directory must contain "
+                                 "chat_template in tokenizer_config.json or a chat_template.jinja file.");
+    }
+
+    // Convert ChatMessage to nlohmann::ordered_json array
+    nlohmann::ordered_json json_messages = nlohmann::ordered_json::array();
+    for (const auto& msg : messages) {
+        json_messages.push_back({{"role", msg.role}, {"content", msg.content}});
+    }
+
+    minja::chat_template_inputs inputs;
+    inputs.messages = json_messages;
+    inputs.add_generation_prompt = add_generation_prompt;
+    inputs.now = std::chrono::system_clock::now();
+
+    return impl_->chat_tmpl->apply(inputs);
+}
+
+std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(
+        const std::vector<ChatMessage>& messages,
+        bool add_generation_prompt) const {
+    std::string text = apply_chat_template(messages, add_generation_prompt);
+    return encode_with_special_tokens(text);
 }
 
 } // namespace tokenizer

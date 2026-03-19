@@ -96,6 +96,14 @@ FetchContent_Declare(
         GIT_TAG        12.0.0
 )
 
+# minja: Jinja2 template engine for chat templates (header-only)
+FetchContent_Declare(
+        minja
+        GIT_REPOSITORY https://github.com/ochafik/minja.git
+        GIT_TAG main
+        EXCLUDE_FROM_ALL
+)
+
 # Catch2 for tests
 FetchContent_Declare(
         catch2
@@ -152,6 +160,12 @@ FetchContent_MakeAvailable(fmt)
 FetchContent_MakeAvailable(catch2)
 FetchContent_MakeAvailable(cutlass)
 FetchContent_MakeAvailable(backward)
+
+# minja is header-only; just need the include path
+FetchContent_GetProperties(minja)
+if(NOT minja_POPULATED)
+    FetchContent_Populate(minja)
+endif()
 
 # Populate flash-attention source tree without invoking its build system
 FetchContent_GetProperties(flash_attn)
@@ -482,7 +496,7 @@ target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
 target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/shims ${FLASH_ATTN_DIR}/src)
-target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
+target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR} ${minja_SOURCE_DIR}/include)
 
 # backward-cpp for stack traces
 if(BACKWARD_HAS_DW)
