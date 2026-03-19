@@ -30,6 +30,7 @@
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "utilities/dtype.h"
+#include "tokenizer/tokenizer.h"
 
 namespace nb = nanobind;
 
@@ -1714,6 +1715,54 @@ NB_MODULE(_surogate, m) {
          }, nb::arg("trainer"),
              "Log a compute/throughput estimate based on the current model/trainer configuration.\n\n"
              "Parameters:\n- trainer: SurogateTrainer instance to read config/options/shape from.")
+        ;
+
+    // ---- Native Tokenizer ----
+    nb::class_<tokenizer::Tokenizer>(m, "Tokenizer",
+        "High-performance BPE tokenizer that loads from HuggingFace tokenizer.json.\n\n"
+        "Uses tiktoken-speed BPE algorithm with llama.cpp Unicode support.\n"
+        "Zero external dependencies (no PCRE2, no Rust).")
+        .def_static("from_pretrained", &tokenizer::Tokenizer::from_pretrained,
+             nb::arg("model_dir"),
+             "Load tokenizer from a HuggingFace model directory.\n\n"
+             "The directory must contain tokenizer.json. Optionally reads\n"
+             "tokenizer_config.json for BOS/EOS/PAD token metadata.\n\n"
+             "Parameters:\n- model_dir: Path to model directory.")
+        .def("encode", &tokenizer::Tokenizer::encode,
+             nb::arg("text"), nb::arg("add_special_tokens") = false,
+             "Encode text to token IDs.\n\n"
+             "Parameters:\n- text: Input text.\n"
+             "- add_special_tokens: If True, prepend BOS / append EOS as configured.")
+        .def("encode_with_special_tokens", &tokenizer::Tokenizer::encode_with_special_tokens,
+             nb::arg("text"),
+             "Encode text, treating all known special tokens found in the text as special.")
+        .def("encode_ordinary", &tokenizer::Tokenizer::encode_ordinary,
+             nb::arg("text"),
+             "Encode text without any special token handling (pure BPE).")
+        .def("encode_batch", &tokenizer::Tokenizer::encode_batch,
+             nb::arg("texts"), nb::arg("add_special_tokens") = false,
+             "Batch-encode multiple texts in parallel.\n\n"
+             "Parameters:\n- texts: List of input texts.\n"
+             "- add_special_tokens: If True, prepend BOS / append EOS as configured.")
+        .def("decode", &tokenizer::Tokenizer::decode,
+             nb::arg("ids"),
+             "Decode token IDs back to text.")
+        .def("encode_single_token", &tokenizer::Tokenizer::encode_single_token,
+             nb::arg("token_bytes"),
+             "Encode a single known token string to its ID. Raises on unknown token.")
+        .def("decode_single_token", &tokenizer::Tokenizer::decode_single_token,
+             nb::arg("id"),
+             "Decode a single token ID to its string. Raises on unknown ID.")
+        .def_prop_ro("vocab_size", &tokenizer::Tokenizer::vocab_size, "Total vocabulary size.")
+        .def_prop_ro("bos_token_id", &tokenizer::Tokenizer::bos_token_id, "BOS token ID (-1 if unset).")
+        .def_prop_ro("eos_token_id", &tokenizer::Tokenizer::eos_token_id, "EOS token ID (-1 if unset).")
+        .def_prop_ro("pad_token_id", &tokenizer::Tokenizer::pad_token_id, "PAD token ID (-1 if unset).")
+        .def("is_special_token", &tokenizer::Tokenizer::is_special_token,
+             nb::arg("id"),
+             "Check if a token ID is a special token.")
+        .def("special_token", &tokenizer::Tokenizer::special_token,
+             nb::arg("name"),
+             "Get special token string by name (e.g. 'eos_token'). Returns '' if not found.")
         ;
 
     // Disable leak warnings during interpreter shutdown - these are false positives

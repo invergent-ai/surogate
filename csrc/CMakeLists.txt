@@ -356,6 +356,11 @@ target_sources(surogate-common PRIVATE
     src/runtime/lora/lora_optimizer_state.cpp
     src/runtime/lora/lora_utils.cpp
 
+    # Tokenizer (native C++ BPE, loads HuggingFace tokenizer.json)
+    src/tokenizer/tokenizer.cpp
+    src/tokenizer/unicode.cpp
+    src/tokenizer/unicode_data.cpp
+
     # JIT kernel loader (Triton, CuTe, etc.)
     src/runtime/jit/jit_kernel.cpp
     src/runtime/jit/gated_delta_rule_kernels.cpp
@@ -599,6 +604,9 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # JIT kernel loader
             src/testing/jit/test-jit-kernel.cpp
+
+            # Tokenizer
+            src/testing/tokenizer/test_tokenizer.cpp
 
             # Utilities
             src/testing/utilities/test-sol.cpp
