@@ -1720,7 +1720,11 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         float temperature,
         int eos_token_id,
         bool use_lora,
-        bool use_cuda_graphs) {
+        bool use_cuda_graphs,
+        int top_k,
+        float top_p,
+        float min_p,
+        float repetition_penalty) {
 
     // Run generation on GPU 0 only (DP — each GPU generates independently)
     GenerationResult result;
@@ -1744,6 +1748,10 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         infer::GenerationEngineConfig gen_config{};
         gen_config.max_gen_len = max_gen_len;
         gen_config.temperature = temperature;
+        gen_config.top_k = top_k;
+        gen_config.top_p = top_p;
+        gen_config.min_p = min_p;
+        gen_config.repetition_penalty = repetition_penalty;
         gen_config.eos_token_id = eos_token_id;
         gen_config.num_completions = num_completions;
         gen_config.use_cuda_graphs = use_cuda_graphs;

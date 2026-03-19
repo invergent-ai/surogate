@@ -38,6 +38,16 @@ public:
     Checkpoint checkpoint() const;
     void restore(const Checkpoint& cp);
 
+    /// Set a persistent prefix boundary. After this call, restore() will not
+    /// rewind below the current stack position. Used for GRPO persistent
+    /// system prefix KV-cache that survives arena reset between phases.
+    ///
+    /// Call set_prefix_boundary() after allocating the prefix data.
+    /// Call clear_prefix_boundary() to allow full rewind again.
+    void set_prefix_boundary();
+    void clear_prefix_boundary();
+    bool has_prefix_boundary() const { return mHasPrefixBoundary; }
+
     struct sAllocRecord {
         std::byte* Pointer;
         std::size_t Amount;
@@ -62,6 +72,10 @@ private:
 
     std::size_t mMaxUtilization = 0;
     std::vector<sAllocRecord> mHighMark;
+
+    // Prefix boundary: restore() will not rewind below this point.
+    bool mHasPrefixBoundary = false;
+    Checkpoint mPrefixBoundary{};
 };
 
 

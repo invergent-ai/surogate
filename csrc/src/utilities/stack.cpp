@@ -252,6 +252,22 @@ void DeviceMemoryStack::restore(const Checkpoint& cp) {
     if (cp.top < mBackingMemory || cp.top > mBackingMemory + mCapacity) {
         throw std::logic_error("DeviceMemoryStack::restore: invalid checkpoint");
     }
-    mTop = cp.top;
-    mAlloc.resize(cp.alloc_count);
+    // Respect prefix boundary: don't rewind below it
+    if (mHasPrefixBoundary && cp.top < mPrefixBoundary.top) {
+        mTop = mPrefixBoundary.top;
+        mAlloc.resize(mPrefixBoundary.alloc_count);
+    } else {
+        mTop = cp.top;
+        mAlloc.resize(cp.alloc_count);
+    }
+}
+
+void DeviceMemoryStack::set_prefix_boundary() {
+    mHasPrefixBoundary = true;
+    mPrefixBoundary = checkpoint();
+}
+
+void DeviceMemoryStack::clear_prefix_boundary() {
+    mHasPrefixBoundary = false;
+    mPrefixBoundary = {};
 }

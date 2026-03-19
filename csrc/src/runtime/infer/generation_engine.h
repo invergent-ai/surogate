@@ -37,10 +37,19 @@ namespace infer {
 struct GenerationEngineConfig {
     int max_gen_len = 512;          // Maximum tokens to generate
     float temperature = 1.0f;       // Sampling temperature (0 = greedy)
+    int top_k = 0;                  // Top-K sampling (0 = disabled)
+    float top_p = 1.0f;            // Top-P / nucleus sampling (1.0 = disabled)
+    float min_p = 0.0f;            // Min-P sampling (0.0 = disabled)
+    float repetition_penalty = 1.0f; // Repetition penalty (1.0 = disabled)
     int eos_token_id = 2;           // End-of-sequence token
     uint64_t seed = 42;             // RNG seed for reproducible sampling
     int num_completions = 1;        // N completions per prompt (Phase 3: GRPO multi-completion)
     bool use_cuda_graphs = false;   // Capture decode step as CUDA graph (Phase 4)
+
+    // Persistent system prefix: if non-empty, this token sequence is prefilled
+    // once and its KV-cache survives across generate() calls via arena prefix
+    // boundary. Subsequent calls skip re-prefilling the system prefix.
+    std::vector<int32_t> system_prefix_tokens;
 };
 
 /// GenerationEngine: prefill + decode loop for batch generation.

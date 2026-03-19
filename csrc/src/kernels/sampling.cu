@@ -122,6 +122,292 @@ void sampling_from_logits(
 }
 
 // ============================================================================
+// Top-K sampling
+// ============================================================================
+
+void sampling_top_k(
+        float* probs,
+        int32_t* output,
+        int top_k,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    float* top_k_arr_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    auto err = flashinfer::sampling::TopKSamplingFromProb<float, int32_t>(
+        probs, output, indices_null, top_k_arr_null,
+        static_cast<uint32_t>(batch_size),
+        static_cast<uint32_t>(top_k),
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_top_k failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Top-P (nucleus) sampling
+// ============================================================================
+
+void sampling_top_p(
+        float* probs,
+        int32_t* output,
+        float top_p,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    float* top_p_arr_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    auto err = flashinfer::sampling::TopPSamplingFromProb<float, int32_t>(
+        probs, output, indices_null, top_p_arr_null,
+        static_cast<uint32_t>(batch_size),
+        top_p,
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_top_p failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Combined Top-K + Top-P sampling
+// ============================================================================
+
+void sampling_top_k_top_p(
+        float* probs,
+        int32_t* output,
+        int top_k,
+        float top_p,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    int32_t* top_k_arr_null = nullptr;
+    float* top_p_arr_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    auto err = flashinfer::sampling::TopKTopPSamplingFromProb<float, int32_t>(
+        probs, top_k_arr_null, top_p_arr_null, output, indices_null,
+        static_cast<uint32_t>(batch_size),
+        static_cast<int32_t>(top_k),
+        top_p,
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_top_k_top_p failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Min-P sampling
+// ============================================================================
+
+void sampling_min_p(
+        float* probs,
+        int32_t* output,
+        float min_p,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    float* min_p_arr_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    auto err = flashinfer::sampling::MinPSamplingFromProb<float, int32_t>(
+        probs, min_p_arr_null, output, indices_null,
+        static_cast<uint32_t>(batch_size),
+        min_p,
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_min_p failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Per-sequence Top-K sampling
+// ============================================================================
+
+void sampling_top_k_per_seq(
+        float* probs,
+        int32_t* output,
+        const int32_t* top_k_arr,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    // When top_k_arr is provided, FlashInfer reads per-row K values from it.
+    // We cast away const — FlashInfer doesn't modify it but the API isn't const-correct.
+    auto err = flashinfer::sampling::TopKSamplingFromProb<float, int32_t>(
+        probs, output, indices_null,
+        const_cast<float*>(reinterpret_cast<const float*>(top_k_arr)),  // top_k_arr as float* (API quirk)
+        static_cast<uint32_t>(batch_size),
+        0,  // top_k_val unused when array is provided
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_top_k_per_seq failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Per-sequence Top-P sampling
+// ============================================================================
+
+void sampling_top_p_per_seq(
+        float* probs,
+        int32_t* output,
+        const float* top_p_arr,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    auto err = flashinfer::sampling::TopPSamplingFromProb<float, int32_t>(
+        probs, output, indices_null,
+        const_cast<float*>(top_p_arr),
+        static_cast<uint32_t>(batch_size),
+        1.0f,  // top_p_val unused when array is provided
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_top_p_per_seq failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Per-sequence Top-K + Top-P combined sampling
+// ============================================================================
+
+void sampling_top_k_top_p_per_seq(
+        float* probs,
+        int32_t* output,
+        const int32_t* top_k_arr,
+        const float* top_p_arr,
+        int batch_size,
+        int vocab_size,
+        bool deterministic,
+        uint64_t seed,
+        uint64_t offset,
+        cudaStream_t stream) {
+
+    int32_t* indices_null = nullptr;
+    uint64_t* seed_arr_null = nullptr;
+    uint64_t* offset_arr_null = nullptr;
+    auto err = flashinfer::sampling::TopKTopPSamplingFromProb<float, int32_t>(
+        probs,
+        const_cast<int32_t*>(top_k_arr),
+        const_cast<float*>(top_p_arr),
+        output, indices_null,
+        static_cast<uint32_t>(batch_size),
+        0,    // top_k_val unused
+        1.0f, // top_p_val unused
+        static_cast<uint32_t>(vocab_size),
+        deterministic,
+        seed_arr_null, seed, offset_arr_null, offset,
+        stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sampling_top_k_top_p_per_seq failed: ") + cudaGetErrorString(err));
+    }
+}
+
+// ============================================================================
+// Repetition penalty
+// ============================================================================
+
+namespace {
+
+// For each batch item, scan its token history and penalize the corresponding logit.
+// Grid: (batch_size)  Block: (256)
+__global__ void repetition_penalty_kernel(
+        float* __restrict__ logits,
+        const int32_t* __restrict__ token_ids,
+        const int* __restrict__ seq_lens,
+        float penalty,
+        int vocab_size, int max_seq_len) {
+    const int batch_idx = blockIdx.x;
+    const int seq_len = seq_lens[batch_idx];
+    float* row = logits + static_cast<long>(batch_idx) * vocab_size;
+    const int32_t* tokens = token_ids + static_cast<long>(batch_idx) * max_seq_len;
+
+    for (int i = threadIdx.x; i < seq_len; i += blockDim.x) {
+        const int tok = tokens[i];
+        if (tok >= 0 && tok < vocab_size) {
+            float val = row[tok];
+            // Penalize: divide positive logits, multiply negative logits
+            row[tok] = (val > 0.0f) ? val / penalty : val * penalty;
+        }
+    }
+}
+
+}  // anonymous namespace
+
+void sampling_repetition_penalty(
+        float* logits,
+        const int32_t* token_ids,
+        const int* seq_lens,
+        float penalty,
+        int batch_size,
+        int vocab_size,
+        int max_seq_len,
+        cudaStream_t stream) {
+
+    if (penalty == 1.0f) return;  // no-op
+    repetition_penalty_kernel<<<batch_size, 256, 0, stream>>>(
+        logits, token_ids, seq_lens, penalty, vocab_size, max_seq_len);
+}
+
+// ============================================================================
 // Log-probability extraction: logprob[i] = log(probs[i, token_ids[i]])
 // ============================================================================
 

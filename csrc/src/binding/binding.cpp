@@ -1359,10 +1359,15 @@ NB_MODULE(_surogate, m) {
                 float temperature,
                 int eos_token_id,
                 bool use_lora,
-                bool use_cuda_graphs) {
+                bool use_cuda_graphs,
+                int top_k,
+                float top_p,
+                float min_p,
+                float repetition_penalty) {
             auto result = trainer->generate(
                 prompts, num_completions, max_gen_len, temperature,
-                eos_token_id, use_lora, use_cuda_graphs);
+                eos_token_id, use_lora, use_cuda_graphs,
+                top_k, top_p, min_p, repetition_penalty);
             return nb::make_tuple(
                 result.tokens, result.logprobs,
                 result.prompt_lens, result.completion_lens);
@@ -1374,9 +1379,25 @@ NB_MODULE(_surogate, m) {
         nb::arg("eos_token_id") = 2,
         nb::arg("use_lora") = true,
         nb::arg("use_cuda_graphs") = false,
+        nb::arg("top_k") = 0,
+        nb::arg("top_p") = 1.0f,
+        nb::arg("min_p") = 0.0f,
+        nb::arg("repetition_penalty") = 1.0f,
         "Native generation: generate M×N completions using the trainer's model.\n\n"
         "Uses the model's DeviceMemoryStack as the arena for KV-cache,\n"
         "time-multiplexed with training activations (memory overlay).\n\n"
+        "Parameters:\n"
+        "  prompts: List of token ID lists (ragged)\n"
+        "  num_completions: N completions per prompt (GRPO)\n"
+        "  max_gen_len: Maximum tokens to generate\n"
+        "  temperature: Sampling temperature (0 = greedy)\n"
+        "  eos_token_id: End-of-sequence token ID\n"
+        "  use_lora: Apply LoRA (policy) or skip (reference)\n"
+        "  use_cuda_graphs: Capture decode step as CUDA graph\n"
+        "  top_k: Top-K sampling (0 = disabled)\n"
+        "  top_p: Top-P / nucleus sampling (1.0 = disabled)\n"
+        "  min_p: Min-P sampling (0.0 = disabled)\n"
+        "  repetition_penalty: Repetition penalty (1.0 = disabled)\n\n"
         "Returns (tokens, logprobs, prompt_lens, completion_lens) — all lists of length M*N.")
         .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),
              "Set the gradient accumulation step count for the next training step.\n\n"

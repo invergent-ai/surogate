@@ -157,7 +157,11 @@ public:
         float temperature,
         int eos_token_id,
         bool use_lora,
-        bool use_cuda_graphs = false);
+        bool use_cuda_graphs = false,
+        int top_k = 0,
+        float top_p = 1.0f,
+        float min_p = 0.0f,
+        float repetition_penalty = 1.0f);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism

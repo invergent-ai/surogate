@@ -266,13 +266,35 @@ std::vector<Trajectory> GenerationEngine::generate(
             // Greedy (argmax)
             sampling_argmax(logits_gpu, sampled_tokens_gpu, batch_size, V, mRunState.MainStream);
         } else {
-            // Temperature + categorical sampling
+            // Temperature-scaled softmax → probs
             sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
                              batch_size, V, softmax_workspace, softmax_workspace_bytes,
                              mRunState.MainStream);
-            sampling_from_probs(probs_gpu, sampled_tokens_gpu, batch_size, V,
-                                /*deterministic=*/true, gen_config.seed, rng_offset,
-                                mRunState.MainStream);
+
+            // Apply filtered sampling strategy
+            if (gen_config.top_k > 0 && gen_config.top_p < 1.0f) {
+                sampling_top_k_top_p(probs_gpu, sampled_tokens_gpu,
+                                     gen_config.top_k, gen_config.top_p,
+                                     batch_size, V, /*deterministic=*/true,
+                                     gen_config.seed, rng_offset, mRunState.MainStream);
+            } else if (gen_config.top_k > 0) {
+                sampling_top_k(probs_gpu, sampled_tokens_gpu, gen_config.top_k,
+                               batch_size, V, /*deterministic=*/true,
+                               gen_config.seed, rng_offset, mRunState.MainStream);
+            } else if (gen_config.top_p < 1.0f) {
+                sampling_top_p(probs_gpu, sampled_tokens_gpu, gen_config.top_p,
+                               batch_size, V, /*deterministic=*/true,
+                               gen_config.seed, rng_offset, mRunState.MainStream);
+            } else if (gen_config.min_p > 0.0f) {
+                sampling_min_p(probs_gpu, sampled_tokens_gpu, gen_config.min_p,
+                               batch_size, V, /*deterministic=*/true,
+                               gen_config.seed, rng_offset, mRunState.MainStream);
+            } else {
+                // Plain categorical sampling
+                sampling_from_probs(probs_gpu, sampled_tokens_gpu, batch_size, V,
+                                    /*deterministic=*/true, gen_config.seed, rng_offset,
+                                    mRunState.MainStream);
+            }
         }
         rng_offset++;
 
