@@ -14,6 +14,19 @@
 
 namespace tokenizer {
 
+// Loss masking strategy for encode_for_training().
+enum class LossStrategy {
+    DEFAULT,     // Train on all assistant responses + suffix tokens
+    LAST_ROUND,  // Train only on the last assistant response + suffix
+    ALL          // Train on all tokens (including system/user)
+};
+
+// Result of encode_for_training().
+struct TrainingEncoded {
+    std::vector<int32_t> input_ids;
+    std::vector<int32_t> labels;  // -100 for masked (no loss), token_id for trainable
+};
+
 // A single message in a conversation.
 struct ChatMessage {
     std::string role;    // "system", "user", "assistant", "tool"
@@ -73,6 +86,28 @@ public:
     std::vector<int32_t> apply_chat_template_and_encode(
         const std::vector<ChatMessage>& messages,
         bool add_generation_prompt = false) const;
+
+    // Encode a conversation for training with loss masking.
+    //
+    // Uses incremental chat template rendering to identify which tokens belong
+    // to assistant responses vs. system/user/template chrome. Returns input_ids
+    // and labels where labels[i] = -100 for masked tokens (no loss) and
+    // labels[i] = token_id for trainable tokens.
+    //
+    // The strategy controls which tokens are trainable:
+    //   DEFAULT    — all assistant response + suffix tokens
+    //   LAST_ROUND — only the last assistant response + suffix
+    //   ALL        — all tokens (system, user, assistant, template)
+    //
+    // labels[0] is always -100.
+    TrainingEncoded encode_for_training(
+        const std::vector<ChatMessage>& messages,
+        LossStrategy strategy = LossStrategy::DEFAULT) const;
+
+    // Batch version of encode_for_training (multi-threaded).
+    std::vector<TrainingEncoded> encode_for_training_batch(
+        const std::vector<std::vector<ChatMessage>>& batch,
+        LossStrategy strategy = LossStrategy::DEFAULT) const;
 
 private:
     Tokenizer();

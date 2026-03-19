@@ -150,15 +150,17 @@ inline std::vector<Rank> bpe_merge_small(const uint8_t* piece, size_t piece_len,
 
 // ---- Large-piece BPE: O(m log n) heap-based ----
 // For pieces >= SMALL_PIECE_THRESHOLD bytes. Uses a min-heap with lazy
-// invalidation (tiktoken's approach).
+// invalidation. State is indexed directly by byte position (no sentinel).
 
 inline std::vector<Rank> bpe_merge_large(const uint8_t* piece, size_t piece_len, const EncoderLookup& enc) {
+    // State per byte position. state[i] represents the live token starting at byte i.
+    // After merges, dead states are skipped via the linked-list traversal (end pointers).
     struct State {
-        size_t prev;       // Previous token start
-        size_t end;        // Current token end
-        size_t next_end;   // Next token's end (for lookahead)
-        Rank next_rank;    // Rank of potential merge at this position
-        Rank cur_rank;     // Rank of the already-merged token
+        size_t prev;       // Byte position of previous live token (SIZE_MAX if first)
+        size_t end;        // Byte position where this token ends (exclusive)
+        size_t next_end;   // End of the NEXT live token (for 3-token merge lookahead)
+        Rank next_rank;    // Rank of merge [start .. next_end), RANK_MAX if none
+        Rank cur_rank;     // Rank of this (possibly merged) token, RANK_MAX if unmerged
     };
 
     struct Merge {
@@ -169,34 +171,37 @@ inline std::vector<Rank> bpe_merge_large(const uint8_t* piece, size_t piece_len,
         }
     };
 
-    std::vector<State> state;
-    state.reserve(piece_len);
-    state.push_back({SIZE_MAX, 1, 2, RANK_MAX, RANK_MAX}); // sentinel at index 0
-
+    // piece_len + 1 entries: one per byte position plus a sentinel at the end
+    // so that state[right_start] is always in-bounds even when right_start == piece_len-1's end.
+    std::vector<State> state(piece_len + 1);
     std::priority_queue<Merge, std::vector<Merge>, std::greater<Merge>> heap;
 
-    for (size_t i = 0; i < piece_len - 1; i++) {
-        Rank r = enc.get(piece + i, 2);
-        if (r != RANK_MAX) {
-            heap.push({i, r});
-        }
-        state.push_back({
-            i,                                         // prev
-            i + 2,                                     // end
-            std::min(i + 3, piece_len),                // next_end
-            r,                                         // next_rank (valid merge rank or MAX)
-            RANK_MAX                                   // cur_rank (not yet merged)
-        });
-    }
+    for (size_t i = 0; i < piece_len; i++) {
+        state[i].prev = (i > 0) ? i - 1 : SIZE_MAX;
+        state[i].end = i + 1;
+        state[i].next_end = std::min(i + 2, piece_len);
+        state[i].cur_rank = RANK_MAX;
+        state[i].next_rank = RANK_MAX;
 
-    auto potential_merge = [&](size_t start, size_t next_end_item) {
-        state[start].next_end = next_end_item;
-        state[start].next_rank = RANK_MAX;
-        if (next_end_item <= piece_len) {
-            Rank r = enc.get(piece + start, next_end_item - start);
+        if (i + 1 < piece_len) {
+            Rank r = enc.get(piece + i, 2);
             if (r != RANK_MAX) {
-                heap.push({start, r});
+                state[i].next_rank = r;
+                heap.push({i, r});
+            }
+        }
+    }
+    // End sentinel: safe to read but never participates in merges.
+    state[piece_len] = {SIZE_MAX, piece_len + 1, piece_len + 1, RANK_MAX, RANK_MAX};
+
+    auto try_merge = [&](size_t start, size_t next_end_val) {
+        state[start].next_end = next_end_val;
+        state[start].next_rank = RANK_MAX;
+        if (next_end_val <= piece_len) {
+            Rank r = enc.get(piece + start, next_end_val - start);
+            if (r != RANK_MAX) {
                 state[start].next_rank = r;
+                heap.push({start, r});
             }
         }
     };
@@ -206,36 +211,37 @@ inline std::vector<Rank> bpe_merge_large(const uint8_t* piece, size_t piece_len,
         heap.pop();
 
         if (rank == RANK_MAX) break;
-        if (rank != state[left_start].next_rank) continue; // invalidated
+        if (rank != state[left_start].next_rank) continue; // stale entry
 
         size_t right_start = state[left_start].end;
         size_t right_end = state[left_start].next_end;
         size_t right_next_end = state[right_start].next_end;
 
-        // Merge left and right.
+        // Merge: left absorbs right.
         state[left_start].cur_rank = rank;
         state[left_start].end = right_end;
-        potential_merge(left_start, right_next_end);
 
-        // Update backward link.
-        if (right_end < state.size()) {
+        // Recompute merge potential for left with the token after right.
+        try_merge(left_start, right_next_end);
+
+        // Update backward link so the token after right points back to left.
+        if (right_end < piece_len) {
             state[right_end].prev = left_start;
         }
 
-        // Update merge that ends at left_start.
-        if (left_start > 0) {
-            size_t prev_start = state[left_start].prev;
-            potential_merge(prev_start, right_end);
+        // Recompute merge potential for the token before left.
+        if (state[left_start].prev != SIZE_MAX) {
+            try_merge(state[left_start].prev, right_end);
         }
 
-        // Invalidate merge starting at right_start.
+        // Invalidate the dead right state.
         state[right_start].next_rank = RANK_MAX;
     }
 
-    // Extract final token ranks.
+    // Extract final tokens by following the end-pointer chain.
     std::vector<Rank> result;
     size_t i = 0;
-    while (i < state.size()) {
+    while (i < piece_len) {
         if (state[i].cur_rank != RANK_MAX) {
             result.push_back(state[i].cur_rank);
         } else {

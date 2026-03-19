@@ -1798,6 +1798,85 @@ NB_MODULE(_surogate, m) {
              nb::arg("messages"), nb::arg("add_generation_prompt") = false,
              "Apply chat template and encode in one call.\n\n"
              "Returns token IDs.")
+        .def("encode_for_training",
+             [](const tokenizer::Tokenizer& self, nb::list messages, const std::string& strategy_str) {
+                 // Parse strategy
+                 tokenizer::LossStrategy strategy;
+                 if (strategy_str == "default") strategy = tokenizer::LossStrategy::DEFAULT;
+                 else if (strategy_str == "last_round") strategy = tokenizer::LossStrategy::LAST_ROUND;
+                 else if (strategy_str == "all") strategy = tokenizer::LossStrategy::ALL;
+                 else throw std::invalid_argument("strategy must be 'default', 'last_round', or 'all', got: " + strategy_str);
+
+                 // Convert messages, skipping entries with null content
+                 std::vector<tokenizer::ChatMessage> msgs;
+                 msgs.reserve(nb::len(messages));
+                 for (auto item : messages) {
+                     nb::dict d = nb::cast<nb::dict>(item);
+                     auto content_obj = d["content"];
+                     if (content_obj.is_none()) continue;
+                     msgs.push_back({
+                         nb::cast<std::string>(d["role"]),
+                         nb::cast<std::string>(content_obj)
+                     });
+                 }
+
+                 auto result = self.encode_for_training(msgs, strategy);
+                 nb::dict out;
+                 out["input_ids"] = nb::cast(result.input_ids);
+                 out["labels"] = nb::cast(result.labels);
+                 return out;
+             },
+             nb::arg("messages"), nb::arg("strategy") = "default",
+             "Encode a conversation for training with loss masking.\n\n"
+             "Uses incremental chat template rendering to identify assistant response\n"
+             "tokens. Returns a dict with 'input_ids' and 'labels' where labels[i]=-100\n"
+             "for masked tokens (no loss) and labels[i]=token_id for trainable tokens.\n\n"
+             "Parameters:\n"
+             "- messages: List of dicts with 'role' and 'content' keys.\n"
+             "- strategy: 'default' (train on all assistant turns), 'last_round'\n"
+             "            (train only on last assistant turn), or 'all' (train on everything).")
+        .def("encode_for_training_batch",
+             [](const tokenizer::Tokenizer& self, nb::list batch, const std::string& strategy_str) {
+                 tokenizer::LossStrategy strategy;
+                 if (strategy_str == "default") strategy = tokenizer::LossStrategy::DEFAULT;
+                 else if (strategy_str == "last_round") strategy = tokenizer::LossStrategy::LAST_ROUND;
+                 else if (strategy_str == "all") strategy = tokenizer::LossStrategy::ALL;
+                 else throw std::invalid_argument("strategy must be 'default', 'last_round', or 'all', got: " + strategy_str);
+
+                 // Convert batch of conversations, skipping entries with null content
+                 std::vector<std::vector<tokenizer::ChatMessage>> cpp_batch;
+                 cpp_batch.reserve(nb::len(batch));
+                 for (auto conv_item : batch) {
+                     nb::list conv = nb::cast<nb::list>(conv_item);
+                     std::vector<tokenizer::ChatMessage> msgs;
+                     msgs.reserve(nb::len(conv));
+                     for (auto msg_item : conv) {
+                         nb::dict d = nb::cast<nb::dict>(msg_item);
+                         auto content_obj = d["content"];
+                         if (content_obj.is_none()) continue;
+                         msgs.push_back({
+                             nb::cast<std::string>(d["role"]),
+                             nb::cast<std::string>(content_obj)
+                         });
+                     }
+                     cpp_batch.push_back(std::move(msgs));
+                 }
+
+                 auto results = self.encode_for_training_batch(cpp_batch, strategy);
+                 nb::list out;
+                 for (auto& r : results) {
+                     nb::dict d;
+                     d["input_ids"] = nb::cast(r.input_ids);
+                     d["labels"] = nb::cast(r.labels);
+                     out.append(d);
+                 }
+                 return out;
+             },
+             nb::arg("batch"), nb::arg("strategy") = "default",
+             "Batch encode conversations for training (multi-threaded).\n\n"
+             "Parameters:\n"
+             "- batch: List of conversations, each a list of message dicts.\n"
+             "- strategy: 'default', 'last_round', or 'all'.")
         ;
 
     // Disable leak warnings during interpreter shutdown - these are false positives

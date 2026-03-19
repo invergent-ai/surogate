@@ -21,6 +21,11 @@ from surogate.utils.np_utils import get_seed
 from rich.console import Console
 from rich.text import Text
 
+try:
+    from surogate._surogate import Tokenizer as NativeTokenizer
+    HAS_NATIVE_TOKENIZER = True
+except ImportError:
+    HAS_NATIVE_TOKENIZER = False
 
 logger = get_logger()
 
@@ -485,6 +490,67 @@ def debug_labels(example, tokenizer, text_only=False):
 
     return output
 
+class NativeEncodePreprocessor:
+    """Fast dataset encoder using the C++ tokenizer's encode_for_training.
+
+    Drop-in replacement for EncodePreprocessor that bypasses the Python
+    ChatTemplateProcessor entirely. Uses the Jinja chat template + BPE
+    tokenizer in C++ with multi-threaded batch encoding.
+
+    Iterates the dataset directly instead of using dataset.map() to avoid
+    pickling the C++ tokenizer object across process boundaries.
+    """
+
+    def __init__(self, native_tokenizer: 'NativeTokenizer', loss_strategy: str = 'default'):
+        self.native_tokenizer = native_tokenizer
+        self.loss_strategy = loss_strategy
+
+    def __call__(self, dataset, batch_size: int = 10000, desc: str = "Encoding", **kwargs):
+        from datasets import Dataset as HfDataset
+        from tqdm import tqdm
+
+        all_input_ids = []
+        all_labels = []
+        n_skipped = 0
+        n_total = len(dataset)
+
+        with tqdm(total=n_total, desc=desc, unit=" examples") as pbar:
+            for batch in dataset.iter(batch_size=batch_size):
+                messages_batch = batch['messages']
+
+                try:
+                    results = self.native_tokenizer.encode_for_training_batch(
+                        messages_batch, strategy=self.loss_strategy)
+                except Exception as e:
+                    # Fall back to one-by-one to isolate bad examples
+                    logger.warning(f"Batch encoding failed ({e}), falling back to row-by-row")
+                    results = []
+                    for msgs in messages_batch:
+                        try:
+                            results.append(self.native_tokenizer.encode_for_training(
+                                msgs, strategy=self.loss_strategy))
+                        except Exception:
+                            n_skipped += 1
+                            results.append({'input_ids': [], 'labels': []})
+
+                for result in results:
+                    ids = result['input_ids']
+                    if len(ids) == 0:
+                        continue
+                    all_input_ids.append(ids)
+                    all_labels.append(result['labels'])
+
+                pbar.update(len(messages_batch))
+
+        if n_skipped > 0:
+            logger.warning(f"Skipped {n_skipped} examples due to encoding errors")
+
+        return HfDataset.from_dict({
+            'input_ids': all_input_ids,
+            'labels': all_labels,
+        })
+
+
 class TokenizeDatasets(SurogateCommand):
     template_processor: ChatTemplateProcessor
     tokenizer: PreTrainedTokenizerBase
@@ -509,6 +575,7 @@ class TokenizeDatasets(SurogateCommand):
 
     def _load_and_encode_datasets(self):
         """Load, preprocess, and encode datasets. Returns (train_dataset, val_dataset)."""
+        import time
         train_datasets, val_datasets = [], []
         train_seed = np.random.RandomState(self.config.train_seed)
         eval_seed = np.random.RandomState(self.config.eval_seed)
@@ -520,6 +587,7 @@ class TokenizeDatasets(SurogateCommand):
 
         with disable_datasets_caching():
             for ds_config in self.config.datasets:
+                t0 = time.perf_counter()
                 # Shard training data across nodes for distributed training
                 dataset = load_dataset_with_config(
                     ds_config,
@@ -527,14 +595,20 @@ class TokenizeDatasets(SurogateCommand):
                     node_rank=node_rank,
                     num_nodes=num_nodes,
                 )
+                t1 = time.perf_counter()
 
                 dataset = pre_process(dataset, ds_config, num_proc=self.config.dataloader_num_workers)
+                t2 = time.perf_counter()
+
                 train_dataset, val_dataset = post_process(
                     dataset,
                     dataset_sample=ds_config.samples,
                     split_dataset_ratio=self.config.validation_split_ratio if not has_validation_datasets else 0.0,
                     random_state=train_seed,
                 )
+                t3 = time.perf_counter()
+                logger.info(f"Dataset '{ds_config.path}': load={t1-t0:.2f}s, pre_process={t2-t1:.2f}s, post_process={t3-t2:.2f}s")
+
                 train_datasets.append(train_dataset)
                 if val_dataset is not None:
                     val_datasets.append(val_dataset)
@@ -555,12 +629,12 @@ class TokenizeDatasets(SurogateCommand):
             train_dataset = concat_datasets(train_datasets)
             train_dataset = shuffle_dataset(
                 train_dataset, seed=get_seed(train_seed), buffer_size=1000)
-            
+
             if len(val_datasets) > 0:
                 val_dataset = concat_datasets(val_datasets)
                 val_dataset = shuffle_dataset(
                     val_dataset, seed=get_seed(eval_seed), buffer_size=1000)
-
+            
             train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset)
 
         return train_dataset, val_dataset
@@ -615,20 +689,58 @@ class TokenizeDatasets(SurogateCommand):
         write_tokenize_hash(self.config.output_dir, current_hash)
         logger.info(f"Tokenization complete. Hash saved: {current_hash}")
 
+    def _can_use_native_encoder(self) -> bool:
+        """Check if we can use the fast C++ encoder instead of the Python one."""
+        if not HAS_NATIVE_TOKENIZER:
+            return False
+        if self.config.model_template.is_multimodal:
+            return False
+        # Only base strategies are supported by the native encoder
+        loss_scale = getattr(self.config, 'loss_scale', 'default')
+        if loss_scale not in ('default', 'last_round', 'all'):
+            return False
+        return True
+
     def _encode_dataset(self, train_dataset, val_dataset):
+        if self._can_use_native_encoder():
+            return self._encode_dataset_native(train_dataset, val_dataset)
+        return self._encode_dataset_python(train_dataset, val_dataset)
+
+    def _encode_dataset_native(self, train_dataset, val_dataset):
+        """Encode datasets using the fast C++ tokenizer."""
+        import time
+        native_tok = NativeTokenizer.from_pretrained(self.config.model_dir)
+
+        loss_strategy = getattr(self.config, 'loss_scale', 'default')
+        preprocessor = NativeEncodePreprocessor(native_tok, loss_strategy=loss_strategy)
+
+        datasets = [train_dataset, val_dataset]
+        for i, dataset in enumerate(datasets):
+            if dataset is None:
+                continue
+            split_name = 'train' if i == 0 else 'validation'
+            t0 = time.perf_counter()
+            datasets[i] = preprocessor(dataset, batch_size=10000, desc=f"Encoding {split_name}")
+            t1 = time.perf_counter()
+            n = len(datasets[i])
+            logger.info(f"Encoded {split_name}: {n} examples in {t1-t0:.2f}s ({n/(t1-t0):.0f} examples/s)")
+        return datasets
+
+    def _encode_dataset_python(self, train_dataset, val_dataset):
+        """Encode datasets using the Python ChatTemplateProcessor (fallback)."""
         template_processor = self.template_processor
 
         datasets = [train_dataset, val_dataset]
         origin_template_model = template_processor.model
         template_processor.model = None  # Avoid serializing the model with IPC when mapping the dataset.
-        
+
         for i, dataset in enumerate(datasets):
             if dataset is None:
                 continue
             logger.info(f"Encoding {'train' if i == 0 else 'validation'} dataset...")
             preprocessor = EncodePreprocessor(template=template_processor)
             batch_size = 100 if self.config.model_template.is_multimodal else 10000
-            
+
             dataset = preprocessor(
                 dataset,
                 num_proc=self.config.dataloader_num_workers,
@@ -646,214 +758,163 @@ class TokenizeDatasets(SurogateCommand):
                        num_workers: Optional[int] = None) -> None:
         """Write dataset to BIN.TOK format file(s).
 
-        Args:
-            dataset: The dataset to write.
-            out_path: Output file path. For multi-file output, this is used as a base
-                     (e.g., 'train.bin' becomes 'train-000.bin', 'train-001.bin', etc.)
-            packing: If True, pack multiple examples into sequences (for training).
-                     If False, pad each example individually (for validation).
-            max_tokens_per_file: Maximum tokens per output file. If None or the total
-                                tokens fit in one file, writes a single file.
-                                Default is 100M tokens per file for training data.
-            num_workers: Number of parallel workers for data preparation. If None, uses
-                        half of available CPUs (capped at 8).
+        Vectorized implementation: bulk-converts all examples to numpy, concatenates,
+        builds position IDs and masks, slices into seq_len chunks, and writes files.
         """
+        from tqdm import tqdm
+
         vocab_size = self.config.tokenizer.vocab_size
         seq_len = self.config.sequence_len or self.config.max_model_len
         pad_token_id = self.config.tokenizer.pad_token_id if self.config.tokenizer.pad_token_id is not None else 0
 
-        # Set defaults for multi-file processing
         if max_tokens_per_file is None:
             max_tokens_per_file = DEFAULT_MAX_TOKENS_PER_FILE
 
-        if num_workers is None:
-            num_workers = max(1, min(mp.cpu_count() // 2, 8))
-
-        def iter_docs():
-            for batch in dataset.iter(batch_size=1000):
-                # Process batch items
-                batch_input_ids = batch['input_ids']
-                batch_labels = batch['labels']
-
-                for i in range(len(batch_input_ids)):
-                    input_ids = np.asarray(batch_input_ids[i], dtype=np.int32)
-                    labels = np.asarray(batch_labels[i], dtype=np.int32)
-                    # Create mask: 1 where we want to compute loss (labels != -100), 0 otherwise
-                    # Shift by 1 position for input-aligned mask (as in _to_input_mask)
-                    assistant_mask = (labels != -100).astype(np.int32)
-                    mask = _to_input_mask(assistant_mask)
-                    yield {'tokens': input_ids, 'mask': mask}
-
+        non_overlapping = not packing
         out_dir = os.path.dirname(out_path)
         base_name = os.path.basename(out_path)
         name_without_ext = base_name.rsplit('.', 1)[0] if '.' in base_name else base_name
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-        # non_overlapping=True for validation (padded, non-packed) so dataloader uses correct chunk count
-        non_overlapping = not packing
+        # Step 1: Bulk collect all doc tokens/masks and their lengths
+        all_tokens = []
+        all_masks = []
+        doc_lengths = []
+        n_docs = len(dataset)
 
-        if max_tokens_per_file:
-            self._write_multi_file(
-                iter_docs(),
-                out_dir=out_dir,
-                name_prefix=name_without_ext,
-                vocab_size=vocab_size,
-                seq_len=seq_len,
-                pad_token_id=pad_token_id,
-                max_tokens_per_file=max_tokens_per_file,
-                non_overlapping=non_overlapping,
-                packing=packing
+        for batch in tqdm(dataset.iter(batch_size=5000), desc="Preparing",
+                          total=(n_docs + 4999) // 5000, unit=" batches"):
+            for input_ids, labels in zip(batch['input_ids'], batch['labels']):
+                tokens = np.asarray(input_ids, dtype=np.int32)
+                lab = np.asarray(labels, dtype=np.int32)
+                if tokens.size == 0:
+                    continue
+                mask = _to_input_mask((lab != -100).astype(np.int32))
+                all_tokens.append(tokens)
+                all_masks.append(mask)
+                doc_lengths.append(tokens.size)
+
+        if not all_tokens:
+            return
+
+        if packing:
+            self._write_packed_vectorized(
+                all_tokens, all_masks, doc_lengths,
+                out_dir, name_without_ext, vocab_size, seq_len,
+                pad_token_id, max_tokens_per_file, non_overlapping,
             )
         else:
-            # Single file output for validation or small datasets
-            with TokenizedDataFileWriter(out_path, vocab_size, masking=True, non_overlapping=non_overlapping) as writer:
-                if packing:
-                    pack_and_write(writer, iter_docs(), seq_len=seq_len, pad_token_id=pad_token_id)
-                else:
-                    write_padded(writer, iter_docs(), seq_len=seq_len, pad_token_id=pad_token_id)
+            self._write_padded_vectorized(
+                all_tokens, all_masks, doc_lengths,
+                out_dir, name_without_ext, vocab_size, seq_len,
+                pad_token_id, max_tokens_per_file, non_overlapping,
+            )
 
-    def _write_multi_file(
-        self,
-        docs: Iterable[dict],
-        out_dir: str,
-        name_prefix: str,
-        vocab_size: int,
-        seq_len: int,
-        pad_token_id: int,
-        max_tokens_per_file: int,
-        non_overlapping: bool = False,
-        packing: bool = True
-    ) -> int:
-        """Write tokenized documents to multiple files, splitting when token limit is reached.
+    def _write_packed_vectorized(
+        self, all_tokens, all_masks, doc_lengths,
+        out_dir, name_prefix, vocab_size, seq_len,
+        pad_token_id, max_tokens_per_file, non_overlapping,
+    ):
+        """Vectorized packing: concat all docs, build position IDs, slice into sequences."""
+        from tqdm import tqdm
 
-        Args:
-            docs: Iterable of document dictionaries with 'tokens' and 'mask' keys.
-            out_dir: Output directory.
-            name_prefix: Prefix for output files (e.g., 'train' -> 'train-000.bin').
-            vocab_size: Vocabulary size for header.
-            seq_len: Sequence length for packing/padding.
-            pad_token_id: Padding token ID.
-            max_tokens_per_file: Maximum tokens per file before creating a new shard.
-            non_overlapping: Whether chunks should be non-overlapping.
-            packing: If True, pack multiple docs into sequences. If False, pad each doc individually.
+        # Build per-doc position IDs (0..len-1 for each doc)
+        pos_segments = [np.arange(l, dtype=np.int32) for l in doc_lengths]
 
-        Returns:
-            Total number of tokens written across all files.
-        """
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        # Concatenate everything into big flat arrays
+        big_tokens = np.concatenate(all_tokens)
+        big_mask = np.concatenate(all_masks)
+        big_pos = np.concatenate(pos_segments)
+        total = big_tokens.size
+
+        # Pad to multiple of seq_len
+        remainder = total % seq_len
+        if remainder != 0:
+            pad_len = seq_len - remainder
+            big_tokens = np.pad(big_tokens, (0, pad_len), constant_values=pad_token_id)
+            big_mask = np.pad(big_mask, (0, pad_len), constant_values=0)
+            # Continue position IDs monotonically through padding
+            last_pos = int(big_pos[-1]) if big_pos.size > 0 else -1
+            big_pos = np.concatenate([big_pos, np.arange(last_pos + 1, last_pos + 1 + pad_len, dtype=np.int32)])
+
+        n_seqs = big_tokens.size // seq_len
+
+        # Reshape into (n_seqs, seq_len) for bulk slicing
+        tokens_2d = big_tokens.reshape(n_seqs, seq_len)
+        mask_2d = big_mask.reshape(n_seqs, seq_len)
+        pos_2d = big_pos.reshape(n_seqs, seq_len)
+
+        # Write to file(s)
+        file_index = 0
+        total_tokens = 0
+
+        def get_path(idx):
+            return os.path.join(out_dir, f"{name_prefix}-{idx:03d}.bin")
+
+        writer = None
+        seqs_per_file = max(1, max_tokens_per_file // seq_len)
+
+        for start in tqdm(range(0, n_seqs, seqs_per_file), desc="Writing", unit=" shards"):
+            end = min(start + seqs_per_file, n_seqs)
+            output_path = get_path(file_index)
+            with TokenizedDataFileWriter(output_path, vocab_size, masking=True, non_overlapping=non_overlapping) as writer:
+                for i in range(start, end):
+                    writer.add_document(tokens=tokens_2d[i], position_ids=pos_2d[i], mask=mask_2d[i])
+                total_tokens += writer.n_tokens
+                logger.info(f"Completed file {output_path} with {writer.n_tokens:,} tokens")
+            file_index += 1
+
+        logger.info(f"Multi-file write complete: {file_index} files, {total_tokens:,} total tokens")
+
+    def _write_padded_vectorized(
+        self, all_tokens, all_masks, doc_lengths,
+        out_dir, name_prefix, vocab_size, seq_len,
+        pad_token_id, max_tokens_per_file, non_overlapping,
+    ):
+        """Vectorized padded write: each doc is individually padded/truncated."""
+        from tqdm import tqdm
 
         file_index = 0
         total_tokens = 0
-        current_writer = None
-        current_tokens = []
-        current_masks = []
-        current_len = 0
+        seqs_per_file = max(1, max_tokens_per_file // seq_len)
 
-        def get_output_path(idx: int) -> str:
+        def get_path(idx):
             return os.path.join(out_dir, f"{name_prefix}-{idx:03d}.bin")
 
-        def flush_to_writer():
-            nonlocal current_tokens, current_masks, current_len
-            if current_len == 0:
-                return
+        n_docs = len(all_tokens)
+        writer = None
 
-            tokens, pos_ids, mask = _pack_buffer_to_sequence(
-                current_tokens, current_masks, current_len, seq_len, pad_token_id
-            )
-            current_writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
-            current_tokens = []
-            current_masks = []
-            current_len = 0
+        for start in tqdm(range(0, n_docs, seqs_per_file), desc="Writing", unit=" shards"):
+            end = min(start + seqs_per_file, n_docs)
+            output_path = get_path(file_index)
+            with TokenizedDataFileWriter(output_path, vocab_size, masking=True, non_overlapping=non_overlapping) as writer:
+                for i in range(start, end):
+                    tokens = all_tokens[i]
+                    mask = all_masks[i]
 
-        def write_padded_doc(tokens: np.ndarray, mask: np.ndarray):
-            """Write a single document with padding (no packing)."""
-            # Truncate if too long
-            if tokens.size > seq_len:
-                tokens = tokens[:seq_len]
-                mask = mask[:seq_len]
+                    # Truncate
+                    if tokens.size > seq_len:
+                        tokens = tokens[:seq_len]
+                        mask = mask[:seq_len]
 
-            actual_len = tokens.size
+                    actual_len = tokens.size
 
-            # Pad if too short
-            if tokens.size < seq_len:
-                pad_len = seq_len - tokens.size
-                tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
-                mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
+                    # Pad
+                    if tokens.size < seq_len:
+                        p = seq_len - tokens.size
+                        tokens = np.pad(tokens, (0, p), constant_values=pad_token_id)
+                        mask = np.pad(mask, (0, p), constant_values=0)
 
-            # Position IDs: 0..actual_len-1, then 0 for padding
-            pos_ids = np.zeros(seq_len, dtype=np.int32)
-            pos_ids[:actual_len] = np.arange(actual_len, dtype=np.int32)
+                    pos_ids = np.zeros(seq_len, dtype=np.int32)
+                    pos_ids[:actual_len] = np.arange(actual_len, dtype=np.int32)
+                    writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
 
-            current_writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
-
-        def start_new_file():
-            nonlocal current_writer, file_index
-            if current_writer is not None:
-                if packing:
-                    flush_to_writer()
-                current_writer.__exit__(None, None, None)
-                logger.info(f"Completed file {get_output_path(file_index - 1)} with {current_writer.n_tokens:,} tokens")
-
-            output_path = get_output_path(file_index)
-            current_writer = TokenizedDataFileWriter(output_path, vocab_size, masking=True, non_overlapping=non_overlapping)
-            current_writer.__enter__()
+                total_tokens += writer.n_tokens
+                logger.info(f"Completed file {output_path} with {writer.n_tokens:,} tokens")
             file_index += 1
 
-        # Start first file
-        start_new_file()
-
-        for doc in docs:
-            tokens = np.asarray(doc["tokens"], dtype=np.int32)
-            mask = np.asarray(doc["mask"], dtype=np.int32)
-
-            if tokens.ndim != 1 or mask.ndim != 1 or tokens.size != mask.size:
-                raise ValueError("doc tokens/mask must be 1D and same length")
-            if tokens.size == 0:
-                continue
-
-            if packing:
-                # Packing mode: combine multiple docs into sequences
-                # Check if we need to start a new file
-                if current_writer.n_tokens + current_len >= max_tokens_per_file:
-                    flush_to_writer()
-                    total_tokens += current_writer.n_tokens
-                    start_new_file()
-
-                # Handle documents longer than seq_len
-                if tokens.size > seq_len:
-                    flush_to_writer()
-                    current_writer.add_document(
-                        tokens=tokens[:seq_len],
-                        position_ids=np.arange(seq_len, dtype=np.int32),
-                        mask=mask[:seq_len]
-                    )
-                    continue
-
-                # Check if adding this doc would exceed seq_len
-                if current_len + tokens.size > seq_len:
-                    flush_to_writer()
-
-                current_tokens.append(tokens)
-                current_masks.append(mask)
-                current_len += tokens.size
-            else:
-                # Non-packing mode: each doc is padded individually
-                # Check if we need to start a new file (each padded doc is seq_len tokens)
-                if current_writer.n_tokens + seq_len > max_tokens_per_file:
-                    total_tokens += current_writer.n_tokens
-                    start_new_file()
-
-                write_padded_doc(tokens, mask)
-
-        # Flush remaining data
-        if packing:
-            flush_to_writer()
-        if current_writer is not None:
-            total_tokens += current_writer.n_tokens
-            current_writer.__exit__(None, None, None)
-            logger.info(f"Completed file {get_output_path(file_index - 1)} with {current_writer.n_tokens:,} tokens")
-
         logger.info(f"Multi-file write complete: {file_index} files, {total_tokens:,} total tokens")
-        return total_tokens
+
 
 
 def tokenize_main(config: SFTConfig, args: DictDefault):

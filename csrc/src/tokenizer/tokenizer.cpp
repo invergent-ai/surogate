@@ -7,7 +7,7 @@
 #include "bpe.h"
 #include "unicode.h"
 
-#include <minja/chat-template.hpp>
+#include <minja/minja.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -25,8 +25,11 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 
-// minja uses nlohmann::ordered_json as 'json'. We use the same alias to avoid conflicts.
-using json = nlohmann::ordered_json;
+// minja uses nlohmann::ordered_json as its 'json' type. We only use it for
+// template rendering (small objects). For parsing the large tokenizer.json
+// (10+ MB, 150k+ vocab entries) we use unordered nlohmann::json which is ~100x faster.
+using json = nlohmann::ordered_json;       // for minja interop
+using fast_json = nlohmann::json;          // for tokenizer.json parsing
 
 namespace tokenizer {
 
@@ -102,9 +105,11 @@ struct Tokenizer::Impl {
     std::unordered_map<Rank, std::vector<uint8_t>> decoder;      // rank -> byte_seq
     EncoderLookup* encoder_lookup = nullptr;                     // fast lookup (no alloc)
 
-    // Special tokens
-    std::unordered_map<std::string, Rank> special_tokens_encoder; // text -> id
-    std::unordered_map<Rank, std::string> special_tokens_decoder; // id -> text
+    // Added tokens (ALL added tokens — matched before pre-tokenization during encode)
+    std::unordered_map<std::string, Rank> added_tokens_encoder;  // text -> id
+    std::unordered_map<Rank, std::string> added_tokens_decoder;  // id -> text (plain-text decode, no byte-level)
+
+    // Special tokens (subset of added tokens with special=true)
     std::unordered_set<Rank> special_token_ids;
 
     // Pre-tokenizer regex patterns (from tokenizer.json)
@@ -132,10 +137,41 @@ struct Tokenizer::Impl {
     bool add_bos = false;
     bool add_eos = false;
 
-    // Chat template (Jinja2, rendered by minja)
-    std::unique_ptr<minja::chat_template> chat_tmpl;
+    // Chat template — raw Jinja AST (no capability probing overhead)
+    std::shared_ptr<minja::TemplateNode> chat_tmpl_root;
+    std::string bos_token_str;
+    std::string eos_token_str;
 
     ~Impl() { delete encoder_lookup; }
+
+    // Render the chat template with the given messages and options.
+    std::string render_chat_template(
+            const nlohmann::ordered_json& messages,
+            bool add_generation_prompt) const {
+        if (!chat_tmpl_root) {
+            throw std::runtime_error("No chat template loaded.");
+        }
+        auto context = minja::Context::make(json({
+            {"messages", messages},
+            {"add_generation_prompt", add_generation_prompt},
+        }));
+        context->set("bos_token", bos_token_str);
+        context->set("eos_token", eos_token_str);
+
+        auto now = std::chrono::system_clock::now();
+        context->set("strftime_now", minja::Value::callable(
+            [now](const std::shared_ptr<minja::Context>&, minja::ArgumentsValue& args) {
+                args.expectArgs("strftime_now", {1, 1}, {0, 0});
+                auto fmt = args.args[0].get<std::string>();
+                auto t = std::chrono::system_clock::to_time_t(now);
+                auto lt = *std::localtime(&t);
+                std::ostringstream ss;
+                ss << std::put_time(&lt, fmt.c_str());
+                return ss.str();
+            }));
+
+        return chat_tmpl_root->render(context);
+    }
 
     void build_lookup() {
         delete encoder_lookup;
@@ -175,24 +211,26 @@ struct Tokenizer::Impl {
         return result;
     }
 
-    // Encode with special token handling.
+    // Encode with added/special token handling.
+    // Splits text around all added tokens (both special=true and special=false),
+    // encodes the non-added-token parts with BPE, and emits added tokens as single IDs.
     std::vector<int32_t> encode_impl(const std::string& text, bool use_special) const {
-        if (!use_special || special_tokens_encoder.empty()) {
+        if (!use_special || added_tokens_encoder.empty()) {
             return encode_ordinary_impl(text);
         }
 
         std::vector<int32_t> result;
 
-        // Find all special token occurrences and split around them.
-        // Use a simple linear scan (special tokens are few and this is not the hot path).
+        // Find all added token occurrences and split around them.
+        // Use a simple linear scan (added tokens are few and this is not the hot path).
         size_t pos = 0;
         while (pos < text.size()) {
-            // Find the earliest special token from current position.
+            // Find the earliest added token from current position.
             size_t best_pos = std::string::npos;
             std::string best_token;
             Rank best_id = 0;
 
-            for (const auto& [token, id] : special_tokens_encoder) {
+            for (const auto& [token, id] : added_tokens_encoder) {
                 size_t found = text.find(token, pos);
                 if (found != std::string::npos && (found < best_pos || (found == best_pos && token.size() > best_token.size()))) {
                     best_pos = found;
@@ -202,19 +240,19 @@ struct Tokenizer::Impl {
             }
 
             if (best_pos == std::string::npos) {
-                // No more special tokens; encode the rest as ordinary.
+                // No more added tokens; encode the rest as ordinary.
                 auto tail = encode_ordinary_impl(text.substr(pos));
                 result.insert(result.end(), tail.begin(), tail.end());
                 break;
             }
 
-            // Encode text before the special token.
+            // Encode text before the added token.
             if (best_pos > pos) {
                 auto prefix = encode_ordinary_impl(text.substr(pos, best_pos - pos));
                 result.insert(result.end(), prefix.begin(), prefix.end());
             }
 
-            // Add the special token.
+            // Add the added token as a single ID.
             result.push_back(static_cast<int32_t>(best_id));
             pos = best_pos + best_token.size();
         }
@@ -241,11 +279,12 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         throw std::runtime_error(fmt::format("tokenizer.json not found in {}", model_dir));
     }
 
-    // Parse tokenizer.json
-    json data;
+    // Parse tokenizer.json using fast (unordered) JSON — ~100x faster than ordered_json
+    // for the 10+ MB file with 150k+ vocab entries.
+    fast_json data;
     {
         std::ifstream f(tokenizer_json_path);
-        data = json::parse(f);
+        data = fast_json::parse(f);
     }
 
     Tokenizer tok;
@@ -320,8 +359,8 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     std::string architecture;
     auto model_config_path = dir / "config.json";
     if (fs::exists(model_config_path)) {
-        json model_config;
-        { std::ifstream f(model_config_path); model_config = json::parse(f); }
+        fast_json model_config;
+        { std::ifstream f(model_config_path); model_config = fast_json::parse(f); }
         architecture = model_config.value("model_type", "");
     }
 
@@ -376,20 +415,24 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         }
     }
 
-    // ---- Added tokens (special tokens) ----
+    // ---- Added tokens ----
+    // ALL added tokens are matched before pre-tokenization during encode.
+    // Only special=true tokens are flagged in special_token_ids (for is_special_token()).
     if (data.contains("added_tokens") && data["added_tokens"].is_array()) {
         for (auto& tok_obj : data["added_tokens"]) {
             std::string content = tok_obj.at("content").get<std::string>();
             Rank id = tok_obj.at("id").get<Rank>();
             bool is_special = tok_obj.value("special", false);
 
+            // All added tokens get matched during encode and decoded as plain text.
+            impl.added_tokens_encoder[content] = id;
+            impl.added_tokens_decoder[id] = content;
+
             if (is_special) {
-                impl.special_tokens_encoder[content] = id;
-                impl.special_tokens_decoder[id] = content;
                 impl.special_token_ids.insert(id);
             }
 
-            // Also add to encoder/decoder if not already present
+            // Also add to BPE encoder/decoder if not already present.
             std::vector<uint8_t> bytes(content.begin(), content.end());
             if (impl.encoder.find(bytes) == impl.encoder.end()) {
                 impl.encoder[bytes] = id;
@@ -402,14 +445,14 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     // ---- Load tokenizer_config.json for extra metadata ----
     auto config_path = dir / "tokenizer_config.json";
     if (fs::exists(config_path)) {
-        json config;
+        fast_json config;
         {
             std::ifstream f(config_path);
-            config = json::parse(f);
+            config = fast_json::parse(f);
         }
 
         // BOS/EOS/PAD token resolution
-        auto resolve_token_id = [&](const json& config, const std::string& key) -> int32_t {
+        auto resolve_token_id = [&](const fast_json& config, const std::string& key) -> int32_t {
             if (!config.contains(key) || config[key].is_null()) return -1;
 
             std::string token_str;
@@ -424,9 +467,9 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
             // Store named special token
             impl.named_special_tokens[key] = token_str;
 
-            // Look up in special tokens first
-            auto it = impl.special_tokens_encoder.find(token_str);
-            if (it != impl.special_tokens_encoder.end()) {
+            // Look up in added tokens first
+            auto it = impl.added_tokens_encoder.find(token_str);
+            if (it != impl.added_tokens_encoder.end()) {
                 return static_cast<int32_t>(it->second);
             }
 
@@ -449,20 +492,32 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         impl.add_bos = config.value("add_bos_token", false);
         impl.add_eos = config.value("add_eos_token", false);
 
-        // Load chat template (Jinja2 string)
+        // Load chat template (Jinja2 string) — parse directly, skip capability probing
         if (config.contains("chat_template") && config["chat_template"].is_string()) {
             std::string tmpl_str = config["chat_template"].get<std::string>();
-            impl.chat_tmpl = std::make_unique<minja::chat_template>(tmpl_str, impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "", impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "");
+            impl.chat_tmpl_root = minja::Parser::parse(tmpl_str, {
+                /* .trim_blocks = */ true,
+                /* .lstrip_blocks = */ true,
+                /* .keep_trailing_newline = */ false,
+            });
+            impl.bos_token_str = impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
+            impl.eos_token_str = impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
         }
     }
 
     // If no chat template in tokenizer_config.json, check for chat_template.jinja file
-    if (!impl.chat_tmpl) {
+    if (!impl.chat_tmpl_root) {
         auto jinja_path = dir / "chat_template.jinja";
         if (fs::exists(jinja_path)) {
             std::ifstream f(jinja_path);
             std::string tmpl_str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            impl.chat_tmpl = std::make_unique<minja::chat_template>(tmpl_str, impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "", impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "");
+            impl.chat_tmpl_root = minja::Parser::parse(tmpl_str, {
+                /* .trim_blocks = */ true,
+                /* .lstrip_blocks = */ true,
+                /* .keep_trailing_newline = */ false,
+            });
+            impl.bos_token_str = impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
+            impl.eos_token_str = impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
         }
     }
 
@@ -549,9 +604,9 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     for (int32_t id : ids) {
         auto uid = static_cast<Rank>(id);
 
-        // Check special tokens first — these are plain text, not byte-level encoded
-        auto sit = impl_->special_tokens_decoder.find(uid);
-        if (sit != impl_->special_tokens_decoder.end()) {
+        // Check added tokens first — these are plain text, not byte-level encoded
+        auto sit = impl_->added_tokens_decoder.find(uid);
+        if (sit != impl_->added_tokens_decoder.end()) {
             flush_byte_level();
             result += sit->second;
             continue;
@@ -574,9 +629,9 @@ int32_t Tokenizer::encode_single_token(const std::string& token_bytes) const {
     if (it != impl_->encoder.end()) {
         return static_cast<int32_t>(it->second);
     }
-    // Check special tokens
-    auto sit = impl_->special_tokens_encoder.find(token_bytes);
-    if (sit != impl_->special_tokens_encoder.end()) {
+    // Check added tokens
+    auto sit = impl_->added_tokens_encoder.find(token_bytes);
+    if (sit != impl_->added_tokens_encoder.end()) {
         return static_cast<int32_t>(sit->second);
     }
     throw std::runtime_error(fmt::format("Token not found in vocabulary: '{}'", token_bytes));
@@ -585,8 +640,8 @@ int32_t Tokenizer::encode_single_token(const std::string& token_bytes) const {
 std::string Tokenizer::decode_single_token(int32_t id) const {
     auto uid = static_cast<Rank>(id);
 
-    auto sit = impl_->special_tokens_decoder.find(uid);
-    if (sit != impl_->special_tokens_decoder.end()) {
+    auto sit = impl_->added_tokens_decoder.find(uid);
+    if (sit != impl_->added_tokens_decoder.end()) {
         return sit->second;
     }
 
@@ -621,23 +676,13 @@ std::string Tokenizer::special_token(const std::string& name) const {
 std::string Tokenizer::apply_chat_template(
         const std::vector<ChatMessage>& messages,
         bool add_generation_prompt) const {
-    if (!impl_->chat_tmpl) {
-        throw std::runtime_error("No chat template loaded. Model directory must contain "
-                                 "chat_template in tokenizer_config.json or a chat_template.jinja file.");
-    }
-
     // Convert ChatMessage to nlohmann::ordered_json array
     nlohmann::ordered_json json_messages = nlohmann::ordered_json::array();
     for (const auto& msg : messages) {
         json_messages.push_back({{"role", msg.role}, {"content", msg.content}});
     }
 
-    minja::chat_template_inputs inputs;
-    inputs.messages = json_messages;
-    inputs.add_generation_prompt = add_generation_prompt;
-    inputs.now = std::chrono::system_clock::now();
-
-    return impl_->chat_tmpl->apply(inputs);
+    return impl_->render_chat_template(json_messages, add_generation_prompt);
 }
 
 std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(
@@ -645,6 +690,151 @@ std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(
         bool add_generation_prompt) const {
     std::string text = apply_chat_template(messages, add_generation_prompt);
     return encode_with_special_tokens(text);
+}
+
+// ============================================================================
+// Training-aware encoding with loss masking
+// ============================================================================
+
+TrainingEncoded Tokenizer::encode_for_training(
+        const std::vector<ChatMessage>& messages,
+        LossStrategy strategy) const {
+    TrainingEncoded result;
+    if (messages.empty()) return result;
+
+    if (!impl_->chat_tmpl_root) {
+        throw std::runtime_error("No chat template loaded. Required for encode_for_training().");
+    }
+
+    // Find where the user/assistant pairs start (skip leading system messages).
+    size_t first_non_system = 0;
+    while (first_non_system < messages.size() && messages[first_non_system].role == "system") {
+        first_non_system++;
+    }
+
+    // Count complete user-assistant rounds.
+    size_t num_pairs = 0;
+    for (size_t i = first_non_system; i + 1 < messages.size(); i += 2) {
+        num_pairs++;
+    }
+    if (num_pairs == 0) return result;
+
+    // Build segments via incremental template rendering.
+    // For each round we render twice:
+    //   1. Up to user_i  (gen_prompt=true)  → everything before assistant's content
+    //   2. Up to asst_i  (gen_prompt=false) → adds assistant's content + suffix
+    // The diff between consecutive renders gives us a cleanly separated segment
+    // that we can tag as trainable or not.
+    struct Segment {
+        std::string text;
+        bool trainable;
+    };
+    std::vector<Segment> segments;
+    segments.reserve(num_pairs * 2);
+
+    std::string prev_render;
+    size_t round_idx = 0;
+
+    for (size_t i = first_non_system; i + 1 < messages.size(); i += 2) {
+        round_idx++;
+        bool is_last_round = (round_idx == num_pairs);
+
+        // 1. Render up to user_i with gen_prompt=true → prefix/chrome segment
+        std::vector<ChatMessage> up_to_user(messages.begin(), messages.begin() + i + 1);
+        std::string render_with_user = apply_chat_template(up_to_user, /*add_generation_prompt=*/true);
+
+        if (render_with_user.size() > prev_render.size()) {
+            std::string chrome = render_with_user.substr(prev_render.size());
+            bool trainable = (strategy == LossStrategy::ALL);
+            segments.push_back({std::move(chrome), trainable});
+        }
+
+        // 2. Render up to asst_i with gen_prompt=false → response segment
+        std::vector<ChatMessage> up_to_asst(messages.begin(), messages.begin() + i + 2);
+        std::string render_with_asst = apply_chat_template(up_to_asst, /*add_generation_prompt=*/false);
+
+        if (render_with_asst.size() > render_with_user.size()) {
+            std::string response = render_with_asst.substr(render_with_user.size());
+            bool trainable = false;
+            switch (strategy) {
+                case LossStrategy::ALL:
+                case LossStrategy::DEFAULT:
+                    trainable = true;
+                    break;
+                case LossStrategy::LAST_ROUND:
+                    trainable = is_last_round;
+                    break;
+            }
+            segments.push_back({std::move(response), trainable});
+        }
+
+        prev_render = std::move(render_with_asst);
+    }
+
+    // Tokenize each segment and build input_ids / labels.
+    for (const auto& seg : segments) {
+        auto tokens = impl_->encode_impl(seg.text, /*use_special=*/true);
+        result.input_ids.insert(result.input_ids.end(), tokens.begin(), tokens.end());
+        if (seg.trainable) {
+            result.labels.insert(result.labels.end(), tokens.begin(), tokens.end());
+        } else {
+            result.labels.insert(result.labels.end(), tokens.size(), -100);
+        }
+    }
+
+    // Never compute loss on the first token.
+    if (!result.labels.empty()) {
+        result.labels[0] = -100;
+    }
+
+    return result;
+}
+
+// Thread-safe wrapper that catches exceptions per-example.
+static TrainingEncoded encode_for_training_safe(
+        const Tokenizer& tok,
+        const std::vector<ChatMessage>& messages,
+        LossStrategy strategy) {
+    try {
+        return tok.encode_for_training(messages, strategy);
+    } catch (...) {
+        return TrainingEncoded{};  // empty = skipped
+    }
+}
+
+std::vector<TrainingEncoded> Tokenizer::encode_for_training_batch(
+        const std::vector<std::vector<ChatMessage>>& batch,
+        LossStrategy strategy) const {
+    std::vector<TrainingEncoded> results(batch.size());
+
+    if (batch.size() > 1) {
+        unsigned num_threads = std::min(static_cast<unsigned>(batch.size()),
+                                        std::thread::hardware_concurrency());
+        if (num_threads < 2) num_threads = 1;
+
+        if (num_threads > 1) {
+            std::vector<std::thread> threads;
+            threads.reserve(num_threads);
+            std::atomic<size_t> next_idx{0};
+
+            for (unsigned t = 0; t < num_threads; t++) {
+                threads.emplace_back([&]() {
+                    while (true) {
+                        size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= batch.size()) break;
+                        results[i] = encode_for_training_safe(*this, batch[i], strategy);
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+            return results;
+        }
+    }
+
+    for (size_t i = 0; i < batch.size(); i++) {
+        results[i] = encode_for_training_safe(*this, batch[i], strategy);
+    }
+    return results;
 }
 
 } // namespace tokenizer
