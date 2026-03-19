@@ -151,6 +151,16 @@ FetchContent_Declare(
         EXCLUDE_FROM_ALL
 )
 
+# FlashInfer — header-only sampling kernels (OnlineSoftmax, SamplingFromProbs, TopK/TopP).
+# We only use the include/flashinfer/ headers; no build system invoked.
+FetchContent_Declare(
+        flashinfer
+        GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+        GIT_TAG v0.6.6
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL
+)
+
 find_package(CUDAToolkit COMPONENTS cuBLAS REQUIRED)
 
 FetchContent_MakeAvailable(json)
@@ -172,6 +182,13 @@ FetchContent_GetProperties(flash_attn)
 if(NOT flash_attn_POPULATED)
     FetchContent_Populate(flash_attn)
 endif()
+
+# Populate FlashInfer for header-only sampling kernels
+FetchContent_GetProperties(flashinfer)
+if(NOT flashinfer_POPULATED)
+    FetchContent_Populate(flashinfer)
+endif()
+set(FLASHINFER_INCLUDE_DIR ${flashinfer_SOURCE_DIR}/include)
 
 # Find libdw (elfutils) or libdwarf for stack traces with backward-cpp
 # libdw (from elfutils) is preferred, libdwarf is a fallback
@@ -370,6 +387,9 @@ target_sources(surogate-common PRIVATE
     src/runtime/lora/lora_optimizer_state.cpp
     src/runtime/lora/lora_utils.cpp
 
+    # Inference (autoregressive generation engine for GRPO)
+    src/runtime/infer/generation_engine.cpp
+
     # Tokenizer (native C++ BPE, loads HuggingFace tokenizer.json)
     src/tokenizer/tokenizer.cpp
     src/tokenizer/unicode.cpp
@@ -411,6 +431,10 @@ target_sources(surogate-common PRIVATE
     src/kernels/cudnn_att.cpp
     src/kernels/flash_attn_varlen.cpp
     src/kernels/flash_attn_scatter.cu
+    src/kernels/attention_decode.cpp
+    src/kernels/attention_decode_kernels.cu
+    src/kernels/attention_decode_fp8.cu
+    src/kernels/sampling.cu
     src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu
     src/kernels/mxfp4_dequant.cu
@@ -469,6 +493,11 @@ set(FLASH_ATTN_SOURCES
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim96_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim128_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim256_bf16_causal_sm80.cu
+    # Non-causal forward (used by decode attention — seqlen_q=1, no causal mask needed)
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim64_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim96_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim128_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim256_bf16_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_bwd_hdim64_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_bwd_hdim96_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_bwd_hdim128_bf16_causal_sm80.cu
@@ -495,7 +524,7 @@ target_link_libraries(surogate-common PRIVATE flash_attn ${CUFILE_LIBS} cudnn_fr
 target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt ${NVML_LIBS} nlohmann_json::nlohmann_json)
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
-target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/shims ${FLASH_ATTN_DIR}/src)
+target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/shims ${FLASH_ATTN_DIR}/src ${FLASHINFER_INCLUDE_DIR})
 target_include_directories(surogate-common PUBLIC src src/runtime src/third_party ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR} ${minja_SOURCE_DIR}/include)
 
 # backward-cpp for stack traces
@@ -594,6 +623,9 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/kernels/test-classifier.cu
             src/testing/kernels/test-grad-clip.cu
             src/testing/kernels/test-multi-tensor-norm.cu
+            src/testing/kernels/test-attention-decode.cu
+            src/testing/kernels/test-sampling.cu
+            src/testing/kernels/test-attention-decode-fp8.cu
 
 
             # Quantization

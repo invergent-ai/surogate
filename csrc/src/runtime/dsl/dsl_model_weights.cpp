@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "runtime/dsl/dsl_model_internal.h"
+#include "runtime/dsl/graph_executor.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/graph_executor.h"
@@ -898,6 +899,10 @@ IRunState& DslModel::get_run_state() const {
         throw std::logic_error("DslModel::get_run_state() called before allocate_run_state()");
     }
     return *mRunState;
+}
+
+GraphExecutor* DslModel::graph_executor() {
+    return dynamic_cast<GraphExecutor*>(mExecutor.get());
 }
 
 bool DslModel::is_weight_streaming_enabled() const {

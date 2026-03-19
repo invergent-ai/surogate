@@ -23,6 +23,68 @@
 namespace dsl {
 
 void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
+    // Prefill mode: skip LM head entirely — we only need KV-cache populated.
+    // Must check BEFORE resolving tensors (which may trigger dtype assertions
+    // when the graph was recompiled for a different B*T).
+    // Early exits for generation modes (must be before tensor resolution
+    // which can trigger dtype assertions when recompiled for different B*T).
+    if (mDecodeState && mDecodeState->prefill_mode) {
+        return;  // Prefill: skip LM head — we only need KV-cache populated
+    }
+
+    if (mDecodeState && mDecodeState->logits_out_gpu != nullptr) {
+        // Decode: compute logits for sampling, skip loss.
+        // Only resolve the tensors we actually need (xF_flat and weight).
+        Tensor& xF_flat = resolve_tensor(op.inputs[0]);
+        Tensor& weight = resolve_tensor(op.inputs[1]);
+
+        const long BT = xF_flat.Sizes[0];
+        const int V = static_cast<int>(weight.Sizes[0]);
+        const int C = static_cast<int>(weight.Sizes[1]);
+
+        const bool need_lm_head =
+            mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled());
+        if (need_lm_head && mComm) {
+            mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
+        }
+
+        Tensor logits = mRunState.non_block_activations().output;
+        logits.Sizes[0] = BT;
+        logits.Sizes[1] = V;
+        logits.Rank = 2;
+
+        matmul(logits, weight, xF_flat,
+               std::nullopt, nullptr, nullptr,
+               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+               V, static_cast<int>(BT), C,
+               swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        // Copy logits to the FP32 output buffer.
+        // The matmul output tensor might be BF16 (from non_block_activations).
+        // The matmul with BF16 inputs produces BF16 output in the logits tensor.
+        // We need to convert BF16→FP32 for sampling kernels.
+        if (logits.DType == ETensorDType::BF16) {
+            convert_dtype(mDecodeState->logits_out_gpu,
+                          logits.get<nv_bfloat16>(),
+                          static_cast<long>(BT) * V,
+                          mRunState.MainStream);
+        } else {
+            // Already FP32 — just copy
+            if (mDecodeState->logits_out_gpu != logits.get<float>()) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    mDecodeState->logits_out_gpu, logits.Data,
+                    static_cast<std::size_t>(BT) * V * sizeof(float),
+                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        }
+
+        if (need_lm_head) {
+            mWeightManager->release_lm_head(mRunState.MainStream);
+        }
+        return;
+    }
+
+    // Normal training path: resolve all tensors including targets and loss
     Tensor& xF_flat = resolve_tensor(op.inputs[0]);
     Tensor& weight = resolve_tensor(op.inputs[1]);
     Tensor& targets = resolve_tensor(op.inputs[2]);

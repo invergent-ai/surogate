@@ -33,6 +33,7 @@
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/jit/gated_delta_rule_kernels.h"
+#include "runtime/infer/decode_state.h"
 
 namespace modules {
 struct ModelConfig;
@@ -124,6 +125,11 @@ public:
     void set_inv_temperature_context(const float* inv_temperature_gpu) {
         mInvTemperatureGpu = inv_temperature_gpu;
     }
+
+    /// Set decode mode state for autoregressive generation with KV-cache.
+    /// When non-null, dispatch_rope appends K/V to the cache, and
+    /// dispatch_flash_attention uses decode attention (Q attends to KV-cache).
+    void set_decode_state(infer::DecodeState* state) { mDecodeState = state; }
 
     /// Set the GPU buffer containing per-token custom d_loss values for GRPO backward.
     /// When non-null, dispatch_fused_lm_head_loss_backward copies these values into
@@ -358,6 +364,13 @@ private:
     int mNumDocs = 0;
     int mMaxDocSeqlen = 0;
     int mTotalDocTokens = 0;
+
+    // ========================================================================
+    // Decode mode (autoregressive generation with KV-cache)
+    // ========================================================================
+    // When non-null, dispatch_rope appends K/V to this cache, and
+    // dispatch_flash_attention uses decode attention (Q attends to KV-cache).
+    infer::DecodeState* mDecodeState = nullptr;
 
     // Optional components
     const modules::ModularLoRAConfig* mLoRAConfig = nullptr;

@@ -326,6 +326,11 @@ void GraphExecutor::reset_cuda_graphs() {
     }
     // Reset per-layer graphs in run state
     mRunState.reset_cuda_graphs();
+    // Reset decode graph
+    if (mDecodeGraphExec) {
+        (void)cudaGraphExecDestroy(mDecodeGraphExec);
+        mDecodeGraphExec = nullptr;
+    }
     // Reset split-attention segment graphs
     if (mCompiledExecutor) {
         mCompiledExecutor->reset_segment_graphs();
@@ -1699,6 +1704,137 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
         mCompiledExecutor->set_inv_temperature_context(nullptr);
         CUDA_CHECK(cudaFree(inv_temperature_gpu));
     }
+    mCompiledExecutor->set_save_list(&mSaveList);
+}
+
+// ============================================================================
+// Prefill (full-sequence forward, populates KV-cache)
+// ============================================================================
+
+void GraphExecutor::execute_prefill(long B, long T,
+                                     const std::int32_t* token_ids_cpu,
+                                     const std::int32_t* position_ids_cpu,
+                                     infer::DecodeState& decode_state,
+                                     NCCLCommunicator& comm,
+                                     const modules::ForwardHook* hook)
+{
+    if (!mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiled executor not initialized");
+    }
+
+    compile_graphs(B, T);
+    if (!mCompiledForward) {
+        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
+    }
+
+    DslRunState& rs = mRunState;
+    const std::size_t token_bytes = static_cast<std::size_t>(B * T) * sizeof(std::int32_t);
+
+    // Copy token IDs and position IDs to device
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_cpu, token_bytes,
+                               cudaMemcpyHostToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_cpu, token_bytes,
+                               cudaMemcpyHostToDevice, rs.MainStream));
+
+    // Initialize targets to -100 (masked) so fused_lm_head_loss produces zero loss.
+    if (rs.Targets.Data) {
+        CUDA_CHECK(cudaMemsetAsync(rs.Targets.Data, 0xFF,
+                                   static_cast<std::size_t>(B * T) * sizeof(std::int32_t),
+                                   rs.MainStream));  // 0xFFFFFFFF = -1 as int32, close to -100
+        // Actually fill with -100 properly
+        std::vector<std::int32_t> targets_fill(static_cast<std::size_t>(B * T), -100);
+        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_fill.data(),
+                                   static_cast<std::size_t>(B * T) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, rs.MainStream));
+    }
+
+    // Zero loss/metrics buffers
+    if (rs.Losses.Data) fill_zero(rs.Losses, rs.MainStream);
+    if (rs.ValidTokenCount.Data) fill_zero(rs.ValidTokenCount, rs.MainStream);
+    if (rs.CorrectCount.Data) fill_zero(rs.CorrectCount, rs.MainStream);
+
+    // Set prefill mode: dispatch_rope writes K/V to cache, flash_attention runs normally.
+    // Disable logits extraction during prefill — we only need the KV-cache populated.
+    decode_state.prefill_mode = true;
+    float* saved_logits = decode_state.logits_out_gpu;
+    decode_state.logits_out_gpu = nullptr;
+    mCompiledExecutor->set_decode_state(&decode_state);
+    mCompiledExecutor->set_dimensions(B, T);
+
+    static const std::vector<std::string> empty_save_list;
+    mCompiledExecutor->set_save_list(&empty_save_list);
+
+    mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, hook);
+
+    // Restore state
+    decode_state.prefill_mode = false;
+    decode_state.logits_out_gpu = saved_logits;
+    mCompiledExecutor->set_decode_state(nullptr);
+    mCompiledExecutor->set_save_list(&mSaveList);
+}
+
+// ============================================================================
+// Decode step (single-token forward with KV-cache)
+// ============================================================================
+
+void GraphExecutor::execute_decode_step(long B,
+                                         const std::int32_t* token_ids_gpu,
+                                         const std::int32_t* position_ids_gpu,
+                                         infer::DecodeState& decode_state,
+                                         NCCLCommunicator& comm,
+                                         const modules::ForwardHook* hook,
+                                         bool use_cuda_graph)
+{
+    if (!mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiled executor not initialized");
+    }
+
+    const long T = 1;
+    compile_graphs(B, T);
+    if (!mCompiledForward) {
+        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
+    }
+
+    DslRunState& rs = mRunState;
+
+    // Copy inputs to device (these write to fixed addresses read by the graph)
+    const std::size_t token_bytes = static_cast<std::size_t>(B) * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_gpu, token_bytes,
+                               cudaMemcpyDeviceToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_gpu, token_bytes,
+                               cudaMemcpyDeviceToDevice, rs.MainStream));
+
+    // Set decode mode
+    mCompiledExecutor->set_decode_state(&decode_state);
+    mCompiledExecutor->set_dimensions(B, T);
+    static const std::vector<std::string> empty_save_list;
+    mCompiledExecutor->set_save_list(&empty_save_list);
+
+    if (use_cuda_graph) {
+        // Invalidate cached graph if batch size changed
+        if (mDecodeGraphExec && mDecodeGraphB != B) {
+            CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
+            mDecodeGraphExec = nullptr;
+        }
+
+        // CUDA graph capture/replay using the existing stack checkpoint pattern
+        trace_or_execute_cuda_graph_with_stack(
+            [&]() {
+                mCompiledExecutor->execute_forward(
+                    *mCompiledForward, comm, /*full=*/false, hook);
+            },
+            rs.MainStream,
+            mDecodeGraphExec,
+            /*enabled=*/true,
+            rs.Stack,
+            mDecodeGraphCheckpoint);
+        mDecodeGraphB = B;
+    } else {
+        mCompiledExecutor->execute_forward(
+            *mCompiledForward, comm, /*full=*/false, hook);
+    }
+
+    mCompiledExecutor->set_decode_state(nullptr);
     mCompiledExecutor->set_save_list(&mSaveList);
 }
 

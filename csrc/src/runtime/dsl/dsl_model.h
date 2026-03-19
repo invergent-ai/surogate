@@ -37,6 +37,7 @@ struct HfMapping;
 namespace dsl {
 
 class IGraphExecutor;
+class GraphExecutor;
 class DslParamStore;
 class DslGradStore;
 class DslRunState;
@@ -258,6 +259,12 @@ public:
 
     std::string_view model_type() const override;
     IRunState& get_run_state() const override;
+
+    /// Accessors for native generation (Phase 5 memory overlay).
+    DslRunState& dsl_run_state() { return *mRunState; }
+    DslParamStore& param_store() { return *mParams; }
+    GraphExecutor* graph_executor();
+    const modules::ModelConfig& model_config() const { return mModelConfig; }
 
     // Type alias for backward compatibility — canonical definition is dsl::MappingSpec.
     using MappingSpec = ::dsl::MappingSpec;

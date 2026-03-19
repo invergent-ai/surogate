@@ -138,6 +138,27 @@ public:
     // Inputs/targets/position_ids are reused from forward_for_grpo (already in GPU buffers).
     void backward_grpo(const float* per_token_grads);
 
+    // Native generation: generate M×N completions using the trainer's own model and arena.
+    // Replaces vLLM inference for GRPO. Uses the model's DeviceMemoryStack as the arena
+    // for KV-cache (time-multiplexed with training activations).
+    //
+    // prompts: [M][prompt_len] token IDs (ragged)
+    // Returns per-sequence: {tokens, logprobs, prompt_len, completion_len}
+    struct GenerationResult {
+        std::vector<std::vector<int32_t>> tokens;       // [M*N] prompt + completion tokens
+        std::vector<std::vector<float>> logprobs;        // [M*N] per-completion-token logprobs
+        std::vector<int> prompt_lens;                    // [M*N]
+        std::vector<int> completion_lens;                // [M*N]
+    };
+    GenerationResult generate(
+        const std::vector<std::vector<int32_t>>& prompts,
+        int num_completions,
+        int max_gen_len,
+        float temperature,
+        int eos_token_id,
+        bool use_lora,
+        bool use_cuda_graphs = false);
+
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
     RuntimeOptions mOptions;

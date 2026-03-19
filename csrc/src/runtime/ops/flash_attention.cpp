@@ -20,6 +20,7 @@
 #include "runtime/dsl/graph_executor_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "kernels/attention_decode.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
@@ -46,6 +47,156 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     if (layer_idx < 0 && !op.inputs.empty()) {
         std::string field;
         parse_block_param(op.inputs[0].name, layer_idx, field);
+    }
+
+    // -----------------------------------------------------------------------
+    // Decode path: Q attends to KV-cache (autoregressive generation)
+    // -----------------------------------------------------------------------
+    // Prefill mode: normal self-attention (no decode interception).
+    // KV-cache is populated by dispatch_rope; attention computes over full prompt.
+
+    // Decode mode: intercept attention to use KV-cache
+    if (mDecodeState && !mDecodeState->prefill_mode && mT == 1 && layer_idx >= 0) {
+        const int ds_batch = static_cast<int>(mB);
+
+        // Extract Q from interleaved QKV [B, 1, (Hq+2Hkv), Hs] → [B, Hq, Hs]
+        Tensor q_buf = mRunState.temp_alloc(ETensorDType::BF16,
+            {static_cast<long>(ds_batch), static_cast<long>(Hq), static_cast<long>(Hs)}, "decode_q");
+        mTemps.push_back(q_buf);
+        const auto* qkv_bf16 = qkv.get<nv_bfloat16>();
+        auto* q_bf16 = q_buf.get<nv_bfloat16>();
+        for (int b = 0; b < ds_batch; ++b) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                q_bf16 + static_cast<std::size_t>(b) * Hq * Hs,
+                qkv_bf16 + static_cast<std::size_t>(b) * H * Hs,
+                static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
+                cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+
+        if (mDecodeState->paged) {
+            const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
+            const std::size_t layer_pool_bytes =
+                static_cast<std::size_t>(mDecodeState->total_pages)
+                * mDecodeState->page_block_size * Hkv * Hs * elem_size;
+            const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
+
+            if (mDecodeState->fp8) {
+                // FP8 paged: dequant to temp BF16 buffer, then run BF16 paged attention.
+                // Temp buffer: [B, max_seqlen_k, Hkv, Hs] BF16
+                const int msk = mDecodeState->max_seqlen_k;
+                Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                    {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_k");
+                Tensor v_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                    {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_v");
+                mTemps.push_back(k_tmp);
+                mTemps.push_back(v_tmp);
+
+                const std::size_t scale_layer_elems =
+                    static_cast<std::size_t>(mDecodeState->total_pages)
+                    * mDecodeState->page_block_size * Hkv;
+                const std::size_t scale_layer_offset = static_cast<std::size_t>(layer_idx) * scale_layer_elems;
+
+                kv_cache_dequant_paged_fp8_to_bf16(
+                    k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                    reinterpret_cast<const __nv_fp8_e4m3*>(
+                        reinterpret_cast<const std::byte*>(mDecodeState->k_pages) + layer_offset),
+                    reinterpret_cast<const __nv_fp8_e4m3*>(
+                        reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset),
+                    mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                    mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
+                    mDecodeState->seq_lens_gpu,
+                    mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                    mDecodeState->page_block_size,
+                    ds_batch, msk, Hkv, Hs,
+                    mRunState.MainStream);
+
+                // Run BF16 contiguous attention on dequantized buffer
+                attention_decode_flash(
+                    out.get<nv_bfloat16>(), lse.get<float>(),
+                    q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                    mDecodeState->cu_seqlens_q_gpu,
+                    mDecodeState->cu_seqlens_k_gpu,
+                    msk, ds_batch, Hq, Hkv, Hs,
+                    mRunState.MainStream);
+            } else {
+                // BF16 paged: direct paged attention
+                auto* k_pool_layer = reinterpret_cast<nv_bfloat16*>(
+                    reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+                auto* v_pool_layer = reinterpret_cast<nv_bfloat16*>(
+                    reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+
+                attention_decode_flash_paged(
+                    out.get<nv_bfloat16>(), lse.get<float>(),
+                    q_bf16, k_pool_layer, v_pool_layer,
+                    mDecodeState->cu_seqlens_q_gpu,
+                    mDecodeState->cu_seqlens_k_gpu,
+                    mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                    mDecodeState->page_block_size,
+                    mDecodeState->max_seqlen_k,
+                    ds_batch, Hq, Hkv, Hs,
+                    mRunState.MainStream);
+            }
+        } else {
+            // Contiguous KV-cache
+            const int ds_max_seq = mDecodeState->max_seq_len;
+
+            if (mDecodeState->fp8) {
+                // FP8 contiguous: dequant to temp BF16 buffer, then contiguous attention
+                const int msk = mDecodeState->max_seqlen_k;
+                Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                    {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_k");
+                Tensor v_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                    {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_v");
+                mTemps.push_back(k_tmp);
+                mTemps.push_back(v_tmp);
+
+                const std::size_t layer_stride_fp8 =
+                    static_cast<std::size_t>(ds_batch) * ds_max_seq * Hkv * Hs * 1;  // 1 byte per FP8
+                const std::size_t layer_offset_fp8 = static_cast<std::size_t>(layer_idx) * layer_stride_fp8;
+                const std::size_t scale_layer_elems =
+                    static_cast<std::size_t>(ds_batch) * ds_max_seq * Hkv;
+                const std::size_t scale_layer_offset = static_cast<std::size_t>(layer_idx) * scale_layer_elems;
+
+                kv_cache_dequant_fp8_to_bf16(
+                    k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                    reinterpret_cast<const __nv_fp8_e4m3*>(
+                        reinterpret_cast<const std::byte*>(mDecodeState->k_data) + layer_offset_fp8),
+                    reinterpret_cast<const __nv_fp8_e4m3*>(
+                        reinterpret_cast<const std::byte*>(mDecodeState->v_data) + layer_offset_fp8),
+                    mDecodeState->k_scales_fp8 + scale_layer_offset,
+                    mDecodeState->v_scales_fp8 + scale_layer_offset,
+                    mDecodeState->seq_lens_gpu,
+                    ds_batch, ds_max_seq, Hkv, Hs,
+                    mRunState.MainStream);
+
+                attention_decode_flash(
+                    out.get<nv_bfloat16>(), lse.get<float>(),
+                    q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                    mDecodeState->cu_seqlens_q_gpu,
+                    mDecodeState->cu_seqlens_k_gpu,
+                    msk, ds_batch, Hq, Hkv, Hs,
+                    mRunState.MainStream);
+            } else {
+                const std::size_t layer_stride_bytes =
+                    static_cast<std::size_t>(ds_batch) * ds_max_seq * Hkv * Hs * sizeof(nv_bfloat16);
+                const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_stride_bytes;
+
+                auto* k_layer = reinterpret_cast<nv_bfloat16*>(
+                    reinterpret_cast<std::byte*>(mDecodeState->k_data) + layer_offset);
+                auto* v_layer = reinterpret_cast<nv_bfloat16*>(
+                    reinterpret_cast<std::byte*>(mDecodeState->v_data) + layer_offset);
+
+                attention_decode_flash(
+                    out.get<nv_bfloat16>(), lse.get<float>(),
+                    q_bf16, k_layer, v_layer,
+                    mDecodeState->cu_seqlens_q_gpu,
+                    mDecodeState->cu_seqlens_k_gpu,
+                    mDecodeState->max_seqlen_k,
+                    ds_batch, Hq, Hkv, Hs,
+                    mRunState.MainStream);
+            }
+        }
+        return;
     }
 
     // -----------------------------------------------------------------------

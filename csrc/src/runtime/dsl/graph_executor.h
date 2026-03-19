@@ -20,6 +20,7 @@
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
+#include "runtime/infer/decode_state.h"
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 
@@ -205,6 +206,45 @@ public:
                                      const modules::BackwardHook* hook,
                                      const float* temperatures_cpu = nullptr);
 
+    /// Execute a full-sequence prefill forward, populating the KV-cache.
+    ///
+    /// Runs the compiled forward graph with B sequences and T=prompt_len.
+    /// The DecodeState's prefill_mode flag causes dispatch_rope to bulk-store
+    /// K/V into the KV-cache, while self-attention runs normally (no decode interception).
+    /// The fused LM head writes logits to DecodeState::logits_out_gpu if set.
+    ///
+    /// After this call, the KV-cache contains entries for positions [0, T) per batch item.
+    void execute_prefill(long B, long T,
+                         const std::int32_t* token_ids_cpu,
+                         const std::int32_t* position_ids_cpu,
+                         infer::DecodeState& decode_state,
+                         NCCLCommunicator& comm,
+                         const modules::ForwardHook* hook = nullptr);
+
+    /// Execute a single-token decode step with KV-cache.
+    ///
+    /// Runs the compiled forward graph with B sequences and T=1,
+    /// using the provided DecodeState for KV-cache read/write.
+    /// After this call, the logits for the next token are in the
+    /// run state's activation buffers (accessible via the compiled executor).
+    ///
+    /// @param B           Batch size (number of sequences).
+    /// @param token_ids   [B] last token IDs on GPU (int32).
+    /// @param position_ids [B] position IDs on GPU (int32).
+    /// @param decode_state KV-cache and decode tracking state.
+    /// @param comm        NCCL communicator (for DP gradient sync — unused in decode).
+    /// @param hook        Optional LoRA forward hook.
+    /// @param use_cuda_graph  If true, capture the first call and replay on subsequent calls.
+    ///                        Requires fixed batch size across calls. Input buffers (token_ids,
+    ///                        position_ids) must be at stable GPU addresses updated in-place.
+    void execute_decode_step(long B,
+                             const std::int32_t* token_ids_gpu,
+                             const std::int32_t* position_ids_gpu,
+                             infer::DecodeState& decode_state,
+                             NCCLCommunicator& comm,
+                             const modules::ForwardHook* hook = nullptr,
+                             bool use_cuda_graph = false);
+
     /// Estimate the peak stack usage during backward execution.
     ///
     /// Compiles the backward graph (if not already compiled) and walks its ops to
@@ -353,6 +393,13 @@ private:
 
     // Per-layer CUDA graph execution (more granular than whole-graph capture)
     bool mPerLayerGraphsEnabled = false;
+
+    // ========================================================================
+    // Decode CUDA graph capture (Phase 4)
+    // ========================================================================
+    cudaGraphExec_t mDecodeGraphExec = nullptr;
+    DeviceMemoryStack::Checkpoint mDecodeGraphCheckpoint{};
+    long mDecodeGraphB = 0;
 
     // ========================================================================
     // Compiled execution (operations pre-compiled into direct function calls)

@@ -28,6 +28,10 @@
 #include "runtime/core/model_factory.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dsl_run_state.h"
+#include "runtime/dsl/dsl_param_store.h"
+#include "runtime/dsl/graph_executor.h"
+#include "runtime/infer/generation_engine.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/optimizers/normuon.h"
@@ -1709,6 +1713,78 @@ void MultiGPUPyTrainer::backward_grpo(const float* per_token_grads) {
     });
 
     ++mTrainMicroStep;
+}
+
+MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
+        const std::vector<std::vector<int32_t>>& prompts,
+        int num_completions,
+        int max_gen_len,
+        float temperature,
+        int eos_token_id,
+        bool use_lora,
+        bool use_cuda_graphs) {
+
+    // Run generation on GPU 0 only (DP — each GPU generates independently)
+    GenerationResult result;
+
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("generate: model is not a DslModel");
+        }
+
+        auto* graph_exec = dsl_model->graph_executor();
+        if (!graph_exec) {
+            throw std::runtime_error("generate: model has no GraphExecutor");
+        }
+
+        auto& run_state = dsl_model->dsl_run_state();
+        auto& params = dsl_model->param_store();
+        const auto& model_config = dsl_model->model_config();
+
+        // Build generation config
+        infer::GenerationEngineConfig gen_config{};
+        gen_config.max_gen_len = max_gen_len;
+        gen_config.temperature = temperature;
+        gen_config.eos_token_id = eos_token_id;
+        gen_config.num_completions = num_completions;
+        gen_config.use_cuda_graphs = use_cuda_graphs;
+
+        // Create generation engine using the model's own stack as the arena.
+        // The stack is shared with training — generation allocates from it,
+        // and restores the checkpoint at the end (memory overlay).
+        infer::GenerationEngine engine(run_state, params, model_config, mOptions);
+
+        // Build LoRA forward hook if requested
+        const modules::ForwardHook* hook_ptr = nullptr;
+        // TODO: wire LoRA hook from DslModel for use_lora=true
+
+        // Generate using the model's stack as arena
+        std::vector<infer::Trajectory> trajectories;
+        if (num_completions > 1) {
+            trajectories = engine.generate_grpo(
+                prompts, gen_config, run_state.Stack,
+                *graph_exec, *ctx.Communicator, hook_ptr);
+        } else {
+            trajectories = engine.generate(
+                prompts, gen_config, run_state.Stack,
+                *graph_exec, *ctx.Communicator, hook_ptr);
+        }
+
+        // Convert trajectories to result
+        result.tokens.resize(trajectories.size());
+        result.logprobs.resize(trajectories.size());
+        result.prompt_lens.resize(trajectories.size());
+        result.completion_lens.resize(trajectories.size());
+        for (std::size_t i = 0; i < trajectories.size(); ++i) {
+            result.tokens[i] = std::move(trajectories[i].tokens);
+            result.logprobs[i] = std::move(trajectories[i].logprobs);
+            result.prompt_lens[i] = trajectories[i].prompt_len;
+            result.completion_lens[i] = trajectories[i].completion_len;
+        }
+    }, /*gpu_id=*/0);
+
+    return result;
 }
 
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {

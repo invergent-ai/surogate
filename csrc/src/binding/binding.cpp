@@ -1352,6 +1352,32 @@ NB_MODULE(_surogate, m) {
         nb::arg("per_token_grads"),
         nb::arg("position_ids") = nb::none(),
         "GRPO backward pass using activations saved by forward_for_grpo().")
+        .def("generate", [](MultiGPUPyTrainer* trainer,
+                const std::vector<std::vector<int32_t>>& prompts,
+                int num_completions,
+                int max_gen_len,
+                float temperature,
+                int eos_token_id,
+                bool use_lora,
+                bool use_cuda_graphs) {
+            auto result = trainer->generate(
+                prompts, num_completions, max_gen_len, temperature,
+                eos_token_id, use_lora, use_cuda_graphs);
+            return nb::make_tuple(
+                result.tokens, result.logprobs,
+                result.prompt_lens, result.completion_lens);
+        },
+        nb::arg("prompts"),
+        nb::arg("num_completions") = 1,
+        nb::arg("max_gen_len") = 512,
+        nb::arg("temperature") = 1.0f,
+        nb::arg("eos_token_id") = 2,
+        nb::arg("use_lora") = true,
+        nb::arg("use_cuda_graphs") = false,
+        "Native generation: generate M×N completions using the trainer's model.\n\n"
+        "Uses the model's DeviceMemoryStack as the arena for KV-cache,\n"
+        "time-multiplexed with training activations (memory overlay).\n\n"
+        "Returns (tokens, logprobs, prompt_lens, completion_lens) — all lists of length M*N.")
         .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),
              "Set the gradient accumulation step count for the next training step.\n\n"
              "Call this before the first step_with_custom_loss() of each optimizer step\n"
