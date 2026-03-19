@@ -2858,6 +2858,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
     mCurrentLayer = -1;
+    mSegmentDispatchedUntil = 0;
 
     // Match GraphExecutor behavior: initialize loss/counter buffers for full forward runs.
     // This avoids stale accumulation when tests call CompiledExecutor directly.
@@ -3387,6 +3388,116 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 layer_active[static_cast<std::size_t>(op.layer_start)] = 1;
             }
             handle_layer_start(op.layer_start);
+
+            // Split-attention graph mode: pre-dispatch all layer ops via segments.
+            // Non-attention segments are captured/replayed as CUDA graphs;
+            // graph-breaking ops run eagerly. The normal loop still iterates
+            // through these ops for layer_end handling, tensor persistence, and
+            // pruning — but skips the per-op dispatch (already done here).
+            if (mSplitAttentionGraphs &&
+                !graph.layer_segments.empty() &&
+                static_cast<std::size_t>(op.layer_start) < graph.layer_segments.size() &&
+                !graph.layer_segments[static_cast<std::size_t>(op.layer_start)].empty()) {
+                const int L = op.layer_start;
+                const auto& segs = graph.layer_segments[static_cast<std::size_t>(L)];
+                for (std::size_t s = 0; s < segs.size(); ++s) {
+                    const auto& seg = segs[s];
+                    if (seg.eager) {
+                        // Check if this eager segment matches an MLP tile group.
+                        // compute_layer_segments emits these as single eager segments.
+                        const MlpTileGroup* tile_group = nullptr;
+                        for (const auto& tg : graph.mlp_tile_groups) {
+                            if (tg.start_op_idx == seg.start_op) {
+                                tile_group = &tg;
+                                break;
+                            }
+                        }
+                        if (tile_group) {
+                            execute_tiled_mlp(graph, *tile_group, mB, mT, hook);
+                        } else {
+                            for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                dispatch_forward_op(graph.ops[i], hook);
+                            }
+                        }
+                    } else {
+                        auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
+                        const bool is_capture = (sg.exec == nullptr);
+                        // Track mSaved entries before segment to detect new ones
+                        std::size_t saved_before = mSaved ? mSaved->size() : 0;
+                        auto run = [&]() {
+                            for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                dispatch_forward_op(graph.ops[i], hook);
+                            }
+                        };
+                        trace_or_execute_cuda_graph_with_stack(
+                            run, mRunState.MainStream, sg.exec, true,
+                            mRunState.Stack, sg.checkpoint);
+                        if (is_capture) {
+                            // Save post-dispatch stack state. On replay,
+                            // trace_or_execute restores to sg.checkpoint (pre-alloc)
+                            // before launching the graph. We must then advance
+                            // past the graph's stack allocations so the next
+                            // segment doesn't overlap.
+                            sg.post_checkpoint = mRunState.Stack.checkpoint();
+
+                            // Snapshot all tensor entries after capture. On replay
+                            // dispatch doesn't run so mTensors/mNamedTensors/mSaved
+                            // wouldn't be populated.
+                            sg.tensor_snapshot.clear();
+                            sg.named_snapshot.clear();
+                            sg.saved_snapshot.clear();
+                            for (int tid = 0; tid < static_cast<int>(mTensors.size()); ++tid) {
+                                if (mTensors[tid].Data) {
+                                    sg.tensor_snapshot.emplace_back(tid, mTensors[tid]);
+                                }
+                            }
+                            for (const auto& [name, t] : mNamedTensors) {
+                                if (t.Data) {
+                                    sg.named_snapshot.emplace_back(name, t);
+                                }
+                            }
+                            // Snapshot mSaved entries added by dispatch (e.g.
+                            // MambaGatedRMSNorm writes rstd directly to mSaved)
+                            if (mSaved && mSaved->size() > saved_before) {
+                                for (const auto& [name, t] : *mSaved) {
+                                    sg.saved_snapshot.emplace_back(name, t);
+                                }
+                            }
+                        } else {
+                            // Advance stack past graph's allocations so the next
+                            // segment (eager attention) doesn't overlap.
+                            mRunState.Stack.restore(sg.post_checkpoint);
+
+                            // Restore tensor/saved entries from capture snapshot
+                            for (const auto& [tid, t] : sg.tensor_snapshot) {
+                                if (static_cast<std::size_t>(tid) < mTensors.size()) {
+                                    mTensors[tid] = t;
+                                }
+                            }
+                            for (const auto& [name, t] : sg.named_snapshot) {
+                                mNamedTensors[name] = t;
+                            }
+                            if (mSaved) {
+                                for (const auto& [name, t] : sg.saved_snapshot) {
+                                    if (mSaved->find(name) == mSaved->end()) {
+                                        (*mSaved)[name] = t;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Mark: layer ops already dispatched. The normal loop will still
+                // iterate through them for layer_end handling but skip dispatch.
+                mSegmentDispatchedUntil = graph.layer_end_indices[static_cast<std::size_t>(L)];
+            }
+        }
+
+        // Skip dispatch for ops already handled by split-attention segment execution.
+        // The normal loop still runs for these ops to handle layer_end boundaries,
+        // tensor persistence, pruning, etc.
+        if (idx < mSegmentDispatchedUntil) {
+            goto skip_dispatch;
         }
 
         try {
@@ -3618,6 +3729,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 << ", id=" << op.op_id << "): " << e.what();
             throw std::runtime_error(oss.str());
         }
+
+        skip_dispatch:
 
         // Handle layer end
         if (op.layer_end >= 0) {
@@ -4282,6 +4395,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 mLastRecomputeLayer = layer_idx;
             }
         }
+
+            // Note: backward always runs through the normal dispatch loop (no segment
+            // graph shortcut) because backward tensor lifetime management (cross-layer
+            // persistence, prune_by_last_use, deferred recompute checkpoints) is too
+            // complex to replicate in the segmented path. The forward segmented path
+            // provides the graph capture benefit; backward runs fully eager.
         }
 
         if (mRecomputeEnabled && mRecomputeFn) {
@@ -4703,6 +4822,169 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             mWeightManager->release_lm_head(mRunState.MainStream);
         }
     }
+}
+
+// ============================================================================
+// Split-attention CUDA graph support
+// ============================================================================
+
+void CompiledExecutor::dispatch_forward_op(const CompiledOp& op,
+                                            const modules::ForwardHook* hook) {
+    switch (op.type) {
+        case CompiledOpType::Embedding:          dispatch_embedding(op); break;
+        case CompiledOpType::Zeros:              dispatch_zeros(op); break;
+        case CompiledOpType::Ones:               dispatch_ones(op); break;
+        case CompiledOpType::FusedResidualRMSNorm: dispatch_fused_residual_rmsnorm(op); break;
+        case CompiledOpType::LayerNorm:          dispatch_layernorm(op); break;
+        case CompiledOpType::View:               dispatch_view(op); break;
+        case CompiledOpType::Transpose:          dispatch_transpose(op); break;
+        case CompiledOpType::Split:              dispatch_split(op); break;
+        case CompiledOpType::Concat:             dispatch_concat(op); break;
+        case CompiledOpType::Add:                dispatch_add(op); break;
+        case CompiledOpType::Matmul:
+        case CompiledOpType::MatmulBias:         dispatch_matmul(op, hook); break;
+        case CompiledOpType::BiasAdd:            dispatch_bias_add(op); break;
+        case CompiledOpType::SwiGLU:             dispatch_swiglu(op); break;
+        case CompiledOpType::GptOssMoeAct:       dispatch_gpt_oss_moe_act(op); break;
+        case CompiledOpType::Silu:               dispatch_silu(op); break;
+        case CompiledOpType::Gelu:               dispatch_gelu(op); break;
+        case CompiledOpType::Relu2:              dispatch_relu2(op); break;
+        case CompiledOpType::Mul:                dispatch_mul(op); break;
+        case CompiledOpType::MaskScatter:        dispatch_mask_scatter(op); break;
+        case CompiledOpType::DeepstackInject:    dispatch_deepstack_inject(op); break;
+        case CompiledOpType::MatmulSwiGLU:       dispatch_matmul_swiglu(op, hook); break;
+        case CompiledOpType::QKVQKNorm:          dispatch_qkv_qk_norm(op); break;
+        case CompiledOpType::QKVQKNormRoPE:      dispatch_qkv_qk_norm_rope(op); break;
+        case CompiledOpType::MRoPE:              dispatch_mrope(op); break;
+        case CompiledOpType::RoPE:               dispatch_rope(op); break;
+        case CompiledOpType::FlashAttention:     dispatch_flash_attention(op); break;
+        case CompiledOpType::CrossEntropyLoss:   dispatch_cross_entropy_loss(op); break;
+        case CompiledOpType::FusedLMHeadLoss:    dispatch_fused_lm_head_loss(op); break;
+        case CompiledOpType::MoESoftmax:         dispatch_moe_softmax(op); break;
+        case CompiledOpType::MoESigmoid:         dispatch_moe_sigmoid(op); break;
+        case CompiledOpType::MoETopK:            dispatch_moe_topk(op); break;
+        case CompiledOpType::MoEPermute:         dispatch_moe_permute(op); break;
+        case CompiledOpType::MoEGroupedGemm:     dispatch_moe_grouped_gemm(op); break;
+        case CompiledOpType::MoEGroupedGemmGateUp: dispatch_moe_grouped_gemm_gate_up(op); break;
+        case CompiledOpType::MoEGroupedGemmDown: dispatch_moe_grouped_gemm_down(op); break;
+        case CompiledOpType::MoEUnpermute:       dispatch_moe_unpermute(op); break;
+        case CompiledOpType::MoEExpertBiasAdd:   dispatch_moe_expert_bias_add(op); break;
+        case CompiledOpType::EpDispatch:         dispatch_ep_dispatch(op); break;
+        case CompiledOpType::EpCombine:          dispatch_ep_combine(op); break;
+        case CompiledOpType::MambaSplitProj:     dispatch_mamba_split_proj(op); break;
+        case CompiledOpType::MambaConv1d:        dispatch_mamba_conv1d(op); break;
+        case CompiledOpType::MambaSplitConvOut:  dispatch_mamba_split_conv_out(op); break;
+        case CompiledOpType::MambaSsmScan:       dispatch_mamba_ssm_scan(op); break;
+        case CompiledOpType::MambaGatedRMSNorm:  dispatch_mamba_gated_rmsnorm(op); break;
+        case CompiledOpType::MambaOutProj:       dispatch_mamba_out_proj(op, hook); break;
+        case CompiledOpType::ChunkGatedDeltaRule: dispatch_chunk_gated_delta_rule(op); break;
+        case CompiledOpType::Qwen3_5Decay:       dispatch_qwen3_5_decay(op); break;
+        case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;
+        default:
+            throw std::runtime_error("dispatch_forward_op: unsupported op type");
+    }
+}
+
+void CompiledExecutor::dispatch_backward_op(const CompiledOp& op,
+                                             const modules::BackwardHook* hook) {
+    switch (op.type) {
+        // Explicit backward ops
+        case CompiledOpType::ViewBackward:         dispatch_view_backward(op); break;
+        case CompiledOpType::AddBackward:          dispatch_add_backward(op); break;
+        case CompiledOpType::MatmulBackward:       dispatch_matmul_backward(op, hook); break;
+        case CompiledOpType::BiasAddBackward:      dispatch_bias_add_backward(op); break;
+        case CompiledOpType::SwiGLUBackward:       dispatch_swiglu_backward(op); break;
+        case CompiledOpType::GptOssMoeActBackward: dispatch_gpt_oss_moe_act_backward(op); break;
+        case CompiledOpType::SiluBackward:         dispatch_silu_backward(op); break;
+        case CompiledOpType::GeluBackward:         dispatch_gelu_backward(op); break;
+        case CompiledOpType::Relu2Backward:        dispatch_relu2_backward(op); break;
+        case CompiledOpType::MulBackward:          dispatch_mul_backward(op); break;
+        case CompiledOpType::MaskScatterBackward:  dispatch_mask_scatter_backward(op); break;
+        case CompiledOpType::DeepstackInjectBackward: dispatch_deepstack_inject_backward(op); break;
+        case CompiledOpType::MatmulSwiGLUBackward: dispatch_matmul_swiglu_backward(op, hook); break;
+        case CompiledOpType::QKVQKNormBackward:    dispatch_qkv_qk_norm_backward(op); break;
+        case CompiledOpType::RoPEBackward:         dispatch_rope_backward(op); break;
+        case CompiledOpType::QKVQKNormRoPEBackward: dispatch_qkv_qk_norm_rope_backward(op); break;
+        case CompiledOpType::MRoPEBackward:        dispatch_mrope_backward(op); break;
+        case CompiledOpType::FlashAttentionBackward: dispatch_flash_attention_backward(op); break;
+        case CompiledOpType::ZerosBackward:        dispatch_zeros_backward(op); break;
+        case CompiledOpType::FusedResidualRMSNormBackward: dispatch_fused_residual_rmsnorm_backward(op); break;
+        case CompiledOpType::LayerNormBackward:    dispatch_layernorm_backward(op); break;
+        case CompiledOpType::EmbeddingBackward:    dispatch_embedding_backward(op); break;
+        case CompiledOpType::CrossEntropyLossBackward: dispatch_cross_entropy_loss_backward(op); break;
+        case CompiledOpType::FusedLMHeadLossBackward: dispatch_fused_lm_head_loss_backward(op); break;
+        // Forward ops that appear in backward graph (autodiff generates these)
+        case CompiledOpType::View:                 dispatch_view_backward(op); break;
+        case CompiledOpType::Transpose:            dispatch_transpose(op); break;
+        case CompiledOpType::Split:                dispatch_split(op); break;
+        case CompiledOpType::Concat:               dispatch_concat(op); break;
+        case CompiledOpType::Add:                  dispatch_add(op); break;
+        case CompiledOpType::Zeros:                dispatch_zeros_backward(op); break;
+        case CompiledOpType::Ones:                 dispatch_zeros_backward(op); break;
+        // MoE backward operations
+        case CompiledOpType::MoESoftmaxBackward:   dispatch_moe_softmax_backward(op); break;
+        case CompiledOpType::MoESigmoidBackward:   dispatch_moe_sigmoid_backward(op); break;
+        case CompiledOpType::MoETopKBackward:      dispatch_moe_topk_backward(op); break;
+        case CompiledOpType::MoEPermuteBackward:   dispatch_moe_permute_backward(op); break;
+        case CompiledOpType::MoEGroupedGemmBackward: dispatch_moe_grouped_gemm_backward(op); break;
+        case CompiledOpType::MoEGroupedGemmGateUpBackward: dispatch_moe_grouped_gemm_gate_up_backward(op); break;
+        case CompiledOpType::MoEGroupedGemmDownBackward: dispatch_moe_grouped_gemm_down_backward(op); break;
+        case CompiledOpType::MoEUnpermuteBackward: dispatch_moe_unpermute_backward(op); break;
+        case CompiledOpType::MoEExpertBiasAddBackward: dispatch_moe_expert_bias_add_backward(op); break;
+        // Expert Parallelism backward operations
+        case CompiledOpType::EpDispatchBackward:   dispatch_ep_dispatch_backward(op); break;
+        case CompiledOpType::EpCombineBackward:    dispatch_ep_combine_backward(op); break;
+        // Mamba/SSM backward operations
+        case CompiledOpType::MambaSplitProjBackward: dispatch_mamba_split_proj_backward(op); break;
+        case CompiledOpType::MambaConv1dBackward:  dispatch_mamba_conv1d_backward(op); break;
+        case CompiledOpType::MambaSplitConvOutBackward: dispatch_mamba_split_conv_out_backward(op); break;
+        case CompiledOpType::MambaSsmScanBackward: dispatch_mamba_ssm_scan_backward(op); break;
+        case CompiledOpType::MambaGatedRMSNormBackward: dispatch_mamba_gated_rmsnorm_backward(op); break;
+        case CompiledOpType::MambaOutProjBackward: dispatch_mamba_out_proj_backward(op, hook); break;
+        // Qwen3.5 gated delta rule backward
+        case CompiledOpType::ChunkGatedDeltaRuleBackward: dispatch_chunk_gated_delta_rule_backward(op); break;
+        case CompiledOpType::Qwen3_5DecayBackward: dispatch_qwen3_5_decay_backward(op); break;
+        case CompiledOpType::RepeatInterleaveHeadsBackward: dispatch_repeat_interleave_heads_backward(op); break;
+        default: {
+            std::ostringstream oss;
+            oss << "dispatch_backward_op: unsupported op type "
+                << op_type_to_string(op.type) << " (id=" << op.op_id << ")";
+            throw std::runtime_error(oss.str());
+        }
+    }
+}
+
+void CompiledExecutor::reset_segment_graphs() {
+    auto destroy = [](std::vector<std::vector<SegmentGraphExec>>& layers) {
+        for (auto& segs : layers) {
+            for (auto& sg : segs) {
+                if (sg.exec) {
+                    cudaGraphExecDestroy(sg.exec);
+                    sg.exec = nullptr;
+                }
+                sg.checkpoint = {};
+            }
+        }
+    };
+    destroy(mFwdSegGraphs);
+    destroy(mBwdSegGraphs[0]);
+    destroy(mBwdSegGraphs[1]);
+    mSegGraphB = 0;
+    mSegGraphT = 0;
+}
+
+void CompiledExecutor::resize_segment_graphs(const CompiledGraph& fwd_graph,
+                                              const CompiledGraph& bwd_graph) {
+    auto resize = [](std::vector<std::vector<SegmentGraphExec>>& layers,
+                     const std::vector<std::vector<GraphSegment>>& segs) {
+        layers.resize(segs.size());
+        for (std::size_t L = 0; L < segs.size(); ++L) {
+            layers[L].resize(segs[L].size());
+        }
+    };
+    resize(mFwdSegGraphs, fwd_graph.layer_segments);
+    resize(mBwdSegGraphs[0], bwd_graph.layer_segments);
+    resize(mBwdSegGraphs[1], bwd_graph.layer_segments);
 }
 
 }  // namespace dsl

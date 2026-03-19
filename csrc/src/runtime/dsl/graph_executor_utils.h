@@ -12,10 +12,14 @@
 #include <unordered_set>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "runtime/dsl/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "kernels/kernels.h"
+#include "utilities/stack.h"
 #include "utilities/tensor.h"
+#include "utilities/utils.h"
 
 namespace dsl {
 
@@ -66,6 +70,43 @@ std::vector<char> compute_required_ops(const Graph& graph, const std::vector<std
 
 // Temporary memory management
 void free_temps(ExecState& st);
+
+// ---------------------------------------------------------------------------
+// CUDA graph capture/replay with stack checkpoint management.
+//
+// Ensures temp_alloc returns the same addresses across graph replays by
+// saving/restoring the stack allocator state.
+// ---------------------------------------------------------------------------
+template<typename Function>
+inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStream_t stream,
+                                                    cudaGraphExec_t& instance, bool enabled,
+                                                    DeviceMemoryStack& stack,
+                                                    DeviceMemoryStack::Checkpoint& checkpoint) {
+    if (!enabled) {
+        function();
+        return;
+    }
+
+    // Fast path: restore stack state and replay existing executable.
+    if (instance != nullptr) {
+        stack.restore(checkpoint);
+        CUDA_CHECK(cudaGraphLaunch(instance, stream));
+        return;
+    }
+
+    // Capture path: save checkpoint before capture so we know where to restore to.
+    checkpoint = stack.checkpoint();
+
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    function();
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+
+    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
+
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaGraphLaunch(instance, stream));
+}
 
 }  // namespace dsl
 

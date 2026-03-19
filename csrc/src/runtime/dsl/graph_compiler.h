@@ -290,6 +290,18 @@ struct TensorMeta {
 };
 
 // ============================================================================
+// Graph Segment (for split-attention CUDA graph capture)
+// ============================================================================
+
+/// A contiguous range of ops within a layer that can be captured as a single
+/// CUDA graph, or must run eagerly (e.g., FlashAttention with doc masking).
+struct GraphSegment {
+    std::size_t start_op;    ///< Inclusive start index in CompiledGraph::ops
+    std::size_t end_op;      ///< Exclusive end index in CompiledGraph::ops
+    bool eager;              ///< true = run eagerly (attention ops with dynamic cu_seqlens)
+};
+
+// ============================================================================
 // MLP Tile Group (for long-context tiled execution)
 // ============================================================================
 
@@ -339,6 +351,16 @@ struct CompiledGraph {
     // Forward groups: view → matmul_up → view → swiglu → view → matmul_down → view
     // Backward groups: view_bwd → matmul_bwd(down) → ... → matmul_bwd(up) → view_bwd
     std::vector<MlpTileGroup> mlp_tile_groups;
+
+    // Per-layer segments for split-attention CUDA graph mode.
+    // When populated, each layer is split into alternating graph-captured and
+    // eager segments around FlashAttention/FlashAttentionBackward ops.
+    // layer_segments[L] = ordered segments for layer L.
+    std::vector<std::vector<GraphSegment>> layer_segments;
+
+    /// Populate layer_segments by scanning each layer for FlashAttention ops.
+    /// Call after annotate_layer_boundaries().
+    void compute_layer_segments();
 
     // Statistics
     std::size_t total_ops = 0;

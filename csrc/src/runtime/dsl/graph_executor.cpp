@@ -80,47 +80,7 @@ inline void copy_position_ids_to_device(const std::int32_t* src_cpu, std::size_t
     }
 }
 
-/**
- * @brief Execute a callable with stack checkpoint/restore for CUDA graph compatibility.
- *
- * When graphs are enabled and use temp_alloc() inside the captured function, we must
- * ensure the stack is in the same state before each graph replay. This function:
- * - On first capture: saves a checkpoint after the function runs
- * - On replay: restores the stack to the checkpoint before launching the graph
- *
- * This ensures temp_alloc returns the same memory addresses that were captured in the graph.
- * (Same pattern as modules::detail::trace_or_execute_cuda_graph_with_stack)
- */
-template<typename Function>
-inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStream_t stream,
-                                                    cudaGraphExec_t& instance, bool enabled,
-                                                    DeviceMemoryStack& stack,
-                                                    DeviceMemoryStack::Checkpoint& checkpoint) {
-    if (!enabled) {
-        function();
-        return;
-    }
-
-    // Fast path: restore stack state and replay existing executable.
-    if (instance != nullptr) {
-        stack.restore(checkpoint);
-        CUDA_CHECK(cudaGraphLaunch(instance, stream));
-        return;
-    }
-
-    // Capture path: save checkpoint before capture so we know where to restore to.
-    checkpoint = stack.checkpoint();
-
-    cudaGraph_t graph = nullptr;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    function();
-    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-
-    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
-
-    CUDA_CHECK(cudaGraphDestroy(graph));
-    CUDA_CHECK(cudaGraphLaunch(instance, stream));
-}
+// trace_or_execute_cuda_graph_with_stack is now in graph_executor_utils.h
 
 inline bool stream_is_capturing(cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
@@ -366,6 +326,10 @@ void GraphExecutor::reset_cuda_graphs() {
     }
     // Reset per-layer graphs in run state
     mRunState.reset_cuda_graphs();
+    // Reset split-attention segment graphs
+    if (mCompiledExecutor) {
+        mCompiledExecutor->reset_segment_graphs();
+    }
 }
 
 void GraphExecutor::init(const GraphExecutorOptions& options) {
@@ -729,12 +693,19 @@ void GraphExecutor::compile_graphs(long B, long T) {
     if (B != mCompiledB || T != mCompiledT) {
         if (mForward) {
             mCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+            mCompiledForward->compute_layer_segments();
         }
         if (mBackward) {
             mCompiledBackward = std::make_unique<CompiledGraph>(mCompiler->compile(*mBackward, B, T));
+            mCompiledBackward->compute_layer_segments();
         }
         mCompiledB = B;
         mCompiledT = T;
+
+        // Resize split-attention segment graph storage when dimensions change
+        if (mCompiledForward && mCompiledBackward) {
+            mCompiledExecutor->resize_segment_graphs(*mCompiledForward, *mCompiledBackward);
+        }
     }
 }
 
@@ -925,18 +896,21 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
     // case while keeping non-Qwen3.5 models and non-LoRA paths graphed.
     const bool disable_fwd_graphs_for_qwen35_lora =
         graph_has_qwen35_ops(mCompiledForward.get()) && mLoRAConfig && mLoRAConfig->enabled();
-    if (disable_fwd_graphs_for_qwen35_lora && mGraphsEnabled &&
-        !mLoggedQwen35LoraFwdGraphDisable) {
-        std::cerr << "GraphExecutor: disabling forward CUDA graphs for Qwen3.5 LoRA "
-                     "(capture-unsafe forward path)." << std::endl;
-        mLoggedQwen35LoraFwdGraphDisable = true;
-    }
-    const bool use_graphs = mGraphsEnabled && !in_capture && !disable_fwd_graphs_for_qwen35_lora;
+    // When doc masking or capture-unsafe ops are present, use split-attention mode:
+    // capture-unsafe ops (FlashAttention varlen, ChunkGatedDeltaRule, Qwen3_5Decay)
+    // run eagerly while all other ops are graphed per-segment.
+    const bool doc_masking_active = (mCuSeqlensGpu != nullptr);
+    const bool has_capture_unsafe_ops = disable_fwd_graphs_for_qwen35_lora;
+    const bool has_tiled_mlp = mCompiledForward && !mCompiledForward->mlp_tile_groups.empty();
+    const bool needs_split = doc_masking_active || has_capture_unsafe_ops || has_tiled_mlp;
+    const bool use_split_attention = needs_split && mOptions.UseCudaGraphs && !in_capture;
+    const bool use_graphs = mGraphsEnabled && !in_capture && !needs_split;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
         mGraphT = T;
     }
+    mCompiledExecutor->set_split_attention_graphs(use_split_attention);
     const bool recompute_active =
         mOptions.recompute_enabled() && mCompiledForward != nullptr;
     mCompiledExecutor->set_recompute_enabled(recompute_active);
@@ -1013,14 +987,14 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
     // backward execution for this case.
     const bool disable_bwd_graphs_for_qwen35_lora =
         has_qwen35_ops && mLoRAConfig && mLoRAConfig->enabled();
-    if (disable_bwd_graphs_for_qwen35_lora && mBackwardGraphsEnabled &&
-        !mLoggedQwen35LoraBwdGraphDisable) {
-        std::cerr << "GraphExecutor: disabling backward CUDA graphs for Qwen3.5 LoRA "
-                     "(capture-unsafe matmul fallback path)." << std::endl;
-        mLoggedQwen35LoraBwdGraphDisable = true;
-    }
+    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr);
+    const bool has_capture_unsafe_bwd = disable_bwd_graphs_for_qwen35_lora;
+    const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
+    const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
+    const bool use_split_attention_bwd = needs_split_bwd && mOptions.UseCudaGraphs && !in_capture;
     const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture &&
-                            !disable_bwd_graphs_for_qwen35_lora;
+                            !needs_split_bwd;
+    mCompiledExecutor->set_split_attention_graphs(use_split_attention_bwd);
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;

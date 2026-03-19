@@ -784,17 +784,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         // If graphs are disabled or packed sequences need doc masking, use eager execution.
+        // When doc boundaries are present but CUDA graphs are enabled, the GraphExecutor
+        // uses split-attention mode: non-attention ops are captured as per-segment CUDA
+        // graphs, while FlashAttention runs eagerly with per-step cu_seqlens.
         if (!mOptions.UseCudaGraphs || has_doc_boundaries) {
-            // Disable internal per-layer CUDA graphs when falling back to eager mode
-            // with doc boundaries. Internal graphs capture the attention dispatch path
-            // (cuDNN vs Flash varlen) — replaying a cuDNN graph when doc masking
-            // switches to varlen produces incorrect results.
-            auto* dsl_model_eager = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-            const bool had_internal_graphs = dsl_model_eager && dsl_model_eager->internal_graphs_enabled();
-            if (had_internal_graphs && has_doc_boundaries) {
-                dsl_model_eager->set_internal_graphs_enabled(false);
-            }
-
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
@@ -812,10 +805,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             ctx.Model->update_with_config(*ctx.Communicator, config, opt_step_host);
             if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerEnd, rs.MainStream));
             CUDA_CHECK(cudaDeviceSynchronize());
-
-            if (had_internal_graphs && has_doc_boundaries) {
-                dsl_model_eager->set_internal_graphs_enabled(true);
-            }
             return;
         }
 

@@ -1166,6 +1166,70 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
 }
 
 
+void CompiledGraph::compute_layer_segments() {
+    const int num_layers = static_cast<int>(layer_start_indices.size());
+    layer_segments.resize(static_cast<std::size_t>(num_layers));
+
+    // Build an interval map of MLP tile group op ranges within each layer.
+    // These must run eagerly as a group (tiled execution uses dynamic chunk loops).
+    // Key: start_op_idx → end_op_idx (inclusive), so the whole group becomes one eager segment.
+    std::unordered_map<std::size_t, std::size_t> mlp_tile_starts; // start → end+1
+    for (const auto& tg : mlp_tile_groups) {
+        mlp_tile_starts[tg.start_op_idx] = tg.end_op_idx + 1;
+    }
+
+    for (int L = 0; L < num_layers; ++L) {
+        auto& segs = layer_segments[static_cast<std::size_t>(L)];
+        segs.clear();
+
+        const std::size_t start = layer_start_indices[static_cast<std::size_t>(L)];
+        const std::size_t end = layer_end_indices[static_cast<std::size_t>(L)];
+        if (start == SIZE_MAX || end == SIZE_MAX || start >= end) {
+            continue;
+        }
+
+        std::size_t seg_start = start;
+        for (std::size_t i = start; i < end; ++i) {
+            const auto ty = ops[i].type;
+            // Graph-breaking ops: must run eagerly because they are
+            // capture-unsafe (dynamic cu_seqlens, JIT kernel loading,
+            // cuBLAS host-sync calls, etc.)
+            const bool graph_breaking =
+                ty == CompiledOpType::FlashAttention ||
+                ty == CompiledOpType::FlashAttentionBackward ||
+                ty == CompiledOpType::ChunkGatedDeltaRule ||
+                ty == CompiledOpType::ChunkGatedDeltaRuleBackward ||
+                ty == CompiledOpType::Qwen3_5Decay ||
+                ty == CompiledOpType::Qwen3_5DecayBackward;
+
+            // Check if this op starts an MLP tile group
+            auto tile_it = mlp_tile_starts.find(i);
+
+            if (graph_breaking) {
+                if (i > seg_start) {
+                    segs.push_back({seg_start, i, /*eager=*/false});
+                }
+                segs.push_back({i, i + 1, /*eager=*/true});
+                seg_start = i + 1;
+            } else if (tile_it != mlp_tile_starts.end()) {
+                // MLP tile group: emit as one eager segment
+                if (i > seg_start) {
+                    segs.push_back({seg_start, i, /*eager=*/false});
+                }
+                std::size_t tile_end = tile_it->second;
+                if (tile_end > end) tile_end = end;
+                segs.push_back({i, tile_end, /*eager=*/true});
+                i = tile_end - 1; // loop will ++i
+                seg_start = tile_end;
+            }
+        }
+        // Trailing graphable segment
+        if (seg_start < end) {
+            segs.push_back({seg_start, end, /*eager=*/false});
+        }
+    }
+}
+
 
 // ============================================================================
 // Shape Validation Methods

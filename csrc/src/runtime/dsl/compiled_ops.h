@@ -590,7 +590,44 @@ private:
     std::vector<std::size_t> mLayerTempMarks;
     std::vector<char> mLayerActive;
 
+    // ========================================================================
+    // Split-attention CUDA graph mode
+    // ========================================================================
+    // When enabled, each layer's forward/backward is split into segments
+    // around FlashAttention ops. Non-attention segments are captured as CUDA
+    // graphs; attention runs eagerly with dynamic cu_seqlens (doc masking).
+    bool mSplitAttentionGraphs = false;
+    std::size_t mSegmentDispatchedUntil = 0;  ///< Ops before this index already dispatched by segments
+
+    struct SegmentGraphExec {
+        cudaGraphExec_t exec = nullptr;
+        DeviceMemoryStack::Checkpoint checkpoint{};
+        DeviceMemoryStack::Checkpoint post_checkpoint{}; // stack state AFTER dispatch (for replay advance)
+        // Tensor entries produced during capture. On graph replay the dispatch
+        // functions don't run, so mTensors isn't populated. We snapshot the
+        // entries after the initial capture and restore them on replay so that
+        // cross-segment tensor lookups (e.g. attention reading QKV) still work.
+        // Stack addresses are stable because the checkpoint is restored before replay.
+        std::vector<std::pair<int, Tensor>> tensor_snapshot;       // by tensor_id
+        std::vector<std::pair<std::string, Tensor>> named_snapshot; // by name
+        std::vector<std::pair<std::string, Tensor>> saved_snapshot; // mSaved entries written by dispatch
+    };
+
+    // Forward segment graphs: [layer_idx][segment_idx]
+    std::vector<std::vector<SegmentGraphExec>> mFwdSegGraphs;
+    // Backward segment graphs: [accum_mode 0/1][layer_idx][segment_idx]
+    std::vector<std::vector<SegmentGraphExec>> mBwdSegGraphs[2];
+    long mSegGraphB = 0, mSegGraphT = 0;
+
+    /// Dispatch a single forward op (extracted from the switch in execute_forward).
+    void dispatch_forward_op(const CompiledOp& op, const modules::ForwardHook* hook);
+    /// Dispatch a single backward op (extracted from the switch in execute_backward).
+    void dispatch_backward_op(const CompiledOp& op, const modules::BackwardHook* hook);
+
 public:
+    void set_split_attention_graphs(bool enabled) { mSplitAttentionGraphs = enabled; }
+    void reset_segment_graphs();
+    void resize_segment_graphs(const CompiledGraph& fwd_graph, const CompiledGraph& bwd_graph);
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
     size_t saved_buffers_total_bytes() const {
         size_t total = 0;

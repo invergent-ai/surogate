@@ -716,13 +716,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             self.use_cuda_graphs = False
             logger.info("[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture).")
 
-        if self.sample_packing and self.use_cuda_graphs:
-            self.use_cuda_graphs = False
-            logger.info("[sample_packing]: disabling CUDA graphs (packed sequences use Flash Attention varlen which bypasses graph replay).")
-
         if self.long_context and self.use_cuda_graphs:
-            self.use_cuda_graphs = False
-            logger.info("[long_context]: disabling CUDA graphs (tiled MLP execution is incompatible with graph capture).")
+            # long_context uses split-attention mode: MLP tile groups run eagerly
+            # while the rest of each layer (norms, attention, projections) stays graphed.
+            logger.info("[long_context]: CUDA graphs enabled with split-attention mode (tiled MLP runs eagerly per-segment, non-MLP ops graphed).")
 
         if self.debug_time_breakdown and self.use_cuda_graphs:
             self.use_cuda_graphs = False
