@@ -167,8 +167,13 @@ DslParamStore::DslParamStore(const Module& module,
     ShapeEnv env = make_shape_env(module, /*B=*/1, /*T=*/1);
     augment_shape_env(env, module.config);
 
-    const bool freeze_base = lora_config && lora_config->enabled();
-    const bool train_router = freeze_base && lora_config->train_router;
+    const bool has_enabled_lora = lora_config && lora_config->enabled();
+    // When quantized base weights are provided as external params (QLoRA/prequant),
+    // and no LoRA adapter config is attached, this instance is inference-only.
+    // Freeze all base params to avoid allocating full-size gradient tensors.
+    const bool freeze_base =
+        has_enabled_lora || (!lora_config && external_params && !external_params->empty());
+    const bool train_router = has_enabled_lora && lora_config->train_router;
     auto is_router_param = [&](const std::string& name) -> bool {
         return name.find("router") != std::string::npos;
     };

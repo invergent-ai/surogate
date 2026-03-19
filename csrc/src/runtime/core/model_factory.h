@@ -43,10 +43,11 @@ public:
         const RuntimeOptions& options,
         int rank,
         int world,
-        const std::shared_ptr<TensorAllocator>& alloc = nullptr) {
+        const std::shared_ptr<TensorAllocator>& alloc = nullptr,
+        const QLoRAConfig& qlora_config = QLoRAConfig{}) {
         require_dsl_ir(options);
         return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc,
-                                               std::nullopt, modules::QLoRAConfig{}, rank, world);
+                                               std::nullopt, qlora_config, rank, world);
     }
 
     /**

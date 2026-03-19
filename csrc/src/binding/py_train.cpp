@@ -1125,6 +1125,10 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
     }
 
     auto allocator = std::make_shared<TensorAllocator>();
+    modules::QLoRAConfig qlora_config;
+    if (mQLoRAConfig.has_value()) {
+        qlora_config = mQLoRAConfig.value();
+    }
 
     if (mLoRAConfig.has_value()) {
         // Convert LoRAAdapterConfig -> modular LoRA config
@@ -1152,19 +1156,13 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             }
         }
 
-        // Build QLoRA config if provided
-        modules::QLoRAConfig qlora_config;
-        if (mQLoRAConfig.has_value()) {
-            qlora_config = mQLoRAConfig.value();
-        }
-
         // Use factory to create LoRA model with proper architecture dispatch
         ctx.Model = modules::ModelFactory::create_lora_from_pretrained_config(
             *mConfig, mod_lora, mOptions, comm, allocator, qlora_config);
     } else {
         // Use factory to create base model with proper architecture dispatch
         ctx.Model = modules::ModelFactory::create_from_pretrained_config(
-            *mConfig, mOptions, comm.rank(), comm.world_size(), allocator);
+            *mConfig, mOptions, comm.rank(), comm.world_size(), allocator, qlora_config);
     }
 
     // DEBUG: GPU memory after model creation (before run state)

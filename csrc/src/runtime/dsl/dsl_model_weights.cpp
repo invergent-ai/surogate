@@ -109,9 +109,6 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
     std::vector<std::pair<std::string, std::string>> tied_params;
 
     if (qlora_enabled()) {
-        if (!mLoRAConfig) {
-            throw std::runtime_error("DSL model: QLoRA enabled without LoRA config");
-        }
         if (mModelConfig.moe_config.has_value()) {
             const auto& moe = mModelConfig.moe_config.value();
             if (mQLoRAConfig.num_experts == 0) {
@@ -143,9 +140,14 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
         }
 
+        // Pure pre-quantized inference may not attach a LoRA adapter.
+        const modules::ModularLoRAConfig default_lora_cfg{};
+        const modules::ModularLoRAConfig& lora_cfg_for_provider =
+            mLoRAConfig ? *mLoRAConfig : default_lora_cfg;
+
         mQLoRAProvider = internal::create_dsl_qlora_provider(
             *mModule, mModelConfig, *mConfig, mOptions,
-            *mLoRAConfig, mQLoRAConfig, mAllocator,
+            lora_cfg_for_provider, mQLoRAConfig, mAllocator,
             mHfMapping, mShardIdx, mNumShards, mAdapterPath);
         cudaStream_t quant_stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&quant_stream));
@@ -917,10 +919,6 @@ void DslModel::import_weights_from_external(
     if (!mParams) {
         throw std::logic_error("DslModel::import_weights_from_external called before parameters are initialized");
     }
-    if (!mLoRAConfig) {
-        throw std::runtime_error("import_weights_from_external requires LoRA config (QLoRA mode)");
-    }
-
     // Populate MoE config from model
     if (mModelConfig.moe_config.has_value()) {
         const auto& moe = mModelConfig.moe_config.value();
@@ -937,9 +935,13 @@ void DslModel::import_weights_from_external(
     }
 
     // Create the QLoRA provider (builds pipeline config from IR)
+    const modules::ModularLoRAConfig default_lora_cfg{};
+    const modules::ModularLoRAConfig& lora_cfg_for_provider =
+        mLoRAConfig ? *mLoRAConfig : default_lora_cfg;
+
     mQLoRAProvider = internal::create_dsl_qlora_provider(
         *mModule, mModelConfig, *mConfig, mOptions,
-        *mLoRAConfig, mQLoRAConfig, mAllocator,
+        lora_cfg_for_provider, mQLoRAConfig, mAllocator,
         mHfMapping, mShardIdx, mNumShards, mAdapterPath);
 
     // Use the provider's import_from_external instead of import_and_quantize
