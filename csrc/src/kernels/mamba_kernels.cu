@@ -564,6 +564,8 @@ void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tenso
 template<typename input_t, typename weight_t>
 void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream);
 template<typename input_t, typename weight_t>
+void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream);
+template<typename input_t, typename weight_t>
 void causal_conv1d_bwd_cuda(ConvParamsBwd &params, cudaStream_t stream);
 
 void mamba_causal_conv1d_forward(Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
@@ -605,6 +607,62 @@ void mamba_causal_conv1d_forward(Tensor& out, const Tensor& x, const Tensor& wei
         causal_conv1d_fwd_cuda<float, float>(params, stream);
     } else {
         throw std::logic_error("mamba_causal_conv1d_forward: unsupported dtype");
+    }
+}
+
+void mamba_causal_conv1d_update(Tensor& out, Tensor& conv_state, const Tensor& x, const Tensor& weight, const Tensor* bias,
+                                int B, int Tlen, int conv_dim, int kernel, bool silu, cudaStream_t stream) {
+    if (conv_state.Rank != 3 || conv_state.Sizes[0] != B || conv_state.Sizes[1] != conv_dim) {
+        throw std::logic_error("mamba_causal_conv1d_update: conv_state must be [B, conv_dim, state_len]");
+    }
+    const int state_len = static_cast<int>(conv_state.Sizes[2]);
+    if (state_len < kernel - 1) {
+        throw std::logic_error("mamba_causal_conv1d_update: conv_state_len must be >= kernel - 1");
+    }
+    if (conv_state.DType != x.DType) {
+        throw std::logic_error("mamba_causal_conv1d_update: conv_state dtype must match input dtype");
+    }
+
+    ConvParamsBase params{};
+    params.batch = B;
+    params.dim = conv_dim;
+    params.seqlen = Tlen;
+    params.width = kernel;
+    params.silu_activation = silu;
+
+    params.x_batch_stride = conv_dim * Tlen;
+    params.x_c_stride = Tlen;
+    params.x_l_stride = 1;
+    params.weight_c_stride = kernel;
+    params.weight_width_stride = 1;
+    params.out_batch_stride = conv_dim * Tlen;
+    params.out_c_stride = Tlen;
+    params.out_l_stride = 1;
+
+    params.x_ptr = x.Data;
+    params.weight_ptr = weight.Data;
+    params.bias_ptr = bias ? bias->Data : nullptr;
+    params.out_ptr = out.Data;
+
+    params.conv_state_ptr = conv_state.Data;
+    params.conv_state_len = state_len;
+    params.conv_state_batch_stride = conv_dim * state_len;
+    params.conv_state_c_stride = state_len;
+    params.conv_state_l_stride = 1;
+    params.cache_seqlens = nullptr;  // linear (non-circular) buffer update
+    params.conv_state_indices_ptr = nullptr;
+    params.seq_idx_ptr = nullptr;
+    params.initial_states_ptr = nullptr;
+    params.final_states_ptr = nullptr;
+
+    if (x.DType == ETensorDType::BF16 && weight.DType == ETensorDType::BF16) {
+        causal_conv1d_update_cuda<at::BFloat16, at::BFloat16>(params, stream);
+    } else if (x.DType == ETensorDType::FP16 && weight.DType == ETensorDType::FP16) {
+        causal_conv1d_update_cuda<at::Half, at::Half>(params, stream);
+    } else if (x.DType == ETensorDType::FP32 && weight.DType == ETensorDType::FP32) {
+        causal_conv1d_update_cuda<float, float>(params, stream);
+    } else {
+        throw std::logic_error("mamba_causal_conv1d_update: unsupported dtype");
     }
 }
 

@@ -42,6 +42,7 @@ void GatedDeltaRuleKernels::load(
     load_kernel(manifests, "gdr_bwd_wy",     bwd_wy_);
     load_kernel(manifests, "gdr_l2norm_fwd_q", l2norm_fwd_q_);
     load_kernel(manifests, "gdr_l2norm_bwd_q", l2norm_bwd_q_);
+    load_kernel(manifests, "gdr_recurrent_fwd", recurrent_fwd_);
 }
 
 bool GatedDeltaRuleKernels::is_ready() const {
@@ -108,6 +109,10 @@ void GatedDeltaRuleKernels::l2norm_fwd_q(dim3 grid, void** args, int num_args, c
 
 void GatedDeltaRuleKernels::l2norm_bwd_q(dim3 grid, void** args, int num_args, cudaStream_t stream) const {
     LAUNCH_KERNEL(l2norm_bwd_q_, "gdr_l2norm_bwd_q");
+}
+
+void GatedDeltaRuleKernels::recurrent_fwd(dim3 grid, void** args, int num_args, cudaStream_t stream) const {
+    LAUNCH_KERNEL(recurrent_fwd_, "gdr_recurrent_fwd");
 }
 
 #undef LAUNCH_KERNEL

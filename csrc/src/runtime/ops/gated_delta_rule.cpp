@@ -12,6 +12,8 @@
 #include <algorithm>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
+#include "runtime/dsl/graph_executor_utils.h"
+#include "kernels/kernels.h"
 #include "utilities/utils.h"
 
 namespace dsl {
@@ -75,6 +77,32 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         initial_state = &resolve_tensor(op.inputs[5]);
     }
 
+    // Decode mode: inject saved recurrent state as initial_state
+    int layer_idx_for_state = -1;
+    Tensor injected_state;
+    if (mDecodeState && mDecodeState->recurrent_states) {
+        std::string field;
+        // Try to find layer index from any input name
+        for (const auto& inp : op.inputs) {
+            if (parse_block_param(inp.name, layer_idx_for_state, field) && layer_idx_for_state >= 0)
+                break;
+        }
+        if (layer_idx_for_state >= 0) {
+            auto it = mDecodeState->recurrent_states->find(layer_idx_for_state);
+            if (it != mDecodeState->recurrent_states->end() && it->second != nullptr) {
+                // Create a Tensor view over the saved state buffer
+                injected_state.Data = static_cast<std::byte*>(it->second);
+                injected_state.DType = ETensorDType::BF16;
+                injected_state.Rank = 4;
+                injected_state.Sizes[0] = B;
+                injected_state.Sizes[1] = H;
+                injected_state.Sizes[2] = K;
+                injected_state.Sizes[3] = V;
+                initial_state = &injected_state;
+            }
+        }
+    }
+
     // Allocate outputs
     Tensor* out_ptr = nullptr;
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
@@ -109,19 +137,17 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     }
 
     const int BT = 64;
-    const int NT = cdiv(static_cast<int>(T), BT);
-    const int BK_kkt = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
-    const int BV_h = (K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
-    const int BK_o = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
-    const int BV_o = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
     const int BH = static_cast<int>(B * H);
     cudaStream_t stream = mRunState.MainStream;
 
-    // Optional L2 normalization of q and k (Qwen3.5 requires this)
+    // Optional L2 normalization of q and k (Qwen3.5 requires this).
+    // Keep this in front of both recurrent and chunk paths so decode parity
+    // matches full-chunk execution.
     const bool use_l2norm = op.attrs.use_qk_l2norm_in_kernel;
     void* q_eff = q.Data;
     void* k_eff = k.Data;
     if (use_l2norm) {
+        const int NT_l2 = cdiv(static_cast<int>(T), BT);
         Tensor q_norm = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_q_norm");
         mTemps.push_back(q_norm);
         Tensor q_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_q_rstd");
@@ -136,7 +162,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
             void* x = q.Data; void* y = q_norm.Data; void* r = q_rstd.Data;
             int32_t T_val = static_cast<int32_t>(T);
             void* args[] = { &x, &y, &r, &T_val };
-            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT_l2), static_cast<unsigned>(BH), 1},
                                      args, 4, stream);
         }
         // L2 norm K: same kernel (D=K)
@@ -144,12 +170,63 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
             void* x = k.Data; void* y = k_norm.Data; void* r = k_rstd.Data;
             int32_t T_val = static_cast<int32_t>(T);
             void* args[] = { &x, &y, &r, &T_val };
-            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT_l2), static_cast<unsigned>(BH), 1},
                                      args, 4, stream);
         }
         q_eff = q_norm.Data;
         k_eff = k_norm.Data;
     }
+
+    // -----------------------------------------------------------------------
+    // Recurrent path: for T<=1 (decode), use the fused recurrent kernel
+    // -----------------------------------------------------------------------
+    if (T <= 1 && mGdrKernels.has_recurrent_fwd()) {
+        const int BV_rec = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+        const int NV_rec = cdiv(static_cast<int>(V), BV_rec);
+
+        void* h0_ptr = initial_state ? initial_state->Data : nullptr;
+        void* ht_ptr = final_state_ptr->Data;
+        int32_t T_val = static_cast<int32_t>(T);
+        void* args[] = {
+            &q_eff, &k_eff, &v.Data, &g_input.Data, &beta.Data,
+            &out_ptr->Data, &h0_ptr, &ht_ptr, &scale, &T_val
+        };
+        mGdrKernels.recurrent_fwd(
+            {static_cast<unsigned>(NV_rec), static_cast<unsigned>(BH), 1},
+            args, 10, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (!op.outputs.empty() && !op.outputs[0].name.empty())
+            store_tensor(op.outputs[0], *out_ptr);
+        if (op.outputs.size() > 1 && !op.outputs[1].name.empty())
+            store_tensor(op.outputs[1], *final_state_ptr);
+
+        // Save recurrent state for next step
+        if (mDecodeState && mDecodeState->recurrent_states && layer_idx_for_state >= 0) {
+            auto& states = *mDecodeState->recurrent_states;
+            const std::size_t state_bytes = static_cast<std::size_t>(B * H * K * V) * sizeof(nv_bfloat16);
+            void* saved = states[layer_idx_for_state];
+            if (!saved) {
+                CUDA_CHECK(cudaMalloc(&saved, state_bytes));
+                states[layer_idx_for_state] = saved;
+            }
+            if (final_state_ptr->DType == ETensorDType::FP32) {
+                convert_dtype(reinterpret_cast<nv_bfloat16*>(saved),
+                              final_state_ptr->get<float>(),
+                              static_cast<long>(B * H * K * V), stream);
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(saved, final_state_ptr->Data, state_bytes,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+        return;
+    }
+
+    const int NT = cdiv(static_cast<int>(T), BT);
+    const int BK_kkt = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
+    const int BV_h = (K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    const int BK_o = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
+    const int BV_o = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
 
     // Allocate intermediates
     Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
@@ -266,6 +343,32 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         store_tensor(op.outputs[1], *final_state_ptr);
     }
+
+    // Decode mode: save the final recurrent state for the next decode step.
+    // The state buffer must persist across steps (NOT stack-allocated).
+    if (mDecodeState && mDecodeState->recurrent_states && layer_idx_for_state >= 0) {
+        auto& states = *mDecodeState->recurrent_states;
+        const std::size_t state_bytes = static_cast<std::size_t>(B * H * K * V) * sizeof(nv_bfloat16);
+
+        void* saved = states[layer_idx_for_state];
+        if (!saved) {
+            // First time: allocate persistent GPU buffer (NOT from stack)
+            CUDA_CHECK(cudaMalloc(&saved, state_bytes));
+            states[layer_idx_for_state] = saved;
+        }
+
+        // The final_state is in FP32 but the kernel expects BF16 initial_state.
+        // Convert FP32→BF16 into the saved buffer.
+        if (final_state_ptr->DType == ETensorDType::FP32) {
+            convert_dtype(reinterpret_cast<nv_bfloat16*>(saved),
+                          final_state_ptr->get<float>(),
+                          static_cast<long>(B * H * K * V),
+                          mRunState.MainStream);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(saved, final_state_ptr->Data, state_bytes,
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+    }
 }
 
 void CompiledExecutor::dispatch_chunk_gated_delta_rule(const CompiledOp& op) {
@@ -273,15 +376,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule(const CompiledOp& op) {
 }
 
 void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op) {
-    static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
-    if (debug_replay) {
-        fprintf(stderr, "[GDR_BWD] inputs=%zu outputs=%zu\n", op.inputs.size(), op.outputs.size());
-        for (std::size_t i = 0; i < op.inputs.size(); ++i) {
-            fprintf(stderr, "[GDR_BWD]   input[%zu] name='%s' slot=%d layer=%d tid=%d\n",
-                    i, op.inputs[i].name.c_str(), static_cast<int>(op.inputs[i].slot),
-                    op.inputs[i].layer_idx, op.inputs[i].tensor_id);
-        }
-    }
     if (!mGdrKernels.is_ready()) {
         throw std::runtime_error(
             "chunk_gated_delta_rule_backward: JIT Triton kernels not loaded.");
@@ -291,33 +385,24 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             "chunk_gated_delta_rule_backward: expected at least 7 inputs");
     }
 
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving d_out...\n");
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving d_final_state...\n");
     Tensor* d_final_state = nullptr;
     if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
         d_final_state = &resolve_tensor(op.inputs[1]);
     }
     const std::size_t offs = 2;
 
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving q...\n");
     Tensor& q = resolve_tensor(op.inputs[offs + 0]);
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving k...\n");
     Tensor& k = resolve_tensor(op.inputs[offs + 1]);
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving v...\n");
     Tensor& v = resolve_tensor(op.inputs[offs + 2]);
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving g_input...\n");
     Tensor& g_input = resolve_tensor(op.inputs[offs + 3]);
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving beta...\n");
     Tensor& beta = resolve_tensor(op.inputs[offs + 4]);
 
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving initial_state...\n");
     Tensor* initial_state = nullptr;
     if (op.inputs.size() > offs + 5 && !op.inputs[offs + 5].name.empty()) {
         initial_state = &resolve_tensor(op.inputs[offs + 5]);
     }
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] all inputs resolved, q.Data=%p\n", q.Data);
 
     const long B = q.Sizes[0];
     const long T = q.Sizes[1];
@@ -343,19 +428,12 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         return &mTemps.back();
     };
 
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] allocating outputs B=%ld T=%ld H=%ld K=%ld V=%ld\n", B, T, H, K, V);
     Tensor* d_q = ensure_or_temp(0, q.DType, {B, T, H, K});
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_q done\n");
     Tensor* d_k = ensure_or_temp(1, k.DType, {B, T, H, K});
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_k done\n");
     Tensor* d_v = ensure_or_temp(2, v.DType, {B, T, H, V});
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_v done\n");
     Tensor* d_g = ensure_or_temp(3, g_input.DType, {B, T, H});
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_g done\n");
     Tensor* d_beta = ensure_or_temp(4, beta.DType, {B, T, H});
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_beta done\n");
     Tensor* d_initial = ensure_or_temp(5, ETensorDType::FP32, {B, H, K, V});
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_initial done, about to launch kernels\n");
 
     float scale = op.attrs.delta_rule_scale;
     if (!(scale > 0.0f)) {
@@ -372,7 +450,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     cudaStream_t stream = mRunState.MainStream;
 
     // Optional L2 normalization recompute (mirrors forward)
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] use_l2norm=%d\n", op.attrs.use_qk_l2norm_in_kernel);
     const bool use_l2norm = op.attrs.use_qk_l2norm_in_kernel;
     void* q_eff = q.Data;
     void* k_eff = k.Data;
@@ -381,7 +458,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor q_norm_bwd, k_norm_bwd, q_rstd_bwd, k_rstd_bwd;
     Tensor dq_norm_buf, dk_norm_buf;
     if (use_l2norm) {
-        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: allocating temps...\n");
         q_norm_bwd = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_q_norm_bwd");
         mTemps.push_back(q_norm_bwd);
         q_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_q_rstd_bwd");
@@ -390,7 +466,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         mTemps.push_back(k_norm_bwd);
         k_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_k_rstd_bwd");
         mTemps.push_back(k_rstd_bwd);
-        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching q_norm kernel...\n");
         {
             void* x = q.Data; void* y = q_norm_bwd.Data; void* r = q_rstd_bwd.Data;
             int32_t T_val = static_cast<int32_t>(T);
@@ -398,7 +473,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
                                      args, 4, stream);
         }
-        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching k_norm kernel...\n");
         {
             void* x = k.Data; void* y = k_norm_bwd.Data; void* r = k_rstd_bwd.Data;
             int32_t T_val = static_cast<int32_t>(T);
@@ -406,29 +480,22 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
                                      args, 4, stream);
         }
-        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: done, allocating dq/dk norm buffers...\n");
         q_eff = q_norm_bwd.Data;
         k_eff = k_norm_bwd.Data;
         // Backward pipeline writes dq_norm/dk_norm to temp buffers
         try {
-            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: temp_alloc dq_norm q.DType=%d\n", static_cast<int>(q.DType));
             dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_dq_norm_buf");
-            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dq_norm_buf.Data=%p\n", dq_norm_buf.Data);
             mTemps.push_back(dq_norm_buf);
             dk_norm_buf = mRunState.temp_alloc(k.DType, {B, T, H, K}, "gated_delta_rule_dk_norm_buf");
-            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dk_norm_buf.Data=%p\n", dk_norm_buf.Data);
             mTemps.push_back(dk_norm_buf);
         } catch (const std::exception& e) {
-            fprintf(stderr, "[GDR_BWD] l2norm temp_alloc FAILED: %s\n", e.what());
             throw;
         }
         dq_data = dq_norm_buf.Data;
         dk_data = dk_norm_buf.Data;
-        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm path complete\n");
     }
 
     // ---- Recompute forward intermediates ----
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] recomputing forward intermediates...\n");
     // g_cum
     Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
     mTemps.push_back(g_cum);
@@ -497,8 +564,6 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     // ---- Backward pipeline ----
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] starting backward pipeline...\n");
-
     // bwd_dv_local
     {
         void* gp = g_cum.Data;

@@ -5,6 +5,7 @@
 
 #include "runtime/dsl/compiled_ops.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -56,6 +57,39 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         Tensor out = mRunState.temp_alloc(x.DType, {B, conv_dim, T}, "mamba_conv1d_out");
         mTemps.push_back(out);
         out_ptr = &mTemps.back();
+    }
+
+    int layer_idx = op.attrs.layer_idx;
+    if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
+        layer_idx = op.inputs[0].layer_idx;
+    }
+    if (layer_idx < 0 && !op.inputs.empty()) {
+        std::string field;
+        parse_block_param(op.inputs[0].name, layer_idx, field);
+    }
+
+    // Decode/prefill generation path for non-paged batches:
+    // keep and update per-layer causal-conv tail state [B, conv_dim, kernel-1].
+    if (mDecodeState && mDecodeState->conv_states && !mDecodeState->paged && layer_idx >= 0 && kernel > 1) {
+        auto& conv_states = *mDecodeState->conv_states;
+        const int state_len = kernel - 1;
+        const std::size_t state_elems =
+            static_cast<std::size_t>(B) * static_cast<std::size_t>(conv_dim) * static_cast<std::size_t>(state_len);
+        const std::size_t state_bytes = state_elems * get_dtype_size(x.DType);
+
+        void* state_ptr = conv_states[layer_idx];
+        if (!state_ptr) {
+            CUDA_CHECK(cudaMalloc(&state_ptr, state_bytes));
+            CUDA_CHECK(cudaMemsetAsync(state_ptr, 0, state_bytes, mRunState.MainStream));
+            conv_states[layer_idx] = state_ptr;
+        }
+
+        Tensor conv_state = Tensor::from_pointer(
+            static_cast<std::byte*>(state_ptr), /*device=*/0, x.DType, std::vector<long>{B, conv_dim, state_len});
+        mamba_causal_conv1d_update(*out_ptr, conv_state, x, weight, bias,
+                                   B, T, conv_dim, kernel, silu, mRunState.MainStream);
+        store_tensor(op.outputs[0], *out_ptr);
+        return;
     }
 
     // Call kernel

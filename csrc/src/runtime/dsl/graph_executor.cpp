@@ -1733,8 +1733,7 @@ void GraphExecutor::execute_prefill(long B, long T,
     // Copy token IDs and position IDs to device
     CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_cpu, token_bytes,
                                cudaMemcpyHostToDevice, rs.MainStream));
-    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_cpu, token_bytes,
-                               cudaMemcpyHostToDevice, rs.MainStream));
+    copy_position_ids_to_device(position_ids_cpu, token_bytes, rs.PositionIDs, B, T, rs.MainStream);
 
     // Initialize targets to -100 (masked) so fused_lm_head_loss produces zero loss.
     if (rs.Targets.Data) {
@@ -1801,8 +1800,19 @@ void GraphExecutor::execute_decode_step(long B,
     const std::size_t token_bytes = static_cast<std::size_t>(B) * sizeof(std::int32_t);
     CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_gpu, token_bytes,
                                cudaMemcpyDeviceToDevice, rs.MainStream));
-    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_gpu, token_bytes,
-                               cudaMemcpyDeviceToDevice, rs.MainStream));
+    // mRoPE models store position IDs as [3, B, T]. Decode provides a single
+    // plane [B, T], so replicate it across all 3 planes for text-only decode.
+    const std::size_t plane_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * sizeof(std::int32_t);
+    if (rs.PositionIDs.Rank == 3 && rs.PositionIDs.Sizes[0] == 3 && token_bytes <= plane_bytes) {
+        for (int p = 0; p < 3; ++p) {
+            auto* dst = static_cast<std::byte*>(rs.PositionIDs.Data) + static_cast<std::size_t>(p) * plane_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(dst, position_ids_gpu, token_bytes,
+                                       cudaMemcpyDeviceToDevice, rs.MainStream));
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_gpu, token_bytes,
+                                   cudaMemcpyDeviceToDevice, rs.MainStream));
+    }
 
     // Set decode mode
     mCompiledExecutor->set_decode_state(&decode_state);

@@ -2261,6 +2261,8 @@ void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tenso
 // Causal conv1d wrappers (depthwise, optional SiLU).
 void mamba_causal_conv1d_forward(Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
                                  int B, int T, int conv_dim, int kernel, bool silu, cudaStream_t stream);
+void mamba_causal_conv1d_update(Tensor& out, Tensor& conv_state, const Tensor& x, const Tensor& weight, const Tensor* bias,
+                                int B, int T, int conv_dim, int kernel, bool silu, cudaStream_t stream);
 void mamba_causal_conv1d_backward(Tensor& dx, Tensor& dweight_fp32, Tensor* dbias_fp32,
                                   const Tensor& x, const Tensor& weight, const Tensor& dout,
                                   int B, int T, int conv_dim, int kernel, bool silu, cudaStream_t stream);

@@ -1050,6 +1050,149 @@ def prepare_wy_repr_bwd_kernel(
 
 
 # =========================================================================
+# Fused recurrent kernel (decode / single-token inference)
+# =========================================================================
+# Adapted from flash-linear-attention (fla) fused_recurrent.py.
+# Processes T tokens sequentially, updating the recurrent state in-place.
+# For decode (T=1), this is a single-step state update + output computation.
+
+@triton.jit(do_not_specialize=['T'])
+def fused_recurrent_gated_delta_rule_fwd_kernel(
+    q, k, v, g, beta, o, h0, ht, scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_BETA_HEADWISE: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+):
+    """Single-token recurrent gated delta rule forward kernel.
+
+    Grid: (cdiv(V, BV), B * H)
+    Each program handles one (batch, head) pair and a BV-wide slice of the V dimension.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n = i_nh // H
+    i_h = i_nh % H
+
+    bos = i_n * T
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * H + i_h) * V + o_v
+    p_g = g + bos * H + i_h
+    if IS_BETA_HEADWISE:
+        p_beta = beta + bos * H + i_h
+    else:
+        p_beta = beta + (bos * H + i_h) * V + o_v
+    p_o = o + (bos * H + i_h) * V + o_v
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        p_h0 = h0 + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    for _ in tl.range(0, T):
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta).to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+
+        b_g = tl.load(p_g).to(tl.float32)
+        b_h *= tl.exp(b_g)
+
+        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+        b_h += b_k[:, None] * b_v
+        b_o = tl.sum(b_h * b_q[:, None], 0)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        p_q += H * K
+        p_k += H * K
+        p_v += H * V
+        p_g += H
+        p_beta += H * (1 if IS_BETA_HEADWISE else V)
+        p_o += H * V
+
+    if STORE_FINAL_STATE:
+        p_ht = ht + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+
+def fused_recurrent_gated_delta_rule_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = True,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Fused recurrent gated delta rule forward.
+
+    For decode (T=1): processes single token, updates recurrent state.
+
+    Args:
+        q: [B, T, H, K]
+        k: [B, T, H, K]
+        v: [B, T, H, V]
+        g: [B, T, H] (scalar gating per head)
+        beta: [B, T, H] (headwise)
+        scale: attention scale factor
+        initial_state: [B, H, K, V] or None
+        output_final_state: whether to return updated state
+        use_qk_l2norm_in_kernel: L2 normalize q/k in kernel
+
+    Returns:
+        o: [B, T, H, V]
+        final_state: [B, H, K, V] if output_final_state else None
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BK = triton.next_power_of_2(K)
+    BV = triton.next_power_of_2(V)
+    NV = triton.cdiv(V, BV)
+
+    o = torch.empty_like(v)
+    final_state = None
+    if output_final_state:
+        final_state = q.new_empty(B, H, K, V, dtype=torch.float32)
+
+    grid = (NV, B * H)
+    fused_recurrent_gated_delta_rule_fwd_kernel[grid](
+        q=q, k=k, v=v, g=g, beta=beta, o=o,
+        h0=initial_state, ht=final_state,
+        scale=scale,
+        T=T, H=H, K=K, V=V, BK=BK, BV=BV,
+        IS_BETA_HEADWISE=True,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        num_warps=1,
+        num_stages=3,
+    )
+    return o, final_state
+
+
+# =========================================================================
 # Compilation
 # =========================================================================
 
@@ -1283,6 +1426,41 @@ def compile_gated_delta_rule(
                       for w in [2, 4] for ns in [2, 3, 4]],
              bench_args=(k, v, beta, g, A_bf16, dw, dv2, dk, dv_out, db, dg_wy, T),
              grid=(NT, B * H))
+
+    # --- Recurrent forward (single-token decode / inference) ---
+    BK_rec = min(max(triton.next_power_of_2(K), 16), 64)
+    BV_rec = min(max(triton.next_power_of_2(V), 16), 64)
+    NV_rec = (V + BV_rec - 1) // BV_rec
+    # Use T=1 for autotuning (decode case)
+    rec_q = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device="cuda")
+    rec_k = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device="cuda")
+    rec_v = torch.randn(B, 1, H, V, dtype=torch.bfloat16, device="cuda")
+    rec_g = torch.randn(B, 1, H, dtype=torch.float32, device="cuda")
+    rec_beta = torch.randn(B, 1, H, dtype=torch.bfloat16, device="cuda")
+    rec_o = torch.empty_like(rec_v)
+    rec_h0 = torch.randn(B, H, K, V, dtype=torch.bfloat16, device="cuda")
+    rec_ht = torch.empty(B, H, K, V, dtype=torch.float32, device="cuda")
+    rec_scale = float(K ** -0.5)
+
+    _compile("gdr_recurrent_fwd", fused_recurrent_gated_delta_rule_fwd_kernel,
+             signature={
+                 "q": "*bf16", "k": "*bf16", "v": "*bf16", "g": "*fp32", "beta": "*bf16",
+                 "o": "*bf16", "h0": "*bf16", "ht": "*fp32", "scale": "fp32", "T": "i32",
+             },
+             constants={
+                 "H": H, "K": K, "V": V, "BK": BK_rec, "BV": BV_rec,
+                 # Keep recurrent decode numerics aligned with chunk path by
+                 # applying Q/K L2 norm in the shared pre-kernel step.
+                 "USE_QK_L2NORM_IN_KERNEL": False,
+                 "IS_BETA_HEADWISE": True,
+                 "USE_INITIAL_STATE": True,
+                 "STORE_FINAL_STATE": True,
+             },
+             configs=[{"num_warps": w, "num_stages": ns}
+                      for w in [1, 2, 4] for ns in [1, 2, 3]],
+             bench_args=(rec_q, rec_k, rec_v, rec_g, rec_beta,
+                         rec_o, rec_h0, rec_ht, rec_scale, 1),
+             grid=(NV_rec, B * H))
 
     logger.info("Compiled %d gated delta rule kernels to %s", len(manifests), output_dir)
     return manifests

@@ -1,5 +1,7 @@
 #include "runtime/dsl/compiled_ops.h"
 
+#include "kernels/attention_decode.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -69,6 +71,58 @@ void CompiledExecutor::dispatch_mrope(const CompiledOp& op) {
                  mRunState.MainStream);
 
     store_tensor(op.outputs[0], qkv_out);
+
+    // KV-cache intercept (same as dispatch_rope / dispatch_qkv_qk_norm_rope)
+    if (mDecodeState) {
+        int layer_idx = -1;
+        std::string field;
+        parse_block_param(op.inputs[0].name, layer_idx, field);
+
+        if (layer_idx >= 0) {
+            const int ds_batch = static_cast<int>(mB);
+            const int ds_Hkv = mDecodeState->num_kv_heads;
+            const int ds_Hs = mDecodeState->head_dim;
+
+            if (mDecodeState->prefill_mode && mT > 1) {
+                if (!mDecodeState->paged) {
+                    const std::size_t ls = static_cast<std::size_t>(ds_batch) * mDecodeState->max_seq_len * ds_Hkv * ds_Hs * sizeof(nv_bfloat16);
+                    auto* kl = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->k_data) + layer_idx * ls);
+                    auto* vl = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->v_data) + layer_idx * ls);
+                    kv_cache_store_bf16(kl, vl, qkv_out.get<nv_bfloat16>(),
+                        ds_batch, static_cast<int>(mT), mDecodeState->max_seq_len, Hq, ds_Hkv, ds_Hs,
+                        mRunState.MainStream);
+                } else {
+                    const int es = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
+                    const std::size_t lp = static_cast<std::size_t>(mDecodeState->total_pages)
+                        * mDecodeState->page_block_size * ds_Hkv * ds_Hs * es;
+                    auto* kp = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_idx * lp);
+                    auto* vp = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_idx * lp);
+                    kv_cache_store_paged_bf16(kp, vp, qkv_out.get<nv_bfloat16>(),
+                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                        mDecodeState->page_block_size, ds_batch, static_cast<int>(mT), Hq, ds_Hkv, ds_Hs,
+                        mRunState.MainStream);
+                }
+            } else if (!mDecodeState->prefill_mode && mT == 1) {
+                if (!mDecodeState->paged) {
+                    const std::size_t ls = static_cast<std::size_t>(ds_batch) * mDecodeState->max_seq_len * ds_Hkv * ds_Hs * sizeof(nv_bfloat16);
+                    auto* kl = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->k_data) + layer_idx * ls);
+                    auto* vl = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->v_data) + layer_idx * ls);
+                    kv_cache_append_bf16(kl, vl, qkv_out.get<nv_bfloat16>(),
+                        mDecodeState->seq_lens_gpu, ds_batch, mDecodeState->max_seq_len,
+                        Hq, ds_Hkv, ds_Hs, mRunState.MainStream);
+                } else {
+                    const int es = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
+                    const std::size_t lp = static_cast<std::size_t>(mDecodeState->total_pages)
+                        * mDecodeState->page_block_size * ds_Hkv * ds_Hs * es;
+                    auto* kp = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_idx * lp);
+                    auto* vp = reinterpret_cast<nv_bfloat16*>(reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_idx * lp);
+                    kv_cache_append_paged_bf16(kp, vp, qkv_out.get<nv_bfloat16>(),
+                        mDecodeState->seq_lens_gpu, mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                        mDecodeState->page_block_size, ds_batch, Hq, ds_Hkv, ds_Hs, mRunState.MainStream);
+                }
+            }
+        }
+    }
 }
 
 void CompiledExecutor::dispatch_mrope_backward(const CompiledOp& op) {

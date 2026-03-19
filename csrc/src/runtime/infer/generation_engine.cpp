@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -131,15 +132,29 @@ std::vector<Trajectory> GenerationEngine::generate(
     int num_active = batch_size;
 
     std::vector<int> prompt_lens_host(static_cast<std::size_t>(batch_size), 0);
+    std::vector<int> prefill_lens_host(static_cast<std::size_t>(batch_size), 0);
+    int max_prefill_len = 0;
     for (int b = 0; b < batch_size; ++b) {
         const int prompt_len = static_cast<int>(prompts[static_cast<std::size_t>(b)].size());
+        if (prompt_len <= 0) {
+            throw std::invalid_argument("GenerationEngine::generate: prompts must be non-empty");
+        }
+        const int prefill_len = prompt_len - 1;
         prompt_lens_host[static_cast<std::size_t>(b)] = prompt_len;
+        prefill_lens_host[static_cast<std::size_t>(b)] = prefill_len;
+        max_prefill_len = std::max(max_prefill_len, prefill_len);
         trajectories[static_cast<std::size_t>(b)].prompt_len = prompt_len;
         trajectories[static_cast<std::size_t>(b)].tokens = prompts[static_cast<std::size_t>(b)];
     }
 
+    // Recurrent state map for delta-rule / SSM layers (Qwen3.5 hybrid)
+    std::unordered_map<int, void*> recurrent_states;
+    std::unordered_map<int, void*> conv_states;
+
     // Set up decode state
     infer::DecodeState decode_state{};
+    decode_state.recurrent_states = &recurrent_states;
+    decode_state.conv_states = &conv_states;
     decode_state.finished_gpu = finished_gpu;
     decode_state.k_data = kv_cache.k_data;
     decode_state.v_data = kv_cache.v_data;
@@ -155,33 +170,35 @@ std::vector<Trajectory> GenerationEngine::generate(
     decode_state.vocab_size = V;
 
     // ========================================================================
-    // Prefill: process all prompt tokens in a single full-sequence forward.
+    // Prefill: process prompt prefix (all tokens except the last one) in a
+    // single full-sequence forward. The first decode step then consumes the
+    // last prompt token to produce the first generated token.
     // dispatch_rope bulk-stores K/V to the KV-cache; attention runs normally.
     // ========================================================================
-    {
-        // Pad prompts into [batch_size, max_prompt_len] row-major
-        const std::size_t padded_size = static_cast<std::size_t>(batch_size) * max_prompt_len;
+    if (max_prefill_len > 0) {
+        // Pad prompt prefixes into [batch_size, max_prefill_len] row-major
+        const std::size_t padded_size = static_cast<std::size_t>(batch_size) * max_prefill_len;
         std::vector<int32_t> tokens_host(padded_size, 0);
         std::vector<int32_t> pos_ids_host(padded_size);
         for (int b = 0; b < batch_size; ++b) {
             const auto& p = prompts[static_cast<std::size_t>(b)];
-            const int plen = prompt_lens_host[static_cast<std::size_t>(b)];
-            for (int t = 0; t < max_prompt_len; ++t) {
-                const std::size_t idx = static_cast<std::size_t>(b) * max_prompt_len + t;
-                tokens_host[idx] = t < plen ? p[static_cast<std::size_t>(t)] : 0;
+            const int prefill_len = prefill_lens_host[static_cast<std::size_t>(b)];
+            for (int t = 0; t < max_prefill_len; ++t) {
+                const std::size_t idx = static_cast<std::size_t>(b) * max_prefill_len + t;
+                tokens_host[idx] = t < prefill_len ? p[static_cast<std::size_t>(t)] : 0;
                 pos_ids_host[idx] = t;
             }
         }
 
         graph_executor.execute_prefill(
-            static_cast<long>(batch_size), static_cast<long>(max_prompt_len),
+            static_cast<long>(batch_size), static_cast<long>(max_prefill_len),
             tokens_host.data(), pos_ids_host.data(),
             decode_state, comm, hook);
+    }
 
-        // Update seq_lens to reflect prefilled lengths
-        for (int b = 0; b < batch_size; ++b) {
-            seq_lens_host[static_cast<std::size_t>(b)] = prompt_lens_host[static_cast<std::size_t>(b)];
-        }
+    // Update seq_lens to reflect prefilled prefix lengths.
+    for (int b = 0; b < batch_size; ++b) {
+        seq_lens_host[static_cast<std::size_t>(b)] = prefill_lens_host[static_cast<std::size_t>(b)];
     }
 
     // ========================================================================
@@ -341,6 +358,15 @@ std::vector<Trajectory> GenerationEngine::generate(
     CUDA_CHECK(cudaStreamDestroy(copy_stream));
     CUDA_CHECK(cudaFreeHost(pinned_tokens));
     CUDA_CHECK(cudaFreeHost(pinned_logprobs));
+
+    // Free recurrent state buffers (allocated via cudaMalloc, not arena)
+    for (auto& [_, ptr] : recurrent_states) {
+        if (ptr) cudaFree(ptr);
+    }
+    for (auto& [_, ptr] : conv_states) {
+        if (ptr) cudaFree(ptr);
+    }
+
     arena.restore(arena_cp);
 
     return trajectories;
@@ -439,8 +465,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     int num_active = total_batch;
 
     std::vector<int> prompt_lens_host(static_cast<std::size_t>(total_batch));
+    std::vector<int> prefill_lens_per_prompt(static_cast<std::size_t>(M), 0);
     for (int m = 0; m < M; ++m) {
         const int plen = static_cast<int>(prompts[static_cast<std::size_t>(m)].size());
+        if (plen <= 0) {
+            throw std::invalid_argument("GenerationEngine::generate_grpo: prompts must be non-empty");
+        }
+        prefill_lens_per_prompt[static_cast<std::size_t>(m)] = plen - 1;
         for (int n = 0; n < N; ++n) {
             const int idx = m * N + n;
             prompt_lens_host[static_cast<std::size_t>(idx)] = plen;
@@ -454,14 +485,16 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         alloc(static_cast<std::size_t>(paged_kv.max_pages_per_seq) * sizeof(int), "grpo_prefill_bt"));
 
     // ========================================================================
-    // Prefill: for each prompt, run full-sequence forward to populate prefix pages
+    // Prefill: for each prompt, run prefix-only forward (all tokens except the
+    // last one) to populate shared prefix pages.
     // ========================================================================
     for (int m = 0; m < M; ++m) {
         const auto& prompt = prompts[static_cast<std::size_t>(m)];
         const int plen = static_cast<int>(prompt.size());
+        const int prefill_len = prefill_lens_per_prompt[static_cast<std::size_t>(m)];
 
         // Allocate prefix pages and share to all N sequences
-        const int prefix_pages = paged_kv.alloc_prefix_pages(m, plen);
+        const int prefix_pages = paged_kv.alloc_prefix_pages(m, prefill_len);
         paged_kv.share_prefix_pages(m, prefix_pages);
 
         // Upload block table for source slot (B=1)
@@ -487,19 +520,20 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         prompt_ds.vocab_size = V;
         // prefill_mode is set by execute_prefill()
 
-        // Build token and position arrays for this prompt
-        std::vector<int32_t> tokens_host(static_cast<std::size_t>(plen));
-        std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(plen));
-        for (int t = 0; t < plen; ++t) {
-            tokens_host[static_cast<std::size_t>(t)] = prompt[static_cast<std::size_t>(t)];
-            pos_ids_host[static_cast<std::size_t>(t)] = t;
-        }
+        if (prefill_len > 0) {
+            // Build token and position arrays for this prompt prefix.
+            std::vector<int32_t> tokens_host(static_cast<std::size_t>(prefill_len));
+            std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(prefill_len));
+            for (int t = 0; t < prefill_len; ++t) {
+                tokens_host[static_cast<std::size_t>(t)] = prompt[static_cast<std::size_t>(t)];
+                pos_ids_host[static_cast<std::size_t>(t)] = t;
+            }
 
-        // Full-sequence prefill (B=1, T=plen)
-        graph_executor.execute_prefill(
-            1L, static_cast<long>(plen),
-            tokens_host.data(), pos_ids_host.data(),
-            prompt_ds, comm, hook);
+            graph_executor.execute_prefill(
+                1L, static_cast<long>(prefill_len),
+                tokens_host.data(), pos_ids_host.data(),
+                prompt_ds, comm, hook);
+        }
 
         // Allocate first suffix page for each of the N sequences
         const int suffix_start_page = prefix_pages;
@@ -508,7 +542,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         }
 
         for (int n = 0; n < N; ++n) {
-            seq_lens_host[static_cast<std::size_t>(m * N + n)] = plen;
+            seq_lens_host[static_cast<std::size_t>(m * N + n)] = prefill_len;
         }
     }
 
@@ -518,7 +552,12 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     // ========================================================================
     // Decode loop: all M×N sequences decode in parallel
     // ========================================================================
+    std::unordered_map<int, void*> grpo_recurrent_states;
+    std::unordered_map<int, void*> grpo_conv_states;
+
     infer::DecodeState decode_state{};
+    decode_state.recurrent_states = &grpo_recurrent_states;
+    decode_state.conv_states = &grpo_conv_states;
     decode_state.paged = true;
     decode_state.k_pages = paged_kv.k_pages;
     decode_state.v_pages = paged_kv.v_pages;
@@ -682,6 +721,12 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     CUDA_CHECK(cudaStreamDestroy(copy_stream));
     CUDA_CHECK(cudaFreeHost(pinned_tokens));
     CUDA_CHECK(cudaFreeHost(pinned_logprobs));
+    for (auto& [_, ptr] : grpo_recurrent_states) {
+        if (ptr) cudaFree(ptr);
+    }
+    for (auto& [_, ptr] : grpo_conv_states) {
+        if (ptr) cudaFree(ptr);
+    }
     arena.restore(arena_cp);
 
     return trajectories;

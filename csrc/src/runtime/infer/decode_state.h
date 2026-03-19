@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 
 namespace infer {
 
@@ -42,6 +43,18 @@ struct DecodeState {
     // When finished_gpu[i] != 0, the sequence is done — dispatch_rope skips
     // KV-cache append, and the token is replaced with 0 (pad) before embedding.
     int* finished_gpu = nullptr;
+
+    // Recurrent state for delta-rule / SSM layers (Qwen3.5 hybrid).
+    // Maps layer_idx → GPU buffer holding the recurrent state [B, H, K, V].
+    // During prefill: dispatch_chunk_gated_delta_rule saves final_state here.
+    // During decode: dispatch_chunk_gated_delta_rule reads initial_state from here
+    //                and updates it with the new final_state.
+    std::unordered_map<int, void*>* recurrent_states = nullptr;
+
+    // Per-layer causal-conv state for Mamba-style conv1d in Qwen3.5 linear blocks.
+    // Maps layer_idx -> GPU buffer [B, conv_dim, kernel-1] with the rolling tail.
+    // Used by dispatch_mamba_conv1d in decode mode (non-paged path).
+    std::unordered_map<int, void*>* conv_states = nullptr;
 
     // Prefill mode: when true, dispatch_rope writes K/V to the KV-cache at ALL
     // positions (not just position seq_lens[i]) AND lets self-attention proceed

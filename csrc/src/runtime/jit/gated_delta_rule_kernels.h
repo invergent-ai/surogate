@@ -99,6 +99,16 @@ public:
     /// Backward through WY representation. Grid: (NT, B*H).
     void bwd_wy(dim3 grid, void** args, int num_args, cudaStream_t stream) const;
 
+    // ======================================================================
+    // Recurrent (decode / inference) kernel
+    // ======================================================================
+
+    /// Fused recurrent forward (single-token or short sequences). Grid: (cdiv(V,BV), B*H).
+    void recurrent_fwd(dim3 grid, void** args, int num_args, cudaStream_t stream) const;
+
+    /// Check if the recurrent kernel is loaded (optional — only needed for generation).
+    [[nodiscard]] bool has_recurrent_fwd() const { return recurrent_fwd_.has_value(); }
+
 private:
     /// Load a single kernel from manifests, if present.
     void load_kernel(const std::unordered_map<std::string, std::string>& manifests,
@@ -123,6 +133,9 @@ private:
     // L2 normalization kernels (used when use_qk_l2norm_in_kernel=true)
     std::optional<JitKernel> l2norm_fwd_q_;
     std::optional<JitKernel> l2norm_bwd_q_;
+
+    // Recurrent forward kernel (single-token decode / inference)
+    std::optional<JitKernel> recurrent_fwd_;
 };
 
 #endif // SUROGATE_SRC_RUNTIME_JIT_GATED_DELTA_RULE_KERNELS_H
