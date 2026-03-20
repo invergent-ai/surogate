@@ -18,6 +18,27 @@
 #include "kernels/sampling.h"
 #include "utilities/utils.h"
 
+namespace {
+
+bool softmax_enable_pdl() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    int device = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        cached = 0;
+        return false;
+    }
+    // Match mini-sgl behavior: enable PDL on Hopper+.
+    cached = (prop.major >= 9) ? 1 : 0;
+    return cached != 0;
+}
+
+}  // namespace
+
 // ============================================================================
 // Softmax: logits → probs with optional temperature
 // ============================================================================
@@ -41,7 +62,7 @@ void sampling_softmax(
         1.0f,                               // scalar temperature when array is null
         workspace,
         workspace_bytes,
-        /*enable_pdl=*/false,
+        /*enable_pdl=*/softmax_enable_pdl(),
         stream);
 
     if (err != cudaSuccess) {
@@ -475,6 +496,85 @@ void sampling_extract_logprob(
     const int blocks = (batch_size + threads - 1) / threads;
     extract_logprob_kernel<<<blocks, threads, 0, stream>>>(
         logprobs, probs, token_ids, batch_size, vocab_size);
+}
+
+namespace {
+
+template <int Threads>
+__global__ void extract_logprob_from_logits_kernel(
+        const float* __restrict__ logits,
+        const int32_t* __restrict__ token_ids,
+        const float* __restrict__ temperature,
+        float* __restrict__ logprobs,
+        int vocab_size) {
+    const int row_idx = blockIdx.x;
+    const float* row = logits + static_cast<long>(row_idx) * vocab_size;
+
+    float inv_t = 1.0f;
+    if (temperature) {
+        const float t = fmaxf(temperature[row_idx], 1e-6f);
+        inv_t = 1.0f / t;
+    }
+
+    float local_max = -INFINITY;
+    for (int i = threadIdx.x; i < vocab_size; i += Threads) {
+        const float v = row[i] * inv_t;
+        local_max = fmaxf(local_max, v);
+    }
+    using MaxReduce = cub::BlockReduce<float, Threads>;
+    __shared__ typename MaxReduce::TempStorage max_storage;
+    const float row_max = MaxReduce(max_storage).Reduce(local_max, cub::Max());
+
+    __shared__ float shared_max;
+    __shared__ float shared_token_logit;
+    if (threadIdx.x == 0) {
+        shared_max = row_max;
+        const int tok = token_ids[row_idx];
+        if (tok >= 0 && tok < vocab_size) {
+            shared_token_logit = row[tok] * inv_t;
+        } else {
+            shared_token_logit = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vocab_size; i += Threads) {
+        local_sum += expf(row[i] * inv_t - shared_max);
+    }
+    using SumReduce = cub::BlockReduce<float, Threads>;
+    __shared__ typename SumReduce::TempStorage sum_storage;
+    const float row_sum = SumReduce(sum_storage).Sum(local_sum);
+
+    if (threadIdx.x == 0) {
+        const int tok = token_ids[row_idx];
+        if (tok < 0 || tok >= vocab_size) {
+            logprobs[row_idx] = logf(1e-10f);
+            return;
+        }
+        const float log_z = logf(fmaxf(row_sum, 1e-10f)) + shared_max;
+        logprobs[row_idx] = shared_token_logit - log_z;
+    }
+}
+
+}  // anonymous namespace
+
+void sampling_extract_logprob_from_logits(
+        const float* logits,
+        const int32_t* token_ids,
+        float* logprobs,
+        const float* temperature,
+        int batch_size,
+        int vocab_size,
+        cudaStream_t stream) {
+
+    if (batch_size <= 0 || vocab_size <= 0) {
+        return;
+    }
+    constexpr int kThreads = 256;
+    extract_logprob_from_logits_kernel<kThreads><<<batch_size, kThreads, 0, stream>>>(
+        logits, token_ids, temperature, logprobs, vocab_size);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================

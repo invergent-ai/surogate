@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "kernels/attention_decode.h"
+#include "utilities/utils.h"
 
 namespace {
 
@@ -193,6 +194,42 @@ __global__ void mask_finished_tokens_kernel(
     }
 }
 
+/// Update per-sequence decode state after one sampling step.
+/// Active sequence:
+///   seq_len += 1
+///   completion_len += 1
+///   if sampled token is EOS -> mark finished
+__global__ void update_generation_state_kernel(
+        const int32_t* __restrict__ sampled_tokens,
+        int* __restrict__ finished_gpu,
+        int* __restrict__ seq_lens_gpu,
+        int32_t* __restrict__ completion_lens_gpu,
+        int32_t eos_token_id,
+        int batch_size) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= batch_size) return;
+    if (finished_gpu[idx] != 0) {
+        return;
+    }
+
+    seq_lens_gpu[idx] += 1;
+    completion_lens_gpu[idx] += 1;
+    if (sampled_tokens[idx] == eos_token_id) {
+        finished_gpu[idx] = 1;
+    }
+}
+
+__global__ void count_active_sequences_kernel(
+        const int* __restrict__ finished_gpu,
+        int* __restrict__ active_count_gpu,
+        int batch_size) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= batch_size) return;
+    if (finished_gpu[idx] == 0) {
+        atomicAdd(active_count_gpu, 1);
+    }
+}
+
 }  // anonymous namespace
 
 void mask_finished_tokens(
@@ -204,6 +241,32 @@ void mask_finished_tokens(
     const int blocks = (batch_size + threads - 1) / threads;
     mask_finished_tokens_kernel<<<blocks, threads, 0, stream>>>(
         token_ids, finished_gpu, batch_size);
+}
+
+void update_generation_state(
+        const int32_t* sampled_tokens,
+        int* finished_gpu,
+        int* seq_lens_gpu,
+        int32_t* completion_lens_gpu,
+        int32_t eos_token_id,
+        int batch_size,
+        cudaStream_t stream) {
+    const int threads = 256;
+    const int blocks = (batch_size + threads - 1) / threads;
+    update_generation_state_kernel<<<blocks, threads, 0, stream>>>(
+        sampled_tokens, finished_gpu, seq_lens_gpu, completion_lens_gpu, eos_token_id, batch_size);
+}
+
+void count_active_sequences(
+        const int* finished_gpu,
+        int* active_count_gpu,
+        int batch_size,
+        cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(active_count_gpu, 0, sizeof(int), stream));
+    const int threads = 256;
+    const int blocks = (batch_size + threads - 1) / threads;
+    count_active_sequences_kernel<<<blocks, threads, 0, stream>>>(
+        finished_gpu, active_count_gpu, batch_size);
 }
 
 void kv_cache_store_bf16(

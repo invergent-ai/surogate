@@ -139,6 +139,31 @@ void mask_finished_tokens(
     int batch_size,
     cudaStream_t stream);
 
+/// Update decode sequence state after sampling one token.
+///
+/// For each active sequence (finished_gpu[i] == 0):
+/// - seq_lens_gpu[i] += 1
+/// - completion_lens_gpu[i] += 1
+/// - if sampled_tokens[i] == eos_token_id, mark finished_gpu[i] = 1
+///
+/// Finished sequences are left unchanged.
+void update_generation_state(
+    const int32_t* sampled_tokens,
+    int* finished_gpu,
+    int* seq_lens_gpu,
+    int32_t* completion_lens_gpu,
+    int32_t eos_token_id,
+    int batch_size,
+    cudaStream_t stream);
+
+/// Count active (unfinished) sequences.
+/// Writes the count to active_count_gpu[0].
+void count_active_sequences(
+    const int* finished_gpu,
+    int* active_count_gpu,
+    int batch_size,
+    cudaStream_t stream);
+
 /// Bulk-store K/V from interleaved QKV [B, T, (Hq+2*Hkv), Hs] into contiguous KV-cache.
 /// Used during prefill to populate the entire prompt's KV in one shot.
 ///

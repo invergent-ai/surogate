@@ -101,6 +101,25 @@ void sampling_extract_logprob(
     int vocab_size,
     cudaStream_t stream);
 
+/// Extract log-probability of sampled token directly from logits.
+/// Computes log_softmax(logits / temperature)[token_ids[i]] per row.
+///
+/// @param logits       [batch_size, vocab_size] unnormalized logits (FP32)
+/// @param token_ids    [batch_size] sampled token IDs (INT32)
+/// @param logprobs     [batch_size] output log-probabilities (FP32)
+/// @param temperature  [batch_size] per-sequence temperatures, or nullptr for 1.0
+/// @param batch_size   Number of sequences
+/// @param vocab_size   Vocabulary size
+/// @param stream       CUDA stream
+void sampling_extract_logprob_from_logits(
+    const float* logits,
+    const int32_t* token_ids,
+    float* logprobs,
+    const float* temperature,
+    int batch_size,
+    int vocab_size,
+    cudaStream_t stream);
+
 /// Top-K sampling from probability distribution.
 ///
 /// @param probs        [batch_size, vocab_size] normalized probabilities (FP32, modified in-place)

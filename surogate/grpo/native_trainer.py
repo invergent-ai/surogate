@@ -346,7 +346,7 @@ class NativeGRPOTrainer:
             temperature=temperature,
             eos_token_id=self.eos_id,
             use_lora=config.lora,
-            use_cuda_graphs=False,
+            use_cuda_graphs=True,
             top_k=gen.top_k,
             top_p=gen.top_p,
         )
@@ -1041,7 +1041,7 @@ class NativeGRPOTrainer:
                 temperature=gen_temp,
                 eos_token_id=self.eos_id,
                 use_lora=self.config.lora,
-                use_cuda_graphs=False,
+                use_cuda_graphs=True,
                 top_k=0,
                 top_p=1.0,
             )

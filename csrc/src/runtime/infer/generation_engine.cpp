@@ -4,6 +4,7 @@
 #include "runtime/infer/generation_engine.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,44 @@ namespace {
 
 inline bool is_valid_token_id(const int32_t token_id, const int vocab_size) {
     return token_id >= 0 && token_id < vocab_size;
+}
+
+inline bool sanitize_logits_enabled() {
+    static int enabled = -1;
+    if (enabled >= 0) {
+        return enabled != 0;
+    }
+    const char* env = std::getenv("SUROGATE_SANITIZE_LOGITS");
+    enabled = (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    return enabled != 0;
+}
+
+inline int round_up_prompt_len_bucket(
+        int observed_max_prompt_len,
+        int max_gen_len,
+        const dsl::DslRunState& run_state) {
+    if (observed_max_prompt_len <= 0) {
+        return observed_max_prompt_len;
+    }
+
+    // Limit by trainer sequence capacity when known.
+    int prompt_cap = observed_max_prompt_len;
+    if (run_state.Inputs.Rank >= 2) {
+        const int seq_cap = static_cast<int>(run_state.Inputs.Sizes[1]);
+        if (seq_cap > max_gen_len) {
+            prompt_cap = std::max(observed_max_prompt_len, seq_cap - max_gen_len);
+        }
+    }
+
+    static constexpr int kBuckets[] = {
+        32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 640, 768, 1024, 1536, 2048
+    };
+    for (int b : kBuckets) {
+        if (b >= observed_max_prompt_len && b <= prompt_cap) {
+            return b;
+        }
+    }
+    return std::min(prompt_cap, observed_max_prompt_len);
 }
 
 void validate_prompt_tokens_or_throw(const std::vector<std::vector<int32_t>>& prompts,
@@ -75,11 +114,14 @@ std::vector<Trajectory> GenerationEngine::generate(
     const int batch_size = static_cast<int>(prompts.size());
     if (batch_size == 0) return {};
 
-    // Find max prompt length
-    int max_prompt_len = 0;
+    // Find max prompt length and round up to a stable bucket to improve
+    // decode graph reuse across calls with slightly different prompt lengths.
+    int max_prompt_len_observed = 0;
     for (const auto& p : prompts) {
-        max_prompt_len = std::max(max_prompt_len, static_cast<int>(p.size()));
+        max_prompt_len_observed = std::max(max_prompt_len_observed, static_cast<int>(p.size()));
     }
+    const int max_prompt_len =
+        round_up_prompt_len_bucket(max_prompt_len_observed, gen_config.max_gen_len, mRunState);
 
     const int max_total_len = max_prompt_len + gen_config.max_gen_len;
     const int Hkv = mConfig.NumKeyValHeads;
@@ -259,6 +301,11 @@ std::vector<Trajectory> GenerationEngine::generate(
     // Pre-allocate host buffers used every step (avoid heap allocs in hot loop)
     std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(batch_size));
     std::vector<int> finished_host_buf(static_cast<std::size_t>(batch_size), 0);
+    const bool use_direct_logits_sampling =
+        (gen_config.temperature == 1.0f) &&
+        (gen_config.top_k <= 0) &&
+        (gen_config.top_p >= 1.0f) &&
+        (gen_config.min_p <= 0.0f);
 
     for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
         // Upload seq_lens and build cu_seqlens/seqused_k
@@ -290,8 +337,10 @@ std::vector<Trajectory> GenerationEngine::generate(
         graph_executor.execute_decode_step(
             static_cast<long>(batch_size), last_tokens_gpu, position_ids_gpu,
             decode_state, comm, hook, gen_config.use_cuda_graphs);
-        // Match HF invalid-value handling before sampling.
-        sampling_sanitize_logits(logits_gpu, batch_size, V, mRunState.MainStream);
+        if (sanitize_logits_enabled()) {
+            // Match HF remove_invalid_values behavior when explicitly enabled.
+            sampling_sanitize_logits(logits_gpu, batch_size, V, mRunState.MainStream);
+        }
 
         // ----------------------------------------------------------------
         // Sample from logits
@@ -299,6 +348,12 @@ std::vector<Trajectory> GenerationEngine::generate(
         if (gen_config.temperature <= 0.0f) {
             // Greedy (argmax)
             sampling_argmax(logits_gpu, sampled_tokens_gpu, batch_size, V, mRunState.MainStream);
+        } else if (use_direct_logits_sampling) {
+            // Unfiltered categorical sampling (temperature=1): sample directly
+            // from logits to avoid materializing full probs.
+            sampling_from_logits(logits_gpu, sampled_tokens_gpu, batch_size, V,
+                                 /*deterministic=*/false, gen_config.seed, rng_offset,
+                                 mRunState.MainStream);
         } else {
             // Temperature-scaled softmax → probs
             sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
@@ -334,15 +389,16 @@ std::vector<Trajectory> GenerationEngine::generate(
         mask_finished_tokens(sampled_tokens_gpu, finished_gpu, batch_size, mRunState.MainStream);
         rng_offset++;
 
-        // Extract logprobs: logprob[i] = log(softmax(logits)[i, sampled_token[i]])
-        // If we did greedy (no softmax), compute softmax now for logprobs
-        if (gen_config.temperature <= 0.0f) {
-            sampling_softmax(logits_gpu, probs_gpu, /*temperature=*/nullptr,
-                             batch_size, V, softmax_workspace, softmax_workspace_bytes,
-                             mRunState.MainStream);
+        // Extract logprobs: logprob[i] = log p(sampled_token_i | logits_i)
+        if (gen_config.temperature <= 0.0f || use_direct_logits_sampling) {
+            sampling_extract_logprob_from_logits(
+                logits_gpu, sampled_tokens_gpu, logprobs_gpu,
+                /*temperature=*/nullptr,
+                batch_size, V, mRunState.MainStream);
+        } else {
+            sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                     batch_size, V, mRunState.MainStream);
         }
-        sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
-                                 batch_size, V, mRunState.MainStream);
 
         // ----------------------------------------------------------------
         // Streaming D2H: copy (token, logprob) to pinned host on copy stream
@@ -420,6 +476,8 @@ std::vector<Trajectory> GenerationEngine::generate(
         if (ptr) cudaFree(ptr);
     }
 
+    // Invalidate decode graph before arena restore: captured graph arguments
+    // include generation arena pointers that become stale after restore.
     graph_executor.invalidate_decode_graph();
     arena.restore(arena_cp);
 
@@ -440,11 +498,14 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
 
     const int total_batch = M * N;  // total sequences
 
-    // Find max prompt length
-    int max_prompt_len = 0;
+    // Find max prompt length and round up to a stable bucket to improve
+    // decode graph reuse across calls with slightly different prompt lengths.
+    int max_prompt_len_observed = 0;
     for (const auto& p : prompts) {
-        max_prompt_len = std::max(max_prompt_len, static_cast<int>(p.size()));
+        max_prompt_len_observed = std::max(max_prompt_len_observed, static_cast<int>(p.size()));
     }
+    const int max_prompt_len =
+        round_up_prompt_len_bucket(max_prompt_len_observed, gen_config.max_gen_len, mRunState);
 
     const int max_total_len = max_prompt_len + gen_config.max_gen_len;
     const int Hkv = mConfig.NumKeyValHeads;
@@ -490,6 +551,18 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         alloc(static_cast<std::size_t>(total_batch) * sizeof(int32_t), "grpo_sampled"));
     auto* logprobs_gpu = reinterpret_cast<float*>(
         alloc(static_cast<std::size_t>(total_batch) * sizeof(float), "grpo_logprobs"));
+    auto* generated_tokens_gpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(gen_config.max_gen_len) * static_cast<std::size_t>(total_batch) * sizeof(int32_t),
+              "grpo_generated_tokens"));
+    auto* generated_logprobs_gpu = reinterpret_cast<float*>(
+        alloc(static_cast<std::size_t>(gen_config.max_gen_len) * static_cast<std::size_t>(total_batch) * sizeof(float),
+              "grpo_generated_logprobs"));
+    auto* completion_lens_gpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(total_batch) * sizeof(int32_t), "grpo_completion_lens"));
+    CUDA_CHECK(cudaMemsetAsync(completion_lens_gpu, 0,
+                               static_cast<std::size_t>(total_batch) * sizeof(int32_t), mRunState.MainStream));
+    auto* active_count_gpu = reinterpret_cast<int*>(
+        alloc(sizeof(int), "grpo_active_count"));
     auto* grpo_finished_gpu = reinterpret_cast<int*>(
         alloc(static_cast<std::size_t>(total_batch) * sizeof(int), "grpo_finished"));
     CUDA_CHECK(cudaMemsetAsync(grpo_finished_gpu, 0,
@@ -505,20 +578,11 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
                                    cudaMemcpyHostToDevice, mRunState.MainStream));
     }
 
-    cudaStream_t copy_stream = nullptr;
-    CUDA_CHECK(cudaStreamCreate(&copy_stream));
-    int32_t* pinned_tokens = nullptr;
-    float* pinned_logprobs = nullptr;
-    CUDA_CHECK(cudaMallocHost(&pinned_tokens, static_cast<std::size_t>(total_batch) * sizeof(int32_t)));
-    CUDA_CHECK(cudaMallocHost(&pinned_logprobs, static_cast<std::size_t>(total_batch) * sizeof(float)));
-
     // ========================================================================
     // Initialize state for all M×N sequences
     // ========================================================================
     std::vector<Trajectory> trajectories(static_cast<std::size_t>(total_batch));
     std::vector<int> seq_lens_host(static_cast<std::size_t>(total_batch), 0);
-    std::vector<bool> finished(static_cast<std::size_t>(total_batch), false);
-    int num_active = total_batch;
 
     std::vector<int> prompt_lens_host(static_cast<std::size_t>(total_batch));
     std::vector<int> prefill_lens_per_prompt(static_cast<std::size_t>(M), 0);
@@ -627,8 +691,18 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         }
     }
 
-    // Upload the full block table to GPU for the decode phase
-    paged_kv.upload_block_table(mRunState.MainStream);
+    // Pre-allocate all missing pages for decode once. This removes per-step
+    // host-side page-boundary checks and block-table uploads from the hot loop.
+    {
+        for (int i = 0; i < total_batch; ++i) {
+            for (int vp = 0; vp < paged_kv.max_pages_per_seq; ++vp) {
+                if (paged_kv.get_block_table(i, vp) < 0) {
+                    paged_kv.alloc_suffix_page(i, vp);
+                }
+            }
+        }
+        paged_kv.upload_block_table(mRunState.MainStream);
+    }
 
     // ========================================================================
     // Decode loop: all M×N sequences decode in parallel
@@ -669,56 +743,32 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
                                    static_cast<std::size_t>(total_batch) * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, mRunState.MainStream));
     }
+    CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu, seq_lens_host.data(),
+                               static_cast<std::size_t>(total_batch) * sizeof(int),
+                               cudaMemcpyHostToDevice, mRunState.MainStream));
 
     uint64_t rng_offset = 0;
-    cudaEvent_t compute_done;
-    CUDA_CHECK(cudaEventCreate(&compute_done));
+    decode_state.max_seqlen_k = max_total_len;
+    int generated_steps = gen_config.max_gen_len;
+    int active_count_host = total_batch;
+    const int stop_check_start = std::max(16, gen_config.max_gen_len / 2);
+    const int stop_check_interval = std::max(16, gen_config.max_gen_len / 8);
+    const bool use_direct_logits_sampling =
+        (gen_config.temperature == 1.0f) &&
+        (gen_config.top_k <= 0) &&
+        (gen_config.top_p >= 1.0f) &&
+        (gen_config.min_p <= 0.0f);
 
-    // Pre-allocate host buffers used every step (avoid heap allocs in hot loop)
-    std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(total_batch));
-    std::vector<int> finished_host(static_cast<std::size_t>(total_batch), 0);
-
-    for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
-        // ----------------------------------------------------------------
-        // Paged KV: allocate suffix pages for sequences crossing a page boundary
-        // ----------------------------------------------------------------
-        {
-            bool block_table_dirty = false;
-            for (int i = 0; i < total_batch; ++i) {
-                if (finished[static_cast<std::size_t>(i)]) continue;
-                const int new_pos = seq_lens_host[static_cast<std::size_t>(i)];
-                const int virtual_page = new_pos / kPageBlockSize;
-                if (paged_kv.get_block_table(i, virtual_page) < 0) {
-                    paged_kv.alloc_suffix_page(i, virtual_page);
-                    block_table_dirty = true;
-                }
-            }
-            if (block_table_dirty) {
-                paged_kv.upload_block_table(mRunState.MainStream);
-            }
-        }
+    for (int step = 0; step < gen_config.max_gen_len; ++step) {
 
         // ----------------------------------------------------------------
         // Upload metadata for this decode step
         // ----------------------------------------------------------------
-        CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu, seq_lens_host.data(),
-                                   static_cast<std::size_t>(total_batch) * sizeof(int),
-                                   cudaMemcpyHostToDevice, mRunState.MainStream));
-        if (gen_config.use_cuda_graphs) {
-            decode_state.max_seqlen_k = max_prompt_len + gen_config.max_gen_len;
-        } else {
-            decode_state.max_seqlen_k = *std::max_element(seq_lens_host.begin(), seq_lens_host.end()) + 1;
-        }
-
         fill_decode_cu_seqlens(cu_seqlens_q_gpu, seqused_k_gpu,
                                seq_lens_gpu, total_batch, mRunState.MainStream);
-
-        for (int i = 0; i < total_batch; ++i) {
-            pos_ids_host[static_cast<std::size_t>(i)] = seq_lens_host[static_cast<std::size_t>(i)];
-        }
-        CUDA_CHECK(cudaMemcpyAsync(position_ids_gpu, pos_ids_host.data(),
+        CUDA_CHECK(cudaMemcpyAsync(position_ids_gpu, seq_lens_gpu,
                                    static_cast<std::size_t>(total_batch) * sizeof(int32_t),
-                                   cudaMemcpyHostToDevice, mRunState.MainStream));
+                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
         // Mask finished sequences
         mask_finished_tokens(last_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
@@ -729,8 +779,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         graph_executor.execute_decode_step(
             static_cast<long>(total_batch), last_tokens_gpu, position_ids_gpu,
             decode_state, comm, hook, gen_config.use_cuda_graphs);
-        // Match HF invalid-value handling before sampling.
-        sampling_sanitize_logits(logits_gpu, total_batch, V, mRunState.MainStream);
+        if (sanitize_logits_enabled()) {
+            // Match HF remove_invalid_values behavior when explicitly enabled.
+            sampling_sanitize_logits(logits_gpu, total_batch, V, mRunState.MainStream);
+        }
 
         // Check for async errors after decode step (catches OOB writes in
         // LoRA hooks, attention, etc. that would otherwise surface later
@@ -739,6 +791,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
 
         if (gen_config.temperature <= 0.0f) {
             sampling_argmax(logits_gpu, sampled_tokens_gpu, total_batch, V, mRunState.MainStream);
+        } else if (use_direct_logits_sampling) {
+            sampling_from_logits(logits_gpu, sampled_tokens_gpu, total_batch, V,
+                                 /*deterministic=*/false, gen_config.seed, rng_offset,
+                                 mRunState.MainStream);
         } else {
             sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
                              total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
@@ -769,70 +825,84 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         mask_finished_tokens(sampled_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
         rng_offset++;
 
-        if (gen_config.temperature <= 0.0f) {
-            sampling_softmax(logits_gpu, probs_gpu, nullptr,
-                             total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
-                             mRunState.MainStream);
+        if (gen_config.temperature <= 0.0f || use_direct_logits_sampling) {
+            sampling_extract_logprob_from_logits(
+                logits_gpu, sampled_tokens_gpu, logprobs_gpu,
+                /*temperature=*/nullptr,
+                total_batch, V, mRunState.MainStream);
+        } else {
+            sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                     total_batch, V, mRunState.MainStream);
         }
-        sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
-                                 total_batch, V, mRunState.MainStream);
 
-        // ----------------------------------------------------------------
-        // D2H: copy sampled tokens and logprobs to pinned host memory.
-        // Single-stream sync — simple and race-free.
-        // ----------------------------------------------------------------
-        CUDA_CHECK(cudaEventRecord(compute_done, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, compute_done, 0));
-        CUDA_CHECK(cudaMemcpyAsync(pinned_tokens, sampled_tokens_gpu,
-                                   static_cast<std::size_t>(total_batch) * sizeof(int32_t),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaMemcpyAsync(pinned_logprobs, logprobs_gpu,
-                                   static_cast<std::size_t>(total_batch) * sizeof(float),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+        // Store step outputs on GPU; host copies are done once after decode.
+        const std::size_t step_off =
+            static_cast<std::size_t>(step) * static_cast<std::size_t>(total_batch);
+        CUDA_CHECK(cudaMemcpyAsync(
+            generated_tokens_gpu + step_off, sampled_tokens_gpu,
+            static_cast<std::size_t>(total_batch) * sizeof(int32_t),
+            cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            generated_logprobs_gpu + step_off, logprobs_gpu,
+            static_cast<std::size_t>(total_batch) * sizeof(float),
+            cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
         // Feed sampled tokens back for next step.
         CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu, sampled_tokens_gpu,
                                    static_cast<std::size_t>(total_batch) * sizeof(int32_t),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        update_generation_state(
+            sampled_tokens_gpu,
+            grpo_finished_gpu,
+            seq_lens_gpu,
+            completion_lens_gpu,
+            static_cast<int32_t>(gen_config.eos_token_id),
+            total_batch,
+            mRunState.MainStream);
 
-        // EOS detection + trajectory update
-        bool finished_changed = false;
-        for (int i = 0; i < total_batch; ++i) {
-            if (finished[static_cast<std::size_t>(i)]) continue;
-            const int32_t token = pinned_tokens[i];
-            const float logprob = pinned_logprobs[i];
-            trajectories[static_cast<std::size_t>(i)].tokens.push_back(token);
-            trajectories[static_cast<std::size_t>(i)].logprobs.push_back(logprob);
-            seq_lens_host[static_cast<std::size_t>(i)]++;
-            if (token == gen_config.eos_token_id) {
-                finished[static_cast<std::size_t>(i)] = true;
-                finished_changed = true;
-                trajectories[static_cast<std::size_t>(i)].completion_len = step + 1;
-                num_active--;
+        if ((step + 1) >= stop_check_start &&
+            (((step + 1 - stop_check_start) % stop_check_interval) == 0 ||
+             (step + 1) == gen_config.max_gen_len)) {
+            count_active_sequences(
+                grpo_finished_gpu, active_count_gpu, total_batch, mRunState.MainStream);
+            CUDA_CHECK(cudaMemcpyAsync(&active_count_host, active_count_gpu, sizeof(int),
+                                       cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            if (active_count_host == 0) {
+                generated_steps = step + 1;
+                break;
             }
-        }
-        if (finished_changed) {
-            for (int i = 0; i < total_batch; ++i) {
-                finished_host[static_cast<std::size_t>(i)] = finished[static_cast<std::size_t>(i)] ? 1 : 0;
-            }
-            CUDA_CHECK(cudaMemcpyAsync(grpo_finished_gpu, finished_host.data(),
-                                       static_cast<std::size_t>(total_batch) * sizeof(int),
-                                       cudaMemcpyHostToDevice, mRunState.MainStream));
         }
     }
+
+    std::vector<int32_t> completion_lens_host(static_cast<std::size_t>(total_batch), 0);
+    std::vector<int32_t> generated_tokens_host(
+        static_cast<std::size_t>(generated_steps) * static_cast<std::size_t>(total_batch), 0);
+    std::vector<float> generated_logprobs_host(
+        static_cast<std::size_t>(generated_steps) * static_cast<std::size_t>(total_batch), 0.0f);
+    CUDA_CHECK(cudaMemcpyAsync(completion_lens_host.data(), completion_lens_gpu,
+                               static_cast<std::size_t>(total_batch) * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, mRunState.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(generated_tokens_host.data(), generated_tokens_gpu,
+                               generated_tokens_host.size() * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, mRunState.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(generated_logprobs_host.data(), generated_logprobs_gpu,
+                               generated_logprobs_host.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost, mRunState.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
 
     for (int i = 0; i < total_batch; ++i) {
-        if (!finished[static_cast<std::size_t>(i)]) {
-            trajectories[static_cast<std::size_t>(i)].completion_len =
-                static_cast<int>(trajectories[static_cast<std::size_t>(i)].tokens.size())
-                - trajectories[static_cast<std::size_t>(i)].prompt_len;
+        int cl = completion_lens_host[static_cast<std::size_t>(i)];
+        cl = std::max(0, std::min(cl, generated_steps));
+        trajectories[static_cast<std::size_t>(i)].completion_len = cl;
+        for (int step = 0; step < cl; ++step) {
+            const std::size_t off =
+                static_cast<std::size_t>(step) * static_cast<std::size_t>(total_batch)
+                + static_cast<std::size_t>(i);
+            trajectories[static_cast<std::size_t>(i)].tokens.push_back(generated_tokens_host[off]);
+            trajectories[static_cast<std::size_t>(i)].logprobs.push_back(generated_logprobs_host[off]);
         }
     }
-    CUDA_CHECK(cudaEventDestroy(compute_done));
-    CUDA_CHECK(cudaStreamDestroy(copy_stream));
-    CUDA_CHECK(cudaFreeHost(pinned_tokens));
-    CUDA_CHECK(cudaFreeHost(pinned_logprobs));
     for (auto& [_, ptr] : grpo_recurrent_states) {
         if (ptr) cudaFree(ptr);
     }
@@ -840,9 +910,8 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         if (ptr) cudaFree(ptr);
     }
 
-    // Invalidate the cached decode CUDA graph before restoring the arena.
-    // The graph captures pointers into the arena (KV cache, logits, etc.)
-    // that become stale after arena.restore().
+    // Invalidate decode graph before arena restore: captured graph arguments
+    // include generation arena pointers that become stale after restore.
     graph_executor.invalidate_decode_graph();
 
     // Clear any prefix boundary that generation may have left, so

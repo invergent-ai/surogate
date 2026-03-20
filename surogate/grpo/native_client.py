@@ -119,7 +119,7 @@ class NativeClient(Client[None, list[dict], dict, None]):
             temperature=max(temperature, 1e-6),  # Avoid exact 0 (use small temp for ~greedy)
             eos_token_id=self.eos_id,
             use_lora=self.use_lora,
-            use_cuda_graphs=False,
+            use_cuda_graphs=True,
             top_k=top_k,
             top_p=top_p,
         )
