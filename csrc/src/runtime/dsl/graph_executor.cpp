@@ -1722,9 +1722,28 @@ void GraphExecutor::execute_prefill(long B, long T,
         throw std::runtime_error("GraphExecutor: compiled executor not initialized");
     }
 
-    compile_graphs(B, T);
-    if (!mCompiledForward) {
-        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
+    // Compile a separate forward graph for prefill (same as decode: don't
+    // touch the training-compiled mCompiledForward/mCompiledBackward).
+    if (!mCompiler || !mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiler/executor not initialized");
+    }
+    // Reuse the decode compiled graph if dimensions match, otherwise compile fresh.
+    // Disable doc_masking and recompute for prefill (paged attention handles masking,
+    // no backward during prefill).
+    if (B != mDecodeCompiledB || T != mDecodeCompiledT) {
+        auto& opts = const_cast<RuntimeOptions&>(mOptions);
+        const bool saved_doc_masking = opts.DocMasking;
+        const auto saved_recompute = opts.Recompute;
+        opts.DocMasking = false;
+        opts.Recompute = RecomputeLevel::None;
+
+        mDecodeCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+        mDecodeCompiledForward->compute_layer_segments();
+        mDecodeCompiledB = B;
+        mDecodeCompiledT = T;
+
+        opts.DocMasking = saved_doc_masking;
+        opts.Recompute = saved_recompute;
     }
 
     DslRunState& rs = mRunState;
@@ -1737,10 +1756,6 @@ void GraphExecutor::execute_prefill(long B, long T,
 
     // Initialize targets to -100 (masked) so fused_lm_head_loss produces zero loss.
     if (rs.Targets.Data) {
-        CUDA_CHECK(cudaMemsetAsync(rs.Targets.Data, 0xFF,
-                                   static_cast<std::size_t>(B * T) * sizeof(std::int32_t),
-                                   rs.MainStream));  // 0xFFFFFFFF = -1 as int32, close to -100
-        // Actually fill with -100 properly
         std::vector<std::int32_t> targets_fill(static_cast<std::size_t>(B * T), -100);
         CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_fill.data(),
                                    static_cast<std::size_t>(B * T) * sizeof(std::int32_t),
@@ -1758,12 +1773,15 @@ void GraphExecutor::execute_prefill(long B, long T,
     float* saved_logits = decode_state.logits_out_gpu;
     decode_state.logits_out_gpu = nullptr;
     mCompiledExecutor->set_decode_state(&decode_state);
+    // Prefill is inference-only: never run recompute replay paths here.
+    mCompiledExecutor->set_recompute_enabled(false);
+    mCompiledExecutor->set_recompute_use_graphs(false);
     mCompiledExecutor->set_dimensions(B, T);
 
     static const std::vector<std::string> empty_save_list;
     mCompiledExecutor->set_save_list(&empty_save_list);
 
-    mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, hook);
+    mCompiledExecutor->execute_forward(*mDecodeCompiledForward, comm, /*full=*/false, hook);
 
     // Restore state
     decode_state.prefill_mode = false;
@@ -1789,9 +1807,29 @@ void GraphExecutor::execute_decode_step(long B,
     }
 
     const long T = 1;
-    compile_graphs(B, T);
-    if (!mCompiledForward) {
-        throw std::runtime_error("GraphExecutor: compiled forward graph not available");
+
+    // Compile a SEPARATE forward graph for decode so we don't mutate
+    // the training-compiled mCompiledForward/mCompiledBackward.
+    // Decode doesn't need doc_masking (paged attention handles masking)
+    // or recompute (no backward pass during decode).
+    if (!mCompiler || !mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiler/executor not initialized");
+    }
+    if (B != mDecodeCompiledB || T != mDecodeCompiledT) {
+        // Temporarily disable doc_masking and recompute for decode compilation
+        auto& opts = const_cast<RuntimeOptions&>(mOptions);
+        const bool saved_doc_masking = opts.DocMasking;
+        const auto saved_recompute = opts.Recompute;
+        opts.DocMasking = false;
+        opts.Recompute = RecomputeLevel::None;
+
+        mDecodeCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+        mDecodeCompiledForward->compute_layer_segments();
+        mDecodeCompiledB = B;
+        mDecodeCompiledT = T;
+
+        opts.DocMasking = saved_doc_masking;
+        opts.Recompute = saved_recompute;
     }
 
     DslRunState& rs = mRunState;
@@ -1816,6 +1854,9 @@ void GraphExecutor::execute_decode_step(long B,
 
     // Set decode mode
     mCompiledExecutor->set_decode_state(&decode_state);
+    // Decode is inference-only: never run recompute replay paths here.
+    mCompiledExecutor->set_recompute_enabled(false);
+    mCompiledExecutor->set_recompute_use_graphs(false);
     mCompiledExecutor->set_dimensions(B, T);
     static const std::vector<std::string> empty_save_list;
     mCompiledExecutor->set_save_list(&empty_save_list);
@@ -1827,11 +1868,10 @@ void GraphExecutor::execute_decode_step(long B,
             mDecodeGraphExec = nullptr;
         }
 
-        // CUDA graph capture/replay using the existing stack checkpoint pattern
         trace_or_execute_cuda_graph_with_stack(
             [&]() {
                 mCompiledExecutor->execute_forward(
-                    *mCompiledForward, comm, /*full=*/false, hook);
+                    *mDecodeCompiledForward, comm, /*full=*/false, hook);
             },
             rs.MainStream,
             mDecodeGraphExec,
@@ -1841,7 +1881,7 @@ void GraphExecutor::execute_decode_step(long B,
         mDecodeGraphB = B;
     } else {
         mCompiledExecutor->execute_forward(
-            *mCompiledForward, comm, /*full=*/false, hook);
+            *mDecodeCompiledForward, comm, /*full=*/false, hook);
     }
 
     mCompiledExecutor->set_decode_state(nullptr);
@@ -1854,16 +1894,11 @@ void GraphExecutor::invalidate_decode_graph() {
         mDecodeGraphExec = nullptr;
         mDecodeGraphB = 0;
     }
-}
-
-void GraphExecutor::force_recompile() {
-    // Reset compiled dimensions so compile_graphs() recompiles on next use.
-    // This is needed after generation changes the compiled state for decode
-    // dimensions that are incompatible with training.
-    mCompiledB = 0;
-    mCompiledT = 0;
-    mCompiledForward.reset();
-    mCompiledBackward.reset();
+    // Also release the decode-specific compiled forward graph.
+    // It will be recompiled on the next execute_decode_step call.
+    mDecodeCompiledForward.reset();
+    mDecodeCompiledB = 0;
+    mDecodeCompiledT = 0;
 }
 
 // ============================================================================

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <cfloat>
 
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -47,6 +48,36 @@ void sampling_softmax(
         throw std::runtime_error(
             std::string("sampling_softmax failed: ") + cudaGetErrorString(err));
     }
+}
+
+namespace {
+
+__global__ void sanitize_logits_kernel(
+        float* __restrict__ logits,
+        int total) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const float x = logits[idx];
+    if (isnan(x)) {
+        logits[idx] = 0.0f;
+    } else if (isinf(x)) {
+        logits[idx] = x > 0.0f ? FLT_MAX : -FLT_MAX;
+    }
+}
+
+}  // namespace
+
+void sampling_sanitize_logits(
+        float* logits,
+        int batch_size,
+        int vocab_size,
+        cudaStream_t stream) {
+    if (batch_size <= 0 || vocab_size <= 0) return;
+    const int total = batch_size * vocab_size;
+    constexpr int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    sanitize_logits_kernel<<<blocks, threads, 0, stream>>>(logits, total);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================
@@ -422,6 +453,10 @@ __global__ void extract_logprob_kernel(
     if (idx >= batch_size) return;
 
     const int token = token_ids[idx];
+    if (token < 0 || token >= vocab_size) {
+        logprobs[idx] = logf(1e-10f);
+        return;
+    }
     const float prob = probs[static_cast<long>(idx) * vocab_size + token];
     logprobs[idx] = logf(fmaxf(prob, 1e-10f));  // clamp to avoid log(0)
 }

@@ -1,0 +1,98 @@
+# Native GRPO training with Qwen3-0.6B + LoRA
+#
+# Single-process GRPO: generation, scoring, and training happen in one process.
+# No vLLM, no orchestrator, no transport layer.
+#
+# Usage:
+#   surogate grpo-native examples/grpo-native/qwen3-lora.yaml
+
+model: Qwen/Qwen3-0.6B
+output_dir: ./grpo-native-qwen3
+
+# Training
+gpus: 1
+per_device_train_batch_size: 1
+sequence_len: 256
+max_steps: 20
+learning_rate: 2e-5
+lr_scheduler_type: constant
+optimizer: adamw_8bit
+weight_decay: 0.01
+max_grad_norm: 1.0
+recipe: bf16
+
+# LoRA
+lora: true
+lora_rank: 8
+lora_alpha: 16
+
+# GRPO generation
+generation:
+  num_completions: 4
+  max_gen_len: 64
+  top_p: 0.9
+  top_k: 0
+
+# Sampling (temperature scheduling)
+sampling:
+  temperature: 0.8
+
+# Reward (callback mode with a simple length+diversity reward)
+# For verifiers mode, replace with:
+#   reward:
+#     mode: verifiers
+#     env:
+#       - id: gsm8k
+reward:
+  mode: callback
+  reward_fn_import_path: surogate.grpo.reward_fns.length_diversity_reward
+  prompts:
+    - "The meaning of life is"
+    - "To build a great AI system, you need"
+    - "The most important scientific discovery was"
+    - "In a galaxy far far away,"
+    - "The best way to learn programming is"
+    - "Climate change can be addressed by"
+    - "The future of artificial intelligence will"
+    - "A good leader should always"
+
+# GRPO loss
+loss:
+  kl_tau: 0.001
+  adv_tau: 1.0
+  ipo_mask_low: 0.2
+  ipo_mask_high: 0.2
+
+# Advantage (per-problem baseline subtraction)
+advantage:
+  type: default
+
+# Batch size (number of unique prompts per step)
+problems_per_step: 2
+
+# Checkpointing
+save_steps: 50
+
+# Monitoring (W&B)
+# report_to:
+#   project: Surogate-GRPO-Native
+
+# Online evaluation
+# eval:
+#   env:
+#     - id: gsm8k
+#   num_examples: 50
+#   rollouts_per_example: 1
+#   interval: 25
+#   temperature: 0.0
+
+# Filters (gibberish + repetition detection)
+# filters:
+#   - type: gibberish
+#     enforce: true
+#     token_id_threshold: 100000
+#     logprob_offset: 2.0
+#   - type: repetition
+#     enforce: true
+#     window: 3000
+#     prob_threshold: 0.99

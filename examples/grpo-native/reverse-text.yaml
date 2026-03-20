@@ -1,0 +1,62 @@
+# Native GRPO: reverse-text with verifiers
+#
+# Equivalent to the 3-process examples/grpo/{train,orch,infer}.yaml setup
+# but in a single process with native generation.
+#
+# Usage:
+#   surogate grpo-native examples/grpo-native/reverse-text.yaml
+
+model: ./reverse-text-qwen3-2
+output_dir: ./grpo-native-reverse-text
+
+# Training
+gpus: 1
+per_device_train_batch_size: 1
+sequence_len: 2048
+max_steps: 5
+learning_rate: 1e-4
+lr_scheduler_type: constant
+warmup_steps: 0
+max_grad_norm: 1.0
+weight_decay: 0.01
+optimizer: adamw
+recipe: bf16
+
+# LoRA
+lora: true
+lora_rank: 16
+lora_alpha: 32
+
+# Generation (match production: rollouts_per_example=16, max_tokens=128)
+generation:
+  num_completions: 16
+  max_gen_len: 128
+  top_p: 1.0
+  top_k: 0
+
+# Sampling
+sampling:
+  temperature: 1.0
+
+# Reward (verifiers mode — uses the reverse-text environment)
+reward:
+  mode: verifiers
+  env:
+    - id: reverse-text
+
+# Loss
+loss:
+  kl_tau: 0.001
+  adv_tau: 1.0
+  ipo_mask_low: 0.2
+  ipo_mask_high: 0.2
+
+# Advantage
+advantage:
+  type: default
+
+# Batch size (number of unique prompts per step)
+problems_per_step: 8
+
+# Checkpointing
+save_steps: 100

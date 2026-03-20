@@ -268,11 +268,6 @@ public:
     /// the graph captures pointers into the arena that become stale.
     void invalidate_decode_graph();
 
-    /// Force recompilation of the forward/backward graphs on next use.
-    /// Call after generation to ensure training gets freshly compiled graphs
-    /// for its own (B, T) dimensions.
-    void force_recompile();
-
 private:
     void init(const GraphExecutorOptions& options);
     void reset_cuda_graphs();
@@ -420,6 +415,13 @@ private:
     std::unique_ptr<CompiledGraph> mCompiledBackward;
     long mCompiledB = 0;
     long mCompiledT = 0;
+
+    // Separate compiled forward graph for decode (execute_decode_step).
+    // Decode uses (large B, T=1) which differs from training (small B, large T).
+    // Keeping them separate prevents decode from corrupting training state.
+    std::unique_ptr<CompiledGraph> mDecodeCompiledForward;
+    long mDecodeCompiledB = 0;
+    long mDecodeCompiledT = 0;
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);

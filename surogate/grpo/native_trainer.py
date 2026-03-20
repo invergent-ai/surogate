@@ -76,21 +76,17 @@ class NativeGRPOTrainer:
 
         jit_manifests = compile_jit_kernels(ir_json)
 
-        # --- Build clean RuntimeOptions ---
-        # SFTConfig.__post_init__() sets many runtime options designed for
-        # the pure-training path that conflict with the generate-then-train
-        # loop (e.g. activation buffer layout). Build a minimal RuntimeOptions
-        # with only what's needed.
-        options = _surogate.RuntimeOptions()
+        # --- Runtime options ---
+        # Start from the fully configured SFT runtime options (production parity),
+        # then inject native-specific IR/JIT and hard requirements.
+        rc = config.runtime_config
+        options = rc
         options.dsl_ir_json = ir_json
         if jit_manifests:
             options.jit_kernel_manifests = jit_manifests
-        # Copy safe options from the SFTConfig-derived runtime_config
-        rc = config.runtime_config
-        options.lmhead_chunks = getattr(rc, "lmhead_chunks", 8)
         options.use_cuda_graphs = False
-        if hasattr(rc, "ep_size"):
-            options.ep_size = rc.ep_size
+        options.doc_masking = getattr(rc, "doc_masking", True)
+        options.recompute = "true"
 
         # Ensure the DeviceMemoryStack is large enough for the paged KV cache
         # during generation. KV per token ≈ 2 * Hkv * Hs * num_layers * 2 bytes.
@@ -111,12 +107,16 @@ class NativeGRPOTrainer:
                 head_dim = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size") // HfConfigFactory.get_config_attr(hf_cfg, "num_attention_heads")
                 max_total = 100 + gen.max_gen_len  # prompt + gen
                 kv_bytes = 2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
-                min_stack_mb = max(2048, int(kv_bytes / (1024 * 1024) * 3.0))  # 3x margin (paged KV over-allocates for max_total_len)
+                # Training activations: ~hidden_size * seq_len * 4 bytes per
+                # intermediate tensor, with ~4 such tensors per layer
+                hidden_size = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size")
+                train_bytes = hidden_size * config.sequence_len * 4 * 4 * n_layers
+                total_bytes = kv_bytes * 3.0 + train_bytes * 2.0
+                min_stack_mb = max(4096, int(total_bytes / (1024 * 1024)))
                 os.environ["SUROGATE_MIN_STACK_MB"] = str(min_stack_mb)
-                logger.info(f"Set SUROGATE_MIN_STACK_MB={min_stack_mb} for {total_seqs} sequences")
+                logger.info(f"Set SUROGATE_MIN_STACK_MB={min_stack_mb} for {total_seqs} sequences, seq_len={config.sequence_len}")
             except Exception:
-                os.environ["SUROGATE_MIN_STACK_MB"] = "4096"
-
+                os.environ["SUROGATE_MIN_STACK_MB"] = "8192"
         # --- Build LoRA config ---
         # Use a clean LoRA config with just rank/alpha from the YAML.
         # SFTConfig's lora_config may have target_modules='all' which
@@ -285,6 +285,24 @@ class NativeGRPOTrainer:
             return compute_temperature(step, config.sampling, config.max_steps)
         return 1.0
 
+    def _encode_prompt(self, prompt: str) -> list[int]:
+        """Encode a prompt into safe in-vocab token ids."""
+        token_ids = list(self.tokenizer.encode(prompt, add_special_tokens=True))
+        vocab_size = int(self._vocab_size)
+        fallback = self.eos_id if 0 <= int(self.eos_id) < vocab_size else 0
+
+        if not token_ids:
+            return [fallback]
+
+        safe_ids = []
+        for tid in token_ids:
+            tid_i = int(tid)
+            if 0 <= tid_i < vocab_size:
+                safe_ids.append(tid_i)
+            else:
+                safe_ids.append(fallback)
+        return safe_ids
+
     def generate_rollout(
         self,
         prompts: list[str],
@@ -302,16 +320,9 @@ class NativeGRPOTrainer:
         num_completions = gen.num_completions
 
         # Tokenize prompts
-        prompt_token_ids = [self.tokenizer.encode(p) for p in prompts]
+        prompt_token_ids = [self._encode_prompt(p) for p in prompts]
 
-        # Generate completions. Batch as many prompts as possible per call
-        # to maximize GPU utilization (paged KV cache shares prefix pages).
-        # The max batch is limited by the training buffer size (B*T elements
-        # in the input tensor). With B=1,T=seq_len, we can fit up to seq_len
-        # decode sequences (each needs 1 element per step).
-        # Batch all prompts into a single generate_grpo() call for max GPU
-        # utilization. The paged KV cache shares prefix pages across the N
-        # completions per prompt.
+        # Generate completions with paged GRPO decode.
         gen_start = time.time()
         tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
             prompts=prompt_token_ids,
@@ -687,33 +698,72 @@ class NativeGRPOTrainer:
         loss_mask_override: np.ndarray,
         completion_masks: list[np.ndarray] | None = None,
     ) -> tuple[dict, int]:
-        """Run forward_for_grpo + backward_grpo on each trajectory.
+        """Pack trajectories and run forward_for_grpo + backward_grpo.
 
-        Args:
-            completion_masks: Optional per-token masks for each trajectory's
-                completion region. When provided (multi-turn), tokens with
-                mask=False (e.g. environment responses) are excluded from loss.
-                When None (single-turn), all completion tokens contribute.
+        Uses First Fit Decreasing packing to combine multiple short
+        trajectories into packed sequences, dramatically reducing the
+        number of forward/backward passes (e.g. 128 trajectories → ~12
+        packed micro-batches with seq_len=2048).
 
         Returns (step_metrics, loss_scale).
         """
+        from surogate.grpo.batch import prepare_sample, packed_samples_into_micro_bs
+        from surogate.grpo.data import microbatch_to_numpy
+        from surogate.grpo.trainer import _find_sample_boundaries
+        from surogate.grpo.transport.types import TrainingSample
+
         config = self.config
         seq_len = config.sequence_len
         ngpu = config.gpus
         loss_config = config.loss or GRPOLossConfig()
         total = len(all_tokens)
+        temperature = self._get_temperature(0)  # For completion_temperatures
 
-        # Count active completion tokens for loss scaling
-        loss_scale = 0
+        # --- Build TrainingSamples from raw trajectory data ---
+        samples: list[TrainingSample] = []
         for i in range(total):
-            if loss_mask_override[i]:
-                if completion_masks is not None:
-                    loss_scale += int(completion_masks[i].sum())
-                else:
-                    loss_scale += int(completion_lens[i])
+            pl = prompt_lens[i]
+            cl = completion_lens[i]
+            toks = all_tokens[i]
+
+            prompt_ids = list(toks[:pl])
+            completion_ids = list(toks[pl : pl + cl])
+            prompt_mask = [False] * pl
+
+            if completion_masks is not None and loss_mask_override[i]:
+                comp_mask = list(completion_masks[i][:cl].astype(bool))
+            elif loss_mask_override[i]:
+                comp_mask = [True] * cl
+            else:
+                comp_mask = [False] * cl
+
+            traj_lp = all_logprobs[i]
+            comp_lp = list(traj_lp[:cl]) if len(traj_lp) >= cl else list(traj_lp) + [0.0] * (cl - len(traj_lp))
+            comp_temps = [temperature] * cl
+
+            samples.append(TrainingSample(
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                completion_ids=completion_ids,
+                completion_mask=comp_mask,
+                completion_logprobs=comp_lp,
+                completion_temperatures=comp_temps,
+                advantage=float(advantages[i]),
+            ))
+
+        # --- Pack into micro-batches using First Fit Decreasing ---
+        packed_samples = [(0, prepare_sample(s, seq_len)) for s in samples]
+        micro_batches = packed_samples_into_micro_bs(packed_samples, seq_len, num_loras=1)
+
+        # Convert to numpy
+        numpy_batches = [microbatch_to_numpy(mb) for mb in micro_batches]
+        n_mb = len(numpy_batches)
+
+        # Compute loss_scale across all micro-batches
+        loss_scale = int(sum(int(mb["loss_mask"].sum()) for mb in numpy_batches))
         loss_scale = max(loss_scale, 1)
 
-        self.trainer.set_grad_accumulation(total)
+        self.trainer.set_grad_accumulation(n_mb)
 
         step_metrics = {
             "policy_loss": 0.0,
@@ -723,98 +773,68 @@ class NativeGRPOTrainer:
             "total_tokens": 0,
         }
 
-        for i in range(total):
-            pl = prompt_lens[i]
-            cl = completion_lens[i]
-            T_actual = pl + cl
+        for mb in numpy_batches:
+            input_ids = mb["input_ids"]       # [1, T_mb]
+            targets = mb["targets"]           # [1, T_mb]
+            position_ids = mb["position_ids"] # [1, T_mb]
+            adv_flat = mb["advantages"].flatten()
+            inf_lp = mb["inference_logprobs"].flatten()
+            loss_mask_flat = mb["loss_mask"].flatten()
+
+            T_actual = input_ids.shape[1]
 
             # Pad to seq_len
-            input_padded = np.zeros((1, seq_len), dtype=np.int32)
-            input_padded[0, : min(T_actual, seq_len)] = all_tokens[i][:seq_len]
-
-            # Targets: shifted input_ids, masked to completion only
-            targets_padded = np.full((1, seq_len), -100, dtype=np.int32)
-            if loss_mask_override[i]:
-                for t in range(pl - 1, min(T_actual - 1, seq_len - 1)):
-                    targets_padded[0, t] = all_tokens[i][t + 1]
-
-            pos_padded = np.zeros((1, seq_len), dtype=np.int32)
-            pos_padded[0, : min(T_actual, seq_len)] = np.arange(
-                min(T_actual, seq_len), dtype=np.int32
-            )
             if T_actual < seq_len:
-                last_pos = min(T_actual, seq_len) - 1
-                pos_padded[0, T_actual:] = np.arange(
-                    last_pos + 1, last_pos + 1 + seq_len - T_actual, dtype=np.int32
-                )
+                pad_w = seq_len - T_actual
+                input_ids = np.pad(input_ids, ((0, 0), (0, pad_w)), constant_values=0)
+                targets = np.pad(targets, ((0, 0), (0, pad_w)), constant_values=-100)
+                last_pos = int(position_ids[0, T_actual - 1])
+                pad_pos = np.arange(last_pos + 1, last_pos + 1 + pad_w, dtype=np.int32).reshape(1, -1)
+                position_ids = np.concatenate([position_ids, pad_pos], axis=1)
+
+            # Apply loss_mask to targets (mask prompt tokens)
+            tmask = loss_mask_flat[:T_actual].astype(bool)
+            tmask_shifted = np.zeros_like(tmask)
+            if T_actual > 1:
+                tmask_shifted[:-1] = tmask[1:]
+            masked_targets = targets.copy()
+            masked_targets[0, :T_actual][~tmask_shifted] = -100
 
             if ngpu > 1:
-                input_padded = np.tile(input_padded, (ngpu, 1))
-                targets_padded = np.tile(targets_padded, (ngpu, 1))
-                pos_padded = np.tile(pos_padded, (ngpu, 1))
+                input_ids = np.tile(input_ids, (ngpu, 1))
+                masked_targets = np.tile(masked_targets, (ngpu, 1))
+                position_ids = np.tile(position_ids, (ngpu, 1))
 
             # Forward: get policy logprobs
             raw_lp = self.trainer.forward_for_grpo(
-                input_padded, targets_padded, position_ids=pos_padded
+                input_ids, masked_targets, position_ids=position_ids
             )
             raw_lp = np.asarray(raw_lp[0, :T_actual], dtype=np.float32)
 
-            # Right-shift logprobs (align with token positions)
+            # Right-shift logprobs (global shift across packed sequence)
             trainer_logprobs = np.zeros(T_actual, dtype=np.float32)
             if T_actual > 1:
                 trainer_logprobs[1:T_actual] = raw_lp[: T_actual - 1]
             if self._pad_logprob is not None and T_actual > 0:
                 trainer_logprobs[0] = self._pad_logprob
 
-            # Build loss mask (bool — required by compute_grpo_per_token_grads)
-            loss_mask = np.zeros(T_actual, dtype=bool)
-            if loss_mask_override[i]:
-                if completion_masks is not None:
-                    # Use per-token mask (multi-turn: excludes env response tokens)
-                    mask_len = min(cl, len(completion_masks[i]))
-                    loss_mask[pl : pl + mask_len] = completion_masks[i][:mask_len]
-                else:
-                    loss_mask[pl : pl + cl] = True
+            # Find sample boundaries in the packed sequence
+            pos_flat = position_ids[0, :T_actual] if ngpu <= 1 else mb["position_ids"].flatten()[:T_actual]
+            sample_ranges = _find_sample_boundaries(pos_flat)
 
-            # Inference logprobs from rollout
-            inference_lp = np.zeros(T_actual, dtype=np.float32)
-            traj_lp = all_logprobs[i]
-            if len(traj_lp) > 0:
-                n_copy = min(cl, len(traj_lp))
-                inference_lp[pl : pl + n_copy] = np.array(
-                    traj_lp[:n_copy], dtype=np.float32
-                )
-
-            # Per-token advantages (broadcast scalar advantage to completion)
-            adv_flat = np.zeros(T_actual, dtype=np.float32)
-            adv_flat[pl : pl + cl] = advantages[i]
-
-            # Teacher logprobs (for KL distillation)
-            teacher_lp = None
-            if self._teacher_trainer is not None:
-                teacher_raw = self._teacher_trainer.forward_for_grpo(
-                    input_padded, targets_padded, position_ids=pos_padded
-                )
-                teacher_raw = np.asarray(teacher_raw[0, :T_actual], dtype=np.float32)
-                teacher_lp = np.zeros(T_actual, dtype=np.float32)
-                if T_actual > 1:
-                    teacher_lp[1:T_actual] = teacher_raw[: T_actual - 1]
-                if self._pad_logprob is not None and T_actual > 0:
-                    teacher_lp[0] = self._pad_logprob
-
-            # Compute GRPO per-token gradients
+            # Compute GRPO per-token gradients (per-sample within packed seq)
             per_token_grads, mb_metrics = compute_grpo_per_token_grads(
                 trainer_logprobs=trainer_logprobs,
-                inference_logprobs=inference_lp[:T_actual],
+                inference_logprobs=inf_lp[:T_actual],
                 advantages=adv_flat[:T_actual],
-                loss_mask=loss_mask[:T_actual],
+                loss_mask=loss_mask_flat[:T_actual],
                 loss_config=loss_config,
-                sample_ranges=[(0, T_actual)],
-                teacher_logprobs=teacher_lp[:T_actual] if teacher_lp is not None else None,
+                sample_ranges=sample_ranges,
             )
-            per_token_grads = per_token_grads / float(loss_scale)
+            if loss_scale > 1:
+                per_token_grads = per_token_grads / float(loss_scale)
 
-            # Left-shift gradients (align with training targets)
+            # Left-shift gradients (global shift)
             surogate_grads = np.zeros(T_actual, dtype=np.float32)
             if T_actual > 1:
                 surogate_grads[: T_actual - 1] = per_token_grads[1:T_actual]
@@ -824,18 +844,16 @@ class NativeGRPOTrainer:
             if ngpu > 1:
                 grads_padded = np.tile(grads_padded, (ngpu, 1))
 
-            # Backward
             self.trainer.backward_grpo(grads_padded)
 
-            # Accumulate metrics
             for key in step_metrics:
                 if key in mb_metrics:
                     step_metrics[key] += mb_metrics[key]
 
         # Normalize averaged metrics
-        if total > 0:
+        if n_mb > 0:
             for key in ("policy_loss", "mismatch_kl", "is_masked"):
-                step_metrics[key] /= max(total, 1)
+                step_metrics[key] /= max(n_mb, 1)
 
         return step_metrics, loss_scale
 
@@ -986,7 +1004,7 @@ class NativeGRPOTrainer:
                 eval_prompts.append(text)
 
             # Generate completions
-            prompt_token_ids = [self.tokenizer.encode(p) for p in eval_prompts]
+            prompt_token_ids = [self._encode_prompt(p) for p in eval_prompts]
             rollouts_per = eval_config.rollouts_per_example
 
             # Guard temperature: use small value for near-greedy instead of exact 0
@@ -1180,12 +1198,15 @@ class NativeGRPOTrainer:
         logger.info(
             f"  Completions per problem: {config.generation.num_completions}"
         )
+        logger.info("  Generation path: paged GRPO decode")
         logger.info(f"  Max gen length: {config.generation.max_gen_len}")
         logger.info(f"  Learning rate: {config.learning_rate}")
         logger.info(
             f"  LoRA: enabled={config.lora}, "
             f"rank={config.lora_rank}, alpha={config.lora_alpha}"
         )
+        logger.info(f"  Doc masking: {getattr(config, 'doc_masking', True)}")
+        logger.info("  Recompute: True")
         logger.info(f"  Optimizer: {config.optimizer}")
         logger.info(f"  Max steps: {max_steps}")
         if config.loss:

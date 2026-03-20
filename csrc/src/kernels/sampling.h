@@ -34,6 +34,15 @@ void sampling_softmax(
     size_t workspace_bytes,
     cudaStream_t stream);
 
+/// Sanitize logits in-place to match HF invalid-value handling.
+///
+/// Replaces NaN with 0, +Inf with FLT_MAX, and -Inf with -FLT_MAX.
+void sampling_sanitize_logits(
+    float* logits,
+    int batch_size,
+    int vocab_size,
+    cudaStream_t stream);
+
 /// Sample token IDs from probability distribution (categorical sampling).
 ///
 /// @param probs        [batch_size, vocab_size] normalized probabilities (FP32)

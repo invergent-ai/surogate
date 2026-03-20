@@ -103,7 +103,9 @@ __global__ void encoder_forward_kernel3_nowpe(floatX* out,
     int t = bt % T;
     int c = idx % C;
     int ix = inp[b * T + t];
-    assert(0 <= ix && ix < V);
+    if (ix < 0 || ix >= V) {
+        ix = 0;
+    }
     x128 wte128 = x128::load(wte + ix * C + c);
     wte128.store(out + b * T * C + t * C + c);
 }

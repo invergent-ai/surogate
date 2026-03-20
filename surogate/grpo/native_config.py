@@ -174,6 +174,8 @@ class NativeGRPOConfig(SFTConfig):
 
     # Batch
     problems_per_step: int = 8
+    # Document-level attention masking for packed sequences.
+    doc_masking: bool = True
 
     # Checkpointing
     save_steps: int = 0
@@ -237,12 +239,19 @@ class NativeGRPOConfig(SFTConfig):
         self.filters = _parse_filter_configs(filter_list) if filter_list else []
 
         self.problems_per_step = cfg.get("problems_per_step", self.problems_per_step)
+        self.doc_masking = cfg.get("doc_masking", self.doc_masking)
         self.save_steps = cfg.get("save_steps", self.save_steps)
         self.checkpoint_dir = cfg.get("checkpoint_dir", self.checkpoint_dir)
         self.resume_from_checkpoint = cfg.get("resume_from_checkpoint", self.resume_from_checkpoint)
 
         # Initialize inherited config
         self.__post_init__()
+        # Native GRPO always runs with recompute enabled.
+        self.recompute = True
+        self.runtime_config.recompute = "true"
+        # Match production GRPO: enable document-level attention masking by default.
+        # This prevents cross-sample attention in packed micro-batches.
+        self.runtime_config.doc_masking = self.doc_masking
 
         # Disable CUDA graphs (same as GRPOTrainConfig)
         if self.use_cuda_graphs:

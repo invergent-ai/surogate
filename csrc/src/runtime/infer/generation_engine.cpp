@@ -4,7 +4,6 @@
 #include "runtime/infer/generation_engine.h"
 
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +22,37 @@
 #include "utilities/utils.h"
 
 namespace infer {
+
+namespace {
+
+inline bool is_valid_token_id(const int32_t token_id, const int vocab_size) {
+    return token_id >= 0 && token_id < vocab_size;
+}
+
+void validate_prompt_tokens_or_throw(const std::vector<std::vector<int32_t>>& prompts,
+                                     const int vocab_size,
+                                     const char* caller) {
+    for (std::size_t prompt_idx = 0; prompt_idx < prompts.size(); ++prompt_idx) {
+        const auto& prompt = prompts[prompt_idx];
+        for (std::size_t tok_idx = 0; tok_idx < prompt.size(); ++tok_idx) {
+            const int32_t tok = prompt[tok_idx];
+            if (!is_valid_token_id(tok, vocab_size)) {
+                throw std::invalid_argument(
+                    std::string(caller)
+                    + ": prompt token out of range at prompt "
+                    + std::to_string(prompt_idx)
+                    + ", token "
+                    + std::to_string(tok_idx)
+                    + ": id="
+                    + std::to_string(tok)
+                    + ", vocab_size="
+                    + std::to_string(vocab_size));
+            }
+        }
+    }
+}
+
+}  // namespace
 
 GenerationEngine::GenerationEngine(dsl::DslRunState& run_state,
                                    dsl::DslParamStore& weights,
@@ -56,6 +86,8 @@ std::vector<Trajectory> GenerationEngine::generate(
     const int Hs = mConfig.head_size();
     const int num_layers = mConfig.NumLayers;
     const int V = mConfig.VocabSize;
+
+    validate_prompt_tokens_or_throw(prompts, V, "GenerationEngine::generate");
 
     // Save arena checkpoint for cleanup
     auto arena_cp = arena.checkpoint();
@@ -258,6 +290,8 @@ std::vector<Trajectory> GenerationEngine::generate(
         graph_executor.execute_decode_step(
             static_cast<long>(batch_size), last_tokens_gpu, position_ids_gpu,
             decode_state, comm, hook, gen_config.use_cuda_graphs);
+        // Match HF invalid-value handling before sampling.
+        sampling_sanitize_logits(logits_gpu, batch_size, V, mRunState.MainStream);
 
         // ----------------------------------------------------------------
         // Sample from logits
@@ -275,27 +309,29 @@ std::vector<Trajectory> GenerationEngine::generate(
             if (gen_config.top_k > 0 && gen_config.top_p < 1.0f) {
                 sampling_top_k_top_p(probs_gpu, sampled_tokens_gpu,
                                      gen_config.top_k, gen_config.top_p,
-                                     batch_size, V, /*deterministic=*/true,
+                                     batch_size, V, /*deterministic=*/false,
                                      gen_config.seed, rng_offset, mRunState.MainStream);
             } else if (gen_config.top_k > 0) {
                 sampling_top_k(probs_gpu, sampled_tokens_gpu, gen_config.top_k,
-                               batch_size, V, /*deterministic=*/true,
+                               batch_size, V, /*deterministic=*/false,
                                gen_config.seed, rng_offset, mRunState.MainStream);
             } else if (gen_config.top_p < 1.0f) {
                 sampling_top_p(probs_gpu, sampled_tokens_gpu, gen_config.top_p,
-                               batch_size, V, /*deterministic=*/true,
+                               batch_size, V, /*deterministic=*/false,
                                gen_config.seed, rng_offset, mRunState.MainStream);
             } else if (gen_config.min_p > 0.0f) {
                 sampling_min_p(probs_gpu, sampled_tokens_gpu, gen_config.min_p,
-                               batch_size, V, /*deterministic=*/true,
+                               batch_size, V, /*deterministic=*/false,
                                gen_config.seed, rng_offset, mRunState.MainStream);
             } else {
                 // Plain categorical sampling
                 sampling_from_probs(probs_gpu, sampled_tokens_gpu, batch_size, V,
-                                    /*deterministic=*/true, gen_config.seed, rng_offset,
+                                    /*deterministic=*/false, gen_config.seed, rng_offset,
                                     mRunState.MainStream);
             }
         }
+        // Ensure finished rows remain masked for subsequent decode steps.
+        mask_finished_tokens(sampled_tokens_gpu, finished_gpu, batch_size, mRunState.MainStream);
         rng_offset++;
 
         // Extract logprobs: logprob[i] = log(softmax(logits)[i, sampled_token[i]])
@@ -324,10 +360,7 @@ std::vector<Trajectory> GenerationEngine::generate(
         // Wait for D2H to complete before reading host buffers
         CUDA_CHECK(cudaStreamSynchronize(copy_stream));
 
-        // ----------------------------------------------------------------
-        // Update sampled tokens as input for next step
-        // ----------------------------------------------------------------
-        // Copy sampled tokens back to last_tokens_gpu for next decode step
+        // Feed sampled tokens back for next step.
         CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu, sampled_tokens_gpu,
                                    static_cast<std::size_t>(batch_size) * sizeof(int32_t),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
@@ -373,7 +406,6 @@ std::vector<Trajectory> GenerationEngine::generate(
                 - trajectories[static_cast<std::size_t>(b)].prompt_len;
         }
     }
-
     // Cleanup
     CUDA_CHECK(cudaEventDestroy(compute_done));
     CUDA_CHECK(cudaStreamDestroy(copy_stream));
@@ -419,6 +451,8 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     const int Hs = mConfig.head_size();
     const int num_layers = mConfig.NumLayers;
     const int V = mConfig.VocabSize;
+
+    validate_prompt_tokens_or_throw(prompts, V, "GenerationEngine::generate_grpo");
 
     auto arena_cp = arena.checkpoint();
 
@@ -619,56 +653,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(total_batch));
     std::vector<int> finished_host(static_cast<std::size_t>(total_batch), 0);
 
-    // Double-buffered pinned memory for overlapped D2H copies.
-    // While the GPU computes step N+1, the CPU processes step N's results
-    // from the other buffer — no cudaStreamSynchronize in the hot path.
-    int32_t* pinned_tokens_b = nullptr;
-    float* pinned_logprobs_b = nullptr;
-    CUDA_CHECK(cudaMallocHost(&pinned_tokens_b, static_cast<std::size_t>(total_batch) * sizeof(int32_t)));
-    CUDA_CHECK(cudaMallocHost(&pinned_logprobs_b, static_cast<std::size_t>(total_batch) * sizeof(float)));
-    int32_t* db_tokens[2] = { pinned_tokens, pinned_tokens_b };
-    float*   db_logprobs[2] = { pinned_logprobs, pinned_logprobs_b };
-    cudaEvent_t copy_done[2];
-    CUDA_CHECK(cudaEventCreate(&copy_done[0]));
-    CUDA_CHECK(cudaEventCreate(&copy_done[1]));
-    int pending_buf = -1;  // which buffer has pending D2H (-1 = none)
-    int pending_step = -1;
-
     for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
-        const int cur_buf = step & 1;
-
-        // ----------------------------------------------------------------
-        // Process PREVIOUS step's D2H results (overlapped with this step's
-        // H2D uploads below). On the first step there's nothing to process.
-        // ----------------------------------------------------------------
-        if (pending_buf >= 0) {
-            CUDA_CHECK(cudaEventSynchronize(copy_done[pending_buf]));
-            bool finished_changed = false;
-            for (int i = 0; i < total_batch; ++i) {
-                if (finished[static_cast<std::size_t>(i)]) continue;
-                const int32_t token = db_tokens[pending_buf][i];
-                const float logprob = db_logprobs[pending_buf][i];
-                trajectories[static_cast<std::size_t>(i)].tokens.push_back(token);
-                trajectories[static_cast<std::size_t>(i)].logprobs.push_back(logprob);
-                seq_lens_host[static_cast<std::size_t>(i)]++;
-                if (token == gen_config.eos_token_id) {
-                    finished[static_cast<std::size_t>(i)] = true;
-                    finished_changed = true;
-                    trajectories[static_cast<std::size_t>(i)].completion_len = pending_step + 1;
-                    num_active--;
-                }
-            }
-            if (finished_changed) {
-                for (int i = 0; i < total_batch; ++i) {
-                    finished_host[static_cast<std::size_t>(i)] = finished[static_cast<std::size_t>(i)] ? 1 : 0;
-                }
-                CUDA_CHECK(cudaMemcpyAsync(grpo_finished_gpu, finished_host.data(),
-                                           static_cast<std::size_t>(total_batch) * sizeof(int),
-                                           cudaMemcpyHostToDevice, mRunState.MainStream));
-            }
-            if (num_active <= 0) break;
-        }
-
         // ----------------------------------------------------------------
         // Paged KV: allocate suffix pages for sequences crossing a page boundary
         // ----------------------------------------------------------------
@@ -719,6 +704,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         graph_executor.execute_decode_step(
             static_cast<long>(total_batch), last_tokens_gpu, position_ids_gpu,
             decode_state, comm, hook, gen_config.use_cuda_graphs);
+        // Match HF invalid-value handling before sampling.
+        sampling_sanitize_logits(logits_gpu, total_batch, V, mRunState.MainStream);
+
+        // Check for async errors after decode step (catches OOB writes in
+        // LoRA hooks, attention, etc. that would otherwise surface later
+        // during training and be hard to diagnose).
+        CUDA_CHECK(cudaGetLastError());
 
         if (gen_config.temperature <= 0.0f) {
             sampling_argmax(logits_gpu, sampled_tokens_gpu, total_batch, V, mRunState.MainStream);
@@ -726,10 +718,30 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
             sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
                              total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
                              mRunState.MainStream);
-            sampling_from_probs(probs_gpu, sampled_tokens_gpu, total_batch, V,
-                                /*deterministic=*/true, gen_config.seed, rng_offset,
-                                mRunState.MainStream);
+            if (gen_config.top_k > 0 && gen_config.top_p < 1.0f) {
+                sampling_top_k_top_p(probs_gpu, sampled_tokens_gpu,
+                                     gen_config.top_k, gen_config.top_p,
+                                     total_batch, V, /*deterministic=*/false,
+                                     gen_config.seed, rng_offset, mRunState.MainStream);
+            } else if (gen_config.top_k > 0) {
+                sampling_top_k(probs_gpu, sampled_tokens_gpu, gen_config.top_k,
+                               total_batch, V, /*deterministic=*/false,
+                               gen_config.seed, rng_offset, mRunState.MainStream);
+            } else if (gen_config.top_p < 1.0f) {
+                sampling_top_p(probs_gpu, sampled_tokens_gpu, gen_config.top_p,
+                               total_batch, V, /*deterministic=*/false,
+                               gen_config.seed, rng_offset, mRunState.MainStream);
+            } else if (gen_config.min_p > 0.0f) {
+                sampling_min_p(probs_gpu, sampled_tokens_gpu, gen_config.min_p,
+                               total_batch, V, /*deterministic=*/false,
+                               gen_config.seed, rng_offset, mRunState.MainStream);
+            } else {
+                sampling_from_probs(probs_gpu, sampled_tokens_gpu, total_batch, V,
+                                    /*deterministic=*/false, gen_config.seed, rng_offset,
+                                    mRunState.MainStream);
+            }
         }
+        mask_finished_tokens(sampled_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
         rng_offset++;
 
         if (gen_config.temperature <= 0.0f) {
@@ -740,44 +752,48 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
                                  total_batch, V, mRunState.MainStream);
 
-        // Feed sampled tokens back as input for next step (D2D, no sync needed)
+        // ----------------------------------------------------------------
+        // D2H: copy sampled tokens and logprobs to pinned host memory.
+        // Single-stream sync — simple and race-free.
+        // ----------------------------------------------------------------
+        CUDA_CHECK(cudaEventRecord(compute_done, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, compute_done, 0));
+        CUDA_CHECK(cudaMemcpyAsync(pinned_tokens, sampled_tokens_gpu,
+                                   static_cast<std::size_t>(total_batch) * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, copy_stream));
+        CUDA_CHECK(cudaMemcpyAsync(pinned_logprobs, logprobs_gpu,
+                                   static_cast<std::size_t>(total_batch) * sizeof(float),
+                                   cudaMemcpyDeviceToHost, copy_stream));
+        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+
+        // Feed sampled tokens back for next step.
         CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu, sampled_tokens_gpu,
                                    static_cast<std::size_t>(total_batch) * sizeof(int32_t),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
-        // ----------------------------------------------------------------
-        // Async D2H into double buffer (no sync — will be read next iteration)
-        // ----------------------------------------------------------------
-        CUDA_CHECK(cudaEventRecord(compute_done, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, compute_done, 0));
-        CUDA_CHECK(cudaMemcpyAsync(db_tokens[cur_buf], sampled_tokens_gpu,
-                                   static_cast<std::size_t>(total_batch) * sizeof(int32_t),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaMemcpyAsync(db_logprobs[cur_buf], logprobs_gpu,
-                                   static_cast<std::size_t>(total_batch) * sizeof(float),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaEventRecord(copy_done[cur_buf], copy_stream));
-
-        pending_buf = cur_buf;
-        pending_step = step;
-    }
-
-    // ----------------------------------------------------------------
-    // Drain: process the last pending D2H buffer
-    // ----------------------------------------------------------------
-    if (pending_buf >= 0) {
-        CUDA_CHECK(cudaEventSynchronize(copy_done[pending_buf]));
+        // EOS detection + trajectory update
+        bool finished_changed = false;
         for (int i = 0; i < total_batch; ++i) {
             if (finished[static_cast<std::size_t>(i)]) continue;
-            const int32_t token = db_tokens[pending_buf][i];
-            const float logprob = db_logprobs[pending_buf][i];
+            const int32_t token = pinned_tokens[i];
+            const float logprob = pinned_logprobs[i];
             trajectories[static_cast<std::size_t>(i)].tokens.push_back(token);
             trajectories[static_cast<std::size_t>(i)].logprobs.push_back(logprob);
             seq_lens_host[static_cast<std::size_t>(i)]++;
             if (token == gen_config.eos_token_id) {
                 finished[static_cast<std::size_t>(i)] = true;
-                trajectories[static_cast<std::size_t>(i)].completion_len = pending_step + 1;
+                finished_changed = true;
+                trajectories[static_cast<std::size_t>(i)].completion_len = step + 1;
+                num_active--;
             }
+        }
+        if (finished_changed) {
+            for (int i = 0; i < total_batch; ++i) {
+                finished_host[static_cast<std::size_t>(i)] = finished[static_cast<std::size_t>(i)] ? 1 : 0;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(grpo_finished_gpu, finished_host.data(),
+                                       static_cast<std::size_t>(total_batch) * sizeof(int),
+                                       cudaMemcpyHostToDevice, mRunState.MainStream));
         }
     }
 
@@ -788,15 +804,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
                 - trajectories[static_cast<std::size_t>(i)].prompt_len;
         }
     }
-
     CUDA_CHECK(cudaEventDestroy(compute_done));
-    CUDA_CHECK(cudaEventDestroy(copy_done[0]));
-    CUDA_CHECK(cudaEventDestroy(copy_done[1]));
     CUDA_CHECK(cudaStreamDestroy(copy_stream));
     CUDA_CHECK(cudaFreeHost(pinned_tokens));
     CUDA_CHECK(cudaFreeHost(pinned_logprobs));
-    CUDA_CHECK(cudaFreeHost(pinned_tokens_b));
-    CUDA_CHECK(cudaFreeHost(pinned_logprobs_b));
     for (auto& [_, ptr] : grpo_recurrent_states) {
         if (ptr) cudaFree(ptr);
     }
@@ -809,6 +820,9 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     // that become stale after arena.restore().
     graph_executor.invalidate_decode_graph();
 
+    // Clear any prefix boundary that generation may have left, so
+    // arena.restore() can fully rewind the stack to pre-generation state.
+    arena.clear_prefix_boundary();
     arena.restore(arena_cp);
 
     return trajectories;

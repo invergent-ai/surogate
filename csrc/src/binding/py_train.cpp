@@ -1782,8 +1782,7 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
                 *graph_exec, *ctx.Communicator, hook_ptr);
         }
 
-        // Sync GPU to surface any async errors from generation before
-        // they corrupt later training operations.
+        // Sync GPU and check for errors from generation.
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Invalidate decode graph (captured arena pointers are now stale).
