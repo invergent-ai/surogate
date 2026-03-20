@@ -16,6 +16,7 @@ COMMAND_MAPPING: Dict[str, str] = {
     'grpo-train': 'surogate.cli.grpo_train',
     'grpo-infer': 'surogate.cli.grpo_infer',
     'grpo-orch': 'surogate.cli.grpo_orch',
+    'grpo-native': 'surogate.cli.grpo_native',
     'vf-init': 'surogate.cli.vf_init',
     'vf-eval': 'surogate.cli.vf_eval',
     'tokenize': 'surogate.cli.tokenize_cmd',
@@ -64,6 +65,10 @@ def parse_args():
     from surogate.cli.grpo_orch import prepare_command_parser as grpo_orch_prepare_command_parser
     grpo_orch_prepare_command_parser(subparsers.add_parser('grpo-orch', help="GRPO RL Orchestrator"))
 
+    # grpo-native command
+    from surogate.cli.grpo_native import prepare_command_parser as grpo_native_prepare_command_parser
+    grpo_native_prepare_command_parser(subparsers.add_parser('grpo-native', help="Native GRPO RL Training (single-process)"))
+
     # vf-init command
     from surogate.cli.vf_init import prepare_command_parser as vf_init_prepare_command_parser
     vf_init_prepare_command_parser(subparsers.add_parser('vf-init', help="RL Environment Initialization"))
@@ -81,7 +86,7 @@ def parse_args():
         parser.print_help()
         sys.exit(1)
 
-    commands_with_config = ['sft', 'pt', 'grpo_train', 'grpo_infer', 'grpo_orch', 'tokenize']
+    commands_with_config = ['sft', 'pt', 'grpo_train', 'grpo_infer', 'grpo_orch', 'grpo-native', 'tokenize']
     if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
         sys.exit(1)
