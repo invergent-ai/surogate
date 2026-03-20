@@ -1765,6 +1765,11 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         const modules::ForwardHook* hook_ptr = nullptr;
         // TODO: wire LoRA hook from DslModel for use_lora=true
 
+        // Generation may recompile the graph for decode dimensions via
+        // execute_decode_step -> compile_graphs(). After generation finishes,
+        // force_recompile() ensures the next training operation gets fresh
+        // graphs for training dimensions (B_train, T_train).
+
         // Generate using the model's stack as arena
         std::vector<infer::Trajectory> trajectories;
         if (num_completions > 1) {
@@ -1776,6 +1781,13 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
                 prompts, gen_config, run_state.Stack,
                 *graph_exec, *ctx.Communicator, hook_ptr);
         }
+
+        // Sync GPU to surface any async errors from generation before
+        // they corrupt later training operations.
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Invalidate decode graph (captured arena pointers are now stale).
+        graph_exec->invalidate_decode_graph();
 
         // Convert trajectories to result
         result.tokens.resize(trajectories.size());

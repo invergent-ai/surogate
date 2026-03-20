@@ -224,15 +224,16 @@ std::vector<Trajectory> GenerationEngine::generate(
     cudaEvent_t compute_done;
     CUDA_CHECK(cudaEventCreate(&compute_done));
 
+    // Pre-allocate host buffers used every step (avoid heap allocs in hot loop)
+    std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(batch_size));
+    std::vector<int> finished_host_buf(static_cast<std::size_t>(batch_size), 0);
+
     for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
         // Upload seq_lens and build cu_seqlens/seqused_k
         CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu, seq_lens_host.data(),
                                    static_cast<std::size_t>(batch_size) * sizeof(int),
                                    cudaMemcpyHostToDevice, mRunState.MainStream));
 
-        // max_seqlen_k: when using CUDA graphs, set to max_total_len so the
-        // captured graph's attention kernel iteration bound is constant across replays.
-        // Per-sequence actual lengths are controlled by seqused_k (read from GPU).
         if (gen_config.use_cuda_graphs) {
             decode_state.max_seqlen_k = max_prompt_len + gen_config.max_gen_len;
         } else {
@@ -243,7 +244,6 @@ std::vector<Trajectory> GenerationEngine::generate(
                                seq_lens_gpu, batch_size, mRunState.MainStream);
 
         // Position IDs
-        std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(batch_size));
         for (int b = 0; b < batch_size; ++b) {
             pos_ids_host[static_cast<std::size_t>(b)] = seq_lens_host[static_cast<std::size_t>(b)];
         }
@@ -356,11 +356,10 @@ std::vector<Trajectory> GenerationEngine::generate(
 
         // Upload finished mask to GPU for next step's EOS masking
         if (finished_changed) {
-            std::vector<int> finished_host(static_cast<std::size_t>(batch_size));
             for (int b = 0; b < batch_size; ++b) {
-                finished_host[static_cast<std::size_t>(b)] = finished[static_cast<std::size_t>(b)] ? 1 : 0;
+                finished_host_buf[static_cast<std::size_t>(b)] = finished[static_cast<std::size_t>(b)] ? 1 : 0;
             }
-            CUDA_CHECK(cudaMemcpyAsync(finished_gpu, finished_host.data(),
+            CUDA_CHECK(cudaMemcpyAsync(finished_gpu, finished_host_buf.data(),
                                        static_cast<std::size_t>(batch_size) * sizeof(int),
                                        cudaMemcpyHostToDevice, mRunState.MainStream));
         }
@@ -389,6 +388,7 @@ std::vector<Trajectory> GenerationEngine::generate(
         if (ptr) cudaFree(ptr);
     }
 
+    graph_executor.invalidate_decode_graph();
     arena.restore(arena_cp);
 
     return trajectories;
@@ -615,10 +615,63 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     cudaEvent_t compute_done;
     CUDA_CHECK(cudaEventCreate(&compute_done));
 
+    // Pre-allocate host buffers used every step (avoid heap allocs in hot loop)
+    std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(total_batch));
+    std::vector<int> finished_host(static_cast<std::size_t>(total_batch), 0);
+
+    // Double-buffered pinned memory for overlapped D2H copies.
+    // While the GPU computes step N+1, the CPU processes step N's results
+    // from the other buffer — no cudaStreamSynchronize in the hot path.
+    int32_t* pinned_tokens_b = nullptr;
+    float* pinned_logprobs_b = nullptr;
+    CUDA_CHECK(cudaMallocHost(&pinned_tokens_b, static_cast<std::size_t>(total_batch) * sizeof(int32_t)));
+    CUDA_CHECK(cudaMallocHost(&pinned_logprobs_b, static_cast<std::size_t>(total_batch) * sizeof(float)));
+    int32_t* db_tokens[2] = { pinned_tokens, pinned_tokens_b };
+    float*   db_logprobs[2] = { pinned_logprobs, pinned_logprobs_b };
+    cudaEvent_t copy_done[2];
+    CUDA_CHECK(cudaEventCreate(&copy_done[0]));
+    CUDA_CHECK(cudaEventCreate(&copy_done[1]));
+    int pending_buf = -1;  // which buffer has pending D2H (-1 = none)
+    int pending_step = -1;
+
     for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
-        // Allocate new suffix pages for sequences that have crossed a page boundary.
-        // The new token position is seq_lens_host[i] (0-indexed). If it falls on a
-        // new page that hasn't been allocated yet, allocate and update the block table.
+        const int cur_buf = step & 1;
+
+        // ----------------------------------------------------------------
+        // Process PREVIOUS step's D2H results (overlapped with this step's
+        // H2D uploads below). On the first step there's nothing to process.
+        // ----------------------------------------------------------------
+        if (pending_buf >= 0) {
+            CUDA_CHECK(cudaEventSynchronize(copy_done[pending_buf]));
+            bool finished_changed = false;
+            for (int i = 0; i < total_batch; ++i) {
+                if (finished[static_cast<std::size_t>(i)]) continue;
+                const int32_t token = db_tokens[pending_buf][i];
+                const float logprob = db_logprobs[pending_buf][i];
+                trajectories[static_cast<std::size_t>(i)].tokens.push_back(token);
+                trajectories[static_cast<std::size_t>(i)].logprobs.push_back(logprob);
+                seq_lens_host[static_cast<std::size_t>(i)]++;
+                if (token == gen_config.eos_token_id) {
+                    finished[static_cast<std::size_t>(i)] = true;
+                    finished_changed = true;
+                    trajectories[static_cast<std::size_t>(i)].completion_len = pending_step + 1;
+                    num_active--;
+                }
+            }
+            if (finished_changed) {
+                for (int i = 0; i < total_batch; ++i) {
+                    finished_host[static_cast<std::size_t>(i)] = finished[static_cast<std::size_t>(i)] ? 1 : 0;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(grpo_finished_gpu, finished_host.data(),
+                                           static_cast<std::size_t>(total_batch) * sizeof(int),
+                                           cudaMemcpyHostToDevice, mRunState.MainStream));
+            }
+            if (num_active <= 0) break;
+        }
+
+        // ----------------------------------------------------------------
+        // Paged KV: allocate suffix pages for sequences crossing a page boundary
+        // ----------------------------------------------------------------
         {
             bool block_table_dirty = false;
             for (int i = 0; i < total_batch; ++i) {
@@ -635,6 +688,9 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
             }
         }
 
+        // ----------------------------------------------------------------
+        // Upload metadata for this decode step
+        // ----------------------------------------------------------------
         CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu, seq_lens_host.data(),
                                    static_cast<std::size_t>(total_batch) * sizeof(int),
                                    cudaMemcpyHostToDevice, mRunState.MainStream));
@@ -647,7 +703,6 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         fill_decode_cu_seqlens(cu_seqlens_q_gpu, seqused_k_gpu,
                                seq_lens_gpu, total_batch, mRunState.MainStream);
 
-        std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(total_batch));
         for (int i = 0; i < total_batch; ++i) {
             pos_ids_host[static_cast<std::size_t>(i)] = seq_lens_host[static_cast<std::size_t>(i)];
         }
@@ -658,11 +713,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         // Mask finished sequences
         mask_finished_tokens(last_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
 
+        // ----------------------------------------------------------------
+        // GPU compute: model forward + sampling
+        // ----------------------------------------------------------------
         graph_executor.execute_decode_step(
             static_cast<long>(total_batch), last_tokens_gpu, position_ids_gpu,
             decode_state, comm, hook, gen_config.use_cuda_graphs);
 
-        // Sample
         if (gen_config.temperature <= 0.0f) {
             sampling_argmax(logits_gpu, sampled_tokens_gpu, total_batch, V, mRunState.MainStream);
         } else {
@@ -675,7 +732,6 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         }
         rng_offset++;
 
-        // Logprobs
         if (gen_config.temperature <= 0.0f) {
             sampling_softmax(logits_gpu, probs_gpu, nullptr,
                              total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
@@ -684,50 +740,44 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
                                  total_batch, V, mRunState.MainStream);
 
-        // Streaming D2H
-        CUDA_CHECK(cudaEventRecord(compute_done, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, compute_done, 0));
-        CUDA_CHECK(cudaMemcpyAsync(pinned_tokens, sampled_tokens_gpu,
-                                   static_cast<std::size_t>(total_batch) * sizeof(int32_t),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaMemcpyAsync(pinned_logprobs, logprobs_gpu,
-                                   static_cast<std::size_t>(total_batch) * sizeof(float),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
-
-        // Feed sampled tokens back for next step
+        // Feed sampled tokens back as input for next step (D2D, no sync needed)
         CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu, sampled_tokens_gpu,
                                    static_cast<std::size_t>(total_batch) * sizeof(int32_t),
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
-        // EOS detection + trajectory update
-        bool finished_changed = false;
+        // ----------------------------------------------------------------
+        // Async D2H into double buffer (no sync — will be read next iteration)
+        // ----------------------------------------------------------------
+        CUDA_CHECK(cudaEventRecord(compute_done, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, compute_done, 0));
+        CUDA_CHECK(cudaMemcpyAsync(db_tokens[cur_buf], sampled_tokens_gpu,
+                                   static_cast<std::size_t>(total_batch) * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, copy_stream));
+        CUDA_CHECK(cudaMemcpyAsync(db_logprobs[cur_buf], logprobs_gpu,
+                                   static_cast<std::size_t>(total_batch) * sizeof(float),
+                                   cudaMemcpyDeviceToHost, copy_stream));
+        CUDA_CHECK(cudaEventRecord(copy_done[cur_buf], copy_stream));
+
+        pending_buf = cur_buf;
+        pending_step = step;
+    }
+
+    // ----------------------------------------------------------------
+    // Drain: process the last pending D2H buffer
+    // ----------------------------------------------------------------
+    if (pending_buf >= 0) {
+        CUDA_CHECK(cudaEventSynchronize(copy_done[pending_buf]));
         for (int i = 0; i < total_batch; ++i) {
             if (finished[static_cast<std::size_t>(i)]) continue;
-
-            const int32_t token = pinned_tokens[i];
-            const float logprob = pinned_logprobs[i];
-
+            const int32_t token = db_tokens[pending_buf][i];
+            const float logprob = db_logprobs[pending_buf][i];
             trajectories[static_cast<std::size_t>(i)].tokens.push_back(token);
             trajectories[static_cast<std::size_t>(i)].logprobs.push_back(logprob);
             seq_lens_host[static_cast<std::size_t>(i)]++;
-
             if (token == gen_config.eos_token_id) {
                 finished[static_cast<std::size_t>(i)] = true;
-                finished_changed = true;
-                trajectories[static_cast<std::size_t>(i)].completion_len = step + 1;
-                num_active--;
+                trajectories[static_cast<std::size_t>(i)].completion_len = pending_step + 1;
             }
-        }
-
-        if (finished_changed) {
-            std::vector<int> finished_host(static_cast<std::size_t>(total_batch));
-            for (int i = 0; i < total_batch; ++i) {
-                finished_host[static_cast<std::size_t>(i)] = finished[static_cast<std::size_t>(i)] ? 1 : 0;
-            }
-            CUDA_CHECK(cudaMemcpyAsync(grpo_finished_gpu, finished_host.data(),
-                                       static_cast<std::size_t>(total_batch) * sizeof(int),
-                                       cudaMemcpyHostToDevice, mRunState.MainStream));
         }
     }
 
@@ -740,15 +790,25 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     }
 
     CUDA_CHECK(cudaEventDestroy(compute_done));
+    CUDA_CHECK(cudaEventDestroy(copy_done[0]));
+    CUDA_CHECK(cudaEventDestroy(copy_done[1]));
     CUDA_CHECK(cudaStreamDestroy(copy_stream));
     CUDA_CHECK(cudaFreeHost(pinned_tokens));
     CUDA_CHECK(cudaFreeHost(pinned_logprobs));
+    CUDA_CHECK(cudaFreeHost(pinned_tokens_b));
+    CUDA_CHECK(cudaFreeHost(pinned_logprobs_b));
     for (auto& [_, ptr] : grpo_recurrent_states) {
         if (ptr) cudaFree(ptr);
     }
     for (auto& [_, ptr] : grpo_conv_states) {
         if (ptr) cudaFree(ptr);
     }
+
+    // Invalidate the cached decode CUDA graph before restoring the arena.
+    // The graph captures pointers into the arena (KV cache, logits, etc.)
+    // that become stale after arena.restore().
+    graph_executor.invalidate_decode_graph();
+
     arena.restore(arena_cp);
 
     return trajectories;

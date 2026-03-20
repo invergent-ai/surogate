@@ -89,13 +89,44 @@ class NativeGRPOTrainer:
         rc = config.runtime_config
         options.lmhead_chunks = getattr(rc, "lmhead_chunks", 8)
         options.use_cuda_graphs = False
-        # Note: master_dtype=F32 from GRPOTrainConfig is intentionally not copied.
-        # FP32 master weights are needed for the 3-process trainer where gradient
-        # magnitudes are tiny after IPO masking+loss_scale. The native trainer
-        # uses BF16 master weights by default — sufficient since there's no
-        # inter-process gradient quantization.
         if hasattr(rc, "ep_size"):
             options.ep_size = rc.ep_size
+
+        # Ensure the DeviceMemoryStack is large enough for the paged KV cache
+        # during generation. KV per token ≈ 2 * Hkv * Hs * num_layers * 2 bytes.
+        # Total sequences = problems_per_step * num_completions.
+        # We set SUROGATE_MIN_STACK_MB if not already set by the user.
+        import os
+
+        if "SUROGATE_MIN_STACK_MB" not in os.environ:
+            gen = config.generation
+            total_seqs = config.problems_per_step * gen.num_completions
+            # Estimate KV cache bytes (conservative: full max_total_len per seq)
+            try:
+                from surogate.core.model.hf_config import HfConfigFactory
+
+                hf_cfg = config.model_info.config
+                n_layers = HfConfigFactory.get_config_attr(hf_cfg, "num_hidden_layers")
+                n_kv_heads = HfConfigFactory.get_config_attr(hf_cfg, "num_key_value_heads")
+                head_dim = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size") // HfConfigFactory.get_config_attr(hf_cfg, "num_attention_heads")
+                max_total = 100 + gen.max_gen_len  # prompt + gen
+                kv_bytes = 2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
+                min_stack_mb = max(2048, int(kv_bytes / (1024 * 1024) * 3.0))  # 3x margin (paged KV over-allocates for max_total_len)
+                os.environ["SUROGATE_MIN_STACK_MB"] = str(min_stack_mb)
+                logger.info(f"Set SUROGATE_MIN_STACK_MB={min_stack_mb} for {total_seqs} sequences")
+            except Exception:
+                os.environ["SUROGATE_MIN_STACK_MB"] = "4096"
+
+        # --- Build LoRA config ---
+        # Use a clean LoRA config with just rank/alpha from the YAML.
+        # SFTConfig's lora_config may have target_modules='all' which
+        # applies LoRA to all layers including LM head — this causes
+        # buffer overflows during large-batch generation (B=128+).
+        lora_config = None
+        if config.lora:
+            lora_config = _surogate.LoRAAdapterConfig()
+            lora_config.rank = config.lora_rank
+            lora_config.alpha = config.lora_alpha
 
         # --- Create C++ trainer ---
         logger.info(
@@ -112,7 +143,7 @@ class NativeGRPOTrainer:
             grad_accum=1,  # Set dynamically per step
             memcpy_all_gather=True,
             memcpy_send_recv=True,
-            lora_config=config.lora_config,
+            lora_config=lora_config,
             qlora_config=config.qlora_config,
         )
 
@@ -273,30 +304,26 @@ class NativeGRPOTrainer:
         # Tokenize prompts
         prompt_token_ids = [self.tokenizer.encode(p) for p in prompts]
 
-        # Generate per-prompt to avoid KV cache OOM.
-        # The C++ generate() batches num_completions sequences concurrently,
-        # so generating per-prompt keeps KV cache usage at num_completions
-        # instead of len(prompts) * num_completions.
+        # Generate completions. Batch as many prompts as possible per call
+        # to maximize GPU utilization (paged KV cache shares prefix pages).
+        # The max batch is limited by the training buffer size (B*T elements
+        # in the input tensor). With B=1,T=seq_len, we can fit up to seq_len
+        # decode sequences (each needs 1 element per step).
+        # Batch all prompts into a single generate_grpo() call for max GPU
+        # utilization. The paged KV cache shares prefix pages across the N
+        # completions per prompt.
         gen_start = time.time()
-        tokens = []
-        logprobs = []
-        prompt_lens = []
-        completion_lens = []
-        for pid in prompt_token_ids:
-            t, lp, pl, cl = self.trainer.generate(
-                prompts=[pid],
-                num_completions=num_completions,
-                max_gen_len=gen.max_gen_len,
-                temperature=temperature,
-                eos_token_id=self.eos_id,
-                use_lora=config.lora,
-                top_k=gen.top_k,
-                top_p=gen.top_p,
-            )
-            tokens.extend(t)
-            logprobs.extend(lp)
-            prompt_lens.extend(pl)
-            completion_lens.extend(cl)
+        tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
+            prompts=prompt_token_ids,
+            num_completions=num_completions,
+            max_gen_len=gen.max_gen_len,
+            temperature=temperature,
+            eos_token_id=self.eos_id,
+            use_lora=config.lora,
+            use_cuda_graphs=False,
+            top_k=gen.top_k,
+            top_p=gen.top_p,
+        )
         gen_time = time.time() - gen_start
 
         # Decode completions
@@ -972,6 +999,7 @@ class NativeGRPOTrainer:
                 temperature=gen_temp,
                 eos_token_id=self.eos_id,
                 use_lora=self.config.lora,
+                use_cuda_graphs=False,
                 top_k=0,
                 top_p=1.0,
             )

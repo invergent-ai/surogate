@@ -263,6 +263,16 @@ public:
     void clear_doc_masking();
     void set_inv_temperature_context(const float* inv_temperature_gpu);
 
+    /// Invalidate the cached decode CUDA graph.
+    /// Must be called after generate() when the arena is restored, since
+    /// the graph captures pointers into the arena that become stale.
+    void invalidate_decode_graph();
+
+    /// Force recompilation of the forward/backward graphs on next use.
+    /// Call after generation to ensure training gets freshly compiled graphs
+    /// for its own (B, T) dimensions.
+    void force_recompile();
+
 private:
     void init(const GraphExecutorOptions& options);
     void reset_cuda_graphs();

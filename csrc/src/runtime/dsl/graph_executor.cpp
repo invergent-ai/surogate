@@ -1848,6 +1848,24 @@ void GraphExecutor::execute_decode_step(long B,
     mCompiledExecutor->set_save_list(&mSaveList);
 }
 
+void GraphExecutor::invalidate_decode_graph() {
+    if (mDecodeGraphExec) {
+        CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
+        mDecodeGraphExec = nullptr;
+        mDecodeGraphB = 0;
+    }
+}
+
+void GraphExecutor::force_recompile() {
+    // Reset compiled dimensions so compile_graphs() recompiles on next use.
+    // This is needed after generation changes the compiled state for decode
+    // dimensions that are incompatible with training.
+    mCompiledB = 0;
+    mCompiledT = 0;
+    mCompiledForward.reset();
+    mCompiledBackward.reset();
+}
+
 // ============================================================================
 // Custom d_loss backward (GRPO: external per-token gradient multipliers)
 // ============================================================================
