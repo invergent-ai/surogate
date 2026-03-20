@@ -14,6 +14,7 @@ checkpointing with resume, temperature scheduling, LR scheduling.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import shutil
 import time
@@ -322,6 +323,7 @@ class NativeGRPOTrainer:
         self,
         prompts: list[str],
         step: int,
+        prompt_token_ids: list[list[int]] | None = None,
     ) -> dict:
         """Generate completions for a batch of prompts.
 
@@ -334,8 +336,13 @@ class NativeGRPOTrainer:
         temperature = self._get_temperature(step)
         num_completions = gen.num_completions
 
-        # Tokenize prompts
-        prompt_token_ids = [self._encode_prompt(p) for p in prompts]
+        # Tokenize prompts (or use pre-tokenized IDs from overlap prefetch).
+        if prompt_token_ids is None:
+            prompt_token_ids = [self._encode_prompt(p) for p in prompts]
+        elif len(prompt_token_ids) != len(prompts):
+            raise ValueError(
+                "generate_rollout: prompt_token_ids length must match prompts length"
+            )
 
         # Generate completions with paged GRPO decode.
         gen_start = time.time()
@@ -378,6 +385,18 @@ class NativeGRPOTrainer:
             "temperature": temperature,
             "gen_time": gen_time,
         }
+
+    def _fetch_and_tokenize_prompts(
+        self, problems_per_step: int
+    ) -> tuple[list[str], list[list[int]]]:
+        """Fetch next prompt batch and pre-tokenize it.
+
+        This runs in a background thread to overlap CPU prompt preparation with
+        current-step GPU training work.
+        """
+        prompts = self.reward_provider.get_next_batch(problems_per_step)
+        prompt_token_ids = [self._encode_prompt(p) for p in prompts]
+        return prompts, prompt_token_ids
 
     # ========================================================================
     # Filtering
@@ -458,7 +477,13 @@ class NativeGRPOTrainer:
             and self.reward_provider._native_client is not None
         )
 
-    def train_step(self, prompts: list[str], step: int) -> dict:
+    def train_step(
+        self,
+        prompts: list[str],
+        step: int,
+        prompt_token_ids: list[list[int]] | None = None,
+        start_next_prefetch: Callable[[], None] | None = None,
+    ) -> dict:
         """One GRPO training step: generate -> score -> train.
 
         In multi-turn verifiers mode, generation + scoring happen together
@@ -468,17 +493,34 @@ class NativeGRPOTrainer:
         Returns metrics dict.
         """
         if self._is_multiturn:
-            return self._train_step_multiturn(prompts, step)
-        return self._train_step_single(prompts, step)
+            return self._train_step_multiturn(
+                prompts,
+                step,
+                start_next_prefetch=start_next_prefetch,
+            )
+        return self._train_step_single(
+            prompts,
+            step,
+            prompt_token_ids=prompt_token_ids,
+            start_next_prefetch=start_next_prefetch,
+        )
 
-    def _train_step_single(self, prompts: list[str], step: int) -> dict:
+    def _train_step_single(
+        self,
+        prompts: list[str],
+        step: int,
+        prompt_token_ids: list[list[int]] | None = None,
+        start_next_prefetch: Callable[[], None] | None = None,
+    ) -> dict:
         """Single-turn training step: generate -> score -> train."""
         config = self.config
         gen = config.generation
         num_completions = gen.num_completions
 
         # 1. Generate rollout
-        rollout = self.generate_rollout(prompts, step)
+        rollout = self.generate_rollout(
+            prompts, step, prompt_token_ids=prompt_token_ids
+        )
         all_tokens = rollout["all_tokens"]
         all_logprobs = rollout["logprobs"]
         prompt_lens_list = rollout["prompt_lens"]
@@ -494,6 +536,11 @@ class NativeGRPOTrainer:
         )
         rewards = np.array(rewards, dtype=np.float32)
         score_time = time.time() - score_start
+
+        # Start overlap prefetch only after scoring is done, to avoid concurrent
+        # access to reward provider methods in different threads.
+        if start_next_prefetch is not None:
+            start_next_prefetch()
 
         # 3. Apply filters
         comp_token_ids = []
@@ -560,7 +607,12 @@ class NativeGRPOTrainer:
             num_completions=config.generation.num_completions,
         )
 
-    def _train_step_multiturn(self, prompts: list[str], step: int) -> dict:
+    def _train_step_multiturn(
+        self,
+        prompts: list[str],
+        step: int,
+        start_next_prefetch: Callable[[], None] | None = None,
+    ) -> dict:
         """Multi-turn training step: rollouts (generate+score) -> train.
 
         Generation and scoring happen together inside env.run_rollout()
@@ -582,6 +634,10 @@ class NativeGRPOTrainer:
         rewards = self.reward_provider.score(prompts, [], num_completions, use_rollouts=True)
         rewards = np.array(rewards, dtype=np.float32)
         gen_score_time = time.time() - gen_start
+
+        # In multiturn mode, rollout extraction still touches reward-provider
+        # state right after score(); defer overlap prefetch to caller fallback.
+        _ = start_next_prefetch
 
         # 2. Extract trajectory data from rollout outputs
         rollout_outputs = self.reward_provider.get_rollout_data() or []
@@ -1231,6 +1287,7 @@ class NativeGRPOTrainer:
         )
         logger.info(f"  Doc masking: {getattr(config, 'doc_masking', True)}")
         logger.info("  Recompute: True")
+        logger.info("  Overlap scheduling: enabled (next-batch prefetch)")
         logger.info(f"  Optimizer: {config.optimizer}")
         logger.info(f"  Max steps: {max_steps}")
         if config.loss:
@@ -1251,47 +1308,81 @@ class NativeGRPOTrainer:
         total_tokens = 0
         total_samples = 0
 
-        for step in range(start_step, max_steps):
-            step_start = time.time()
-
-            # Sample prompts
-            prompts = self.reward_provider.get_next_batch(problems_per_step)
-
-            # Train step
-            metrics = self.train_step(prompts, step)
-
-            total_tokens += metrics.get("progress/tokens", 0)
-            total_samples += metrics.get("progress/samples", 0)
-            metrics["progress/total_tokens"] = total_tokens
-            metrics["progress/total_samples"] = total_samples
-
-            # Log metrics
-            if self.monitor is not None:
-                self.monitor.log(metrics, step=step)
-                self.monitor.flush(step=step)
-
-            # Log to console
-            logger.info(
-                f"Step {step} | "
-                f"Reward: {metrics['reward/mean']:.4f} | "
-                f"Loss: {metrics['train/policy_loss']:.4f} | "
-                f"KL: {metrics['train/mismatch_kl']:.4f} | "
-                f"Grad: {metrics['train/grad_norm']:.4f} | "
-                f"LR: {metrics['train/lr']:.2e} | "
-                f"Temp: {metrics['sampling/temperature']:.2f} | "
-                f"Time: {metrics['time/step']:.2f}s"
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="native-grpo-prefetch"
+        ) as prefetch_executor:
+            next_batch_future: Future[
+                tuple[list[str], list[list[int]]]
+            ] = prefetch_executor.submit(
+                self._fetch_and_tokenize_prompts, problems_per_step
             )
 
-            # Online evaluation
-            if eval_interval > 0 and step % eval_interval == 0:
-                eval_metrics = self.evaluate(step)
-                if eval_metrics and self.monitor is not None:
-                    self.monitor.log(eval_metrics, step=step)
+            for step in range(start_step, max_steps):
+                wait_start = time.time()
+                prompts, prompt_token_ids = next_batch_future.result()
+                prefetch_wait = time.time() - wait_start
+
+                next_holder: dict[str, Future[tuple[list[str], list[list[int]]]] | None] = {
+                    "future": None
+                }
+
+                def _start_next_prefetch():
+                    if step + 1 >= max_steps:
+                        return
+                    if next_holder["future"] is None:
+                        next_holder["future"] = prefetch_executor.submit(
+                            self._fetch_and_tokenize_prompts, problems_per_step
+                        )
+
+                # Train step
+                metrics = self.train_step(
+                    prompts,
+                    step,
+                    prompt_token_ids=prompt_token_ids,
+                    start_next_prefetch=_start_next_prefetch,
+                )
+                metrics["time/prefetch_wait"] = prefetch_wait
+
+                if step + 1 < max_steps:
+                    if next_holder["future"] is None:
+                        # Fallback path for modes that did not start overlap.
+                        next_holder["future"] = prefetch_executor.submit(
+                            self._fetch_and_tokenize_prompts, problems_per_step
+                        )
+                    next_batch_future = next_holder["future"]
+
+                total_tokens += metrics.get("progress/tokens", 0)
+                total_samples += metrics.get("progress/samples", 0)
+                metrics["progress/total_tokens"] = total_tokens
+                metrics["progress/total_samples"] = total_samples
+
+                # Log metrics
+                if self.monitor is not None:
+                    self.monitor.log(metrics, step=step)
                     self.monitor.flush(step=step)
 
-            # Checkpoint
-            if save_steps > 0 and step > 0 and step % save_steps == 0:
-                self.save_checkpoint(step)
+                # Log to console
+                logger.info(
+                    f"Step {step} | "
+                    f"Reward: {metrics['reward/mean']:.4f} | "
+                    f"Loss: {metrics['train/policy_loss']:.4f} | "
+                    f"KL: {metrics['train/mismatch_kl']:.4f} | "
+                    f"Grad: {metrics['train/grad_norm']:.4f} | "
+                    f"LR: {metrics['train/lr']:.2e} | "
+                    f"Temp: {metrics['sampling/temperature']:.2f} | "
+                    f"Time: {metrics['time/step']:.2f}s"
+                )
+
+                # Online evaluation
+                if eval_interval > 0 and step % eval_interval == 0:
+                    eval_metrics = self.evaluate(step)
+                    if eval_metrics and self.monitor is not None:
+                        self.monitor.log(eval_metrics, step=step)
+                        self.monitor.flush(step=step)
+
+                # Checkpoint
+                if save_steps > 0 and step > 0 and step % save_steps == 0:
+                    self.save_checkpoint(step)
 
         # Final export
         self._export_final()
