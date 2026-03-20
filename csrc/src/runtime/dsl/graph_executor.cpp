@@ -336,6 +336,8 @@ void GraphExecutor::reset_cuda_graphs() {
         (void)cudaGraphExecDestroy(mDecodeGraphExec);
         mDecodeGraphExec = nullptr;
     }
+    mDecodeGraphB = 0;
+    mDecodeGraphPrimed = false;
     // Reset split-attention segment graphs
     if (mCompiledExecutor) {
         mCompiledExecutor->reset_segment_graphs();
@@ -1975,19 +1977,30 @@ void GraphExecutor::execute_decode_step(long B,
         if (mDecodeGraphExec && mDecodeGraphB != B) {
             CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
             mDecodeGraphExec = nullptr;
+            mDecodeGraphB = 0;
+            mDecodeGraphPrimed = false;
         }
 
-        trace_or_execute_cuda_graph_with_stack(
-            [&]() {
-                mCompiledExecutor->execute_forward(
-                    *mDecodeCompiledForward, comm, /*full=*/false, hook);
-            },
-            rs.MainStream,
-            mDecodeGraphExec,
-            /*enabled=*/true,
-            rs.Stack,
-            mDecodeGraphCheckpoint);
-        mDecodeGraphB = B;
+        if (!mDecodeGraphExec && !mDecodeGraphPrimed) {
+            // Warm-up eager decode once before graph capture so capture-unsafe
+            // lazy allocations (e.g. recurrent state cudaMalloc) happen outside
+            // stream capture.
+            mCompiledExecutor->execute_forward(
+                *mDecodeCompiledForward, comm, /*full=*/false, hook);
+            mDecodeGraphPrimed = true;
+        } else {
+            trace_or_execute_cuda_graph_with_stack(
+                [&]() {
+                    mCompiledExecutor->execute_forward(
+                        *mDecodeCompiledForward, comm, /*full=*/false, hook);
+                },
+                rs.MainStream,
+                mDecodeGraphExec,
+                /*enabled=*/true,
+                rs.Stack,
+                mDecodeGraphCheckpoint);
+            mDecodeGraphB = B;
+        }
     } else {
         mCompiledExecutor->execute_forward(
             *mDecodeCompiledForward, comm, /*full=*/false, hook);
@@ -2007,8 +2020,9 @@ void GraphExecutor::invalidate_decode_graph() {
     if (mDecodeGraphExec) {
         CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
         mDecodeGraphExec = nullptr;
-        mDecodeGraphB = 0;
     }
+    mDecodeGraphB = 0;
+    mDecodeGraphPrimed = false;
     // Keep compiled decode/prefill graphs cached. They are shape-specialized IR
     // artifacts and do not capture per-call arena pointers.
 }

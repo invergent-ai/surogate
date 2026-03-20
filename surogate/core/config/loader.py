@@ -3,37 +3,60 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Type, TYPE_CHECKING, Union
+from typing import Any, Type, TypeVar
 from urllib.request import urlopen
 import yaml
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
-if TYPE_CHECKING:
-    from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
-    from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
-    from surogate.core.config.sft_config import SFTConfig
-    SurogateConfig = Union[SFTConfig, GRPOInferenceConfig, GRPOOrchestratorConfig]
-
 logger = get_logger()
 
-def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
+TConfig = TypeVar("TConfig")
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def load_config(
+    config_cls: Type[TConfig],
+    path: str | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> TConfig:
+    cfg_dict: dict[str, Any] = {}
+
     # Check if path is an HTTP(S) URL
-    if path.startswith(('http://', 'https://')):
-        logger.info(f"Fetching config from URL: {path}")
-        with urlopen(path) as response:
-            content = response.read().decode('utf-8')
-            cfg_dict = yaml.safe_load(content)
-    else:
-        with open(path, encoding="utf-8") as file:
-            cfg_dict = yaml.safe_load(file)
+    if path:
+        if path.startswith(('http://', 'https://')):
+            logger.info(f"Fetching config from URL: {path}")
+            with urlopen(path) as response:
+                content = response.read().decode('utf-8')
+                cfg_dict = yaml.safe_load(content)
+        else:
+            with open(path, encoding="utf-8") as file:
+                cfg_dict = yaml.safe_load(file)
+
+    if cfg_dict is None:
+        cfg_dict = {}
+    if not isinstance(cfg_dict, dict):
+        raise ValueError(
+            f"Invalid config payload for {config_cls.__name__}: expected mapping at top level"
+        )
+
+    if overrides:
+        cfg_dict = _deep_merge(cfg_dict, dict(overrides))
 
     # Expand environment variables
     cfg_dict = _expand_env_vars(cfg_dict)
     cfg: DictDefault = DictDefault(cfg_dict)
     
     config = config_cls(cfg)
-    cfg.config_path = path
+    cfg.config_path = path or "<cli-overrides>"
 
     cfg_to_log = {
         k: v for k, v in cfg.items() if v is not None
@@ -71,6 +94,4 @@ def _expand_env_vars(obj: Any) -> Any:
         return re.sub(pattern, replace_env_var, obj)
     else:
         return obj
-
-
 

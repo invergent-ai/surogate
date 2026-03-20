@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -122,390 +123,11 @@ std::vector<Trajectory> GenerationEngine::generate(
         dsl::GraphExecutor& graph_executor,
         NCCLCommunicator& comm,
         const modules::ForwardHook* hook) {
-
-    const int batch_size = static_cast<int>(prompts.size());
-    if (batch_size == 0) return {};
-
-    // Find max prompt length and round up to a stable bucket to improve
-    // decode graph reuse across calls with slightly different prompt lengths.
-    int max_prompt_len_observed = 0;
-    int max_prefill_len_observed = 0;
-    for (const auto& p : prompts) {
-        max_prompt_len_observed = std::max(max_prompt_len_observed, static_cast<int>(p.size()));
-        max_prefill_len_observed = std::max(
-            max_prefill_len_observed,
-            std::max(0, static_cast<int>(p.size()) - 1));
-    }
-    const int max_prompt_len =
-        round_up_prompt_len_bucket(max_prompt_len_observed, gen_config.max_gen_len, mRunState);
-    const int prefill_chunk_size = resolve_prefill_chunk_size(gen_config, max_prefill_len_observed);
-
-    const int max_total_len = max_prompt_len + gen_config.max_gen_len;
-    const int Hkv = mConfig.NumKeyValHeads;
-    const int Hs = mConfig.head_size();
-    const int num_layers = mConfig.NumLayers;
-    const int V = mConfig.VocabSize;
-    const int32_t fallback_token_id = is_valid_token_id(
-        static_cast<int32_t>(gen_config.eos_token_id), V
-    ) ? static_cast<int32_t>(gen_config.eos_token_id) : int32_t{0};
-
-    validate_prompt_tokens_or_throw(prompts, V, "GenerationEngine::generate");
-
-    // Save arena checkpoint for cleanup
-    auto arena_cp = arena.checkpoint();
-
-    // ========================================================================
-    // Allocate KV-cache
-    // ========================================================================
-    KVCache kv_cache(num_layers, batch_size, max_total_len, Hkv, Hs, KVDType::BF16);
-    kv_cache.allocate(arena);
-
-    // ========================================================================
-    // Allocate GPU buffers
-    // ========================================================================
-    auto* seq_lens_gpu = reinterpret_cast<int*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(int), "gen_seq_lens"));
-    auto* cu_seqlens_q_gpu = reinterpret_cast<int32_t*>(
-        arena.allocate(static_cast<std::size_t>(batch_size + 1) * sizeof(int32_t), "gen_cu_q"));
-    auto* seqused_k_gpu = reinterpret_cast<int32_t*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(int32_t), "gen_seqused_k"));
-    auto* position_ids_gpu = reinterpret_cast<int32_t*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(int32_t), "gen_pos_ids"));
-    auto* last_tokens_gpu = reinterpret_cast<int32_t*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(int32_t), "gen_last_tokens"));
-
-    // Logits buffer: [batch_size, vocab_size] — used by fused LM head in decode mode
-    auto* logits_gpu = reinterpret_cast<float*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * V * sizeof(float), "gen_logits"));
-    // Probs buffer (reuse logits memory for in-place softmax when temperature > 0)
-    auto* probs_gpu = logits_gpu;  // in-place softmax
-
-    // EOS finished mask on GPU (0 = active, 1 = finished)
-    auto* finished_gpu = reinterpret_cast<int*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(int), "gen_finished"));
-    CUDA_CHECK(cudaMemsetAsync(finished_gpu, 0, static_cast<std::size_t>(batch_size) * sizeof(int),
-                               mRunState.MainStream));
-
-    // Sampled token IDs and logprobs on GPU
-    auto* sampled_tokens_gpu = reinterpret_cast<int32_t*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(int32_t), "gen_sampled"));
-    auto* logprobs_gpu = reinterpret_cast<float*>(
-        arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(float), "gen_logprobs"));
-
-    // Softmax workspace (FlashInfer needs this for large vocab multi-block reduction)
-    const std::size_t softmax_workspace_bytes = static_cast<std::size_t>(batch_size) * 256 * 8;  // generous
-    void* softmax_workspace = arena.allocate(softmax_workspace_bytes, "gen_softmax_ws");
-
-    // Temperature buffer (per-sequence, for softmax)
-    float* temperature_gpu = nullptr;
-    if (gen_config.temperature > 0.0f && gen_config.temperature != 1.0f) {
-        temperature_gpu = reinterpret_cast<float*>(
-            arena.allocate(static_cast<std::size_t>(batch_size) * sizeof(float), "gen_temperature"));
-        std::vector<float> temp_host(static_cast<std::size_t>(batch_size), gen_config.temperature);
-        CUDA_CHECK(cudaMemcpyAsync(temperature_gpu, temp_host.data(),
-                                   static_cast<std::size_t>(batch_size) * sizeof(float),
-                                   cudaMemcpyHostToDevice, mRunState.MainStream));
-    }
-
-    // Create a copy stream for async D2H of (token, logprob) per decode step
-    cudaStream_t copy_stream = nullptr;
-    CUDA_CHECK(cudaStreamCreate(&copy_stream));
-
-    // Pinned host buffers for streaming D2H
-    int32_t* pinned_tokens = nullptr;
-    float* pinned_logprobs = nullptr;
-    CUDA_CHECK(cudaMallocHost(&pinned_tokens, static_cast<std::size_t>(batch_size) * sizeof(int32_t)));
-    CUDA_CHECK(cudaMallocHost(&pinned_logprobs, static_cast<std::size_t>(batch_size) * sizeof(float)));
-
-    // ========================================================================
-    // Initialize state
-    // ========================================================================
-    std::vector<Trajectory> trajectories(static_cast<std::size_t>(batch_size));
-    std::vector<int> seq_lens_host(static_cast<std::size_t>(batch_size), 0);
-    std::vector<bool> finished(static_cast<std::size_t>(batch_size), false);
-    int num_active = batch_size;
-
-    std::vector<int> prompt_lens_host(static_cast<std::size_t>(batch_size), 0);
-    std::vector<int> prefill_lens_host(static_cast<std::size_t>(batch_size), 0);
-    int max_prefill_len = 0;
-    for (int b = 0; b < batch_size; ++b) {
-        const int prompt_len = static_cast<int>(prompts[static_cast<std::size_t>(b)].size());
-        if (prompt_len <= 0) {
-            throw std::invalid_argument("GenerationEngine::generate: prompts must be non-empty");
-        }
-        const int prefill_len = prompt_len - 1;
-        prompt_lens_host[static_cast<std::size_t>(b)] = prompt_len;
-        prefill_lens_host[static_cast<std::size_t>(b)] = prefill_len;
-        max_prefill_len = std::max(max_prefill_len, prefill_len);
-        trajectories[static_cast<std::size_t>(b)].prompt_len = prompt_len;
-        trajectories[static_cast<std::size_t>(b)].tokens = prompts[static_cast<std::size_t>(b)];
-    }
-
-    // Recurrent state map for delta-rule / SSM layers (Qwen3.5 hybrid)
-    std::unordered_map<int, void*> recurrent_states;
-    std::unordered_map<int, void*> conv_states;
-
-    // Set up decode state
-    infer::DecodeState decode_state{};
-    decode_state.recurrent_states = &recurrent_states;
-    decode_state.conv_states = &conv_states;
-    decode_state.finished_gpu = finished_gpu;
-    decode_state.k_data = kv_cache.k_data;
-    decode_state.v_data = kv_cache.v_data;
-    decode_state.per_buffer_bytes = kv_cache.per_buffer_bytes;
-    decode_state.seq_lens_gpu = seq_lens_gpu;
-    decode_state.cu_seqlens_q_gpu = cu_seqlens_q_gpu;
-    decode_state.cu_seqlens_k_gpu = seqused_k_gpu;  // reused as seqused_k
-    decode_state.max_seq_len = max_total_len;
-    decode_state.num_kv_heads = Hkv;
-    decode_state.head_dim = Hs;
-    decode_state.fp8 = false;
-    decode_state.logits_out_gpu = logits_gpu;
-    decode_state.vocab_size = V;
-
-    // ========================================================================
-    // Prefill: process prompt prefix (all tokens except the last one) using
-    // chunked full-sequence forwards. The first decode step then consumes the
-    // last prompt token to produce the first generated token.
-    // dispatch_rope bulk-stores K/V to the KV-cache; attention runs normally.
-    // ========================================================================
-    if (max_prefill_len > 0) {
-        const std::size_t max_chunk_padded =
-            static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(prefill_chunk_size);
-        std::vector<int32_t> tokens_host(max_chunk_padded, 0);
-        std::vector<int32_t> pos_ids_host(max_chunk_padded, 0);
-
-        for (int chunk_start = 0; chunk_start < max_prefill_len; chunk_start += prefill_chunk_size) {
-            const int chunk_len = std::min(prefill_chunk_size, max_prefill_len - chunk_start);
-            const std::size_t chunk_padded =
-                static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(chunk_len);
-            std::fill(tokens_host.begin(), tokens_host.begin() + chunk_padded, 0);
-
-            for (int b = 0; b < batch_size; ++b) {
-                const auto& p = prompts[static_cast<std::size_t>(b)];
-                const int prefill_len = prefill_lens_host[static_cast<std::size_t>(b)];
-                for (int t = 0; t < chunk_len; ++t) {
-                    const int absolute_t = chunk_start + t;
-                    const std::size_t idx = static_cast<std::size_t>(b) * chunk_len + t;
-                    tokens_host[idx] = absolute_t < prefill_len ? p[static_cast<std::size_t>(absolute_t)] : 0;
-                    pos_ids_host[idx] = absolute_t;
-                }
-            }
-
-            graph_executor.execute_prefill(
-                static_cast<long>(batch_size), static_cast<long>(chunk_len),
-                tokens_host.data(), pos_ids_host.data(),
-                decode_state, comm, hook);
-        }
-    }
-
-    // Update seq_lens to reflect prefilled prefix lengths.
-    for (int b = 0; b < batch_size; ++b) {
-        seq_lens_host[static_cast<std::size_t>(b)] = prefill_lens_host[static_cast<std::size_t>(b)];
-    }
-
-    // ========================================================================
-    // Decode loop: generate tokens autoregressively
-    // ========================================================================
-    // After prefill, last_tokens_gpu holds the last prompt token for each seq.
-    // We need to set it to the last token of each prompt for the first decode step.
-    {
-        std::vector<int32_t> first_decode_tokens(static_cast<std::size_t>(batch_size));
-        for (int b = 0; b < batch_size; ++b) {
-            const auto& p = prompts[static_cast<std::size_t>(b)];
-            first_decode_tokens[static_cast<std::size_t>(b)] = p.back();
-        }
-        CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu, first_decode_tokens.data(),
-                                   static_cast<std::size_t>(batch_size) * sizeof(int32_t),
-                                   cudaMemcpyHostToDevice, mRunState.MainStream));
-    }
-
-    // RNG state for sampling
-    uint64_t rng_offset = 0;
-
-    // Event for copy stream synchronization
-    cudaEvent_t compute_done;
-    CUDA_CHECK(cudaEventCreate(&compute_done));
-
-    // Pre-allocate host buffers used every step (avoid heap allocs in hot loop)
-    std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(batch_size));
-    std::vector<int> finished_host_buf(static_cast<std::size_t>(batch_size), 0);
-
-    for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
-        // Upload seq_lens and build cu_seqlens/seqused_k
-        CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu, seq_lens_host.data(),
-                                   static_cast<std::size_t>(batch_size) * sizeof(int),
-                                   cudaMemcpyHostToDevice, mRunState.MainStream));
-
-        if (gen_config.use_cuda_graphs) {
-            decode_state.max_seqlen_k = max_prompt_len + gen_config.max_gen_len;
-        } else {
-            decode_state.max_seqlen_k = *std::max_element(seq_lens_host.begin(), seq_lens_host.end()) + 1;
-        }
-
-        fill_decode_cu_seqlens(cu_seqlens_q_gpu, seqused_k_gpu,
-                               seq_lens_gpu, batch_size, mRunState.MainStream);
-
-        // Position IDs
-        for (int b = 0; b < batch_size; ++b) {
-            pos_ids_host[static_cast<std::size_t>(b)] = seq_lens_host[static_cast<std::size_t>(b)];
-        }
-        CUDA_CHECK(cudaMemcpyAsync(position_ids_gpu, pos_ids_host.data(),
-                                   static_cast<std::size_t>(batch_size) * sizeof(int32_t),
-                                   cudaMemcpyHostToDevice, mRunState.MainStream));
-
-        // Mask finished sequences: replace their token with pad (0)
-        mask_finished_tokens(last_tokens_gpu, finished_gpu, batch_size, mRunState.MainStream);
-
-        // Execute decode step → logits in logits_gpu [batch_size, V]
-        graph_executor.execute_decode_step(
-            static_cast<long>(batch_size), last_tokens_gpu, position_ids_gpu,
-            decode_state, comm, hook, gen_config.use_cuda_graphs);
-        if (sanitize_logits_enabled()) {
-            // Match HF remove_invalid_values behavior when explicitly enabled.
-            sampling_sanitize_logits(logits_gpu, batch_size, V, mRunState.MainStream);
-        }
-
-        // ----------------------------------------------------------------
-        // Sample from logits
-        // ----------------------------------------------------------------
-        if (gen_config.temperature <= 0.0f) {
-            // Greedy (argmax)
-            sampling_argmax(logits_gpu, sampled_tokens_gpu, batch_size, V, mRunState.MainStream);
-        } else {
-            // Temperature-scaled softmax → probs
-            sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
-                             batch_size, V, softmax_workspace, softmax_workspace_bytes,
-                             mRunState.MainStream);
-
-            // Apply filtered sampling strategy
-            if (gen_config.top_k > 0 && gen_config.top_p < 1.0f) {
-                sampling_top_k_top_p(probs_gpu, sampled_tokens_gpu,
-                                     gen_config.top_k, gen_config.top_p,
-                                     batch_size, V, /*deterministic=*/false,
-                                     gen_config.seed, rng_offset, mRunState.MainStream);
-            } else if (gen_config.top_k > 0) {
-                sampling_top_k(probs_gpu, sampled_tokens_gpu, gen_config.top_k,
-                               batch_size, V, /*deterministic=*/false,
-                               gen_config.seed, rng_offset, mRunState.MainStream);
-            } else if (gen_config.top_p < 1.0f) {
-                sampling_top_p(probs_gpu, sampled_tokens_gpu, gen_config.top_p,
-                               batch_size, V, /*deterministic=*/false,
-                               gen_config.seed, rng_offset, mRunState.MainStream);
-            } else if (gen_config.min_p > 0.0f) {
-                sampling_min_p(probs_gpu, sampled_tokens_gpu, gen_config.min_p,
-                               batch_size, V, /*deterministic=*/false,
-                               gen_config.seed, rng_offset, mRunState.MainStream);
-            } else {
-                // Plain categorical sampling
-                sampling_from_probs(probs_gpu, sampled_tokens_gpu, batch_size, V,
-                                    /*deterministic=*/false, gen_config.seed, rng_offset,
-                                    mRunState.MainStream);
-            }
-        }
-        // Ensure finished rows remain masked for subsequent decode steps.
-        mask_finished_tokens(sampled_tokens_gpu, finished_gpu, batch_size, mRunState.MainStream);
-        // Guarantee sampled IDs stay in-vocab before feedback / host export.
-        sampling_sanitize_token_ids(
-            sampled_tokens_gpu,
-            batch_size,
-            V,
-            fallback_token_id,
-            /*invalid_count=*/nullptr,
-            mRunState.MainStream);
-        rng_offset++;
-
-        // Extract logprobs: logprob[i] = log p(sampled_token_i | logits_i)
-        if (gen_config.temperature <= 0.0f) {
-            sampling_softmax(logits_gpu, probs_gpu, /*temperature=*/nullptr,
-                             batch_size, V, softmax_workspace, softmax_workspace_bytes,
-                             mRunState.MainStream);
-        }
-        sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
-                                 batch_size, V, mRunState.MainStream);
-
-        // ----------------------------------------------------------------
-        // Streaming D2H: copy (token, logprob) to pinned host on copy stream
-        // ----------------------------------------------------------------
-        CUDA_CHECK(cudaEventRecord(compute_done, mRunState.MainStream));
-        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, compute_done, 0));
-
-        CUDA_CHECK(cudaMemcpyAsync(pinned_tokens, sampled_tokens_gpu,
-                                   static_cast<std::size_t>(batch_size) * sizeof(int32_t),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-        CUDA_CHECK(cudaMemcpyAsync(pinned_logprobs, logprobs_gpu,
-                                   static_cast<std::size_t>(batch_size) * sizeof(float),
-                                   cudaMemcpyDeviceToHost, copy_stream));
-
-        // Wait for D2H to complete before reading host buffers
-        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
-
-        // Feed sampled tokens back for next step.
-        CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu, sampled_tokens_gpu,
-                                   static_cast<std::size_t>(batch_size) * sizeof(int32_t),
-                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
-
-        // ----------------------------------------------------------------
-        // EOS detection + trajectory update
-        // ----------------------------------------------------------------
-        bool finished_changed = false;
-        for (int b = 0; b < batch_size; ++b) {
-            if (finished[static_cast<std::size_t>(b)]) continue;
-
-            const int32_t token = pinned_tokens[b];
-            const float logprob = pinned_logprobs[b];
-
-            trajectories[static_cast<std::size_t>(b)].tokens.push_back(token);
-            trajectories[static_cast<std::size_t>(b)].logprobs.push_back(logprob);
-            seq_lens_host[static_cast<std::size_t>(b)]++;
-
-            if (token == gen_config.eos_token_id) {
-                finished[static_cast<std::size_t>(b)] = true;
-                finished_changed = true;
-                trajectories[static_cast<std::size_t>(b)].completion_len = step + 1;
-                num_active--;
-            }
-        }
-
-        // Upload finished mask to GPU for next step's EOS masking
-        if (finished_changed) {
-            for (int b = 0; b < batch_size; ++b) {
-                finished_host_buf[static_cast<std::size_t>(b)] = finished[static_cast<std::size_t>(b)] ? 1 : 0;
-            }
-            CUDA_CHECK(cudaMemcpyAsync(finished_gpu, finished_host_buf.data(),
-                                       static_cast<std::size_t>(batch_size) * sizeof(int),
-                                       cudaMemcpyHostToDevice, mRunState.MainStream));
-        }
-    }
-
-    // Set completion_len for sequences that didn't hit EOS
-    for (int b = 0; b < batch_size; ++b) {
-        if (!finished[static_cast<std::size_t>(b)]) {
-            trajectories[static_cast<std::size_t>(b)].completion_len =
-                static_cast<int>(trajectories[static_cast<std::size_t>(b)].tokens.size())
-                - trajectories[static_cast<std::size_t>(b)].prompt_len;
-        }
-    }
-    // Cleanup
-    CUDA_CHECK(cudaEventDestroy(compute_done));
-    CUDA_CHECK(cudaStreamDestroy(copy_stream));
-    CUDA_CHECK(cudaFreeHost(pinned_tokens));
-    CUDA_CHECK(cudaFreeHost(pinned_logprobs));
-
-    // Free recurrent state buffers (allocated via cudaMalloc, not arena)
-    for (auto& [_, ptr] : recurrent_states) {
-        if (ptr) cudaFree(ptr);
-    }
-    for (auto& [_, ptr] : conv_states) {
-        if (ptr) cudaFree(ptr);
-    }
-
-    // Invalidate decode graph before arena restore: captured graph arguments
-    // include generation arena pointers that become stale after restore.
-    graph_executor.invalidate_decode_graph();
-    arena.restore(arena_cp);
-
-    return trajectories;
+    // Non-GRPO generation now runs through the same paged-KV decode path as
+    // GRPO with N=1, so we keep one optimized implementation.
+    GenerationEngineConfig paged_cfg = gen_config;
+    paged_cfg.num_completions = 1;
+    return generate_grpo(prompts, paged_cfg, arena, graph_executor, comm, hook);
 }
 
 std::vector<Trajectory> GenerationEngine::generate_grpo(
@@ -640,6 +262,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     std::vector<int32_t> prefill_pos_chunk(
         static_cast<std::size_t>(std::max(1, prefill_chunk_size)), 0);
 
+    // Shared recurrent/conv state maps for decode.
+    // Recurrent state is prefilled per-prompt (B=1) then scattered into these
+    // full-batch [M*N, H, K, V] buffers before decode starts.
+    std::unordered_map<int, void*> grpo_recurrent_states;
+    std::unordered_map<int, std::size_t> grpo_recurrent_state_bytes;
+    std::unordered_map<int, void*> grpo_conv_states;
+
     // ========================================================================
     // Prefill: for each prompt, run prefix-only forward (all tokens except the
     // last one) to populate shared prefix pages.
@@ -679,6 +308,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
             static_cast<std::size_t>(paged_kv.max_pages_per_seq) * sizeof(int),
             cudaMemcpyHostToDevice, mRunState.MainStream));
 
+        // Per-prompt recurrent-state capture during prefill (B=1 source slot).
+        std::unordered_map<int, void*> prompt_recurrent_states;
+        std::unordered_map<int, std::size_t> prompt_recurrent_state_bytes;
+
         // Prefill decode state (B=1, paged, prefill_mode=true)
         infer::DecodeState prompt_ds{};
         prompt_ds.paged = true;
@@ -693,6 +326,9 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         prompt_ds.head_dim = Hs;
         prompt_ds.logits_out_gpu = logits_gpu;
         prompt_ds.vocab_size = V;
+        prompt_ds.recurrent_states = &prompt_recurrent_states;
+        prompt_ds.recurrent_state_bytes = &prompt_recurrent_state_bytes;
+        prompt_ds.conv_states = &grpo_conv_states;
         // prefill_mode is set by execute_prefill()
 
         if (prefill_len > 0) {
@@ -710,6 +346,50 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
                     1L, static_cast<long>(chunk_len),
                     prefill_tokens_chunk.data(), prefill_pos_chunk.data(),
                     prompt_ds, comm, hook);
+            }
+        }
+
+        // Scatter per-prompt recurrent state [1,H,K,V] to each completion slot
+        // in the decode batch buffer [M*N,H,K,V].
+        for (const auto& [layer_idx, src_ptr] : prompt_recurrent_states) {
+            if (!src_ptr) {
+                continue;
+            }
+            auto it_bytes = prompt_recurrent_state_bytes.find(layer_idx);
+            if (it_bytes == prompt_recurrent_state_bytes.end() || it_bytes->second == 0) {
+                throw std::runtime_error(
+                    "GenerationEngine::generate_grpo: missing recurrent state bytes for layer "
+                    + std::to_string(layer_idx));
+            }
+            const std::size_t per_seq_bytes = it_bytes->second;
+
+            void*& dst_base = grpo_recurrent_states[layer_idx];
+            auto it_global_bytes = grpo_recurrent_state_bytes.find(layer_idx);
+            if (!dst_base) {
+                const std::size_t total_bytes =
+                    per_seq_bytes * static_cast<std::size_t>(total_batch);
+                CUDA_CHECK(cudaMalloc(&dst_base, total_bytes));
+                CUDA_CHECK(cudaMemsetAsync(dst_base, 0, total_bytes, mRunState.MainStream));
+                grpo_recurrent_state_bytes[layer_idx] = per_seq_bytes;
+            } else if (it_global_bytes == grpo_recurrent_state_bytes.end() ||
+                       it_global_bytes->second != per_seq_bytes) {
+                throw std::runtime_error(
+                    "GenerationEngine::generate_grpo: recurrent state byte-size mismatch for layer "
+                    + std::to_string(layer_idx));
+            }
+
+            for (int n = 0; n < N; ++n) {
+                const int dst_slot = src_slot + n;
+                auto* dst_ptr = static_cast<char*>(dst_base)
+                              + static_cast<std::size_t>(dst_slot) * per_seq_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, per_seq_bytes,
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        }
+
+        for (auto& [_, ptr] : prompt_recurrent_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
             }
         }
 
@@ -746,11 +426,9 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     // ========================================================================
     // Decode loop: all M×N sequences decode in parallel
     // ========================================================================
-    std::unordered_map<int, void*> grpo_recurrent_states;
-    std::unordered_map<int, void*> grpo_conv_states;
-
     infer::DecodeState decode_state{};
     decode_state.recurrent_states = &grpo_recurrent_states;
+    decode_state.recurrent_state_bytes = &grpo_recurrent_state_bytes;
     decode_state.conv_states = &grpo_conv_states;
     decode_state.paged = true;
     decode_state.k_pages = paged_kv.k_pages;

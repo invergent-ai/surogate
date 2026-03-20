@@ -184,7 +184,18 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         const int BV_rec = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
         const int NV_rec = cdiv(static_cast<int>(V), BV_rec);
 
-        void* h0_ptr = initial_state ? initial_state->Data : nullptr;
+        Tensor h0_buf;
+        void* h0_ptr = nullptr;
+        if (initial_state) {
+            h0_ptr = initial_state->Data;
+        } else {
+            // For empty/length-1 prompts there is no prefill-produced recurrent
+            // state; decode should start from zero state.
+            h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_rec");
+            mTemps.push_back(h0_buf);
+            CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
+            h0_ptr = h0_buf.Data;
+        }
         void* ht_ptr = final_state_ptr->Data;
         int32_t T_val = static_cast<int32_t>(T);
         void* args[] = {
@@ -209,6 +220,10 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
             if (!saved) {
                 CUDA_CHECK(cudaMalloc(&saved, state_bytes));
                 states[layer_idx_for_state] = saved;
+            }
+            if (mDecodeState->recurrent_state_bytes) {
+                (*mDecodeState->recurrent_state_bytes)[layer_idx_for_state] =
+                    state_bytes / static_cast<std::size_t>(std::max<long>(1, B));
             }
             if (final_state_ptr->DType == ETensorDType::FP32) {
                 convert_dtype(reinterpret_cast<nv_bfloat16*>(saved),
@@ -355,6 +370,10 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
             // First time: allocate persistent GPU buffer (NOT from stack)
             CUDA_CHECK(cudaMalloc(&saved, state_bytes));
             states[layer_idx_for_state] = saved;
+        }
+        if (mDecodeState->recurrent_state_bytes) {
+            (*mDecodeState->recurrent_state_bytes)[layer_idx_for_state] =
+                state_bytes / static_cast<std::size_t>(std::max<long>(1, B));
         }
 
         // The final_state is in FP32 but the kernel expects BF16 initial_state.

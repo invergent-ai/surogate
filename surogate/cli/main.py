@@ -12,6 +12,7 @@ logger = get_logger()
 COMMAND_MAPPING: Dict[str, str] = {
     'sft': 'surogate.cli.sft',
     'pt': 'surogate.cli.pt',
+    'serve': 'surogate.cli.serve',
     'grpo': 'surogate.cli.grpo',
     'grpo-train': 'surogate.cli.grpo_train',
     'grpo-infer': 'surogate.cli.grpo_infer',
@@ -49,6 +50,10 @@ def parse_args():
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
     pt_prepare_command_parser(subparsers.add_parser('pt', help="Pretraining"))
 
+    # native serving command
+    from surogate.cli.serve import prepare_command_parser as serve_prepare_command_parser
+    serve_prepare_command_parser(subparsers.add_parser('serve', help="Native OpenAI-compatible inference serving"))
+
     # grpo command (unified co-locate mode)
     from surogate.cli.grpo import prepare_command_parser as grpo_prepare_command_parser
     grpo_prepare_command_parser(subparsers.add_parser('grpo', help="GRPO RL (unified co-locate mode)"))
@@ -81,13 +86,10 @@ def parse_args():
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser
     tokenize_prepare_command_parser(subparsers.add_parser('tokenize', help="Tokenize datasets for training"))
 
-    args = parser.parse_args(sys.argv[1:])
+    # Use parse_known_args so dynamic config overrides like
+    # --sampling.temperature=0.7 pass through to subcommand parsers.
+    args, _unknown = parser.parse_known_args(sys.argv[1:])
     if args.command is None:
-        parser.print_help()
-        sys.exit(1)
-
-    commands_with_config = ['sft', 'pt', 'grpo_train', 'grpo_infer', 'grpo_orch', 'grpo-native', 'tokenize']
-    if args.command in commands_with_config and not getattr(args, 'config', None):
         parser.print_help()
         sys.exit(1)
 

@@ -10,11 +10,10 @@
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
+from surogate.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger()
 
 def compile_jit_kernels(ir_json: str) -> dict[str, str]:
     """Compile all JIT kernels required by the model.

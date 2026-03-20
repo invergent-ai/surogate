@@ -1,12 +1,9 @@
-"""CLI entry point for GRPO RL Orchestrator: `surogate grpo-orch config.yaml`"""
+"""CLI entry point for native OpenAI-compatible inference serving."""
 
-import sys
 import argparse
+import sys
 
 from surogate.cli.config_overrides import parse_cli_overrides
-from surogate.utils.logger import get_logger
-
-logger = get_logger()
 
 
 def prepare_command_parser(parser=None):
@@ -18,7 +15,7 @@ def prepare_command_parser(parser=None):
         type=str,
         nargs="?",
         default=None,
-        help="Optional path to GRPO Orchestrator config YAML file",
+        help="Optional path to serving config YAML file",
     )
     return parser
 
@@ -27,9 +24,9 @@ if __name__ == "__main__":
     args, unknown = prepare_command_parser().parse_known_args(sys.argv[1:])
 
     from surogate.core.config.loader import load_config
-    from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
-    from surogate.grpo.orchestrator.grpo_orch import grpo_orchestrator
+    from surogate.core.config.serve_config import ServeConfig
+    from surogate.serve.server import serve
 
     overrides = parse_cli_overrides(unknown)
-    config = load_config(GRPOOrchestratorConfig, args.config, overrides=overrides)
-    grpo_orchestrator(config)
+    config = load_config(ServeConfig, args.config, overrides=overrides)
+    serve(config)

@@ -406,6 +406,7 @@ private:
     cudaGraphExec_t mDecodeGraphExec = nullptr;
     DeviceMemoryStack::Checkpoint mDecodeGraphCheckpoint{};
     long mDecodeGraphB = 0;
+    bool mDecodeGraphPrimed = false;
 
     // ========================================================================
     // Compiled execution (operations pre-compiled into direct function calls)

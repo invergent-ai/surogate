@@ -19,8 +19,9 @@ import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable
+from surogate.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 _DEFAULT_CACHE_DIR = Path.home() / ".cache" / "surogate" / "kernels"
 

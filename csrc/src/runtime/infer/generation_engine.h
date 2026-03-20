@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// GenerationEngine: single-load synchronous generation for GRPO rollouts.
+// GenerationEngine: synchronous native generation for training/inference paths.
 //
 // Orchestrates prefill + decode loop using the same model weights and GPU
 // context as the training engine. No separate process, no weight broadcast.
@@ -67,9 +67,10 @@ public:
                      const RuntimeOptions& options);
 
     /// Generate completions for a batch of prompts (1 completion each).
+    /// Uses the paged-KV decode backend with N=1 for consistency.
     ///
     /// @param prompts        [num_prompts][prompt_len] token IDs (host, ragged)
-    /// @param gen_config     Generation parameters (num_completions ignored, always 1)
+    /// @param gen_config     Generation parameters (num_completions forced to 1)
     /// @param arena          Arena to allocate KV-cache from
     /// @param graph_executor Model graph executor
     /// @param comm           NCCL communicator

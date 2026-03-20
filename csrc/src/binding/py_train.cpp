@@ -1822,14 +1822,18 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         // force_recompile() ensures the next training operation gets fresh
         // graphs for training dimensions (B_train, T_train).
 
-        // Generate using the model's stack as arena
+        // Generate using the model's stack as arena.
+        // N=1 uses the non-GRPO API surface, but it now also runs paged KV.
         std::vector<infer::Trajectory> trajectories;
-        trajectories = engine.generate_grpo(
-            prompts, gen_config, run_state.Stack,
-            *graph_exec, *ctx.Communicator, hook_ptr);
-
-        // generate_grpo() already synchronizes generation stream and invalidates
-        // decode graph captures that reference generation-arena pointers.
+        if (num_completions == 1) {
+            trajectories = engine.generate(
+                prompts, gen_config, run_state.Stack,
+                *graph_exec, *ctx.Communicator, hook_ptr);
+        } else {
+            trajectories = engine.generate_grpo(
+                prompts, gen_config, run_state.Stack,
+                *graph_exec, *ctx.Communicator, hook_ptr);
+        }
 
         // Convert trajectories to result
         result.tokens.resize(trajectories.size());

@@ -50,6 +50,9 @@ struct DecodeState {
     // During decode: dispatch_chunk_gated_delta_rule reads initial_state from here
     //                and updates it with the new final_state.
     std::unordered_map<int, void*>* recurrent_states = nullptr;
+    // Optional recurrent state stride metadata.
+    // Maps layer_idx → bytes for one sequence state slice [1, H, K, V].
+    std::unordered_map<int, std::size_t>* recurrent_state_bytes = nullptr;
 
     // Per-layer causal-conv state for Mamba-style conv1d in Qwen3.5 linear blocks.
     // Maps layer_idx -> GPU buffer [B, conv_dim, kernel-1] with the rolling tail.
