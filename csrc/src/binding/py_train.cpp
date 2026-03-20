@@ -1756,6 +1756,7 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         int top_k,
         float top_p,
         float min_p,
+        int prefill_chunk_size,
         float repetition_penalty) {
     if (num_completions <= 0) {
         throw std::invalid_argument("generate: num_completions must be > 0");
@@ -1786,6 +1787,7 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         gen_config.top_k = top_k;
         gen_config.top_p = top_p;
         gen_config.min_p = min_p;
+        gen_config.prefill_chunk_size = std::max(0, prefill_chunk_size);
         gen_config.repetition_penalty = repetition_penalty;
         gen_config.eos_token_id = eos_token_id;
         gen_config.num_completions = num_completions;

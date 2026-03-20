@@ -68,6 +68,18 @@ inline int round_up_prompt_len_bucket(
     return std::min(prompt_cap, observed_max_prompt_len);
 }
 
+inline int resolve_prefill_chunk_size(
+        const GenerationEngineConfig& gen_config,
+        const int max_prefill_len) {
+    if (max_prefill_len <= 0) {
+        return 0;
+    }
+    if (gen_config.prefill_chunk_size <= 0) {
+        return max_prefill_len;
+    }
+    return std::max(1, std::min(gen_config.prefill_chunk_size, max_prefill_len));
+}
+
 void validate_prompt_tokens_or_throw(const std::vector<std::vector<int32_t>>& prompts,
                                      const int vocab_size,
                                      const char* caller) {
@@ -117,17 +129,25 @@ std::vector<Trajectory> GenerationEngine::generate(
     // Find max prompt length and round up to a stable bucket to improve
     // decode graph reuse across calls with slightly different prompt lengths.
     int max_prompt_len_observed = 0;
+    int max_prefill_len_observed = 0;
     for (const auto& p : prompts) {
         max_prompt_len_observed = std::max(max_prompt_len_observed, static_cast<int>(p.size()));
+        max_prefill_len_observed = std::max(
+            max_prefill_len_observed,
+            std::max(0, static_cast<int>(p.size()) - 1));
     }
     const int max_prompt_len =
         round_up_prompt_len_bucket(max_prompt_len_observed, gen_config.max_gen_len, mRunState);
+    const int prefill_chunk_size = resolve_prefill_chunk_size(gen_config, max_prefill_len_observed);
 
     const int max_total_len = max_prompt_len + gen_config.max_gen_len;
     const int Hkv = mConfig.NumKeyValHeads;
     const int Hs = mConfig.head_size();
     const int num_layers = mConfig.NumLayers;
     const int V = mConfig.VocabSize;
+    const int32_t fallback_token_id = is_valid_token_id(
+        static_cast<int32_t>(gen_config.eos_token_id), V
+    ) ? static_cast<int32_t>(gen_config.eos_token_id) : int32_t{0};
 
     validate_prompt_tokens_or_throw(prompts, V, "GenerationEngine::generate");
 
@@ -244,30 +264,39 @@ std::vector<Trajectory> GenerationEngine::generate(
     decode_state.vocab_size = V;
 
     // ========================================================================
-    // Prefill: process prompt prefix (all tokens except the last one) in a
-    // single full-sequence forward. The first decode step then consumes the
+    // Prefill: process prompt prefix (all tokens except the last one) using
+    // chunked full-sequence forwards. The first decode step then consumes the
     // last prompt token to produce the first generated token.
     // dispatch_rope bulk-stores K/V to the KV-cache; attention runs normally.
     // ========================================================================
     if (max_prefill_len > 0) {
-        // Pad prompt prefixes into [batch_size, max_prefill_len] row-major
-        const std::size_t padded_size = static_cast<std::size_t>(batch_size) * max_prefill_len;
-        std::vector<int32_t> tokens_host(padded_size, 0);
-        std::vector<int32_t> pos_ids_host(padded_size);
-        for (int b = 0; b < batch_size; ++b) {
-            const auto& p = prompts[static_cast<std::size_t>(b)];
-            const int prefill_len = prefill_lens_host[static_cast<std::size_t>(b)];
-            for (int t = 0; t < max_prefill_len; ++t) {
-                const std::size_t idx = static_cast<std::size_t>(b) * max_prefill_len + t;
-                tokens_host[idx] = t < prefill_len ? p[static_cast<std::size_t>(t)] : 0;
-                pos_ids_host[idx] = t;
-            }
-        }
+        const std::size_t max_chunk_padded =
+            static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(prefill_chunk_size);
+        std::vector<int32_t> tokens_host(max_chunk_padded, 0);
+        std::vector<int32_t> pos_ids_host(max_chunk_padded, 0);
 
-        graph_executor.execute_prefill(
-            static_cast<long>(batch_size), static_cast<long>(max_prefill_len),
-            tokens_host.data(), pos_ids_host.data(),
-            decode_state, comm, hook);
+        for (int chunk_start = 0; chunk_start < max_prefill_len; chunk_start += prefill_chunk_size) {
+            const int chunk_len = std::min(prefill_chunk_size, max_prefill_len - chunk_start);
+            const std::size_t chunk_padded =
+                static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(chunk_len);
+            std::fill(tokens_host.begin(), tokens_host.begin() + chunk_padded, 0);
+
+            for (int b = 0; b < batch_size; ++b) {
+                const auto& p = prompts[static_cast<std::size_t>(b)];
+                const int prefill_len = prefill_lens_host[static_cast<std::size_t>(b)];
+                for (int t = 0; t < chunk_len; ++t) {
+                    const int absolute_t = chunk_start + t;
+                    const std::size_t idx = static_cast<std::size_t>(b) * chunk_len + t;
+                    tokens_host[idx] = absolute_t < prefill_len ? p[static_cast<std::size_t>(absolute_t)] : 0;
+                    pos_ids_host[idx] = absolute_t;
+                }
+            }
+
+            graph_executor.execute_prefill(
+                static_cast<long>(batch_size), static_cast<long>(chunk_len),
+                tokens_host.data(), pos_ids_host.data(),
+                decode_state, comm, hook);
+        }
     }
 
     // Update seq_lens to reflect prefilled prefix lengths.
@@ -376,6 +405,14 @@ std::vector<Trajectory> GenerationEngine::generate(
         }
         // Ensure finished rows remain masked for subsequent decode steps.
         mask_finished_tokens(sampled_tokens_gpu, finished_gpu, batch_size, mRunState.MainStream);
+        // Guarantee sampled IDs stay in-vocab before feedback / host export.
+        sampling_sanitize_token_ids(
+            sampled_tokens_gpu,
+            batch_size,
+            V,
+            fallback_token_id,
+            /*invalid_count=*/nullptr,
+            mRunState.MainStream);
         rng_offset++;
 
         // Extract logprobs: logprob[i] = log p(sampled_token_i | logits_i)
@@ -488,17 +525,25 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     // Find max prompt length and round up to a stable bucket to improve
     // decode graph reuse across calls with slightly different prompt lengths.
     int max_prompt_len_observed = 0;
+    int max_prefill_len_observed = 0;
     for (const auto& p : prompts) {
         max_prompt_len_observed = std::max(max_prompt_len_observed, static_cast<int>(p.size()));
+        max_prefill_len_observed = std::max(
+            max_prefill_len_observed,
+            std::max(0, static_cast<int>(p.size()) - 1));
     }
     const int max_prompt_len =
         round_up_prompt_len_bucket(max_prompt_len_observed, gen_config.max_gen_len, mRunState);
+    const int prefill_chunk_size = resolve_prefill_chunk_size(gen_config, max_prefill_len_observed);
 
     const int max_total_len = max_prompt_len + gen_config.max_gen_len;
     const int Hkv = mConfig.NumKeyValHeads;
     const int Hs = mConfig.head_size();
     const int num_layers = mConfig.NumLayers;
     const int V = mConfig.VocabSize;
+    const int32_t fallback_token_id = is_valid_token_id(
+        static_cast<int32_t>(gen_config.eos_token_id), V
+    ) ? static_cast<int32_t>(gen_config.eos_token_id) : int32_t{0};
 
     validate_prompt_tokens_or_throw(prompts, V, "GenerationEngine::generate_grpo");
 
@@ -590,6 +635,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     // Block table GPU buffer for B=1 prefill
     auto* prefill_block_table_gpu = reinterpret_cast<int*>(
         alloc(static_cast<std::size_t>(paged_kv.max_pages_per_seq) * sizeof(int), "grpo_prefill_bt"));
+    std::vector<int32_t> prefill_tokens_chunk(
+        static_cast<std::size_t>(std::max(1, prefill_chunk_size)), 0);
+    std::vector<int32_t> prefill_pos_chunk(
+        static_cast<std::size_t>(std::max(1, prefill_chunk_size)), 0);
 
     // ========================================================================
     // Prefill: for each prompt, run prefix-only forward (all tokens except the
@@ -647,18 +696,21 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         // prefill_mode is set by execute_prefill()
 
         if (prefill_len > 0) {
-            // Build token and position arrays for this prompt prefix.
-            std::vector<int32_t> tokens_host(static_cast<std::size_t>(prefill_len));
-            std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(prefill_len));
-            for (int t = 0; t < prefill_len; ++t) {
-                tokens_host[static_cast<std::size_t>(t)] = prompt[static_cast<std::size_t>(t)];
-                pos_ids_host[static_cast<std::size_t>(t)] = t;
-            }
+            const int chunk_size = std::max(1, prefill_chunk_size);
+            for (int chunk_start = 0; chunk_start < prefill_len; chunk_start += chunk_size) {
+                const int chunk_len = std::min(chunk_size, prefill_len - chunk_start);
+                for (int t = 0; t < chunk_len; ++t) {
+                    const int absolute_t = chunk_start + t;
+                    prefill_tokens_chunk[static_cast<std::size_t>(t)] =
+                        prompt[static_cast<std::size_t>(absolute_t)];
+                    prefill_pos_chunk[static_cast<std::size_t>(t)] = absolute_t;
+                }
 
-            graph_executor.execute_prefill(
-                1L, static_cast<long>(prefill_len),
-                tokens_host.data(), pos_ids_host.data(),
-                prompt_ds, comm, hook);
+                graph_executor.execute_prefill(
+                    1L, static_cast<long>(chunk_len),
+                    prefill_tokens_chunk.data(), prefill_pos_chunk.data(),
+                    prompt_ds, comm, hook);
+            }
         }
 
         // Copy the initialized prefix tail from source partial page into each
@@ -801,6 +853,14 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
             }
         }
         mask_finished_tokens(sampled_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
+        // Guarantee sampled IDs stay in-vocab before feedback / host export.
+        sampling_sanitize_token_ids(
+            sampled_tokens_gpu,
+            total_batch,
+            V,
+            fallback_token_id,
+            /*invalid_count=*/nullptr,
+            mRunState.MainStream);
         rng_offset++;
 
         if (gen_config.temperature <= 0.0f) {

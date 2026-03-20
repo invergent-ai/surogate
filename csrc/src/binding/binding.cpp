@@ -1363,11 +1363,12 @@ NB_MODULE(_surogate, m) {
                 int top_k,
                 float top_p,
                 float min_p,
+                int prefill_chunk_size,
                 float repetition_penalty) {
             auto result = trainer->generate(
                 prompts, num_completions, max_gen_len, temperature,
                 eos_token_id, use_lora, use_cuda_graphs,
-                top_k, top_p, min_p, repetition_penalty);
+                top_k, top_p, min_p, prefill_chunk_size, repetition_penalty);
             return nb::make_tuple(
                 result.tokens, result.logprobs,
                 result.prompt_lens, result.completion_lens);
@@ -1382,6 +1383,7 @@ NB_MODULE(_surogate, m) {
         nb::arg("top_k") = 0,
         nb::arg("top_p") = 1.0f,
         nb::arg("min_p") = 0.0f,
+        nb::arg("prefill_chunk_size") = 256,
         nb::arg("repetition_penalty") = 1.0f,
         "Native generation: generate M×N completions using the trainer's model.\n\n"
         "Uses the model's DeviceMemoryStack as the arena for KV-cache,\n"
@@ -1397,6 +1399,7 @@ NB_MODULE(_surogate, m) {
         "  top_k: Top-K sampling (0 = disabled)\n"
         "  top_p: Top-P / nucleus sampling (1.0 = disabled)\n"
         "  min_p: Min-P sampling (0.0 = disabled)\n"
+        "  prefill_chunk_size: Prefill chunk size (0 = disabled)\n"
         "  repetition_penalty: Repetition penalty (1.0 = disabled)\n\n"
         "Returns (tokens, logprobs, prompt_lens, completion_lens) — all lists of length M*N.")
         .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),

@@ -37,6 +37,7 @@ class NativeGRPOGenerationConfig:
         top_p: Nucleus sampling threshold.
         top_k: Top-k sampling. 0 means disabled.
         min_p: Minimum probability threshold for sampling.
+        prefill_chunk_size: Chunk size for prompt prefill. 0 disables chunking.
     """
 
     num_completions: int = 4
@@ -44,6 +45,7 @@ class NativeGRPOGenerationConfig:
     top_p: float = 1.0
     top_k: int = 0
     min_p: float = 0.0
+    prefill_chunk_size: int = 256
 
     def __init__(self, cfg: DictDefault):
         self.num_completions = cfg.get("num_completions", self.num_completions)
@@ -51,6 +53,11 @@ class NativeGRPOGenerationConfig:
         self.top_p = cfg.get("top_p", self.top_p)
         self.top_k = cfg.get("top_k", self.top_k)
         self.min_p = cfg.get("min_p", self.min_p)
+        self.prefill_chunk_size = int(
+            cfg.get("prefill_chunk_size", self.prefill_chunk_size)
+        )
+        if self.prefill_chunk_size < 0:
+            self.prefill_chunk_size = 0
 
 
 @dataclass

@@ -86,6 +86,23 @@ __global__ void sanitize_logits_kernel(
     }
 }
 
+__global__ void sanitize_token_ids_kernel(
+        int32_t* __restrict__ token_ids,
+        int batch_size,
+        int vocab_size,
+        int32_t fallback_id,
+        int32_t* invalid_count) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+    const int32_t tok = token_ids[idx];
+    if (tok < 0 || tok >= vocab_size) {
+        token_ids[idx] = fallback_id;
+        if (invalid_count) {
+            atomicAdd(invalid_count, 1);
+        }
+    }
+}
+
 }  // namespace
 
 void sampling_sanitize_logits(
@@ -98,6 +115,24 @@ void sampling_sanitize_logits(
     constexpr int threads = 256;
     const int blocks = (total + threads - 1) / threads;
     sanitize_logits_kernel<<<blocks, threads, 0, stream>>>(logits, total);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sampling_sanitize_token_ids(
+        int32_t* token_ids,
+        int batch_size,
+        int vocab_size,
+        int32_t fallback_id,
+        int32_t* invalid_count,
+        cudaStream_t stream) {
+    if (batch_size <= 0 || vocab_size <= 0) return;
+    if (fallback_id < 0 || fallback_id >= vocab_size) {
+        fallback_id = 0;
+    }
+    constexpr int threads = 256;
+    const int blocks = (batch_size + threads - 1) / threads;
+    sanitize_token_ids_kernel<<<blocks, threads, 0, stream>>>(
+        token_ids, batch_size, vocab_size, fallback_id, invalid_count);
     CUDA_CHECK(cudaGetLastError());
 }
 

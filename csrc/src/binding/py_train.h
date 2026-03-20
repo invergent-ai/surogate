@@ -161,6 +161,7 @@ public:
         int top_k = 0,
         float top_p = 1.0f,
         float min_p = 0.0f,
+        int prefill_chunk_size = 256,
         float repetition_penalty = 1.0f);
 
 private:

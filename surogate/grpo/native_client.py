@@ -41,6 +41,7 @@ class NativeClient(Client[None, list[dict], dict, None]):
         tokenizer: Any,
         max_gen_len: int = 512,
         use_lora: bool = True,
+        prefill_chunk_size: int = 256,
     ):
         # Skip parent __init__ since we don't use ClientConfig
         self._client = None
@@ -48,6 +49,7 @@ class NativeClient(Client[None, list[dict], dict, None]):
         self.tokenizer = tokenizer
         self.max_gen_len = max_gen_len
         self.use_lora = use_lora
+        self.prefill_chunk_size = max(0, int(prefill_chunk_size))
         self.eos_id = tokenizer.eos_token_id or 151643
         self.default_temperature = 1.0  # Updated by trainer with scheduled temperature
         self.logger = logger
@@ -122,6 +124,7 @@ class NativeClient(Client[None, list[dict], dict, None]):
             use_cuda_graphs=True,
             top_k=top_k,
             top_p=top_p,
+            prefill_chunk_size=self.prefill_chunk_size,
         )
 
         pl = prompt_lens[0]

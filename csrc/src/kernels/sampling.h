@@ -43,6 +43,22 @@ void sampling_sanitize_logits(
     int vocab_size,
     cudaStream_t stream);
 
+/// Sanitize sampled token IDs in-place to a fallback ID when out of range.
+///
+/// @param token_ids     [batch_size] sampled token IDs (INT32), modified in-place
+/// @param batch_size    Number of sequences
+/// @param vocab_size    Vocabulary size
+/// @param fallback_id   Replacement token ID for invalid values (must be in range)
+/// @param invalid_count Optional device pointer to INT32 counter incremented per invalid token
+/// @param stream        CUDA stream
+void sampling_sanitize_token_ids(
+    int32_t* token_ids,
+    int batch_size,
+    int vocab_size,
+    int32_t fallback_id,
+    int32_t* invalid_count,
+    cudaStream_t stream);
+
 /// Sample token IDs from probability distribution (categorical sampling).
 ///
 /// @param probs        [batch_size, vocab_size] normalized probabilities (FP32)

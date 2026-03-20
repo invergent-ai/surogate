@@ -45,6 +45,7 @@ struct GenerationEngineConfig {
     uint64_t seed = 42;             // RNG seed for reproducible sampling
     int num_completions = 1;        // N completions per prompt (Phase 3: GRPO multi-completion)
     bool use_cuda_graphs = false;   // Capture decode step as CUDA graph (Phase 4)
+    int prefill_chunk_size = 256;   // Chunk size for prompt prefill (0 = disabled)
 
     // Persistent system prefix: if non-empty, this token sequence is prefilled
     // once and its KV-cache survives across generate() calls via arena prefix

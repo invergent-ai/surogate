@@ -156,7 +156,13 @@ class VerifiersRewardProvider(RewardProvider):
                 self._all_examples.append((env_idx, example))
         random.shuffle(self._all_examples)
 
-    def set_trainer(self, trainer: Any, max_gen_len: int = 512, use_lora: bool = True):
+    def set_trainer(
+        self,
+        trainer: Any,
+        max_gen_len: int = 512,
+        use_lora: bool = True,
+        prefill_chunk_size: int = 256,
+    ):
         """Initialize the NativeClient with the C++ trainer.
 
         Must be called before score() to enable multi-turn rollouts.
@@ -168,6 +174,7 @@ class VerifiersRewardProvider(RewardProvider):
             tokenizer=self._tokenizer,
             max_gen_len=max_gen_len,
             use_lora=use_lora,
+            prefill_chunk_size=prefill_chunk_size,
         )
 
     def _run_rollouts(

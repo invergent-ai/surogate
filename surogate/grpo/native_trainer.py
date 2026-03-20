@@ -214,6 +214,7 @@ class NativeGRPOTrainer:
                 trainer=self.trainer,
                 max_gen_len=config.generation.max_gen_len,
                 use_lora=config.lora,
+                prefill_chunk_size=config.generation.prefill_chunk_size,
             )
 
         # --- Monitor ---
@@ -356,6 +357,7 @@ class NativeGRPOTrainer:
             use_cuda_graphs=True,
             top_k=gen.top_k,
             top_p=gen.top_p,
+            prefill_chunk_size=gen.prefill_chunk_size,
         )
         gen_time = time.time() - gen_start
 
@@ -1100,6 +1102,7 @@ class NativeGRPOTrainer:
                 use_cuda_graphs=True,
                 top_k=0,
                 top_p=1.0,
+                prefill_chunk_size=gen_config.prefill_chunk_size,
             )
 
             # Decode completions
@@ -1280,6 +1283,7 @@ class NativeGRPOTrainer:
         )
         logger.info("  Generation path: paged GRPO decode")
         logger.info(f"  Max gen length: {config.generation.max_gen_len}")
+        logger.info(f"  Prefill chunk size: {config.generation.prefill_chunk_size}")
         logger.info(f"  Learning rate: {config.learning_rate}")
         logger.info(
             f"  LoRA: enabled={config.lora}, "
