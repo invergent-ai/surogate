@@ -342,6 +342,10 @@ struct CompiledGraph {
 
     // Look up or return -1
     int find_tensor_id(const std::string& name) const {
+        // Guard against querying moved-from / not-yet-populated maps.
+        if (tensor_name_to_id.empty() || tensor_name_to_id.bucket_count() == 0) {
+            return -1;
+        }
         auto it = tensor_name_to_id.find(name);
         return (it != tensor_name_to_id.end()) ? it->second : -1;
     }

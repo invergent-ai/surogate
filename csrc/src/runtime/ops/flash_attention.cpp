@@ -116,7 +116,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
                     mDecodeState->cu_seqlens_q_gpu,
                     mDecodeState->cu_seqlens_k_gpu,
-                    msk, ds_batch, Hq, Hkv, Hs,
+                    msk, msk, ds_batch, Hq, Hkv, Hs,
                     mRunState.MainStream);
             } else {
                 // BF16 paged: direct paged attention
@@ -174,7 +174,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
                     mDecodeState->cu_seqlens_q_gpu,
                     mDecodeState->cu_seqlens_k_gpu,
-                    msk, ds_batch, Hq, Hkv, Hs,
+                    msk, msk, ds_batch, Hq, Hkv, Hs,
                     mRunState.MainStream);
             } else {
                 const std::size_t layer_stride_bytes =
@@ -191,7 +191,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     q_bf16, k_layer, v_layer,
                     mDecodeState->cu_seqlens_q_gpu,
                     mDecodeState->cu_seqlens_k_gpu,
-                    mDecodeState->max_seqlen_k,
+                    mDecodeState->max_seqlen_k, ds_max_seq,
                     ds_batch, Hq, Hkv, Hs,
                     mRunState.MainStream);
             }

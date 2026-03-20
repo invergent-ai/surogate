@@ -169,7 +169,7 @@ TEST_CASE("FP8 decode attention vs BF16 decode attention", "[decode][fp8][attent
         thrust::raw_pointer_cast(k_bf16_dev.data()),
         thrust::raw_pointer_cast(v_bf16_dev.data()),
         nullptr, thrust::raw_pointer_cast(seqused_dev.data()),
-        T, B, Hq, Hkv, Hs, nullptr);
+        T, T, B, Hq, Hkv, Hs, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // ========== FP8 path ==========
@@ -229,7 +229,7 @@ TEST_CASE("FP8 decode attention vs BF16 decode attention", "[decode][fp8][attent
         thrust::raw_pointer_cast(k_dq.data()),
         thrust::raw_pointer_cast(v_dq.data()),
         nullptr, thrust::raw_pointer_cast(seqused_dev.data()),
-        T, B, Hq, Hkv, Hs, nullptr);
+        T, T, B, Hq, Hkv, Hs, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Compare

@@ -967,6 +967,168 @@ bool DslModel::internal_graphs_enabled() const {
     return mExecutor ? mExecutor->internal_graphs_enabled() : false;
 }
 
+const modules::ForwardHook* DslModel::make_forward_hook(
+        bool use_lora,
+        int ensure_B,
+        int ensure_T,
+        NCCLCommunicator& comm,
+        modules::ForwardHook& hook_storage) {
+    if (!(use_lora && lora_enabled())) {
+        return nullptr;
+    }
+
+    ensure_lora_run_state(comm, ensure_B, ensure_T);
+
+    hook_storage = [this](int layer_idx, cudaStream_t stream, modules::ForwardHookPoint point, void* context) {
+        const auto& cfg = mModelConfig;
+        auto& rs = *mRunState;
+        const int C = static_cast<int>(cfg.HiddenSize);
+        const int D = cfg.get_intermediate_size(layer_idx);
+        const int Hq = static_cast<int>(cfg.NumQueryHeads);
+        const int Hkv = static_cast<int>(cfg.NumKeyValHeads);
+        const int Hs = static_cast<int>(cfg.head_size());
+        const int rank = mLoRAConfig->rank;
+        const float scaling = mLoRAConfig->scaling();
+        const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+        const auto* runtime_ctx = static_cast<const modules::ForwardHookRuntimeContext*>(context);
+        const int bt_hint = (runtime_ctx && runtime_ctx->B > 0 && runtime_ctx->T > 0)
+            ? static_cast<int>(runtime_ctx->B * runtime_ctx->T)
+            : 0;
+
+        auto& acts = rs.simplified_acts(layer_idx);
+        auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+        auto infer_bt = [bt_hint](const Tensor& t, int features) -> int {
+            if (bt_hint > 0) {
+                return bt_hint;
+            }
+            if (!t.Data || features <= 0) return 0;
+            const auto n = static_cast<long long>(t.nelem());
+            return static_cast<int>(n / static_cast<long long>(features));
+        };
+
+        switch (point) {
+            case modules::ForwardHookPoint::AfterQKVProjection: {
+                const int bt = infer_bt(acts.ln1, C);
+                if (bt <= 0) break;
+                if (lora_block.attention.q.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    bt, C, Hq * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.attention.k.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    bt, C, Hkv * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (lora_block.attention.v.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    bt, C, Hkv * Hs, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                const int bt = infer_bt(acts.att, Hq * Hs);
+                if (bt <= 0) break;
+                if (lora_block.attention.o.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    bt, Hq * Hs, C, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterMLPUpProjection: {
+                Tensor& ln2_input = acts.ln2.Data ? acts.ln2 : acts.ln1;
+                const int bt = infer_bt(ln2_input, C);
+                if (bt <= 0) break;
+                if (lora_block.mlp.up.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, 0, ln2_input, lora_block.mlp.up.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    bt, C, D, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+                if (gated_mlp && lora_block.mlp.gate.has_value()) {
+                    modules::detail::apply_lora_contribution(acts.mlp_up, D, ln2_input, lora_block.mlp.gate.value(),
+                                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                                    scaling, 0.0f, 0, false,
+                                                    bt, C, D, rank,
+                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                }
+            } break;
+            case modules::ForwardHookPoint::AfterMLPDownProjection: {
+                if (lora_block.mlp.down.has_value()) {
+                    Tensor down_input = acts.swiglu;
+                    Tensor down_input_tmp{};
+                    bool free_down_input_tmp = false;
+                    const int bt_from_up = (bt_hint > 0) ? bt_hint : infer_bt(acts.mlp_up, gated_mlp ? 2 * D : D);
+                    if (!down_input.Data && acts.mlp_up.Data) {
+                        if (bt_from_up <= 0) {
+                            break;
+                        }
+                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {bt_from_up, D}, "down_input_tmp");
+                        Tensor down_input_view = down_input_tmp;
+                        down_input_view.Rank = 3;
+                        down_input_view.Sizes[0] = 1;
+                        down_input_view.Sizes[1] = bt_from_up;
+                        down_input_view.Sizes[2] = D;
+                        for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
+                        switch (cfg.activation_type) {
+                            case modules::ActivationType::SwiGLU:
+                            case modules::ActivationType::GeGLU:
+                                swiglu_forward(down_input_view, acts.mlp_up, nullptr, 1, bt_from_up, D, stream);
+                                break;
+                            case modules::ActivationType::ReLU2: {
+                                const long N = static_cast<long>(bt_from_up) * static_cast<long>(D);
+                                relu2_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            case modules::ActivationType::SiLU: {
+                                const long N = static_cast<long>(bt_from_up) * static_cast<long>(D);
+                                silu_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            case modules::ActivationType::GeLU: {
+                                const long N = static_cast<long>(bt_from_up) * static_cast<long>(D);
+                                gelu_forward(down_input_view, acts.mlp_up, N, stream);
+                            } break;
+                            default:
+                                throw std::runtime_error("unsupported activation type for LoRA MLPDown replay");
+                        }
+                        down_input = down_input_view;
+                        free_down_input_tmp = true;
+                    }
+                    if (down_input.Data) {
+                        const int bt = (bt_hint > 0) ? bt_hint : infer_bt(down_input, D);
+                        if (bt <= 0) {
+                            if (free_down_input_tmp) rs.temp_free(down_input_tmp);
+                            break;
+                        }
+                        try {
+                            modules::detail::apply_lora_contribution(acts.mlp_down, 0, down_input, lora_block.mlp.down.value(),
+                                                            mLoRARunState->intermediate, mLoRARunState->slice,
+                                                            scaling, 0.0f, 0, false,
+                                                            bt, D, C, rank,
+                                                            rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                        } catch (...) {
+                            if (free_down_input_tmp) rs.temp_free(down_input_tmp);
+                            throw;
+                        }
+                    }
+                    if (free_down_input_tmp) rs.temp_free(down_input_tmp);
+                }
+            } break;
+            default:
+                break;
+        }
+    };
+    return &hook_storage;
+}
+
 std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                                                const std::int32_t* targets,
                                                int B, int T, bool use_lora,
@@ -985,137 +1147,8 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     const int BT = B * T;
     std::vector<float> result(static_cast<std::size_t>(BT), 0.0f);
 
-    const modules::ForwardHook* hook_ptr = nullptr;
     modules::ForwardHook hook;
-
-    if (use_lora && lora_enabled()) {
-        ensure_lora_run_state(comm, B, T);
-
-        hook = [this](int layer_idx, cudaStream_t stream, modules::ForwardHookPoint point, void* context) {
-            (void)context;
-            const auto& cfg = mModelConfig;
-            auto& rs = *mRunState;
-            const int B_ = (int)rs.B;
-            const int T_ = (int)rs.T;
-            const int C = (int)cfg.HiddenSize;
-            const int D = cfg.get_intermediate_size(layer_idx);
-            const int Hq = (int)cfg.NumQueryHeads;
-            const int Hkv = (int)cfg.NumKeyValHeads;
-            const int Hs = (int)cfg.head_size();
-            const int rank = mLoRAConfig->rank;
-            const float scaling = mLoRAConfig->scaling();
-            const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
-
-            auto& acts = rs.simplified_acts(layer_idx);
-            auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
-
-            switch (point) {
-                case modules::ForwardHookPoint::AfterQKVProjection: {
-                    if (lora_block.attention.q.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, C, Hq * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    }
-                    if (lora_block.attention.k.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, C, Hkv * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    }
-                    if (lora_block.attention.v.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, C, Hkv * Hs, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    }
-                } break;
-                case modules::ForwardHookPoint::AfterAttnOutProjection: {
-                    if (lora_block.attention.o.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, Hq * Hs, C, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    }
-                } break;
-                case modules::ForwardHookPoint::AfterMLPUpProjection: {
-                    Tensor& ln2_input = acts.ln2.Data ? acts.ln2 : acts.ln1;
-                    if (lora_block.mlp.up.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.mlp_up, 0, ln2_input, lora_block.mlp.up.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, C, D, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    }
-                    if (gated_mlp && lora_block.mlp.gate.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.mlp_up, D, ln2_input, lora_block.mlp.gate.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, C, D, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                    }
-                } break;
-                case modules::ForwardHookPoint::AfterMLPDownProjection: {
-                    if (lora_block.mlp.down.has_value()) {
-                        Tensor down_input = acts.swiglu;
-                        Tensor down_input_tmp{};
-                        bool free_down_input_tmp = false;
-                        if (!down_input.Data && acts.mlp_up.Data) {
-                            down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B_ * T_, D}, "down_input_tmp");
-                            Tensor down_input_view = down_input_tmp;
-                            down_input_view.Rank = 3;
-                            down_input_view.Sizes[0] = B_;
-                            down_input_view.Sizes[1] = T_;
-                            down_input_view.Sizes[2] = D;
-                            for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
-                            switch (cfg.activation_type) {
-                                case modules::ActivationType::SwiGLU:
-                                case modules::ActivationType::GeGLU:
-                                    swiglu_forward(down_input_view, acts.mlp_up, nullptr, B_, T_, D, stream);
-                                    break;
-                                case modules::ActivationType::ReLU2: {
-                                    const long N = static_cast<long>(B_) * static_cast<long>(T_) * static_cast<long>(D);
-                                    relu2_forward(down_input_view, acts.mlp_up, N, stream);
-                                } break;
-                                case modules::ActivationType::SiLU: {
-                                    const long N = static_cast<long>(B_) * static_cast<long>(T_) * static_cast<long>(D);
-                                    silu_forward(down_input_view, acts.mlp_up, N, stream);
-                                } break;
-                                case modules::ActivationType::GeLU: {
-                                    const long N = static_cast<long>(B_) * static_cast<long>(T_) * static_cast<long>(D);
-                                    gelu_forward(down_input_view, acts.mlp_up, N, stream);
-                                } break;
-                                default:
-                                    throw std::runtime_error("unsupported activation type for LoRA MLPDown replay");
-                            }
-                            down_input = down_input_view;
-                            free_down_input_tmp = true;
-                        }
-                        if (down_input.Data) {
-                            try {
-                                modules::detail::apply_lora_contribution(acts.mlp_down, 0, down_input, lora_block.mlp.down.value(),
-                                                                mLoRARunState->intermediate, mLoRARunState->slice,
-                                                                scaling, 0.0f, 0, false,
-                                                                B_ * T_, D, C, rank,
-                                                                rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
-                            } catch (...) {
-                                if (free_down_input_tmp) rs.temp_free(down_input_tmp);
-                                throw;
-                            }
-                        }
-                        if (free_down_input_tmp) rs.temp_free(down_input_tmp);
-                    }
-                } break;
-                default:
-                    break;
-            }
-        };
-        hook_ptr = &hook;
-    }
+    const modules::ForwardHook* hook_ptr = make_forward_hook(use_lora, B, T, comm, hook);
 
     // Detect document boundaries and enable flash varlen masking if needed.
     const bool mrope = mModelConfig.Rope.is_multimodal();

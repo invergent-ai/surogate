@@ -96,6 +96,7 @@ class NativeGRPOTrainer:
 
         if "SUROGATE_MIN_STACK_MB" not in os.environ:
             gen = config.generation
+            page_block_size = 256
             total_seqs = config.problems_per_step * gen.num_completions
             # Estimate KV cache bytes (conservative: full max_total_len per seq)
             try:
@@ -105,13 +106,27 @@ class NativeGRPOTrainer:
                 n_layers = HfConfigFactory.get_config_attr(hf_cfg, "num_hidden_layers")
                 n_kv_heads = HfConfigFactory.get_config_attr(hf_cfg, "num_key_value_heads")
                 head_dim = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size") // HfConfigFactory.get_config_attr(hf_cfg, "num_attention_heads")
-                max_total = 100 + gen.max_gen_len  # prompt + gen
-                kv_bytes = 2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
+                max_prompt = 100
+                max_total = max_prompt + gen.max_gen_len  # prompt + gen
+                # Contiguous upper-bound estimate (kept as fallback)
+                kv_bytes_contig = 2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
+                # Paged GRPO estimate (matches GenerationEngine::generate_grpo budgeting).
+                M = config.problems_per_step
+                N = gen.num_completions
+                shared_prefix_pages = (max_prompt + page_block_size - 1) // page_block_size
+                private_partial_extra = (N - 1) if (max_prompt > 0 and N > 1) else 0
+                prefix_pages_per_prompt = shared_prefix_pages + private_partial_extra
+                suffix_pages_per_seq = (gen.max_gen_len + page_block_size - 1) // page_block_size
+                total_pages = M * prefix_pages_per_prompt + M * N * suffix_pages_per_seq
+                page_elems = page_block_size * n_kv_heads * head_dim
+                k_pool_bytes = n_layers * total_pages * page_elems * 2  # bf16
+                kv_bytes_paged = 2 * k_pool_bytes  # K + V
+                kv_bytes = max(kv_bytes_contig, kv_bytes_paged)
                 # Training activations: ~hidden_size * seq_len * 4 bytes per
                 # intermediate tensor, with ~4 such tensors per layer
                 hidden_size = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size")
                 train_bytes = hidden_size * config.sequence_len * 4 * 4 * n_layers
-                total_bytes = kv_bytes * 3.0 + train_bytes * 2.0
+                total_bytes = kv_bytes * 3.2 + train_bytes * 2.0
                 min_stack_mb = max(4096, int(total_bytes / (1024 * 1024)))
                 os.environ["SUROGATE_MIN_STACK_MB"] = str(min_stack_mb)
                 logger.info(f"Set SUROGATE_MIN_STACK_MB={min_stack_mb} for {total_seqs} sequences, seq_len={config.sequence_len}")
@@ -518,6 +533,7 @@ class NativeGRPOTrainer:
             completion_lens=completion_lens_list,
             advantages=advantages,
             loss_mask_override=loss_mask_override,
+            temperature=rollout["temperature"],
         )
 
         # 6. Optimizer step
@@ -656,6 +672,7 @@ class NativeGRPOTrainer:
             advantages=advantages,
             loss_mask_override=loss_mask_override,
             completion_masks=all_completion_masks,
+            temperature=temperature,
         )
 
         # 6. Optimizer step
@@ -696,6 +713,7 @@ class NativeGRPOTrainer:
         completion_lens: list[int],
         advantages: np.ndarray,
         loss_mask_override: np.ndarray,
+        temperature: float,
         completion_masks: list[np.ndarray] | None = None,
     ) -> tuple[dict, int]:
         """Pack trajectories and run forward_for_grpo + backward_grpo.
@@ -717,7 +735,6 @@ class NativeGRPOTrainer:
         ngpu = config.gpus
         loss_config = config.loss or GRPOLossConfig()
         total = len(all_tokens)
-        temperature = self._get_temperature(0)  # For completion_temperatures
 
         # --- Build TrainingSamples from raw trajectory data ---
         samples: list[TrainingSample] = []
@@ -780,6 +797,7 @@ class NativeGRPOTrainer:
             adv_flat = mb["advantages"].flatten()
             inf_lp = mb["inference_logprobs"].flatten()
             loss_mask_flat = mb["loss_mask"].flatten()
+            temps_flat = mb["temperatures"].flatten()
 
             T_actual = input_ids.shape[1]
 
@@ -791,6 +809,8 @@ class NativeGRPOTrainer:
                 last_pos = int(position_ids[0, T_actual - 1])
                 pad_pos = np.arange(last_pos + 1, last_pos + 1 + pad_w, dtype=np.int32).reshape(1, -1)
                 position_ids = np.concatenate([position_ids, pad_pos], axis=1)
+            temp_padded = np.ones((1, seq_len), dtype=np.float32)
+            temp_padded[0, :T_actual] = temps_flat[:T_actual]
 
             # Apply loss_mask to targets (mask prompt tokens)
             tmask = loss_mask_flat[:T_actual].astype(bool)
@@ -804,10 +824,14 @@ class NativeGRPOTrainer:
                 input_ids = np.tile(input_ids, (ngpu, 1))
                 masked_targets = np.tile(masked_targets, (ngpu, 1))
                 position_ids = np.tile(position_ids, (ngpu, 1))
+                temp_padded = np.tile(temp_padded, (ngpu, 1))
 
             # Forward: get policy logprobs
             raw_lp = self.trainer.forward_for_grpo(
-                input_ids, masked_targets, position_ids=position_ids
+                input_ids,
+                masked_targets,
+                position_ids=position_ids,
+                temperatures=temp_padded,
             )
             raw_lp = np.asarray(raw_lp[0, :T_actual], dtype=np.float32)
 

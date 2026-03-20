@@ -25,6 +25,7 @@
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "runtime/training/model.h"
+#include "runtime/core/forward_hooks.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
 #include "runtime/core/qlora_provider.h"
@@ -265,6 +266,12 @@ public:
     DslParamStore& param_store() { return *mParams; }
     GraphExecutor* graph_executor();
     const modules::ModelConfig& model_config() const { return mModelConfig; }
+    const modules::ForwardHook* make_forward_hook(
+        bool use_lora,
+        int ensure_B,
+        int ensure_T,
+        NCCLCommunicator& comm,
+        modules::ForwardHook& hook_storage);
 
     // Type alias for backward compatibility — canonical definition is dsl::MappingSpec.
     using MappingSpec = ::dsl::MappingSpec;

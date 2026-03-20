@@ -58,10 +58,10 @@ void set_decode_common(surogate_flash::Flash_fwd_params& params,
     params.scale_softmax = 1.0f / std::sqrt(static_cast<float>(Hs));
     params.scale_softmax_log2 = params.scale_softmax * static_cast<float>(M_LOG2E);
 
-    // Decode is fixed seqlen_q=1 per batch item, so keep Q/K in dense batch mode.
-    // Passing varlen cu_seqlens with paged K can mis-index multi-batch paths.
-    (void)cu_seqlens_q;
-    params.cu_seqlens_q = nullptr;
+    // Decode uses seqlen_q=1 per batch item, but FlashAttention forward still
+    // goes through varlen kernels when M/N are not tile-aligned. Supplying
+    // cu_seqlens_q keeps batch row mapping correct for B > 1 in decode mode.
+    params.cu_seqlens_q = const_cast<int*>(reinterpret_cast<const int*>(cu_seqlens_q));
     params.cu_seqlens_k = nullptr;
     params.seqused_k = const_cast<int*>(reinterpret_cast<const int*>(seqused_k));
     params.is_seqlens_k_cumulative = false;
@@ -99,7 +99,7 @@ void attention_decode_flash(
         const nv_bfloat16* q,
         const nv_bfloat16* k_cache, const nv_bfloat16* v_cache,
         const int32_t* cu_seqlens_q, const int32_t* seqused_k,
-        int max_seqlen_k,
+        int max_seqlen_k, int kv_stride_seqlen,
         int batch_size, int Hq, int Hkv, int Hs,
         cudaStream_t stream) {
 
@@ -111,12 +111,12 @@ void attention_decode_flash(
 
     // K/V: padded batch mode [B, max_seq_len_k, Hkv, Hs]
     params.k_ptr = const_cast<void*>(static_cast<const void*>(k_cache));
-    params.k_batch_stride = static_cast<int64_t>(max_seqlen_k) * Hkv * Hs;
+    params.k_batch_stride = static_cast<int64_t>(kv_stride_seqlen) * Hkv * Hs;
     params.k_row_stride = Hkv * Hs;
     params.k_head_stride = Hs;
 
     params.v_ptr = const_cast<void*>(static_cast<const void*>(v_cache));
-    params.v_batch_stride = static_cast<int64_t>(max_seqlen_k) * Hkv * Hs;
+    params.v_batch_stride = static_cast<int64_t>(kv_stride_seqlen) * Hkv * Hs;
     params.v_row_stride = Hkv * Hs;
     params.v_head_stride = Hs;
 

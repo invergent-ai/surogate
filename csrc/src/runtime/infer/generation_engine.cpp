@@ -549,14 +549,33 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         const int plen = static_cast<int>(prompt.size());
         const int prefill_len = prefill_lens_per_prompt[static_cast<std::size_t>(m)];
 
-        // Allocate prefix pages and share to all N sequences
+        // Allocate prefix pages for source slot.
         const int prefix_pages = paged_kv.alloc_prefix_pages(m, prefill_len);
-        paged_kv.share_prefix_pages(m, prefix_pages);
+        const int full_prefix_pages = prefill_len / kPageBlockSize;
+        const int partial_prefix_tokens = prefill_len % kPageBlockSize;
+        const int src_slot = m * N;
+
+        // Share only full prefix pages.
+        if (full_prefix_pages > 0) {
+            paged_kv.share_prefix_pages(m, full_prefix_pages);
+        }
+
+        // Materialize private copies for the last partially-filled prefix page.
+        // Sharing that page would alias continuation writes across completions.
+        int partial_virtual_page = -1;
+        if (partial_prefix_tokens > 0) {
+            partial_virtual_page = full_prefix_pages;
+            for (int n = 1; n < N; ++n) {
+                const int dst_slot = src_slot + n;
+                const int dst_phys = paged_kv.alloc_page();
+                paged_kv.set_block_table(dst_slot, partial_virtual_page, dst_phys);
+            }
+        }
 
         // Upload block table for source slot (B=1)
         CUDA_CHECK(cudaMemcpyAsync(
             prefill_block_table_gpu,
-            paged_kv.block_table_host.data() + static_cast<std::size_t>(m * N) * paged_kv.max_pages_per_seq,
+            paged_kv.block_table_host.data() + static_cast<std::size_t>(src_slot) * paged_kv.max_pages_per_seq,
             static_cast<std::size_t>(paged_kv.max_pages_per_seq) * sizeof(int),
             cudaMemcpyHostToDevice, mRunState.MainStream));
 
@@ -591,10 +610,16 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
                 prompt_ds, comm, hook);
         }
 
-        // Allocate first suffix page for each of the N sequences
-        const int suffix_start_page = prefix_pages;
-        for (int n = 0; n < N; ++n) {
-            paged_kv.alloc_suffix_page(m * N + n, suffix_start_page);
+        // Copy the initialized prefix tail from source partial page into each
+        // completion's private partial page (all layers, K and V).
+        if (partial_prefix_tokens > 0 && N > 1) {
+            const int src_phys = paged_kv.get_block_table(src_slot, partial_virtual_page);
+            for (int n = 1; n < N; ++n) {
+                const int dst_slot = src_slot + n;
+                const int dst_phys = paged_kv.get_block_table(dst_slot, partial_virtual_page);
+                paged_kv.copy_prefix_tokens_between_pages(
+                    src_phys, dst_phys, partial_prefix_tokens, mRunState.MainStream);
+            }
         }
 
         for (int n = 0; n < N; ++n) {

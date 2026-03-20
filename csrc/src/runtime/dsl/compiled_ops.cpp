@@ -766,9 +766,10 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(
         }
     };
 
+    const CompiledGraph* graph_for_lookup = capture_graph ? capture_graph : mCurrentGraph;
     auto resolve_source = [&](const std::string& name) -> std::optional<Tensor> {
-        if (mCurrentGraph) {
-            int tid = mCurrentGraph->find_tensor_id(name);
+        if (graph_for_lookup) {
+            int tid = graph_for_lookup->find_tensor_id(name);
             if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() && mTensors[tid].Data) {
                 return mTensors[tid];
             }

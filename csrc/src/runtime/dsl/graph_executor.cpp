@@ -877,6 +877,30 @@ const std::unordered_map<std::string, size_t>& GraphExecutor::saved_buffers_size
 
 void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
                                     const modules::ForwardHook* hook) {
+    const bool hook_active = hook && *hook;
+    modules::ForwardHookRuntimeContext hook_runtime_ctx{};
+    void* prev_hook_context = mHookContext;
+    if (hook_active) {
+        hook_runtime_ctx.B = B;
+        hook_runtime_ctx.T = T;
+        hook_runtime_ctx.decode_mode = false;
+        hook_runtime_ctx.prefill_mode = false;
+        mHookContext = &hook_runtime_ctx;
+        if (mCompiledExecutor) {
+            mCompiledExecutor->set_hook_context(mHookContext);
+        }
+    }
+    auto restore_hook_context = [&]() {
+        if (!hook_active) {
+            return;
+        }
+        mHookContext = prev_hook_context;
+        if (mCompiledExecutor) {
+            mCompiledExecutor->set_hook_context(mHookContext);
+        }
+    };
+
+    try {
     // Store forward hook for replay (LoRA deltas must be applied during recompute)
     if (hook && *hook) {
         mReplayForwardHook = *hook;
@@ -970,6 +994,12 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mCompiledExecutor->save_tensors(mSaveList);
     }
     mCompiledExecutor->set_capturing(false);
+    } catch (...) {
+        restore_hook_context();
+        throw;
+    }
+
+    restore_hook_context();
 }
 
 void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
@@ -1637,6 +1667,26 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     DslRunState& rs = mRunState;
     const int BT = static_cast<int>(B * T);
     const std::size_t token_bytes = static_cast<std::size_t>(BT) * sizeof(std::int32_t);
+    const bool hook_active = hook && *hook;
+    modules::ForwardHookRuntimeContext hook_runtime_ctx{};
+    void* prev_hook_context = mHookContext;
+    if (hook_active) {
+        hook_runtime_ctx.B = B;
+        hook_runtime_ctx.T = T;
+        hook_runtime_ctx.decode_mode = false;
+        hook_runtime_ctx.prefill_mode = false;
+        mHookContext = &hook_runtime_ctx;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    }
+    auto restore_hook_context = [&]() {
+        if (!hook_active) {
+            return;
+        }
+        mHookContext = prev_hook_context;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    };
+
+    try {
 
     // Copy input IDs and targets to device.
     CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, input_ids_cpu, token_bytes,
@@ -1705,6 +1755,12 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
         CUDA_CHECK(cudaFree(inv_temperature_gpu));
     }
     mCompiledExecutor->set_save_list(&mSaveList);
+    } catch (...) {
+        restore_hook_context();
+        throw;
+    }
+
+    restore_hook_context();
 }
 
 // ============================================================================
@@ -1748,6 +1804,26 @@ void GraphExecutor::execute_prefill(long B, long T,
 
     DslRunState& rs = mRunState;
     const std::size_t token_bytes = static_cast<std::size_t>(B * T) * sizeof(std::int32_t);
+    const bool hook_active = hook && *hook;
+    modules::ForwardHookRuntimeContext hook_runtime_ctx{};
+    void* prev_hook_context = mHookContext;
+    if (hook_active) {
+        hook_runtime_ctx.B = B;
+        hook_runtime_ctx.T = T;
+        hook_runtime_ctx.decode_mode = true;
+        hook_runtime_ctx.prefill_mode = true;
+        mHookContext = &hook_runtime_ctx;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    }
+    auto restore_hook_context = [&]() {
+        if (!hook_active) {
+            return;
+        }
+        mHookContext = prev_hook_context;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    };
+
+    try {
 
     // Copy token IDs and position IDs to device
     CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_cpu, token_bytes,
@@ -1788,6 +1864,12 @@ void GraphExecutor::execute_prefill(long B, long T,
     decode_state.logits_out_gpu = saved_logits;
     mCompiledExecutor->set_decode_state(nullptr);
     mCompiledExecutor->set_save_list(&mSaveList);
+    } catch (...) {
+        restore_hook_context();
+        throw;
+    }
+
+    restore_hook_context();
 }
 
 // ============================================================================
@@ -1807,6 +1889,26 @@ void GraphExecutor::execute_decode_step(long B,
     }
 
     const long T = 1;
+    const bool hook_active = hook && *hook;
+    modules::ForwardHookRuntimeContext hook_runtime_ctx{};
+    void* prev_hook_context = mHookContext;
+    if (hook_active) {
+        hook_runtime_ctx.B = B;
+        hook_runtime_ctx.T = T;
+        hook_runtime_ctx.decode_mode = true;
+        hook_runtime_ctx.prefill_mode = false;
+        mHookContext = &hook_runtime_ctx;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    }
+    auto restore_hook_context = [&]() {
+        if (!hook_active) {
+            return;
+        }
+        mHookContext = prev_hook_context;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    };
+
+    try {
 
     // Compile a SEPARATE forward graph for decode so we don't mutate
     // the training-compiled mCompiledForward/mCompiledBackward.
@@ -1886,6 +1988,12 @@ void GraphExecutor::execute_decode_step(long B,
 
     mCompiledExecutor->set_decode_state(nullptr);
     mCompiledExecutor->set_save_list(&mSaveList);
+    } catch (...) {
+        restore_hook_context();
+        throw;
+    }
+
+    restore_hook_context();
 }
 
 void GraphExecutor::invalidate_decode_graph() {

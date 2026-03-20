@@ -41,6 +41,20 @@ constexpr const char* hook_point_name(ForwardHookPoint point) {
 using ForwardHook = std::function<void(int layer_idx, cudaStream_t stream, ForwardHookPoint point, void* context)>;
 
 /**
+ * @brief Runtime metadata passed to ForwardHook callbacks via `context`.
+ *
+ * This carries the live execution dimensions for the current forward run.
+ * It is especially important for generation paths (prefill/decode), where
+ * run-state activation buffers may be overprovisioned to training capacity.
+ */
+struct ForwardHookRuntimeContext {
+    long B = 0;
+    long T = 0;
+    bool decode_mode = false;
+    bool prefill_mode = false;
+};
+
+/**
  * @brief Hook points during MoE expert forward pass
  *
  * These correspond to specific locations within a single expert's forward pass
@@ -76,4 +90,3 @@ using MoEExpertHook = std::function<void(int layer_idx, int expert_idx, MoEExper
 } // namespace modules
 
 #endif // SUROGATE_SRC_MODULES_FORWARD_HOOKS_H
-

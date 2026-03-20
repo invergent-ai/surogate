@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -262,6 +263,11 @@ struct PagedKVCache {
              * static_cast<std::size_t>(elem_bytes());
     }
 
+    /// Bytes for one physical page in one layer.
+    std::size_t page_bytes() const {
+        return page_elems() * static_cast<std::size_t>(elem_bytes());
+    }
+
     /// Bytes for block table on GPU.
     std::size_t block_table_bytes() const {
         return static_cast<std::size_t>(batch_size)
@@ -289,8 +295,17 @@ struct PagedKVCache {
         const int max_total_len = max_prefix_len + max_gen_len;
         max_pages_per_seq = (max_total_len + page_block_size - 1) / page_block_size;
 
-        // Page budget: M shared prefix page-sets + M*N separate suffix page-sets
-        const int prefix_pages_per_prompt = (max_prefix_len + page_block_size - 1) / page_block_size;
+        // Page budget:
+        // - Prefix: full pages are shared across N completions.
+        // - Partial last prefix page (if any) is private per completion to
+        //   avoid cross-completion writes when generation continues in-page.
+        // Reserve this private-page overhead pessimistically for every prompt
+        // because prompt lengths are ragged and some prompts may end on a
+        // partial page even when max_prefix_len is page-aligned.
+        const int shared_prefix_pages_per_prompt = (max_prefix_len + page_block_size - 1) / page_block_size;
+        const int private_partial_extra_per_prompt =
+            (max_prefix_len > 0 && N > 1) ? (N - 1) : 0;
+        const int prefix_pages_per_prompt = shared_prefix_pages_per_prompt + private_partial_extra_per_prompt;
         const int suffix_pages_per_seq = (max_gen_len + page_block_size - 1) / page_block_size;
         total_pages = M * prefix_pages_per_prompt + M * N * suffix_pages_per_seq;
 
@@ -319,11 +334,23 @@ struct PagedKVCache {
 
     /// Set block table entry: block_table[seq_idx][virtual_page] = physical_page.
     void set_block_table(int seq_idx, int virtual_page, int physical_page) {
+        if (seq_idx < 0 || seq_idx >= batch_size) {
+            throw std::runtime_error("PagedKVCache: seq_idx out of range");
+        }
+        if (virtual_page < 0 || virtual_page >= max_pages_per_seq) {
+            throw std::runtime_error("PagedKVCache: virtual_page out of range");
+        }
         block_table_host[static_cast<std::size_t>(seq_idx) * max_pages_per_seq + virtual_page] = physical_page;
     }
 
     /// Get block table entry.
     int get_block_table(int seq_idx, int virtual_page) const {
+        if (seq_idx < 0 || seq_idx >= batch_size) {
+            throw std::runtime_error("PagedKVCache: seq_idx out of range");
+        }
+        if (virtual_page < 0 || virtual_page >= max_pages_per_seq) {
+            throw std::runtime_error("PagedKVCache: virtual_page out of range");
+        }
         return block_table_host[static_cast<std::size_t>(seq_idx) * max_pages_per_seq + virtual_page];
     }
 
@@ -362,6 +389,41 @@ struct PagedKVCache {
         CUDA_CHECK(cudaMemcpyAsync(
             block_table_gpu, block_table_host.data(),
             block_table_bytes(), cudaMemcpyHostToDevice, stream));
+    }
+
+    /// Copy the prefix token region from one physical page to another for all layers.
+    /// Used to materialize private copies of a partially-filled shared prefix page.
+    void copy_prefix_tokens_between_pages(
+        int src_physical_page, int dst_physical_page, int prefix_tokens, cudaStream_t stream) {
+        if (prefix_tokens <= 0) return;
+        if (src_physical_page < 0 || dst_physical_page < 0) {
+            throw std::runtime_error("PagedKVCache: invalid page index for copy");
+        }
+        if (prefix_tokens > page_block_size) {
+            throw std::runtime_error("PagedKVCache: prefix_tokens exceeds page_block_size");
+        }
+
+        const std::size_t tokens_bytes =
+            static_cast<std::size_t>(prefix_tokens)
+            * static_cast<std::size_t>(num_kv_heads)
+            * static_cast<std::size_t>(head_dim)
+            * static_cast<std::size_t>(elem_bytes());
+        const std::size_t per_layer_bytes =
+            static_cast<std::size_t>(total_pages) * page_bytes();
+        const std::size_t src_off = static_cast<std::size_t>(src_physical_page) * page_bytes();
+        const std::size_t dst_off = static_cast<std::size_t>(dst_physical_page) * page_bytes();
+
+        for (int layer = 0; layer < num_layers; ++layer) {
+            auto* k_layer = k_pages + static_cast<std::size_t>(layer) * per_layer_bytes;
+            auto* v_layer = v_pages + static_cast<std::size_t>(layer) * per_layer_bytes;
+
+            CUDA_CHECK(cudaMemcpyAsync(
+                k_layer + dst_off, k_layer + src_off, tokens_bytes,
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                v_layer + dst_off, v_layer + src_off, tokens_bytes,
+                cudaMemcpyDeviceToDevice, stream));
+        }
     }
 
     /// Get K page pool pointer for a specific layer.

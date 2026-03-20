@@ -677,6 +677,7 @@ TEST_CASE("Decode attention matches full-sequence attention", "[decode][attentio
         thrust::raw_pointer_cast(decode_cu_q.data()),
         thrust::raw_pointer_cast(decode_seqused_k.data()),
         T,  // max_seqlen_k
+        T,  // kv_stride_seqlen
         B, Hq, Hkv, Hs,
         nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -744,7 +745,7 @@ TEST_CASE("Contiguous B=2 with identical data", "[decode][b2_debug]") {
         thrust::raw_pointer_cast(q_dev.data()),
         thrust::raw_pointer_cast(k_dev.data()), thrust::raw_pointer_cast(v_dev.data()),
         thrust::raw_pointer_cast(cu_q.data()), thrust::raw_pointer_cast(sk.data()),
-        T, B, Hq, Hkv, Hs, nullptr);
+        T, T, B, Hq, Hkv, Hs, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto out_host = from_bf16_device(out);

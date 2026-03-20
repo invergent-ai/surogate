@@ -30,6 +30,9 @@
 /// @param seqused_k    Per-sequence K lengths [batch_size] (NOT cumulative).
 ///                     Passed to Flash Attention as non-cumulative seqlens_k.
 /// @param max_seqlen_k Maximum KV sequence length across the batch
+/// @param kv_stride_seqlen Physical KV stride (sequence capacity) per batch row.
+///                         For contiguous caches this is the cache capacity
+///                         max_seq_len, not max_seqlen_k.
 /// @param batch_size   Number of sequences
 /// @param Hq           Number of query heads
 /// @param Hkv          Number of key/value heads (GQA: Hkv < Hq)
@@ -40,7 +43,7 @@ void attention_decode_flash(
     const nv_bfloat16* q,
     const nv_bfloat16* k_cache, const nv_bfloat16* v_cache,
     const int32_t* cu_seqlens_q, const int32_t* seqused_k,
-    int max_seqlen_k,
+    int max_seqlen_k, int kv_stride_seqlen,
     int batch_size, int Hq, int Hkv, int Hs,
     cudaStream_t stream);
 

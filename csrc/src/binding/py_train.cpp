@@ -11,6 +11,8 @@
 #include <cstring>
 #include <vector>
 #include <iostream>
+#include <chrono>
+#include <random>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -49,6 +51,36 @@ bool env_enabled(const char* name) {
         return false;
     }
     return true;
+}
+
+uint64_t default_generation_seed() {
+    static std::atomic<uint64_t> counter{0};
+    const uint64_t c = counter.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t t = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    std::random_device rd;
+    const uint64_t r = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    // SplitMix64-style mixing.
+    uint64_t x = t ^ r ^ (c + 0x9e3779b97f4a7c15ULL);
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+uint64_t generation_seed_from_env_or_default() {
+    const char* raw = std::getenv("SUROGATE_GENERATE_SEED");
+    if (!raw || !*raw) {
+        return default_generation_seed();
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (end == raw || (end && *end != '\0')) {
+        return default_generation_seed();
+    }
+    return static_cast<uint64_t>(parsed);
 }
 
 }  // namespace
@@ -1725,6 +1757,9 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         float top_p,
         float min_p,
         float repetition_penalty) {
+    if (num_completions <= 0) {
+        throw std::invalid_argument("generate: num_completions must be > 0");
+    }
 
     // Run generation on GPU 0 only (DP — each GPU generates independently)
     GenerationResult result;
@@ -1755,15 +1790,30 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         gen_config.eos_token_id = eos_token_id;
         gen_config.num_completions = num_completions;
         gen_config.use_cuda_graphs = use_cuda_graphs;
+        gen_config.seed = generation_seed_from_env_or_default();
 
         // Create generation engine using the model's own stack as the arena.
         // The stack is shared with training — generation allocates from it,
         // and restores the checkpoint at the end (memory overlay).
         infer::GenerationEngine engine(run_state, params, model_config, mOptions);
 
-        // Build LoRA forward hook if requested
+        // Build LoRA forward hook if requested.
+        modules::ForwardHook hook_storage;
         const modules::ForwardHook* hook_ptr = nullptr;
-        // TODO: wire LoRA hook from DslModel for use_lora=true
+        if (use_lora) {
+            int max_prompt_len = 0;
+            for (const auto& prompt : prompts) {
+                max_prompt_len = std::max(max_prompt_len, static_cast<int>(prompt.size()));
+            }
+            const int total_batch = static_cast<int>(prompts.size()) * std::max(1, num_completions);
+            const int lora_bt_capacity = std::max(total_batch, max_prompt_len);
+            hook_ptr = dsl_model->make_forward_hook(
+                /*use_lora=*/true,
+                /*ensure_B=*/std::max(1, lora_bt_capacity),
+                /*ensure_T=*/1,
+                *ctx.Communicator,
+                hook_storage);
+        }
 
         // Generation may recompile the graph for decode dimensions via
         // execute_decode_step -> compile_graphs(). After generation finishes,
@@ -1772,15 +1822,9 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
 
         // Generate using the model's stack as arena
         std::vector<infer::Trajectory> trajectories;
-        if (num_completions > 1) {
-            trajectories = engine.generate_grpo(
-                prompts, gen_config, run_state.Stack,
-                *graph_exec, *ctx.Communicator, hook_ptr);
-        } else {
-            trajectories = engine.generate(
-                prompts, gen_config, run_state.Stack,
-                *graph_exec, *ctx.Communicator, hook_ptr);
-        }
+        trajectories = engine.generate_grpo(
+            prompts, gen_config, run_state.Stack,
+            *graph_exec, *ctx.Communicator, hook_ptr);
 
         // Sync GPU and check for errors from generation.
         CUDA_CHECK(cudaDeviceSynchronize());
