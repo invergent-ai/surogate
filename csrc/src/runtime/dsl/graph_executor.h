@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_H
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <random>
@@ -422,6 +423,10 @@ private:
     std::unique_ptr<CompiledGraph> mDecodeCompiledForward;
     long mDecodeCompiledB = 0;
     long mDecodeCompiledT = 0;
+
+    // Prefill compiled forward cache keyed by (B,T). GRPO prefill lengths vary
+    // across prompts, so caching avoids frequent recompilation.
+    std::unordered_map<std::uint64_t, std::unique_ptr<CompiledGraph>> mPrefillCompiledForwardCache;
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);

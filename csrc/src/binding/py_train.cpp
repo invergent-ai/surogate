@@ -1826,11 +1826,8 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
             prompts, gen_config, run_state.Stack,
             *graph_exec, *ctx.Communicator, hook_ptr);
 
-        // Sync GPU and check for errors from generation.
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Invalidate decode graph (captured arena pointers are now stale).
-        graph_exec->invalidate_decode_graph();
+        // generate_grpo() already synchronizes generation stream and invalidates
+        // decode graph captures that reference generation-arena pointers.
 
         // Convert trajectories to result
         result.tokens.resize(trajectories.size());

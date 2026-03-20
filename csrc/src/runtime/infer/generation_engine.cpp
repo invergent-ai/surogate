@@ -301,11 +301,6 @@ std::vector<Trajectory> GenerationEngine::generate(
     // Pre-allocate host buffers used every step (avoid heap allocs in hot loop)
     std::vector<int32_t> pos_ids_host(static_cast<std::size_t>(batch_size));
     std::vector<int> finished_host_buf(static_cast<std::size_t>(batch_size), 0);
-    const bool use_direct_logits_sampling =
-        (gen_config.temperature == 1.0f) &&
-        (gen_config.top_k <= 0) &&
-        (gen_config.top_p >= 1.0f) &&
-        (gen_config.min_p <= 0.0f);
 
     for (int step = 0; step < gen_config.max_gen_len && num_active > 0; ++step) {
         // Upload seq_lens and build cu_seqlens/seqused_k
@@ -348,12 +343,6 @@ std::vector<Trajectory> GenerationEngine::generate(
         if (gen_config.temperature <= 0.0f) {
             // Greedy (argmax)
             sampling_argmax(logits_gpu, sampled_tokens_gpu, batch_size, V, mRunState.MainStream);
-        } else if (use_direct_logits_sampling) {
-            // Unfiltered categorical sampling (temperature=1): sample directly
-            // from logits to avoid materializing full probs.
-            sampling_from_logits(logits_gpu, sampled_tokens_gpu, batch_size, V,
-                                 /*deterministic=*/false, gen_config.seed, rng_offset,
-                                 mRunState.MainStream);
         } else {
             // Temperature-scaled softmax → probs
             sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
@@ -390,15 +379,13 @@ std::vector<Trajectory> GenerationEngine::generate(
         rng_offset++;
 
         // Extract logprobs: logprob[i] = log p(sampled_token_i | logits_i)
-        if (gen_config.temperature <= 0.0f || use_direct_logits_sampling) {
-            sampling_extract_logprob_from_logits(
-                logits_gpu, sampled_tokens_gpu, logprobs_gpu,
-                /*temperature=*/nullptr,
-                batch_size, V, mRunState.MainStream);
-        } else {
-            sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
-                                     batch_size, V, mRunState.MainStream);
+        if (gen_config.temperature <= 0.0f) {
+            sampling_softmax(logits_gpu, probs_gpu, /*temperature=*/nullptr,
+                             batch_size, V, softmax_workspace, softmax_workspace_bytes,
+                             mRunState.MainStream);
         }
+        sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                 batch_size, V, mRunState.MainStream);
 
         // ----------------------------------------------------------------
         // Streaming D2H: copy (token, logprob) to pinned host on copy stream
@@ -753,11 +740,6 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     int active_count_host = total_batch;
     const int stop_check_start = std::max(16, gen_config.max_gen_len / 2);
     const int stop_check_interval = std::max(16, gen_config.max_gen_len / 8);
-    const bool use_direct_logits_sampling =
-        (gen_config.temperature == 1.0f) &&
-        (gen_config.top_k <= 0) &&
-        (gen_config.top_p >= 1.0f) &&
-        (gen_config.min_p <= 0.0f);
 
     for (int step = 0; step < gen_config.max_gen_len; ++step) {
 
@@ -791,10 +773,6 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
 
         if (gen_config.temperature <= 0.0f) {
             sampling_argmax(logits_gpu, sampled_tokens_gpu, total_batch, V, mRunState.MainStream);
-        } else if (use_direct_logits_sampling) {
-            sampling_from_logits(logits_gpu, sampled_tokens_gpu, total_batch, V,
-                                 /*deterministic=*/false, gen_config.seed, rng_offset,
-                                 mRunState.MainStream);
         } else {
             sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
                              total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
@@ -825,15 +803,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         mask_finished_tokens(sampled_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
         rng_offset++;
 
-        if (gen_config.temperature <= 0.0f || use_direct_logits_sampling) {
-            sampling_extract_logprob_from_logits(
-                logits_gpu, sampled_tokens_gpu, logprobs_gpu,
-                /*temperature=*/nullptr,
-                total_batch, V, mRunState.MainStream);
-        } else {
-            sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
-                                     total_batch, V, mRunState.MainStream);
+        if (gen_config.temperature <= 0.0f) {
+            sampling_softmax(logits_gpu, probs_gpu, nullptr,
+                             total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
+                             mRunState.MainStream);
         }
+        sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                 total_batch, V, mRunState.MainStream);
 
         // Store step outputs on GPU; host copies are done once after decode.
         const std::size_t step_off =

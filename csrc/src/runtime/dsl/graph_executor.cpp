@@ -103,6 +103,11 @@ inline bool graph_has_qwen35_ops(const CompiledGraph* g) {
     return false;
 }
 
+inline std::uint64_t bt_cache_key(long B, long T) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(B)) << 32)
+         | static_cast<std::uint64_t>(static_cast<std::uint32_t>(T));
+}
+
 inline void sync_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
     if (!stream_is_capturing(stream)) {
         CUDA_CHECK(cudaEventSynchronize(event));
@@ -1783,24 +1788,26 @@ void GraphExecutor::execute_prefill(long B, long T,
     if (!mCompiler || !mCompiledExecutor) {
         throw std::runtime_error("GraphExecutor: compiler/executor not initialized");
     }
-    // Reuse the decode compiled graph if dimensions match, otherwise compile fresh.
-    // Disable doc_masking and recompute for prefill (paged attention handles masking,
-    // no backward during prefill).
-    if (B != mDecodeCompiledB || T != mDecodeCompiledT) {
+    // Prefill has variable dimensions (especially T for prompt length). Cache
+    // compiled prefill graphs by (B,T) to avoid repeated recompilation.
+    const std::uint64_t prefill_key = bt_cache_key(B, T);
+    auto prefill_it = mPrefillCompiledForwardCache.find(prefill_key);
+    if (prefill_it == mPrefillCompiledForwardCache.end()) {
         auto& opts = const_cast<RuntimeOptions&>(mOptions);
         const bool saved_doc_masking = opts.DocMasking;
         const auto saved_recompute = opts.Recompute;
         opts.DocMasking = false;
         opts.Recompute = RecomputeLevel::None;
 
-        mDecodeCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
-        mDecodeCompiledForward->compute_layer_segments();
-        mDecodeCompiledB = B;
-        mDecodeCompiledT = T;
+        auto compiled = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+        compiled->compute_layer_segments();
 
         opts.DocMasking = saved_doc_masking;
         opts.Recompute = saved_recompute;
+
+        prefill_it = mPrefillCompiledForwardCache.emplace(prefill_key, std::move(compiled)).first;
     }
+    CompiledGraph* prefill_graph = prefill_it->second.get();
 
     DslRunState& rs = mRunState;
     const std::size_t token_bytes = static_cast<std::size_t>(B * T) * sizeof(std::int32_t);
@@ -1857,7 +1864,7 @@ void GraphExecutor::execute_prefill(long B, long T,
     static const std::vector<std::string> empty_save_list;
     mCompiledExecutor->set_save_list(&empty_save_list);
 
-    mCompiledExecutor->execute_forward(*mDecodeCompiledForward, comm, /*full=*/false, hook);
+    mCompiledExecutor->execute_forward(*prefill_graph, comm, /*full=*/false, hook);
 
     // Restore state
     decode_state.prefill_mode = false;
@@ -2002,11 +2009,8 @@ void GraphExecutor::invalidate_decode_graph() {
         mDecodeGraphExec = nullptr;
         mDecodeGraphB = 0;
     }
-    // Also release the decode-specific compiled forward graph.
-    // It will be recompiled on the next execute_decode_step call.
-    mDecodeCompiledForward.reset();
-    mDecodeCompiledB = 0;
-    mDecodeCompiledT = 0;
+    // Keep compiled decode/prefill graphs cached. They are shape-specialized IR
+    // artifacts and do not capture per-call arena pointers.
 }
 
 // ============================================================================
