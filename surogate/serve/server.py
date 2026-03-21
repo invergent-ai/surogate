@@ -18,6 +18,7 @@ from transformers import AutoTokenizer
 
 from surogate import _surogate
 from surogate.core.config.serve_config import ServeConfig
+from surogate.core.model.registry import ModelInfo
 from surogate.dsl.ir_builder import build_dsl_ir_for_model
 from surogate.kernels.jit_compile import compile_jit_kernels
 from surogate.utils.hf import get_model_weights_path
@@ -149,6 +150,7 @@ class NativeServingRuntime:
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
+        qlora_config = self._resolve_prequant_qlora_config(model_dir)
         logger.info(f"Loading tokenizer for {model_dir}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, trust_remote_code=config.trust_remote_code
@@ -191,6 +193,7 @@ class NativeServingRuntime:
             grad_accum=1,
             memcpy_all_gather=True,
             memcpy_send_recv=True,
+            qlora_config=qlora_config,
         )
 
         model_weights_path = get_model_weights_path(model_dir)
@@ -274,6 +277,39 @@ class NativeServingRuntime:
                 exc,
             )
         return int(auto_min_mb)
+
+    @staticmethod
+    def _resolve_prequant_qlora_config(model_dir: str):
+        """Auto-detect pre-quantized models and return matching QLoRAConfig."""
+        try:
+            model_info = ModelInfo.create(model_dir)
+            quant_info = model_info.quant_info or {}
+            quant_method = (model_info.quant_method or "").lower()
+            modules_to_not_convert = quant_info.get("modules_to_not_convert") or []
+
+            if quant_method == "prequant_fp8":
+                qlora = _surogate.QLoRAConfig.prequant_fp8()
+            elif quant_method == "prequant_nvfp4":
+                qlora = _surogate.QLoRAConfig.prequant_nvfp4()
+            elif quant_method == "prequant_mxfp4":
+                qlora = _surogate.QLoRAConfig.prequant_mxfp4()
+            else:
+                return None
+
+            if modules_to_not_convert:
+                qlora.modules_to_not_convert = list(modules_to_not_convert)
+            logger.info(
+                "Detected pre-quantized model (%s); enabling prequant serve loading path.",
+                quant_method,
+            )
+            return qlora
+        except Exception as exc:
+            logger.warning(
+                "Prequant auto-detection failed for %s (%s). Proceeding without prequant config.",
+                model_dir,
+                exc,
+            )
+            return None
 
     @staticmethod
     def _resolve_lmhead_chunks(
