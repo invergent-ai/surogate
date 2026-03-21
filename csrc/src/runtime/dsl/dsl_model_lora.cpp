@@ -5,6 +5,7 @@
 
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_model_internal.h"
+#include "runtime/dsl/graph_executor.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -260,8 +261,21 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
 
 void DslModel::ensure_lora_run_state(NCCLCommunicator& comm, int B, int T) {
     if (!lora_enabled()) return;
-    if (!mLoRARunState || mLoRARunState->B != B || mLoRARunState->T != T) {
+    const bool needs_realloc =
+        (!mLoRARunState || mLoRARunState->B != B || mLoRARunState->T != T);
+    if (needs_realloc) {
         allocate_lora_run_state(comm, B, T);
+    }
+
+    // Keep executor LoRA runtime pointer in sync with the current run-state object.
+    // ensure_lora_run_state() may replace mLoRARunState when B/T changes (e.g. native
+    // generation path), which invalidates previously wired pointers in the executor.
+    if (mExecutor && mLoRARunState) {
+        mExecutor->set_lora_state(
+            mLoRAConfig ? &*mLoRAConfig : nullptr,
+            mLoRAWeights.get(),
+            mLoRAGrads.get(),
+            mLoRARunState.get());
     }
 }
 
