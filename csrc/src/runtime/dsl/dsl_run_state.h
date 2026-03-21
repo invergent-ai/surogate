@@ -62,6 +62,7 @@ public:
     modules::NonBlockActivations& non_block_activations() { return mNonBlockActivations; }
     modules::NonBlockGradientBuffers& non_block_gradients() { return mNonBlockGradients; }
     modules::ScratchBuffers& scratch() { return mScratch; }
+    void ensure_rope_freq_capacity(const PretrainedConfig& cfg, int required_seq_len);
 
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();

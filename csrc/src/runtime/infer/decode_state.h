@@ -58,6 +58,9 @@ struct DecodeState {
     // Maps layer_idx -> GPU buffer [B, conv_dim, kernel-1] with the rolling tail.
     // Used by dispatch_mamba_conv1d in decode mode (non-paged path).
     std::unordered_map<int, void*>* conv_states = nullptr;
+    // Optional per-sequence conv-state size metadata.
+    // Maps layer_idx -> bytes for one sequence state slice [1, conv_dim, kernel-1].
+    std::unordered_map<int, std::size_t>* conv_state_bytes = nullptr;
 
     // Prefill mode: when true, dispatch_rope writes K/V to the KV-cache at ALL
     // positions (not just position seq_lens[i]) AND lets self-attention proceed

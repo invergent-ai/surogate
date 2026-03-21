@@ -391,6 +391,51 @@ Tensor& DslRunState::get_final_residual() {
     return mResidualManager->get_final_residual();
 }
 
+void DslRunState::ensure_rope_freq_capacity(const PretrainedConfig& cfg, int required_seq_len) {
+    if (required_seq_len <= 0) {
+        return;
+    }
+
+    Tensor& freq = mNonBlockActivations.freq_cis;
+    if (!freq.Data || freq.Rank < 1) {
+        return;
+    }
+
+    const int current_seq_len = static_cast<int>(freq.Sizes[0]);
+    if (required_seq_len <= current_seq_len) {
+        return;
+    }
+
+    const int head_size = cfg.head_size();
+    if (head_size <= 0) {
+        return;
+    }
+
+    const int target_seq_len = std::max(
+        required_seq_len,
+        std::max(current_seq_len * 2, current_seq_len + 256));
+    const ETensorDType dtype = freq.DType;
+
+    Tensor expanded = mAllocator->allocate(
+        dtype, "freq_cis", EAllocationType::ON_DEVICE, {target_seq_len, 2 * head_size});
+    const RopeInvFreq rope_params = compute_rope_inv_freq(cfg, head_size, target_seq_len);
+    if (dtype == ETensorDType::BF16) {
+        std::vector<nv_bfloat16> freq_cpu(static_cast<std::size_t>(target_seq_len) * 2 * head_size);
+        fill_rope_freqs(freq_cpu, rope_params, head_size, target_seq_len);
+        CUDA_CHECK(cudaMemcpy(expanded.Data, freq_cpu.data(),
+                              freq_cpu.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    } else if (dtype == ETensorDType::FP32) {
+        std::vector<float> freq_cpu(static_cast<std::size_t>(target_seq_len) * 2 * head_size);
+        fill_rope_freqs(freq_cpu, rope_params, head_size, target_seq_len);
+        CUDA_CHECK(cudaMemcpy(expanded.Data, freq_cpu.data(),
+                              freq_cpu.size() * sizeof(float), cudaMemcpyHostToDevice));
+    } else {
+        fill_zero(expanded, MainStream);
+    }
+
+    mNonBlockActivations.freq_cis = expanded;
+}
+
 void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     const long B = this->B;
     const long T = this->T;

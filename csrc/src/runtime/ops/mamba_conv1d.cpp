@@ -78,12 +78,30 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         const std::size_t state_elems =
             static_cast<std::size_t>(B) * static_cast<std::size_t>(conv_dim) * static_cast<std::size_t>(state_len);
         const std::size_t state_bytes = state_elems * get_dtype_size(x.DType);
+        const std::size_t per_seq_bytes =
+            state_bytes / static_cast<std::size_t>(std::max(1, B));
 
         void* state_ptr = conv_states[layer_idx];
-        if (!state_ptr) {
+        bool need_realloc = (state_ptr == nullptr);
+        if (mDecodeState->conv_state_bytes) {
+            auto& conv_state_bytes = *mDecodeState->conv_state_bytes;
+            auto it = conv_state_bytes.find(layer_idx);
+            if (it == conv_state_bytes.end() || it->second != per_seq_bytes) {
+                need_realloc = true;
+            }
+        }
+
+        if (need_realloc) {
+            if (state_ptr) {
+                CUDA_CHECK(cudaFree(state_ptr));
+                state_ptr = nullptr;
+            }
             CUDA_CHECK(cudaMalloc(&state_ptr, state_bytes));
             CUDA_CHECK(cudaMemsetAsync(state_ptr, 0, state_bytes, mRunState.MainStream));
             conv_states[layer_idx] = state_ptr;
+        }
+        if (mDecodeState->conv_state_bytes) {
+            (*mDecodeState->conv_state_bytes)[layer_idx] = per_seq_bytes;
         }
 
         Tensor conv_state = Tensor::from_pointer(

@@ -156,7 +156,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     }
     const int max_prompt_len =
         round_up_prompt_len_bucket(max_prompt_len_observed, gen_config.max_gen_len, mRunState);
-    const int prefill_chunk_size = resolve_prefill_chunk_size(gen_config, max_prefill_len_observed);
+    int prefill_chunk_size = resolve_prefill_chunk_size(gen_config, max_prefill_len_observed);
+    if (prefill_chunk_size > 0 && mRunState.Inputs.Rank >= 2) {
+        const int static_t_cap = static_cast<int>(mRunState.Inputs.Sizes[1]);
+        if (static_t_cap > 0) {
+            prefill_chunk_size = std::max(1, std::min(prefill_chunk_size, static_t_cap));
+        }
+    }
 
     const int max_total_len = max_prompt_len + gen_config.max_gen_len;
     const int Hkv = mConfig.NumKeyValHeads;
@@ -168,6 +174,9 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     ) ? static_cast<int32_t>(gen_config.eos_token_id) : int32_t{0};
 
     validate_prompt_tokens_or_throw(prompts, V, "GenerationEngine::generate_grpo");
+    // Generation can receive prompts longer than the trainer's static T.
+    // Ensure RoPE cache covers all positions touched by prefill+decode.
+    mRunState.ensure_rope_freq_capacity(mConfig, max_total_len);
 
     auto arena_cp = arena.checkpoint();
 
@@ -324,6 +333,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     std::unordered_map<int, void*> grpo_recurrent_states;
     std::unordered_map<int, std::size_t> grpo_recurrent_state_bytes;
     std::unordered_map<int, void*> grpo_conv_states;
+    std::unordered_map<int, std::size_t> grpo_conv_state_bytes;
 
     // ========================================================================
     // Prefill: for each prompt, run prefix-only forward (all tokens except the
@@ -383,6 +393,8 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         // Per-prompt recurrent-state capture during prefill (B=1 source slot).
         std::unordered_map<int, void*> prompt_recurrent_states;
         std::unordered_map<int, std::size_t> prompt_recurrent_state_bytes;
+        std::unordered_map<int, void*> prompt_conv_states;
+        std::unordered_map<int, std::size_t> prompt_conv_state_bytes;
 
         // Prefill decode state (B=1, paged, prefill_mode=true)
         infer::DecodeState prompt_ds{};
@@ -400,7 +412,8 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         prompt_ds.vocab_size = V;
         prompt_ds.recurrent_states = &prompt_recurrent_states;
         prompt_ds.recurrent_state_bytes = &prompt_recurrent_state_bytes;
-        prompt_ds.conv_states = &grpo_conv_states;
+        prompt_ds.conv_states = &prompt_conv_states;
+        prompt_ds.conv_state_bytes = &prompt_conv_state_bytes;
         // prefill_mode is set by execute_prefill()
 
         const int prefill_start = shared_full_pages * kPageBlockSize;
@@ -466,6 +479,50 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
             }
         }
 
+        // Scatter per-prompt causal-conv state [1, conv_dim, kernel-1] into
+        // decode batch buffer [M*N, conv_dim, kernel-1].
+        for (const auto& [layer_idx, src_ptr] : prompt_conv_states) {
+            if (!src_ptr) {
+                continue;
+            }
+            auto it_bytes = prompt_conv_state_bytes.find(layer_idx);
+            if (it_bytes == prompt_conv_state_bytes.end() || it_bytes->second == 0) {
+                throw std::runtime_error(
+                    "GenerationEngine::generate_grpo: missing conv state bytes for layer "
+                    + std::to_string(layer_idx));
+            }
+            const std::size_t per_seq_bytes = it_bytes->second;
+
+            void*& dst_base = grpo_conv_states[layer_idx];
+            auto it_global_bytes = grpo_conv_state_bytes.find(layer_idx);
+            if (!dst_base) {
+                const std::size_t total_bytes =
+                    per_seq_bytes * static_cast<std::size_t>(total_batch);
+                CUDA_CHECK(cudaMalloc(&dst_base, total_bytes));
+                CUDA_CHECK(cudaMemsetAsync(dst_base, 0, total_bytes, mRunState.MainStream));
+                grpo_conv_state_bytes[layer_idx] = per_seq_bytes;
+            } else if (it_global_bytes == grpo_conv_state_bytes.end() ||
+                       it_global_bytes->second != per_seq_bytes) {
+                throw std::runtime_error(
+                    "GenerationEngine::generate_grpo: conv state byte-size mismatch for layer "
+                    + std::to_string(layer_idx));
+            }
+
+            for (int n = 0; n < N; ++n) {
+                const int dst_slot = src_slot + n;
+                auto* dst_ptr = static_cast<char*>(dst_base)
+                              + static_cast<std::size_t>(dst_slot) * per_seq_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, per_seq_bytes,
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        }
+
+        for (auto& [_, ptr] : prompt_conv_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+            }
+        }
+
         // Copy the initialized prefix tail from source partial page into each
         // completion's private partial page (all layers, K and V).
         if (partial_prefix_tokens > 0 && N > 1) {
@@ -503,6 +560,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     decode_state.recurrent_states = &grpo_recurrent_states;
     decode_state.recurrent_state_bytes = &grpo_recurrent_state_bytes;
     decode_state.conv_states = &grpo_conv_states;
+    decode_state.conv_state_bytes = &grpo_conv_state_bytes;
     decode_state.paged = true;
     decode_state.k_pages = paged_kv.k_pages;
     decode_state.v_pages = paged_kv.v_pages;
