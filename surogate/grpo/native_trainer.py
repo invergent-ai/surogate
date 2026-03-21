@@ -1331,7 +1331,6 @@ class NativeGRPOTrainer:
         logger.info(
             f"  Completions per problem: {config.generation.num_completions}"
         )
-        logger.info("  Generation path: paged GRPO decode")
         logger.info(f"  Max gen length: {config.generation.max_gen_len}")
         logger.info(f"  Prefill chunk size: {config.generation.prefill_chunk_size}")
         logger.info(f"  Learning rate: {config.learning_rate}")
@@ -1340,8 +1339,6 @@ class NativeGRPOTrainer:
             f"rank={config.lora_rank}, alpha={config.lora_alpha}"
         )
         logger.info(f"  Doc masking: {getattr(config, 'doc_masking', True)}")
-        logger.info("  Recompute: True")
-        logger.info("  Overlap scheduling: enabled (next-batch prefetch)")
         logger.info(f"  Optimizer: {config.optimizer}")
         logger.info(f"  Max steps: {max_steps}")
         if config.loss:
