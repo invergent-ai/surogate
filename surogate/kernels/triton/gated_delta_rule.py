@@ -1428,7 +1428,9 @@ def compile_gated_delta_rule(
              grid=(NT, B * H))
 
     # --- Recurrent forward (single-token decode / inference) ---
-    BK_rec = min(max(triton.next_power_of_2(K), 16), 64)
+    # Recurrent kernel consumes the full K dimension in one program (no NK grid),
+    # so BK must cover K entirely.
+    BK_rec = triton.next_power_of_2(K)
     BV_rec = min(max(triton.next_power_of_2(V), 16), 64)
     NV_rec = (V + BV_rec - 1) // BV_rec
     # Use T=1 for autotuning (decode case)

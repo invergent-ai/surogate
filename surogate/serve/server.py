@@ -101,6 +101,14 @@ class PendingGeneration:
     error: Optional[Exception] = None
 
 
+@dataclass
+class ActiveGeneration:
+    pending: PendingGeneration
+    generated_ids: list[int] = field(default_factory=list)
+    finished: bool = False
+    finish_reason: str = "stop"
+
+
 def _normalize_stop(stop: Optional[str | list[str]]) -> list[str]:
     if stop is None:
         return []
@@ -196,6 +204,15 @@ class NativeServingRuntime:
             0.0,
             float(os.getenv("SUROGATE_SERVE_BATCH_WAIT_MS", "2")) / 1000.0,
         )
+        self._continuous_enabled = os.getenv("SUROGATE_SERVE_CONTINUOUS_BATCHING", "1") != "0"
+        self._continuous_step_tokens = max(
+            1,
+            int(os.getenv("SUROGATE_SERVE_CONTINUOUS_STEP_TOKENS", "32")),
+        )
+        self._continuous_idle_step_tokens = max(
+            self._continuous_step_tokens,
+            int(os.getenv("SUROGATE_SERVE_CONTINUOUS_IDLE_STEP_TOKENS", "256")),
+        )
         # Trainer capacity is bounded by config.batch_size (total decode sequences B).
         configured_cap = max(1, int(config.batch_size))
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
@@ -211,7 +228,12 @@ class NativeServingRuntime:
             daemon=True,
         )
         self._batch_worker.start()
-        logger.info("Native inference runtime ready")
+        logger.info(
+            "Native inference runtime ready (continuous_batching=%s step_tokens=%d idle_step_tokens=%d)",
+            bool(self._continuous_enabled),
+            int(self._continuous_step_tokens),
+            int(self._continuous_idle_step_tokens),
+        )
 
     @staticmethod
     def _resolve_min_stack_mb(config: ServeConfig) -> int:
@@ -423,48 +445,214 @@ class NativeServingRuntime:
                 )
             item.result = choices
 
+    def _run_continuous_step(
+        self,
+        active: list[ActiveGeneration],
+        params: GenerationParams,
+        *,
+        step_tokens: int,
+    ) -> None:
+        prompts = [
+            item.pending.prompt_ids + item.generated_ids
+            for item in active
+        ]
+        tokens, _, prompt_lens, completion_lens = self.trainer.generate(
+            prompts=prompts,
+            num_completions=1,
+            max_gen_len=step_tokens,
+            temperature=params.temperature,
+            eos_token_id=self.eos_id,
+            use_lora=self.config.use_lora,
+            use_cuda_graphs=self.config.use_cuda_graphs,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            min_p=params.min_p,
+            prefill_chunk_size=self.config.prefill_chunk_size,
+            repetition_penalty=params.repetition_penalty,
+        )
+
+        for row_idx, item in enumerate(active):
+            if item.finished:
+                continue
+
+            pl = int(prompt_lens[row_idx])
+            cl = int(completion_lens[row_idx])
+            if cl <= 0:
+                # Defensive: avoid spinning if backend returns no new tokens.
+                item.finished = True
+                item.finish_reason = "stop"
+                continue
+
+            new_ids = [int(t) for t in tokens[row_idx][pl : pl + cl]]
+            if new_ids:
+                item.generated_ids.extend(new_ids)
+
+            raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
+            trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
+            if stop_hit:
+                item.generated_ids = [
+                    int(t)
+                    for t in self.tokenizer.encode(trimmed_text, add_special_tokens=False)
+                ]
+                item.finished = True
+                item.finish_reason = "stop"
+                continue
+
+            if item.generated_ids and item.generated_ids[-1] == self.eos_id:
+                item.finished = True
+                item.finish_reason = "stop"
+                continue
+
+            if len(item.generated_ids) >= params.max_tokens:
+                if len(item.generated_ids) > params.max_tokens:
+                    item.generated_ids = item.generated_ids[: params.max_tokens]
+                item.finished = True
+                item.finish_reason = "length"
+
+    def _finalize_continuous_request(self, item: ActiveGeneration) -> None:
+        raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
+        trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
+        if stop_hit:
+            out_ids = self.tokenizer.encode(trimmed_text, add_special_tokens=False)
+            finish_reason = "stop"
+        else:
+            out_ids = item.generated_ids
+            finish_reason = item.finish_reason
+
+        item.pending.result = [
+            GeneratedChoice(
+                index=0,
+                text=trimmed_text,
+                token_ids=[int(t) for t in out_ids],
+                finish_reason=finish_reason,
+                prompt_tokens=len(item.pending.prompt_ids),
+                completion_tokens=len(out_ids),
+            )
+        ]
+
     def _generation_worker_loop(self) -> None:
         while True:
-            batch: list[PendingGeneration] = []
             with self._pending_cv:
                 while not self._pending and not self._shutdown:
                     self._pending_cv.wait()
                 if self._shutdown:
                     return
-
                 first = self._pending.pop(0)
-                batch.append(first)
+
+            # Fallback for n>1: keep the previous one-shot batch behavior.
+            if (not self._continuous_enabled) or first.params.n != 1:
+                batch: list[PendingGeneration] = [first]
                 prompt_cap = self._prompt_capacity(first.params)
                 deadline = time.perf_counter() + self._batch_wait_s
+                with self._pending_cv:
+                    while len(batch) < prompt_cap:
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        if not self._pending:
+                            self._pending_cv.wait(timeout=remaining)
+                            continue
 
-                while len(batch) < prompt_cap:
+                        i = 0
+                        while i < len(self._pending) and len(batch) < prompt_cap:
+                            item = self._pending[i]
+                            if item.params == first.params:
+                                batch.append(self._pending.pop(i))
+                            else:
+                                i += 1
+                        if not self._pending:
+                            continue
+
+                err: Optional[Exception] = None
+                try:
+                    self._run_generation_batch(batch)
+                except Exception as e:
+                    err = e
+
+                for item in batch:
+                    if err is not None:
+                        item.error = err
+                    item.done.set()
+                continue
+
+            params = first.params
+            prompt_cap = self._prompt_capacity(params)
+            active: list[ActiveGeneration] = [ActiveGeneration(pending=first)]
+            deadline = time.perf_counter() + self._batch_wait_s
+            with self._pending_cv:
+                while len(active) < prompt_cap:
                     remaining = deadline - time.perf_counter()
                     if remaining <= 0:
                         break
                     if not self._pending:
                         self._pending_cv.wait(timeout=remaining)
                         continue
-
                     i = 0
-                    while i < len(self._pending) and len(batch) < prompt_cap:
-                        item = self._pending[i]
-                        if item.params == first.params:
-                            batch.append(self._pending.pop(i))
+                    while i < len(self._pending) and len(active) < prompt_cap:
+                        queued = self._pending[i]
+                        if queued.params == params:
+                            active.append(ActiveGeneration(pending=self._pending.pop(i)))
                         else:
                             i += 1
-                    if not self._pending:
-                        continue
 
-            err: Optional[Exception] = None
-            try:
-                self._run_generation_batch(batch)
-            except Exception as e:
-                err = e
+            while True:
+                waiting_match = False
+                with self._pending_cv:
+                    i = 0
+                    while i < len(self._pending):
+                        queued = self._pending[i]
+                        if queued.params != params:
+                            i += 1
+                            continue
+                        if len(active) < prompt_cap:
+                            active.append(ActiveGeneration(pending=self._pending.pop(i)))
+                            continue
+                        waiting_match = True
+                        i += 1
 
-            for item in batch:
+                if not active:
+                    if not waiting_match:
+                        break
+                    continue
+
+                unfinished = [a for a in active if not a.finished]
+                if not unfinished:
+                    active.clear()
+                    if not waiting_match:
+                        break
+                    continue
+
+                max_step_tokens = (
+                    self._continuous_step_tokens
+                    if waiting_match or len(active) > 1
+                    else self._continuous_idle_step_tokens
+                )
+                remaining_min = min(
+                    max(1, params.max_tokens - len(a.generated_ids))
+                    for a in unfinished
+                )
+                step_tokens = max(1, min(max_step_tokens, remaining_min))
+
+                err: Optional[Exception] = None
+                try:
+                    self._run_continuous_step(active, params, step_tokens=step_tokens)
+                except Exception as e:
+                    err = e
+
                 if err is not None:
-                    item.error = err
-                item.done.set()
+                    for item in active:
+                        item.pending.error = err
+                        item.pending.done.set()
+                    break
+
+                still_active: list[ActiveGeneration] = []
+                for item in active:
+                    if item.finished:
+                        self._finalize_continuous_request(item)
+                        item.pending.done.set()
+                    else:
+                        still_active.append(item)
+                active = still_active
 
     def _generate(
         self,
@@ -510,7 +698,10 @@ class NativeServingRuntime:
             raise ValueError("`n` must be > 0")
 
         prompt_text = self._messages_to_prompt_text(req.messages)
-        prompt_ids = self.tokenizer.encode(prompt_text)
+        # apply_chat_template() already injects BOS/role/control markers.
+        # Re-adding special tokens here diverges from HF/vLLM chat behavior,
+        # especially on Qwen3.5.
+        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
 
         max_tokens = int(
             req.max_completion_tokens

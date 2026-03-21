@@ -68,9 +68,11 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         parse_block_param(op.inputs[0].name, layer_idx, field);
     }
 
-    // Decode/prefill generation path for non-paged batches:
+    // Decode/prefill generation path:
     // keep and update per-layer causal-conv tail state [B, conv_dim, kernel-1].
-    if (mDecodeState && mDecodeState->conv_states && !mDecodeState->paged && layer_idx >= 0 && kernel > 1) {
+    // This state is independent of KV paging, so it must be active for both
+    // paged and non-paged decode.
+    if (mDecodeState && mDecodeState->conv_states && layer_idx >= 0 && kernel > 1) {
         auto& conv_states = *mDecodeState->conv_states;
         const int state_len = kernel - 1;
         const std::size_t state_elems =

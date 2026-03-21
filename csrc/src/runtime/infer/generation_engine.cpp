@@ -254,6 +254,62 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         }
     }
 
+    // Cross-prompt full-page prefix sharing:
+    // If two prompts share the same leading page-aligned prefix, later prompts
+    // can alias those KV pages and skip prefill on the shared leading pages.
+    // Keep this disabled for recurrent/Mamba models where hidden state must
+    // also be carried across the skipped region.
+    const bool has_recurrent_prefix_state = [&]() -> bool {
+        if (mConfig.MambaSsmStateSize > 0 || mConfig.MambaConvKernel > 1 || mConfig.MambaNumHeads > 0) {
+            return true;
+        }
+        for (int layer = 0; layer < mConfig.NumLayers; ++layer) {
+            if (mConfig.get_block_type(layer) == modules::BlockType::Mamba) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    const bool enable_cross_prompt_prefix_sharing = !has_recurrent_prefix_state;
+
+    std::vector<int> share_from_prompt(static_cast<std::size_t>(M), -1);
+    std::vector<int> shared_full_pages_per_prompt(static_cast<std::size_t>(M), 0);
+    if (enable_cross_prompt_prefix_sharing) {
+        for (int m = 0; m < M; ++m) {
+            const int full_pages_m = prefill_lens_per_prompt[static_cast<std::size_t>(m)] / kPageBlockSize;
+            if (full_pages_m <= 0) {
+                continue;
+            }
+
+            int best_src = -1;
+            int best_shared_pages = 0;
+            for (int src = 0; src < m; ++src) {
+                const int full_pages_src = prefill_lens_per_prompt[static_cast<std::size_t>(src)] / kPageBlockSize;
+                const int max_pages = std::min(full_pages_m, full_pages_src);
+                int shared_pages = 0;
+                while (shared_pages < max_pages) {
+                    const int off = shared_pages * kPageBlockSize;
+                    if (!std::equal(
+                            prompts[static_cast<std::size_t>(m)].begin() + off,
+                            prompts[static_cast<std::size_t>(m)].begin() + off + kPageBlockSize,
+                            prompts[static_cast<std::size_t>(src)].begin() + off)) {
+                        break;
+                    }
+                    ++shared_pages;
+                }
+                if (shared_pages > best_shared_pages) {
+                    best_shared_pages = shared_pages;
+                    best_src = src;
+                }
+            }
+
+            if (best_shared_pages > 0) {
+                share_from_prompt[static_cast<std::size_t>(m)] = best_src;
+                shared_full_pages_per_prompt[static_cast<std::size_t>(m)] = best_shared_pages;
+            }
+        }
+    }
+
     // Block table GPU buffer for B=1 prefill
     auto* prefill_block_table_gpu = reinterpret_cast<int*>(
         alloc(static_cast<std::size_t>(paged_kv.max_pages_per_seq) * sizeof(int), "grpo_prefill_bt"));
@@ -278,11 +334,30 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         const int plen = static_cast<int>(prompt.size());
         const int prefill_len = prefill_lens_per_prompt[static_cast<std::size_t>(m)];
 
-        // Allocate prefix pages for source slot.
-        const int prefix_pages = paged_kv.alloc_prefix_pages(m, prefill_len);
         const int full_prefix_pages = prefill_len / kPageBlockSize;
         const int partial_prefix_tokens = prefill_len % kPageBlockSize;
         const int src_slot = m * N;
+        const int shared_full_pages = std::min(
+            full_prefix_pages,
+            shared_full_pages_per_prompt[static_cast<std::size_t>(m)]);
+        const int share_src_prompt = share_from_prompt[static_cast<std::size_t>(m)];
+
+        // Share leading full prefix pages from an earlier prompt with the same
+        // page-aligned prefix, then allocate the remaining full pages.
+        if (shared_full_pages > 0 && share_src_prompt >= 0) {
+            const int share_src_slot = share_src_prompt * N;
+            for (int p = 0; p < shared_full_pages; ++p) {
+                paged_kv.set_block_table(src_slot, p, paged_kv.get_block_table(share_src_slot, p));
+            }
+        }
+        for (int p = shared_full_pages; p < full_prefix_pages; ++p) {
+            paged_kv.set_block_table(src_slot, p, paged_kv.alloc_page());
+        }
+        int partial_virtual_page = -1;
+        if (partial_prefix_tokens > 0) {
+            partial_virtual_page = full_prefix_pages;
+            paged_kv.set_block_table(src_slot, partial_virtual_page, paged_kv.alloc_page());
+        }
 
         // Share only full prefix pages.
         if (full_prefix_pages > 0) {
@@ -291,13 +366,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
 
         // Materialize private copies for the last partially-filled prefix page.
         // Sharing that page would alias continuation writes across completions.
-        int partial_virtual_page = -1;
         if (partial_prefix_tokens > 0) {
-            partial_virtual_page = full_prefix_pages;
             for (int n = 1; n < N; ++n) {
                 const int dst_slot = src_slot + n;
-                const int dst_phys = paged_kv.alloc_page();
-                paged_kv.set_block_table(dst_slot, partial_virtual_page, dst_phys);
+                paged_kv.set_block_table(dst_slot, partial_virtual_page, paged_kv.alloc_page());
             }
         }
 
@@ -331,9 +403,10 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         prompt_ds.conv_states = &grpo_conv_states;
         // prefill_mode is set by execute_prefill()
 
-        if (prefill_len > 0) {
+        const int prefill_start = shared_full_pages * kPageBlockSize;
+        if (prefill_len > prefill_start) {
             const int chunk_size = std::max(1, prefill_chunk_size);
-            for (int chunk_start = 0; chunk_start < prefill_len; chunk_start += chunk_size) {
+            for (int chunk_start = prefill_start; chunk_start < prefill_len; chunk_start += chunk_size) {
                 const int chunk_len = std::min(chunk_size, prefill_len - chunk_start);
                 for (int t = 0; t < chunk_len; ++t) {
                     const int absolute_t = chunk_start + t;
