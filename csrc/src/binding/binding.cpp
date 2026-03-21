@@ -309,6 +309,7 @@ NB_MODULE(_surogate, m) {
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
             bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks, bool long_context,
+            int min_stack_mb, int stack_slack_mb,
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope, bool doc_masking,
             int fp8_amax_history, const std::string& fp4_backend,
@@ -352,6 +353,8 @@ NB_MODULE(_surogate, m) {
                 .UseAllToAllReduce = use_all_to_all_reduce,
                 .InitProjectionsToZero = init_projections_to_zero,
                 .DebugMemoryBreakdown = debug_memory_breakdown,
+                .MinStackMB = (min_stack_mb > 0 ? min_stack_mb : 0),
+                .StackSlackMB = (stack_slack_mb > 0 ? stack_slack_mb : 0),
                 .TrainingRecipe = std::move(training_recipe),
                 .RecipeOptions = recipe_options,
                 .UseFusedRope = use_fused_rope,
@@ -382,6 +385,8 @@ NB_MODULE(_surogate, m) {
              nb::arg("lmhead_chunks") = 1,
              nb::arg("attn_bwd_chunks") = 1,
              nb::arg("long_context") = false,
+             nb::arg("min_stack_mb") = 0,
+             nb::arg("stack_slack_mb") = 0,
              nb::arg("matmul_type") = "",
              nb::arg("gradient_type") = "",
              nb::arg("master_dtype") = "",
@@ -399,6 +404,8 @@ NB_MODULE(_surogate, m) {
              "- recompute: Enable activation recomputation ('true' or 'false').\n"
              "  - 'false': Save all activations. Maximum memory, fastest training.\n"
              "  - 'true': Recompute intermediates from checkpoints. Saves ~17% VRAM.\n"
+             "- min_stack_mb: Minimum DSL stack size in MiB (0 = runtime auto).\n"
+             "- stack_slack_mb: Extra DSL stack slack in MiB (0 = runtime auto).\n"
              "- offload_*: Offload specific buffers/states; may reduce VRAM at performance cost.\n"
              "- use_cuda_graphs: Enable CUDA graphs where supported.\n"
              "- trigger_timing_events: Log additional timing information.\n"
@@ -422,6 +429,8 @@ NB_MODULE(_surogate, m) {
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")
         .def_rw("long_context", &RuntimeOptions::LongContext, "Enable tiled MLP execution for long context training (reduces memory at long seq_len).")
+        .def_rw("min_stack_mb", &RuntimeOptions::MinStackMB, "Minimum DSL stack size in MiB (0 = auto).")
+        .def_rw("stack_slack_mb", &RuntimeOptions::StackSlackMB, "Additional DSL stack slack in MiB (0 = auto).")
         .def_rw("use_cuda_graphs", &RuntimeOptions::UseCudaGraphs, "Enable CUDA graphs for steady-state execution.")
         .def_rw("trigger_timing_events", &RuntimeOptions::TriggerTimingEvents, "Log additional timing information.")
         .def_rw("offload_master", &RuntimeOptions::OffloadMaster, "Offload FP32 master weights (optimizer state).")

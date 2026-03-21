@@ -8,7 +8,6 @@
 #include <bit>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <unordered_set>
@@ -47,16 +46,23 @@ struct sSafeTensorsHeader {
  * @throws std::runtime_error If the file cannot be read or the header is invalid.
  */
 sSafeTensorsHeader read_safetensors_header(const std::string& file_name) {
-    std::uint64_t header_size = -1;
-    std::ifstream file(file_name, std::ios_base::binary);
-    file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
-    if (!file) {
-        // read error
+    int fd = open(file_name.c_str(), O_RDONLY);
+    if (fd == -1)
         throw std::runtime_error("Error opening safetensors file '" + file_name + "'");
+
+    std::uint64_t header_size = -1;
+    if (pread(fd, &header_size, sizeof(header_size), 0) != sizeof(header_size)) {
+        close(fd);
+        throw std::runtime_error("Error reading header size from safetensors file '" + file_name + "'");
     }
 
     std::vector<char> header(header_size, '\0');
-    file.read(header.data(), (long)header_size);
+    if (pread(fd, header.data(), header_size, sizeof(header_size)) != static_cast<ssize_t>(header_size)) {
+        close(fd);
+        throw std::runtime_error("Error reading header from safetensors file '" + file_name + "'");
+    }
+    close(fd);
+
     auto parsed = nlohmann::json::parse(header.begin(), header.end());
     return {header_size, std::move(parsed)};
 }
@@ -228,8 +234,19 @@ void SafeTensorsReader::parse_single_file(const std::string& file_path) {
  * @throws std::runtime_error / nlohmann::json exceptions on I/O or parse failures.
  */
 void SafeTensorsReader::parse_index_file(const std::string& index_file) {
-    std::ifstream file(index_file);
-    auto parsed = nlohmann::json::parse(file);
+    int fd = open(index_file.c_str(), O_RDONLY);
+    if (fd == -1)
+        throw std::runtime_error("Error opening index file '" + index_file + "'");
+
+    auto file_size = std::filesystem::file_size(index_file);
+    std::vector<char> buf(file_size);
+    if (pread(fd, buf.data(), file_size, 0) != static_cast<ssize_t>(file_size)) {
+        close(fd);
+        throw std::runtime_error("Error reading index file '" + index_file + "'");
+    }
+    close(fd);
+
+    auto parsed = nlohmann::json::parse(buf.begin(), buf.end());
     auto weight_map = parsed["weight_map"];
 
     std::unordered_set<std::string> processed_files;

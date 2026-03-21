@@ -86,6 +86,12 @@ struct RuntimeOptions {
     // Debug: print detailed memory breakdown after model allocation (useful for QLoRA optimization)
     bool DebugMemoryBreakdown = false;
 
+    // Minimum DSL stack size in MiB. 0 keeps architecture-specific defaults.
+    int MinStackMB = 0;
+
+    // Additional DSL stack slack in MiB. 0 keeps default heuristic slack.
+    int StackSlackMB = 0;
+
     // Training recipe - defines quantization strategy for forward/backward passes.
     // Default is BF16 (no quantization). Set via --recipe=<name> CLI flag.
     std::shared_ptr<recipes::Recipe> TrainingRecipe;

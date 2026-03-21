@@ -21,6 +21,39 @@
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
+namespace {
+
+/// Double-buffered pinned staging area, lazily allocated once per thread.
+/// Two buffers enable overlapping pread() on one while cudaMemcpyAsync()
+/// drains the other.
+constexpr size_t CHUNK = 4 << 20;  // 4 MiB per buffer
+
+struct PinnedBuffers {
+    void* buf[2] = {nullptr, nullptr};
+    cudaStream_t stream = nullptr;
+
+    PinnedBuffers() = default;
+    ~PinnedBuffers() {
+        for (auto& b : buf)
+            if (b) { cudaFreeHost(b); b = nullptr; }
+        if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+    }
+
+    void ensure_allocated() {
+        if (buf[0]) return;
+        CUDA_CHECK(cudaMallocHost(&buf[0], CHUNK));
+        CUDA_CHECK(cudaMallocHost(&buf[1], CHUNK));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    }
+
+    PinnedBuffers(const PinnedBuffers&) = delete;
+    PinnedBuffers& operator=(const PinnedBuffers&) = delete;
+};
+
+thread_local PinnedBuffers g_pinned;
+
+} // namespace
+
 
 /**
  * @brief Open a file for reading via the POSIX fallback path (no cuFile).
@@ -59,35 +92,40 @@ void cufile_read_bytes(int fd, std::byte* d_target, std::ptrdiff_t begin, std::p
     }
 
     const size_t nbytes = static_cast<size_t>(end - begin);
+    if (nbytes == 0) return;
 
-    constexpr size_t CHUNK = 1 << 20;
-    void* hbuf = nullptr;
-    CUDA_CHECK(cudaMallocHost(&hbuf, CHUNK));
+    g_pinned.ensure_allocated();
 
+    // Double-buffer: pread into buf[cur] while the GPU async-copies from buf[prev].
+    int cur = 0;
     size_t done = 0;
+    size_t in_flight = 0;  // bytes of the previous async copy still on the stream
+
     while (done < nbytes) {
         const size_t want = std::min(CHUNK, nbytes - done);
         const off_t off = static_cast<off_t>(begin + done);
-        ssize_t r = ::pread(fd, hbuf, want, off);
-        if (r < 0) {
-            cudaFreeHost(hbuf);
-            throw std::runtime_error(fmt::format("posix pread error ({}) for {}, range {} - {}",
-                                                 errno, file_name, off, off + want));
-        }
+
+        ssize_t r = ::pread(fd, g_pinned.buf[cur], want, off);
+        if (r < 0)
+            throw std::runtime_error(fmt::format("posix pread error ({}) for {}, range {} - {}: {}",
+                                                 errno, file_name, off, off + want, strerror(errno)));
         if (r == 0) break;
 
-        auto ce = cudaMemcpy(reinterpret_cast<void*>(d_target + done),
-                        hbuf, static_cast<size_t>(r),
-                        cudaMemcpyHostToDevice);
-        if (ce != cudaSuccess) {
-            cudaFreeHost(hbuf);
-            throw std::runtime_error(fmt::format("cudaMemcpy failed: {}",
-                                                 cudaGetErrorString(ce)));
-        }
-        done += static_cast<size_t>(r);
+        // Wait for the previous async copy to finish before reusing its buffer next iteration.
+        if (in_flight > 0)
+            CUDA_CHECK(cudaStreamSynchronize(g_pinned.stream));
+
+        CUDA_CHECK(cudaMemcpyAsync(d_target + done, g_pinned.buf[cur],
+                                   static_cast<size_t>(r),
+                                   cudaMemcpyHostToDevice, g_pinned.stream));
+        in_flight = static_cast<size_t>(r);
+        done += in_flight;
+        cur ^= 1;  // swap buffer
     }
 
-    cudaFreeHost(hbuf);
+    // Wait for the last async copy.
+    if (in_flight > 0)
+        CUDA_CHECK(cudaStreamSynchronize(g_pinned.stream));
 
     if (done != nbytes) {
         throw std::runtime_error(fmt::format("posix read short: expected {} bytes, got {}",

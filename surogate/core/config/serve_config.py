@@ -19,10 +19,11 @@ class ServeConfig:
     model_id: Optional[str] = None
     dtype: Literal["bf16", "fp32"] = "bf16"
     gpus: int = 1
-    batch_size: int = 1
+    batch_size: int = 8
     sequence_len: int = 4096
     trust_remote_code: bool = True
-    min_stack_mb: int = 8192
+    min_stack_mb: Optional[int] = None
+    gpu_memory_utilization: float = 0.9
 
     # Generation defaults
     max_gen_len: int = 512
@@ -50,7 +51,11 @@ class ServeConfig:
         self.trust_remote_code = bool(
             cfg.get("trust_remote_code", self.trust_remote_code)
         )
-        self.min_stack_mb = int(cfg.get("min_stack_mb", self.min_stack_mb))
+        min_stack_raw = cfg.get("min_stack_mb", self.min_stack_mb)
+        self.min_stack_mb = None if min_stack_raw is None else int(min_stack_raw)
+        self.gpu_memory_utilization = float(
+            cfg.get("gpu_memory_utilization", self.gpu_memory_utilization)
+        )
 
         self.max_gen_len = int(cfg.get("max_gen_len", self.max_gen_len))
         self.temperature = float(cfg.get("temperature", self.temperature))
@@ -79,6 +84,12 @@ class ServeConfig:
             raise ValueError("ServeConfig: `sequence_len` must be > 0")
         if self.max_gen_len <= 0:
             raise ValueError("ServeConfig: `max_gen_len` must be > 0")
+        if self.gpu_memory_utilization <= 0.0 or self.gpu_memory_utilization > 1.0:
+            raise ValueError(
+                "ServeConfig: `gpu_memory_utilization` must be in (0, 1]"
+            )
+        if self.min_stack_mb is not None and self.min_stack_mb <= 0:
+            self.min_stack_mb = None
         if self.prefill_chunk_size < 0:
             self.prefill_chunk_size = 0
         if self.top_k < 0:
@@ -89,4 +100,3 @@ class ServeConfig:
             self.min_p = 0.0
         if self.repetition_penalty <= 0.0:
             self.repetition_penalty = 1.0
-

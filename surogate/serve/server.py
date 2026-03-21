@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Sequence
 
 import uvicorn
@@ -30,6 +31,10 @@ class ChatMessage(BaseModel):
     content: Any
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionsRequest(BaseModel):
     model: Optional[str] = None
     messages: list[ChatMessage]
@@ -40,6 +45,7 @@ class ChatCompletionsRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stop: Optional[str | list[str]] = None
+    stream_options: Optional[StreamOptions] = None
 
     # Non-standard but useful for parity with existing internal generation knobs.
     top_k: Optional[int] = None
@@ -56,6 +62,7 @@ class CompletionsRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stop: Optional[str | list[str]] = None
+    stream_options: Optional[StreamOptions] = None
 
     # Non-standard sampling knobs.
     top_k: Optional[int] = None
@@ -71,6 +78,27 @@ class GeneratedChoice:
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
+
+
+@dataclass(frozen=True)
+class GenerationParams:
+    n: int
+    max_tokens: int
+    temperature: float
+    top_k: int
+    top_p: float
+    min_p: float
+    repetition_penalty: float
+
+
+@dataclass
+class PendingGeneration:
+    prompt_ids: list[int]
+    stop_strings: list[str]
+    params: GenerationParams
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Optional[list[GeneratedChoice]] = None
+    error: Optional[Exception] = None
 
 
 def _normalize_stop(stop: Optional[str | list[str]]) -> list[str]:
@@ -98,14 +126,19 @@ def _sse(data: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def _token_text_chunks(tokenizer: Any, token_ids: Sequence[int]) -> list[str]:
+    chunks: list[str] = []
+    for tok in token_ids:
+        piece = tokenizer.decode([int(tok)], skip_special_tokens=True)
+        if piece:
+            chunks.append(piece)
+    return chunks
+
+
 class NativeServingRuntime:
     def __init__(self, config: ServeConfig):
         self.config = config
         self.model_id = config.model_id or config.model or "native"
-        self._lock = threading.Lock()
-
-        if "SUROGATE_MIN_STACK_MB" not in os.environ:
-            os.environ["SUROGATE_MIN_STACK_MB"] = str(config.min_stack_mb)
 
         model_dir = self._resolve_model_dir(config.model or "")
         logger.info(f"Loading tokenizer for {model_dir}")
@@ -117,6 +150,7 @@ class NativeServingRuntime:
         logger.info(f"Building DSL IR for {model_dir}")
         ir_json = build_dsl_ir_for_model(model_dir)
         jit_manifests = compile_jit_kernels(ir_json)
+        effective_seq_len = self._resolve_effective_sequence_len(config)
 
         options = _surogate.RuntimeOptions()
         options.dsl_ir_json = ir_json
@@ -125,14 +159,27 @@ class NativeServingRuntime:
         options.use_cuda_graphs = bool(config.use_cuda_graphs)
         options.doc_masking = True
         options.recompute = "true"
+        # Serve uses generate-only paths. Keep training-specific buffers lightweight.
+        options.offload_grads = True
+        options.lmhead_chunks = self._resolve_lmhead_chunks(
+            config,
+            effective_seq_len=effective_seq_len,
+        )
+        options.min_stack_mb = self._resolve_min_stack_mb(config)
+        logger.info(
+            "Serving runtime stack floor=%d MiB lmhead_chunks=%d offload_grads=%s (gpu_memory_utilization=%.2f)",
+            int(options.min_stack_mb),
+            int(options.lmhead_chunks),
+            bool(options.offload_grads),
+            float(config.gpu_memory_utilization),
+        )
 
-        logger.info(f"Creating native serving trainer for {model_dir} ({config.gpus} GPUs)")
         self.trainer = _surogate.SurogateTrainer(
             ngpu=config.gpus,
             config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
             options=options,
             batch_size=config.batch_size,
-            seq_len=config.sequence_len,
+            seq_len=effective_seq_len,
             grad_accum=1,
             memcpy_all_gather=True,
             memcpy_send_recv=True,
@@ -141,7 +188,109 @@ class NativeServingRuntime:
         model_weights_path = get_model_weights_path(model_dir)
         logger.info(f"Importing weights from {model_weights_path}")
         self.trainer.import_weights(model_weights_path)
+        self._pending_lock = threading.Lock()
+        self._pending_cv = threading.Condition(self._pending_lock)
+        self._pending: list[PendingGeneration] = []
+        self._shutdown = False
+        self._batch_wait_s = max(
+            0.0,
+            float(os.getenv("SUROGATE_SERVE_BATCH_WAIT_MS", "2")) / 1000.0,
+        )
+        # Trainer capacity is bounded by config.batch_size (total decode sequences B).
+        configured_cap = max(1, int(config.batch_size))
+        env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
+        self._max_batch_sequences = max(1, min(configured_cap, env_cap))
+        if self._max_batch_sequences <= 1:
+            logger.warning(
+                "Serve runtime running with batch_size=1; concurrent requests will be serialized. "
+                "Set --batch_size>1 to improve throughput."
+            )
+        self._batch_worker = threading.Thread(
+            target=self._generation_worker_loop,
+            name="surogate-generate-batcher",
+            daemon=True,
+        )
+        self._batch_worker.start()
         logger.info("Native inference runtime ready")
+
+    @staticmethod
+    def _resolve_min_stack_mb(config: ServeConfig) -> int:
+        explicit_min = config.min_stack_mb
+        if explicit_min is not None:
+            return max(64, int(explicit_min))
+
+        # For inference we keep the stack floor small by default.
+        # gpu_memory_utilization controls overall serving budget; stack floor should
+        # be a small slice of reserved headroom, not multi-GB.
+        auto_min_mb = 512
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info(0)
+                mb = 1024 * 1024
+                free_mb = int(free_b // mb)
+                total_mb = int(total_b // mb)
+                util = float(config.gpu_memory_utilization)
+                reserve_mb = max(0.0, (1.0 - util) * float(total_mb))
+                # Keep stack floor in a tight inference range [256, 1024] MiB.
+                by_reserve = int(reserve_mb * 0.05)  # 5% of reserved headroom
+                by_free = int(max(256, free_mb * 0.10))  # never exceed 10% of currently free memory
+                auto_min_mb = max(256, min(1024, by_reserve, by_free))
+                logger.info(
+                    "Auto min_stack_mb=%d MiB from free=%d MiB total=%d MiB reserve=%d MiB gpu_memory_utilization=%.2f",
+                    auto_min_mb,
+                    free_mb,
+                    total_mb,
+                    int(reserve_mb),
+                    float(config.gpu_memory_utilization),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Falling back to default min_stack_mb=%d MiB: %s",
+                auto_min_mb,
+                exc,
+            )
+        return int(auto_min_mb)
+
+    @staticmethod
+    def _resolve_lmhead_chunks(
+        config: ServeConfig,
+        *,
+        effective_seq_len: int,
+    ) -> int:
+        # Training runtime persists an output buffer shaped [B*T/lmhead_chunks, V].
+        # Keep per-chunk token count small for inference startup memory stability.
+        tokens_per_chunk = max(
+            128,
+            int(os.getenv("SUROGATE_SERVE_LMHEAD_TOKENS_PER_CHUNK", "1024")),
+        )
+        total_tokens = max(1, int(config.batch_size) * int(effective_seq_len))
+        chunks = max(1, math.ceil(total_tokens / tokens_per_chunk))
+        return int(chunks)
+
+    @staticmethod
+    def _resolve_effective_sequence_len(config: ServeConfig) -> int:
+        # Serve allocates static [B, T, ...] training-era buffers. Keep B*T within
+        # a conservative startup budget to avoid OOM, especially on single-GPU runs.
+        requested_t = max(1, int(config.sequence_len))
+        bsz = max(1, int(config.batch_size))
+        base_budget = int(os.getenv("SUROGATE_SERVE_STATIC_TOKEN_BUDGET", "8192"))
+        util_scale = float(config.gpu_memory_utilization) / 0.8
+        token_budget = max(1024, int(base_budget * max(0.5, util_scale)))
+        max_t = max(1, token_budget // bsz)
+        if requested_t > max_t:
+            logger.warning(
+                "Reducing serve seq_len from %d to %d to respect static token budget "
+                "(batch_size=%d, budget_tokens=%d). Override with --sequence_len and/or "
+                "SUROGATE_SERVE_STATIC_TOKEN_BUDGET if needed.",
+                requested_t,
+                max_t,
+                bsz,
+                token_budget,
+            )
+            return int(max_t)
+        return int(requested_t)
 
     @staticmethod
     def _resolve_model_dir(model: str) -> str:
@@ -198,6 +347,125 @@ class NativeServingRuntime:
                 f"{m['role']}: {m['content']}" for m in normalized
             ) + "\nassistant:"
 
+    def _build_choice(
+        self,
+        token_row: Sequence[int],
+        prompt_len: int,
+        completion_len: int,
+        *,
+        index: int,
+        max_tokens: int,
+        stop_strings: Sequence[str],
+    ) -> GeneratedChoice:
+        pl = int(prompt_len)
+        cl = int(completion_len)
+        raw_ids = [int(t) for t in token_row[pl : pl + cl]]
+        raw_text = self.tokenizer.decode(raw_ids, skip_special_tokens=True)
+
+        trimmed_text, stop_hit = _apply_stop(raw_text, stop_strings)
+        if stop_hit:
+            out_ids = self.tokenizer.encode(trimmed_text, add_special_tokens=False)
+        else:
+            out_ids = raw_ids
+
+        if stop_hit:
+            finish_reason = "stop"
+        elif raw_ids and raw_ids[-1] == self.eos_id:
+            finish_reason = "stop"
+        elif cl >= max_tokens:
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
+
+        return GeneratedChoice(
+            index=index,
+            text=trimmed_text,
+            token_ids=[int(t) for t in out_ids],
+            finish_reason=finish_reason,
+            prompt_tokens=pl,
+            completion_tokens=len(out_ids),
+        )
+
+    def _prompt_capacity(self, params: GenerationParams) -> int:
+        return max(1, self._max_batch_sequences // max(1, params.n))
+
+    def _run_generation_batch(self, batch: list[PendingGeneration]) -> None:
+        params = batch[0].params
+        prompts = [item.prompt_ids for item in batch]
+        tokens, _, prompt_lens, completion_lens = self.trainer.generate(
+            prompts=prompts,
+            num_completions=params.n,
+            max_gen_len=params.max_tokens,
+            temperature=params.temperature,
+            eos_token_id=self.eos_id,
+            use_lora=self.config.use_lora,
+            use_cuda_graphs=self.config.use_cuda_graphs,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            min_p=params.min_p,
+            prefill_chunk_size=self.config.prefill_chunk_size,
+            repetition_penalty=params.repetition_penalty,
+        )
+
+        for b_idx, item in enumerate(batch):
+            choices: list[GeneratedChoice] = []
+            for c_idx in range(params.n):
+                row_idx = b_idx * params.n + c_idx
+                choices.append(
+                    self._build_choice(
+                        tokens[row_idx],
+                        int(prompt_lens[row_idx]),
+                        int(completion_lens[row_idx]),
+                        index=c_idx,
+                        max_tokens=params.max_tokens,
+                        stop_strings=item.stop_strings,
+                    )
+                )
+            item.result = choices
+
+    def _generation_worker_loop(self) -> None:
+        while True:
+            batch: list[PendingGeneration] = []
+            with self._pending_cv:
+                while not self._pending and not self._shutdown:
+                    self._pending_cv.wait()
+                if self._shutdown:
+                    return
+
+                first = self._pending.pop(0)
+                batch.append(first)
+                prompt_cap = self._prompt_capacity(first.params)
+                deadline = time.perf_counter() + self._batch_wait_s
+
+                while len(batch) < prompt_cap:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    if not self._pending:
+                        self._pending_cv.wait(timeout=remaining)
+                        continue
+
+                    i = 0
+                    while i < len(self._pending) and len(batch) < prompt_cap:
+                        item = self._pending[i]
+                        if item.params == first.params:
+                            batch.append(self._pending.pop(i))
+                        else:
+                            i += 1
+                    if not self._pending:
+                        continue
+
+            err: Optional[Exception] = None
+            try:
+                self._run_generation_batch(batch)
+            except Exception as e:
+                err = e
+
+            for item in batch:
+                if err is not None:
+                    item.error = err
+                item.done.set()
+
     def _generate(
         self,
         prompt_ids: list[int],
@@ -211,57 +479,29 @@ class NativeServingRuntime:
         repetition_penalty: float,
         stop_strings: Sequence[str],
     ) -> list[GeneratedChoice]:
-        with self._lock:
-            tokens, _, prompt_lens, completion_lens = self.trainer.generate(
-                prompts=[prompt_ids],
-                num_completions=n,
-                max_gen_len=max_tokens,
+        pending = PendingGeneration(
+            prompt_ids=prompt_ids,
+            stop_strings=list(stop_strings),
+            params=GenerationParams(
+                n=n,
+                max_tokens=max_tokens,
                 temperature=temperature,
-                eos_token_id=self.eos_id,
-                use_lora=self.config.use_lora,
-                use_cuda_graphs=self.config.use_cuda_graphs,
                 top_k=top_k,
                 top_p=top_p,
                 min_p=min_p,
-                prefill_chunk_size=self.config.prefill_chunk_size,
                 repetition_penalty=repetition_penalty,
-            )
+            ),
+        )
+        with self._pending_cv:
+            self._pending.append(pending)
+            self._pending_cv.notify()
 
-        choices: list[GeneratedChoice] = []
-        for i in range(len(tokens)):
-            pl = int(prompt_lens[i])
-            cl = int(completion_lens[i])
-            raw_ids = [int(t) for t in tokens[i][pl : pl + cl]]
-            raw_text = self.tokenizer.decode(raw_ids, skip_special_tokens=True)
-
-            trimmed_text, stop_hit = _apply_stop(raw_text, stop_strings)
-            if stop_hit:
-                out_ids = self.tokenizer.encode(
-                    trimmed_text, add_special_tokens=False
-                )
-            else:
-                out_ids = raw_ids
-
-            if stop_hit:
-                finish_reason = "stop"
-            elif raw_ids and raw_ids[-1] == self.eos_id:
-                finish_reason = "stop"
-            elif cl >= max_tokens:
-                finish_reason = "length"
-            else:
-                finish_reason = "stop"
-
-            choices.append(
-                GeneratedChoice(
-                    index=i,
-                    text=trimmed_text,
-                    token_ids=[int(t) for t in out_ids],
-                    finish_reason=finish_reason,
-                    prompt_tokens=pl,
-                    completion_tokens=len(out_ids),
-                )
-            )
-        return choices
+        pending.done.wait()
+        if pending.error is not None:
+            raise pending.error
+        if pending.result is None:
+            raise RuntimeError("generation batcher produced no result")
+        return pending.result
 
     def generate_for_chat(self, req: ChatCompletionsRequest) -> list[GeneratedChoice]:
         if req.model and req.model not in {self.model_id, self.config.model}:
@@ -358,8 +598,15 @@ def _usage_from_choices(choices: list[GeneratedChoice]) -> dict[str, int]:
 
 
 def _chat_stream_chunks(
-    request_id: str, created: int, model_id: str, choices: list[GeneratedChoice]
+    request_id: str,
+    created: int,
+    model_id: str,
+    tokenizer: Any,
+    choices: list[GeneratedChoice],
+    include_usage: bool,
 ):
+    usage = _usage_from_choices(choices) if include_usage else None
+
     async def _gen():
         for c in choices:
             yield _sse(
@@ -377,7 +624,7 @@ def _chat_stream_chunks(
                     ],
                 }
             )
-            if c.text:
+            for piece in _token_text_chunks(tokenizer, c.token_ids):
                 yield _sse(
                     {
                         "id": request_id,
@@ -387,7 +634,7 @@ def _chat_stream_chunks(
                         "choices": [
                             {
                                 "index": c.index,
-                                "delta": {"content": c.text},
+                                "delta": {"content": piece},
                                 "finish_reason": None,
                             }
                         ],
@@ -408,17 +655,35 @@ def _chat_stream_chunks(
                     ],
                 }
             )
+        if include_usage and usage is not None:
+            yield _sse(
+                {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [],
+                    "usage": usage,
+                }
+            )
         yield b"data: [DONE]\n\n"
 
     return _gen()
 
 
 def _completion_stream_chunks(
-    request_id: str, created: int, model_id: str, choices: list[GeneratedChoice]
+    request_id: str,
+    created: int,
+    model_id: str,
+    tokenizer: Any,
+    choices: list[GeneratedChoice],
+    include_usage: bool,
 ):
+    usage = _usage_from_choices(choices) if include_usage else None
+
     async def _gen():
         for c in choices:
-            if c.text:
+            for piece in _token_text_chunks(tokenizer, c.token_ids):
                 yield _sse(
                     {
                         "id": request_id,
@@ -428,7 +693,7 @@ def _completion_stream_chunks(
                         "choices": [
                             {
                                 "index": c.index,
-                                "text": c.text,
+                                "text": piece,
                                 "finish_reason": None,
                             }
                         ],
@@ -447,6 +712,17 @@ def _completion_stream_chunks(
                             "finish_reason": c.finish_reason,
                         }
                     ],
+                }
+            )
+        if include_usage and usage is not None:
+            yield _sse(
+                {
+                    "id": request_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [],
+                    "usage": usage,
                 }
             )
         yield b"data: [DONE]\n\n"
@@ -497,8 +773,18 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e)) from e
 
         if req.stream:
+            include_usage = bool(
+                req.stream_options and req.stream_options.include_usage
+            )
             return StreamingResponse(
-                _chat_stream_chunks(request_id, created, runtime.model_id, choices),
+                _chat_stream_chunks(
+                    request_id,
+                    created,
+                    runtime.model_id,
+                    runtime.tokenizer,
+                    choices,
+                    include_usage,
+                ),
                 media_type="text/event-stream",
             )
 
@@ -534,8 +820,18 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e)) from e
 
         if req.stream:
+            include_usage = bool(
+                req.stream_options and req.stream_options.include_usage
+            )
             return StreamingResponse(
-                _completion_stream_chunks(request_id, created, runtime.model_id, choices),
+                _completion_stream_chunks(
+                    request_id,
+                    created,
+                    runtime.model_id,
+                    runtime.tokenizer,
+                    choices,
+                    include_usage,
+                ),
                 media_type="text/event-stream",
             )
 
@@ -564,4 +860,10 @@ def serve(config: ServeConfig):
     runtime = NativeServingRuntime(config)
     app = create_app(runtime)
     logger.info(f"Starting native inference server on {config.host}:{config.port}")
-    uvicorn.run(app, host=config.host, port=config.port, log_level=config.log_level)
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level=config.log_level,
+        access_log=False,
+    )

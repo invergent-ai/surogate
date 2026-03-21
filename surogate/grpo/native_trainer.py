@@ -89,13 +89,9 @@ class NativeGRPOTrainer:
         options.doc_masking = getattr(rc, "doc_masking", True)
         options.recompute = "true"
 
-        # Ensure the DeviceMemoryStack is large enough for the paged KV cache
-        # during generation. KV per token ≈ 2 * Hkv * Hs * num_layers * 2 bytes.
-        # Total sequences = problems_per_step * num_completions.
-        # We set SUROGATE_MIN_STACK_MB if not already set by the user.
-        import os
-
-        if "SUROGATE_MIN_STACK_MB" not in os.environ:
+        # Ensure the DeviceMemoryStack is large enough for paged decode and
+        # backward graph temps. Use RuntimeOptions (not process env vars).
+        if int(getattr(options, "min_stack_mb", 0)) <= 0:
             gen = config.generation
             page_block_size = 256
             total_seqs = config.problems_per_step * gen.num_completions
@@ -104,13 +100,21 @@ class NativeGRPOTrainer:
                 from surogate.core.model.hf_config import HfConfigFactory
 
                 hf_cfg = config.model_info.config
-                n_layers = HfConfigFactory.get_config_attr(hf_cfg, "num_hidden_layers")
-                n_kv_heads = HfConfigFactory.get_config_attr(hf_cfg, "num_key_value_heads")
-                head_dim = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size") // HfConfigFactory.get_config_attr(hf_cfg, "num_attention_heads")
+                n_layers = HfConfigFactory.get_config_attr(
+                    hf_cfg, "num_hidden_layers"
+                )
+                n_kv_heads = HfConfigFactory.get_config_attr(
+                    hf_cfg, "num_key_value_heads"
+                )
+                head_dim = HfConfigFactory.get_config_attr(
+                    hf_cfg, "hidden_size"
+                ) // HfConfigFactory.get_config_attr(hf_cfg, "num_attention_heads")
                 max_prompt = 100
                 max_total = max_prompt + gen.max_gen_len  # prompt + gen
                 # Contiguous upper-bound estimate (kept as fallback)
-                kv_bytes_contig = 2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
+                kv_bytes_contig = (
+                    2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
+                )
                 # Paged GRPO estimate (matches GenerationEngine::generate_grpo budgeting).
                 M = config.problems_per_step
                 N = gen.num_completions
@@ -128,11 +132,15 @@ class NativeGRPOTrainer:
                 hidden_size = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size")
                 train_bytes = hidden_size * config.sequence_len * 4 * 4 * n_layers
                 total_bytes = kv_bytes * 3.2 + train_bytes * 2.0
-                min_stack_mb = max(4096, int(total_bytes / (1024 * 1024)))
-                os.environ["SUROGATE_MIN_STACK_MB"] = str(min_stack_mb)
-                logger.info(f"Set SUROGATE_MIN_STACK_MB={min_stack_mb} for {total_seqs} sequences, seq_len={config.sequence_len}")
+                options.min_stack_mb = max(4096, int(total_bytes / (1024 * 1024)))
             except Exception:
-                os.environ["SUROGATE_MIN_STACK_MB"] = "8192"
+                options.min_stack_mb = 8192
+            logger.info(
+                "Set RuntimeOptions.min_stack_mb=%d for %d sequences, seq_len=%d",
+                int(options.min_stack_mb),
+                int(total_seqs),
+                int(config.sequence_len),
+            )
         # --- Build LoRA config ---
         # Use a clean LoRA config with just rank/alpha from the YAML.
         # SFTConfig's lora_config may have target_modules='all' which

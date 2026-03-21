@@ -826,8 +826,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     if (mModelConfig.NumExperts > 0) {
         moe_stack_slack = 2048L * 1024 * 1024;  // MoE backward temps can spike beyond simulated high-water mark
     }
-    if (const char* env = std::getenv("SUROGATE_STACK_SLACK_MB")) {
-        const long mb = std::max(0L, std::atol(env));
+    if (mOptions.StackSlackMB > 0) {
+        const long mb = std::max(0L, static_cast<long>(mOptions.StackSlackMB));
         moe_stack_slack = std::max(moe_stack_slack, mb * 1024 * 1024);
     }
     required_size += moe_stack_slack;
@@ -851,8 +851,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
             min_stack_base = std::max(min_stack_base, 1536L * 1024 * 1024);
         }
     }
-    if (const char* env = std::getenv("SUROGATE_MIN_STACK_MB")) {
-        const long mb = std::max(64L, std::atol(env));
+    if (mOptions.MinStackMB > 0) {
+        const long mb = std::max(64L, static_cast<long>(mOptions.MinStackMB));
         min_stack_base = mb * 1024 * 1024;
     }
     const long min_stack_bytes = min_stack_base + attn_fallback_bytes + moe_stack_slack;
