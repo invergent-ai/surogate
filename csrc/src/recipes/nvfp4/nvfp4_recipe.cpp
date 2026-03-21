@@ -525,21 +525,6 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     const int C_in = ctx.C_in;
     const int C_out = ctx.C_out;
 
-    // One-shot diagnostic: print key info on first call
-    static bool s_diag_printed = false;
-    if (!s_diag_printed) {
-        const bool use_cached = (ctx.cached_fp4_data != nullptr &&
-                                 ctx.cached_fp4_scales != nullptr &&
-                                 ctx.cached_fp4_amax != nullptr);
-        std::cerr << "[NVFP4 CUTLASS fwd] first call: M=" << BT << " N=" << C_out << " K=" << C_in
-                  << " cached_weight=" << use_cached
-                  << " 4o6=" << mConfig.enable_four_over_six
-                  << " layer=" << ctx.layer_idx
-                  << " op=" << static_cast<int>(ctx.op)
-                  << std::endl;
-        s_diag_printed = true;
-    }
-
     // Check if we have cached FP4 weights (eliminates weight quantization overhead)
     // The weight manager's 4/6 setting is synchronized with the recipe's config at
     // allocate_run_state(), so cached weights use the same quantization method.

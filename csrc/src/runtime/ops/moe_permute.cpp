@@ -77,18 +77,26 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                       num_tokens, top_k, num_experts, mRunState.MainStream);
 
     // Cache expert offsets on host for grouped GEMM fast path.
+    // During CUDA graph capture, host sync/copy is not capture-safe: skip and
+    // let grouped GEMM use device offsets on the captured stream.
     if (num_experts > 0) {
-        mMoEExpertOffsetsData.resize(static_cast<std::size_t>(num_experts + 1));
-        CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsData.data(),
-                                   expert_offsets.get<int>(),
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const bool is_capturing =
+            (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
+             capture_status != cudaStreamCaptureStatusNone);
+        if (!is_capturing) {
+            mMoEExpertOffsetsData.resize(static_cast<std::size_t>(num_experts + 1));
+            CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsData.data(),
+                                       expert_offsets.get<int>(),
+                                       static_cast<std::size_t>(num_experts + 1) * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
 
-        // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
-        if (layer_idx_any >= 0) {
-            mMoEHostOffsetsCache[layer_idx_any] = mMoEExpertOffsetsData;
+            // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
+            if (layer_idx_any >= 0) {
+                mMoEHostOffsetsCache[layer_idx_any] = mMoEExpertOffsetsData;
+            }
         }
     }
 

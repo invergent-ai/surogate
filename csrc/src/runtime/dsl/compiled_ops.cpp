@@ -167,6 +167,15 @@ const int* CompiledExecutor::get_or_sync_moe_host_offsets(int layer_idx,
     if (layer_idx < 0 || num_experts <= 0 || !device_offsets) {
         return nullptr;
     }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool is_capturing =
+        (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
+         capture_status != cudaStreamCaptureStatusNone);
+    if (is_capturing) {
+        // Host-side offset sync is not capture-safe; callers will fall back to
+        // device-offset paths for compact-expert handling.
+        return nullptr;
+    }
     auto it = mMoEHostOffsetsCache.find(layer_idx);
     if (it != mMoEHostOffsetsCache.end()) {
         return it->second.data();

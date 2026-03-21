@@ -71,6 +71,7 @@ public:
                              cudaStream_t stream) override;
 
     void prefetch_for_layer(int layer_idx, cudaStream_t stream) override;
+    void prepare_for_decode_graph_capture(cudaStream_t stream) override;
 
     [[nodiscard]] bool has_offloading() const override;
 

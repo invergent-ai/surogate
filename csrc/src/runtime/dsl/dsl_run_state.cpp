@@ -317,6 +317,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
         mGradQuantDtype = options.GradientType.value_or(mMatmulDtype);
     }
     mEnableFp8Forward = options.fp8_forward_enabled();
+    mEnableFp4Forward = options.fp4_forward_enabled();
     if (options.LMHeadChunks < 1) {
         throw std::runtime_error("lmhead_chunks must be >= 1");
     }

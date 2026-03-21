@@ -315,6 +315,11 @@ public:
     /// @param stream    CUDA stream for async transfers
     void prefetch_group(int group_id, cudaStream_t stream);
 
+    /// Evict all currently resident offload groups from GPU.
+    /// Used before first decode CUDA-graph capture to avoid capture-unsafe
+    /// frees of eager-allocated offload buffers.
+    void unload_all_offload_groups(cudaStream_t stream);
+
     // =========================================================================
     // Step management
     // =========================================================================

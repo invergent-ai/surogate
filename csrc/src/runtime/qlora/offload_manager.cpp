@@ -114,9 +114,8 @@ public:
         evict_if_needed(group_id, stream);
 
         // Transfer from CPU to GPU
-        allocate_gpu_buffers(group);
+        allocate_gpu_buffers(group, stream);
         transfer_to_gpu(group, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         group.state = GroupState::RESIDENT;
         mNumResident++;
@@ -136,23 +135,38 @@ public:
             return;
         }
 
+        const GroupState prev_state = group.state;
         if (group.state == GroupState::LOADING) {
             // Wait for prefetch to finish before unloading
-            if (mPrefetchStream) {
-                CUDA_CHECK(cudaStreamSynchronize(mPrefetchStream));
+            if (mPrefetchEvent) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, mPrefetchEvent, 0));
             }
         }
 
         // Transfer data back to CPU buffers
         transfer_to_cpu(group, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // Free GPU shadow buffers
-        free_gpu_buffers(group);
+        // Free GPU shadow buffers on the same stream as the D2H copies.
+        // This keeps ordering without host synchronization.
+        free_gpu_buffers(group, stream);
 
         group.state = GroupState::UNLOADED;
-        if (mNumResident > 0) {
+        if (prev_state == GroupState::RESIDENT && mNumResident > 0) {
             mNumResident--;
+        }
+    }
+
+    void unload_all(cudaStream_t stream) override {
+        std::vector<int> to_unload;
+        to_unload.reserve(mGroups.size());
+        for (const auto& [gid, group] : mGroups) {
+            if (group.state == GroupState::RESIDENT ||
+                group.state == GroupState::LOADING) {
+                to_unload.push_back(gid);
+            }
+        }
+        for (int gid : to_unload) {
+            unload_group(gid, stream);
         }
     }
 
@@ -187,7 +201,7 @@ public:
         }
 
         // Allocate GPU buffers and start async transfer on prefetch stream
-        allocate_gpu_buffers(group);
+        allocate_gpu_buffers(group, mPrefetchStream);
         transfer_to_gpu(group, mPrefetchStream);
 
         // Record event so load_group() can wait on it
@@ -355,7 +369,7 @@ private:
     }
 
     /// Allocate GPU shadow buffers for a group's tensors.
-    void allocate_gpu_buffers(Group& group) {
+    void allocate_gpu_buffers(Group& group, cudaStream_t stream) {
         for (auto& entry : group.entries) {
             if (!entry.tensor) continue;
 
@@ -367,27 +381,64 @@ private:
 
             // Allocate GPU buffers
             if (entry.cpu_data_bytes > 0) {
-                CUDA_CHECK(cudaMalloc(&entry.gpu_data, entry.cpu_data_bytes));
+                if (!entry.gpu_data) {
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&entry.gpu_data), entry.cpu_data_bytes, stream));
+                }
             }
             if (entry.cpu_scales_bytes > 0) {
-                CUDA_CHECK(cudaMalloc(&entry.gpu_scales, entry.cpu_scales_bytes));
+                if (!entry.gpu_scales) {
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&entry.gpu_scales), entry.cpu_scales_bytes, stream));
+                }
             }
             if (entry.cpu_meta_bytes > 0) {
-                CUDA_CHECK(cudaMalloc(&entry.gpu_meta, entry.cpu_meta_bytes));
+                if (!entry.gpu_meta) {
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&entry.gpu_meta), entry.cpu_meta_bytes, stream));
+                }
             }
             if (entry.cpu_meta2_bytes > 0) {
-                CUDA_CHECK(cudaMalloc(&entry.gpu_meta2, entry.cpu_meta2_bytes));
+                if (!entry.gpu_meta2) {
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&entry.gpu_meta2), entry.cpu_meta2_bytes, stream));
+                }
             }
         }
     }
 
     /// Free GPU shadow buffers for a group.
-    void free_gpu_buffers(Group& group) {
+    void free_gpu_buffers(Group& group, cudaStream_t stream = nullptr) {
+        const bool use_async_free = (stream != nullptr);
         for (auto& entry : group.entries) {
-            if (entry.gpu_data) { cudaFree(entry.gpu_data); entry.gpu_data = nullptr; }
-            if (entry.gpu_scales) { cudaFree(entry.gpu_scales); entry.gpu_scales = nullptr; }
-            if (entry.gpu_meta) { cudaFree(entry.gpu_meta); entry.gpu_meta = nullptr; }
-            if (entry.gpu_meta2) { cudaFree(entry.gpu_meta2); entry.gpu_meta2 = nullptr; }
+            if (entry.gpu_data) {
+                if (use_async_free) {
+                    CUDA_CHECK(cudaFreeAsync(entry.gpu_data, stream));
+                } else {
+                    CUDA_CHECK(cudaFree(entry.gpu_data));
+                }
+                entry.gpu_data = nullptr;
+            }
+            if (entry.gpu_scales) {
+                if (use_async_free) {
+                    CUDA_CHECK(cudaFreeAsync(entry.gpu_scales, stream));
+                } else {
+                    CUDA_CHECK(cudaFree(entry.gpu_scales));
+                }
+                entry.gpu_scales = nullptr;
+            }
+            if (entry.gpu_meta) {
+                if (use_async_free) {
+                    CUDA_CHECK(cudaFreeAsync(entry.gpu_meta, stream));
+                } else {
+                    CUDA_CHECK(cudaFree(entry.gpu_meta));
+                }
+                entry.gpu_meta = nullptr;
+            }
+            if (entry.gpu_meta2) {
+                if (use_async_free) {
+                    CUDA_CHECK(cudaFreeAsync(entry.gpu_meta2, stream));
+                } else {
+                    CUDA_CHECK(cudaFree(entry.gpu_meta2));
+                }
+                entry.gpu_meta2 = nullptr;
+            }
         }
     }
 

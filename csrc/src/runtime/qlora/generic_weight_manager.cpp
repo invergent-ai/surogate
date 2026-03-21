@@ -487,6 +487,12 @@ void GenericWeightManager::prefetch_group(int group_id, cudaStream_t stream) {
     }
 }
 
+void GenericWeightManager::unload_all_offload_groups(cudaStream_t stream) {
+    if (mOffloadManager) {
+        mOffloadManager->unload_all(stream);
+    }
+}
+
 // =============================================================================
 // Step management
 // =============================================================================

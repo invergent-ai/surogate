@@ -964,7 +964,7 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
         prime_fp8_weight_cache({});
-        prime_fp4_weight_cache({});
+        prime_fp4_weight_cache({}, /*prime_backward=*/false);
     } else if (!use_graphs && !in_capture) {
         // External/full-step CUDA graph capture paths (outside GraphExecutor) can still
         // call save_tensors() while the stream is captured. Preallocate persistent save
@@ -980,7 +980,7 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // cheap (single abs_max + per-element scale), and priming FP8 caches adds
         // ~2x model size in persistent GPU memory (FP8 + FP8 transposed), causing
         // OOM on memory-constrained GPUs with QLoRA.
-        prime_fp4_weight_cache({});
+        prime_fp4_weight_cache({}, /*prime_backward=*/false);
         mWeightCachesPrimed = true;
     }
 
@@ -1050,7 +1050,7 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
         // Same reason as forward: avoid allocating inside capture when a recipe wants cached weights.
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
-        prime_fp4_weight_cache({});
+        prime_fp4_weight_cache({}, /*prime_backward=*/true);
     }
 
     auto run_ops = [&]() {
@@ -1833,6 +1833,19 @@ void GraphExecutor::execute_prefill(long B, long T,
     };
 
     try {
+    // Generation paths do not pass through execute_forward(), so FP4/FP8
+    // caches must be primed here on first use to avoid per-op requantization.
+    const bool need_fp8_cache_prime = mRunState.has_fp8_forward() && mFP8WeightCache.empty();
+    const bool need_fp4_cache_prime = mRunState.has_fp4_forward() && mFP4WeightCache.empty();
+    if (need_fp8_cache_prime) {
+        prime_fp8_weight_cache({});
+    }
+    if (need_fp4_cache_prime) {
+        prime_fp4_weight_cache({}, /*prime_backward=*/false);
+    }
+    if (need_fp8_cache_prime || need_fp4_cache_prime) {
+        mWeightCachesPrimed = true;
+    }
 
     // Copy token IDs and position IDs to device
     CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_cpu, token_bytes,
@@ -1973,22 +1986,23 @@ void GraphExecutor::execute_decode_step(long B,
     mCompiledExecutor->set_save_list(&empty_save_list);
 
     if (use_cuda_graph) {
-        // Invalidate cached graph if batch size changed
-        if (mDecodeGraphExec && mDecodeGraphB != B) {
-            CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
-            mDecodeGraphExec = nullptr;
+        const bool offload_decode = mOptions.OffloadExperts || mOptions.OffloadMaster;
+        if (offload_decode) {
+            // Offload decode currently performs stream-ordered residency updates
+            // that make graph replay non-deterministic across token steps.
+            // Capture and launch a fresh decode graph per step, then destroy it.
+            if (mDecodeGraphExec) {
+                CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
+                mDecodeGraphExec = nullptr;
+            }
             mDecodeGraphB = 0;
             mDecodeGraphPrimed = false;
-        }
 
-        if (!mDecodeGraphExec && !mDecodeGraphPrimed) {
-            // Warm-up eager decode once before graph capture so capture-unsafe
-            // lazy allocations (e.g. recurrent state cudaMalloc) happen outside
-            // stream capture.
-            mCompiledExecutor->execute_forward(
-                *mDecodeCompiledForward, comm, /*full=*/false, hook);
-            mDecodeGraphPrimed = true;
-        } else {
+            if (auto* provider = mWeights.qlora_provider()) {
+                provider->prepare_for_decode_graph_capture(rs.MainStream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+
             trace_or_execute_cuda_graph_with_stack(
                 [&]() {
                     mCompiledExecutor->execute_forward(
@@ -1999,7 +2013,41 @@ void GraphExecutor::execute_decode_step(long B,
                 /*enabled=*/true,
                 rs.Stack,
                 mDecodeGraphCheckpoint);
-            mDecodeGraphB = B;
+            if (mDecodeGraphExec) {
+                CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
+                mDecodeGraphExec = nullptr;
+            }
+            mDecodeGraphB = 0;
+            mDecodeGraphPrimed = false;
+        } else {
+            // Invalidate cached graph if batch size changed.
+            if (mDecodeGraphExec && mDecodeGraphB != B) {
+                CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
+                mDecodeGraphExec = nullptr;
+                mDecodeGraphB = 0;
+                mDecodeGraphPrimed = false;
+            }
+
+            if (!mDecodeGraphExec && !mDecodeGraphPrimed) {
+                // Warm-up eager decode once before graph capture so capture-unsafe
+                // lazy allocations (e.g. recurrent state cudaMalloc) happen outside
+                // stream capture.
+                mCompiledExecutor->execute_forward(
+                    *mDecodeCompiledForward, comm, /*full=*/false, hook);
+                mDecodeGraphPrimed = true;
+            } else {
+                trace_or_execute_cuda_graph_with_stack(
+                    [&]() {
+                        mCompiledExecutor->execute_forward(
+                            *mDecodeCompiledForward, comm, /*full=*/false, hook);
+                    },
+                    rs.MainStream,
+                    mDecodeGraphExec,
+                    /*enabled=*/true,
+                    rs.Stack,
+                    mDecodeGraphCheckpoint);
+                mDecodeGraphB = B;
+            }
         }
     } else {
         mCompiledExecutor->execute_forward(

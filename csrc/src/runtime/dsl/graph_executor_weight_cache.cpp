@@ -282,7 +282,7 @@ const Tensor* GraphExecutor::get_fp8_cached_weight_transposed(const std::string&
 // FP4 Weight Caching (for NVFP4 recipe on Blackwell+)
 // ============================================================================
 
-void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
+void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required, bool prime_backward) {
     if (!mOptions.TrainingRecipe || !mOptions.fp4_enabled()) {
         return;
     }
@@ -291,6 +291,13 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
     }
 
     int primed_fwd = 0, skipped_fwd = 0, failed_fwd = 0;
+    bool stop_fwd_on_oom = false;
+    auto is_cuda_oom_error = [](const std::exception& ex) {
+        const std::string msg = ex.what();
+        return msg.find("Cuda OOM") != std::string::npos ||
+               msg.find("cudaErrorMemoryAllocation") != std::string::npos ||
+               msg.find("out of memory") != std::string::npos;
+    };
 
     // Pre-quantize static weights for all matmul operations that allow FP4 (forward pass)
     for (std::size_t i = 0; i < mForward->operations.size(); ++i) {
@@ -315,12 +322,33 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
         // Check if this layer allows FP4 quantization
         int layer_idx = -1;
         auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
-        if (!op_kind.has_value() || !allow_quant_layer(mOptions, mConfig, layer_idx)) {
+        // Some architectures use shared-weight names (e.g. qkv_shared) that
+        // do not encode a block index. For those, prime caches unconditionally.
+        if (op_kind.has_value() && !allow_quant_layer(mOptions, mConfig, layer_idx)) {
             continue;
         }
 
+        if (stop_fwd_on_oom) {
+            skipped_fwd++;
+            continue;
+        }
         Tensor& weight = mWeights.get(weight_name);
-        auto* entry = get_fp4_cached_weight(weight_name, weight, mRunState.MainStream);
+        const FP4WeightCacheEntry* entry = nullptr;
+        try {
+            entry = get_fp4_cached_weight(weight_name, weight, mRunState.MainStream);
+        } catch (const std::exception& ex) {
+            failed_fwd++;
+            if (is_cuda_oom_error(ex)) {
+                stop_fwd_on_oom = true;
+                std::cerr << "[FP4 cache] OOM while priming forward cache at weight "
+                          << weight_name << " — continuing without additional FP4 cache entries."
+                          << std::endl;
+            } else {
+                std::cerr << "[FP4 cache] FAILED to prime forward weight: " << weight_name
+                          << " (" << ex.what() << ")" << std::endl;
+            }
+            continue;
+        }
         if (entry) {
             primed_fwd++;
         } else {
@@ -334,9 +362,10 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
     }
 
     int primed_bwd = 0, failed_bwd = 0;
+    bool stop_bwd_on_oom = false;
 
     // Also prime transposed FP4 cache for backward pass (matmul_backward dgrad)
-    if (mBackward) {
+    if (prime_backward && mBackward) {
         for (const auto& op : mBackward->operations) {
             const std::string& op_type =
                 (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
@@ -356,12 +385,30 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
             // Check if this layer allows FP4 quantization
             int layer_idx = -1;
             auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
-            if (!op_kind.has_value() || !allow_quant_layer(mOptions, mConfig, layer_idx)) {
+            if (op_kind.has_value() && !allow_quant_layer(mOptions, mConfig, layer_idx)) {
                 continue;
             }
 
+            if (stop_bwd_on_oom) {
+                continue;
+            }
             Tensor& weight = mWeights.get(weight_name);
-            auto* entry = get_fp4_cached_weight_transposed(weight_name, weight, mRunState.MainStream);
+            const FP4WeightCacheEntry* entry = nullptr;
+            try {
+                entry = get_fp4_cached_weight_transposed(weight_name, weight, mRunState.MainStream);
+            } catch (const std::exception& ex) {
+                failed_bwd++;
+                if (is_cuda_oom_error(ex)) {
+                    stop_bwd_on_oom = true;
+                    std::cerr << "[FP4 cache] OOM while priming backward cache at weight "
+                              << weight_name << " — continuing without additional FP4T entries."
+                              << std::endl;
+                } else {
+                    std::cerr << "[FP4 cache] FAILED to prime backward weight: " << weight_name
+                              << " (" << ex.what() << ")" << std::endl;
+                }
+                continue;
+            }
             if (entry) {
                 primed_bwd++;
             } else {
@@ -373,11 +420,6 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
             }
         }
     }
-
-    std::cerr << "[FP4 cache] Primed: " << primed_fwd << " fwd + " << primed_bwd << " bwd"
-              << " | Failed: " << failed_fwd << " fwd + " << failed_bwd << " bwd"
-              << " | Cache sizes: fwd=" << mFP4WeightCache.size()
-              << " bwd=" << mFP4WeightCacheT.size() << std::endl;
 }
 
 const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
@@ -435,18 +477,25 @@ const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
                         return nullptr;
                     }
 
-                    // Allocate cache entry if needed
+                    // Allocate cache entry if needed.
+                    // For pre-quantized QLoRA FP4 weights, reuse (alias) provider
+                    // storage directly instead of duplicating packed data/scales.
+                    // This avoids multi-GB cache replication on large models.
                     if (it == mFP4WeightCache.end()) {
                         FP4WeightCacheEntry entry{};
-                        entry.data = mRunState.Allocator->allocate(ETensorDType::BYTE,
-                            ("fp4_cache_" + name + "_data").c_str(),
-                            EAllocationType::ON_DEVICE,
-                            {static_cast<long>(N), static_cast<long>(K / 2)});
-                        const std::size_t ss = compute_nvfp4_cutlass_scale_size(N, K);
-                        entry.scales = mRunState.Allocator->allocate(ETensorDType::BYTE,
-                            ("fp4_cache_" + name + "_scales").c_str(),
-                            EAllocationType::ON_DEVICE,
-                            {static_cast<long>(ss)});
+                        // CUTLASS FP4 kernels consume both packed data and scales as raw bytes.
+                        // QLoRA prequant stores scales as FP8_E4M3; create a byte-view alias
+                        // to avoid dtype guard trips in Tensor::get<uint8_t>().
+                        entry.data = Tensor::from_pointer(
+                            qt->data.Data,
+                            qt->data.Device,
+                            ETensorDType::BYTE,
+                            std::vector<long>{static_cast<long>(qt->data.bytes())});
+                        entry.scales = Tensor::from_pointer(
+                            qt->scales.Data,
+                            qt->scales.Device,
+                            ETensorDType::BYTE,
+                            std::vector<long>{static_cast<long>(qt->scales.bytes())});
                         entry.amax = mRunState.Allocator->allocate(ETensorDType::FP32,
                             ("fp4_cache_" + name + "_amax").c_str(),
                             EAllocationType::ON_DEVICE,
@@ -454,18 +503,6 @@ const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
                         auto [ins_it, _] = mFP4WeightCache.emplace(name, std::move(entry));
                         it = ins_it;
                     }
-
-                    // Copy packed FP4 data directly (identical byte layout)
-                    const size_t data_bytes = static_cast<size_t>(N) * (K / 2);
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        it->second.data.Data, qt->data.Data,
-                        data_bytes, cudaMemcpyDeviceToDevice, stream));
-
-                    // Copy FP8 scales directly (F8_128x4 == CUTLASS Sm1xxBlkScaled layout)
-                    const std::size_t scale_bytes = compute_nvfp4_cutlass_scale_size(N, K);
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        it->second.scales.Data, qt->scales.Data,
-                        scale_bytes, cudaMemcpyDeviceToDevice, stream));
 
                     // Convert global_scale to amax: amax = global_scale * FP8_MAX * FP4_MAX
                     constexpr float kFP8Max = 448.0f;

@@ -120,6 +120,12 @@ public:
     /// @param stream    CUDA stream for async transfers
     virtual void unload_group(int group_id, cudaStream_t stream) = 0;
 
+    /// Unload all resident/loading groups from GPU back to CPU.
+    ///
+    /// Useful before CUDA-graph capture to avoid mixing eager-allocated and
+    /// capture-allocated group buffers in the same offload lifecycle.
+    virtual void unload_all(cudaStream_t stream) = 0;
+
     /// Prefetch a group to GPU for future use.
     ///
     /// Initiates an async load on a secondary stream. The next call to

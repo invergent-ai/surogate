@@ -243,6 +243,13 @@ void GenericQLoRAProvider::prefetch_for_layer(int layer_idx, cudaStream_t stream
     }
 }
 
+void GenericQLoRAProvider::prepare_for_decode_graph_capture(cudaStream_t stream) {
+    if (!mWeightMgr || !mHasOffloading) {
+        return;
+    }
+    mWeightMgr->unload_all_offload_groups(stream);
+}
+
 bool GenericQLoRAProvider::has_offloading() const {
     return mHasOffloading;
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import math
 import os
@@ -110,6 +111,12 @@ class ActiveGeneration:
     finish_reason: str = "stop"
 
 
+class ContextLengthExceededError(ValueError):
+    def __init__(self, message: str, *, param: str):
+        super().__init__(message)
+        self.param = param
+
+
 def _normalize_stop(stop: Optional[str | list[str]]) -> list[str]:
     if stop is None:
         return []
@@ -135,6 +142,20 @@ def _sse(data: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def _openai_context_length_error(message: str, param: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": "context_length_exceeded",
+            }
+        },
+    )
+
+
 def _token_text_chunks(tokenizer: Any, token_ids: Sequence[int]) -> list[str]:
     chunks: list[str] = []
     for tok in token_ids:
@@ -150,7 +171,10 @@ class NativeServingRuntime:
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
-        qlora_config = self._resolve_prequant_qlora_config(model_dir)
+        qlora_config, prequant_method, is_moe_model = self._resolve_prequant_qlora_config(
+            model_dir
+        )
+        self._is_moe_model = bool(is_moe_model)
         logger.info(f"Loading tokenizer for {model_dir}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, trust_remote_code=config.trust_remote_code
@@ -160,20 +184,77 @@ class NativeServingRuntime:
         logger.info(f"Building DSL IR for {model_dir}")
         ir_json = build_dsl_ir_for_model(model_dir)
         jit_manifests = compile_jit_kernels(ir_json)
-        effective_seq_len = self._resolve_effective_sequence_len(config)
+        requested_batch_size = max(1, int(config.batch_size))
+        requested_seq_len = self._resolve_effective_sequence_len(config)
 
-        options = _surogate.RuntimeOptions()
+        # Prequant NVFP4 on Blackwell is most stable/fast with cuDNN FP4 backend.
+        # Allow override via env for A/B testing.
+        serve_fp4_backend: Optional[str] = None
+        if prequant_method == "prequant_nvfp4":
+            fp4_backend = os.getenv("SUROGATE_SERVE_FP4_BACKEND", "cudnn").strip().lower()
+            if fp4_backend not in {"cudnn", "cutlass"}:
+                fp4_backend = "cudnn"
+            serve_fp4_backend = fp4_backend
+            options = _surogate.RuntimeOptions(
+                fp4_backend=fp4_backend,
+                fp4_enable_four_over_six=False,
+            )
+        else:
+            options = _surogate.RuntimeOptions()
         options.dsl_ir_json = ir_json
         if jit_manifests:
             options.jit_kernel_manifests = jit_manifests
+        prequant_recipe_env = os.getenv("SUROGATE_SERVE_PREQUANT_RECIPE", "").strip()
+        if prequant_recipe_env:
+            prequant_recipe_enabled = prequant_recipe_env != "0"
+            prequant_recipe_auto = False
+        else:
+            prequant_recipe_enabled = True
+            prequant_recipe_auto = True
+            # Default to BF16 runtime for prequant serving.
+            # Enable quant runtime recipe only via explicit override:
+            #   SUROGATE_SERVE_PREQUANT_RECIPE=1
+            if prequant_method in {"prequant_nvfp4", "prequant_fp8"}:
+                prequant_recipe_enabled = False
+        if prequant_recipe_enabled:
+            if prequant_method == "prequant_nvfp4":
+                options.set_recipe("nvfp4")
+                logger.info(
+                    "Serve runtime recipe set to nvfp4 for prequant NVFP4 model (fp4_backend=%s, four_over_six=false).",
+                    serve_fp4_backend or "cudnn",
+                )
+            elif prequant_method == "prequant_fp8":
+                options.set_recipe("fp8-hybrid")
+                logger.info("Serve runtime recipe set to fp8-hybrid for prequant FP8 model.")
+        elif prequant_method is not None:
+            if prequant_recipe_auto:
+                logger.info(
+                    "Serve runtime recipe disabled for prequant model (prequant_method=%s). "
+                    "Set SUROGATE_SERVE_PREQUANT_RECIPE=1 to force quant recipe.",
+                    prequant_method,
+                )
+            else:
+                logger.info(
+                    "Prequant recipe override disabled by SUROGATE_SERVE_PREQUANT_RECIPE=0; using bf16 recipe."
+                )
         options.use_cuda_graphs = bool(config.use_cuda_graphs)
         options.doc_masking = True
         options.recompute = "true"
+        if hasattr(options, "selective_expert_dequant"):
+            options.selective_expert_dequant = True
+        self._offload_experts = bool(config.offload_experts)
+        if hasattr(options, "offload_experts"):
+            options.offload_experts = self._offload_experts
+        elif self._offload_experts:
+            logger.warning(
+                "offload_experts requested, but runtime binding does not expose this option."
+            )
         # Serve uses generate-only paths. Keep training-specific buffers lightweight.
         options.offload_grads = True
         options.lmhead_chunks = self._resolve_lmhead_chunks(
             config,
-            effective_seq_len=effective_seq_len,
+            effective_seq_len=requested_seq_len,
+            batch_size=requested_batch_size,
         )
         options.min_stack_mb = self._resolve_min_stack_mb(config)
         logger.info(
@@ -184,21 +265,38 @@ class NativeServingRuntime:
             float(config.gpu_memory_utilization),
         )
 
-        self.trainer = _surogate.SurogateTrainer(
-            ngpu=config.gpus,
-            config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
-            options=options,
-            batch_size=config.batch_size,
-            seq_len=effective_seq_len,
-            grad_accum=1,
-            memcpy_all_gather=True,
-            memcpy_send_recv=True,
-            qlora_config=qlora_config,
-        )
-
         model_weights_path = get_model_weights_path(model_dir)
-        logger.info(f"Importing weights from {model_weights_path}")
-        self.trainer.import_weights(model_weights_path)
+        (
+            self._runtime_batch_size,
+            self._runtime_seq_len,
+            self.trainer,
+        ) = self._build_trainer_with_oom_retries(
+            model_dir=model_dir,
+            config=config,
+            options=options,
+            qlora_config=qlora_config,
+            model_weights_path=model_weights_path,
+            initial_batch_size=requested_batch_size,
+            initial_seq_len=requested_seq_len,
+        )
+        if (
+            self._runtime_batch_size != requested_batch_size
+            or self._runtime_seq_len != requested_seq_len
+        ):
+            logger.warning(
+                "Serve startup auto-sized capacity from batch_size=%d seq_len=%d to "
+                "batch_size=%d seq_len=%d after CUDA OOM retries.",
+                requested_batch_size,
+                requested_seq_len,
+                self._runtime_batch_size,
+                self._runtime_seq_len,
+            )
+        else:
+            logger.info(
+                "Serve startup capacity: batch_size=%d seq_len=%d",
+                self._runtime_batch_size,
+                self._runtime_seq_len,
+            )
         self._pending_lock = threading.Lock()
         self._pending_cv = threading.Condition(self._pending_lock)
         self._pending: list[PendingGeneration] = []
@@ -216,8 +314,23 @@ class NativeServingRuntime:
             self._continuous_step_tokens,
             int(os.getenv("SUROGATE_SERVE_CONTINUOUS_IDLE_STEP_TOKENS", "256")),
         )
-        # Trainer capacity is bounded by config.batch_size (total decode sequences B).
-        configured_cap = max(1, int(config.batch_size))
+        if self._is_moe_model:
+            default_moe_cap = "64" if self._offload_experts else "32"
+            moe_step_cap = max(
+                1,
+                int(os.getenv("SUROGATE_SERVE_MOE_MAX_STEP_TOKENS", default_moe_cap)),
+            )
+            self._continuous_step_tokens = min(self._continuous_step_tokens, moe_step_cap)
+            self._continuous_idle_step_tokens = min(
+                self._continuous_idle_step_tokens, moe_step_cap
+            )
+            logger.info(
+                "Applied MoE decode-step cap=%d tokens (offload_experts=%s).",
+                moe_step_cap,
+                bool(self._offload_experts),
+            )
+        # Trainer capacity is bounded by loaded runtime batch size (total decode sequences B).
+        configured_cap = max(1, int(self._runtime_batch_size))
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
         self._max_batch_sequences = max(1, min(configured_cap, env_cap))
         if self._max_batch_sequences <= 1:
@@ -237,6 +350,128 @@ class NativeServingRuntime:
             int(self._continuous_step_tokens),
             int(self._continuous_idle_step_tokens),
         )
+
+    @staticmethod
+    def _is_cuda_oom_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return (
+            "cuda oom" in msg
+            or "out of memory" in msg
+            or "cuda_error_out_of_memory" in msg
+        )
+
+    @staticmethod
+    def _clear_cuda_allocator() -> None:
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _next_capacity_after_oom(
+        *,
+        batch_size: int,
+        seq_len: int,
+        min_seq_len: int,
+    ) -> Optional[tuple[int, int]]:
+        # First preserve completion headroom (>= max_gen_len) while shrinking seq.
+        safe_min_seq = max(128, int(min_seq_len))
+        if seq_len > safe_min_seq:
+            next_seq = max(safe_min_seq, seq_len // 2)
+            if next_seq < seq_len:
+                return batch_size, next_seq
+
+        # Then shrink parallel decode width.
+        if batch_size > 1:
+            next_batch = max(1, batch_size // 2)
+            if next_batch < batch_size:
+                return next_batch, seq_len
+
+        # Last-resort shrink below max_gen_len to allow startup on constrained VRAM.
+        if seq_len > 128:
+            next_seq = max(128, seq_len // 2)
+            if next_seq < seq_len:
+                return batch_size, next_seq
+        return None
+
+    def _build_trainer_with_oom_retries(
+        self,
+        *,
+        model_dir: str,
+        config: ServeConfig,
+        options: Any,
+        qlora_config: Any,
+        model_weights_path: str,
+        initial_batch_size: int,
+        initial_seq_len: int,
+    ) -> tuple[int, int, Any]:
+        batch_size = max(1, int(initial_batch_size))
+        seq_len = max(1, int(initial_seq_len))
+        min_seq_len = max(128, int(config.max_gen_len))
+        attempt = 0
+
+        while True:
+            options.lmhead_chunks = self._resolve_lmhead_chunks(
+                config,
+                effective_seq_len=seq_len,
+                batch_size=batch_size,
+            )
+            logger.info(
+                "Serve runtime init attempt %d with batch_size=%d seq_len=%d lmhead_chunks=%d",
+                attempt + 1,
+                batch_size,
+                seq_len,
+                int(options.lmhead_chunks),
+            )
+            trainer = None
+            try:
+                trainer = _surogate.SurogateTrainer(
+                    ngpu=config.gpus,
+                    config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
+                    options=options,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    grad_accum=1,
+                    memcpy_all_gather=True,
+                    memcpy_send_recv=True,
+                    qlora_config=qlora_config,
+                )
+                logger.info(f"Importing weights from {model_weights_path}")
+                trainer.import_weights(model_weights_path)
+                return batch_size, seq_len, trainer
+            except RuntimeError as exc:
+                if trainer is not None:
+                    del trainer
+                if not self._is_cuda_oom_error(exc):
+                    raise
+
+                next_capacity = self._next_capacity_after_oom(
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    min_seq_len=min_seq_len,
+                )
+                if next_capacity is None:
+                    raise RuntimeError(
+                        "Serve startup failed due to CUDA OOM even after capacity "
+                        f"reductions (batch_size={batch_size}, seq_len={seq_len}). "
+                        "Reduce --batch_size/--sequence_len or lower --gpu-memory-utilization."
+                    ) from exc
+                next_batch, next_seq = next_capacity
+                logger.warning(
+                    "Serve startup OOM at batch_size=%d seq_len=%d. Retrying with "
+                    "batch_size=%d seq_len=%d.",
+                    batch_size,
+                    seq_len,
+                    next_batch,
+                    next_seq,
+                )
+                self._clear_cuda_allocator()
+                batch_size, seq_len = next_batch, next_seq
+                attempt += 1
 
     @staticmethod
     def _resolve_min_stack_mb(config: ServeConfig) -> int:
@@ -294,7 +529,7 @@ class NativeServingRuntime:
             elif quant_method == "prequant_mxfp4":
                 qlora = _surogate.QLoRAConfig.prequant_mxfp4()
             else:
-                return None
+                return None, None, bool(model_info.is_moe_model)
 
             if modules_to_not_convert:
                 qlora.modules_to_not_convert = list(modules_to_not_convert)
@@ -302,20 +537,21 @@ class NativeServingRuntime:
                 "Detected pre-quantized model (%s); enabling prequant serve loading path.",
                 quant_method,
             )
-            return qlora
+            return qlora, quant_method, bool(model_info.is_moe_model)
         except Exception as exc:
             logger.warning(
                 "Prequant auto-detection failed for %s (%s). Proceeding without prequant config.",
                 model_dir,
                 exc,
             )
-            return None
+            return None, None, False
 
     @staticmethod
     def _resolve_lmhead_chunks(
         config: ServeConfig,
         *,
         effective_seq_len: int,
+        batch_size: Optional[int] = None,
     ) -> int:
         # Training runtime persists an output buffer shaped [B*T/lmhead_chunks, V].
         # Keep per-chunk token count small for inference startup memory stability.
@@ -323,7 +559,8 @@ class NativeServingRuntime:
             128,
             int(os.getenv("SUROGATE_SERVE_LMHEAD_TOKENS_PER_CHUNK", "1024")),
         )
-        total_tokens = max(1, int(config.batch_size) * int(effective_seq_len))
+        bsz = max(1, int(config.batch_size if batch_size is None else batch_size))
+        total_tokens = max(1, bsz * int(effective_seq_len))
         chunks = max(1, math.ceil(total_tokens / tokens_per_chunk))
         return int(chunks)
 
@@ -447,6 +684,30 @@ class NativeServingRuntime:
     def _prompt_capacity(self, params: GenerationParams) -> int:
         return max(1, self._max_batch_sequences // max(1, params.n))
 
+    def _fit_prompt_and_max_tokens(
+        self,
+        prompt_ids: list[int],
+        max_tokens: int,
+        *,
+        param_name: str,
+    ) -> tuple[list[int], int]:
+        runtime_seq_len = max(2, int(self._runtime_seq_len))
+        out_prompt = [int(t) for t in prompt_ids]
+        requested_max_tokens = max(1, int(max_tokens))
+        prompt_tokens = len(out_prompt)
+        total = prompt_tokens + requested_max_tokens
+        if total > runtime_seq_len:
+            raise ContextLengthExceededError(
+                (
+                    f"This model's maximum context length is {runtime_seq_len} tokens, "
+                    f"but you requested {total} tokens "
+                    f"({prompt_tokens} in the prompt; {requested_max_tokens} for the completion). "
+                    "Please reduce the prompt or max_tokens."
+                ),
+                param=param_name,
+            )
+        return out_prompt, requested_max_tokens
+
     def _run_generation_batch(self, batch: list[PendingGeneration]) -> None:
         params = batch[0].params
         prompts = [item.prompt_ids for item in batch]
@@ -544,6 +805,30 @@ class NativeServingRuntime:
                     item.generated_ids = item.generated_ids[: params.max_tokens]
                 item.finished = True
                 item.finish_reason = "length"
+
+    def _run_continuous_step_with_oom_backoff(
+        self,
+        active: list[ActiveGeneration],
+        params: GenerationParams,
+        *,
+        step_tokens: int,
+    ) -> None:
+        cur_step_tokens = max(1, int(step_tokens))
+        while True:
+            try:
+                self._run_continuous_step(active, params, step_tokens=cur_step_tokens)
+                return
+            except RuntimeError as exc:
+                if (not self._is_cuda_oom_error(exc)) or cur_step_tokens <= 1:
+                    raise
+                next_step_tokens = max(1, cur_step_tokens // 2)
+                logger.warning(
+                    "Continuous decode OOM at step_tokens=%d; retrying with step_tokens=%d.",
+                    cur_step_tokens,
+                    next_step_tokens,
+                )
+                self._clear_cuda_allocator()
+                cur_step_tokens = next_step_tokens
 
     def _finalize_continuous_request(self, item: ActiveGeneration) -> None:
         raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
@@ -671,7 +956,9 @@ class NativeServingRuntime:
 
                 err: Optional[Exception] = None
                 try:
-                    self._run_continuous_step(active, params, step_tokens=step_tokens)
+                    self._run_continuous_step_with_oom_backoff(
+                        active, params, step_tokens=step_tokens
+                    )
                 except Exception as e:
                     err = e
 
@@ -757,11 +1044,14 @@ class NativeServingRuntime:
             if req.repetition_penalty is not None
             else self.config.repetition_penalty
         )
+        prompt_ids, max_tokens = self._fit_prompt_and_max_tokens(
+            prompt_ids, max(1, max_tokens), param_name="messages"
+        )
 
         return self._generate(
             prompt_ids,
             n=req.n,
-            max_tokens=max(1, max_tokens),
+            max_tokens=max_tokens,
             temperature=temperature,
             top_k=max(0, top_k),
             top_p=top_p,
@@ -800,11 +1090,14 @@ class NativeServingRuntime:
             if req.repetition_penalty is not None
             else self.config.repetition_penalty
         )
+        prompt_ids, max_tokens = self._fit_prompt_and_max_tokens(
+            prompt_ids, max(1, max_tokens), param_name="prompt"
+        )
 
         return self._generate(
             prompt_ids,
             n=req.n,
-            max_tokens=max(1, max_tokens),
+            max_tokens=max_tokens,
             temperature=temperature,
             top_k=max(0, top_k),
             top_p=top_p,
@@ -993,6 +1286,8 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
         created = int(time.time())
         try:
             choices = await asyncio.to_thread(runtime.generate_for_chat, req)
+        except ContextLengthExceededError as e:
+            return _openai_context_length_error(str(e), e.param)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:
@@ -1040,6 +1335,8 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
         created = int(time.time())
         try:
             choices = await asyncio.to_thread(runtime.generate_for_completion, req)
+        except ContextLengthExceededError as e:
+            return _openai_context_length_error(str(e), e.param)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:

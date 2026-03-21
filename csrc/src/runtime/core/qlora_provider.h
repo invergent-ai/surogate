@@ -75,6 +75,14 @@ public:
         (void)stream;
     }
 
+    /// Prepare provider state before first decode CUDA-graph capture.
+    ///
+    /// Offload implementations may need to evict resident groups allocated by
+    /// eager prefill so decode capture records a consistent alloc/free lifetime.
+    virtual void prepare_for_decode_graph_capture(cudaStream_t stream) {
+        (void)stream;
+    }
+
     /// Returns true if this provider uses weight offloading (CPU↔GPU).
     /// Used by the graph executor to enable prefetch scheduling.
     [[nodiscard]] virtual bool has_offloading() const { return false; }

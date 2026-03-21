@@ -6,34 +6,62 @@ from surogate.utils.dict import DictDefault
 
 @dataclass
 class ServeConfig:
-    """Configuration for native OpenAI-compatible inference serving."""
+    """Configuration for native OpenAI-compatible inference serving.
+
+    Parameters are grouped by purpose (server, runtime, generation defaults).
+    Values can come from YAML config and/or CLI overrides.
+    """
 
     # Server
+    # Bind address for the HTTP server.
     host: str = "0.0.0.0"
+    # TCP port used by the HTTP server.
     port: int = 8000
+    # Uvicorn/server logging verbosity (for example: "debug", "info", "warning").
     log_level: str = "info"
+    # Optional bearer token required by the API when set.
     api_key: Optional[str] = None
 
     # Model / runtime
+    # Model identifier or local model path (required).
     model: Optional[str] = None
+    # Optional public model id returned in API responses; defaults to `model` when unset.
     model_id: Optional[str] = None
+    # Runtime compute dtype.
     dtype: Literal["bf16", "fp32"] = "bf16"
+    # Number of GPUs to initialize for the runtime.
     gpus: int = 1
+    # Maximum runtime batch capacity used by serving scheduler/generation.
     batch_size: int = 8
+    # Runtime sequence length cap used to size model buffers.
     sequence_len: int = 4096
+    # Whether Hugging Face remote code is trusted during model/tokenizer load.
     trust_remote_code: bool = True
+    # Optional explicit floor for runtime stack arena size in MiB.
     min_stack_mb: Optional[int] = None
+    # Target fraction of GPU memory budgeted for serving allocations.
     gpu_memory_utilization: float = 0.9
+    # Enable MoE expert offloading (CPU/GPU streaming) when model/runtime supports it.
+    offload_experts: bool = False
 
     # Generation defaults
+    # Default maximum number of generated tokens per request (unless overridden by request).
     max_gen_len: int = 512
+    # Default sampling temperature.
     temperature: float = 1.0
+    # Default top-k sampling cutoff (0 means disabled).
     top_k: int = 0
+    # Default nucleus sampling probability (top-p).
     top_p: float = 1.0
+    # Default minimum probability sampling floor.
     min_p: float = 0.0
+    # Default repetition penalty (> 0).
     repetition_penalty: float = 1.0
+    # Enable LoRA adapter path for serving when available.
     use_lora: bool = False
+    # Enable CUDA graph execution in inference path.
     use_cuda_graphs: bool = True
+    # Prefill chunk size for long-prompt chunked prefill (0 disables chunking).
     prefill_chunk_size: int = 256
 
     def __init__(self, cfg: DictDefault):
@@ -56,6 +84,7 @@ class ServeConfig:
         self.gpu_memory_utilization = float(
             cfg.get("gpu_memory_utilization", self.gpu_memory_utilization)
         )
+        self.offload_experts = bool(cfg.get("offload_experts", self.offload_experts))
 
         self.max_gen_len = int(cfg.get("max_gen_len", self.max_gen_len))
         self.temperature = float(cfg.get("temperature", self.temperature))

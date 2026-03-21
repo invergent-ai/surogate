@@ -149,8 +149,8 @@ public:
         return mEnableFp8Forward && mGradQuantDtype == ETensorDType::FP8_E5M2;
     }
     [[nodiscard]] bool has_fp8_delayed_scaling() const override { return mFP8ScalingState != nullptr; }
-    [[nodiscard]] bool has_fp4_forward() const override { return false; }
-    [[nodiscard]] bool has_fp4_backward() const override { return false; }
+    [[nodiscard]] bool has_fp4_forward() const override { return mEnableFp4Forward; }
+    [[nodiscard]] bool has_fp4_backward() const override { return mEnableFp4Forward; }
     [[nodiscard]] Tensor* get_fp8_forward_buffer(int op) override;
     [[nodiscard]] Tensor* get_gradient_quant_buffer(int op) override;
     [[nodiscard]] modules::FP8ScalingState* get_fp8_scaling_state() override { return mFP8ScalingState.get(); }
@@ -193,6 +193,7 @@ private:
     ETensorDType mMatmulDtype = ETensorDType::BF16;
     ETensorDType mGradQuantDtype = ETensorDType::BF16;
     bool mEnableFp8Forward = false;
+    bool mEnableFp4Forward = false;
     bool mOffloadResiduals = false;
     int mLMHeadChunks = 1;
     int mAttnBwdChunks = 1;

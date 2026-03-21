@@ -102,7 +102,15 @@ inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStre
     function();
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
 
+    // Decode/offload captures may include stream-ordered allocation nodes
+    // (cudaMallocAsync). Enable auto-free-on-launch so relaunch remains valid
+    // even when some allocations are still live at graph end.
+#if defined(cudaGraphInstantiateFlagAutoFreeOnLaunch)
+    CUDA_CHECK(cudaGraphInstantiateWithFlags(
+        &instance, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch));
+#else
     CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
+#endif
 
     CUDA_CHECK(cudaGraphDestroy(graph));
     CUDA_CHECK(cudaGraphLaunch(instance, stream));

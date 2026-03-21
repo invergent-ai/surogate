@@ -357,7 +357,7 @@ private:
     const Tensor* get_fp8_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
 
     // FP4 weight cache helpers (for NVFP4 recipe on Blackwell+)
-    void prime_fp4_weight_cache(const std::vector<char>& required);
+    void prime_fp4_weight_cache(const std::vector<char>& required, bool prime_backward = true);
     const FP4WeightCacheEntry* get_fp4_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
     const FP4WeightCacheEntry* get_fp4_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
 
