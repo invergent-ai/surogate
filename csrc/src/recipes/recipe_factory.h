@@ -27,6 +27,7 @@ struct RecipeConfig {
 
     // FP4 options (for nvfp4)
     bool fp4_disable_2d_quantization = false;
+    bool fp4_enable_four_over_six = true;
     int skip_quant_first_layers = 0;  ///< Skip quantization for first N layers (embedding layers)
     int skip_quant_last_layers = 0;   ///< Skip quantization for last N layers (lm_head layers)
     EMatmulBackend fp4_backend = EMatmulBackend::CUTLASS;  ///< FP4 matmul backend (CUBLASLT=cuDNN, CUTLASS)

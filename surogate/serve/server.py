@@ -150,7 +150,7 @@ class NativeServingRuntime:
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
-        qlora_config = self._resolve_prequant_qlora_config(model_dir)
+        qlora_config, prequant_method = self._resolve_prequant_qlora_config(model_dir)
         logger.info(f"Loading tokenizer for {model_dir}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, trust_remote_code=config.trust_remote_code
@@ -162,10 +162,56 @@ class NativeServingRuntime:
         jit_manifests = compile_jit_kernels(ir_json)
         effective_seq_len = self._resolve_effective_sequence_len(config)
 
-        options = _surogate.RuntimeOptions()
+        # Prequant NVFP4 on Blackwell is most stable/fast with cuDNN FP4 backend.
+        # Allow override via env for A/B testing.
+        serve_fp4_backend: Optional[str] = None
+        if prequant_method == "prequant_nvfp4":
+            fp4_backend = os.getenv("SUROGATE_SERVE_FP4_BACKEND", "cudnn").strip().lower()
+            if fp4_backend not in {"cudnn", "cutlass"}:
+                fp4_backend = "cudnn"
+            serve_fp4_backend = fp4_backend
+            options = _surogate.RuntimeOptions(
+                fp4_backend=fp4_backend,
+                fp4_enable_four_over_six=False,
+            )
+        else:
+            options = _surogate.RuntimeOptions()
         options.dsl_ir_json = ir_json
         if jit_manifests:
             options.jit_kernel_manifests = jit_manifests
+        prequant_recipe_env = os.getenv("SUROGATE_SERVE_PREQUANT_RECIPE", "").strip()
+        if prequant_recipe_env:
+            prequant_recipe_enabled = prequant_recipe_env != "0"
+            prequant_recipe_auto = False
+        else:
+            prequant_recipe_enabled = True
+            prequant_recipe_auto = True
+            # Default to BF16 runtime for prequant serving.
+            # Enable quant runtime recipe only via explicit override:
+            #   SUROGATE_SERVE_PREQUANT_RECIPE=1
+            if prequant_method in {"prequant_nvfp4", "prequant_fp8"}:
+                prequant_recipe_enabled = False
+        if prequant_recipe_enabled:
+            if prequant_method == "prequant_nvfp4":
+                options.set_recipe("nvfp4")
+                logger.info(
+                    "Serve runtime recipe set to nvfp4 for prequant NVFP4 model (fp4_backend=%s, four_over_six=false).",
+                    serve_fp4_backend or "cudnn",
+                )
+            elif prequant_method == "prequant_fp8":
+                options.set_recipe("fp8-hybrid")
+                logger.info("Serve runtime recipe set to fp8-hybrid for prequant FP8 model.")
+        elif prequant_method is not None:
+            if prequant_recipe_auto:
+                logger.info(
+                    "Serve runtime recipe disabled for prequant model (prequant_method=%s). "
+                    "Set SUROGATE_SERVE_PREQUANT_RECIPE=1 to force quant recipe.",
+                    prequant_method,
+                )
+            else:
+                logger.info(
+                    "Prequant recipe override disabled by SUROGATE_SERVE_PREQUANT_RECIPE=0; using bf16 recipe."
+                )
         options.use_cuda_graphs = bool(config.use_cuda_graphs)
         options.doc_masking = True
         options.recompute = "true"
@@ -294,7 +340,7 @@ class NativeServingRuntime:
             elif quant_method == "prequant_mxfp4":
                 qlora = _surogate.QLoRAConfig.prequant_mxfp4()
             else:
-                return None
+                return None, None
 
             if modules_to_not_convert:
                 qlora.modules_to_not_convert = list(modules_to_not_convert)
@@ -302,14 +348,14 @@ class NativeServingRuntime:
                 "Detected pre-quantized model (%s); enabling prequant serve loading path.",
                 quant_method,
             )
-            return qlora
+            return qlora, quant_method
         except Exception as exc:
             logger.warning(
                 "Prequant auto-detection failed for %s (%s). Proceeding without prequant config.",
                 model_dir,
                 exc,
             )
-            return None
+            return None, None
 
     @staticmethod
     def _resolve_lmhead_chunks(

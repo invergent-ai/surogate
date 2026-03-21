@@ -873,15 +873,67 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
         }
     }
 
-    // Use pooled dequant buffers to limit peak GPU memory.
-    // Only one layer's weights are needed at a time (forward or backward),
-    // so cache_size=4 (one per weight type: QKV, Out, GateUp, Down) matches
-    // the old provider's shared-buffer approach.
+    // Dequant cache policy:
+    // - Training/LoRA keeps a small pooled cache to minimize peak memory.
+    // - Frozen prequant inference should keep dequantized weights resident
+    //   when they fit to avoid per-request dequantization churn.
     const int num_quantizable = static_cast<int>(std::count_if(
         config.weight_specs.begin(), config.weight_specs.end(),
         [](const qlora::WeightLoadSpec& s) { return s.quantize; }));
     if (num_quantizable > 4) {
-        config.weight_manager_config.max_dequant_cache_size = 4;
+        int dequant_cache_size = 4;  // pooled cache (training-oriented default)
+
+        const bool frozen_prequant_inference =
+            config.prequantized &&
+            !lora_cfg.enabled() &&
+            !options.OffloadMaster &&
+            !options.OffloadExperts;
+
+        if (frozen_prequant_inference) {
+            std::size_t dequant_bytes = 0;
+            for (const auto& spec : config.weight_specs) {
+                if (!spec.quantize) continue;
+                std::size_t elems = 0;
+                if (!spec.shape.empty()) {
+                    elems = 1;
+                    for (long dim : spec.shape) {
+                        if (dim <= 0) {
+                            elems = 0;
+                            break;
+                        }
+                        elems *= static_cast<std::size_t>(dim);
+                    }
+                } else if (spec.M > 0 && spec.K > 0) {
+                    elems = static_cast<std::size_t>(spec.M) * static_cast<std::size_t>(spec.K);
+                }
+                dequant_bytes += elems * sizeof(nv_bfloat16);
+            }
+
+            std::size_t free_bytes = 0;
+            std::size_t total_bytes = 0;
+            std::size_t budget = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+                constexpr std::size_t kGuardBytes = 1ull << 30;  // 1 GiB fixed headroom
+                const std::size_t usable_free =
+                    free_bytes > kGuardBytes ? (free_bytes - kGuardBytes) : 0;
+                // Reserve additional runtime headroom for activations/workspace.
+                budget =
+                    static_cast<std::size_t>(static_cast<double>(usable_free) * 0.70);
+                if (dequant_bytes <= budget) {
+                    dequant_cache_size = 0;  // unlimited: keep all dequant weights resident
+                }
+            }
+            fprintf(stderr,
+                    "[QLoRA] Dequant cache heuristic: prequant_infer=%d dequant=%.1f MiB "
+                    "free=%.1f MiB budget=%.1f MiB selected=%s\n",
+                    frozen_prequant_inference ? 1 : 0,
+                    static_cast<double>(dequant_bytes) / (1024.0 * 1024.0),
+                    static_cast<double>(free_bytes) / (1024.0 * 1024.0),
+                    static_cast<double>(budget) / (1024.0 * 1024.0),
+                    dequant_cache_size == 0 ? "unlimited" : "pooled");
+        }
+
+        config.weight_manager_config.max_dequant_cache_size = dequant_cache_size;
     }
 
     const char* format_label =
@@ -900,6 +952,14 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
             format_label,
             shard_idx+1, num_shards,
             config.prequantized ? " [pre-quantized]" : "");
+    if (num_quantizable > 0) {
+        if (config.weight_manager_config.max_dequant_cache_size == 0) {
+            fprintf(stderr, "[QLoRA] Dequant cache mode: unlimited (resident)\n");
+        } else {
+            fprintf(stderr, "[QLoRA] Dequant cache mode: pooled (%d)\n",
+                    config.weight_manager_config.max_dequant_cache_size);
+        }
+    }
     const int router_fp = count_router_fp_weights(module);
     if (router_fp > 0) {
         fprintf(stderr, "[QLoRA] Router weights kept full-precision (excluded from QLoRA): %d\n", router_fp);

@@ -141,7 +141,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         }
 
         // Pure pre-quantized inference may not attach a LoRA adapter.
-        const modules::ModularLoRAConfig default_lora_cfg{};
+        modules::ModularLoRAConfig default_lora_cfg{};
+        default_lora_cfg.rank = 0;  // No LoRA adapter attached in pure inference mode.
         const modules::ModularLoRAConfig& lora_cfg_for_provider =
             mLoRAConfig ? *mLoRAConfig : default_lora_cfg;
 
@@ -935,7 +936,8 @@ void DslModel::import_weights_from_external(
     }
 
     // Create the QLoRA provider (builds pipeline config from IR)
-    const modules::ModularLoRAConfig default_lora_cfg{};
+    modules::ModularLoRAConfig default_lora_cfg{};
+    default_lora_cfg.rank = 0;  // No LoRA adapter attached in pure inference mode.
     const modules::ModularLoRAConfig& lora_cfg_for_provider =
         mLoRAConfig ? *mLoRAConfig : default_lora_cfg;
 

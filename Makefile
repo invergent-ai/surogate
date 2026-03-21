@@ -4,6 +4,29 @@
 BUILD_DIR ?= csrc/build
 BUILD_TYPE ?= Release
 PARALLEL_JOBS ?= $(shell nproc)
+# Use explicit GPU arch for every configure so stale CMake cache values do not
+# keep targeting old architectures (e.g. sm90 on Blackwell hosts).
+ifeq ($(strip $(CUDAARCHS)),)
+CUDA_COMPUTE_CAP := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]')
+CUDA_COMPUTE_DIGITS := $(subst .,,$(CUDA_COMPUTE_CAP))
+ifeq ($(CUDA_COMPUTE_DIGITS),90)
+CMAKE_CUDA_ARCHS_EFFECTIVE := 90a
+else ifeq ($(CUDA_COMPUTE_DIGITS),100)
+CMAKE_CUDA_ARCHS_EFFECTIVE := 100a
+else ifeq ($(CUDA_COMPUTE_DIGITS),103)
+CMAKE_CUDA_ARCHS_EFFECTIVE := 103a
+else ifeq ($(CUDA_COMPUTE_DIGITS),120)
+CMAKE_CUDA_ARCHS_EFFECTIVE := 120a
+else ifeq ($(CUDA_COMPUTE_DIGITS),121)
+CMAKE_CUDA_ARCHS_EFFECTIVE := 121a
+else ifeq ($(strip $(CUDA_COMPUTE_DIGITS)),)
+CMAKE_CUDA_ARCHS_EFFECTIVE := native
+else
+CMAKE_CUDA_ARCHS_EFFECTIVE := $(CUDA_COMPUTE_DIGITS)
+endif
+else
+CMAKE_CUDA_ARCHS_EFFECTIVE := $(CUDAARCHS)
+endif
 
 .PHONY: all build export-checkpoint wheel configure clean clean-all build-tests test test-unit test-integration test-all help
 
@@ -12,7 +35,8 @@ all: build
 
 # Configure the build
 configure:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
+	@echo "Configuring with CMAKE_CUDA_ARCHITECTURES=$(CMAKE_CUDA_ARCHS_EFFECTIVE)"
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DCMAKE_CUDA_ARCHITECTURES=$(CMAKE_CUDA_ARCHS_EFFECTIVE)
 
 # Build all targets
 build: configure

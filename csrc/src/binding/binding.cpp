@@ -313,7 +313,7 @@ NB_MODULE(_surogate, m) {
             int min_stack_mb, int stack_slack_mb,
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope, bool doc_masking,
-            int fp8_amax_history, const std::string& fp4_backend,
+            int fp8_amax_history, const std::string& fp4_backend, bool fp4_enable_four_over_six,
             int skip_quant_first_layers, int skip_quant_last_layers,
             bool use_dsl_ir) {
 
@@ -321,6 +321,7 @@ NB_MODULE(_surogate, m) {
             recipes::RecipeConfig recipe_options;
             recipe_options.fp8_amax_history_len = fp8_amax_history;
             recipe_options.fp4_backend = matmul_backend_from_str(fp4_backend);
+            recipe_options.fp4_enable_four_over_six = fp4_enable_four_over_six;
             recipe_options.skip_quant_first_layers = skip_quant_first_layers;
             recipe_options.skip_quant_last_layers = skip_quant_last_layers;
 
@@ -397,6 +398,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("doc_masking") = true,
              nb::arg("fp8_amax_history") = 1024,
              nb::arg("fp4_backend") = "cutlass",
+             nb::arg("fp4_enable_four_over_six") = true,
              nb::arg("skip_quant_first_layers") = 0,
              nb::arg("skip_quant_last_layers") = 0,
              nb::arg("use_dsl_ir") = true,
@@ -419,6 +421,7 @@ NB_MODULE(_surogate, m) {
              "- doc_masking: Enable document-level attention masking for packed sequences.\n"
              "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
+             "- fp4_enable_four_over_six: Enable Four-Over-Six adaptive scaling (nvfp4 recipe).\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
              "- skip_quant_last_layers: Skip quantization for last N layers.\n"
              "- use_dsl_ir: Deprecated (DSL backend is always enabled).")

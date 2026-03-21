@@ -750,7 +750,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mAllocator = std::make_shared<TensorAllocator>();
     }
     mOptions = options;
-    if (qlora_enabled() && mQLoRAConfig.is_fp4()) {
+    // Dynamic FP4 QLoRA quantization is not graph-safe yet, but pre-quantized
+    // FP4 checkpoints are capture-safe and should keep CUDA graphs enabled.
+    if (qlora_enabled() && mQLoRAConfig.is_fp4() && !mQLoRAConfig.is_prequantized()) {
         mOptions.UseCudaGraphs = false;
     }
     const std::size_t dummy_stack_bytes = 1024ULL * 1024ULL * 1024ULL * 1024ULL;  // 1TB dummy stack
