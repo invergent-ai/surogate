@@ -17,6 +17,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -26,7 +27,6 @@ from transformers import AutoTokenizer
 
 from surogate import _surogate
 from surogate.grpo.config import GRPOLossConfig
-from surogate.grpo.loss import compute_grpo_per_token_grads
 from surogate.grpo.native_config import NativeGRPOConfig
 from surogate.grpo.orchestrator.advantage import compute_advantages
 from surogate.grpo.reward_provider import setup_reward_provider
@@ -170,6 +170,8 @@ class NativeGRPOTrainer:
             lora_config=lora_config,
             qlora_config=config.qlora_config,
         )
+        # Serialize low-level trainer API calls across producer/consumer threads.
+        self._trainer_call_lock = threading.Lock()
 
         # --- Pad logprob for position 0 ---
         self._pad_logprob = None
@@ -355,18 +357,19 @@ class NativeGRPOTrainer:
 
         # Generate completions with paged GRPO decode.
         gen_start = time.time()
-        tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
-            prompts=prompt_token_ids,
-            num_completions=num_completions,
-            max_gen_len=gen.max_gen_len,
-            temperature=temperature,
-            eos_token_id=self.eos_id,
-            use_lora=config.lora,
-            use_cuda_graphs=True,
-            top_k=gen.top_k,
-            top_p=gen.top_p,
-            prefill_chunk_size=gen.prefill_chunk_size,
-        )
+        with self._trainer_call_lock:
+            tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
+                prompts=prompt_token_ids,
+                num_completions=num_completions,
+                max_gen_len=gen.max_gen_len,
+                temperature=temperature,
+                eos_token_id=self.eos_id,
+                use_lora=config.lora,
+                use_cuda_graphs=True,
+                top_k=gen.top_k,
+                top_p=gen.top_p,
+                prefill_chunk_size=gen.prefill_chunk_size,
+            )
         gen_time = time.time() - gen_start
 
         # Decode completions
@@ -523,11 +526,25 @@ class NativeGRPOTrainer:
         start_next_prefetch: Callable[[], None] | None = None,
     ) -> dict:
         """Single-turn training step: generate -> score -> train."""
-        config = self.config
-        gen = config.generation
-        num_completions = gen.num_completions
+        prepared = self._prepare_single_turn_payload(
+            prompts,
+            step,
+            prompt_token_ids=prompt_token_ids,
+            start_next_prefetch=start_next_prefetch,
+        )
+        return self._finalize_single_turn_payload(prepared, step)
 
-        # 1. Generate rollout
+    def _prepare_single_turn_payload(
+        self,
+        prompts: list[str],
+        step: int,
+        prompt_token_ids: list[list[int]] | None = None,
+        start_next_prefetch: Callable[[], None] | None = None,
+    ) -> dict:
+        """Prepare a single-turn batch through rollout + scoring + advantages."""
+        config = self.config
+        num_completions = config.generation.num_completions
+
         rollout = self.generate_rollout(
             prompts, step, prompt_token_ids=prompt_token_ids
         )
@@ -537,7 +554,10 @@ class NativeGRPOTrainer:
         completion_lens_list = rollout["completion_lens"]
         total = len(all_tokens)
 
-        # 2. Score with reward provider
+        # Reward provider is thread-safe; prefetch can start during scoring.
+        if start_next_prefetch is not None:
+            start_next_prefetch()
+
         score_start = time.time()
         rewards = self.reward_provider.score(
             rollout["prompt_texts"],
@@ -547,12 +567,6 @@ class NativeGRPOTrainer:
         rewards = np.array(rewards, dtype=np.float32)
         score_time = time.time() - score_start
 
-        # Start overlap prefetch only after scoring is done, to avoid concurrent
-        # access to reward provider methods in different threads.
-        if start_next_prefetch is not None:
-            start_next_prefetch()
-
-        # 3. Apply filters
         comp_token_ids = []
         comp_logprobs = []
         for i in range(total):
@@ -566,13 +580,11 @@ class NativeGRPOTrainer:
             comp_token_ids, comp_logprobs
         )
 
-        # Zero out rewards for filtered rollouts (keep for baseline, mask for training)
         loss_mask_override = np.ones(total, dtype=bool)
         for i in range(total):
             if not keep_mask[i]:
                 loss_mask_override[i] = False
 
-        # 4. Compute advantages
         advantages = compute_advantages(
             rewards=rewards.tolist(),
             completion_lengths=[int(cl) for cl in completion_lens_list],
@@ -581,39 +593,54 @@ class NativeGRPOTrainer:
         )
         advantages = np.array(advantages, dtype=np.float32)
 
-        # 5. Training forward/backward
+        return {
+            "prompts": prompts,
+            "rollout": rollout,
+            "rewards": rewards,
+            "advantages": advantages,
+            "all_tokens": all_tokens,
+            "all_logprobs": all_logprobs,
+            "prompt_lens": prompt_lens_list,
+            "completion_lens": completion_lens_list,
+            "loss_mask_override": loss_mask_override,
+            "filter_metrics": filter_metrics,
+            "score_time": score_time,
+        }
+
+    def _finalize_single_turn_payload(self, prepared: dict, step: int) -> dict:
+        """Finalize a prepared single-turn batch via train + optimizer + metrics."""
+        config = self.config
         train_start = time.time()
         step_metrics, loss_scale = self._train_on_trajectories(
-            all_tokens=all_tokens,
-            all_logprobs=all_logprobs,
-            prompt_lens=prompt_lens_list,
-            completion_lens=completion_lens_list,
-            advantages=advantages,
-            loss_mask_override=loss_mask_override,
-            temperature=rollout["temperature"],
+            all_tokens=prepared["all_tokens"],
+            all_logprobs=prepared["all_logprobs"],
+            prompt_lens=prepared["prompt_lens"],
+            completion_lens=prepared["completion_lens"],
+            advantages=prepared["advantages"],
+            loss_mask_override=prepared["loss_mask_override"],
+            temperature=prepared["rollout"]["temperature"],
         )
 
-        # 6. Optimizer step
         lr = self.lr_schedule.get_lr(step)
         result = self._optimizer_step(lr, step)
         train_time = time.time() - train_start
 
         return self._build_metrics(
-            prompts=prompts,
-            rewards=rewards,
-            advantages=advantages,
-            prompt_lens=prompt_lens_list,
-            completion_lens=completion_lens_list,
+            prompts=prepared["prompts"],
+            rewards=prepared["rewards"],
+            advantages=prepared["advantages"],
+            prompt_lens=prepared["prompt_lens"],
+            completion_lens=prepared["completion_lens"],
             step_metrics=step_metrics,
             loss_scale=loss_scale,
             grad_norm=result.get("norm", 0.0),
             lr=lr,
-            temperature=rollout["temperature"],
-            gen_time=rollout["gen_time"],
-            score_time=score_time,
+            temperature=prepared["rollout"]["temperature"],
+            gen_time=prepared["rollout"]["gen_time"],
+            score_time=prepared["score_time"],
             train_time=train_time,
             step=step,
-            filter_metrics=filter_metrics,
+            filter_metrics=prepared["filter_metrics"],
             num_completions=config.generation.num_completions,
         )
 
@@ -791,10 +818,8 @@ class NativeGRPOTrainer:
 
         Returns (step_metrics, loss_scale).
         """
-        from surogate.grpo.batch import prepare_sample, packed_samples_into_micro_bs
-        from surogate.grpo.data import microbatch_to_numpy
-        from surogate.grpo.trainer import _find_sample_boundaries
-        from surogate.grpo.transport.types import TrainingSample
+        from surogate.grpo.batch import packed_samples_into_micro_bs
+        from surogate.grpo.transport.types import MicroBatch
 
         config = self.config
         seq_len = config.sequence_len
@@ -802,8 +827,8 @@ class NativeGRPOTrainer:
         loss_config = config.loss or GRPOLossConfig()
         total = len(all_tokens)
 
-        # --- Build TrainingSamples from raw trajectory data ---
-        samples: list[TrainingSample] = []
+        # --- Build pre-packed samples directly (avoid intermediate TrainingSample objects) ---
+        packed_samples: list[tuple[int, MicroBatch]] = []
         for i in range(total):
             pl = prompt_lens[i]
             cl = completion_lens[i]
@@ -811,8 +836,6 @@ class NativeGRPOTrainer:
 
             prompt_ids = list(toks[:pl])
             completion_ids = list(toks[pl : pl + cl])
-            prompt_mask = [False] * pl
-
             if completion_masks is not None and loss_mask_override[i]:
                 comp_mask = list(completion_masks[i][:cl].astype(bool))
             elif loss_mask_override[i]:
@@ -821,32 +844,52 @@ class NativeGRPOTrainer:
                 comp_mask = [False] * cl
 
             traj_lp = all_logprobs[i]
-            comp_lp = list(traj_lp[:cl]) if len(traj_lp) >= cl else list(traj_lp) + [0.0] * (cl - len(traj_lp))
-            comp_temps = [temperature] * cl
+            comp_lp = (
+                list(traj_lp[:cl])
+                if len(traj_lp) >= cl
+                else list(traj_lp) + [0.0] * (cl - len(traj_lp))
+            )
 
-            samples.append(TrainingSample(
-                prompt_ids=prompt_ids,
-                prompt_mask=prompt_mask,
-                completion_ids=completion_ids,
-                completion_mask=comp_mask,
-                completion_logprobs=comp_lp,
-                completion_temperatures=comp_temps,
-                advantage=float(advantages[i]),
-            ))
+            input_ids = prompt_ids + completion_ids
+            loss_mask_list = ([False] * pl) + comp_mask
+            inference_lp = ([0.0] * pl) + comp_lp
+            adv_tokens = [float(advantages[i])] * len(input_ids)
+            position_ids = list(range(len(input_ids)))
+            prompt_temp = temperature if cl > 0 else 1.0
+            temperatures = ([prompt_temp] * pl) + ([temperature] * cl)
+
+            if len(input_ids) > seq_len:
+                input_ids = input_ids[:seq_len]
+                loss_mask_list = loss_mask_list[:seq_len]
+                inference_lp = inference_lp[:seq_len]
+                adv_tokens = adv_tokens[:seq_len]
+                position_ids = position_ids[:seq_len]
+                temperatures = temperatures[:seq_len]
+
+            packed_samples.append(
+                (
+                    0,
+                    MicroBatch(
+                        input_ids=input_ids,
+                        loss_mask=loss_mask_list,
+                        advantages=adv_tokens,
+                        inference_logprobs=inference_lp,
+                        position_ids=position_ids,
+                        temperatures=temperatures,
+                    ),
+                )
+            )
 
         # --- Pack into micro-batches using First Fit Decreasing ---
-        packed_samples = [(0, prepare_sample(s, seq_len)) for s in samples]
         micro_batches = packed_samples_into_micro_bs(packed_samples, seq_len, num_loras=1)
-
-        # Convert to numpy
-        numpy_batches = [microbatch_to_numpy(mb) for mb in micro_batches]
-        n_mb = len(numpy_batches)
+        n_mb = len(micro_batches)
 
         # Compute loss_scale across all micro-batches
-        loss_scale = int(sum(int(mb["loss_mask"].sum()) for mb in numpy_batches))
+        loss_scale = int(sum(sum(1 for m in mb.loss_mask if m) for mb in micro_batches))
         loss_scale = max(loss_scale, 1)
 
-        self.trainer.set_grad_accumulation(n_mb)
+        with self._trainer_call_lock:
+            self.trainer.set_grad_accumulation(n_mb)
 
         step_metrics = {
             "policy_loss": 0.0,
@@ -856,85 +899,83 @@ class NativeGRPOTrainer:
             "total_tokens": 0,
         }
 
-        for mb in numpy_batches:
-            input_ids = mb["input_ids"]       # [1, T_mb]
-            targets = mb["targets"]           # [1, T_mb]
-            position_ids = mb["position_ids"] # [1, T_mb]
-            adv_flat = mb["advantages"].flatten()
-            inf_lp = mb["inference_logprobs"].flatten()
-            loss_mask_flat = mb["loss_mask"].flatten()
-            temps_flat = mb["temperatures"].flatten()
+        # Reusable staging buffers (avoid per-micro-batch np.pad/np.tile allocations).
+        input_single = np.zeros((1, seq_len), dtype=np.int32)
+        masked_targets_single = np.full((1, seq_len), -100, dtype=np.int32)
+        position_single = np.zeros((1, seq_len), dtype=np.int32)
+        temp_single = np.ones((1, seq_len), dtype=np.float32)
+        inf_lp_single = np.zeros((1, seq_len), dtype=np.float32)
+        adv_single = np.zeros((1, seq_len), dtype=np.float32)
+        loss_mask_single = np.zeros((1, seq_len), dtype=np.uint8)
 
-            T_actual = input_ids.shape[1]
+        if ngpu > 1:
+            input_stage = np.zeros((ngpu, seq_len), dtype=np.int32)
+            masked_targets_stage = np.full((ngpu, seq_len), -100, dtype=np.int32)
+            position_stage = np.zeros((ngpu, seq_len), dtype=np.int32)
+            temp_stage = np.ones((ngpu, seq_len), dtype=np.float32)
+        else:
+            input_stage = input_single
+            masked_targets_stage = masked_targets_single
+            position_stage = position_single
+            temp_stage = temp_single
 
-            # Pad to seq_len
-            if T_actual < seq_len:
-                pad_w = seq_len - T_actual
-                input_ids = np.pad(input_ids, ((0, 0), (0, pad_w)), constant_values=0)
-                targets = np.pad(targets, ((0, 0), (0, pad_w)), constant_values=-100)
-                last_pos = int(position_ids[0, T_actual - 1])
-                pad_pos = np.arange(last_pos + 1, last_pos + 1 + pad_w, dtype=np.int32).reshape(1, -1)
-                position_ids = np.concatenate([position_ids, pad_pos], axis=1)
-            temp_padded = np.ones((1, seq_len), dtype=np.float32)
-            temp_padded[0, :T_actual] = temps_flat[:T_actual]
+        for mb in micro_batches:
+            T_actual = len(mb.input_ids)
 
-            # Apply loss_mask to targets (mask prompt tokens)
-            tmask = loss_mask_flat[:T_actual].astype(bool)
-            tmask_shifted = np.zeros_like(tmask)
-            if T_actual > 1:
-                tmask_shifted[:-1] = tmask[1:]
-            masked_targets = targets.copy()
-            masked_targets[0, :T_actual][~tmask_shifted] = -100
+            input_single.fill(0)
+            masked_targets_single.fill(-100)
+            position_single.fill(0)
+            temp_single.fill(1.0)
+            inf_lp_single.fill(0.0)
+            adv_single.fill(0.0)
+            loss_mask_single.fill(0)
+
+            if T_actual > 0:
+                input_single[0, :T_actual] = mb.input_ids[:T_actual]
+                position_single[0, :T_actual] = mb.position_ids[:T_actual]
+                if T_actual < seq_len:
+                    last_pos = int(mb.position_ids[T_actual - 1])
+                    position_single[0, T_actual:] = np.arange(
+                        last_pos + 1,
+                        last_pos + 1 + (seq_len - T_actual),
+                        dtype=np.int32,
+                    )
+                temp_single[0, :T_actual] = mb.temperatures[:T_actual]
+                inf_lp_single[0, :T_actual] = mb.inference_logprobs[:T_actual]
+                adv_single[0, :T_actual] = mb.advantages[:T_actual]
+                loss_mask_single[0, :T_actual] = np.asarray(
+                    mb.loss_mask[:T_actual], dtype=np.uint8
+                )
+
+                if T_actual > 1:
+                    masked_targets_single[0, : T_actual - 1] = np.asarray(
+                        mb.input_ids[1:T_actual], dtype=np.int32
+                    )
+                    masked_targets_single[0, : T_actual - 1][
+                        loss_mask_single[0, 1:T_actual] == 0
+                    ] = -100
 
             if ngpu > 1:
-                input_ids = np.tile(input_ids, (ngpu, 1))
-                masked_targets = np.tile(masked_targets, (ngpu, 1))
-                position_ids = np.tile(position_ids, (ngpu, 1))
-                temp_padded = np.tile(temp_padded, (ngpu, 1))
+                input_stage[:] = input_single
+                masked_targets_stage[:] = masked_targets_single
+                position_stage[:] = position_single
+                temp_stage[:] = temp_single
 
-            # Forward: get policy logprobs
-            raw_lp = self.trainer.forward_for_grpo(
-                input_ids,
-                masked_targets,
-                position_ids=position_ids,
-                temperatures=temp_padded,
-            )
-            raw_lp = np.asarray(raw_lp[0, :T_actual], dtype=np.float32)
-
-            # Right-shift logprobs (global shift across packed sequence)
-            trainer_logprobs = np.zeros(T_actual, dtype=np.float32)
-            if T_actual > 1:
-                trainer_logprobs[1:T_actual] = raw_lp[: T_actual - 1]
-            if self._pad_logprob is not None and T_actual > 0:
-                trainer_logprobs[0] = self._pad_logprob
-
-            # Find sample boundaries in the packed sequence
-            pos_flat = position_ids[0, :T_actual] if ngpu <= 1 else mb["position_ids"].flatten()[:T_actual]
-            sample_ranges = _find_sample_boundaries(pos_flat)
-
-            # Compute GRPO per-token gradients (per-sample within packed seq)
-            per_token_grads, mb_metrics = compute_grpo_per_token_grads(
-                trainer_logprobs=trainer_logprobs,
-                inference_logprobs=inf_lp[:T_actual],
-                advantages=adv_flat[:T_actual],
-                loss_mask=loss_mask_flat[:T_actual],
-                loss_config=loss_config,
-                sample_ranges=sample_ranges,
-            )
-            if loss_scale > 1:
-                per_token_grads = per_token_grads / float(loss_scale)
-
-            # Left-shift gradients (global shift)
-            surogate_grads = np.zeros(T_actual, dtype=np.float32)
-            if T_actual > 1:
-                surogate_grads[: T_actual - 1] = per_token_grads[1:T_actual]
-
-            grads_padded = np.zeros((1, seq_len), dtype=np.float32)
-            grads_padded[0, :T_actual] = surogate_grads
-            if ngpu > 1:
-                grads_padded = np.tile(grads_padded, (ngpu, 1))
-
-            self.trainer.backward_grpo(grads_padded)
+            with self._trainer_call_lock:
+                mb_metrics = self.trainer.step_with_native_grpo(
+                    input_stage,
+                    masked_targets_stage,
+                    inference_logprobs=inf_lp_single,
+                    advantages=adv_single,
+                    loss_mask=loss_mask_single,
+                    kl_tau=float(loss_config.kl_tau),
+                    adv_tau=float(loss_config.adv_tau),
+                    ipo_mask_low=float(loss_config.ipo_mask_low),
+                    ipo_mask_high=float(loss_config.ipo_mask_high),
+                    loss_scale=float(loss_scale),
+                    position_ids=position_stage,
+                    temperatures=temp_stage,
+                )
 
             for key in step_metrics:
                 if key in mb_metrics:
@@ -959,7 +1000,8 @@ class NativeGRPOTrainer:
             adamw_beta2=config.adamw_beta2,
             adamw_epsilon=config.adamw_epsilon,
         )
-        return self.trainer.update_with_config(opt_config, step + 1)
+        with self._trainer_call_lock:
+            return self.trainer.update_with_config(opt_config, step + 1)
 
     @staticmethod
     def _build_metrics(
@@ -1320,6 +1362,37 @@ class NativeGRPOTrainer:
         total_tokens = 0
         total_samples = 0
 
+        def _handle_step_metrics(step: int, metrics: dict):
+            nonlocal total_tokens, total_samples
+            total_tokens += metrics.get("progress/tokens", 0)
+            total_samples += metrics.get("progress/samples", 0)
+            metrics["progress/total_tokens"] = total_tokens
+            metrics["progress/total_samples"] = total_samples
+
+            if self.monitor is not None:
+                self.monitor.log(metrics, step=step)
+                self.monitor.flush(step=step)
+
+            logger.info(
+                f"Step {step} | "
+                f"Reward: {metrics['reward/mean']:.4f} | "
+                f"Loss: {metrics['train/policy_loss']:.4f} | "
+                f"KL: {metrics['train/mismatch_kl']:.4f} | "
+                f"Grad: {metrics['train/grad_norm']:.4f} | "
+                f"LR: {metrics['train/lr']:.2e} | "
+                f"Temp: {metrics['sampling/temperature']:.2f} | "
+                f"Time: {metrics['time/step']:.2f}s"
+            )
+
+            if eval_interval > 0 and step % eval_interval == 0:
+                eval_metrics = self.evaluate(step)
+                if eval_metrics and self.monitor is not None:
+                    self.monitor.log(eval_metrics, step=step)
+                    self.monitor.flush(step=step)
+
+            if save_steps > 0 and step > 0 and step % save_steps == 0:
+                self.save_checkpoint(step)
+
         with ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="native-grpo-prefetch"
         ) as prefetch_executor:
@@ -1334,9 +1407,9 @@ class NativeGRPOTrainer:
                 prompts, prompt_token_ids = next_batch_future.result()
                 prefetch_wait = time.time() - wait_start
 
-                next_holder: dict[str, Future[tuple[list[str], list[list[int]]]] | None] = {
-                    "future": None
-                }
+                next_holder: dict[
+                    str, Future[tuple[list[str], list[list[int]]]] | None
+                ] = {"future": None}
 
                 def _start_next_prefetch():
                     if step + 1 >= max_steps:
@@ -1346,7 +1419,6 @@ class NativeGRPOTrainer:
                             self._fetch_and_tokenize_prompts, problems_per_step
                         )
 
-                # Train step
                 metrics = self.train_step(
                     prompts,
                     step,
@@ -1357,44 +1429,12 @@ class NativeGRPOTrainer:
 
                 if step + 1 < max_steps:
                     if next_holder["future"] is None:
-                        # Fallback path for modes that did not start overlap.
                         next_holder["future"] = prefetch_executor.submit(
                             self._fetch_and_tokenize_prompts, problems_per_step
                         )
                     next_batch_future = next_holder["future"]
 
-                total_tokens += metrics.get("progress/tokens", 0)
-                total_samples += metrics.get("progress/samples", 0)
-                metrics["progress/total_tokens"] = total_tokens
-                metrics["progress/total_samples"] = total_samples
-
-                # Log metrics
-                if self.monitor is not None:
-                    self.monitor.log(metrics, step=step)
-                    self.monitor.flush(step=step)
-
-                # Log to console
-                logger.info(
-                    f"Step {step} | "
-                    f"Reward: {metrics['reward/mean']:.4f} | "
-                    f"Loss: {metrics['train/policy_loss']:.4f} | "
-                    f"KL: {metrics['train/mismatch_kl']:.4f} | "
-                    f"Grad: {metrics['train/grad_norm']:.4f} | "
-                    f"LR: {metrics['train/lr']:.2e} | "
-                    f"Temp: {metrics['sampling/temperature']:.2f} | "
-                    f"Time: {metrics['time/step']:.2f}s"
-                )
-
-                # Online evaluation
-                if eval_interval > 0 and step % eval_interval == 0:
-                    eval_metrics = self.evaluate(step)
-                    if eval_metrics and self.monitor is not None:
-                        self.monitor.log(eval_metrics, step=step)
-                        self.monitor.flush(step=step)
-
-                # Checkpoint
-                if save_steps > 0 and step > 0 and step % save_steps == 0:
-                    self.save_checkpoint(step)
+                _handle_step_metrics(step, metrics)
 
         # Final export
         self._export_final()

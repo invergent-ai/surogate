@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cstdint>
 
 #include <cublas_v2.h>
 
@@ -221,12 +222,38 @@ public:
                                          NCCLCommunicator& comm,
                                          const float* temperatures = nullptr);
 
+    struct NativeGrpoStepMetrics {
+        float policy_loss = 0.0f;
+        float mismatch_kl = 0.0f;
+        float is_masked = 0.0f;
+        int keep_tokens = 0;
+        int total_tokens = 0;
+    };
+
+    /// Native GRPO fused micro-step:
+    /// forward (save activations) + GPU GRPO dloss build + backward.
+    NativeGrpoStepMetrics step_with_native_grpo(
+        Tensor inputs, Tensor position_ids, Tensor targets,
+        const float* inference_logprobs_cpu,
+        const float* advantages_cpu,
+        const std::uint8_t* loss_mask_cpu,
+        float kl_tau,
+        float adv_tau,
+        float ipo_mask_low,
+        float ipo_mask_high,
+        float loss_scale,
+        int grad_accum_steps,
+        int micro_step,
+        NCCLCommunicator& comm,
+        const float* temperatures = nullptr);
+
     /// GRPO backward pass using activations saved by forward_for_grpo().
     /// Must be called after forward_for_grpo() in the same micro-step.
     void backward_grpo(Tensor inputs, Tensor targets,
                         const float* per_token_grads_cpu,
                         int grad_accum_steps, int micro_step,
-                        NCCLCommunicator& comm);
+                        NCCLCommunicator& comm,
+                        bool per_token_grads_on_gpu = false);
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;

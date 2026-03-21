@@ -2031,6 +2031,30 @@ void GraphExecutor::invalidate_decode_graph() {
 // Custom d_loss backward (GRPO: external per-token gradient multipliers)
 // ============================================================================
 
+void GraphExecutor::backward_with_custom_dloss_gpu(Tensor inputs, Tensor targets,
+                                                    const float* per_token_grads_gpu,
+                                                    NCCLCommunicator& comm,
+                                                    int grad_accum_steps, int micro_step,
+                                                    const modules::BackwardHook* hook,
+                                                    const float* inv_temperature_gpu)
+{
+    mCompiledExecutor->set_custom_dloss_context(const_cast<float*>(per_token_grads_gpu));
+    if (inv_temperature_gpu) {
+        mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
+    }
+
+    if (hook) {
+        backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, *hook);
+    } else {
+        backward(inputs, targets, comm, grad_accum_steps, micro_step);
+    }
+
+    mCompiledExecutor->set_custom_dloss_context(nullptr);
+    if (inv_temperature_gpu) {
+        mCompiledExecutor->set_inv_temperature_context(nullptr);
+    }
+}
+
 void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
                                                 const float* per_token_grads_cpu,
                                                 NCCLCommunicator& comm,
@@ -2044,12 +2068,10 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
     const std::size_t BT = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
 
     // Allocate a temporary GPU buffer and upload the custom per-token gradients.
-    // These replace the standard d_loss=1.0 seeding in dispatch_fused_lm_head_loss_backward.
     float* custom_dloss_gpu = nullptr;
     CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, BT * sizeof(float)));
     CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu, per_token_grads_cpu,
                                BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
-    mCompiledExecutor->set_custom_dloss_context(custom_dloss_gpu);
 
     float* inv_temperature_gpu = nullptr;
     if (temperatures_cpu) {
@@ -2060,25 +2082,16 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
         CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, BT * sizeof(float)));
         CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu, inv_temp.data(),
                                    BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
-        mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
     }
 
-    // Run standard backward (with or without LoRA backward hook).
-    if (hook) {
-        backward_with_hook(inputs, targets, comm, grad_accum_steps, micro_step, *hook);
-    } else {
-        backward(inputs, targets, comm, grad_accum_steps, micro_step);
-    }
+    backward_with_custom_dloss_gpu(inputs, targets, custom_dloss_gpu, comm,
+                                   grad_accum_steps, micro_step, hook,
+                                   inv_temperature_gpu);
 
-    // Synchronize to ensure the D→D copy of custom_dloss_gpu→d_loss completed
-    // before freeing the temporary buffer.  The copy is launched early in the
-    // backward graph (dispatch_fused_lm_head_loss_backward), so this sync also
-    // waits for the full backward to complete on the GPU.
+    // The temporary buffers must stay alive until backward kernels consume them.
     CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-    mCompiledExecutor->set_custom_dloss_context(nullptr);
     CUDA_CHECK(cudaFree(custom_dloss_gpu));
     if (inv_temperature_gpu) {
-        mCompiledExecutor->set_inv_temperature_context(nullptr);
         CUDA_CHECK(cudaFree(inv_temperature_gpu));
     }
 }

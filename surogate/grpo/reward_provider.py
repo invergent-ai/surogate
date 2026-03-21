@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import threading
+from collections import deque
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
@@ -75,6 +77,7 @@ class CallbackRewardProvider(RewardProvider):
         self.reward_fn = reward_fn
         self._prompts: list[str] = []
         self._index = 0
+        self._lock = threading.Lock()
 
         if dataset_path is not None:
             self._prompts = self._load_dataset(dataset_path)
@@ -103,9 +106,10 @@ class CallbackRewardProvider(RewardProvider):
         if not self._prompts:
             raise RuntimeError("No prompts available. Provide dataset_path or prompts.")
         batch = []
-        for _ in range(batch_size):
-            batch.append(self._prompts[self._index % len(self._prompts)])
-            self._index += 1
+        with self._lock:
+            for _ in range(batch_size):
+                batch.append(self._prompts[self._index % len(self._prompts)])
+                self._index += 1
         return batch
 
     def has_data(self) -> bool:
@@ -135,6 +139,8 @@ class VerifiersRewardProvider(RewardProvider):
         self._index = 0
         self._native_client = None  # Set via set_trainer()
         self._last_rollout_outputs: list[Any] = []
+        self._state_lock = threading.Lock()
+        self._pending_batch_contexts: deque[tuple[list[dict], list[int]]] = deque()
 
         for env_cfg in env_configs:
             env_id = env_cfg.id.split("@")[0] if "@" in env_cfg.id else env_cfg.id
@@ -237,15 +243,39 @@ class VerifiersRewardProvider(RewardProvider):
                 NativeClient (generation + scoring together). When False
                 (default), scores pre-generated completions using rubric.
         """
+        n_prompts = len(prompts) if use_rollouts else (len(completions) // max(1, num_completions))
+        examples, env_indices = self._pop_batch_context(n_prompts)
         if use_rollouts and self._native_client is not None:
-            return self._score_with_rollouts(num_completions)
-        return self._score_with_rubric(prompts, completions, num_completions)
+            return self._score_with_rollouts(examples, env_indices, num_completions)
+        return self._score_with_rubric(
+            prompts,
+            completions,
+            num_completions,
+            examples=examples,
+            env_indices=env_indices,
+        )
 
-    def _score_with_rollouts(self, num_completions: int) -> list[float]:
+    def _pop_batch_context(self, n_prompts: int) -> tuple[list[dict], list[int]]:
+        with self._state_lock:
+            if self._pending_batch_contexts:
+                examples, env_indices = self._pending_batch_contexts.popleft()
+            else:
+                examples, env_indices = ([{}] * n_prompts, [0] * n_prompts)
+        if n_prompts <= 0:
+            return [], []
+        if len(examples) < n_prompts:
+            examples = examples + ([{}] * (n_prompts - len(examples)))
+        if len(env_indices) < n_prompts:
+            env_indices = env_indices + ([0] * (n_prompts - len(env_indices)))
+        return examples[:n_prompts], env_indices[:n_prompts]
+
+    def _score_with_rollouts(
+        self,
+        examples: list[dict],
+        env_indices: list[int],
+        num_completions: int,
+    ) -> list[float]:
         """Score by running full multi-turn rollouts."""
-        examples = self._current_examples
-        env_indices = self._current_env_indices
-
         # Pass temperature in sampling_args — required by interleave_rollout
         sampling_args = {"temperature": self._native_client.default_temperature}
 
@@ -276,15 +306,17 @@ class VerifiersRewardProvider(RewardProvider):
         prompts: list[str],
         completions: list[str],
         num_completions: int,
+        examples: list[dict],
+        env_indices: list[int],
     ) -> list[float]:
         """Fallback: score pre-generated completions using rubric directly."""
         if not self._envs:
             return [0.0] * len(completions)
 
-        env_idx = 0
+        env_idx = env_indices[0] if env_indices else 0
         env = self._envs[env_idx]
         n_prompts = len(completions) // num_completions
-        examples = self._current_examples[:n_prompts] if hasattr(self, "_current_examples") else [{}] * n_prompts
+        examples = examples[:n_prompts] if examples else ([{}] * n_prompts)
 
         states = []
         for i, (prompt, completion) in enumerate(zip(prompts, completions)):
@@ -322,13 +354,16 @@ class VerifiersRewardProvider(RewardProvider):
         if not self._all_examples:
             raise RuntimeError("No examples available from verifiers environments.")
 
+        with self._state_lock:
+            selected = []
+            for _ in range(batch_size):
+                selected.append(self._all_examples[self._index % len(self._all_examples)])
+                self._index += 1
+
         batch_prompts = []
         batch_examples = []
         batch_env_indices = []
-        for _ in range(batch_size):
-            env_idx, example = self._all_examples[self._index % len(self._all_examples)]
-            self._index += 1
-
+        for env_idx, example in selected:
             # Extract prompt text from messages
             prompt_messages = example.get("prompt", [])
             if isinstance(prompt_messages, list) and prompt_messages:
@@ -349,9 +384,10 @@ class VerifiersRewardProvider(RewardProvider):
             batch_examples.append(example)
             batch_env_indices.append(env_idx)
 
-        # Store for scoring reference
-        self._current_examples = batch_examples
-        self._current_env_indices = batch_env_indices
+        # Store per-batch context (thread-safe FIFO) so scoring is decoupled from
+        # concurrent next-batch prefetch.
+        with self._state_lock:
+            self._pending_batch_contexts.append((batch_examples, batch_env_indices))
         return batch_prompts
 
     def has_data(self) -> bool:

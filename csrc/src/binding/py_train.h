@@ -13,6 +13,7 @@
 #include <functional>
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 #include <cuda_runtime.h>
 
 #include "config/pretrained_config.h"
@@ -137,6 +138,30 @@ public:
     // GRPO backward pass using activations saved by forward_for_grpo().
     // Inputs/targets/position_ids are reused from forward_for_grpo (already in GPU buffers).
     void backward_grpo(const float* per_token_grads);
+
+    struct NativeGrpoStepMetrics {
+        float policy_loss = 0.0f;
+        float mismatch_kl = 0.0f;
+        float is_masked = 0.0f;
+        int keep_tokens = 0;
+        int total_tokens = 0;
+    };
+
+    // Native fused GRPO micro-step:
+    // forward + GPU dloss build + backward.
+    NativeGrpoStepMetrics step_with_native_grpo(
+        const std::int32_t* inputs,
+        const std::int32_t* targets,
+        const float* inference_logprobs,
+        const float* advantages,
+        const std::uint8_t* loss_mask,
+        float kl_tau,
+        float adv_tau,
+        float ipo_mask_low,
+        float ipo_mask_high,
+        float loss_scale,
+        const std::int32_t* position_ids = nullptr,
+        const float* temperatures = nullptr);
 
     // Native generation: generate M×N completions using the trainer's own model and arena.
     // Replaces vLLM inference for GRPO. Uses the model's DeviceMemoryStack as the arena

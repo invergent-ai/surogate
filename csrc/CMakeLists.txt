@@ -453,6 +453,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/slice_add.cu
     src/kernels/random.cu
     src/kernels/fill.cu
+    src/kernels/grpo_loss.cu
     src/kernels/convert.cu
     src/kernels/lora_dropout.cu
     src/kernels/lora_small_rank.cu

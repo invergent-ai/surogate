@@ -1161,6 +1161,7 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                                      doc_info->num_docs,
                                      doc_info->max_seqlen,
                                      doc_info->total_q);
+        mDocMaskingActive = true;
     }
 
     graph_exec->execute_logprobs_forward((long)B, (long)T, input_ids, targets,
@@ -1531,13 +1532,131 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs, Tensor position_ids
 }
 
 // ============================================================================
+// Native GRPO fused micro-step
+// ============================================================================
+
+DslModel::NativeGrpoStepMetrics DslModel::step_with_native_grpo(
+        Tensor inputs, Tensor position_ids, Tensor targets,
+        const float* inference_logprobs_cpu,
+        const float* advantages_cpu,
+        const std::uint8_t* loss_mask_cpu,
+        float kl_tau,
+        float adv_tau,
+        float ipo_mask_low,
+        float ipo_mask_high,
+        float loss_scale,
+        int grad_accum_steps, int micro_step,
+        NCCLCommunicator& comm,
+        const float* temperatures) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_with_native_grpo called before allocate_run_state()");
+    }
+    mUseTokenScale = false;
+
+    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!graph_exec) {
+        throw std::runtime_error("DslModel::step_with_native_grpo: executor is not a GraphExecutor");
+    }
+
+    if (!inference_logprobs_cpu || !advantages_cpu || !loss_mask_cpu) {
+        throw std::invalid_argument("DslModel::step_with_native_grpo: null rollout input");
+    }
+
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t BT = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+
+    if (mGrpoInvTemperatureGpu) {
+        CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
+        mGrpoInvTemperatureGpu = nullptr;
+    }
+    if (temperatures) {
+        std::vector<float> inv_temp(BT);
+        for (std::size_t i = 0; i < BT; ++i) {
+            inv_temp[i] = 1.0f / temperatures[i];
+        }
+        CUDA_CHECK(cudaMalloc(&mGrpoInvTemperatureGpu, BT * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(mGrpoInvTemperatureGpu, inv_temp.data(),
+                                   BT * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+        graph_exec->set_inv_temperature_context(mGrpoInvTemperatureGpu);
+    }
+
+    fill_zero(rs.Losses, main_stream);
+    fill_zero(rs.ValidTokenCount, main_stream);
+    fill_zero(rs.CorrectCount, main_stream);
+
+    // Forward pass saves activations for backward and writes per-token CE losses.
+    forward(inputs, position_ids, comm, micro_step);
+
+    Tensor inf_lp_gpu = rs.temp_alloc(ETensorDType::FP32, {B_val, T_val}, "grpo_inf_lp");
+    Tensor adv_gpu = rs.temp_alloc(ETensorDType::FP32, {B_val, T_val}, "grpo_adv");
+    Tensor mask_gpu = rs.temp_alloc(ETensorDType::BYTE, {B_val, T_val}, "grpo_mask");
+    Tensor dloss_gpu = rs.temp_alloc(ETensorDType::FP32, {B_val, T_val}, "grpo_dloss");
+    Tensor stats_gpu = rs.temp_alloc(ETensorDType::FP32, {5}, "grpo_stats");
+
+    CUDA_CHECK(cudaMemcpyAsync(inf_lp_gpu.Data, inference_logprobs_cpu,
+                               BT * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+    CUDA_CHECK(cudaMemcpyAsync(adv_gpu.Data, advantages_cpu,
+                               BT * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+    CUDA_CHECK(cudaMemcpyAsync(mask_gpu.Data, loss_mask_cpu,
+                               BT * sizeof(std::uint8_t), cudaMemcpyHostToDevice, main_stream));
+    CUDA_CHECK(cudaMemsetAsync(stats_gpu.Data, 0, 5 * sizeof(float), main_stream));
+
+    const float inv_loss_scale = (loss_scale > 1.0f) ? (1.0f / loss_scale) : 1.0f;
+    build_grpo_custom_dloss_and_stats(
+        rs.Losses.get<float>(),
+        inf_lp_gpu.get<float>(),
+        adv_gpu.get<float>(),
+        mask_gpu.get<std::uint8_t>(),
+        dloss_gpu.get<float>(),
+        stats_gpu.get<float>(),
+        B_val, T_val,
+        kl_tau,
+        adv_tau,
+        ipo_mask_low,
+        ipo_mask_high,
+        inv_loss_scale,
+        main_stream);
+
+    backward_grpo(inputs, targets, dloss_gpu.get<float>(),
+                  grad_accum_steps, micro_step, comm,
+                  /*per_token_grads_on_gpu=*/true);
+
+    float stats_host[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+    CUDA_CHECK(cudaMemcpyAsync(stats_host, stats_gpu.Data, 5 * sizeof(float),
+                               cudaMemcpyDeviceToHost, main_stream));
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+
+    rs.temp_free(stats_gpu);
+    rs.temp_free(dloss_gpu);
+    rs.temp_free(mask_gpu);
+    rs.temp_free(adv_gpu);
+    rs.temp_free(inf_lp_gpu);
+
+    NativeGrpoStepMetrics metrics{};
+    const float total_tokens_f = stats_host[4];
+    metrics.total_tokens = static_cast<int>(std::lround(total_tokens_f));
+    metrics.keep_tokens = static_cast<int>(std::lround(stats_host[3]));
+    if (total_tokens_f > 0.0f) {
+        metrics.policy_loss = stats_host[0] / total_tokens_f;
+        metrics.mismatch_kl = stats_host[1] / total_tokens_f;
+        metrics.is_masked = stats_host[2] / total_tokens_f;
+    }
+    return metrics;
+}
+
+// ============================================================================
 // GRPO backward pass (uses activations saved by forward_for_grpo)
 // ============================================================================
 
 void DslModel::backward_grpo(Tensor inputs, Tensor targets,
                                const float* per_token_grads_cpu,
                                int grad_accum_steps, int micro_step,
-                               NCCLCommunicator& comm) {
+                               NCCLCommunicator& comm,
+                               bool per_token_grads_on_gpu) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::backward_grpo called before allocate_run_state()");
     }
@@ -1553,9 +1672,15 @@ void DslModel::backward_grpo(Tensor inputs, Tensor targets,
     if (!lora_enabled()) {
         // No LoRA: plain backward with custom d_loss.
         // Temperature context is already set from forward_for_grpo (pass nullptr to skip re-allocation).
-        graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
-                                               comm, grad_accum_steps, micro_step, nullptr,
-                                               nullptr);
+        if (per_token_grads_on_gpu) {
+            graph_exec->backward_with_custom_dloss_gpu(inputs, targets, per_token_grads_cpu,
+                                                       comm, grad_accum_steps, micro_step, nullptr,
+                                                       nullptr);
+        } else {
+            graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
+                                                   comm, grad_accum_steps, micro_step, nullptr,
+                                                   nullptr);
+        }
     } else {
         // LoRA backward: mirror step_with_custom_loss LoRA backward path exactly.
         ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
@@ -1753,9 +1878,15 @@ void DslModel::backward_grpo(Tensor inputs, Tensor targets,
             }
         };
 
-        graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
-                                                comm, grad_accum_steps, micro_step, &hook,
-                                                nullptr);
+        if (per_token_grads_on_gpu) {
+            graph_exec->backward_with_custom_dloss_gpu(inputs, targets, per_token_grads_cpu,
+                                                       comm, grad_accum_steps, micro_step, &hook,
+                                                       nullptr);
+        } else {
+            graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
+                                                   comm, grad_accum_steps, micro_step, &hook,
+                                                   nullptr);
+        }
 
         mLoRAGrads->end_micro_step(main_stream, comm);
         internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);

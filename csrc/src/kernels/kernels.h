@@ -756,6 +756,24 @@ void fill_normal(Tensor& dest, std::size_t count, float mean, float std, unsigne
 void fill_constant(float* dst, float value, std::size_t count, cudaStream_t stream);
 void fill_constant(nv_bfloat16* dst, nv_bfloat16 value, std::size_t count, cudaStream_t stream);
 void fill_constant(Tensor& dest, float value, std::size_t count, cudaStream_t stream);
+// Build GRPO custom dloss directly on GPU from forward losses and rollout data.
+// stats (optional, length=5 FP32):
+//   [0]=policy_loss_sum, [1]=mismatch_kl_sum, [2]=masked_token_count,
+//   [3]=keep_token_count, [4]=total_token_count.
+void build_grpo_custom_dloss_and_stats(
+    const float* losses,                 // [B, T], losses[t] = -trainer_logprob_raw[t]
+    const float* inference_logprobs,     // [B, T]
+    const float* advantages,             // [B, T]
+    const std::uint8_t* loss_mask,       // [B, T], 1=completion token
+    float* out_dloss,                    // [B, T], aligned for CE backward
+    float* stats,                        // [5] or nullptr
+    int B, int T,
+    float kl_tau,
+    float adv_tau,
+    float ipo_mask_low,
+    float ipo_mask_high,
+    float inv_loss_scale,
+    cudaStream_t stream);
 // Build dense varlen offsets: cu_seqlens[i] = i * max_doc_seqlen for i in [0, num_docs].
 void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen, cudaStream_t stream);
 

@@ -13,6 +13,7 @@
 
 #include <filesystem>
 #include <cstring>
+#include <cstdint>
 #include <fmt/format.h>
 
 #include "py_train.h"
@@ -1361,6 +1362,65 @@ NB_MODULE(_surogate, m) {
         nb::arg("per_token_grads"),
         nb::arg("position_ids") = nb::none(),
         "GRPO backward pass using activations saved by forward_for_grpo().")
+        .def("step_with_native_grpo", [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+                nb::ndarray<float, nb::ndim<2>, nb::c_contig> inference_logprobs,
+                nb::ndarray<float, nb::ndim<2>, nb::c_contig> advantages,
+                nb::ndarray<std::uint8_t, nb::ndim<2>, nb::c_contig> loss_mask,
+                float kl_tau,
+                float adv_tau,
+                float ipo_mask_low,
+                float ipo_mask_high,
+                float loss_scale,
+                nb::object position_ids_obj,
+                nb::object temperatures_obj) {
+            const std::int32_t* position_ids_ptr = nullptr;
+            if (!position_ids_obj.is_none()) {
+                auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                position_ids_ptr = position_ids.data();
+            }
+            const float* temperatures_ptr = nullptr;
+            if (!temperatures_obj.is_none()) {
+                auto temperatures = nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(temperatures_obj);
+                temperatures_ptr = temperatures.data();
+            }
+            auto metrics = trainer->step_with_native_grpo(
+                input_ids.data(),
+                targets.data(),
+                inference_logprobs.data(),
+                advantages.data(),
+                loss_mask.data(),
+                kl_tau,
+                adv_tau,
+                ipo_mask_low,
+                ipo_mask_high,
+                loss_scale,
+                position_ids_ptr,
+                temperatures_ptr);
+            nb::dict ret;
+            ret["policy_loss"] = metrics.policy_loss;
+            ret["mismatch_kl"] = metrics.mismatch_kl;
+            ret["is_masked"] = metrics.is_masked;
+            ret["keep_tokens"] = metrics.keep_tokens;
+            ret["total_tokens"] = metrics.total_tokens;
+            return ret;
+        },
+        nb::arg("input_ids"),
+        nb::arg("targets"),
+        nb::arg("inference_logprobs"),
+        nb::arg("advantages"),
+        nb::arg("loss_mask"),
+        nb::arg("kl_tau"),
+        nb::arg("adv_tau"),
+        nb::arg("ipo_mask_low"),
+        nb::arg("ipo_mask_high"),
+        nb::arg("loss_scale") = 1.0f,
+        nb::arg("position_ids") = nb::none(),
+        nb::arg("temperatures") = nb::none(),
+        "Fused native GRPO micro-step: forward + GPU dloss build + backward.\n\n"
+        "Returns a metrics dict with keys: policy_loss, mismatch_kl, is_masked,\n"
+        "keep_tokens, total_tokens.")
         .def("generate", [](MultiGPUPyTrainer* trainer,
                 const std::vector<std::vector<int32_t>>& prompts,
                 int num_completions,

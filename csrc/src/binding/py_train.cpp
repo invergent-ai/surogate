@@ -1745,6 +1745,97 @@ void MultiGPUPyTrainer::backward_grpo(const float* per_token_grads) {
     ++mTrainMicroStep;
 }
 
+MultiGPUPyTrainer::NativeGrpoStepMetrics MultiGPUPyTrainer::step_with_native_grpo(
+        const std::int32_t* inputs,
+        const std::int32_t* targets,
+        const float* inference_logprobs,
+        const float* advantages,
+        const std::uint8_t* loss_mask,
+        float kl_tau,
+        float adv_tau,
+        float ipo_mask_low,
+        float ipo_mask_high,
+        float loss_scale,
+        const std::int32_t* position_ids,
+        const float* temperatures) {
+    for (int i = 0; i < (int)mContexts.size(); ++i) {
+        auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("step_with_native_grpo: ctx[{}].Model is null", i));
+        }
+        auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
+        auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+
+        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
+        } else {
+            fill_sequential_position_ids(pb, pos_planes, B, T);
+        }
+    }
+
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(fmt::format("step_with_native_grpo: micro_step {} >= grad_accumulation {}",
+                                             mTrainMicroStep, mGradAccumulation));
+    }
+
+    NativeGrpoStepMetrics result{};
+    run_work([&result, micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
+              inference_logprobs, advantages, loss_mask,
+              kl_tau, adv_tau, ipo_mask_low, ipo_mask_high, loss_scale,
+              temperatures, B = this->B, T = this->T](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("step_with_native_grpo: model is not a DslModel");
+        }
+
+        Tensor inputs_tensor = ctx.Model->get_input_buffer();
+        Tensor position_ids_tensor = ctx.Model->get_position_ids_buffer();
+        Tensor targets_tensor = ctx.Model->get_target_buffer();
+
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const float* temps_for_this_gpu = nullptr;
+        if (temperatures) {
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+        }
+
+        auto metrics = dsl_model->step_with_native_grpo(
+            inputs_tensor,
+            position_ids_tensor,
+            targets_tensor,
+            inference_logprobs,
+            advantages,
+            loss_mask,
+            kl_tau,
+            adv_tau,
+            ipo_mask_low,
+            ipo_mask_high,
+            loss_scale,
+            micro_batches,
+            micro_idx,
+            *ctx.Communicator,
+            temps_for_this_gpu);
+        if (ctx.Communicator->local_rank() == 0) {
+            result.policy_loss = metrics.policy_loss;
+            result.mismatch_kl = metrics.mismatch_kl;
+            result.is_masked = metrics.is_masked;
+            result.keep_tokens = metrics.keep_tokens;
+            result.total_tokens = metrics.total_tokens;
+        }
+    });
+
+    ++mTrainMicroStep;
+    return result;
+}
+
 MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         const std::vector<std::vector<int32_t>>& prompts,
         int num_completions,

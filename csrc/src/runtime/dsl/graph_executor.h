@@ -207,6 +207,15 @@ public:
                                      const modules::BackwardHook* hook,
                                      const float* temperatures_cpu = nullptr);
 
+    /// Same as backward_with_custom_dloss(), but per-token gradients are
+    /// already on GPU (shape [B*T], FP32).
+    void backward_with_custom_dloss_gpu(Tensor inputs, Tensor targets,
+                                        const float* per_token_grads_gpu,
+                                        NCCLCommunicator& comm,
+                                        int grad_accum_steps, int micro_step,
+                                        const modules::BackwardHook* hook,
+                                        const float* inv_temperature_gpu = nullptr);
+
     /// Execute a full-sequence prefill forward, populating the KV-cache.
     ///
     /// Runs the compiled forward graph with B sequences and T=prompt_len.
