@@ -88,16 +88,6 @@ inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
     return sm >= 89;
 }
 
-inline void log_kv_cache_dtype_once(const KVDType dtype, const cudaDeviceProp& prop) {
-    static bool logged_fp8 = false;
-    if (dtype == KVDType::FP8_E4M3 && !logged_fp8) {
-        logged_fp8 = true;
-        const int sm = prop.major * 10 + prop.minor;
-        std::fprintf(stderr, "[surogate] FP8 KV-cache enabled (SM%d).\n", sm);
-        std::fflush(stderr);
-    }
-}
-
 void validate_prompt_tokens_or_throw(const std::vector<std::vector<int32_t>>& prompts,
                                      const int vocab_size,
                                      const char* caller) {
@@ -204,7 +194,6 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     const KVDType kv_dtype =
         supports_fp8_kv_cache(mRunState.DeviceProp) ? KVDType::FP8_E4M3 : KVDType::BF16;
     const bool fp8_kv_cache = kv_dtype == KVDType::FP8_E4M3;
-    log_kv_cache_dtype_once(kv_dtype, mRunState.DeviceProp);
     PagedKVCache paged_kv;
     paged_kv.configure(M, N, num_layers, max_prompt_len, gen_config.max_gen_len,
                        Hkv, Hs, kPageBlockSize, kv_dtype);

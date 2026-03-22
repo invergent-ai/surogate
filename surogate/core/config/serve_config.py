@@ -33,8 +33,9 @@ class ServeConfig:
     gpus: int = 1
     # Maximum runtime batch capacity used by serving scheduler/generation.
     batch_size: int = 8
-    # Runtime sequence length cap used to size model buffers.
-    sequence_len: int = 4096
+    # Runtime sequence length cap used to size model buffers. If None, defaults
+    # to the model's max supported context length.
+    sequence_len: Optional[int] = None
     # Whether Hugging Face remote code is trusted during model/tokenizer load.
     trust_remote_code: bool = True
     # Optional explicit floor for runtime stack arena size in MiB.
@@ -73,7 +74,8 @@ class ServeConfig:
         self.dtype = cfg.get("dtype", self.dtype)
         self.gpus = int(cfg.get("gpus", self.gpus))
         self.batch_size = int(cfg.get("batch_size", self.batch_size))
-        self.sequence_len = int(cfg.get("sequence_len", self.sequence_len))
+        sequence_len_raw = cfg.get("sequence_len", self.sequence_len)
+        self.sequence_len = None if sequence_len_raw is None else int(sequence_len_raw)
         self.trust_remote_code = bool(
             cfg.get("trust_remote_code", self.trust_remote_code)
         )
@@ -106,8 +108,8 @@ class ServeConfig:
             raise ValueError("ServeConfig: `dtype` must be one of: bf16, fp32")
         if self.port <= 0:
             raise ValueError("ServeConfig: `port` must be > 0")
-        if self.sequence_len <= 0:
-            raise ValueError("ServeConfig: `sequence_len` must be > 0")
+        if self.sequence_len is not None and self.sequence_len <= 0:
+            raise ValueError("ServeConfig: `sequence_len` must be > 0 when set")
         if self.max_gen_len <= 0:
             raise ValueError("ServeConfig: `max_gen_len` must be > 0")
         if self.gpu_memory_utilization <= 0.0 or self.gpu_memory_utilization > 1.0:

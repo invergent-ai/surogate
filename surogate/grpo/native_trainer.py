@@ -324,7 +324,7 @@ class NativeGRPOTrainer:
             ]
             if all(sm >= 89 for sm in sms):
                 sm_list = ", ".join(f"SM{sm}" for sm in sms)
-                logger.info("[surogate] FP8 KV-cache enabled (%s, %s).", label, sm_list)
+                logger.info("FP8 KV-cache enabled (%s, %s).", label, sm_list)
         except Exception:
             # Best-effort log only.
             pass

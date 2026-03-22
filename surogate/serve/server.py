@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import json
 import math
 import os
@@ -171,8 +170,8 @@ class NativeServingRuntime:
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
-        qlora_config, prequant_method, is_moe_model = self._resolve_prequant_qlora_config(
-            model_dir
+        qlora_config, prequant_method, is_moe_model, model_max_len = (
+            self._resolve_prequant_qlora_config(model_dir)
         )
         self._is_moe_model = bool(is_moe_model)
 
@@ -186,7 +185,11 @@ class NativeServingRuntime:
         ir_json = build_dsl_ir_for_model(model_dir)
         jit_manifests = compile_jit_kernels(ir_json)
         requested_batch_size = max(1, int(config.batch_size))
-        requested_seq_len = self._resolve_effective_sequence_len(config)
+        requested_seq_len = self._resolve_effective_sequence_len(
+            config,
+            model_max_len=model_max_len,
+            tokenizer=self.tokenizer,
+        )
 
         # Prequant NVFP4 on Blackwell is most stable/fast with cuDNN FP4 backend.
         # Allow override via env for A/B testing.
@@ -271,34 +274,21 @@ class NativeServingRuntime:
             self._runtime_batch_size,
             self._runtime_seq_len,
             self.trainer,
-        ) = self._build_trainer_with_oom_retries(
+        ) = self._build_trainer(
             model_dir=model_dir,
             config=config,
             options=options,
             qlora_config=qlora_config,
             model_weights_path=model_weights_path,
-            initial_batch_size=requested_batch_size,
-            initial_seq_len=requested_seq_len,
+            batch_size=requested_batch_size,
+            seq_len=requested_seq_len,
         )
         self._log_fp8_kv_cache_default(config.gpus)
-        if (
-            self._runtime_batch_size != requested_batch_size
-            or self._runtime_seq_len != requested_seq_len
-        ):
-            logger.warning(
-                "Serve startup auto-sized capacity from batch_size=%d seq_len=%d to "
-                "batch_size=%d seq_len=%d after CUDA OOM retries.",
-                requested_batch_size,
-                requested_seq_len,
-                self._runtime_batch_size,
-                self._runtime_seq_len,
-            )
-        else:
-            logger.info(
-                "Serve startup capacity: batch_size=%d seq_len=%d",
-                self._runtime_batch_size,
-                self._runtime_seq_len,
-            )
+        logger.info(
+            "Serve startup capacity: batch_size=%d seq_len=%d",
+            self._runtime_batch_size,
+            self._runtime_seq_len,
+        )
         self._pending_lock = threading.Lock()
         self._pending_cv = threading.Condition(self._pending_lock)
         self._pending: list[PendingGeneration] = []
@@ -384,45 +374,7 @@ class NativeServingRuntime:
             # Best-effort log only.
             pass
 
-    @staticmethod
-    def _clear_cuda_allocator() -> None:
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _next_capacity_after_oom(
-        *,
-        batch_size: int,
-        seq_len: int,
-        min_seq_len: int,
-    ) -> Optional[tuple[int, int]]:
-        # First preserve completion headroom (>= max_gen_len) while shrinking seq.
-        safe_min_seq = max(128, int(min_seq_len))
-        if seq_len > safe_min_seq:
-            next_seq = max(safe_min_seq, seq_len // 2)
-            if next_seq < seq_len:
-                return batch_size, next_seq
-
-        # Then shrink parallel decode width.
-        if batch_size > 1:
-            next_batch = max(1, batch_size // 2)
-            if next_batch < batch_size:
-                return next_batch, seq_len
-
-        # Last-resort shrink below max_gen_len to allow startup on constrained VRAM.
-        if seq_len > 128:
-            next_seq = max(128, seq_len // 2)
-            if next_seq < seq_len:
-                return batch_size, next_seq
-        return None
-
-    def _build_trainer_with_oom_retries(
+    def _build_trainer(
         self,
         *,
         model_dir: str,
@@ -430,72 +382,47 @@ class NativeServingRuntime:
         options: Any,
         qlora_config: Any,
         model_weights_path: str,
-        initial_batch_size: int,
-        initial_seq_len: int,
+        batch_size: int,
+        seq_len: int,
     ) -> tuple[int, int, Any]:
-        batch_size = max(1, int(initial_batch_size))
-        seq_len = max(1, int(initial_seq_len))
-        min_seq_len = max(128, int(config.max_gen_len))
-        attempt = 0
-
-        while True:
-            options.lmhead_chunks = self._resolve_lmhead_chunks(
-                config,
-                effective_seq_len=seq_len,
+        batch_size = max(1, int(batch_size))
+        seq_len = max(1, int(seq_len))
+        options.lmhead_chunks = self._resolve_lmhead_chunks(
+            config,
+            effective_seq_len=seq_len,
+            batch_size=batch_size,
+        )
+        logger.info(
+            "Serve runtime init with batch_size=%d seq_len=%d lmhead_chunks=%d",
+            batch_size,
+            seq_len,
+            int(options.lmhead_chunks),
+        )
+        trainer = None
+        try:
+            trainer = _surogate.SurogateTrainer(
+                ngpu=config.gpus,
+                config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
+                options=options,
                 batch_size=batch_size,
+                seq_len=seq_len,
+                grad_accum=1,
+                memcpy_all_gather=True,
+                memcpy_send_recv=True,
+                qlora_config=qlora_config,
             )
-            logger.info(
-                "Serve runtime init attempt %d with batch_size=%d seq_len=%d lmhead_chunks=%d",
-                attempt + 1,
-                batch_size,
-                seq_len,
-                int(options.lmhead_chunks),
-            )
-            trainer = None
-            try:
-                trainer = _surogate.SurogateTrainer(
-                    ngpu=config.gpus,
-                    config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
-                    options=options,
-                    batch_size=batch_size,
-                    seq_len=seq_len,
-                    grad_accum=1,
-                    memcpy_all_gather=True,
-                    memcpy_send_recv=True,
-                    qlora_config=qlora_config,
-                )
-                logger.info(f"Importing weights from {model_weights_path}")
-                trainer.import_weights(model_weights_path)
-                return batch_size, seq_len, trainer
-            except RuntimeError as exc:
-                if trainer is not None:
-                    del trainer
-                if not self._is_cuda_oom_error(exc):
-                    raise
-
-                next_capacity = self._next_capacity_after_oom(
-                    batch_size=batch_size,
-                    seq_len=seq_len,
-                    min_seq_len=min_seq_len,
-                )
-                if next_capacity is None:
-                    raise RuntimeError(
-                        "Serve startup failed due to CUDA OOM even after capacity "
-                        f"reductions (batch_size={batch_size}, seq_len={seq_len}). "
-                        "Reduce --batch_size/--sequence_len or lower --gpu-memory-utilization."
-                    ) from exc
-                next_batch, next_seq = next_capacity
-                logger.warning(
-                    "Serve startup OOM at batch_size=%d seq_len=%d. Retrying with "
-                    "batch_size=%d seq_len=%d.",
-                    batch_size,
-                    seq_len,
-                    next_batch,
-                    next_seq,
-                )
-                self._clear_cuda_allocator()
-                batch_size, seq_len = next_batch, next_seq
-                attempt += 1
+            logger.info(f"Importing weights from {model_weights_path}")
+            trainer.import_weights(model_weights_path)
+            return batch_size, seq_len, trainer
+        except RuntimeError as exc:
+            if trainer is not None:
+                del trainer
+            if self._is_cuda_oom_error(exc):
+                raise RuntimeError(
+                    "Serve startup failed due to CUDA OOM "
+                    f"(batch_size={batch_size}, seq_len={seq_len}). "
+                ) from exc
+            raise
 
     @staticmethod
     def _resolve_min_stack_mb(config: ServeConfig) -> int:
@@ -538,13 +465,29 @@ class NativeServingRuntime:
         return int(auto_min_mb)
 
     @staticmethod
+    def _normalize_context_len(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return None
+        if normalized <= 0:
+            return None
+        # Ignore sentinel "infinite/unknown" tokenizer limits.
+        if normalized >= int(1e9):
+            return None
+        return normalized
+
+    @staticmethod
     def _resolve_prequant_qlora_config(model_dir: str):
-        """Auto-detect pre-quantized models and return matching QLoRAConfig."""
+        """Auto-detect pre-quantized models and return QLoRA + model metadata."""
         try:
             model_info = ModelInfo.create(model_dir)
             quant_info = model_info.quant_info or {}
             quant_method = (model_info.quant_method or "").lower()
             modules_to_not_convert = quant_info.get("modules_to_not_convert") or []
+            model_max_len = NativeServingRuntime._normalize_context_len(model_info.max_model_len)
 
             if quant_method == "prequant_fp8":
                 qlora = _surogate.QLoRAConfig.prequant_fp8()
@@ -553,7 +496,7 @@ class NativeServingRuntime:
             elif quant_method == "prequant_mxfp4":
                 qlora = _surogate.QLoRAConfig.prequant_mxfp4()
             else:
-                return None, None, bool(model_info.is_moe_model)
+                return None, None, bool(model_info.is_moe_model), model_max_len
 
             if modules_to_not_convert:
                 qlora.modules_to_not_convert = list(modules_to_not_convert)
@@ -561,14 +504,14 @@ class NativeServingRuntime:
                 "Detected pre-quantized model (%s); enabling prequant serve loading path.",
                 quant_method,
             )
-            return qlora, quant_method, bool(model_info.is_moe_model)
+            return qlora, quant_method, bool(model_info.is_moe_model), model_max_len
         except Exception as exc:
             logger.warning(
                 "Prequant auto-detection failed for %s (%s). Proceeding without prequant config.",
                 model_dir,
                 exc,
             )
-            return None, None, False
+            return None, None, False, None
 
     @staticmethod
     def _resolve_lmhead_chunks(
@@ -589,27 +532,30 @@ class NativeServingRuntime:
         return int(chunks)
 
     @staticmethod
-    def _resolve_effective_sequence_len(config: ServeConfig) -> int:
-        # Serve allocates static [B, T, ...] training-era buffers. Keep B*T within
-        # a conservative startup budget to avoid OOM, especially on single-GPU runs.
-        requested_t = max(1, int(config.sequence_len))
-        bsz = max(1, int(config.batch_size))
-        base_budget = int(os.getenv("SUROGATE_SERVE_STATIC_TOKEN_BUDGET", "8192"))
-        util_scale = float(config.gpu_memory_utilization) / 0.8
-        token_budget = max(1024, int(base_budget * max(0.5, util_scale)))
-        max_t = max(1, token_budget // bsz)
-        if requested_t > max_t:
-            logger.warning(
-                "Reducing serve seq_len from %d to %d to respect static token budget "
-                "(batch_size=%d, budget_tokens=%d). Override with --sequence_len and/or "
-                "SUROGATE_SERVE_STATIC_TOKEN_BUDGET if needed.",
-                requested_t,
-                max_t,
-                bsz,
-                token_budget,
+    def _resolve_effective_sequence_len(
+        config: ServeConfig,
+        *,
+        model_max_len: Optional[int],
+        tokenizer: Any,
+    ) -> int:
+        if config.sequence_len is not None:
+            return max(1, int(config.sequence_len))
+
+        inferred_model_max_len = NativeServingRuntime._normalize_context_len(model_max_len)
+        if inferred_model_max_len is None:
+            inferred_model_max_len = NativeServingRuntime._normalize_context_len(
+                getattr(tokenizer, "model_max_length", None)
             )
-            return int(max_t)
-        return int(requested_t)
+        if inferred_model_max_len is None:
+            raise ValueError(
+                "ServeConfig: `sequence_len` is not set and model max context length "
+                "could not be inferred. Set --sequence_len explicitly."
+            )
+        logger.info(
+            "Serve sequence_len not set; defaulting to model max context length=%d.",
+            inferred_model_max_len,
+        )
+        return inferred_model_max_len
 
     @staticmethod
     def _resolve_model_dir(model: str) -> str:
@@ -830,30 +776,6 @@ class NativeServingRuntime:
                 item.finished = True
                 item.finish_reason = "length"
 
-    def _run_continuous_step_with_oom_backoff(
-        self,
-        active: list[ActiveGeneration],
-        params: GenerationParams,
-        *,
-        step_tokens: int,
-    ) -> None:
-        cur_step_tokens = max(1, int(step_tokens))
-        while True:
-            try:
-                self._run_continuous_step(active, params, step_tokens=cur_step_tokens)
-                return
-            except RuntimeError as exc:
-                if (not self._is_cuda_oom_error(exc)) or cur_step_tokens <= 1:
-                    raise
-                next_step_tokens = max(1, cur_step_tokens // 2)
-                logger.warning(
-                    "Continuous decode OOM at step_tokens=%d; retrying with step_tokens=%d.",
-                    cur_step_tokens,
-                    next_step_tokens,
-                )
-                self._clear_cuda_allocator()
-                cur_step_tokens = next_step_tokens
-
     def _finalize_continuous_request(self, item: ActiveGeneration) -> None:
         raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
         trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
@@ -980,9 +902,7 @@ class NativeServingRuntime:
 
                 err: Optional[Exception] = None
                 try:
-                    self._run_continuous_step_with_oom_backoff(
-                        active, params, step_tokens=step_tokens
-                    )
+                    self._run_continuous_step(active, params, step_tokens=step_tokens)
                 except Exception as e:
                     err = e
 
