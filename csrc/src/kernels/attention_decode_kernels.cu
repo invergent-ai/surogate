@@ -82,7 +82,7 @@ __global__ void kv_cache_store_bf16_kernel(
         nv_bfloat16* __restrict__ k_cache,
         nv_bfloat16* __restrict__ v_cache,
         const nv_bfloat16* __restrict__ qkv_rope,
-        int T, int max_seq_len, int Hq, int Hkv, int Hs) {
+        int T, int max_seq_len, int Hq, int Hkv, int Hs, int start_pos) {
 
     const int bt_idx = blockIdx.x;  // = batch_idx * T + t
     const int head_idx = blockIdx.y;
@@ -91,6 +91,8 @@ __global__ void kv_cache_store_bf16_kernel(
 
     const int batch_idx = bt_idx / T;
     const int t = bt_idx % T;
+    const int t_abs = start_pos + t;
+    if (t_abs >= max_seq_len) return;
     const int H_total = Hq + 2 * Hkv;
 
     // Source: QKV[batch_idx, t, head, dim]
@@ -100,7 +102,7 @@ __global__ void kv_cache_store_bf16_kernel(
 
     // Dest: cache[batch_idx, t, head_idx, dim_idx]
     const long dst = static_cast<long>(batch_idx) * max_seq_len * Hkv * Hs
-                   + static_cast<long>(t) * Hkv * Hs
+                   + static_cast<long>(t_abs) * Hkv * Hs
                    + head_idx * Hs + dim_idx;
     k_cache[dst] = k_val;
     v_cache[dst] = v_val;
@@ -115,7 +117,7 @@ __global__ void kv_cache_store_paged_bf16_kernel(
         const int* __restrict__ block_table,
         int block_table_stride,
         int page_block_size,
-        int T, int Hq, int Hkv, int Hs) {
+        int T, int Hq, int Hkv, int Hs, int start_pos) {
 
     const int bt_idx = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -124,6 +126,7 @@ __global__ void kv_cache_store_paged_bf16_kernel(
 
     const int batch_idx = bt_idx / T;
     const int t = bt_idx % T;
+    const int t_abs = start_pos + t;
     const int H_total = Hq + 2 * Hkv;
     const int page_elems = page_block_size * Hkv * Hs;
 
@@ -131,8 +134,8 @@ __global__ void kv_cache_store_paged_bf16_kernel(
     const nv_bfloat16 k_val = qkv_rope[src_base + (Hq + head_idx) * Hs + dim_idx];
     const nv_bfloat16 v_val = qkv_rope[src_base + (Hq + Hkv + head_idx) * Hs + dim_idx];
 
-    const int vp = t / page_block_size;
-    const int po = t % page_block_size;
+    const int vp = t_abs / page_block_size;
+    const int po = t_abs % page_block_size;
     const int pp = block_table[batch_idx * block_table_stride + vp];
     const long dst = static_cast<long>(pp) * page_elems + po * Hkv * Hs + head_idx * Hs + dim_idx;
     k_pages[dst] = k_val;
@@ -274,12 +277,13 @@ void kv_cache_store_bf16(
         const nv_bfloat16* qkv_rope,
         int B, int T, int max_seq_len,
         int Hq, int Hkv, int Hs,
+        int start_pos,
         cudaStream_t stream) {
 
     dim3 grid(B * T, Hkv);
     dim3 block(Hs);
     kv_cache_store_bf16_kernel<<<grid, block, 0, stream>>>(
-        k_cache, v_cache, qkv_rope, T, max_seq_len, Hq, Hkv, Hs);
+        k_cache, v_cache, qkv_rope, T, max_seq_len, Hq, Hkv, Hs, start_pos);
 }
 
 void kv_cache_store_paged_bf16(
@@ -289,6 +293,7 @@ void kv_cache_store_paged_bf16(
         int page_block_size,
         int B, int T,
         int Hq, int Hkv, int Hs,
+        int start_pos,
         cudaStream_t stream) {
 
     dim3 grid(B * T, Hkv);
@@ -296,7 +301,7 @@ void kv_cache_store_paged_bf16(
     kv_cache_store_paged_bf16_kernel<<<grid, block, 0, stream>>>(
         k_pages, v_pages, qkv_rope,
         block_table, block_table_stride, page_block_size,
-        T, Hq, Hkv, Hs);
+        T, Hq, Hkv, Hs, start_pos);
 }
 
 void kv_cache_append_paged_bf16(

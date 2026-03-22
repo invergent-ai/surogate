@@ -96,6 +96,12 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     * mDecodeState->page_block_size * Hkv;
                 const std::size_t scale_layer_offset = static_cast<std::size_t>(layer_idx) * scale_layer_elems;
 
+                // Dequant must use the effective K lengths for this decode step
+                // (seq_lens + 1 after KV append), not pre-append seq_lens.
+                const int* k_lens_gpu = mDecodeState->cu_seqlens_k_gpu
+                    ? reinterpret_cast<const int*>(mDecodeState->cu_seqlens_k_gpu)
+                    : mDecodeState->seq_lens_gpu;
+
                 kv_cache_dequant_paged_fp8_to_bf16(
                     k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
                     reinterpret_cast<const __nv_fp8_e4m3*>(
@@ -104,7 +110,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset),
                     mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
                     mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
-                    mDecodeState->seq_lens_gpu,
+                    k_lens_gpu,
                     mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
                     mDecodeState->page_block_size,
                     ds_batch, msk, Hkv, Hs,
@@ -157,6 +163,12 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     static_cast<std::size_t>(ds_batch) * ds_max_seq * Hkv;
                 const std::size_t scale_layer_offset = static_cast<std::size_t>(layer_idx) * scale_layer_elems;
 
+                // Dequant must use effective K lengths for this step
+                // (seq_lens + 1 after KV append).
+                const int* k_lens_gpu = mDecodeState->cu_seqlens_k_gpu
+                    ? reinterpret_cast<const int*>(mDecodeState->cu_seqlens_k_gpu)
+                    : mDecodeState->seq_lens_gpu;
+
                 kv_cache_dequant_fp8_to_bf16(
                     k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
                     reinterpret_cast<const __nv_fp8_e4m3*>(
@@ -165,7 +177,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         reinterpret_cast<const std::byte*>(mDecodeState->v_data) + layer_offset_fp8),
                     mDecodeState->k_scales_fp8 + scale_layer_offset,
                     mDecodeState->v_scales_fp8 + scale_layer_offset,
-                    mDecodeState->seq_lens_gpu,
+                    k_lens_gpu,
                     ds_batch, ds_max_seq, Hkv, Hs,
                     mRunState.MainStream);
 

@@ -67,6 +67,10 @@ struct DecodeState {
     // normally (dispatch_flash_attention uses standard training path, NOT decode path).
     // This populates the KV-cache in O(1) model forwards instead of O(T).
     bool prefill_mode = false;
+    // Absolute token offset for chunked prefill writes.
+    // During prompt prefill with chunking, kernels receive T=chunk_len and must
+    // write at [prefill_pos_offset, prefill_pos_offset + T) in KV-cache.
+    int prefill_pos_offset = 0;
 
     // FP8 E4M3 KV-cache (SM89+).
     // When fp8=true, KV data is stored as FP8 with per-head scales.

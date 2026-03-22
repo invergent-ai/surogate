@@ -245,3 +245,88 @@ TEST_CASE("FP8 decode attention vs BF16 decode attention", "[decode][fp8][attent
     // propagates through attention. Tolerance is higher than BF16-only tests.
     REQUIRE(max_diff < 0.15f);
 }
+
+TEST_CASE("FP8 paged bulk store honors start_pos", "[decode][fp8][paged][prefill]") {
+    const int B = 1;
+    const int T = 5;
+    const int start_pos = 3;
+    const int max_seq_len = 16;
+    const int Hq = 4;
+    const int Hkv = 2;
+    const int Hs = 8;
+    const int H = Hq + 2 * Hkv;
+    const int page_block_size = 4;
+    const int max_pages_per_seq = 4;
+    const int total_pages = 6;
+
+    // Random BF16 QKV input [B, T, H, Hs]
+    const std::size_t qkv_elems = static_cast<std::size_t>(B) * T * H * Hs;
+    std::vector<float> qkv_host(qkv_elems);
+    std::mt19937 rng(314);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : qkv_host) v = dist(rng);
+    auto qkv_dev = to_bf16_device(qkv_host);
+
+    // Paged FP8 KV storage + scales
+    const std::size_t page_elems = static_cast<std::size_t>(page_block_size) * Hkv * Hs;
+    const std::size_t pool_elems = static_cast<std::size_t>(total_pages) * page_elems;
+    const std::size_t page_scale_elems = static_cast<std::size_t>(page_block_size) * Hkv;
+    const std::size_t scale_pool_elems = static_cast<std::size_t>(total_pages) * page_scale_elems;
+
+    thrust::device_vector<__nv_fp8_e4m3> k_fp8(pool_elems);
+    thrust::device_vector<__nv_fp8_e4m3> v_fp8(pool_elems);
+    thrust::device_vector<float> k_sc(scale_pool_elems, 0.0f);
+    thrust::device_vector<float> v_sc(scale_pool_elems, 0.0f);
+
+    // Virtual pages -> physical pages for seq 0.
+    std::vector<int> bt_host = {1, 2, 4, 5};
+    thrust::device_vector<int> bt_dev(bt_host.begin(), bt_host.end());
+
+    kv_cache_store_paged_fp8(
+        thrust::raw_pointer_cast(k_fp8.data()),
+        thrust::raw_pointer_cast(v_fp8.data()),
+        thrust::raw_pointer_cast(k_sc.data()),
+        thrust::raw_pointer_cast(v_sc.data()),
+        thrust::raw_pointer_cast(qkv_dev.data()),
+        thrust::raw_pointer_cast(bt_dev.data()), max_pages_per_seq,
+        page_block_size, B, T, Hq, Hkv, Hs, start_pos, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Dequantize to contiguous BF16 [B, max_seq_len, Hkv, Hs].
+    const std::size_t contig_elems = static_cast<std::size_t>(B) * max_seq_len * Hkv * Hs;
+    thrust::device_vector<nv_bfloat16> k_dq(contig_elems, __float2bfloat16(0.0f));
+    thrust::device_vector<nv_bfloat16> v_dq(contig_elems, __float2bfloat16(0.0f));
+    std::vector<int> sl_host = {start_pos + T};
+    thrust::device_vector<int> sl_dev(sl_host.begin(), sl_host.end());
+
+    kv_cache_dequant_paged_fp8_to_bf16(
+        thrust::raw_pointer_cast(k_dq.data()),
+        thrust::raw_pointer_cast(v_dq.data()),
+        thrust::raw_pointer_cast(k_fp8.data()),
+        thrust::raw_pointer_cast(v_fp8.data()),
+        thrust::raw_pointer_cast(k_sc.data()),
+        thrust::raw_pointer_cast(v_sc.data()),
+        thrust::raw_pointer_cast(sl_dev.data()),
+        thrust::raw_pointer_cast(bt_dev.data()), max_pages_per_seq,
+        page_block_size, B, max_seq_len, Hkv, Hs, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto k_dq_h = from_bf16_device(k_dq);
+
+    float max_rel_err = 0.0f;
+    for (int t = 0; t < T; ++t) {
+        const int abs_t = start_pos + t;
+        for (int h = 0; h < Hkv; ++h) {
+            for (int d = 0; d < Hs; ++d) {
+                const float ref = qkv_host[static_cast<std::size_t>(t * H * Hs + (Hq + h) * Hs + d)];
+                const float got = k_dq_h[static_cast<std::size_t>(abs_t * Hkv * Hs + h * Hs + d)];
+                const float rel_err = std::abs(ref) > 0.01f
+                    ? std::abs(got - ref) / std::abs(ref)
+                    : std::abs(got - ref);
+                max_rel_err = std::max(max_rel_err, rel_err);
+            }
+        }
+    }
+    INFO("FP8 paged bulk start_pos max rel error: " << max_rel_err);
+    REQUIRE(max_rel_err < 0.2f);
+}

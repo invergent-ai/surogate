@@ -786,7 +786,7 @@ TEST_CASE("Bulk KV store matches sequential append", "[decode][prefill]") {
         thrust::raw_pointer_cast(k_bulk.data()),
         thrust::raw_pointer_cast(v_bulk.data()),
         thrust::raw_pointer_cast(qkv_dev.data()),
-        B, T, max_seq_len, Hq, Hkv, Hs, nullptr);
+        B, T, max_seq_len, Hq, Hkv, Hs, /*start_pos=*/0, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // === Path B: sequential append, one token at a time ===
@@ -878,7 +878,7 @@ TEST_CASE("Paged bulk KV store matches sequential append", "[decode][prefill][pa
         thrust::raw_pointer_cast(qkv_dev.data()),
         thrust::raw_pointer_cast(bt_dev.data()),
         max_pages_per_seq, page_block_size,
-        B, T, Hq, Hkv, Hs, nullptr);
+        B, T, Hq, Hkv, Hs, /*start_pos=*/0, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // === Path B: sequential paged append ===
@@ -922,6 +922,87 @@ TEST_CASE("Paged bulk KV store matches sequential append", "[decode][prefill][pa
         }
     }
     INFO("Paged bulk vs sequential K diff: " << max_k_diff << ", V diff: " << max_v_diff);
+    REQUIRE(max_k_diff == 0.0f);
+    REQUIRE(max_v_diff == 0.0f);
+}
+
+TEST_CASE("Paged bulk KV store honors start_pos", "[decode][prefill][paged]") {
+    const int B = 1;
+    const int T = 6;
+    const int start_pos = 3;
+    const int Hq = 4;
+    const int Hkv = 2;
+    const int Hs = 8;
+    const int H = Hq + 2 * Hkv;
+    const int page_block_size = 4;
+    const int total_pages = 6;
+    const int max_pages_per_seq = 4;
+
+    const std::size_t qkv_total = static_cast<std::size_t>(B) * T * H * Hs;
+    std::vector<float> qkv_host(qkv_total);
+    std::mt19937 rng(137);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : qkv_host) v = dist(rng);
+    auto qkv_dev = to_bf16_device(qkv_host);
+
+    const std::size_t page_elems = static_cast<std::size_t>(page_block_size) * Hkv * Hs;
+    const std::size_t pool_elems = static_cast<std::size_t>(total_pages) * page_elems;
+
+    // Block table: seq 0 virtual pages [0..3] -> physical pages [1,2,4,5]
+    std::vector<int> bt_host = {1, 2, 4, 5};
+    thrust::device_vector<int> bt_dev(bt_host.begin(), bt_host.end());
+
+    thrust::device_vector<nv_bfloat16> k_bulk(pool_elems, __float2bfloat16(0.0f));
+    thrust::device_vector<nv_bfloat16> v_bulk(pool_elems, __float2bfloat16(0.0f));
+    thrust::device_vector<nv_bfloat16> k_seq(pool_elems, __float2bfloat16(0.0f));
+    thrust::device_vector<nv_bfloat16> v_seq(pool_elems, __float2bfloat16(0.0f));
+
+    kv_cache_store_paged_bf16(
+        thrust::raw_pointer_cast(k_bulk.data()),
+        thrust::raw_pointer_cast(v_bulk.data()),
+        thrust::raw_pointer_cast(qkv_dev.data()),
+        thrust::raw_pointer_cast(bt_dev.data()),
+        max_pages_per_seq, page_block_size,
+        B, T, Hq, Hkv, Hs, start_pos, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Sequential baseline at absolute positions [start_pos, start_pos + T).
+    for (int t = 0; t < T; ++t) {
+        std::vector<float> tok_qkv(static_cast<std::size_t>(H * Hs));
+        for (int h = 0; h < H; ++h) {
+            for (int d = 0; d < Hs; ++d) {
+                tok_qkv[static_cast<std::size_t>(h * Hs + d)] =
+                    qkv_host[static_cast<std::size_t>(t * H * Hs + h * Hs + d)];
+            }
+        }
+        auto tok_dev = to_bf16_device(tok_qkv);
+
+        std::vector<int> sl = {start_pos + t};
+        thrust::device_vector<int> sl_dev(sl.begin(), sl.end());
+
+        kv_cache_append_paged_bf16(
+            thrust::raw_pointer_cast(k_seq.data()),
+            thrust::raw_pointer_cast(v_seq.data()),
+            thrust::raw_pointer_cast(tok_dev.data()),
+            thrust::raw_pointer_cast(sl_dev.data()),
+            thrust::raw_pointer_cast(bt_dev.data()),
+            max_pages_per_seq, page_block_size,
+            B, Hq, Hkv, Hs, nullptr);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto k_bulk_h = from_bf16_device(k_bulk);
+    auto v_bulk_h = from_bf16_device(v_bulk);
+    auto k_seq_h = from_bf16_device(k_seq);
+    auto v_seq_h = from_bf16_device(v_seq);
+
+    float max_k_diff = 0.0f, max_v_diff = 0.0f;
+    for (std::size_t i = 0; i < pool_elems; ++i) {
+        max_k_diff = std::max(max_k_diff, std::abs(k_bulk_h[i] - k_seq_h[i]));
+        max_v_diff = std::max(max_v_diff, std::abs(v_bulk_h[i] - v_seq_h[i]));
+    }
+    INFO("Paged start_pos bulk vs sequential K diff: " << max_k_diff
+         << ", V diff: " << max_v_diff);
     REQUIRE(max_k_diff == 0.0f);
     REQUIRE(max_v_diff == 0.0f);
 }

@@ -84,15 +84,21 @@ struct NCCLCommunicator::CommandBuffer
  * @param rank Global rank in the NCCL communicator (0 to world-1).
  * @param world Total number of ranks in the communicator.
  * @param nccl_id Pointer to an ncclUniqueId shared across all ranks.
- * @param local_device CUDA device index to use (defaults to rank for single-node).
+ * @param local_rank Dense local rank [0..num_local_gpus-1] (defaults to rank).
+ * @param local_device CUDA device index to use (defaults to local_rank).
  *
  * @throws std::runtime_error If NCCL initialization fails.
  */
-NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id, int local_device) :
-    mRank(rank), mWorld(world), mLocalRank(local_device >= 0 ? local_device : rank), mNcclComm(nullptr), mCmdBuf(std::make_unique<CommandBuffer>())
+NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id, int local_rank, int local_device) :
+    mRank(rank),
+    mWorld(world),
+    mLocalRank(local_rank >= 0 ? local_rank : rank),
+    mDeviceIndex(local_device >= 0 ? local_device : (local_rank >= 0 ? local_rank : rank)),
+    mNcclComm(nullptr),
+    mCmdBuf(std::make_unique<CommandBuffer>())
 {
-    // Use local_device for CUDA device selection (supports multi-node where device != global rank)
-    CUDA_CHECK(cudaSetDevice(mLocalRank));
+    // Use physical device index for CUDA context selection.
+    CUDA_CHECK(cudaSetDevice(mDeviceIndex));
     ncclCheck(ncclCommInitRank(&mNcclComm, mWorld, *reinterpret_cast<const ncclUniqueId*>(nccl_id), mRank));
 
     // must be created _after_ we set the device
@@ -864,7 +870,8 @@ public:
     /**
      * @brief Construct a communicator for a given local rank.
      *
-     * @param local_rank Thread/rank index within this node (also used as CUDA device index).
+     * @param local_rank Thread/rank index within this node.
+     * @param local_device CUDA device index for this local rank.
      * @param global_rank Global rank across all nodes.
      * @param global_world Total number of GPUs across all nodes.
      * @param memcpy_allgather If true, all-gather may be implemented via host-coordinated D2D memcpy.
@@ -872,7 +879,7 @@ public:
      * @param nccl_id Pointer to shared ncclUniqueId used for ncclCommInitRank.
      * @param state Shared synchronization/exchange state shared by all local ranks.
      */
-    NCCLCommunicatorImpl(int local_rank, int global_rank, int global_world,
+    NCCLCommunicatorImpl(int local_rank, int local_device, int global_rank, int global_world,
                          bool memcpy_allgather, bool memcpy_send_recv,
                          const void* nccl_id, std::shared_ptr<SharedState> state);
 
@@ -963,10 +970,10 @@ private:
 };
 
 NCCLCommunicatorImpl::NCCLCommunicatorImpl(
-    int local_rank, int global_rank, int global_world,
+    int local_rank, int local_device, int global_rank, int global_world,
     bool memcpy_allgather, bool memcpy_send_recv,
     const void* nccl_id, std::shared_ptr<SharedState> state)
-    : NCCLCommunicator(global_rank, global_world, nccl_id, local_rank)  // Pass local_rank as device
+    : NCCLCommunicator(global_rank, global_world, nccl_id, local_rank, local_device)
     , mShare(std::move(state))
     , mLocalRank(local_rank)
     , mAllGatherUseMemcpy(memcpy_allgather)
@@ -1313,7 +1320,6 @@ launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_rec
     if (ngpus > gpus_available) {
         throw std::runtime_error(fmt::format("Requested {} GPUs, but only {} available", ngpus, gpus_available));
     }
-
     // Generate NCCL unique ID
     ncclUniqueId nccl_id;
     ncclCheck(ncclGetUniqueId(&nccl_id));
@@ -1332,13 +1338,14 @@ launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_rec
     threads.reserve(ngpus);
 
     for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
+        const int local_device = local_rank;
         threads.emplace_back([=]() {
             try {
                 if (!set_cpu_affinity()) {
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
                 }
 
-                NCCLCommunicatorImpl comm(local_rank, local_rank, ngpus,
+                NCCLCommunicatorImpl comm(local_rank, local_device, local_rank, ngpus,
                                           memcpy_allgather, memcpy_send_recv,
                                           &nccl_id, shared_state);
                 work(comm);
@@ -1416,7 +1423,6 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     if (ngpus > gpus_available) {
         throw std::runtime_error(fmt::format("Requested {} GPUs, but only {} available", ngpus, gpus_available));
     }
-
     // Validate parameters
     if (node_rank < 0 || node_rank >= num_nodes) {
         throw std::runtime_error(fmt::format("Invalid node_rank {} for num_nodes {}", node_rank, num_nodes));
@@ -1444,7 +1450,7 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     shared_state->NodeRank = node_rank;
     shared_state->LocalGPUs = ngpus;
 
-    // Allocate staging buffers on device 0 for host gather/all-gather operations
+    // Allocate staging buffers on local device 0.
     CUDA_CHECK(cudaSetDevice(0));
     size_t send_size = NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize * ngpus;
     size_t recv_size = NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize * global_world;
@@ -1469,6 +1475,7 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     threads.reserve(ngpus);
 
     for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
+        const int local_device = local_rank;
         int global_rank = node_rank * ngpus + local_rank;
 
         threads.emplace_back([=]() {
@@ -1477,7 +1484,7 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
                 }
 
-                NCCLCommunicatorImpl comm(local_rank, global_rank, global_world,
+                NCCLCommunicatorImpl comm(local_rank, local_device, global_rank, global_world,
                                           memcpy_allgather, memcpy_send_recv,
                                           &owned_nccl_id, shared_state);
 

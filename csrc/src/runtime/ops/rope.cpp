@@ -71,18 +71,40 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
                     static_cast<std::size_t>(mDecodeState->total_pages)
                     * mDecodeState->page_block_size * ds_Hkv * ds_Hs * elem_size;
                 const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
+                if (mDecodeState->fp8) {
+                    const std::size_t scale_layer_elems =
+                        static_cast<std::size_t>(mDecodeState->total_pages)
+                        * mDecodeState->page_block_size * ds_Hkv;
+                    const std::size_t scale_layer_offset =
+                        static_cast<std::size_t>(layer_idx) * scale_layer_elems;
 
-                auto* k_pool = reinterpret_cast<nv_bfloat16*>(
-                    reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
-                auto* v_pool = reinterpret_cast<nv_bfloat16*>(
-                    reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+                    kv_cache_store_paged_fp8(
+                        reinterpret_cast<__nv_fp8_e4m3*>(
+                            reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset),
+                        reinterpret_cast<__nv_fp8_e4m3*>(
+                            reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset),
+                        mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                        mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
+                        out.get<nv_bfloat16>(),
+                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                        mDecodeState->page_block_size,
+                        ds_batch, ds_T, Hq, ds_Hkv, ds_Hs,
+                        mDecodeState->prefill_pos_offset,
+                        mRunState.MainStream);
+                } else {
+                    auto* k_pool = reinterpret_cast<nv_bfloat16*>(
+                        reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+                    auto* v_pool = reinterpret_cast<nv_bfloat16*>(
+                        reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
 
-                kv_cache_store_paged_bf16(
-                    k_pool, v_pool, out.get<nv_bfloat16>(),
-                    mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
-                    mDecodeState->page_block_size,
-                    ds_batch, ds_T, Hq, ds_Hkv, ds_Hs,
-                    mRunState.MainStream);
+                    kv_cache_store_paged_bf16(
+                        k_pool, v_pool, out.get<nv_bfloat16>(),
+                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                        mDecodeState->page_block_size,
+                        ds_batch, ds_T, Hq, ds_Hkv, ds_Hs,
+                        mDecodeState->prefill_pos_offset,
+                        mRunState.MainStream);
+                }
             } else {
                 const int ds_max_seq = mDecodeState->max_seq_len;
                 const std::size_t layer_stride_bytes =
@@ -97,6 +119,7 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
                 kv_cache_store_bf16(
                     k_layer, v_layer, out.get<nv_bfloat16>(),
                     ds_batch, ds_T, ds_max_seq, Hq, ds_Hkv, ds_Hs,
+                    mDecodeState->prefill_pos_offset,
                     mRunState.MainStream);
             }
         }

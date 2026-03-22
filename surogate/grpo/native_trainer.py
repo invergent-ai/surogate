@@ -54,6 +54,7 @@ class NativeGRPOTrainer:
                 If provided, overrides config.reward settings.
         """
         self.config = config
+        total_gpus = int(config.gpus)
 
         # --- Tokenizer ---
         logger.info(f"Loading tokenizer for {config.model}")
@@ -153,14 +154,17 @@ class NativeGRPOTrainer:
             lora_config.alpha = config.lora_alpha
 
         # --- Create C++ trainer ---
+        model_pretrained_config = _surogate.PretrainedConfig.from_pretrained(
+            config.model_dir, to_surogate_dtype(config.torch_dtype)
+        )
         logger.info(
-            f"Creating native GRPO trainer for {config.model} ({config.gpus} GPUs)"
+            "Creating native GRPO trainer for %s (%d GPUs)",
+            config.model,
+            total_gpus,
         )
         self.trainer = _surogate.SurogateTrainer(
-            ngpu=config.gpus,
-            config=_surogate.PretrainedConfig.from_pretrained(
-                config.model_dir, to_surogate_dtype(config.torch_dtype)
-            ),
+            ngpu=total_gpus,
+            config=model_pretrained_config,
             options=options,
             batch_size=config.per_device_train_batch_size,
             seq_len=config.sequence_len,
@@ -170,8 +174,12 @@ class NativeGRPOTrainer:
             lora_config=lora_config,
             qlora_config=config.qlora_config,
         )
-        # Serialize low-level trainer API calls across producer/consumer threads.
+        # Serialize low-level trainer API calls.
         self._trainer_call_lock = threading.Lock()
+        self._log_fp8_kv_cache_default(
+            label="native-grpo",
+            ngpu=total_gpus,
+        )
 
         # --- Pad logprob for position 0 ---
         self._pad_logprob = None
@@ -256,7 +264,7 @@ class NativeGRPOTrainer:
 
             logger.info(f"Loading teacher model: {config.teacher_model}")
             self._teacher_trainer = _surogate.SurogateTrainer(
-                ngpu=config.gpus,
+                ngpu=total_gpus,
                 config=_surogate.PretrainedConfig.from_pretrained(
                     teacher_dir, to_surogate_dtype(config.torch_dtype)
                 ),
@@ -298,6 +306,28 @@ class NativeGRPOTrainer:
                 self._eval_envs.append(env)
                 self._eval_env_names.append(env_name)
                 logger.info(f"Loaded eval env '{env_name}'")
+
+    @staticmethod
+    def _log_fp8_kv_cache_default(label: str, ngpu: int) -> None:
+        try:
+            infos = _surogate.SystemInfo.get_gpu_info()
+            if not infos:
+                return
+            count = max(1, int(ngpu))
+            selected = infos[:count]
+            if not selected:
+                return
+            sms = [
+                int(info.compute_capability_major) * 10
+                + int(info.compute_capability_minor)
+                for info in selected
+            ]
+            if all(sm >= 89 for sm in sms):
+                sm_list = ", ".join(f"SM{sm}" for sm in sms)
+                logger.info("[surogate] FP8 KV-cache enabled (%s, %s).", label, sm_list)
+        except Exception:
+            # Best-effort log only.
+            pass
 
     # ========================================================================
     # Generation
@@ -534,29 +564,16 @@ class NativeGRPOTrainer:
         )
         return self._finalize_single_turn_payload(prepared, step)
 
-    def _prepare_single_turn_payload(
-        self,
-        prompts: list[str],
-        step: int,
-        prompt_token_ids: list[list[int]] | None = None,
-        start_next_prefetch: Callable[[], None] | None = None,
-    ) -> dict:
-        """Prepare a single-turn batch through rollout + scoring + advantages."""
+    def _prepare_rollout_training_payload(self, prompts: list[str], rollout: dict) -> dict:
+        """Score, filter and compute advantages for a generated rollout."""
         config = self.config
         num_completions = config.generation.num_completions
 
-        rollout = self.generate_rollout(
-            prompts, step, prompt_token_ids=prompt_token_ids
-        )
         all_tokens = rollout["all_tokens"]
         all_logprobs = rollout["logprobs"]
         prompt_lens_list = rollout["prompt_lens"]
         completion_lens_list = rollout["completion_lens"]
         total = len(all_tokens)
-
-        # Reward provider is thread-safe; prefetch can start during scoring.
-        if start_next_prefetch is not None:
-            start_next_prefetch()
 
         score_start = time.time()
         rewards = self.reward_provider.score(
@@ -595,7 +612,6 @@ class NativeGRPOTrainer:
 
         return {
             "prompts": prompts,
-            "rollout": rollout,
             "rewards": rewards,
             "advantages": advantages,
             "all_tokens": all_tokens,
@@ -606,6 +622,26 @@ class NativeGRPOTrainer:
             "filter_metrics": filter_metrics,
             "score_time": score_time,
         }
+
+    def _prepare_single_turn_payload(
+        self,
+        prompts: list[str],
+        step: int,
+        prompt_token_ids: list[list[int]] | None = None,
+        start_next_prefetch: Callable[[], None] | None = None,
+    ) -> dict:
+        """Prepare a single-turn batch through rollout + scoring + advantages."""
+        rollout = self.generate_rollout(
+            prompts, step, prompt_token_ids=prompt_token_ids
+        )
+
+        # Reward provider is thread-safe; prefetch can start during scoring.
+        if start_next_prefetch is not None:
+            start_next_prefetch()
+
+        prepared = self._prepare_rollout_training_payload(prompts, rollout)
+        prepared["rollout"] = rollout
+        return prepared
 
     def _finalize_single_turn_payload(self, prepared: dict, step: int) -> dict:
         """Finalize a prepared single-turn batch via train + optimizer + metrics."""
@@ -823,7 +859,7 @@ class NativeGRPOTrainer:
 
         config = self.config
         seq_len = config.sequence_len
-        ngpu = config.gpus
+        ngpu = int(self.trainer.world_size)
         loss_config = config.loss or GRPOLossConfig()
         total = len(all_tokens)
 
@@ -1028,7 +1064,8 @@ class NativeGRPOTrainer:
             adamw_epsilon=config.adamw_epsilon,
         )
         with self._trainer_call_lock:
-            return self.trainer.update_with_config(opt_config, step + 1)
+            result = self.trainer.update_with_config(opt_config, step + 1)
+        return result
 
     @staticmethod
     def _build_metrics(
@@ -1169,18 +1206,19 @@ class NativeGRPOTrainer:
             # Guard temperature: use small value for near-greedy instead of exact 0
             gen_temp = max(temperature, 1e-6)
 
-            tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
-                prompts=prompt_token_ids,
-                num_completions=rollouts_per,
-                max_gen_len=max_gen_len,
-                temperature=gen_temp,
-                eos_token_id=self.eos_id,
-                use_lora=self.config.lora,
-                use_cuda_graphs=True,
-                top_k=0,
-                top_p=1.0,
-                prefill_chunk_size=gen_config.prefill_chunk_size,
-            )
+            with self._trainer_call_lock:
+                tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
+                    prompts=prompt_token_ids,
+                    num_completions=rollouts_per,
+                    max_gen_len=max_gen_len,
+                    temperature=gen_temp,
+                    eos_token_id=self.eos_id,
+                    use_lora=self.config.lora,
+                    use_cuda_graphs=True,
+                    top_k=0,
+                    top_p=1.0,
+                    prefill_chunk_size=gen_config.prefill_chunk_size,
+                )
 
             # Decode completions
             total = len(tokens)
@@ -1254,7 +1292,8 @@ class NativeGRPOTrainer:
         step_dir.mkdir(parents=True, exist_ok=True)
 
         # Save C++ trainer state
-        self.trainer.save_checkpoint(str(step_dir), step)
+        with self._trainer_call_lock:
+            self.trainer.save_checkpoint(str(step_dir), step)
 
         # Save Python state
         state = {
@@ -1294,7 +1333,8 @@ class NativeGRPOTrainer:
                 resume_step = 0
 
         # Load C++ trainer state
-        self.trainer.load_checkpoint(str(ckpt_dir), resume_step)
+        with self._trainer_call_lock:
+            self.trainer.load_checkpoint(str(ckpt_dir), resume_step)
         logger.info(f"Resumed from checkpoint at step {resume_step} ({ckpt_dir})")
 
         return resume_step + 1  # Start from the next step
@@ -1352,7 +1392,7 @@ class NativeGRPOTrainer:
 
         logger.info("Starting native GRPO training")
         logger.info(f"  Model: {config.model}")
-        logger.info(f"  GPUs: {config.gpus}")
+        logger.info(f"  GPUs (total): {config.gpus}")
         logger.info(f"  Sequence length: {config.sequence_len}")
         logger.info(f"  Problems per step: {problems_per_step}")
         logger.info(
@@ -1374,7 +1414,6 @@ class NativeGRPOTrainer:
                 f"ipo_mask_low={config.loss.ipo_mask_low}, "
                 f"ipo_mask_high={config.loss.ipo_mask_high}"
             )
-
         # Ensure output dir exists
         Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 

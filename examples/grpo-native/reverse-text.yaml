@@ -7,7 +7,7 @@
 #   surogate grpo-native examples/grpo-native/reverse-text.yaml
 
 model: ./reverse-text-qwen3-2
-output_dir: ./grpo-native-reverse-text
+output_dir: ./output-grpo-native-reverse-text
 
 # Training
 gpus: 1

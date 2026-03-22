@@ -4,6 +4,7 @@
 #include "runtime/infer/generation_engine.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -79,6 +80,22 @@ inline int resolve_prefill_chunk_size(
         return max_prefill_len;
     }
     return std::max(1, std::min(gen_config.prefill_chunk_size, max_prefill_len));
+}
+
+inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
+    // FP8 E4M3 KV kernels require FP8-capable Tensor Cores (SM89+).
+    const int sm = prop.major * 10 + prop.minor;
+    return sm >= 89;
+}
+
+inline void log_kv_cache_dtype_once(const KVDType dtype, const cudaDeviceProp& prop) {
+    static bool logged_fp8 = false;
+    if (dtype == KVDType::FP8_E4M3 && !logged_fp8) {
+        logged_fp8 = true;
+        const int sm = prop.major * 10 + prop.minor;
+        std::fprintf(stderr, "[surogate] FP8 KV-cache enabled (SM%d).\n", sm);
+        std::fflush(stderr);
+    }
 }
 
 void validate_prompt_tokens_or_throw(const std::vector<std::vector<int32_t>>& prompts,
@@ -184,9 +201,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     // Allocate paged KV-cache for M×N sequences with shared prefix pages
     // ========================================================================
     constexpr int kPageBlockSize = 256;
+    const KVDType kv_dtype =
+        supports_fp8_kv_cache(mRunState.DeviceProp) ? KVDType::FP8_E4M3 : KVDType::BF16;
+    const bool fp8_kv_cache = kv_dtype == KVDType::FP8_E4M3;
+    log_kv_cache_dtype_once(kv_dtype, mRunState.DeviceProp);
     PagedKVCache paged_kv;
     paged_kv.configure(M, N, num_layers, max_prompt_len, gen_config.max_gen_len,
-                       Hkv, Hs, kPageBlockSize, KVDType::BF16);
+                       Hkv, Hs, kPageBlockSize, kv_dtype);
     paged_kv.allocate(arena);
 
     // ========================================================================
@@ -399,8 +420,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         // Prefill decode state (B=1, paged, prefill_mode=true)
         infer::DecodeState prompt_ds{};
         prompt_ds.paged = true;
+        prompt_ds.fp8 = fp8_kv_cache;
         prompt_ds.k_pages = paged_kv.k_pages;
         prompt_ds.v_pages = paged_kv.v_pages;
+        prompt_ds.k_scales = paged_kv.k_scales;
+        prompt_ds.v_scales = paged_kv.v_scales;
+        prompt_ds.k_scales_paged_fp8 = paged_kv.k_scales;
+        prompt_ds.v_scales_paged_fp8 = paged_kv.v_scales;
         prompt_ds.per_pool_bytes = paged_kv.per_pool_bytes();
         prompt_ds.block_table_gpu = prefill_block_table_gpu;
         prompt_ds.block_table_stride = paged_kv.max_pages_per_seq;
@@ -414,6 +440,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         prompt_ds.recurrent_state_bytes = &prompt_recurrent_state_bytes;
         prompt_ds.conv_states = &prompt_conv_states;
         prompt_ds.conv_state_bytes = &prompt_conv_state_bytes;
+        prompt_ds.prefill_pos_offset = 0;
         // prefill_mode is set by execute_prefill()
 
         const int prefill_start = shared_full_pages * kPageBlockSize;
@@ -427,6 +454,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
                         prompt[static_cast<std::size_t>(absolute_t)];
                     prefill_pos_chunk[static_cast<std::size_t>(t)] = absolute_t;
                 }
+                prompt_ds.prefill_pos_offset = chunk_start;
 
                 graph_executor.execute_prefill(
                     1L, static_cast<long>(chunk_len),
@@ -562,8 +590,13 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     decode_state.conv_states = &grpo_conv_states;
     decode_state.conv_state_bytes = &grpo_conv_state_bytes;
     decode_state.paged = true;
+    decode_state.fp8 = fp8_kv_cache;
     decode_state.k_pages = paged_kv.k_pages;
     decode_state.v_pages = paged_kv.v_pages;
+    decode_state.k_scales = paged_kv.k_scales;
+    decode_state.v_scales = paged_kv.v_scales;
+    decode_state.k_scales_paged_fp8 = paged_kv.k_scales;
+    decode_state.v_scales_paged_fp8 = paged_kv.v_scales;
     decode_state.per_pool_bytes = paged_kv.per_pool_bytes();
     decode_state.block_table_gpu = paged_kv.block_table_gpu;
     decode_state.block_table_stride = paged_kv.max_pages_per_seq;
@@ -577,6 +610,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     decode_state.finished_gpu = grpo_finished_gpu;
     decode_state.logits_out_gpu = logits_gpu;
     decode_state.vocab_size = V;
+    decode_state.prefill_pos_offset = 0;
 
     // Set initial last_tokens to the last token of each prompt
     {

@@ -173,12 +173,14 @@ void count_active_sequences(
 /// @param B, T         Batch size and sequence length of the QKV
 /// @param max_seq_len  Max sequence length capacity of the cache
 /// @param Hq, Hkv, Hs Head dimensions
+/// @param start_pos    Absolute token offset for chunked prefill writes
 /// @param stream       CUDA stream
 void kv_cache_store_bf16(
     nv_bfloat16* k_cache, nv_bfloat16* v_cache,
     const nv_bfloat16* qkv_rope,
     int B, int T, int max_seq_len,
     int Hq, int Hkv, int Hs,
+    int start_pos,
     cudaStream_t stream);
 
 /// Bulk-store K/V into paged KV-cache during prefill.
@@ -189,11 +191,25 @@ void kv_cache_store_paged_bf16(
     int page_block_size,
     int B, int T,
     int Hq, int Hkv, int Hs,
+    int start_pos,
     cudaStream_t stream);
 
 // ============================================================================
 // FP8 E4M3 KV-cache kernels (SM89+)
 // ============================================================================
+
+/// Bulk-store all T positions of K/V from BF16 QKV into paged FP8 KV-cache.
+/// Quantizes per-head/per-position and writes FP8 data + FP32 scales.
+void kv_cache_store_paged_fp8(
+    __nv_fp8_e4m3* k_pages_fp8, __nv_fp8_e4m3* v_pages_fp8,
+    float* k_scales, float* v_scales,
+    const nv_bfloat16* qkv_rope,
+    const int* block_table, int block_table_stride,
+    int page_block_size,
+    int batch_size, int T,
+    int Hq, int Hkv, int Hs,
+    int start_pos,
+    cudaStream_t stream);
 
 /// Append K/V to FP8 KV-cache from BF16 QKV, quantizing on-the-fly.
 ///
@@ -240,14 +256,15 @@ void kv_cache_append_paged_fp8(
 /// @param v_cache_fp8   Input V [B, max_seq_len, Hkv, Hs] (FP8 E4M3)
 /// @param k_scales      Per-head scales [B, max_seq_len, Hkv] (FP32)
 /// @param v_scales      Per-head scales [B, max_seq_len, Hkv] (FP32)
-/// @param seq_lens_gpu  Per-batch K lengths [B] (only dequant valid positions)
+/// @param seqused_k_gpu Per-batch K lengths [B] for the current decode step
+///                      (typically seq_lens + 1 after KV append).
 /// @param batch_size, max_seq_len, Hkv, Hs
 /// @param stream        CUDA stream
 void kv_cache_dequant_fp8_to_bf16(
     nv_bfloat16* k_out_bf16, nv_bfloat16* v_out_bf16,
     const __nv_fp8_e4m3* k_cache_fp8, const __nv_fp8_e4m3* v_cache_fp8,
     const float* k_scales, const float* v_scales,
-    const int* seq_lens_gpu,
+    const int* seqused_k_gpu,
     int batch_size, int max_seq_len,
     int Hkv, int Hs,
     cudaStream_t stream);
@@ -257,7 +274,7 @@ void kv_cache_dequant_paged_fp8_to_bf16(
     nv_bfloat16* k_out_bf16, nv_bfloat16* v_out_bf16,
     const __nv_fp8_e4m3* k_pages_fp8, const __nv_fp8_e4m3* v_pages_fp8,
     const float* k_scales, const float* v_scales,
-    const int* seq_lens_gpu,
+    const int* seqused_k_gpu,
     const int* block_table, int block_table_stride,
     int page_block_size,
     int batch_size, int max_seq_len,

@@ -40,7 +40,7 @@ public:
 
 class NCCLCommunicator {
 public:
-    NCCLCommunicator(int rank, int world, const void* nccl_id, int local_device = -1);
+    NCCLCommunicator(int rank, int world, const void* nccl_id, int local_rank = -1, int local_device = -1);
     virtual ~NCCLCommunicator();
 
     // Cpu-side barrier (includes cross-node sync if multi-node)
@@ -72,6 +72,7 @@ public:
     [[nodiscard]] int rank() const { return mRank; }
     [[nodiscard]] int world_size() const { return mWorld; }
     [[nodiscard]] int local_rank() const { return mLocalRank; }
+    [[nodiscard]] int device_index() const { return mDeviceIndex; }
     [[nodiscard]] virtual int num_nodes() const { return 1; }
     [[nodiscard]] virtual int node_rank() const { return 0; }
     [[nodiscard]] virtual int num_local_gpus() const { return mWorld; }
@@ -169,7 +170,8 @@ public:
      * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
      * @param work Callable invoked once per GPU with that GPU's communicator.
      */
-    static void run_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+    static void run_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
+                                  std::function<void(NCCLCommunicator& comm)> work);
 
     /**
      * @brief Launch communicator threads and return a joinable pack (non-blocking).
@@ -183,7 +185,9 @@ public:
      * @param work Callable invoked once per GPU with that GPU's communicator.
      * @return Joinable pack that can be used to wait for completion.
      */
-    static std::unique_ptr<CommunicatorThreadsPack> launch_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+    static std::unique_ptr<CommunicatorThreadsPack> launch_communicators(
+        int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
+        std::function<void(NCCLCommunicator& comm)> work);
 
     /**
      * @brief Launch communicator threads with externally-provided NCCL IDs (for Ray multi-node).
@@ -242,7 +246,8 @@ private:
     ncclComm_t mNcclComm;
     int mRank;
     int mWorld;
-    int mLocalRank;  // Local device index (same as rank for single-node, device index for multi-node)
+    int mLocalRank;     // Dense local rank [0..num_local_gpus-1]
+    int mDeviceIndex;   // Physical CUDA device index
 
     // EP process group state (initialized by init_ep_groups())
     int mEPSize = 1;

@@ -255,10 +255,10 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
     mIsRunning = false;
 
     // make sure all work has finished
-    // Use local_rank() for cudaSetDevice, and don't throw from destructor
+    // Use communicator device index for cudaSetDevice, and don't throw from destructor
     for(auto& ctx : mContexts) {
         if(ctx.Communicator) {
-            cudaError_t err = cudaSetDevice(ctx.Communicator->local_rank());
+            cudaError_t err = cudaSetDevice(ctx.Communicator->device_index());
             if (err == cudaSuccess) {
                 cudaDeviceSynchronize();
             }

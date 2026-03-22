@@ -280,6 +280,7 @@ class NativeServingRuntime:
             initial_batch_size=requested_batch_size,
             initial_seq_len=requested_seq_len,
         )
+        self._log_fp8_kv_cache_default(config.gpus)
         if (
             self._runtime_batch_size != requested_batch_size
             or self._runtime_seq_len != requested_seq_len
@@ -360,6 +361,28 @@ class NativeServingRuntime:
             or "out of memory" in msg
             or "cuda_error_out_of_memory" in msg
         )
+
+    @staticmethod
+    def _log_fp8_kv_cache_default(ngpu: int) -> None:
+        try:
+            infos = _surogate.SystemInfo.get_gpu_info()
+            if not infos:
+                return
+            use_count = max(1, int(ngpu))
+            selected = infos[:use_count]
+            if not selected:
+                return
+            sms = [
+                int(info.compute_capability_major) * 10
+                + int(info.compute_capability_minor)
+                for info in selected
+            ]
+            if all(sm >= 89 for sm in sms):
+                sm_list = ", ".join(f"SM{sm}" for sm in sms)
+                logger.info("[surogate] FP8 KV-cache enabled (%s).", sm_list)
+        except Exception:
+            # Best-effort log only.
+            pass
 
     @staticmethod
     def _clear_cuda_allocator() -> None:

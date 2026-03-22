@@ -234,6 +234,8 @@ struct PagedKVCache {
     // Arena-backed storage
     std::byte* k_pages = nullptr;   // K page pool [num_layers, total_pages, page_block_size, Hkv, Hs]
     std::byte* v_pages = nullptr;   // V page pool
+    float* k_scales = nullptr;      // FP8 K scales [num_layers, total_pages, page_block_size, Hkv]
+    float* v_scales = nullptr;      // FP8 V scales [num_layers, total_pages, page_block_size, Hkv]
     int* block_table_gpu = nullptr; // [batch_size, max_pages_per_seq] on GPU
 
     // Host state
@@ -275,9 +277,19 @@ struct PagedKVCache {
              * sizeof(int);
     }
 
+    /// Bytes for one FP8 scale pool (0 for BF16).
+    std::size_t per_scale_pool_bytes() const {
+        if (dtype != KVDType::FP8_E4M3) return 0;
+        return static_cast<std::size_t>(num_layers)
+             * static_cast<std::size_t>(total_pages)
+             * static_cast<std::size_t>(page_block_size)
+             * static_cast<std::size_t>(num_kv_heads)
+             * sizeof(float);
+    }
+
     /// Total arena bytes needed (K pool + V pool + block table).
     std::size_t total_bytes() const {
-        return 2 * per_pool_bytes() + block_table_bytes();
+        return 2 * per_pool_bytes() + 2 * per_scale_pool_bytes() + block_table_bytes();
     }
 
     /// Configure for GRPO: M prompts × N completions, with given prompt/gen lengths.
@@ -320,6 +332,13 @@ struct PagedKVCache {
     void allocate(DeviceMemoryStack& arena) {
         k_pages = arena.allocate(per_pool_bytes(), "paged_kv_k_pool");
         v_pages = arena.allocate(per_pool_bytes(), "paged_kv_v_pool");
+        if (dtype == KVDType::FP8_E4M3) {
+            k_scales = reinterpret_cast<float*>(arena.allocate(per_scale_pool_bytes(), "paged_kv_k_scales"));
+            v_scales = reinterpret_cast<float*>(arena.allocate(per_scale_pool_bytes(), "paged_kv_v_scales"));
+        } else {
+            k_scales = nullptr;
+            v_scales = nullptr;
+        }
         block_table_gpu = reinterpret_cast<int*>(
             arena.allocate(block_table_bytes(), "paged_kv_block_table"));
     }
@@ -412,6 +431,25 @@ struct PagedKVCache {
             static_cast<std::size_t>(total_pages) * page_bytes();
         const std::size_t src_off = static_cast<std::size_t>(src_physical_page) * page_bytes();
         const std::size_t dst_off = static_cast<std::size_t>(dst_physical_page) * page_bytes();
+        const std::size_t scale_tokens_bytes =
+            static_cast<std::size_t>(prefix_tokens)
+            * static_cast<std::size_t>(num_kv_heads)
+            * sizeof(float);
+        const std::size_t per_layer_scale_bytes =
+            static_cast<std::size_t>(total_pages)
+            * static_cast<std::size_t>(page_block_size)
+            * static_cast<std::size_t>(num_kv_heads)
+            * sizeof(float);
+        const std::size_t src_scale_off =
+            static_cast<std::size_t>(src_physical_page)
+            * static_cast<std::size_t>(page_block_size)
+            * static_cast<std::size_t>(num_kv_heads)
+            * sizeof(float);
+        const std::size_t dst_scale_off =
+            static_cast<std::size_t>(dst_physical_page)
+            * static_cast<std::size_t>(page_block_size)
+            * static_cast<std::size_t>(num_kv_heads)
+            * sizeof(float);
 
         for (int layer = 0; layer < num_layers; ++layer) {
             auto* k_layer = k_pages + static_cast<std::size_t>(layer) * per_layer_bytes;
@@ -423,6 +461,19 @@ struct PagedKVCache {
             CUDA_CHECK(cudaMemcpyAsync(
                 v_layer + dst_off, v_layer + src_off, tokens_bytes,
                 cudaMemcpyDeviceToDevice, stream));
+
+            if (dtype == KVDType::FP8_E4M3 && k_scales && v_scales) {
+                auto* ks_layer = reinterpret_cast<std::byte*>(k_scales)
+                    + static_cast<std::size_t>(layer) * per_layer_scale_bytes;
+                auto* vs_layer = reinterpret_cast<std::byte*>(v_scales)
+                    + static_cast<std::size_t>(layer) * per_layer_scale_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    ks_layer + dst_scale_off, ks_layer + src_scale_off, scale_tokens_bytes,
+                    cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    vs_layer + dst_scale_off, vs_layer + src_scale_off, scale_tokens_bytes,
+                    cudaMemcpyDeviceToDevice, stream));
+            }
         }
     }
 
