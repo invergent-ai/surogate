@@ -64,6 +64,10 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     const long H = q.Sizes[2];
     const long K = q.Sizes[3];
     const long V = v.Sizes[3];
+    const std::size_t recurrent_state_bytes =
+        static_cast<std::size_t>(B * H * K * V) * sizeof(nv_bfloat16);
+    const std::size_t recurrent_state_per_seq_bytes =
+        recurrent_state_bytes / static_cast<std::size_t>(std::max<long>(1, B));
 
     if (!tensor_shape_matches(k, B, T, H, K)) {
         throw std::runtime_error(std::string(op_name) + ": k shape must match q");
@@ -71,6 +75,9 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     if (v.Sizes[0] != B || v.Sizes[1] != T || v.Sizes[2] != H) {
         throw std::runtime_error(std::string(op_name) + ": v must share B/T/H with q");
     }
+    const bool decode_recurrent_mode = mDecodeState && mDecodeState->recurrent_states;
+    const bool strict_recurrent_state =
+        decode_recurrent_mode && mDecodeState->strict_state_buffers;
 
     Tensor* initial_state = nullptr;
     if (op.inputs.size() > 5 && !op.inputs[5].name.empty()) {
@@ -80,12 +87,16 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     // Decode mode: inject saved recurrent state as initial_state
     int layer_idx_for_state = -1;
     Tensor injected_state;
-    if (mDecodeState && mDecodeState->recurrent_states) {
+    if (decode_recurrent_mode) {
         std::string field;
         // Try to find layer index from any input name
         for (const auto& inp : op.inputs) {
             if (parse_block_param(inp.name, layer_idx_for_state, field) && layer_idx_for_state >= 0)
                 break;
+        }
+        if (strict_recurrent_state && layer_idx_for_state < 0) {
+            throw std::runtime_error(
+                std::string(op_name) + ": strict decode recurrent state enabled but layer index was not found");
         }
         if (layer_idx_for_state >= 0) {
             auto it = mDecodeState->recurrent_states->find(layer_idx_for_state);
@@ -99,6 +110,27 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
                 injected_state.Sizes[2] = K;
                 injected_state.Sizes[3] = V;
                 initial_state = &injected_state;
+            } else if (strict_recurrent_state) {
+                throw std::runtime_error(
+                    std::string(op_name)
+                    + ": strict decode recurrent state missing for layer "
+                    + std::to_string(layer_idx_for_state));
+            }
+            if (strict_recurrent_state) {
+                if (!mDecodeState->recurrent_state_bytes) {
+                    throw std::runtime_error(
+                        std::string(op_name)
+                        + ": strict decode recurrent state requires recurrent_state_bytes map");
+                }
+                auto it_bytes =
+                    mDecodeState->recurrent_state_bytes->find(layer_idx_for_state);
+                if (it_bytes == mDecodeState->recurrent_state_bytes->end()
+                    || it_bytes->second != recurrent_state_per_seq_bytes) {
+                    throw std::runtime_error(
+                        std::string(op_name)
+                        + ": strict decode recurrent state byte-size mismatch for layer "
+                        + std::to_string(layer_idx_for_state));
+                }
             }
         }
     }
@@ -213,24 +245,45 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
             store_tensor(op.outputs[1], *final_state_ptr);
 
         // Save recurrent state for next step
-        if (mDecodeState && mDecodeState->recurrent_states && layer_idx_for_state >= 0) {
+        if (decode_recurrent_mode && layer_idx_for_state >= 0) {
             auto& states = *mDecodeState->recurrent_states;
-            const std::size_t state_bytes = static_cast<std::size_t>(B * H * K * V) * sizeof(nv_bfloat16);
-            void* saved = states[layer_idx_for_state];
+            auto it_state = states.find(layer_idx_for_state);
+            void* saved = (it_state != states.end()) ? it_state->second : nullptr;
             if (!saved) {
-                CUDA_CHECK(cudaMalloc(&saved, state_bytes));
+                if (strict_recurrent_state) {
+                    throw std::runtime_error(
+                        std::string(op_name)
+                        + ": strict decode recurrent state missing for layer "
+                        + std::to_string(layer_idx_for_state));
+                }
+                CUDA_CHECK(cudaMalloc(&saved, recurrent_state_bytes));
                 states[layer_idx_for_state] = saved;
             }
             if (mDecodeState->recurrent_state_bytes) {
-                (*mDecodeState->recurrent_state_bytes)[layer_idx_for_state] =
-                    state_bytes / static_cast<std::size_t>(std::max<long>(1, B));
+                auto& state_bytes_map = *mDecodeState->recurrent_state_bytes;
+                if (strict_recurrent_state) {
+                    auto it_bytes = state_bytes_map.find(layer_idx_for_state);
+                    if (it_bytes == state_bytes_map.end()
+                        || it_bytes->second != recurrent_state_per_seq_bytes) {
+                        throw std::runtime_error(
+                            std::string(op_name)
+                            + ": strict decode recurrent state byte-size mismatch for layer "
+                            + std::to_string(layer_idx_for_state));
+                    }
+                } else {
+                    state_bytes_map[layer_idx_for_state] = recurrent_state_per_seq_bytes;
+                }
+            } else if (strict_recurrent_state) {
+                throw std::runtime_error(
+                    std::string(op_name)
+                    + ": strict decode recurrent state requires recurrent_state_bytes map");
             }
             if (final_state_ptr->DType == ETensorDType::FP32) {
                 convert_dtype(reinterpret_cast<nv_bfloat16*>(saved),
                               final_state_ptr->get<float>(),
                               static_cast<long>(B * H * K * V), stream);
             } else {
-                CUDA_CHECK(cudaMemcpyAsync(saved, final_state_ptr->Data, state_bytes,
+                CUDA_CHECK(cudaMemcpyAsync(saved, final_state_ptr->Data, recurrent_state_bytes,
                                            cudaMemcpyDeviceToDevice, stream));
             }
         }
@@ -361,19 +414,39 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
 
     // Decode mode: save the final recurrent state for the next decode step.
     // The state buffer must persist across steps (NOT stack-allocated).
-    if (mDecodeState && mDecodeState->recurrent_states && layer_idx_for_state >= 0) {
+    if (decode_recurrent_mode && layer_idx_for_state >= 0) {
         auto& states = *mDecodeState->recurrent_states;
-        const std::size_t state_bytes = static_cast<std::size_t>(B * H * K * V) * sizeof(nv_bfloat16);
-
-        void* saved = states[layer_idx_for_state];
+        auto it_state = states.find(layer_idx_for_state);
+        void* saved = (it_state != states.end()) ? it_state->second : nullptr;
         if (!saved) {
+            if (strict_recurrent_state) {
+                throw std::runtime_error(
+                    std::string(op_name)
+                    + ": strict decode recurrent state missing for layer "
+                    + std::to_string(layer_idx_for_state));
+            }
             // First time: allocate persistent GPU buffer (NOT from stack)
-            CUDA_CHECK(cudaMalloc(&saved, state_bytes));
+            CUDA_CHECK(cudaMalloc(&saved, recurrent_state_bytes));
             states[layer_idx_for_state] = saved;
         }
         if (mDecodeState->recurrent_state_bytes) {
-            (*mDecodeState->recurrent_state_bytes)[layer_idx_for_state] =
-                state_bytes / static_cast<std::size_t>(std::max<long>(1, B));
+            auto& state_bytes_map = *mDecodeState->recurrent_state_bytes;
+            if (strict_recurrent_state) {
+                auto it_bytes = state_bytes_map.find(layer_idx_for_state);
+                if (it_bytes == state_bytes_map.end()
+                    || it_bytes->second != recurrent_state_per_seq_bytes) {
+                    throw std::runtime_error(
+                        std::string(op_name)
+                        + ": strict decode recurrent state byte-size mismatch for layer "
+                        + std::to_string(layer_idx_for_state));
+                }
+            } else {
+                state_bytes_map[layer_idx_for_state] = recurrent_state_per_seq_bytes;
+            }
+        } else if (strict_recurrent_state) {
+            throw std::runtime_error(
+                std::string(op_name)
+                + ": strict decode recurrent state requires recurrent_state_bytes map");
         }
 
         // The final_state is in FP32 but the kernel expects BF16 initial_state.
@@ -384,7 +457,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
                           static_cast<long>(B * H * K * V),
                           mRunState.MainStream);
         } else {
-            CUDA_CHECK(cudaMemcpyAsync(saved, final_state_ptr->Data, state_bytes,
+            CUDA_CHECK(cudaMemcpyAsync(saved, final_state_ptr->Data, recurrent_state_bytes,
                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
         }
     }

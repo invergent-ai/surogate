@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
@@ -74,6 +75,7 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     // paged and non-paged decode.
     if (mDecodeState && mDecodeState->conv_states && layer_idx >= 0 && kernel > 1) {
         auto& conv_states = *mDecodeState->conv_states;
+        const bool strict_conv_state = mDecodeState->strict_state_buffers;
         const int state_len = kernel - 1;
         const std::size_t state_elems =
             static_cast<std::size_t>(B) * static_cast<std::size_t>(conv_dim) * static_cast<std::size_t>(state_len);
@@ -81,7 +83,8 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         const std::size_t per_seq_bytes =
             state_bytes / static_cast<std::size_t>(std::max(1, B));
 
-        void* state_ptr = conv_states[layer_idx];
+        auto it_state = conv_states.find(layer_idx);
+        void* state_ptr = (it_state != conv_states.end()) ? it_state->second : nullptr;
         bool need_realloc = (state_ptr == nullptr);
         if (mDecodeState->conv_state_bytes) {
             auto& conv_state_bytes = *mDecodeState->conv_state_bytes;
@@ -89,6 +92,15 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
             if (it == conv_state_bytes.end() || it->second != per_seq_bytes) {
                 need_realloc = true;
             }
+        } else if (strict_conv_state) {
+            throw std::runtime_error(
+                "mamba_conv1d: strict decode conv-state requires conv_state_bytes map");
+        }
+
+        if (strict_conv_state && need_realloc) {
+            throw std::runtime_error(
+                "mamba_conv1d: strict decode conv-state missing or byte-size mismatch for layer "
+                + std::to_string(layer_idx));
         }
 
         if (need_realloc) {
@@ -101,7 +113,9 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
             conv_states[layer_idx] = state_ptr;
         }
         if (mDecodeState->conv_state_bytes) {
-            (*mDecodeState->conv_state_bytes)[layer_idx] = per_seq_bytes;
+            if (!strict_conv_state) {
+                (*mDecodeState->conv_state_bytes)[layer_idx] = per_seq_bytes;
+            }
         }
 
         Tensor conv_state = Tensor::from_pointer(

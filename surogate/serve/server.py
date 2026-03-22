@@ -333,7 +333,8 @@ class NativeServingRuntime:
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
         self._max_batch_sequences = max(1, min(configured_cap, env_cap))
         self._full_cuda_graph_bucket_sizes = self._resolve_full_cuda_graph_bucket_sizes(
-            self._max_batch_sequences
+            self._max_batch_sequences,
+            enable_auto_when_cuda_graphs=bool(self.config.use_cuda_graphs),
         )
         self._full_cuda_graph_padding_enabled = (
             bool(self.config.use_cuda_graphs)
@@ -676,8 +677,16 @@ class NativeServingRuntime:
         return max(1, self._max_batch_sequences // max(1, params.n))
 
     @staticmethod
-    def _resolve_full_cuda_graph_bucket_sizes(prompt_cap: int) -> list[int]:
+    def _resolve_full_cuda_graph_bucket_sizes(
+        prompt_cap: int, *, enable_auto_when_cuda_graphs: bool = False
+    ) -> list[int]:
         raw = os.getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS", "").strip()
+        if not raw and enable_auto_when_cuda_graphs:
+            raw = "auto"
+            os.environ["SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS"] = raw
+            logger.info(
+                "Defaulting SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS=auto because use_cuda_graphs is enabled."
+            )
         if not raw:
             return []
 

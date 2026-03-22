@@ -870,7 +870,6 @@ void GenerationSession::init(
     }
     mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
     mFullStepCudaGraphPrimed = false;
-    mFullStepCudaGraphPostOnly = false;
     // FULL-mode graph capture spans the entire decode token-step body.
     // Keep this mode conservative:
     // - gated by serving FULL-mode env switch
@@ -1138,23 +1137,13 @@ void GenerationSession::init(
         }
     }
     mPagedKV.upload_block_table(mRunState.MainStream);
-    if (mFullStepCudaGraphEnabled && (!mRecurrentStates.empty() || !mConvStates.empty())) {
-        // Recurrent decode state (Qwen3.5 gated-delta / Mamba conv-state) is
-        // unstable when we capture decode-forward inside the full-step graph.
-        // Keep FULL mode enabled, but graph only the post-forward tail
-        // (sampling + state update) while decode-forward uses the existing
-        // piecewise decode graph path.
-        mFullStepCudaGraphPostOnly = true;
-        std::fprintf(
-            stderr,
-            "[GenerationSession] using recurrent-safe FULL mode (post-step CUDA graph only).\n");
-    }
-
+    
     mDecodeState = infer::DecodeState{};
     mDecodeState.recurrent_states = &mRecurrentStates;
     mDecodeState.recurrent_state_bytes = &mRecurrentStateBytes;
     mDecodeState.conv_states = &mConvStates;
     mDecodeState.conv_state_bytes = &mConvStateBytes;
+    mDecodeState.strict_state_buffers = mFullStepCudaGraphEnabled;
     mDecodeState.paged = true;
     mDecodeState.fp8 = fp8_kv_cache;
     mDecodeState.k_pages = mPagedKV.k_pages;
@@ -1223,24 +1212,6 @@ GenerationSessionStepResult GenerationSession::step(
         mStepSampledTokensHost.resize(needed_step_tokens);
         mStepFinishedBeforeHost.resize(needed_step_tokens);
     }
-
-    bool reported_full_step_fallback = false;
-    auto disable_full_step_cuda_graph = [&]() {
-        if (mFullStepCudaGraphExec) {
-            CUDA_CHECK(cudaGraphExecDestroy(mFullStepCudaGraphExec));
-            mFullStepCudaGraphExec = nullptr;
-        }
-        mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
-        mFullStepCudaGraphPrimed = false;
-        mFullStepCudaGraphEnabled = false;
-        mFullStepCudaGraphPostOnly = false;
-        if (!reported_full_step_fallback) {
-            std::fprintf(
-                stderr,
-                "[GenerationSession] full-step CUDA graph fallback: recurrent decode state became active.\n");
-            reported_full_step_fallback = true;
-        }
-    };
 
     auto run_decode_forward_step = [&](bool decode_forward_use_cuda_graph) {
         fill_decode_cu_seqlens(
@@ -1325,12 +1296,6 @@ GenerationSessionStepResult GenerationSession::step(
     int executed_steps = 0;
     for (; executed_steps < steps && !mAllFinished; ++executed_steps) {
         bool full_step_graph_this_step = mFullStepCudaGraphEnabled && !(hook && *hook);
-        if (full_step_graph_this_step
-            && !mFullStepCudaGraphPostOnly
-            && (!mRecurrentStates.empty() || !mConvStates.empty())) {
-            disable_full_step_cuda_graph();
-            full_step_graph_this_step = false;
-        }
         const bool use_dynamic_sampling_offsets =
             full_step_graph_this_step
             && mGenConfig.temperature > 0.0f
@@ -1352,36 +1317,13 @@ GenerationSessionStepResult GenerationSession::step(
                 cudaMemcpyHostToDevice, mRunState.MainStream));
         }
 
-        if (full_step_graph_this_step && mFullStepCudaGraphPostOnly) {
-            // Recurrent-safe FULL mode:
-            // - decode-forward uses existing piecewise decode graph path
-            // - post-forward tail (sampling + state update) is CUDA-graphed
-            run_decode_forward_step(/*decode_forward_use_cuda_graph=*/mGenConfig.use_cuda_graphs);
-            if (!mFullStepCudaGraphExec && !mFullStepCudaGraphPrimed) {
-                // Warm-up eager once so any lazy allocations happen outside capture.
-                run_decode_post_step(sampling_offset_arr);
-                mFullStepCudaGraphPrimed = true;
-            } else {
-                dsl::trace_or_execute_cuda_graph_with_stack(
-                    [&]() {
-                        run_decode_post_step(sampling_offset_arr);
-                    },
-                    mRunState.MainStream,
-                    mFullStepCudaGraphExec,
-                    /*enabled=*/true,
-                    mRunState.Stack,
-                    mFullStepCudaGraphCheckpoint);
-            }
-        } else if (full_step_graph_this_step) {
+        if (full_step_graph_this_step) {
             if (!mFullStepCudaGraphExec && !mFullStepCudaGraphPrimed) {
                 // Warm-up eager once so any lazy allocations happen outside capture.
                 run_one_decode_token_step(
                     /*decode_forward_use_cuda_graph=*/false,
                     sampling_offset_arr);
                 mFullStepCudaGraphPrimed = true;
-                if (!mRecurrentStates.empty() || !mConvStates.empty()) {
-                    disable_full_step_cuda_graph();
-                }
             } else {
                 dsl::trace_or_execute_cuda_graph_with_stack(
                     [&]() {
@@ -1504,7 +1446,6 @@ void GenerationSession::close(dsl::GraphExecutor& graph_executor) {
     mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
     mFullStepCudaGraphPrimed = false;
     mFullStepCudaGraphEnabled = false;
-    mFullStepCudaGraphPostOnly = false;
 
     for (auto& [_, ptr] : mRecurrentStates) {
         if (ptr) {

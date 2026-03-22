@@ -939,6 +939,16 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
                     static_cast<double>(free_bytes) / (1024.0 * 1024.0),
                     static_cast<double>(budget) / (1024.0 * 1024.0),
                     dequant_cache_size == 0 ? "unlimited" : "pooled");
+
+            if (options.UseCudaGraphs && dequant_cache_size != 0) {
+                // Pooled dequant buffers can trigger lazy device allocations while
+                // a decode graph is being captured/replayed. Force resident mode
+                // so all dequant buffers are allocated eagerly outside capture.
+                fprintf(stderr,
+                        "[QLoRA] Forcing dequant cache mode to unlimited for prequant "
+                        "inference with CUDA graphs (capture-safe).\n");
+                dequant_cache_size = 0;
+            }
         }
 
         config.weight_manager_config.max_dequant_cache_size = dequant_cache_size;

@@ -61,6 +61,11 @@ struct DecodeState {
     // Optional per-sequence conv-state size metadata.
     // Maps layer_idx -> bytes for one sequence state slice [1, conv_dim, kernel-1].
     std::unordered_map<int, std::size_t>* conv_state_bytes = nullptr;
+    // When true, decode recurrent/conv state buffers must already be fully
+    // allocated and shape-compatible. Dispatch paths must not allocate/free or
+    // mutate state-map topology during decode (required for stable FULL-step
+    // CUDA graph capture/replay).
+    bool strict_state_buffers = false;
 
     // Prefill mode: when true, dispatch_rope writes K/V to the KV-cache at ALL
     // positions (not just position seq_lens[i]) AND lets self-attention proceed
