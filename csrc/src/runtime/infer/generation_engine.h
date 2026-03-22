@@ -178,6 +178,7 @@ private:
     uint64_t mRngOffset = 0;
     int mGeneratedSteps = 0;
     bool mFullStepCudaGraphEnabled = false;
+    bool mFullStepCudaGraphPostOnly = false;
     bool mFullStepCudaGraphPrimed = false;
     cudaGraphExec_t mFullStepCudaGraphExec = nullptr;
     DeviceMemoryStack::Checkpoint mFullStepCudaGraphCheckpoint{};
