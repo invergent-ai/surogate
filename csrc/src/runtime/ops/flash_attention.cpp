@@ -42,7 +42,13 @@ bool flashinfer_decode_requested() {
     if (cached >= 0) {
         return cached != 0;
     }
-    cached = env_flag_enabled("SUROGATE_USE_FLASHINFER_DECODE") ? 1 : 0;
+    const char* env = std::getenv("SUROGATE_USE_FLASHINFER_DECODE");
+    if (!env || !*env) {
+        // Default on; env var can explicitly disable with 0/false.
+        cached = 1;
+    } else {
+        cached = env_flag_enabled("SUROGATE_USE_FLASHINFER_DECODE") ? 1 : 0;
+    }
     return cached != 0;
 }
 
@@ -104,13 +110,28 @@ void log_flashinfer_decode_head_fallback_once(const int head_dim) {
     }
 }
 
-void log_flashinfer_decode_fp8_fallback_once() {
+void log_fp8_direct_decode_enabled_once(const cudaDeviceProp& prop, int head_dim) {
+    static std::atomic<bool> printed{false};
+    bool expected = false;
+    if (printed.compare_exchange_strong(expected, true)) {
+        const int sm = prop.major * 10 + prop.minor;
+        std::fprintf(
+            stderr,
+            "[surogate] FP8 paged direct decode enabled (SM%d, head_dim=%d).\n",
+            sm,
+            head_dim);
+        std::fflush(stderr);
+    }
+}
+
+void log_fp8_direct_decode_fallback_once(const int head_dim) {
     static std::atomic<bool> printed{false};
     bool expected = false;
     if (printed.compare_exchange_strong(expected, true)) {
         std::fprintf(
             stderr,
-            "[surogate] FlashInfer decode requested, but FP8 paged KV with per-token scales is unsupported in this path; using FlashAttention FP8 dequant decode.\n");
+            "[surogate] FP8 paged direct decode unsupported for head_dim=%d; falling back to BF16 dequant decode.\n",
+            head_dim);
         std::fflush(stderr);
     }
 }
@@ -181,52 +202,168 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
 
             if (mDecodeState->fp8) {
-                if (flashinfer_device_ok) {
-                    log_flashinfer_decode_fp8_fallback_once();
-                }
-                // FP8 paged: dequant to temp BF16 buffer, then run BF16 paged attention.
-                // Temp buffer: [B, max_seqlen_k, Hkv, Hs] BF16
-                const int msk = mDecodeState->max_seqlen_k;
-                Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,
-                    {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_k");
-                Tensor v_tmp = mRunState.temp_alloc(ETensorDType::BF16,
-                    {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_v");
-                mTemps.push_back(k_tmp);
-                mTemps.push_back(v_tmp);
-
                 const std::size_t scale_layer_elems =
                     static_cast<std::size_t>(mDecodeState->total_pages)
                     * mDecodeState->page_block_size * Hkv;
                 const std::size_t scale_layer_offset = static_cast<std::size_t>(layer_idx) * scale_layer_elems;
 
-                // Dequant must use the effective K lengths for this decode step
-                // (seq_lens + 1 after KV append), not pre-append seq_lens.
-                const int* k_lens_gpu = mDecodeState->cu_seqlens_k_gpu
+                // Use effective K lengths for this step (seq_lens + 1 after KV append).
+                const int* k_lens_gpu_i = mDecodeState->cu_seqlens_k_gpu
                     ? reinterpret_cast<const int*>(mDecodeState->cu_seqlens_k_gpu)
                     : mDecodeState->seq_lens_gpu;
+                const int32_t* k_lens_gpu_i32 = mDecodeState->cu_seqlens_k_gpu
+                    ? mDecodeState->cu_seqlens_k_gpu
+                    : reinterpret_cast<const int32_t*>(mDecodeState->seq_lens_gpu);
 
-                kv_cache_dequant_paged_fp8_to_bf16(
-                    k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
-                    reinterpret_cast<const __nv_fp8_e4m3*>(
-                        reinterpret_cast<const std::byte*>(mDecodeState->k_pages) + layer_offset),
-                    reinterpret_cast<const __nv_fp8_e4m3*>(
-                        reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset),
-                    mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
-                    mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
-                    k_lens_gpu,
-                    mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
-                    mDecodeState->page_block_size,
-                    ds_batch, msk, Hkv, Hs,
-                    mRunState.MainStream);
+                const auto* k_pages_layer = reinterpret_cast<const __nv_fp8_e4m3*>(
+                    reinterpret_cast<const std::byte*>(mDecodeState->k_pages) + layer_offset);
+                const auto* v_pages_layer = reinterpret_cast<const __nv_fp8_e4m3*>(
+                    reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset);
 
-                // Run BF16 contiguous attention on dequantized buffer
-                attention_decode_flash(
-                    out.get<nv_bfloat16>(), lse.get<float>(),
-                    q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
-                    mDecodeState->cu_seqlens_q_gpu,
-                    mDecodeState->cu_seqlens_k_gpu,
-                    msk, msk, ds_batch, Hq, Hkv, Hs,
-                    mRunState.MainStream);
+                const bool flashinfer_head_ok = flashinfer_decode_head_supported(Hs);
+                if (flashinfer_device_ok && flashinfer_head_ok) {
+                    // FP8 + FlashInfer path:
+                    //   1) dequantize paged FP8 KV to temporary BF16 contiguous buffers
+                    //   2) run FlashInfer decode using a synthetic 1-page-per-sequence layout
+                    const int msk = mDecodeState->max_seqlen_k;
+                    Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                        {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_k");
+                    Tensor v_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                        {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_v");
+                    mTemps.push_back(k_tmp);
+                    mTemps.push_back(v_tmp);
+
+                    kv_cache_dequant_paged_fp8_to_bf16(
+                        k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                        k_pages_layer,
+                        v_pages_layer,
+                        mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                        mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
+                        k_lens_gpu_i,
+                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                        mDecodeState->page_block_size,
+                        ds_batch, msk, Hkv, Hs,
+                        mRunState.MainStream);
+
+                    Tensor fi_block_table = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch)},
+                        "flashinfer_id_block_table");
+                    Tensor fi_page_counts = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch)},
+                        "flashinfer_page_counts");
+                    Tensor fi_indptr = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch + 1)},
+                        "flashinfer_indptr");
+                    Tensor fi_last_page_len = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch)},
+                        "flashinfer_last_page_len");
+                    Tensor fi_indices = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch)},
+                        "flashinfer_indices");
+                    Tensor fi_request_indices = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch)},
+                        "flashinfer_request_indices");
+                    Tensor fi_kv_tile_indices = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {static_cast<long>(ds_batch)},
+                        "flashinfer_kv_tile_indices");
+                    Tensor fi_kv_chunk_size = mRunState.temp_alloc(
+                        ETensorDType::INT32,
+                        {1},
+                        "flashinfer_kv_chunk_size");
+                    mTemps.push_back(fi_block_table);
+                    mTemps.push_back(fi_page_counts);
+                    mTemps.push_back(fi_indptr);
+                    mTemps.push_back(fi_last_page_len);
+                    mTemps.push_back(fi_indices);
+                    mTemps.push_back(fi_request_indices);
+                    mTemps.push_back(fi_kv_tile_indices);
+                    mTemps.push_back(fi_kv_chunk_size);
+
+                    fill_iota_i32(fi_block_table.get<int32_t>(), ds_batch, mRunState.MainStream);
+
+                    attention_decode_flashinfer_paged(
+                        out.get<nv_bfloat16>(),
+                        lse.get<float>(),
+                        q_bf16,
+                        k_tmp.get<nv_bfloat16>(),
+                        v_tmp.get<nv_bfloat16>(),
+                        k_lens_gpu_i32,
+                        reinterpret_cast<const int*>(fi_block_table.get<int32_t>()),
+                        /*block_table_stride=*/1,
+                        /*page_block_size=*/msk,
+                        ds_batch,
+                        Hq,
+                        Hkv,
+                        Hs,
+                        fi_page_counts.get<int32_t>(),
+                        fi_indptr.get<int32_t>(),
+                        fi_last_page_len.get<int32_t>(),
+                        fi_indices.get<int32_t>(),
+                        fi_request_indices.get<int32_t>(),
+                        fi_kv_tile_indices.get<int32_t>(),
+                        fi_kv_chunk_size.get<int32_t>(),
+                        flashinfer_decode_pdl_enabled(),
+                        mRunState.MainStream);
+                    log_flashinfer_decode_enabled_once(mRunState.DeviceProp, Hs);
+                } else {
+                    if (flashinfer_device_ok && !flashinfer_head_ok) {
+                        log_flashinfer_decode_head_fallback_once(Hs);
+                    }
+
+                    const bool fp8_direct_ok = attention_decode_paged_fp8_direct(
+                        out.get<nv_bfloat16>(), lse.get<float>(),
+                        q_bf16,
+                        k_pages_layer, v_pages_layer,
+                        mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                        mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
+                        k_lens_gpu_i32,
+                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                        mDecodeState->page_block_size,
+                        ds_batch, Hq, Hkv, Hs,
+                        mRunState.MainStream);
+
+                    if (fp8_direct_ok) {
+                        log_fp8_direct_decode_enabled_once(mRunState.DeviceProp, Hs);
+                    } else {
+                        log_fp8_direct_decode_fallback_once(Hs);
+
+                        // Fallback: dequant paged FP8 KV to BF16 contiguous, then FlashAttention decode.
+                        const int msk = mDecodeState->max_seqlen_k;
+                        Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                            {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_k");
+                        Tensor v_tmp = mRunState.temp_alloc(ETensorDType::BF16,
+                            {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_v");
+                        mTemps.push_back(k_tmp);
+                        mTemps.push_back(v_tmp);
+
+                        kv_cache_dequant_paged_fp8_to_bf16(
+                            k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                            k_pages_layer,
+                            v_pages_layer,
+                            mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                            mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
+                            k_lens_gpu_i,
+                            mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                            mDecodeState->page_block_size,
+                            ds_batch, msk, Hkv, Hs,
+                            mRunState.MainStream);
+
+                        attention_decode_flash(
+                            out.get<nv_bfloat16>(), lse.get<float>(),
+                            q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
+                            mDecodeState->cu_seqlens_q_gpu,
+                            mDecodeState->cu_seqlens_k_gpu,
+                            msk, msk, ds_batch, Hq, Hkv, Hs,
+                            mRunState.MainStream);
+                    }
+                }
             } else {
                 // BF16 paged: direct paged attention
                 auto* k_pool_layer = reinterpret_cast<nv_bfloat16*>(

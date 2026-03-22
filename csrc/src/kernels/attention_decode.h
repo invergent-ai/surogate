@@ -81,6 +81,12 @@ void fill_decode_cu_seqlens(
     int batch_size,
     cudaStream_t stream);
 
+/// Fill int32 tensor with iota values [0, 1, ..., n-1].
+void fill_iota_i32(
+    int32_t* out,
+    int n,
+    cudaStream_t stream);
+
 /// Append K/V to paged KV-cache from interleaved QKV (paged mode).
 ///
 /// Like kv_cache_append_bf16, but writes to the correct page via block_table lookup.
@@ -312,6 +318,24 @@ void kv_cache_dequant_paged_fp8_to_bf16(
     int page_block_size,
     int batch_size, int max_seq_len,
     int Hkv, int Hs,
+    cudaStream_t stream);
+
+/// Decode attention directly from paged FP8 KV-cache with per-token/per-head scales.
+///
+/// This path dequantizes K/V on-the-fly inside the decode kernel (single-token decode),
+/// avoiding materializing full BF16 KV buffers.
+///
+/// Returns false when the current shape/config is unsupported (caller should fallback
+/// to BF16 dequant + FlashAttention decode).
+bool attention_decode_paged_fp8_direct(
+    nv_bfloat16* out, float* lse,
+    const nv_bfloat16* q,
+    const __nv_fp8_e4m3* k_pages_fp8, const __nv_fp8_e4m3* v_pages_fp8,
+    const float* k_scales, const float* v_scales,
+    const int32_t* seqused_k,
+    const int* block_table, int block_table_stride,
+    int page_block_size,
+    int batch_size, int Hq, int Hkv, int Hs,
     cudaStream_t stream);
 
 /// Broadcast prefix KV from a source batch slot to N-1 destination slots.

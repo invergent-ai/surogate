@@ -76,6 +76,15 @@ __global__ void fill_decode_cu_seqlens_kernel(
     }
 }
 
+__global__ void fill_iota_i32_kernel(
+        int32_t* __restrict__ out,
+        int n) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        out[idx] = idx;
+    }
+}
+
 /// Bulk-store all T positions of K/V from interleaved QKV into contiguous KV-cache.
 /// Grid: (B*T, Hkv)  Block: (Hs)
 __global__ void kv_cache_store_bf16_kernel(
@@ -372,4 +381,16 @@ void fill_decode_cu_seqlens(
     // batch_size + 1 threads — small kernel, single block
     fill_decode_cu_seqlens_kernel<<<1, batch_size + 1, 0, stream>>>(
         cu_seqlens_q, cu_seqlens_k, seq_lens_gpu, batch_size);
+}
+
+void fill_iota_i32(
+        int32_t* out,
+        int n,
+        cudaStream_t stream) {
+    if (!out || n <= 0) {
+        return;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = (n + kThreads - 1) / kThreads;
+    fill_iota_i32_kernel<<<blocks, kThreads, 0, stream>>>(out, n);
 }
