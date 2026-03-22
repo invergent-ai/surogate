@@ -160,6 +160,7 @@ public:
         float ipo_mask_low,
         float ipo_mask_high,
         float loss_scale,
+        int rollout_batch_rows = -1,
         const std::int32_t* position_ids = nullptr,
         const float* temperatures = nullptr);
 

@@ -888,8 +888,24 @@ class NativeGRPOTrainer:
         loss_scale = int(sum(sum(1 for m in mb.loss_mask if m) for mb in micro_batches))
         loss_scale = max(loss_scale, 1)
 
+        if n_mb == 0:
+            return (
+                {
+                    "policy_loss": 0.0,
+                    "mismatch_kl": 0.0,
+                    "is_masked": 0.0,
+                    "keep_tokens": 0,
+                    "total_tokens": 0,
+                },
+                loss_scale,
+            )
+
+        # Feed distinct packed micro-batches per GPU lane when ngpu > 1.
+        # One C++ micro-step then processes up to ngpu packed sequences.
+        lane_count = ngpu if ngpu > 1 else 1
+        micro_steps = (n_mb + lane_count - 1) // lane_count
         with self._trainer_call_lock:
-            self.trainer.set_grad_accumulation(n_mb)
+            self.trainer.set_grad_accumulation(micro_steps)
 
         step_metrics = {
             "policy_loss": 0.0,
@@ -899,75 +915,69 @@ class NativeGRPOTrainer:
             "total_tokens": 0,
         }
 
-        # Reusable staging buffers (avoid per-micro-batch np.pad/np.tile allocations).
-        input_single = np.zeros((1, seq_len), dtype=np.int32)
-        masked_targets_single = np.full((1, seq_len), -100, dtype=np.int32)
-        position_single = np.zeros((1, seq_len), dtype=np.int32)
-        temp_single = np.ones((1, seq_len), dtype=np.float32)
-        inf_lp_single = np.zeros((1, seq_len), dtype=np.float32)
-        adv_single = np.zeros((1, seq_len), dtype=np.float32)
-        loss_mask_single = np.zeros((1, seq_len), dtype=np.uint8)
+        # Reusable staging buffers (avoid per-micro-batch allocations).
+        input_stage = np.zeros((lane_count, seq_len), dtype=np.int32)
+        masked_targets_stage = np.full((lane_count, seq_len), -100, dtype=np.int32)
+        position_stage = np.zeros((lane_count, seq_len), dtype=np.int32)
+        temp_stage = np.ones((lane_count, seq_len), dtype=np.float32)
+        inf_lp_stage = np.zeros((lane_count, seq_len), dtype=np.float32)
+        adv_stage = np.zeros((lane_count, seq_len), dtype=np.float32)
+        loss_mask_stage = np.zeros((lane_count, seq_len), dtype=np.uint8)
 
-        if ngpu > 1:
-            input_stage = np.zeros((ngpu, seq_len), dtype=np.int32)
-            masked_targets_stage = np.full((ngpu, seq_len), -100, dtype=np.int32)
-            position_stage = np.zeros((ngpu, seq_len), dtype=np.int32)
-            temp_stage = np.ones((ngpu, seq_len), dtype=np.float32)
-        else:
-            input_stage = input_single
-            masked_targets_stage = masked_targets_single
-            position_stage = position_single
-            temp_stage = temp_single
+        weighted_policy = 0.0
+        weighted_kl = 0.0
+        weighted_masked = 0.0
+        weighted_tokens = 0.0
 
-        for mb in micro_batches:
-            T_actual = len(mb.input_ids)
+        for step_idx in range(micro_steps):
+            input_stage.fill(0)
+            masked_targets_stage.fill(-100)
+            position_stage.fill(0)
+            temp_stage.fill(1.0)
+            inf_lp_stage.fill(0.0)
+            adv_stage.fill(0.0)
+            loss_mask_stage.fill(0)
 
-            input_single.fill(0)
-            masked_targets_single.fill(-100)
-            position_single.fill(0)
-            temp_single.fill(1.0)
-            inf_lp_single.fill(0.0)
-            adv_single.fill(0.0)
-            loss_mask_single.fill(0)
+            for lane in range(lane_count):
+                mb_idx = step_idx * lane_count + lane
+                if mb_idx >= n_mb:
+                    continue
+                mb = micro_batches[mb_idx]
+                T_actual = len(mb.input_ids)
+                if T_actual <= 0:
+                    continue
 
-            if T_actual > 0:
-                input_single[0, :T_actual] = mb.input_ids[:T_actual]
-                position_single[0, :T_actual] = mb.position_ids[:T_actual]
+                input_stage[lane, :T_actual] = mb.input_ids[:T_actual]
+                position_stage[lane, :T_actual] = mb.position_ids[:T_actual]
                 if T_actual < seq_len:
                     last_pos = int(mb.position_ids[T_actual - 1])
-                    position_single[0, T_actual:] = np.arange(
+                    position_stage[lane, T_actual:] = np.arange(
                         last_pos + 1,
                         last_pos + 1 + (seq_len - T_actual),
                         dtype=np.int32,
                     )
-                temp_single[0, :T_actual] = mb.temperatures[:T_actual]
-                inf_lp_single[0, :T_actual] = mb.inference_logprobs[:T_actual]
-                adv_single[0, :T_actual] = mb.advantages[:T_actual]
-                loss_mask_single[0, :T_actual] = np.asarray(
+                temp_stage[lane, :T_actual] = mb.temperatures[:T_actual]
+                inf_lp_stage[lane, :T_actual] = mb.inference_logprobs[:T_actual]
+                adv_stage[lane, :T_actual] = mb.advantages[:T_actual]
+                loss_mask_stage[lane, :T_actual] = np.asarray(
                     mb.loss_mask[:T_actual], dtype=np.uint8
                 )
 
                 if T_actual > 1:
-                    masked_targets_single[0, : T_actual - 1] = np.asarray(
+                    masked_targets_stage[lane, : T_actual - 1] = np.asarray(
                         mb.input_ids[1:T_actual], dtype=np.int32
                     )
-                    masked_targets_single[0, : T_actual - 1][
-                        loss_mask_single[0, 1:T_actual] == 0
+                    masked_targets_stage[lane, : T_actual - 1][
+                        loss_mask_stage[lane, 1:T_actual] == 0
                     ] = -100
-
-            if ngpu > 1:
-                input_stage[:] = input_single
-                masked_targets_stage[:] = masked_targets_single
-                position_stage[:] = position_single
-                temp_stage[:] = temp_single
 
             with self._trainer_call_lock:
                 mb_metrics = self.trainer.step_with_native_grpo(
                     input_stage,
                     masked_targets_stage,
-                    inference_logprobs=inf_lp_single,
-                    advantages=adv_single,
-                    loss_mask=loss_mask_single,
+                    inference_logprobs=inf_lp_stage,
+                    advantages=adv_stage,
+                    loss_mask=loss_mask_stage,
                     kl_tau=float(loss_config.kl_tau),
                     adv_tau=float(loss_config.adv_tau),
                     ipo_mask_low=float(loss_config.ipo_mask_low),
@@ -977,14 +987,31 @@ class NativeGRPOTrainer:
                     temperatures=temp_stage,
                 )
 
-            for key in step_metrics:
-                if key in mb_metrics:
-                    step_metrics[key] += mb_metrics[key]
+            keep_tokens = int(mb_metrics.get("keep_tokens", 0))
+            total_tokens = int(mb_metrics.get("total_tokens", 0))
+            step_metrics["keep_tokens"] += keep_tokens
+            step_metrics["total_tokens"] += total_tokens
 
-        # Normalize averaged metrics
-        if n_mb > 0:
-            for key in ("policy_loss", "mismatch_kl", "is_masked"):
-                step_metrics[key] /= max(n_mb, 1)
+            if total_tokens > 0:
+                weighted_tokens += float(total_tokens)
+                weighted_policy += float(mb_metrics.get("policy_loss", 0.0)) * float(
+                    total_tokens
+                )
+                weighted_kl += float(mb_metrics.get("mismatch_kl", 0.0)) * float(
+                    total_tokens
+                )
+                weighted_masked += float(mb_metrics.get("is_masked", 0.0)) * float(
+                    total_tokens
+                )
+
+        if weighted_tokens > 0:
+            step_metrics["policy_loss"] = weighted_policy / weighted_tokens
+            step_metrics["mismatch_kl"] = weighted_kl / weighted_tokens
+            step_metrics["is_masked"] = weighted_masked / weighted_tokens
+        else:
+            step_metrics["policy_loss"] = 0.0
+            step_metrics["mismatch_kl"] = 0.0
+            step_metrics["is_masked"] = 0.0
 
         return step_metrics, loss_scale
 

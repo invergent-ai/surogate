@@ -1756,8 +1756,21 @@ MultiGPUPyTrainer::NativeGrpoStepMetrics MultiGPUPyTrainer::step_with_native_grp
         float ipo_mask_low,
         float ipo_mask_high,
         float loss_scale,
+        int rollout_batch_rows,
         const std::int32_t* position_ids,
         const float* temperatures) {
+    const int world = static_cast<int>(mContexts.size());
+    if (rollout_batch_rows < 0) {
+        rollout_batch_rows = B;
+    }
+    const bool rollout_broadcast = (rollout_batch_rows == B);
+    const bool rollout_sharded = (rollout_batch_rows == B * world);
+    if (!rollout_broadcast && !rollout_sharded) {
+        throw std::runtime_error(
+            fmt::format("step_with_native_grpo: invalid rollout rows {} (expected {} broadcast or {} sharded)",
+                        rollout_batch_rows, B, B * world));
+    }
+
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         if (!ctx.Model) {
@@ -1787,11 +1800,13 @@ MultiGPUPyTrainer::NativeGrpoStepMetrics MultiGPUPyTrainer::step_with_native_grp
                                              mTrainMicroStep, mGradAccumulation));
     }
 
-    NativeGrpoStepMetrics result{};
-    run_work([&result, micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
+    std::vector<NativeGrpoStepMetrics> per_rank_metrics(static_cast<std::size_t>(world));
+    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
               inference_logprobs, advantages, loss_mask,
+              rollout_broadcast,
               kl_tau, adv_tau, ipo_mask_low, ipo_mask_high, loss_scale,
-              temperatures, B = this->B, T = this->T](sThreadContext& ctx) {
+              temperatures, B = this->B, T = this->T,
+              &per_rank_metrics](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("step_with_native_grpo: model is not a DslModel");
@@ -1802,6 +1817,14 @@ MultiGPUPyTrainer::NativeGrpoStepMetrics MultiGPUPyTrainer::step_with_native_grp
         Tensor targets_tensor = ctx.Model->get_target_buffer();
 
         const int gpu_rank = ctx.Communicator->local_rank();
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const std::ptrdiff_t rollout_off = rollout_broadcast
+            ? 0
+            : static_cast<std::ptrdiff_t>(gpu_rank) * static_cast<std::ptrdiff_t>(bt);
+        const float* inf_lp_for_this_gpu = inference_logprobs + rollout_off;
+        const float* adv_for_this_gpu = advantages + rollout_off;
+        const std::uint8_t* mask_for_this_gpu = loss_mask + rollout_off;
+
         const float* temps_for_this_gpu = nullptr;
         if (temperatures) {
             temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
@@ -1811,9 +1834,9 @@ MultiGPUPyTrainer::NativeGrpoStepMetrics MultiGPUPyTrainer::step_with_native_grp
             inputs_tensor,
             position_ids_tensor,
             targets_tensor,
-            inference_logprobs,
-            advantages,
-            loss_mask,
+            inf_lp_for_this_gpu,
+            adv_for_this_gpu,
+            mask_for_this_gpu,
             kl_tau,
             adv_tau,
             ipo_mask_low,
@@ -1823,14 +1846,34 @@ MultiGPUPyTrainer::NativeGrpoStepMetrics MultiGPUPyTrainer::step_with_native_grp
             micro_idx,
             *ctx.Communicator,
             temps_for_this_gpu);
-        if (ctx.Communicator->local_rank() == 0) {
-            result.policy_loss = metrics.policy_loss;
-            result.mismatch_kl = metrics.mismatch_kl;
-            result.is_masked = metrics.is_masked;
-            result.keep_tokens = metrics.keep_tokens;
-            result.total_tokens = metrics.total_tokens;
-        }
+        auto& out = per_rank_metrics[static_cast<std::size_t>(gpu_rank)];
+        out.policy_loss = metrics.policy_loss;
+        out.mismatch_kl = metrics.mismatch_kl;
+        out.is_masked = metrics.is_masked;
+        out.keep_tokens = metrics.keep_tokens;
+        out.total_tokens = metrics.total_tokens;
     });
+
+    NativeGrpoStepMetrics result{};
+    double policy_num = 0.0;
+    double kl_num = 0.0;
+    double masked_num = 0.0;
+    int total_tokens = 0;
+    int keep_tokens = 0;
+    for (const auto& m : per_rank_metrics) {
+        total_tokens += m.total_tokens;
+        keep_tokens += m.keep_tokens;
+        policy_num += static_cast<double>(m.policy_loss) * static_cast<double>(m.total_tokens);
+        kl_num += static_cast<double>(m.mismatch_kl) * static_cast<double>(m.total_tokens);
+        masked_num += static_cast<double>(m.is_masked) * static_cast<double>(m.total_tokens);
+    }
+    result.total_tokens = total_tokens;
+    result.keep_tokens = keep_tokens;
+    if (total_tokens > 0) {
+        result.policy_loss = static_cast<float>(policy_num / static_cast<double>(total_tokens));
+        result.mismatch_kl = static_cast<float>(kl_num / static_cast<double>(total_tokens));
+        result.is_masked = static_cast<float>(masked_num / static_cast<double>(total_tokens));
+    }
 
     ++mTrainMicroStep;
     return result;
@@ -1853,10 +1896,36 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         throw std::invalid_argument("generate: num_completions must be > 0");
     }
 
-    // Run generation on GPU 0 only (DP — each GPU generates independently)
     GenerationResult result;
+    if (prompts.empty()) {
+        return result;
+    }
 
+    struct RankShardOutput {
+        std::vector<int> prompt_indices;
+        std::vector<infer::Trajectory> trajectories;
+    };
+
+    const int local_world = static_cast<int>(mContexts.size());
+    const int prompt_count = static_cast<int>(prompts.size());
+    const uint64_t base_seed = generation_seed_from_env_or_default();
+    std::vector<RankShardOutput> rank_outputs(static_cast<std::size_t>(local_world));
+
+    // Shard prompts across local GPUs (round-robin by prompt index).
+    // Each rank generates only its shard, then we stitch outputs back into
+    // canonical global order [prompt0 completion0..N-1, prompt1 ...].
     run_work([&](sThreadContext& ctx) {
+        const int local_rank = ctx.Communicator->local_rank();
+        std::vector<std::vector<int32_t>> local_prompts;
+        std::vector<int> local_prompt_indices;
+        for (int prompt_idx = local_rank; prompt_idx < prompt_count; prompt_idx += local_world) {
+            local_prompts.push_back(prompts[static_cast<std::size_t>(prompt_idx)]);
+            local_prompt_indices.push_back(prompt_idx);
+        }
+        if (local_prompts.empty()) {
+            return;
+        }
+
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("generate: model is not a DslModel");
@@ -1883,7 +1952,7 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         gen_config.eos_token_id = eos_token_id;
         gen_config.num_completions = num_completions;
         gen_config.use_cuda_graphs = use_cuda_graphs;
-        gen_config.seed = generation_seed_from_env_or_default();
+        gen_config.seed = base_seed + 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(local_rank);
 
         // Create generation engine using the model's own stack as the arena.
         // The stack is shared with training — generation allocates from it,
@@ -1895,10 +1964,10 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         const modules::ForwardHook* hook_ptr = nullptr;
         if (use_lora) {
             int max_prompt_len = 0;
-            for (const auto& prompt : prompts) {
+            for (const auto& prompt : local_prompts) {
                 max_prompt_len = std::max(max_prompt_len, static_cast<int>(prompt.size()));
             }
-            const int total_batch = static_cast<int>(prompts.size()) * std::max(1, num_completions);
+            const int total_batch = static_cast<int>(local_prompts.size()) * std::max(1, num_completions);
             const int lora_bt_capacity = std::max(total_batch, max_prompt_len);
             hook_ptr = dsl_model->make_forward_hook(
                 /*use_lora=*/true,
@@ -1918,26 +1987,49 @@ MultiGPUPyTrainer::GenerationResult MultiGPUPyTrainer::generate(
         std::vector<infer::Trajectory> trajectories;
         if (num_completions == 1) {
             trajectories = engine.generate(
-                prompts, gen_config, run_state.Stack,
+                local_prompts, gen_config, run_state.Stack,
                 *graph_exec, *ctx.Communicator, hook_ptr);
         } else {
             trajectories = engine.generate_grpo(
-                prompts, gen_config, run_state.Stack,
+                local_prompts, gen_config, run_state.Stack,
                 *graph_exec, *ctx.Communicator, hook_ptr);
         }
 
-        // Convert trajectories to result
-        result.tokens.resize(trajectories.size());
-        result.logprobs.resize(trajectories.size());
-        result.prompt_lens.resize(trajectories.size());
-        result.completion_lens.resize(trajectories.size());
-        for (std::size_t i = 0; i < trajectories.size(); ++i) {
-            result.tokens[i] = std::move(trajectories[i].tokens);
-            result.logprobs[i] = std::move(trajectories[i].logprobs);
-            result.prompt_lens[i] = trajectories[i].prompt_len;
-            result.completion_lens[i] = trajectories[i].completion_len;
+        rank_outputs.at(static_cast<std::size_t>(local_rank)).prompt_indices = std::move(local_prompt_indices);
+        rank_outputs.at(static_cast<std::size_t>(local_rank)).trajectories = std::move(trajectories);
+    });
+
+    const std::size_t total_outputs = static_cast<std::size_t>(prompt_count) * static_cast<std::size_t>(num_completions);
+    result.tokens.resize(total_outputs);
+    result.logprobs.resize(total_outputs);
+    result.prompt_lens.resize(total_outputs);
+    result.completion_lens.resize(total_outputs);
+
+    for (int rank = 0; rank < local_world; ++rank) {
+        auto& shard = rank_outputs[static_cast<std::size_t>(rank)];
+        const std::size_t expected = shard.prompt_indices.size() * static_cast<std::size_t>(num_completions);
+        if (shard.trajectories.size() != expected) {
+            throw std::runtime_error(
+                fmt::format("generate: shard output size mismatch on rank {} (expected {}, got {})",
+                            rank, expected, shard.trajectories.size()));
         }
-    }, /*gpu_id=*/0);
+        for (std::size_t local_prompt_pos = 0; local_prompt_pos < shard.prompt_indices.size(); ++local_prompt_pos) {
+            const int global_prompt_idx = shard.prompt_indices[local_prompt_pos];
+            for (int completion_idx = 0; completion_idx < num_completions; ++completion_idx) {
+                const std::size_t local_seq_idx =
+                    local_prompt_pos * static_cast<std::size_t>(num_completions)
+                    + static_cast<std::size_t>(completion_idx);
+                const std::size_t global_seq_idx =
+                    static_cast<std::size_t>(global_prompt_idx) * static_cast<std::size_t>(num_completions)
+                    + static_cast<std::size_t>(completion_idx);
+                auto& traj = shard.trajectories[local_seq_idx];
+                result.tokens[global_seq_idx] = std::move(traj.tokens);
+                result.logprobs[global_seq_idx] = std::move(traj.logprobs);
+                result.prompt_lens[global_seq_idx] = traj.prompt_len;
+                result.completion_lens[global_seq_idx] = traj.completion_len;
+            }
+        }
+    }
 
     return result;
 }

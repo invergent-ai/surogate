@@ -1378,6 +1378,15 @@ NB_MODULE(_surogate, m) {
                 float loss_scale,
                 nb::object position_ids_obj,
                 nb::object temperatures_obj) {
+            const int rollout_rows = static_cast<int>(inference_logprobs.shape(0));
+            const auto rollout_cols = inference_logprobs.shape(1);
+            if (advantages.shape(0) != inference_logprobs.shape(0) ||
+                advantages.shape(1) != rollout_cols ||
+                loss_mask.shape(0) != inference_logprobs.shape(0) ||
+                loss_mask.shape(1) != rollout_cols) {
+                throw std::runtime_error(
+                    "step_with_native_grpo: inference_logprobs/advantages/loss_mask shape mismatch");
+            }
             const std::int32_t* position_ids_ptr = nullptr;
             if (!position_ids_obj.is_none()) {
                 auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
@@ -1399,6 +1408,7 @@ NB_MODULE(_surogate, m) {
                 ipo_mask_low,
                 ipo_mask_high,
                 loss_scale,
+                rollout_rows,
                 position_ids_ptr,
                 temperatures_ptr);
             nb::dict ret;
